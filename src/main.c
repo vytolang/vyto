@@ -447,9 +447,13 @@ int main(int argc, char **argv) {
     SBuf libs;
     sb_init(&libs);
     for (Module *m = g_modules; m; m = m->next)
-        for (int i = 0; i < m->ndecls; i++)
-            if (m->decls[i]->kind == D_LINK)
-                sb_printf(&libs, " -l%s", m->decls[i]->link_lib);
+        for (int i = 0; i < m->ndecls; i++) {
+            Decl *d = m->decls[i];
+            if (d->kind != D_LINK) continue;
+            if (d->link_cond && strncmp(triple, d->link_cond, strlen(d->link_cond)) != 0)
+                continue; /* library is for another platform */
+            sb_printf(&libs, " -l%s", d->link_lib);
+        }
     for (int i = 0; i < ncopy; i++)
         if (!file_exists(exe) || file_mtime(copy_libs[i]) > file_mtime(exe)) relink = true;
     if (relink || !file_exists(exe)) {

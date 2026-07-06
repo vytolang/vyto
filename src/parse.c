@@ -665,6 +665,15 @@ Module *parse_module(const char *path, const char *modname, const char *src) {
             if (cur(&p) != T_STRING) fatal_at(ploc(&p), "expected library name string after #link");
             d->link_lib = arena_strndup(&g_arena, p.lx.tok.sval, p.lx.tok.slen);
             advance(&p);
+            /* optional platform condition: #link "X11" if "linux" —
+               the library is linked only when the target triple starts
+               with the given OS prefix (linux / macos / windows) */
+            if (accept(&p, T_IF)) {
+                if (cur(&p) != T_STRING)
+                    fatal_at(ploc(&p), "expected platform string after 'if'");
+                d->link_cond = arena_strndup(&g_arena, p.lx.tok.sval, p.lx.tok.slen);
+                advance(&p);
+            }
             break;
         }
         case T_IMPORT: {

@@ -707,7 +707,16 @@ int main(int argc, char **argv) {
     printf("// voltbind");
     for (int i = 1; i < argc; i++) printf(" %s", argv[i]);
     printf("\n\n");
-    for (int i = 0; i < nlibs; i++) printf("#link \"%s\"\n", libs[i]);
+    /* --lib name@platform emits a conditional link: #link "name" if "platform" */
+    for (int i = 0; i < nlibs; i++) {
+        const char *at = strchr(libs[i], '@');
+        if (at) {
+            char *name = arena_strndup(&g_arena, libs[i], (size_t)(at - libs[i]));
+            printf("#link \"%s\" if \"%s\"\n", name, at + 1);
+        } else {
+            printf("#link \"%s\"\n", libs[i]);
+        }
+    }
     if (nlibs) printf("\n");
 
     /* pass 1: decide which functions are emitted; marks value-used structs */

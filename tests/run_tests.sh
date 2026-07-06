@@ -92,13 +92,24 @@ for src in examples/[0-9]*.vt; do
 done
 
 # --- volt/surface binding: regenerate with voltbind, golden-check ---
-./voltbind lib/volt/surface/native/src/vsurf.h --lib X11 \
+./voltbind lib/volt/surface/native/src/vsurf.h \
+    --lib X11@linux --lib X11@macos --lib gdi32@windows --lib user32@windows \
     --filter 'vs_*' --filter 'VS_*' > lib/volt/surface/vsurf.vt || exit 1
 if diff -u tests/vsurf.vt.expected lib/volt/surface/vsurf.vt >/dev/null 2>&1; then
     echo "PASS voltbind_vsurf"
 else
     echo "FAIL voltbind_vsurf"
     diff -u tests/vsurf.vt.expected lib/volt/surface/vsurf.vt | head -30
+    fail=1
+fi
+
+# --- conditional #link: platform-filtered libraries stay off the link line ---
+got=$(./voltc run tests/fixtures/condlink.vt 2>&1)
+if [ "$got" = "conditional link ok" ]; then
+    echo "PASS condlink"
+else
+    echo "FAIL condlink"
+    printf '%s\n' "$got"
     fail=1
 fi
 

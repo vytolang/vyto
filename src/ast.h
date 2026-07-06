@@ -247,6 +247,7 @@ struct Decl {
     const char *import_path;
     Module *import_module;  /* resolved */
     const char *link_lib;   /* D_LINK */
+    const char *link_cond;  /* D_LINK: OS prefix of the target triple, or NULL */
     bool wrapper_emitted;   /* D_FN used as closure value: thunk emitted */
 };
 

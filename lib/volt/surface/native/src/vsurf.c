@@ -1,11 +1,388 @@
+/* vsurf backends:
+ *   - Win32 GDI when compiling for Windows (_WIN32)
+ *   - X11 everywhere else
+ *   - headless (VS_HEADLESS=1): no window system at all; events replay from
+ *     the $VS_EVENTS script. Shared by every platform, used by the tests.
+ */
 #include "vsurf.h"
+
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+static int last_key, last_x, last_y;
+static char last_text[32];
+
+/* ---- headless backend (platform-independent) ---- */
+
+static int headless_on(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("VS_HEADLESS");
+        cached = (e && *e && strcmp(e, "0") != 0) ? 1 : 0;
+    }
+    return cached;
+}
+
+static FILE *script; /* $VS_EVENTS */
+static char script_line[512];
+static const char *type_p; /* rest of a "type ..." line being replayed */
+
+static void headless_open_script(void) {
+    const char *ev = getenv("VS_EVENTS");
+    if (ev && !script) script = fopen(ev, "r");
+}
+
+/* one directive per line:
+ *   type <text>      each character becomes a key event
+ *   key <name>       Enter Backspace Esc Up Down Left Right Delete Tab Home End
+ *   click X Y        mouse down (then up) at X,Y
+ *   resize W H
+ *   expose
+ *   close
+ * '#' starts a comment; EOF acts as close. */
+static int headless_wait(int *w, int *h) {
+    static int pending_up; /* deliver MOUSE_UP after each click's MOUSE_DOWN */
+    if (pending_up) {
+        pending_up = 0;
+        return VS_EV_MOUSE_UP;
+    }
+    for (;;) {
+        if (type_p && *type_p) {
+            last_key = (unsigned char)*type_p;
+            last_text[0] = *type_p;
+            last_text[1] = 0;
+            type_p++;
+            return VS_EV_KEY;
+        }
+        type_p = NULL;
+        if (!script || !fgets(script_line, sizeof script_line, script)) return VS_EV_CLOSE;
+        char *nl = strchr(script_line, '\n');
+        if (nl) *nl = 0;
+        if (!script_line[0] || script_line[0] == '#') continue;
+        if (strncmp(script_line, "type ", 5) == 0) {
+            type_p = script_line + 5;
+            continue;
+        }
+        if (strncmp(script_line, "key ", 4) == 0) {
+            const char *k = script_line + 4;
+            last_text[0] = 0;
+            if (strcmp(k, "Enter") == 0) last_key = VS_KEY_ENTER;
+            else if (strcmp(k, "Backspace") == 0) last_key = VS_KEY_BACKSPACE;
+            else if (strcmp(k, "Esc") == 0) last_key = VS_KEY_ESC;
+            else if (strcmp(k, "Up") == 0) last_key = VS_KEY_UP;
+            else if (strcmp(k, "Down") == 0) last_key = VS_KEY_DOWN;
+            else if (strcmp(k, "Left") == 0) last_key = VS_KEY_LEFT;
+            else if (strcmp(k, "Right") == 0) last_key = VS_KEY_RIGHT;
+            else if (strcmp(k, "Delete") == 0) last_key = VS_KEY_DELETE;
+            else if (strcmp(k, "Tab") == 0) last_key = VS_KEY_TAB;
+            else if (strcmp(k, "Home") == 0) last_key = VS_KEY_HOME;
+            else if (strcmp(k, "End") == 0) last_key = VS_KEY_END;
+            else continue;
+            return VS_EV_KEY;
+        }
+        if (sscanf(script_line, "click %d %d", &last_x, &last_y) == 2) {
+            pending_up = 1;
+            return VS_EV_MOUSE_DOWN;
+        }
+        {
+            int nw, nh;
+            if (sscanf(script_line, "resize %d %d", &nw, &nh) == 2) {
+                *w = nw;
+                *h = nh;
+                return VS_EV_RESIZE;
+            }
+        }
+        if (strcmp(script_line, "expose") == 0) return VS_EV_EXPOSE;
+        if (strcmp(script_line, "close") == 0) return VS_EV_CLOSE;
+        /* unknown directive: skip */
+    }
+}
+
+int vs_key(void) { return last_key; }
+const char *vs_text(void) { return last_text; }
+int vs_x(void) { return last_x; }
+int vs_y(void) { return last_y; }
+
+#ifdef _WIN32
+/* ================================================================ Win32 */
+
+#include <windows.h>
+
+typedef struct VSurf {
+    HWND hwnd; /* NULL in headless mode */
+    HDC memdc; /* backbuffer */
+    HBITMAP bmp;
+    HBITMAP bmp0; /* original 1x1 bitmap of memdc, restored before delete */
+    HFONT font;
+    int w, h;
+} VSurf;
+
+/* WndProc -> vs_wait event queue (single window; small ring buffer) */
+typedef struct QEv {
+    int type, key, x, y;
+    char text[2];
+} QEv;
+static QEv evq[64];
+static int evq_head, evq_len;
+
+static void q_push(int type, int key, int x, int y, int ch) {
+    if (evq_len == 64) return; /* drop when full; the loop catches up */
+    QEv *e = &evq[(evq_head + evq_len) % 64];
+    e->type = type;
+    e->key = key;
+    e->x = x;
+    e->y = y;
+    e->text[0] = (char)ch;
+    e->text[1] = 0;
+    evq_len++;
+}
+
+/* 0xRRGGBB -> COLORREF (0x00BBGGRR) */
+static COLORREF cref(int rgb) {
+    return RGB((rgb >> 16) & 0xFF, (rgb >> 8) & 0xFF, rgb & 0xFF);
+}
+
+static void make_backbuffer(VSurf *s) {
+    HDC wdc = GetDC(s->hwnd);
+    HDC mem = CreateCompatibleDC(wdc);
+    HBITMAP bmp = CreateCompatibleBitmap(wdc, s->w > 0 ? s->w : 1, s->h > 0 ? s->h : 1);
+    HBITMAP b0 = SelectObject(mem, bmp);
+    SelectObject(mem, s->font);
+    SetBkMode(mem, TRANSPARENT);
+    if (s->memdc) {
+        SelectObject(s->memdc, s->bmp0);
+        DeleteObject(s->bmp);
+        DeleteDC(s->memdc);
+    }
+    s->memdc = mem;
+    s->bmp = bmp;
+    s->bmp0 = b0;
+    ReleaseDC(s->hwnd, wdc);
+}
+
+static LRESULT CALLBACK vs_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    VSurf *s = (VSurf *)GetWindowLongPtr(hwnd, GWLP_USERDATA);
+    switch (msg) {
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(hwnd, &ps);
+        if (s && s->memdc) BitBlt(dc, 0, 0, s->w, s->h, s->memdc, 0, 0, SRCCOPY);
+        EndPaint(hwnd, &ps);
+        q_push(VS_EV_EXPOSE, 0, 0, 0, 0);
+        return 0;
+    }
+    case WM_SIZE: {
+        int w = LOWORD(lp), h = HIWORD(lp);
+        if (s && w > 0 && h > 0 && (w != s->w || h != s->h)) {
+            s->w = w;
+            s->h = h;
+            make_backbuffer(s);
+            q_push(VS_EV_RESIZE, 0, 0, 0, 0);
+        }
+        return 0;
+    }
+    case WM_CLOSE:
+        q_push(VS_EV_CLOSE, 0, 0, 0, 0);
+        return 0; /* the Volt loop decides; vs_close destroys the window */
+    case WM_LBUTTONDOWN:
+        q_push(VS_EV_MOUSE_DOWN, 0, (short)LOWORD(lp), (short)HIWORD(lp), 0);
+        return 0;
+    case WM_LBUTTONUP:
+        q_push(VS_EV_MOUSE_UP, 0, (short)LOWORD(lp), (short)HIWORD(lp), 0);
+        return 0;
+    case WM_KEYDOWN: {
+        int k = 0;
+        switch (wp) {
+        case VK_RETURN: k = VS_KEY_ENTER; break;
+        case VK_BACK: k = VS_KEY_BACKSPACE; break;
+        case VK_ESCAPE: k = VS_KEY_ESC; break;
+        case VK_UP: k = VS_KEY_UP; break;
+        case VK_DOWN: k = VS_KEY_DOWN; break;
+        case VK_LEFT: k = VS_KEY_LEFT; break;
+        case VK_RIGHT: k = VS_KEY_RIGHT; break;
+        case VK_DELETE: k = VS_KEY_DELETE; break;
+        case VK_TAB: k = VS_KEY_TAB; break;
+        case VK_HOME: k = VS_KEY_HOME; break;
+        case VK_END: k = VS_KEY_END; break;
+        }
+        if (k) {
+            q_push(VS_EV_KEY, k, 0, 0, 0);
+            return 0;
+        }
+        break; /* DefWindowProc; TranslateMessage yields WM_CHAR */
+    }
+    case WM_CHAR:
+        if (wp >= 32 && wp < 127) q_push(VS_EV_KEY, (int)wp, 0, 0, (int)wp);
+        return 0;
+    default:
+        break;
+    }
+    return DefWindowProc(hwnd, msg, wp, lp);
+}
+
+void *vs_open(const char *title, int w, int h) {
+    VSurf *s = calloc(1, sizeof *s);
+    if (!s) return NULL;
+    s->w = w;
+    s->h = h;
+    if (headless_on()) {
+        headless_open_script();
+        return s;
+    }
+    static int registered;
+    if (!registered) {
+        WNDCLASSA wc;
+        memset(&wc, 0, sizeof wc);
+        wc.lpfnWndProc = vs_wndproc;
+        wc.hInstance = GetModuleHandle(NULL);
+        wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+        wc.lpszClassName = "VoltSurface";
+        if (!RegisterClassA(&wc)) { free(s); return NULL; }
+        registered = 1;
+    }
+    RECT r = {0, 0, w, h};
+    AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
+    s->hwnd = CreateWindowA("VoltSurface", title, WS_OVERLAPPEDWINDOW, CW_USEDEFAULT,
+                            CW_USEDEFAULT, r.right - r.left, r.bottom - r.top, NULL, NULL,
+                            GetModuleHandle(NULL), NULL);
+    if (!s->hwnd) { free(s); return NULL; }
+    SetWindowLongPtr(s->hwnd, GWLP_USERDATA, (LONG_PTR)s);
+    s->font = GetStockObject(ANSI_FIXED_FONT);
+    make_backbuffer(s);
+    ShowWindow(s->hwnd, SW_SHOW);
+    UpdateWindow(s->hwnd);
+    return s;
+}
+
+void vs_close(void *vs) {
+    VSurf *s = vs;
+    if (!s) return;
+    if (s->hwnd) {
+        SelectObject(s->memdc, s->bmp0);
+        DeleteObject(s->bmp);
+        DeleteDC(s->memdc);
+        SetWindowLongPtr(s->hwnd, GWLP_USERDATA, 0);
+        DestroyWindow(s->hwnd);
+    }
+    free(s);
+}
+
+int vs_width(void *vs) { return ((VSurf *)vs)->w; }
+int vs_height(void *vs) { return ((VSurf *)vs)->h; }
+
+void vs_set_title(void *vs, const char *t) {
+    VSurf *s = vs;
+    if (s->hwnd) SetWindowTextA(s->hwnd, t);
+}
+
+void vs_fill_rect(void *vs, int x, int y, int w, int h, int rgb) {
+    VSurf *s = vs;
+    if (!s->hwnd) return;
+    RECT r = {x, y, x + w, y + h};
+    HBRUSH b = CreateSolidBrush(cref(rgb));
+    FillRect(s->memdc, &r, b);
+    DeleteObject(b);
+}
+
+void vs_draw_rect(void *vs, int x, int y, int w, int h, int rgb) {
+    VSurf *s = vs;
+    if (!s->hwnd) return;
+    RECT r = {x, y, x + w, y + h};
+    HBRUSH b = CreateSolidBrush(cref(rgb));
+    FrameRect(s->memdc, &r, b);
+    DeleteObject(b);
+}
+
+void vs_draw_line(void *vs, int x0, int y0, int x1, int y1, int rgb) {
+    VSurf *s = vs;
+    if (!s->hwnd) return;
+    HPEN pen = CreatePen(PS_SOLID, 1, cref(rgb));
+    HGDIOBJ old = SelectObject(s->memdc, pen);
+    MoveToEx(s->memdc, x0, y0, NULL);
+    LineTo(s->memdc, x1, y1);
+    SelectObject(s->memdc, old);
+    DeleteObject(pen);
+}
+
+void vs_draw_text(void *vs, int x, int y, const char *str, int rgb) {
+    VSurf *s = vs;
+    if (!s->hwnd) return;
+    /* the y argument is a baseline (X11 convention); GDI wants the top */
+    TEXTMETRICA tm;
+    GetTextMetricsA(s->memdc, &tm);
+    SetTextColor(s->memdc, cref(rgb));
+    TextOutA(s->memdc, x, y - tm.tmAscent, str, (int)strlen(str));
+}
+
+void vs_present(void *vs) {
+    VSurf *s = vs;
+    if (!s->hwnd) return;
+    HDC dc = GetDC(s->hwnd);
+    BitBlt(dc, 0, 0, s->w, s->h, s->memdc, 0, 0, SRCCOPY);
+    ReleaseDC(s->hwnd, dc);
+}
+
+int vs_text_width(void *vs, const char *str) {
+    VSurf *s = vs;
+    if (!s->hwnd) return 9 * (int)strlen(str);
+    SIZE sz;
+    GetTextExtentPoint32A(s->memdc, str, (int)strlen(str), &sz);
+    return (int)sz.cx;
+}
+
+int vs_font_ascent(void *vs) {
+    VSurf *s = vs;
+    if (!s->hwnd) return 11;
+    TEXTMETRICA tm;
+    GetTextMetricsA(s->memdc, &tm);
+    return (int)tm.tmAscent;
+}
+
+int vs_font_height(void *vs) {
+    VSurf *s = vs;
+    if (!s->hwnd) return 15;
+    TEXTMETRICA tm;
+    GetTextMetricsA(s->memdc, &tm);
+    return (int)tm.tmHeight;
+}
+
+int vs_wait(void *vs) {
+    VSurf *s = vs;
+    if (!s->hwnd) return headless_wait(&s->w, &s->h);
+    for (;;) {
+        while (evq_len == 0) {
+            MSG msg;
+            if (GetMessageA(&msg, NULL, 0, 0) <= 0) return VS_EV_CLOSE;
+            TranslateMessage(&msg);
+            DispatchMessageA(&msg);
+        }
+        QEv e = evq[evq_head];
+        evq_head = (evq_head + 1) % 64;
+        evq_len--;
+        last_key = e.key;
+        last_x = e.x;
+        last_y = e.y;
+        last_text[0] = e.text[0];
+        last_text[1] = 0;
+        return e.type;
+    }
+}
+
+void *vs_native_display(void *vs) {
+    (void)vs;
+    return NULL; /* no display concept on Win32 */
+}
+unsigned long vs_native_window(void *vs) { return (unsigned long)(uintptr_t)((VSurf *)vs)->hwnd; }
+void *vs_native_gc(void *vs) { return ((VSurf *)vs)->memdc; }
+
+#else
+/* ================================================================== X11 */
 
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
 #include <X11/keysym.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
 
 typedef struct VSurf {
     Display *dpy; /* NULL in headless mode */
@@ -17,23 +394,6 @@ typedef struct VSurf {
 
 static XFontStruct *font;
 static Atom wm_delete;
-static int last_key, last_x, last_y;
-static char last_text[32];
-
-/* ---- headless backend state ---- */
-
-static int headless_on(void) {
-    static int cached = -1;
-    if (cached < 0) {
-        const char *e = getenv("VS_HEADLESS");
-        cached = (e && *e && strcmp(e, "0") != 0) ? 1 : 0;
-    }
-    return cached;
-}
-
-static FILE *script;        /* $VS_EVENTS */
-static char script_line[512];
-static const char *type_p;  /* rest of a "type ..." line being replayed */
 
 /* ---- color mapping: 0xRRGGBB -> X pixel ---- */
 
@@ -59,16 +419,13 @@ static unsigned long pixel_of(Display *dpy, int rgb) {
     return c.pixel;
 }
 
-/* ---- lifecycle ---- */
-
 void *vs_open(const char *title, int w, int h) {
     VSurf *s = calloc(1, sizeof *s);
     if (!s) return NULL;
     s->w = w;
     s->h = h;
     if (headless_on()) {
-        const char *ev = getenv("VS_EVENTS");
-        if (ev && !script) script = fopen(ev, "r");
+        headless_open_script();
         return s;
     }
     Display *dpy = XOpenDisplay(NULL);
@@ -116,8 +473,6 @@ void vs_set_title(void *vs, const char *t) {
     if (s->dpy) XStoreName(s->dpy, s->win, t);
 }
 
-/* ---- drawing (into the backbuffer) ---- */
-
 void vs_fill_rect(void *vs, int x, int y, int w, int h, int rgb) {
     VSurf *s = vs;
     if (!s->dpy) return;
@@ -153,8 +508,6 @@ void vs_present(void *vs) {
     XFlush(s->dpy);
 }
 
-/* ---- text metrics (fixed 9x15-like numbers in headless mode) ---- */
-
 int vs_text_width(void *vs, const char *str) {
     VSurf *s = vs;
     if (!s->dpy || !font) return 9 * (int)strlen(str);
@@ -173,79 +526,9 @@ int vs_font_height(void *vs) {
     return font->ascent + font->descent;
 }
 
-/* ---- headless event script ----
- * one directive per line:
- *   type <text>      each character becomes a key event
- *   key <name>       Enter Backspace Esc Up Down Left Right Delete Tab Home End
- *   click X Y        mouse down (then up) at X,Y
- *   resize W H
- *   expose
- *   close
- * '#' starts a comment; EOF acts as close. */
-
-static int headless_wait(VSurf *s) {
-    static int pending_up; /* deliver MOUSE_UP after each click's MOUSE_DOWN */
-    if (pending_up) {
-        pending_up = 0;
-        return VS_EV_MOUSE_UP;
-    }
-    for (;;) {
-        if (type_p && *type_p) {
-            last_key = (unsigned char)*type_p;
-            last_text[0] = *type_p;
-            last_text[1] = 0;
-            type_p++;
-            return VS_EV_KEY;
-        }
-        type_p = NULL;
-        if (!script || !fgets(script_line, sizeof script_line, script)) return VS_EV_CLOSE;
-        char *nl = strchr(script_line, '\n');
-        if (nl) *nl = 0;
-        if (!script_line[0] || script_line[0] == '#') continue;
-        if (strncmp(script_line, "type ", 5) == 0) {
-            type_p = script_line + 5;
-            continue;
-        }
-        if (strncmp(script_line, "key ", 4) == 0) {
-            const char *k = script_line + 4;
-            last_text[0] = 0;
-            if (strcmp(k, "Enter") == 0) last_key = VS_KEY_ENTER;
-            else if (strcmp(k, "Backspace") == 0) last_key = VS_KEY_BACKSPACE;
-            else if (strcmp(k, "Esc") == 0) last_key = VS_KEY_ESC;
-            else if (strcmp(k, "Up") == 0) last_key = VS_KEY_UP;
-            else if (strcmp(k, "Down") == 0) last_key = VS_KEY_DOWN;
-            else if (strcmp(k, "Left") == 0) last_key = VS_KEY_LEFT;
-            else if (strcmp(k, "Right") == 0) last_key = VS_KEY_RIGHT;
-            else if (strcmp(k, "Delete") == 0) last_key = VS_KEY_DELETE;
-            else if (strcmp(k, "Tab") == 0) last_key = VS_KEY_TAB;
-            else if (strcmp(k, "Home") == 0) last_key = VS_KEY_HOME;
-            else if (strcmp(k, "End") == 0) last_key = VS_KEY_END;
-            else continue;
-            return VS_EV_KEY;
-        }
-        if (sscanf(script_line, "click %d %d", &last_x, &last_y) == 2) {
-            pending_up = 1;
-            return VS_EV_MOUSE_DOWN;
-        }
-        {
-            int w, h;
-            if (sscanf(script_line, "resize %d %d", &w, &h) == 2) {
-                s->w = w;
-                s->h = h;
-                return VS_EV_RESIZE;
-            }
-        }
-        if (strcmp(script_line, "expose") == 0) return VS_EV_EXPOSE;
-        if (strcmp(script_line, "close") == 0) return VS_EV_CLOSE;
-        /* unknown directive: skip */
-    }
-}
-
-/* ---- event pump ---- */
-
 int vs_wait(void *vs) {
     VSurf *s = vs;
-    if (!s->dpy) return headless_wait(s);
+    if (!s->dpy) return headless_wait(&s->w, &s->h);
     XEvent e;
     for (;;) {
         XNextEvent(s->dpy, &e);
@@ -315,13 +598,8 @@ int vs_wait(void *vs) {
     }
 }
 
-int vs_key(void) { return last_key; }
-const char *vs_text(void) { return last_text; }
-int vs_x(void) { return last_x; }
-int vs_y(void) { return last_y; }
-
-/* ---- escape hatches ---- */
-
 void *vs_native_display(void *vs) { return ((VSurf *)vs)->dpy; }
 unsigned long vs_native_window(void *vs) { return (unsigned long)((VSurf *)vs)->win; }
 void *vs_native_gc(void *vs) { return ((VSurf *)vs)->gc; }
+
+#endif /* _WIN32 / X11 */
