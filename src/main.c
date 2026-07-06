@@ -4,6 +4,7 @@
 #include "emit.h"
 #include "parse.h"
 
+#include <dirent.h>
 #include <libgen.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -36,11 +37,23 @@ static const char *sanitize(const char *s) {
 
 static Module *load_module(const char *path);
 
+static bool file_exists(const char *path) {
+    struct stat st;
+    return stat(path, &st) == 0;
+}
+
 static void resolve_imports(Module *m, const char *basedir) {
     for (int i = 0; i < m->ndecls; i++) {
         Decl *d = m->decls[i];
         if (d->kind != D_IMPORT) continue;
         const char *path = arena_printf(&g_arena, "%s/%s.vt", basedir, d->import_path);
+        if (!file_exists(path)) {
+            /* package layout: mylib/mylib.vt */
+            char *copy = arena_strdup(&g_arena, d->import_path);
+            const char *base = basename(copy);
+            const char *pkg = arena_printf(&g_arena, "%s/%s/%s.vt", basedir, d->import_path, base);
+            if (file_exists(pkg)) path = pkg;
+        }
         d->import_module = load_module(path);
     }
 }
@@ -63,11 +76,6 @@ static Module *load_module(const char *path) {
 }
 
 /* ---- files & processes ---- */
-
-static bool file_exists(const char *path) {
-    struct stat st;
-    return stat(path, &st) == 0;
-}
 
 static bool write_if_changed(const char *path, const char *data, size_t len, bool *changed) {
     size_t old_len = 0;
@@ -118,6 +126,32 @@ static bool have_tcc(void) {
     static int cached = -1;
     if (cached < 0) cached = run_cmd("tcc -v >/dev/null 2>&1", false) == 0 ? 1 : 0;
     return cached == 1;
+}
+
+static const char *volt_triple(void) {
+#if defined(_WIN32) && defined(_M_X64)
+    return "windows-x64";
+#elif defined(__APPLE__) && defined(__aarch64__)
+    return "macos-arm64";
+#elif defined(__APPLE__)
+    return "macos-x64";
+#elif defined(__linux__) && defined(__x86_64__)
+    return "linux-x64";
+#elif defined(__linux__) && defined(__aarch64__)
+    return "linux-arm64";
+#else
+    return "unknown";
+#endif
+}
+
+static long file_mtime(const char *path) {
+    struct stat st;
+    return stat(path, &st) == 0 ? (long)st.st_mtime : -1;
+}
+
+static bool has_suffix(const char *s, const char *suf) {
+    size_t ls = strlen(s), lf = strlen(suf);
+    return ls >= lf && strcmp(s + ls - lf, suf) == 0;
 }
 
 static void usage(void) {
@@ -172,6 +206,60 @@ int main(int argc, char **argv) {
     }
     sb_printf(&objs, " %s", rt_o);
 
+    /* ---- native packages: bundled C sources and prebuilt shared libraries ---- */
+    SBuf shlibs;
+    sb_init(&shlibs);
+    const char *copy_libs[64];
+    int ncopy = 0;
+    bool need_rpath = false;
+    for (Module *m = g_modules; m; m = m->next) {
+        const char *mdir = dir_of(m->path);
+
+        const char *nsrc = arena_printf(&g_arena, "%s/native/src", mdir);
+        DIR *dp = opendir(nsrc);
+        if (dp) {
+            struct dirent *de;
+            while ((de = readdir(dp))) {
+                if (!has_suffix(de->d_name, ".c")) continue;
+                const char *csrc = arena_printf(&g_arena, "%s/%s", nsrc, de->d_name);
+                const char *obj = arena_printf(&g_arena, "%s/native_%s_%s%s.o", cache, m->name,
+                                               stem_of(de->d_name), release ? "_rel" : "");
+                if (!file_exists(obj) || file_mtime(csrc) > file_mtime(obj)) {
+                    char *cl = arena_printf(&g_arena, "%s %s -w -I%s -c -o %s %s", cc,
+                                            release ? "-O2" : opt, nsrc, obj, csrc);
+                    if (run_cmd(cl, verbose) != 0)
+                        fatal("native source of package '%s' failed to compile", m->name);
+                    relink = true;
+                }
+                sb_printf(&objs, " %s", obj);
+            }
+            closedir(dp);
+        }
+
+        const char *pdir = arena_printf(&g_arena, "%s/native/%s", mdir, volt_triple());
+        dp = opendir(pdir);
+        if (dp) {
+            struct dirent *de;
+            bool any = false;
+            while ((de = readdir(dp))) {
+                if (!has_suffix(de->d_name, ".so") && !has_suffix(de->d_name, ".dylib") &&
+                    !has_suffix(de->d_name, ".dll"))
+                    continue;
+                const char *lib = arena_printf(&g_arena, "%s/%s", pdir, de->d_name);
+                sb_printf(&shlibs, " %s", lib);
+                if (ncopy < 64) copy_libs[ncopy++] = lib;
+                need_rpath = true;
+                any = true;
+            }
+            closedir(dp);
+            if (!any) fatal("package '%s' has native/%s/ but no shared library in it", m->name,
+                            volt_triple());
+        } else if (file_exists(arena_printf(&g_arena, "%s/native", mdir)) && !file_exists(nsrc)) {
+            fatal("package '%s' ships native binaries but none for this platform (native/%s)",
+                  m->name, volt_triple());
+        }
+    }
+
     for (Module *m = g_modules; m; m = m->next) {
         SBuf h, c;
         sb_init(&h);
@@ -218,11 +306,24 @@ int main(int argc, char **argv) {
         for (int i = 0; i < m->ndecls; i++)
             if (m->decls[i]->kind == D_LINK)
                 sb_printf(&libs, " -l%s", m->decls[i]->link_lib);
+    for (int i = 0; i < ncopy; i++)
+        if (!file_exists(exe) || file_mtime(copy_libs[i]) > file_mtime(exe)) relink = true;
     if (relink || !file_exists(exe)) {
-        char *cmdline = arena_printf(&g_arena, "%s -o %s%s%s -lm", cc, exe, objs.data, libs.data);
+        /* $ORIGIN must reach the linker unexpanded, hence the single quotes */
+        char *cmdline = arena_printf(&g_arena, "%s -o %s%s%s%s%s -lm", cc, exe, objs.data,
+                                     shlibs.data, libs.data,
+                                     need_rpath ? " '-Wl,-rpath,$ORIGIN'" : "");
         if (run_cmd(cmdline, verbose) != 0) fatal("link failed");
     }
+    /* ship prebuilt libraries next to the executable */
+    const char *exedir = dir_of(exe);
+    for (int i = 0; i < ncopy; i++) {
+        if (strcmp(dir_of(copy_libs[i]), exedir) == 0) continue;
+        char *cl = arena_printf(&g_arena, "cp -p %s %s/", copy_libs[i], exedir);
+        if (run_cmd(cl, verbose) != 0) fatal("cannot copy %s next to the executable", copy_libs[i]);
+    }
     sb_free(&objs);
+    sb_free(&shlibs);
     sb_free(&libs);
 
     if (!do_run) {

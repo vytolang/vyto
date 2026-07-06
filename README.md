@@ -45,6 +45,11 @@ Generated C is human-readable — look inside `.volt-cache/`.
 - **Classes**: single inheritance, `virtual`/`override`, `new`, `super.init`.
 - **Closures**: `(x) => expr`, typed `fn(T): U`, captures by value.
 - **FFI**: `extern "C"` blocks, exact-layout structs, `#link "lib"`.
+- **Native packages**: a module directory with `native/src/*.c` (compiled
+  and linked automatically) or prebuilt `native/<platform>/*.so` (linked
+  with an `$ORIGIN` rpath and shipped next to the executable).
+- **voltbind**: generates the `extern` binding from a C header —
+  `voltbind zlib.h --lib z --filter 'compress*' > zlib.vt`.
 - **Safety**: bounds-checked arrays, checked downcasts, `panic` with
   file:line.
 
