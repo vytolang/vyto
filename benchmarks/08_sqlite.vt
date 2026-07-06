@@ -1,0 +1,113 @@
+// Benchmark: Write 1M log lines to SQLite, then read them all back.
+// Volt v0.2: direct sqlite3_open/prepare_v2 via &out-params (no C wrappers),
+// bytes() buffer instead of malloc, i32/int comparisons without casts.
+import { sqlite3_open, sqlite3_prepare_v2, sqlite3_close, sqlite3_exec,
+         sqlite3_step, sqlite3_finalize, sqlite3_reset, sqlite3_bind_text,
+         sqlite3_column_text, sqlite3_errmsg, sqlite3_changes } from "sqlite3";
+
+const SQLITE_OK: int = 0;
+const SQLITE_ROW: int = 100;
+const SQLITE_DONE: int = 101;
+
+extern "C" {
+    fn fopen(path: cstring, mode: cstring): rawptr;
+    fn fgets(buf: cstring, n: i32, stream: rawptr): cstring;
+    fn fclose(stream: rawptr): i32;
+}
+
+fn main() {
+    // Open database (out-param via address-of)
+    let db: rawptr = null;
+    if (sqlite3_open("benchmarks/logs.db".cstr(), &db) != SQLITE_OK) {
+        panic("cannot open database");
+    }
+
+    if (sqlite3_exec(db, "CREATE TABLE IF NOT EXISTS logs (id INTEGER PRIMARY KEY, timestamp TEXT, level TEXT, service TEXT, message TEXT)".cstr(), null, null, null) != SQLITE_OK) {
+        panic("cannot create table");
+    }
+    if (sqlite3_exec(db, "BEGIN TRANSACTION".cstr(), null, null, null) != SQLITE_OK) {
+        panic("cannot begin transaction");
+    }
+
+    let f = fopen("benchmarks/sample_large.log".cstr(), "r".cstr());
+    if (f == null) {
+        panic("cannot open log file");
+    }
+
+    let stmt: rawptr = null;
+    if (sqlite3_prepare_v2(db, "INSERT INTO logs (timestamp, level, service, message) VALUES (?, ?, ?, ?)".cstr(), -1, &stmt, null) != SQLITE_OK) {
+        panic("cannot prepare statement");
+    }
+
+    let buf = bytes(4096);
+    let line = fgets(buf as cstring, 4096, f);
+    let total = 0;
+
+    while (line != null) {
+        total += 1;
+        let text = str(line);
+
+        // Parse: "2024-01-15 08:32:01.220 [INFO] (auth) connection timeout"
+        let timestamp = text.slice(0, 23);
+
+        let level_start = 0;
+        let level_end = 0;
+        let i = 0;
+        while (i < text.len) {
+            if (text[i] == 91) { level_start = i + 1; }
+            if (text[i] == 93) { level_end = i; break; }
+            i += 1;
+        }
+        let level = text.slice(level_start, level_end);
+
+        let svc_start = 0;
+        let svc_end = 0;
+        let k = 0;
+        while (k < text.len) {
+            if (text[k] == 40) { svc_start = k + 1; }
+            if (text[k] == 41) { svc_end = k; break; }
+            k += 1;
+        }
+        let service = text.slice(svc_start, svc_end);
+
+        let msg_start = svc_end + 2;
+        let message = text.slice(msg_start, text.len - 1);
+
+        sqlite3_bind_text(stmt, 1, timestamp.cstr(), -1, null);
+        sqlite3_bind_text(stmt, 2, level.cstr(), -1, null);
+        sqlite3_bind_text(stmt, 3, service.cstr(), -1, null);
+        sqlite3_bind_text(stmt, 4, message.cstr(), -1, null);
+
+        sqlite3_step(stmt);
+        sqlite3_reset(stmt);
+
+        line = fgets(buf as cstring, 4096, f);
+    }
+
+    fclose(f);
+
+    sqlite3_exec(db, "COMMIT".cstr(), null, null, null);
+    sqlite3_finalize(stmt);
+
+    print("wrote " + total + " rows");
+
+    // ---- READ BACK ----
+    let read_stmt: rawptr = null;
+    if (sqlite3_prepare_v2(db, "SELECT id, timestamp, level, service, message FROM logs ORDER BY id".cstr(), -1, &read_stmt, null) != SQLITE_OK) {
+        panic("cannot prepare select");
+    }
+
+    let read_count = 0;
+    while (sqlite3_step(read_stmt) == SQLITE_ROW) {
+        read_count += 1;
+        let _ts = sqlite3_column_text(read_stmt, 1);
+        let _lv = sqlite3_column_text(read_stmt, 2);
+        let _sv = sqlite3_column_text(read_stmt, 3);
+        let _msg = sqlite3_column_text(read_stmt, 4);
+    }
+
+    sqlite3_finalize(read_stmt);
+    print("read back " + read_count + " rows");
+
+    sqlite3_close(db);
+}
