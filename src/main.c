@@ -6,6 +6,7 @@
 
 #include <dirent.h>
 #include <libgen.h>
+#include <limits.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -42,29 +43,99 @@ static bool file_exists(const char *path) {
     return stat(path, &st) == 0;
 }
 
+/* Locate the stdlib directory: $VOLT_HOME/lib, else lib/ next to the voltc
+   executable (or one level up, matching the runtime search). Cached; NULL
+   when no lib directory exists. Canonicalized for prefix checks. */
+static const char *find_lib_dir(void) {
+    static bool cached = false;
+    static const char *libdir;
+    if (cached) return libdir;
+    cached = true;
+    char real[PATH_MAX];
+    const char *env = getenv("VOLT_HOME");
+    if (env) {
+        const char *p = arena_printf(&g_arena, "%s/lib", env);
+        if (file_exists(p) && realpath(p, real)) return libdir = arena_strdup(&g_arena, real);
+    }
+    char exe[4096];
+    ssize_t n = readlink("/proc/self/exe", exe, sizeof exe - 1);
+    if (n > 0) {
+        exe[n] = 0;
+        const char *d = dir_of(exe);
+        const char *cands[] = {
+            arena_printf(&g_arena, "%s/lib", d),
+            arena_printf(&g_arena, "%s/../lib", d),
+        };
+        for (size_t i = 0; i < 2; i++)
+            if (file_exists(cands[i]) && realpath(cands[i], real))
+                return libdir = arena_strdup(&g_arena, real);
+    }
+    return libdir = NULL;
+}
+
+/* try <dir>/<imp>.vt then the package layout <dir>/<imp>/<leaf>.vt */
+static const char *probe_import(const char *dir, const char *imp) {
+    const char *p = arena_printf(&g_arena, "%s/%s.vt", dir, imp);
+    if (file_exists(p)) return p;
+    char *copy = arena_strdup(&g_arena, imp);
+    const char *base = basename(copy);
+    p = arena_printf(&g_arena, "%s/%s/%s.vt", dir, imp, base);
+    if (file_exists(p)) return p;
+    return NULL;
+}
+
 static void resolve_imports(Module *m, const char *basedir) {
     for (int i = 0; i < m->ndecls; i++) {
         Decl *d = m->decls[i];
         if (d->kind != D_IMPORT) continue;
-        const char *path = arena_printf(&g_arena, "%s/%s.vt", basedir, d->import_path);
-        if (!file_exists(path)) {
-            /* package layout: mylib/mylib.vt */
-            char *copy = arena_strdup(&g_arena, d->import_path);
-            const char *base = basename(copy);
-            const char *pkg = arena_printf(&g_arena, "%s/%s/%s.vt", basedir, d->import_path, base);
-            if (file_exists(pkg)) path = pkg;
+        const char *path = probe_import(basedir, d->import_path);
+        if (!path) {
+            const char *lib = find_lib_dir();
+            if (lib) path = probe_import(lib, d->import_path);
+            if (!path)
+                fatal_at(d->loc, "cannot resolve import \"%s\" (searched %s and %s)",
+                         d->import_path, basedir,
+                         lib ? lib : "the stdlib — none found; set VOLT_HOME");
         }
         d->import_module = load_module(path);
     }
 }
 
+/* Module name for a stdlib file: the lib-relative path, sanitized, with the
+   package layout's duplicate leaf collapsed (volt/ui/ui.vt -> volt_ui). This
+   keeps lib module names collision-proof against user module stems. */
+static const char *lib_module_name(const char *libdir, const char *canon) {
+    const char *rel = canon + strlen(libdir);
+    while (*rel == '/') rel++;
+    char *p = arena_strdup(&g_arena, rel);
+    char *dot = strrchr(p, '.');
+    if (dot) *dot = 0;
+    char *slash = strrchr(p, '/');
+    if (slash) {
+        const char *leaf = slash + 1;
+        char *prev = slash;
+        while (prev > p && prev[-1] != '/') prev--;
+        size_t dirlen = (size_t)(slash - prev);
+        if (strlen(leaf) == dirlen && strncmp(prev, leaf, dirlen) == 0) *slash = 0;
+    }
+    return sanitize(p);
+}
+
 static Module *load_module(const char *path) {
+    char real[PATH_MAX];
+    if (realpath(path, real)) path = arena_strdup(&g_arena, real);
     const char *ipath = intern(path);
     for (Module *m = g_modules; m; m = m->next)
         if (m->path == ipath) return m;
     char *src = read_file(path, NULL);
     if (!src) fatal("cannot open %s", path);
-    Module *m = parse_module(path, sanitize(stem_of(path)), src);
+    const char *lib = find_lib_dir();
+    const char *mname;
+    if (lib && strncmp(path, lib, strlen(lib)) == 0 && path[strlen(lib)] == '/')
+        mname = lib_module_name(lib, path);
+    else
+        mname = sanitize(stem_of(path));
+    Module *m = parse_module(path, mname, src);
     /* duplicate module names (different dirs, same stem) would collide in C */
     for (Module *o = g_modules; o; o = o->next)
         if (strcmp(o->name, m->name) == 0)

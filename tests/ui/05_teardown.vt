@@ -1,0 +1,32 @@
+// Cycle-safe teardown: handler closures capture the owner while the owner
+// (transitively) holds the widgets holding those closures. Window.run()
+// must break the cycle on exit — both deinit lines below must print.
+import { Window, Widget, Column, ListBox, Label } from "volt/ui";
+
+class Marker extends Widget {
+    fn init() { super.init(); }
+    deinit { print("marker freed"); }
+}
+
+class Owner {
+    list: ListBox;
+    fn init() {
+        this.list = new ListBox();
+        let items: string[] = ["one"];
+        let checked: bool[] = [false];
+        this.list.set_items(items, checked);
+    }
+    fn note(i: int) { print("toggle:" + i); }
+    deinit { print("owner freed"); }
+}
+
+fn main() {
+    let win = new Window("Teardown", 300, 200);
+    let owner = new Owner();
+    owner.list.onToggle = (i) => owner.note(i);   // cycle: owner -> list -> closure -> owner
+    win.root = new Column([new Label("t"), owner.list, new Marker()]);
+    win.run();
+    print("after-run handlers-null=" + (owner.list.onToggle == null));
+    owner = null;
+    print("owner-dropped");
+}

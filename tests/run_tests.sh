@@ -50,6 +50,26 @@ else
     fail=1
 fi
 
+# --- stdlib search path: VOLT_HOME lib, stem-collision naming, local shadowing ---
+got=$(VOLT_HOME=tests/fixtures/volthome ./voltc run tests/fixtures/libpath/main.vt 2>&1)
+want="hello from VOLT_HOME lib
+hello from the user module"
+if [ "$got" = "$want" ]; then
+    echo "PASS libpath_volthome"
+else
+    echo "FAIL libpath_volthome"
+    printf '%s\n' "$got"
+    fail=1
+fi
+got=$(VOLT_HOME=tests/fixtures/volthome ./voltc run tests/fixtures/libpath/shadow/main.vt 2>&1)
+if [ "$got" = "hello from the local shadow" ]; then
+    echo "PASS libpath_shadow"
+else
+    echo "FAIL libpath_shadow"
+    printf '%s\n' "$got"
+    fail=1
+fi
+
 # --- run all examples against golden output ---
 for src in examples/[0-9]*.vt; do
     name=$(basename "$src" .vt)
@@ -65,6 +85,33 @@ for src in examples/[0-9]*.vt; do
         echo "FAIL $name"
         echo "--- expected ---"
         cat "$expected"
+        echo "--- got ---"
+        printf '%s\n' "$got"
+        fail=1
+    fi
+done
+
+# --- volt/surface binding: regenerate with voltbind, golden-check ---
+./voltbind lib/volt/surface/native/src/vsurf.h --lib X11 \
+    --filter 'vs_*' --filter 'VS_*' > lib/volt/surface/vsurf.vt || exit 1
+if diff -u tests/vsurf.vt.expected lib/volt/surface/vsurf.vt >/dev/null 2>&1; then
+    echo "PASS voltbind_vsurf"
+else
+    echo "FAIL voltbind_vsurf"
+    diff -u tests/vsurf.vt.expected lib/volt/surface/vsurf.vt | head -30
+    fail=1
+fi
+
+# --- volt/ui headless golden tests (VS_HEADLESS backend, scripted events) ---
+for src in tests/ui/[0-9]*.vt; do
+    name=$(basename "$src" .vt)
+    got=$(VS_HEADLESS=1 VS_EVENTS="tests/ui/$name.events" ./voltc run "$src" 2>&1)
+    if [ "$got" = "$(cat "tests/ui/$name.expected")" ]; then
+        echo "PASS ui_$name"
+    else
+        echo "FAIL ui_$name"
+        echo "--- expected ---"
+        cat "tests/ui/$name.expected"
         echo "--- got ---"
         printf '%s\n' "$got"
         fail=1
@@ -92,6 +139,12 @@ if [ -f /usr/include/X11/Xlib.h ]; then
         echo "PASS app_todo_builds"
     else
         echo "FAIL app_todo_builds"
+        fail=1
+    fi
+    if ./voltc build apps/uidemo/uidemo.vt >/dev/null; then
+        echo "PASS app_uidemo_builds"
+    else
+        echo "FAIL app_uidemo_builds"
         fail=1
     fi
 else

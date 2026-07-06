@@ -18,5 +18,6 @@ test: voltc voltbind
 
 clean:
 	rm -f voltc voltbind
-	rm -rf examples/.volt-cache tests/tmp
+	rm -rf examples/.volt-cache tests/tmp tests/ui/.volt-cache
+	rm -rf tests/fixtures/libpath/.volt-cache tests/fixtures/libpath/shadow/.volt-cache
 	rm -rf examples/greeter/native examples/greeter/greeter.vt

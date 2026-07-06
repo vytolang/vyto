@@ -1,0 +1,106 @@
+// volt/surface — Layer 0 of the bundled UI stack: a pixel canvas plus a
+// classified event queue. Backend today: X11 (see native/src/vsurf.c),
+// with a headless test backend (VS_HEADLESS=1 + VS_EVENTS script file).
+//
+// This is a supported public layer: consume it directly for games, custom
+// renderers, or visualization tools, or let volt/ui sit on top of it.
+
+import { vs_open, vs_close, vs_width, vs_height, vs_set_title,
+         vs_fill_rect, vs_draw_rect, vs_draw_line, vs_draw_text, vs_present,
+         vs_text_width, vs_font_ascent, vs_font_height,
+         vs_wait, vs_key, vs_text, vs_x, vs_y,
+         vs_native_display, vs_native_window, vs_native_gc } from "vsurf";
+
+// Event classes returned by Surface.wait(). Values mirror VS_EV_* in
+// vsurf.h (const initializers must be literals, so they are restated here).
+export const EV_NONE: int = 0;
+export const EV_EXPOSE: int = 1;
+export const EV_KEY: int = 2;
+export const EV_MOUSE_DOWN: int = 3;
+export const EV_MOUSE_UP: int = 4;
+export const EV_RESIZE: int = 5;
+export const EV_CLOSE: int = 6;
+
+// Key codes from Surface.key(): printable ASCII, or one of these
+// (mirrors VS_KEY_* in vsurf.h).
+export const KEY_ENTER: int = 1000;
+export const KEY_BACKSPACE: int = 1001;
+export const KEY_ESC: int = 1002;
+export const KEY_UP: int = 1003;
+export const KEY_DOWN: int = 1004;
+export const KEY_LEFT: int = 1005;
+export const KEY_RIGHT: int = 1006;
+export const KEY_DELETE: int = 1007;
+export const KEY_TAB: int = 1008;
+export const KEY_HOME: int = 1009;
+export const KEY_END: int = 1010;
+
+export struct Rect {
+    x: int;
+    y: int;
+    w: int;
+    h: int;
+}
+
+export fn contains(r: Rect, px: int, py: int): bool {
+    return px >= r.x && px < r.x + r.w && py >= r.y && py < r.y + r.h;
+}
+
+export fn rgb(r: int, g: int, b: int): int {
+    return (r << 16) | (g << 8) | b;
+}
+
+export class Surface {
+    h: rawptr;
+
+    fn init(title: string, w: int, h: int) {
+        this.h = vs_open(title.cstr(), w as i32, h as i32);
+        if (this.h == null) {
+            panic("cannot open a surface (no display?)");
+        }
+    }
+
+    fn width(): int { return vs_width(this.h); }
+    fn height(): int { return vs_height(this.h); }
+    fn set_title(t: string) { vs_set_title(this.h, t.cstr()); }
+
+    fn fill(r: Rect, color: int) {
+        vs_fill_rect(this.h, r.x as i32, r.y as i32, r.w as i32, r.h as i32, color as i32);
+    }
+    fn frame(r: Rect, color: int) {
+        vs_draw_rect(this.h, r.x as i32, r.y as i32, r.w as i32, r.h as i32, color as i32);
+    }
+    fn line(x0: int, y0: int, x1: int, y1: int, color: int) {
+        vs_draw_line(this.h, x0 as i32, y0 as i32, x1 as i32, y1 as i32, color as i32);
+    }
+    fn text(x: int, y: int, s: string, color: int) {
+        vs_draw_text(this.h, x as i32, y as i32, s.cstr(), color as i32);
+    }
+    // vertically centered inside r with a left padding
+    fn text_in(r: Rect, pad: int, s: string, color: int) {
+        let baseline = r.y + (r.h + this.font_ascent()) / 2 - 1;
+        this.text(r.x + pad, baseline, s, color);
+    }
+
+    fn text_width(s: string): int { return vs_text_width(this.h, s.cstr()); }
+    fn font_ascent(): int { return vs_font_ascent(this.h); }
+    fn font_height(): int { return vs_font_height(this.h); }
+
+    fn present() { vs_present(this.h); }
+
+    fn wait(): int { return vs_wait(this.h); }
+    fn key(): int { return vs_key(); }
+    fn text_ev(): string { return str(vs_text()); }
+    fn mouse_x(): int { return vs_x(); }
+    fn mouse_y(): int { return vs_y(); }
+
+    // escape hatches: reach the backend for the 5% case
+    fn raw_handle(): rawptr { return this.h; }
+    fn native_display(): rawptr { return vs_native_display(this.h); }
+    fn native_window(): u64 { return vs_native_window(this.h); }
+    fn native_gc(): rawptr { return vs_native_gc(this.h); }
+
+    deinit {
+        vs_close(this.h);
+    }
+}
