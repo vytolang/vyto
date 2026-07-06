@@ -7,6 +7,15 @@
 #include <stdint.h>
 #include <string.h>
 
+/* extern "C" declarations are emitted under private identifiers aliased to the
+   real symbol with __asm__, so they can never conflict with system headers.
+   Mach-O and 32-bit Windows prefix C symbols with an underscore. */
+#if defined(__APPLE__) || (defined(_WIN32) && !defined(_WIN64))
+#define VT_SYM(s) "_" s
+#else
+#define VT_SYM(s) s
+#endif
+
 typedef struct VtType VtType;
 
 typedef struct VtObj {
@@ -65,6 +74,11 @@ static inline const char *vt_str_cstr(VtString *s) { return s ? s->data : ""; }
 void vt_print(VtString *s);
 void vt_panic(const char *file, int line, VtString *msg);
 
+/* ---- file I/O ---- */
+VtString *vt_file_read(VtString *path, const char *file, int line); /* panics if unreadable */
+bool vt_file_write(VtString *path, VtString *data, bool append);
+struct VtArray *vt_file_lines(VtString *path, const char *file, int line); /* string[] */
+
 /* ---- dynamic arrays ---- */
 
 typedef struct VtArray {
@@ -76,6 +90,8 @@ typedef struct VtArray {
 } VtArray;
 
 VtArray *vt_arr_new(int32_t elem_size, bool elem_ref);
+VtArray *vt_arr_bytes(int64_t n); /* zeroed byte buffer, len = n */
+static inline void *vt_arr_data(VtArray *a) { return a ? a->data : NULL; }
 void vt_arr_push(VtArray *a, const void *elem);                        /* retains if ref */
 void vt_arr_pop(VtArray *a, void *out, const char *file, int line);    /* transfers ownership */
 void *vt_arr_at(VtArray *a, int64_t i, const char *file, int line);    /* bounds-checked slot ptr */

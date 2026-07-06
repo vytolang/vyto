@@ -17,8 +17,10 @@ typedef enum TokKind {
     T_HASH, /* # for #link */
     /* operators */
     T_ASSIGN, T_PLUSEQ, T_MINUSEQ, T_STAREQ, T_SLASHEQ, T_PERCENTEQ,
+    T_AMPEQ, T_PIPEEQ, T_CARETEQ, T_SHLEQ, T_SHREQ,
     T_OROR, T_ANDAND, T_EQ, T_NEQ, T_LT, T_LE, T_GT, T_GE,
     T_PLUS, T_MINUS, T_STAR, T_SLASH, T_PERCENT, T_NOT,
+    T_AMP, T_PIPE, T_CARET, T_TILDE, T_SHL, T_SHR,
 } TokKind;
 
 typedef struct Token {

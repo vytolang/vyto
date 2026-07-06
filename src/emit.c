@@ -42,6 +42,9 @@ static const char *c_type(Type *t) {
 }
 
 static const char *fn_cname(FnDecl *fd) {
+    /* extern fns get a private C identifier aliased to the real symbol via
+       __asm__, so system headers can never clash with our declaration */
+    if (fd->is_extern) return arena_printf(&g_arena, "vx_%s", fd->name);
     if (fd->owner)
         return arena_printf(&g_arena, "v_%s_%s_%s", fd->module->name, fd->owner->name, fd->name);
     return arena_printf(&g_arena, "v_%s_%s", fd->module->name, fd->name);
@@ -326,6 +329,22 @@ static char *emit_call(Em *em, Expr *e, bool *fresh) {
             return arena_printf(&g_arena, "vt_str_slice(%s, %s, %s, \"%s\", %d)", ex_b(em, recv),
                                 ex_b(em, a[0]), ex_b(em, a[1]),
                                 c_escape(e->loc.file, strlen(e->loc.file)), e->loc.line);
+        case B_READFILE:
+            *fresh = true;
+            return arena_printf(&g_arena, "vt_file_read(%s, \"%s\", %d)", ex_b(em, a[0]),
+                                c_escape(e->loc.file, strlen(e->loc.file)), e->loc.line);
+        case B_READLINES:
+            *fresh = true;
+            return arena_printf(&g_arena, "vt_file_lines(%s, \"%s\", %d)", ex_b(em, a[0]),
+                                c_escape(e->loc.file, strlen(e->loc.file)), e->loc.line);
+        case B_WRITEFILE:
+        case B_APPENDFILE:
+            *fresh = false;
+            return arena_printf(&g_arena, "vt_file_write(%s, %s, %s)", ex_b(em, a[0]),
+                                ex_b(em, a[1]), e->builtin == B_APPENDFILE ? "true" : "false");
+        case B_BYTES:
+            *fresh = true;
+            return arena_printf(&g_arena, "vt_arr_bytes(%s)", ex_b(em, a[0]));
         default: break;
         }
         fatal_at(e->loc, "internal: bad builtin");
@@ -333,8 +352,7 @@ static char *emit_call(Em *em, Expr *e, bool *fresh) {
 
     if (e->ref == REF_GLOBAL_FN || e->ref == REF_EXTERN_FN) {
         FnDecl *fd = e->decl->fn;
-        const char *name = e->ref == REF_EXTERN_FN ? fd->name : fn_cname(fd);
-        return arena_printf(&g_arena, "%s(%s)", name,
+        return arena_printf(&g_arena, "%s(%s)", fn_cname(fd),
                             args_list(em, e->args, e->nargs, fd->params, NULL));
     }
 
@@ -461,7 +479,11 @@ static char *ex(Em *em, Expr *e, bool *fresh) {
                             c_escape(e->loc.file, strlen(e->loc.file)), e->loc.line);
     }
     case EX_UN:
-        return arena_printf(&g_arena, "(%s%s)", e->op == T_NOT ? "!" : "-", ex_b(em, e->lhs));
+        if (e->op == T_AMP)
+            return arena_printf(&g_arena, "((void*)&%s)", e->lhs->local->cname);
+        return arena_printf(&g_arena, "(%s%s)",
+                            e->op == T_NOT ? "!" : e->op == T_TILDE ? "~" : "-",
+                            ex_b(em, e->lhs));
     case EX_BIN: {
         Type *lt = e->lhs->type, *rt = e->rhs->type;
         if (e->op == T_PLUS && e->type->kind == TY_STRING) {
@@ -485,6 +507,9 @@ static char *ex(Em *em, Expr *e, bool *fresh) {
         case T_GT: op = ">"; break; case T_GE: op = ">="; break;
         case T_EQ: op = "=="; break; case T_NEQ: op = "!="; break;
         case T_ANDAND: op = "&&"; break; case T_OROR: op = "||"; break;
+        case T_AMP: op = "&"; break; case T_PIPE: op = "|"; break;
+        case T_CARET: op = "^"; break;
+        case T_SHL: op = "<<"; break; case T_SHR: op = ">>"; break;
         }
         return arena_printf(&g_arena, "(%s %s %s)", ex_b(em, e->lhs), op, ex_b(em, e->rhs));
     }
@@ -526,6 +551,8 @@ static char *ex(Em *em, Expr *e, bool *fresh) {
                                 c_type(dst), ex_b(em, e->lhs), class_cname(dst->cdecl),
                                 c_escape(e->loc.file, strlen(e->loc.file)), e->loc.line);
         }
+        if (src->kind == TY_ARRAY) /* byte[] as cstring/rawptr: borrowed buffer view */
+            return arena_printf(&g_arena, "((%s)vt_arr_data(%s))", c_type(dst), ex_b(em, e->lhs));
         return arena_printf(&g_arena, "((%s)(%s))", c_type(dst), ex_b(em, e->lhs));
     }
     case EX_STRCONV:
@@ -653,7 +680,9 @@ static void emit_assign(Em *em, Expr *e) {
     Type *lt = lhs->type;
     const char *cop = e->op == T_PLUSEQ ? "+=" : e->op == T_MINUSEQ ? "-="
                      : e->op == T_STAREQ ? "*=" : e->op == T_SLASHEQ ? "/="
-                     : e->op == T_PERCENTEQ ? "%=" : "=";
+                     : e->op == T_PERCENTEQ ? "%=" : e->op == T_AMPEQ ? "&="
+                     : e->op == T_PIPEEQ ? "|=" : e->op == T_CARETEQ ? "^="
+                     : e->op == T_SHLEQ ? "<<=" : e->op == T_SHREQ ? ">>=" : "=";
 
     /* string += x  →  s = concat(s, x) */
     bool str_append = e->op == T_PLUSEQ && lt->kind == TY_STRING;
@@ -739,11 +768,11 @@ static void emit_assign(Em *em, Expr *e) {
         sb_printf(em->out, "%s = vt_str_concat(*(VtString**)vt_arr_at(%s, %s, %s), %s);\n", tv, ta,
                   ti, fl, ex_b(em, e->rhs));
     } else {
+        /* the compound operator minus its trailing '=' is the plain binary op */
+        char *bop = arena_strndup(&g_arena, cop, strlen(cop) - 1);
         ind(em);
         sb_printf(em->out, "%s = *(%s*)vt_arr_at(%s, %s, %s) %s %s;\n", tv, c_type(et), ta, ti, fl,
-                  cop[0] == '+' ? "+" : cop[0] == '-' ? "-" : cop[0] == '*' ? "*"
-                  : cop[0] == '/' ? "/" : "%",
-                  ex_v(em, e->rhs, et));
+                  bop, ex_v(em, e->rhs, et));
     }
     ind(em);
     sb_printf(em->out, "vt_arr_set(%s, %s, &%s, %s);\n", ta, ti, tv, fl);
@@ -937,7 +966,7 @@ static void emit_stmt(Em *em, Stmt *s) {
 static char *fn_proto(FnDecl *fd, bool with_names) {
     SBuf sb;
     sb_init(&sb);
-    sb_printf(&sb, "%s %s(", c_type(fd->ret), fd->is_extern ? fd->name : fn_cname(fd));
+    sb_printf(&sb, "%s %s(", c_type(fd->ret), fn_cname(fd));
     bool first = true;
     if (fd->owner) {
         sb_printf(&sb, "%s* self", class_cname(fd->owner));
@@ -1154,7 +1183,8 @@ void emit_module(Module *m, bool is_entry, SBuf *h, SBuf *c) {
         Decl *d = m->decls[i];
         switch (d->kind) {
         case D_EXTERN_FN:
-            sb_printf(h, "extern %s;\n", fn_proto(d->fn, false));
+            sb_printf(h, "extern %s __asm__(VT_SYM(\"%s\"));\n", fn_proto(d->fn, false),
+                      d->fn->name);
             break;
         case D_FN:
             sb_printf(h, "%s;\n", fn_proto(d->fn, false));
@@ -1172,6 +1202,7 @@ void emit_module(Module *m, bool is_entry, SBuf *h, SBuf *c) {
             if (e->kind == EX_INT) v = arena_printf(&g_arena, "%lldLL", (long long)e->ival);
             else if (e->kind == EX_FLOAT) v = arena_printf(&g_arena, "%.17g", e->fval);
             else if (e->kind == EX_BOOL) v = e->ival ? "true" : "false";
+            else if (e->kind == EX_NULL) v = "0";
             else if (e->kind == EX_UN && e->lhs->kind == EX_INT)
                 v = arena_printf(&g_arena, "-%lldLL", (long long)e->lhs->ival);
             else v = arena_printf(&g_arena, "-%.17g", e->lhs->fval);

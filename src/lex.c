@@ -175,9 +175,19 @@ static void scan(Lexer *lx, Token *t) {
         t->kind = T_NOT; return;
     case '<':
         if (lx_look(lx) == '=') { lx_getc(lx); t->kind = T_LE; return; }
+        if (lx_look(lx) == '<') {
+            lx_getc(lx);
+            if (lx_look(lx) == '=') { lx_getc(lx); t->kind = T_SHLEQ; return; }
+            t->kind = T_SHL; return;
+        }
         t->kind = T_LT; return;
     case '>':
         if (lx_look(lx) == '=') { lx_getc(lx); t->kind = T_GE; return; }
+        if (lx_look(lx) == '>') {
+            lx_getc(lx);
+            if (lx_look(lx) == '=') { lx_getc(lx); t->kind = T_SHREQ; return; }
+            t->kind = T_SHR; return;
+        }
         t->kind = T_GT; return;
     case '+':
         if (lx_look(lx) == '=') { lx_getc(lx); t->kind = T_PLUSEQ; return; }
@@ -196,10 +206,17 @@ static void scan(Lexer *lx, Token *t) {
         t->kind = T_PERCENT; return;
     case '&':
         if (lx_look(lx) == '&') { lx_getc(lx); t->kind = T_ANDAND; return; }
-        break;
+        if (lx_look(lx) == '=') { lx_getc(lx); t->kind = T_AMPEQ; return; }
+        t->kind = T_AMP; return;
     case '|':
         if (lx_look(lx) == '|') { lx_getc(lx); t->kind = T_OROR; return; }
-        break;
+        if (lx_look(lx) == '=') { lx_getc(lx); t->kind = T_PIPEEQ; return; }
+        t->kind = T_PIPE; return;
+    case '^':
+        if (lx_look(lx) == '=') { lx_getc(lx); t->kind = T_CARETEQ; return; }
+        t->kind = T_CARET; return;
+    case '~':
+        t->kind = T_TILDE; return;
     }
     fatal_at(t->loc, "unexpected character '%c'", c);
 }

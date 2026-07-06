@@ -23,6 +23,13 @@ static void expect(Parser *p, TokKind k) {
     advance(p);
 }
 
+/* close a Map<...>: a '>>' or '>>=' left by nested generics splits into '>' + rest */
+static void expect_gt(Parser *p) {
+    if (cur(p) == T_SHR) { p->lx.tok.kind = T_GT; return; }
+    if (cur(p) == T_SHREQ) { p->lx.tok.kind = T_GE; return; }
+    expect(p, T_GT);
+}
+
 static const char *expect_ident(Parser *p) {
     if (cur(p) != T_IDENT)
         fatal_at(ploc(p), "expected identifier, got %s", tok_desc(cur(p)));
@@ -83,7 +90,7 @@ static Type *parse_base_type(Parser *p) {
             fatal_at(loc, "map keys must be 'string' in v0.1");
         expect(p, T_COMMA);
         Type *vt = parse_type(p);
-        expect(p, T_GT);
+        expect_gt(p);
         t = type_new(TY_MAP);
         t->elem = vt;
         t->loc = loc;
@@ -331,7 +338,7 @@ static Expr *parse_postfix(Parser *p) {
 }
 
 static Expr *parse_unary(Parser *p) {
-    if (cur(p) == T_NOT || cur(p) == T_MINUS) {
+    if (cur(p) == T_NOT || cur(p) == T_MINUS || cur(p) == T_TILDE || cur(p) == T_AMP) {
         Expr *e = new_expr(p, EX_UN);
         e->op = cur(p);
         advance(p);
@@ -355,8 +362,11 @@ static Expr *parse_as(Parser *p) {
 
 static int bin_prec(TokKind k) {
     switch (k) {
-    case T_STAR: case T_SLASH: case T_PERCENT: return 6;
-    case T_PLUS: case T_MINUS: return 5;
+    /* Go-style: shifts and '&' bind like '*', '|' and '^' like '+' —
+       so `a & mask == 0` parses as `(a & mask) == 0` */
+    case T_STAR: case T_SLASH: case T_PERCENT:
+    case T_SHL: case T_SHR: case T_AMP: return 6;
+    case T_PLUS: case T_MINUS: case T_PIPE: case T_CARET: return 5;
     case T_LT: case T_LE: case T_GT: case T_GE: return 4;
     case T_EQ: case T_NEQ: return 3;
     case T_ANDAND: return 2;
@@ -381,7 +391,8 @@ static Expr *parse_bin(Parser *p, int min_prec) {
 
 static bool is_assign_op(TokKind k) {
     return k == T_ASSIGN || k == T_PLUSEQ || k == T_MINUSEQ || k == T_STAREQ ||
-           k == T_SLASHEQ || k == T_PERCENTEQ;
+           k == T_SLASHEQ || k == T_PERCENTEQ || k == T_AMPEQ || k == T_PIPEEQ ||
+           k == T_CARETEQ || k == T_SHLEQ || k == T_SHREQ;
 }
 
 static Expr *parse_expr(Parser *p) {

@@ -132,6 +132,60 @@ void vt_print(VtString *s) {
     fputc('\n', stdout);
 }
 
+/* ---- file I/O ---- */
+
+static FILE *file_open(VtString *path, const char *mode, const char *file, int line) {
+    FILE *f = fopen(vt_str_cstr(path), mode);
+    if (!f) {
+        char buf[512];
+        snprintf(buf, sizeof buf, "cannot open file: %s", vt_str_cstr(path));
+        vt_panic_c(file, line, buf);
+    }
+    return f;
+}
+
+VtString *vt_file_read(VtString *path, const char *file, int line) {
+    FILE *f = file_open(path, "rb", file, line);
+    if (fseek(f, 0, SEEK_END) != 0) vt_panic_c(file, line, "cannot seek in file");
+    long n = ftell(f);
+    if (n < 0) vt_panic_c(file, line, "cannot read file size");
+    fseek(f, 0, SEEK_SET);
+    VtString *s = str_alloc(n);
+    if (fread(s->data, 1, (size_t)n, f) != (size_t)n) {
+        fclose(f);
+        vt_panic_c(file, line, "short read");
+    }
+    fclose(f);
+    return s;
+}
+
+bool vt_file_write(VtString *path, VtString *data, bool append) {
+    FILE *f = fopen(vt_str_cstr(path), append ? "ab" : "wb");
+    if (!f) return false;
+    size_t n = data ? (size_t)data->len : 0;
+    bool ok = fwrite(data ? data->data : "", 1, n, f) == n;
+    return (fclose(f) == 0) && ok;
+}
+
+VtArray *vt_file_lines(VtString *path, const char *file, int line) {
+    VtString *whole = vt_file_read(path, file, line);
+    VtArray *a = vt_arr_new(sizeof(VtString *), true);
+    const char *p = whole->data, *end = whole->data + whole->len;
+    while (p < end) {
+        const char *nl = memchr(p, '\n', (size_t)(end - p));
+        const char *stop = nl ? nl : end;
+        size_t l = (size_t)(stop - p);
+        if (l > 0 && stop[-1] == '\r') l--; /* CRLF */
+        VtString *s = vt_str_new(p, (int64_t)l);
+        vt_arr_push(a, &s); /* push retains */
+        vt_release(s);
+        if (!nl) break;
+        p = nl + 1;
+    }
+    vt_release(whole);
+    return a;
+}
+
 /* ---- arrays ---- */
 
 static void arr_deinit(void *self) {
@@ -147,6 +201,15 @@ VtArray *vt_arr_new(int32_t elem_size, bool elem_ref) {
     VtArray *a = vt_alloc(sizeof(VtArray), &vt_array_type);
     a->elem_size = elem_size;
     a->elem_ref = elem_ref;
+    return a;
+}
+
+VtArray *vt_arr_bytes(int64_t n) {
+    VtArray *a = vt_arr_new(1, false);
+    if (n < 0) n = 0;
+    a->data = calloc((size_t)n ? (size_t)n : 1, 1);
+    if (!a->data) { fprintf(stderr, "volt: out of memory\n"); exit(101); }
+    a->len = a->cap = n;
     return a;
 }
 

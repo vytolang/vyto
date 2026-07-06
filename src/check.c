@@ -59,6 +59,42 @@ static const char *type_str(const Type *t) {
     return "?";
 }
 
+/* ---- integer width/sign rules for implicit widening ---- */
+
+static int int_width(TypeKind k) {
+    switch (norm_kind(k)) {
+    case TY_BYTE: case TY_I8: return 1;
+    case TY_I16: case TY_U16: return 2;
+    case TY_I32: case TY_U32: return 4;
+    default: return 8; /* TY_INT, TY_U64 */
+    }
+}
+
+static bool int_is_signed(TypeKind k) {
+    switch (norm_kind(k)) {
+    case TY_BYTE: case TY_U16: case TY_U32: case TY_U64: return false;
+    default: return true;
+    }
+}
+
+/* value-preserving implicit conversion: src fits in dst for every value */
+static bool int_widens(const Type *src, const Type *dst) {
+    if (!type_is_int(src) || !type_is_int(dst)) return false;
+    int sw = int_width(src->kind), dw = int_width(dst->kind);
+    bool ss = int_is_signed(src->kind), ds = int_is_signed(dst->kind);
+    if (ss == ds) return dw > sw;
+    if (!ss && ds) return dw > sw; /* unsigned fits in a strictly wider signed */
+    return false;
+}
+
+/* common type of two numeric operands, or NULL if they don't mix implicitly */
+static Type *num_join(Type *lt, Type *rt) {
+    if (type_identical(lt, rt)) return lt;
+    if (int_widens(lt, rt)) return rt;
+    if (int_widens(rt, lt)) return lt;
+    return NULL;
+}
+
 bool class_derives(const ClassDecl *sub, const ClassDecl *base) {
     for (const ClassDecl *c = sub; c; c = c->parent)
         if (c == base) return true;
@@ -354,6 +390,7 @@ static bool assignable(Type *dst, Type *src, Expr *e) {
     }
     if (dst->kind == TY_CLASS && src->kind == TY_CLASS && class_derives(src->cdecl, dst->cdecl))
         return true; /* implicit upcast */
+    if (int_widens(src, dst)) return true; /* value-preserving integer widening */
     return false;
 }
 
@@ -476,6 +513,37 @@ static Type *check_call(Ctx *c, Expr *e) {
             e->ref = REF_BUILTIN;
             e->builtin = B_STR;
             return e->type = ty_string();
+        }
+        if (n == intern("readfile") || n == intern("readlines")) {
+            if (e->nargs != 1) fatal_at(e->loc, "%s takes 1 argument", n);
+            check_expr(c, e->args[0], ty_string());
+            want(c, e->args[0], ty_string(), "path");
+            e->ref = REF_BUILTIN;
+            if (n == intern("readfile")) { e->builtin = B_READFILE; return e->type = ty_string(); }
+            e->builtin = B_READLINES;
+            Type *t = mk_type(TY_ARRAY);
+            t->elem = ty_string();
+            return e->type = t;
+        }
+        if (n == intern("writefile") || n == intern("appendfile")) {
+            if (e->nargs != 2) fatal_at(e->loc, "%s takes 2 arguments (path, data)", n);
+            for (int i = 0; i < 2; i++) {
+                check_expr(c, e->args[i], ty_string());
+                want(c, e->args[i], ty_string(), i == 0 ? "path" : "data");
+            }
+            e->ref = REF_BUILTIN;
+            e->builtin = n == intern("writefile") ? B_WRITEFILE : B_APPENDFILE;
+            return e->type = ty_bool();
+        }
+        if (n == intern("bytes")) {
+            if (e->nargs != 1) fatal_at(e->loc, "bytes takes 1 argument");
+            check_expr(c, e->args[0], NULL);
+            want(c, e->args[0], ty_int(), "size");
+            e->ref = REF_BUILTIN;
+            e->builtin = B_BYTES;
+            Type *t = mk_type(TY_ARRAY);
+            t->elem = mk_type(TY_BYTE);
+            return e->type = t;
         }
         /* local closure variable? */
         Local *l = lookup_value(c, callee, n);
@@ -716,10 +784,24 @@ static Type *check_expr(Ctx *c, Expr *e, Type *expected) {
         fatal_at(e->loc, "'%s' cannot be used as a value", e->name);
     }
     case EX_UN: {
-        check_expr(c, e->lhs, expected && e->op == T_MINUS ? expected : NULL);
+        check_expr(c, e->lhs,
+                   expected && (e->op == T_MINUS || e->op == T_TILDE) ? expected : NULL);
         if (e->op == T_NOT) {
             if (e->lhs->type->kind != TY_BOOL) fatal_at(e->loc, "'!' needs a bool");
             return e->type = ty_bool();
+        }
+        if (e->op == T_TILDE) {
+            if (!type_is_int(e->lhs->type)) fatal_at(e->loc, "'~' needs an integer");
+            return e->type = e->lhs->type;
+        }
+        if (e->op == T_AMP) {
+            if (e->lhs->kind != EX_IDENT ||
+                (e->lhs->ref != REF_LOCAL && e->lhs->ref != REF_PARAM))
+                fatal_at(e->loc, "'&' needs a local variable or parameter");
+            if (type_is_ref(e->lhs->type))
+                fatal_at(e->loc, "cannot take the address of a ref-counted value (%s)",
+                         type_str(e->lhs->type));
+            return e->type = mk_type(TY_RAWPTR);
         }
         if (!type_is_num(e->lhs->type)) fatal_at(e->loc, "unary '-' needs a number");
         return e->type = e->lhs->type;
@@ -739,19 +821,33 @@ static Type *check_expr(Ctx *c, Expr *e, Type *expected) {
             }
             /* fall through */
         case T_MINUS: case T_STAR: case T_SLASH: case T_PERCENT: {
-            if (!type_is_num(lt) || !type_identical(lt, rt))
+            Type *jt = type_is_num(lt) ? num_join(lt, rt) : NULL;
+            if (!jt)
                 fatal_at(e->loc, "arithmetic needs matching numeric types (%s vs %s)",
                          type_str(lt), type_str(rt));
-            if (e->op == T_PERCENT && type_is_float(lt))
+            if (e->op == T_PERCENT && type_is_float(jt))
                 fatal_at(e->loc, "'%%' is integer-only");
-            return e->type = lt;
+            return e->type = jt;
         }
+        case T_AMP: case T_PIPE: case T_CARET: {
+            Type *jt = type_is_int(lt) ? num_join(lt, rt) : NULL;
+            if (!jt)
+                fatal_at(e->loc, "bitwise ops need matching integer types (%s vs %s)",
+                         type_str(lt), type_str(rt));
+            return e->type = jt;
+        }
+        case T_SHL: case T_SHR:
+            if (!type_is_int(lt)) fatal_at(e->loc, "shift needs an integer, got %s", type_str(lt));
+            if (!type_is_int(rt)) fatal_at(e->loc, "shift amount must be an integer");
+            return e->type = lt;
         case T_LT: case T_LE: case T_GT: case T_GE:
-            if (!type_is_num(lt) || !type_identical(lt, rt))
-                fatal_at(e->loc, "comparison needs matching numeric types");
+            if (!type_is_num(lt) || !num_join(lt, rt))
+                fatal_at(e->loc, "comparison needs matching numeric types (%s vs %s)",
+                         type_str(lt), type_str(rt));
             return e->type = ty_bool();
         case T_EQ: case T_NEQ: {
             bool ok = false;
+            if (type_is_int(lt) && type_is_int(rt) && num_join(lt, rt)) ok = true;
             if (type_identical(lt, rt) &&
                 (type_is_num(lt) || lt->kind == TY_BOOL || lt->kind == TY_STRING ||
                  lt->kind == TY_CLASS || lt->kind == TY_CSTRING || lt->kind == TY_RAWPTR ||
@@ -805,7 +901,13 @@ static Type *check_expr(Ctx *c, Expr *e, Type *expected) {
             if (!str_convertible(e->rhs->type)) fatal_at(e->loc, "cannot append %s to string", type_str(e->rhs->type));
             e->rhs = strconv(e->rhs);
         } else {
-            if (!type_is_num(lt)) fatal_at(e->loc, "compound assignment needs numbers");
+            bool bitop = e->op == T_AMPEQ || e->op == T_PIPEEQ || e->op == T_CARETEQ ||
+                         e->op == T_SHLEQ || e->op == T_SHREQ;
+            if (bitop) {
+                if (!type_is_int(lt)) fatal_at(e->loc, "bitwise assignment needs an integer");
+            } else if (!type_is_num(lt)) {
+                fatal_at(e->loc, "compound assignment needs numbers");
+            }
             want(c, e->rhs, lt, "assignment");
             if (e->op == T_PERCENTEQ && type_is_float(lt)) fatal_at(e->loc, "'%%=' is integer-only");
         }
@@ -875,6 +977,10 @@ static Type *check_expr(Ctx *c, Expr *e, Type *expected) {
         if ((src->kind == TY_CSTRING && dst->kind == TY_RAWPTR) ||
             (src->kind == TY_RAWPTR && dst->kind == TY_CSTRING))
             return e->type = dst;
+        if (src->kind == TY_ARRAY &&
+            (norm_kind(src->elem->kind) == TY_BYTE || norm_kind(src->elem->kind) == TY_I8) &&
+            (dst->kind == TY_CSTRING || dst->kind == TY_RAWPTR))
+            return e->type = dst; /* borrowed view of the array's buffer */
         if (src->kind == TY_FN && dst->kind == TY_RAWPTR)
             return e->type = dst; /* closure as userdata for cthunk callbacks (borrowed) */
         fatal_at(e->loc, "cannot cast %s to %s", type_str(src), type_str(dst));
@@ -997,10 +1103,10 @@ static void check_fn_body(Module *m, FnDecl *fd, ClassDecl *cls) {
 
 static void check_const(Module *m, Decl *d) {
     Expr *e = d->const_init;
-    if (e->kind != EX_INT && e->kind != EX_FLOAT && e->kind != EX_BOOL &&
+    if (e->kind != EX_INT && e->kind != EX_FLOAT && e->kind != EX_BOOL && e->kind != EX_NULL &&
         !(e->kind == EX_UN && e->op == T_MINUS &&
           (e->lhs->kind == EX_INT || e->lhs->kind == EX_FLOAT)))
-        fatal_at(e->loc, "const initializer must be a literal in v0.1");
+        fatal_at(e->loc, "const initializer must be a literal or null");
     Ctx c = {0};
     c.mod = m;
     FnDecl dummy = {0};

@@ -123,6 +123,11 @@ typedef enum BuiltinKind {
     B_SLICE,        /* string.slice(lo, hi) */
     B_CTHUNK,       /* cthunk(closure): C callback ptr, userdata first */
     B_CTHUNK_LAST,  /* cthunk_last(closure): userdata last */
+    B_READFILE,     /* readfile(path): string */
+    B_READLINES,    /* readlines(path): string[] */
+    B_WRITEFILE,    /* writefile(path, data): bool */
+    B_APPENDFILE,   /* appendfile(path, data): bool */
+    B_BYTES,        /* bytes(n): byte[] — zeroed, sized buffer for FFI */
 } BuiltinKind;
 
 /* ---------------- statements ---------------- */
