@@ -23,6 +23,33 @@ else
     fail=1
 fi
 
+# --- cbwrap package binding (fn-pointer params must map to rawptr) ---
+./voltbind examples/cbwrap/native/src/cbwrap.h --filter 'cb_*' > examples/cbwrap/cbwrap.vt || exit 1
+if diff -u tests/cbwrap.vt.expected examples/cbwrap/cbwrap.vt >/dev/null 2>&1; then
+    echo "PASS voltbind_cbwrap"
+else
+    echo "FAIL voltbind_cbwrap"
+    diff -u tests/cbwrap.vt.expected examples/cbwrap/cbwrap.vt | head -20
+    fail=1
+fi
+
+# --- cross-compile driver logic (host cc standing in as the cross compiler) ---
+rm -rf examples/.volt-cache/linux-x64
+if ./voltc build examples/01_hello.vt --target linux-x64 --cc cc >/dev/null &&
+   [ -x examples/.volt-cache/linux-x64/01_hello ] &&
+   [ "$(examples/.volt-cache/linux-x64/01_hello | head -1)" = "hello, volt" ]; then
+    echo "PASS cross_target_cache"
+else
+    echo "FAIL cross_target_cache"
+    fail=1
+fi
+if ./voltc run examples/01_hello.vt --target linux-arm64 2>&1 | grep -q "copy the binary"; then
+    echo "PASS cross_run_refused"
+else
+    echo "FAIL cross_run_refused"
+    fail=1
+fi
+
 # --- run all examples against golden output ---
 for src in examples/[0-9]*.vt; do
     name=$(basename "$src" .vt)

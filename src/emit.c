@@ -298,6 +298,29 @@ static char *emit_call(Em *em, Expr *e, bool *fresh) {
         case B_CSTR:
             *fresh = false;
             return arena_printf(&g_arena, "vt_str_cstr(%s)", ex_b(em, recv));
+        case B_CTHUNK:
+        case B_CTHUNK_LAST: {
+            bool ud_first = e->builtin == B_CTHUNK;
+            Type *ft = a[0]->type;
+            int id = ++em->mod->arrow_counter;
+            SBuf *ax = em->aux;
+            sb_printf(ax, "static %s __vt_cthunk%d(", c_type(ft->ret), id);
+            if (ud_first) sb_puts(ax, "void* _ud");
+            for (int i = 0; i < ft->nparams; i++)
+                sb_printf(ax, "%s%s a%d", (i || ud_first) ? ", " : "", c_type(ft->params[i]), i);
+            if (!ud_first) sb_printf(ax, "%svoid* _ud", ft->nparams ? ", " : "");
+            if (ud_first && ft->nparams == 0) { /* nothing more */ }
+            sb_puts(ax, ") {\n    VtClosure* _c = (VtClosure*)_ud;\n    ");
+            if (ft->ret->kind != TY_VOID) sb_puts(ax, "return ");
+            sb_printf(ax, "((%s)_c->fn)(_c->env", fnptr_sig(ft->ret, "VtObj*", ft->params,
+                                                            ft->nparams, NULL));
+            for (int i = 0; i < ft->nparams; i++) sb_printf(ax, ", a%d", i);
+            sb_puts(ax, ");\n}\n");
+            *fresh = false;
+            /* evaluate the closure expression for effect/validity, discard the value */
+            char *cv = ex_b(em, a[0]);
+            return arena_printf(&g_arena, "((void)(%s), (void*)__vt_cthunk%d)", cv, id);
+        }
         case B_SLICE:
             *fresh = true;
             return arena_printf(&g_arena, "vt_str_slice(%s, %s, %s, \"%s\", %d)", ex_b(em, recv),

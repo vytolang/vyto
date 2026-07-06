@@ -463,7 +463,7 @@ static bool is_volt_keyword(const char *s) {
 
 /* map a C type to a Volt type name; NULL = unmappable */
 static const char *volt_type(const CType *t, bool is_ret) {
-    if (t->base == B_FNPTR) return NULL;
+    if (t->base == B_FNPTR) return "rawptr"; /* pass thunks from cthunk() */
     if (t->ptr > 0) {
         if ((t->base == B_CHAR || t->base == B_SCHAR) && t->ptr == 1) return "cstring";
         return "rawptr";
@@ -497,7 +497,7 @@ static const char *volt_type(const CType *t, bool is_ret) {
 }
 
 static bool field_mappable(const CType *t) {
-    if (t->base == B_FNPTR) return false;
+    if (t->base == B_FNPTR) return true; /* maps to rawptr */
     if (t->base == B_LDOUBLE || t->base == B_UNION || t->base == B_UNKNOWN) return false;
     if (t->ptr == 0 && t->base == B_VOID) return false;
     return true;

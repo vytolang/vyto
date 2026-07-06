@@ -159,8 +159,32 @@ static void usage(void) {
             "voltc — the Volt compiler\n"
             "usage:\n"
             "  voltc build <file.vt> [-o out] [--release] [--verbose]\n"
-            "  voltc run   <file.vt> [--release] [--verbose] [-- args...]\n");
+            "              [--target <triple>] [--cc <compiler cmd>]\n"
+            "  voltc run   <file.vt> [--release] [--verbose] [-- args...]\n"
+            "targets: linux-x64 linux-arm64 macos-x64 macos-arm64 windows-x64\n"
+            "  --cc (or VOLT_CC) overrides the C compiler; put sysroots/flags inside it,\n"
+            "  e.g. --cc 'zig cc -target aarch64-linux-gnu'\n");
     exit(2);
+}
+
+static const struct { const char *triple; const char *cc; } cross_cc_table[] = {
+    {"linux-x64", "x86_64-linux-gnu-gcc"},
+    {"linux-arm64", "aarch64-linux-gnu-gcc"},
+    {"windows-x64", "x86_64-w64-mingw32-gcc"},
+    {"macos-x64", NULL}, /* no conventional Linux-hosted default; require --cc */
+    {"macos-arm64", NULL},
+};
+
+static bool known_triple(const char *t) {
+    for (size_t i = 0; i < sizeof cross_cc_table / sizeof cross_cc_table[0]; i++)
+        if (strcmp(cross_cc_table[i].triple, t) == 0) return true;
+    return false;
+}
+
+static const char *default_cross_cc(const char *triple) {
+    for (size_t i = 0; i < sizeof cross_cc_table / sizeof cross_cc_table[0]; i++)
+        if (strcmp(cross_cc_table[i].triple, triple) == 0) return cross_cc_table[i].cc;
+    return NULL;
 }
 
 int main(int argc, char **argv) {
@@ -168,37 +192,67 @@ int main(int argc, char **argv) {
     const char *cmd = argv[1];
     const char *input = argv[2];
     bool release = false, verbose = false;
-    const char *outpath = NULL;
+    const char *outpath = NULL, *target = NULL, *cc_override = NULL;
     int prog_argc = 0;
     char **prog_argv = NULL;
     for (int i = 3; i < argc; i++) {
         if (strcmp(argv[i], "--release") == 0) release = true;
         else if (strcmp(argv[i], "--verbose") == 0) verbose = true;
         else if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) outpath = argv[++i];
+        else if (strcmp(argv[i], "--target") == 0 && i + 1 < argc) target = argv[++i];
+        else if (strcmp(argv[i], "--cc") == 0 && i + 1 < argc) cc_override = argv[++i];
         else if (strcmp(argv[i], "--") == 0) { prog_argc = argc - i - 1; prog_argv = argv + i + 1; break; }
         else usage();
     }
     bool do_run = strcmp(cmd, "run") == 0;
     if (!do_run && strcmp(cmd, "build") != 0) usage();
+    if (!cc_override) cc_override = getenv("VOLT_CC");
+    if (target && !known_triple(target))
+        fatal("unknown target '%s' (see voltc --help for the list)", target);
+    const char *host = volt_triple();
+    const char *triple = target ? target : host;
+    bool cross = strcmp(triple, host) != 0;
+    bool win_target = strncmp(triple, "windows", 7) == 0;
+    if (do_run && cross)
+        fatal("built for %s but this host is %s — copy the binary to the target "
+              "or run it under an emulator (qemu/wine)", triple, host);
 
     /* ---- front end ---- */
     Module *entry = load_module(input);
     check_all(g_modules, entry);
 
-    /* ---- emit C into the cache dir ---- */
+    /* ---- emit C into the cache dir (per-target subdir for explicit targets) ---- */
     const char *cache = arena_printf(&g_arena, "%s/.volt-cache", dir_of(input));
     mkdir(cache, 0755);
+    if (target) {
+        cache = arena_printf(&g_arena, "%s/%s", cache, target);
+        mkdir(cache, 0755);
+    }
 
     const char *rtdir = find_runtime_dir();
-    const char *cc = have_tcc() && !release ? "tcc" : "cc";
+    const char *cc;
+    if (cc_override) {
+        cc = cc_override;
+    } else if (cross || (target && win_target)) {
+        cc = default_cross_cc(triple);
+        if (!cc)
+            fatal("no default cross compiler for %s — pass one with --cc or VOLT_CC", triple);
+        char *probe = arena_printf(&g_arena, "command -v %s >/dev/null 2>&1", cc);
+        if (run_cmd(probe, false) != 0)
+            fatal("cross compiler '%s' not found — install it or pass --cc/VOLT_CC "
+                  "(e.g. --cc 'zig cc -target ...')", cc);
+    } else {
+        cc = have_tcc() && !release ? "tcc" : "cc";
+    }
     const char *opt = release ? "-O2" : (strcmp(cc, "tcc") == 0 ? "" : "-O0");
 
     SBuf objs;
     sb_init(&objs);
     bool relink = false;
 
-    /* runtime object */
-    const char *rt_o = arena_printf(&g_arena, "%s/volt_rt_%s%s.o", cache, cc, release ? "_rel" : "");
+    /* runtime object (cc name sanitized: --cc commands may contain spaces) */
+    const char *rt_o = arena_printf(&g_arena, "%s/volt_rt_%s%s.o", cache, sanitize(cc),
+                                    release ? "_rel" : "");
     const char *rt_c = arena_printf(&g_arena, "%s/volt_rt.c", rtdir);
     if (!file_exists(rt_o) || file_mtime(rt_c) > file_mtime(rt_o) ||
         file_mtime(arena_printf(&g_arena, "%s/volt_rt.h", rtdir)) > file_mtime(rt_o)) {
@@ -246,7 +300,7 @@ int main(int argc, char **argv) {
             closedir(dp);
         }
 
-        const char *pdir = arena_printf(&g_arena, "%s/native/%s", mdir, volt_triple());
+        const char *pdir = arena_printf(&g_arena, "%s/native/%s", mdir, triple);
         dp = opendir(pdir);
         if (dp) {
             struct dirent *de;
@@ -263,10 +317,10 @@ int main(int argc, char **argv) {
             }
             closedir(dp);
             if (!any) fatal("package '%s' has native/%s/ but no shared library in it", m->name,
-                            volt_triple());
+                            triple);
         } else if (file_exists(arena_printf(&g_arena, "%s/native", mdir)) && !file_exists(nsrc)) {
             fatal("package '%s' ships native binaries but none for this platform (native/%s)",
-                  m->name, volt_triple());
+                  m->name, triple);
         }
     }
 
@@ -310,7 +364,15 @@ int main(int argc, char **argv) {
 
     /* ---- link ---- */
     const char *exe = outpath ? outpath
-                              : arena_printf(&g_arena, "%s/%s", cache, stem_of(input));
+                              : arena_printf(&g_arena, "%s/%s%s", cache, stem_of(input),
+                                             win_target ? ".exe" : "");
+    const char *rpath_flag = "";
+    if (need_rpath) {
+        /* $ORIGIN / @loader_path must reach the linker unexpanded (single quotes) */
+        if (strncmp(triple, "linux", 5) == 0) rpath_flag = " '-Wl,-rpath,$ORIGIN'";
+        else if (strncmp(triple, "macos", 5) == 0) rpath_flag = " '-Wl,-rpath,@loader_path'";
+        /* windows: none — the exe directory is searched by default */
+    }
     SBuf libs;
     sb_init(&libs);
     for (Module *m = g_modules; m; m = m->next)
@@ -320,10 +382,8 @@ int main(int argc, char **argv) {
     for (int i = 0; i < ncopy; i++)
         if (!file_exists(exe) || file_mtime(copy_libs[i]) > file_mtime(exe)) relink = true;
     if (relink || !file_exists(exe)) {
-        /* $ORIGIN must reach the linker unexpanded, hence the single quotes */
         char *cmdline = arena_printf(&g_arena, "%s -o %s%s%s%s%s -lm", cc, exe, objs.data,
-                                     shlibs.data, libs.data,
-                                     need_rpath ? " '-Wl,-rpath,$ORIGIN'" : "");
+                                     shlibs.data, libs.data, rpath_flag);
         if (run_cmd(cmdline, verbose) != 0) fatal("link failed");
     }
     /* ship prebuilt libraries next to the executable */

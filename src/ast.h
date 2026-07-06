@@ -121,6 +121,8 @@ typedef enum BuiltinKind {
     B_MAP_SET, B_MAP_GET, B_MAP_HAS, B_MAP_REMOVE,
     B_CSTR,         /* string.cstr() */
     B_SLICE,        /* string.slice(lo, hi) */
+    B_CTHUNK,       /* cthunk(closure): C callback ptr, userdata first */
+    B_CTHUNK_LAST,  /* cthunk_last(closure): userdata last */
 } BuiltinKind;
 
 /* ---------------- statements ---------------- */

@@ -62,6 +62,10 @@ Generated C is human-readable — look inside `.volt-cache/`.
   with an `$ORIGIN` rpath and shipped next to the executable).
 - **voltbind**: generates the `extern` binding from a C header —
   `voltbind zlib.h --lib z --filter 'compress*' > zlib.vt`.
+- **C callbacks**: `cthunk(closure)` turns a Volt closure into a C function
+  pointer (userdata-first or `cthunk_last` for userdata-last APIs).
+- **Cross-compilation**: `voltc build app.vt --target linux-arm64`
+  (`--cc`/`VOLT_CC` for custom toolchains, e.g. `zig cc`).
 - **Safety**: bounds-checked arrays, checked downcasts, `panic` with
   file:line.
 

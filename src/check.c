@@ -327,6 +327,12 @@ static bool str_convertible(const Type *t) {
     return t->kind == TY_STRING || type_is_num(t) || t->kind == TY_BOOL;
 }
 
+/* types that can cross the C ABI boundary in a callback signature */
+static bool ffi_safe_type(const Type *t) {
+    return type_is_num(t) || t->kind == TY_BOOL || t->kind == TY_CSTRING ||
+           t->kind == TY_RAWPTR;
+}
+
 /* can `src` (with expr e, may be NULL) be assigned to dst? adapts literals. */
 static bool assignable(Type *dst, Type *src, Expr *e) {
     if (type_identical(dst, src)) return true;
@@ -445,6 +451,22 @@ static Type *check_call(Ctx *c, Expr *e) {
             e->ref = REF_BUILTIN;
             e->builtin = n == intern("print") ? B_PRINT : B_PANIC;
             return e->type = ty_void();
+        }
+        if (n == intern("cthunk") || n == intern("cthunk_last")) {
+            if (e->nargs != 1) fatal_at(e->loc, "%s takes 1 argument", n);
+            Type *t = check_expr(c, e->args[0], NULL);
+            if (t->kind != TY_FN) fatal_at(e->args[0]->loc, "%s expects a closure", n);
+            for (int i = 0; i < t->nparams; i++)
+                if (!ffi_safe_type(t->params[i]))
+                    fatal_at(e->args[0]->loc,
+                             "closure parameter %d is not C-compatible (use numeric, cstring, or rawptr types)",
+                             i + 1);
+            if (t->ret->kind != TY_VOID && !ffi_safe_type(t->ret))
+                fatal_at(e->args[0]->loc, "closure return type is not C-compatible");
+            e->ref = REF_BUILTIN;
+            e->builtin = n == intern("cthunk") ? B_CTHUNK : B_CTHUNK_LAST;
+            Type *r = mk_type(TY_RAWPTR);
+            return e->type = r;
         }
         if (n == intern("str")) {
             if (e->nargs != 1) fatal_at(e->loc, "str takes 1 argument");
@@ -853,6 +875,8 @@ static Type *check_expr(Ctx *c, Expr *e, Type *expected) {
         if ((src->kind == TY_CSTRING && dst->kind == TY_RAWPTR) ||
             (src->kind == TY_RAWPTR && dst->kind == TY_CSTRING))
             return e->type = dst;
+        if (src->kind == TY_FN && dst->kind == TY_RAWPTR)
+            return e->type = dst; /* closure as userdata for cthunk callbacks (borrowed) */
         fatal_at(e->loc, "cannot cast %s to %s", type_str(src), type_str(dst));
     }
     case EX_STRCONV:
