@@ -71,7 +71,9 @@ Generated C is human-readable — look inside `.volt-cache/`.
 
 See [docs/SPEC.md](docs/SPEC.md) for the full language reference,
 [docs/PORTABILITY.md](docs/PORTABILITY.md) for the path to other platforms
-(Windows, Android, iOS, embedded, …), and `examples/` for a tour.
+(Windows, Android, iOS, embedded, …),
+[docs/UI-TOOLKIT.md](docs/UI-TOOLKIT.md) for the bundled-toolkit strategy
+(`volt/ui`, native facades, escape hatches), and `examples/` for a tour.
 
 ## Layout
 
