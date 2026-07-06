@@ -1,0 +1,302 @@
+// ui — a mini widget toolkit over Xlib. This module is the point of Volt:
+// classes with virtual dispatch for the widget tree, closures for events,
+// weak parent refs, RC deinit for deterministic display teardown.
+
+import { XOpenDisplay, XCloseDisplay, XCreateSimpleWindow, XMapWindow, XStoreName,
+         XFillRectangle, XDrawRectangle, XDrawString, XSetForeground, XFlush,
+         XFreeGC } from "x11/x11";
+import { xs_root, xs_white, xs_rgb, xs_gc, xs_select, xs_text_width, xs_font_ascent } from "x11/xshim";
+
+export struct Rect {
+    x: int;
+    y: int;
+    w: int;
+    h: int;
+}
+
+export fn contains(r: Rect, px: int, py: int): bool {
+    return px >= r.x && px < r.x + r.w && py >= r.y && py < r.y + r.h;
+}
+
+// Drawing context: owns the X connection. deinit closes the display the
+// moment the last reference dies — deterministic resource cleanup.
+export class Ui {
+    dpy: rawptr;
+    win: u64;
+    gc: rawptr;
+    w: int;
+    h: int;
+    bg: u64;
+    ink: u64;
+    accent: u64;
+    muted: u64;
+    sel: u64;
+    white: u64;
+
+    fn init(title: string, w: int, h: int) {
+        this.w = w;
+        this.h = h;
+        let dpy = XOpenDisplay(null);
+        if (dpy == null) {
+            panic("cannot open X display");
+        }
+        this.dpy = dpy;
+        this.win = XCreateSimpleWindow(dpy, xs_root(dpy), 0, 0, w as u32, h as u32, 0,
+                                       xs_white(dpy), xs_white(dpy));
+        XStoreName(dpy, this.win, title.cstr());
+        xs_select(dpy, this.win);
+        this.gc = xs_gc(dpy, this.win);
+        this.bg = xs_rgb(dpy, 245, 243, 237);
+        this.ink = xs_rgb(dpy, 34, 34, 40);
+        this.accent = xs_rgb(dpy, 32, 96, 192);
+        this.muted = xs_rgb(dpy, 150, 148, 140);
+        this.sel = xs_rgb(dpy, 219, 230, 247);
+        this.white = xs_white(dpy);
+        XMapWindow(dpy, this.win);
+        XFlush(dpy);
+    }
+
+    fn fill(r: Rect, color: u64) {
+        XSetForeground(this.dpy, this.gc, color);
+        XFillRectangle(this.dpy, this.win, this.gc, r.x as i32, r.y as i32, r.w as u32, r.h as u32);
+    }
+
+    fn frame(r: Rect, color: u64) {
+        XSetForeground(this.dpy, this.gc, color);
+        XDrawRectangle(this.dpy, this.win, this.gc, r.x as i32, r.y as i32,
+                       (r.w - 1) as u32, (r.h - 1) as u32);
+    }
+
+    fn text(x: int, y: int, s: string, color: u64) {
+        XSetForeground(this.dpy, this.gc, color);
+        XDrawString(this.dpy, this.win, this.gc, x as i32, y as i32, s.cstr(), s.len as i32);
+    }
+
+    // text vertically centered inside r
+    fn text_in(r: Rect, pad: int, s: string, color: u64) {
+        let base = r.y + (r.h + xs_font_ascent() as int) / 2 - 2;
+        this.text(r.x + pad, base, s, color);
+    }
+
+    fn width_of(s: string): int {
+        return xs_text_width(s.cstr()) as int;
+    }
+
+    fn clear() {
+        this.fill(Rect(0, 0, this.w, this.h), this.bg);
+    }
+
+    fn flush() {
+        XFlush(this.dpy);
+    }
+
+    deinit {
+        XFreeGC(this.dpy, this.gc);
+        XCloseDisplay(this.dpy);
+        print("[ui] display closed");
+    }
+}
+
+export class Widget {
+    bounds: Rect;
+    parent: weak Widget;
+    children: Widget[];
+
+    fn init(bounds: Rect) {
+        this.bounds = bounds;
+        this.children = [];
+    }
+
+    fn add(child: Widget) {
+        child.parent = this;
+        this.children.push(child);
+    }
+
+    virtual fn draw(ui: Ui) {
+        for (let c in this.children) {
+            c.draw(ui);
+        }
+    }
+
+    // hit-test: returns true when some widget consumed the click
+    virtual fn click(ui: Ui, x: int, y: int): bool {
+        for (let c in this.children) {
+            if (c.click(ui, x, y)) {
+                return true;
+            }
+        }
+        return false;
+    }
+}
+
+export class Label extends Widget {
+    text: string;
+    strong: bool;
+
+    fn init(bounds: Rect, text: string, strong: bool) {
+        super.init(bounds);
+        this.text = text;
+        this.strong = strong;
+    }
+
+    override fn draw(ui: Ui) {
+        let color = ui.muted;
+        if (this.strong) {
+            color = ui.ink;
+        }
+        ui.text_in(this.bounds, 0, this.text, color);
+    }
+}
+
+export class Button extends Widget {
+    label: string;
+    onClick: fn(Button);
+
+    fn init(bounds: Rect, label: string) {
+        super.init(bounds);
+        this.label = label;
+    }
+
+    override fn draw(ui: Ui) {
+        ui.fill(this.bounds, ui.accent);
+        let tw = ui.width_of(this.label);
+        let r = this.bounds;
+        ui.text_in(Rect(r.x + (r.w - tw) / 2, r.y, tw, r.h), 0, this.label, ui.white);
+    }
+
+    override fn click(ui: Ui, x: int, y: int): bool {
+        if (contains(this.bounds, x, y)) {
+            if (this.onClick != null) {
+                this.onClick(this);
+            }
+            return true;
+        }
+        return false;
+    }
+}
+
+export class TextInput extends Widget {
+    text: string;
+    placeholder: string;
+    onSubmit: fn(string);
+
+    fn init(bounds: Rect, placeholder: string) {
+        super.init(bounds);
+        this.text = "";
+        this.placeholder = placeholder;
+    }
+
+    // returns true if the key changed anything
+    fn key(k: int, ch: string): bool {
+        if (k == 1000) { // KEY_ENTER
+            if (this.text.len > 0 && this.onSubmit != null) {
+                this.onSubmit(this.text);
+                this.text = "";
+            }
+            return true;
+        }
+        if (k == 1001) { // KEY_BACKSPACE
+            if (this.text.len > 0) {
+                this.text = this.text.slice(0, this.text.len - 1);
+                return true;
+            }
+            return false;
+        }
+        if (ch.len > 0) {
+            this.text += ch;
+            return true;
+        }
+        return false;
+    }
+
+    override fn draw(ui: Ui) {
+        ui.fill(this.bounds, ui.white);
+        ui.frame(this.bounds, ui.muted);
+        if (this.text.len > 0) {
+            ui.text_in(this.bounds, 8, this.text + "_", ui.ink);
+        } else {
+            ui.text_in(this.bounds, 8, this.placeholder, ui.muted);
+        }
+    }
+}
+
+const ROW_H: int = 26;
+
+export class ListView extends Widget {
+    rows: string[];
+    checked: bool[];
+    selected: int;
+    onToggle: fn(int);
+
+    fn init(bounds: Rect) {
+        super.init(bounds);
+        this.rows = [];
+        this.checked = [];
+        this.selected = 0;
+    }
+
+    fn set_rows(rows: string[], checked: bool[]) {
+        this.rows = rows;
+        this.checked = checked;
+        if (this.selected >= rows.len) {
+            this.selected = rows.len - 1;
+        }
+        if (this.selected < 0) {
+            this.selected = 0;
+        }
+    }
+
+    fn move_sel(delta: int) {
+        let n = this.rows.len;
+        if (n == 0) {
+            return;
+        }
+        let s = this.selected + delta;
+        if (s < 0) {
+            s = 0;
+        }
+        if (s >= n) {
+            s = n - 1;
+        }
+        this.selected = s;
+    }
+
+    override fn draw(ui: Ui) {
+        ui.fill(this.bounds, ui.white);
+        ui.frame(this.bounds, ui.muted);
+        let b = this.bounds;
+        for (let i in 0..this.rows.len) {
+            let r = Rect(b.x + 1, b.y + 1 + i * ROW_H, b.w - 2, ROW_H);
+            if (r.y + ROW_H > b.y + b.h) {
+                break;
+            }
+            if (i == this.selected) {
+                ui.fill(r, ui.sel);
+            }
+            let mark = "[ ] ";
+            let color = ui.ink;
+            if (this.checked[i]) {
+                mark = "[x] ";
+                color = ui.muted;
+            }
+            ui.text_in(r, 8, mark + this.rows[i], color);
+        }
+        if (this.rows.len == 0) {
+            ui.text_in(Rect(b.x, b.y, b.w, ROW_H), 8, "nothing to do — add a task above", ui.muted);
+        }
+    }
+
+    override fn click(ui: Ui, x: int, y: int): bool {
+        if (!contains(this.bounds, x, y)) {
+            return false;
+        }
+        let row = (y - this.bounds.y - 1) / ROW_H;
+        if (row >= 0 && row < this.rows.len) {
+            this.selected = row;
+            if (this.onToggle != null) {
+                this.onToggle(row);
+            }
+        }
+        return true;
+    }
+}

@@ -1,0 +1,100 @@
+// model — tasks and persistence. Save format: one task per line, "1|title".
+
+import { read_lines, write_lines, env_or } from "fio/fio";
+
+export class Task {
+    title: string;
+    done: bool;
+
+    fn init(title: string, done: bool) {
+        this.title = title;
+        this.done = done;
+    }
+}
+
+export fn store_path(): string {
+    return env_or("VOLT_TODO_FILE", "todo.txt");
+}
+
+export class Store {
+    tasks: Task[];
+    path: string;
+
+    fn init(path: string) {
+        this.tasks = [];
+        this.path = path;
+        this.load();
+    }
+
+    fn load() {
+        for (let line in read_lines(this.path)) {
+            if (line.len >= 2 && line[1] == 124) { // '|'
+                let done = line[0] == 49;          // '1'
+                this.tasks.push(new Task(line.slice(2, line.len), done));
+            }
+        }
+    }
+
+    fn save() {
+        let lines: string[] = [];
+        for (let t in this.tasks) {
+            let flag = "0";
+            if (t.done) {
+                flag = "1";
+            }
+            lines.push(flag + "|" + t.title);
+        }
+        write_lines(this.path, lines);
+    }
+
+    fn add(title: string) {
+        this.tasks.push(new Task(title, false));
+        this.save();
+    }
+
+    fn toggle(i: int) {
+        if (i >= 0 && i < this.tasks.len) {
+            let t = this.tasks[i];
+            t.done = !t.done;
+            this.save();
+        }
+    }
+
+    fn remove(i: int) {
+        let kept: Task[] = [];
+        for (let j in 0..this.tasks.len) {
+            if (j != i) {
+                kept.push(this.tasks[j]);
+            }
+        }
+        this.tasks = kept;
+        this.save();
+    }
+
+    fn clear_done() {
+        let kept: Task[] = [];
+        for (let t in this.tasks) {
+            if (!t.done) {
+                kept.push(t);
+            }
+        }
+        this.tasks = kept;
+        this.save();
+    }
+
+    fn counts(): Map<string, int> {
+        let m = new Map<string, int>();
+        let open = 0;
+        let done = 0;
+        for (let t in this.tasks) {
+            if (t.done) {
+                done += 1;
+            } else {
+                open += 1;
+            }
+        }
+        m.set("open", open);
+        m.set("done", done);
+        return m;
+    }
+}

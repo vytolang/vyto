@@ -57,6 +57,8 @@ bool vt_str_eq(VtString *a, VtString *b);
 VtString *vt_str_from_int(int64_t v);
 VtString *vt_str_from_float(double v);
 VtString *vt_str_from_bool(bool v);
+VtString *vt_str_from_cstr(const char *p); /* NULL → empty string */
+VtString *vt_str_slice(VtString *s, int64_t lo, int64_t hi, const char *file, int line);
 int64_t vt_str_index(VtString *s, int64_t i, const char *file, int line);
 static inline const char *vt_str_cstr(VtString *s) { return s ? s->data : ""; }
 

@@ -120,6 +120,7 @@ typedef enum BuiltinKind {
     B_PUSH, B_POP,  /* array */
     B_MAP_SET, B_MAP_GET, B_MAP_HAS, B_MAP_REMOVE,
     B_CSTR,         /* string.cstr() */
+    B_SLICE,        /* string.slice(lo, hi) */
 } BuiltinKind;
 
 /* ---------------- statements ---------------- */

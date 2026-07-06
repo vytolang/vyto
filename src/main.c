@@ -199,7 +199,9 @@ int main(int argc, char **argv) {
 
     /* runtime object */
     const char *rt_o = arena_printf(&g_arena, "%s/volt_rt_%s%s.o", cache, cc, release ? "_rel" : "");
-    if (!file_exists(rt_o)) {
+    const char *rt_c = arena_printf(&g_arena, "%s/volt_rt.c", rtdir);
+    if (!file_exists(rt_o) || file_mtime(rt_c) > file_mtime(rt_o) ||
+        file_mtime(arena_printf(&g_arena, "%s/volt_rt.h", rtdir)) > file_mtime(rt_o)) {
         char *c = arena_printf(&g_arena, "%s %s -w -c -o %s %s/volt_rt.c", cc, opt, rt_o, rtdir);
         if (run_cmd(c, verbose) != 0) fatal("runtime compilation failed");
         relink = true;
@@ -212,8 +214,16 @@ int main(int argc, char **argv) {
     const char *copy_libs[64];
     int ncopy = 0;
     bool need_rpath = false;
+    const char *seen_dirs[128];
+    int nseen = 0;
     for (Module *m = g_modules; m; m = m->next) {
         const char *mdir = dir_of(m->path);
+        /* several modules may live in one package dir: process it once */
+        bool seen = false;
+        for (int i = 0; i < nseen; i++)
+            if (strcmp(seen_dirs[i], mdir) == 0) seen = true;
+        if (seen) continue;
+        if (nseen < 128) seen_dirs[nseen++] = mdir;
 
         const char *nsrc = arena_printf(&g_arena, "%s/native/src", mdir);
         DIR *dp = opendir(nsrc);
@@ -289,7 +299,8 @@ int main(int argc, char **argv) {
         const char *cpath = arena_printf(&g_arena, "%s/mod_%s.c", cache, m->name);
         const char *opath = arena_printf(&g_arena, "%s/mod_%s%s.o", cache, m->name,
                                          release ? "_rel" : "");
-        if (m->src_hash || any_h_changed || !file_exists(opath)) {
+        if (m->src_hash || any_h_changed || !file_exists(opath) ||
+            file_mtime(arena_printf(&g_arena, "%s/volt_rt.h", rtdir)) > file_mtime(opath)) {
             char *cmdline = arena_printf(&g_arena, "%s %s -w -I%s -I%s -c -o %s %s", cc, opt,
                                          rtdir, cache, opath, cpath);
             if (run_cmd(cmdline, verbose) != 0) fatal("C compilation of module '%s' failed", m->name);

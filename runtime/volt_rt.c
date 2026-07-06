@@ -106,6 +106,22 @@ VtString *vt_str_from_float(double v) {
 
 VtString *vt_str_from_bool(bool v) { return vt_str_new(v ? "true" : "false", v ? 4 : 5); }
 
+VtString *vt_str_from_cstr(const char *p) {
+    if (!p) return vt_str_new("", 0);
+    return vt_str_new(p, (int64_t)strlen(p));
+}
+
+VtString *vt_str_slice(VtString *s, int64_t lo, int64_t hi, const char *file, int line) {
+    int64_t len = s ? s->len : 0;
+    if (lo < 0 || hi < lo || hi > len) {
+        char buf[96];
+        snprintf(buf, sizeof buf, "slice [%lld, %lld) out of bounds (len %lld)", (long long)lo,
+                 (long long)hi, (long long)len);
+        vt_panic_c(file, line, buf);
+    }
+    return vt_str_new(s->data + lo, hi - lo);
+}
+
 int64_t vt_str_index(VtString *s, int64_t i, const char *file, int line) {
     if (!s || i < 0 || i >= s->len) vt_panic_c(file, line, "string index out of bounds");
     return (int64_t)(unsigned char)s->data[i];

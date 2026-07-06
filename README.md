@@ -19,6 +19,18 @@ fn main() {
 }   // deterministic teardown: deinit runs here
 ```
 
+## A real app: VoltTodo
+
+[apps/todo](apps/todo/) is a working X11 GUI todo manager written entirely
+in Volt — a mini widget toolkit (virtual dispatch, closure event handlers,
+weak parent refs), voltbind-generated Xlib bindings, two native packages,
+file persistence, and deterministic display teardown via `deinit`.
+AddressSanitizer-clean across full interactive sessions.
+
+```sh
+cd apps/todo && ../../voltc run todo.vt
+```
+
 ## Quick start
 
 ```sh

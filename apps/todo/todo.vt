@@ -1,0 +1,157 @@
+// VoltTodo — a real X11 todo app written in Volt.
+//   VOLT_TODO_FILE=/path/to/file  overrides where tasks are saved (default todo.txt).
+
+import { Ui, Widget, Label, Button, TextInput, ListView, Rect } from "ui";
+import { Store, store_path } from "model";
+import { xs_wait, xs_key, xs_text, xs_x, xs_y,
+         EV_EXPOSE, EV_KEY, EV_CLICK, EV_CLOSE,
+         KEY_ESC, KEY_UP, KEY_DOWN, KEY_DELETE } from "x11/xshim";
+
+const W: int = 480;
+const H: int = 540;
+
+class App {
+    ui: Ui;
+    store: Store;
+    root: Widget;
+    input: TextInput;
+    list: ListView;
+    status: Label;
+
+    fn init() {
+        this.ui = new Ui("VoltTodo", W, H);
+        this.store = new Store(store_path());
+        this.root = new Widget(Rect(0, 0, W, H));
+        this.root.add(new Label(Rect(16, 10, 200, 26), "VoltTodo", true));
+        this.input = new TextInput(Rect(16, 44, 364, 30), "type a task, press Enter");
+        this.root.add(this.input);
+        this.list = new ListView(Rect(16, 88, 448, 392));
+        this.root.add(this.list);
+        this.status = new Label(Rect(16, 498, 448, 24), "", false);
+        this.root.add(this.status);
+    }
+
+    fn refresh() {
+        let rows: string[] = [];
+        let checked: bool[] = [];
+        for (let t in this.store.tasks) {
+            rows.push(t.title);
+            checked.push(t.done);
+        }
+        this.list.set_rows(rows, checked);
+        let c = this.store.counts();
+        this.status.text = c.get("open") + " open / " + c.get("done") + " done  [Del, Esc]";
+    }
+
+    fn draw() {
+        this.ui.clear();
+        this.root.draw(this.ui);
+        this.ui.flush();
+    }
+
+    fn update() {
+        this.refresh();
+        this.draw();
+    }
+
+    fn add_task(title: string) {
+        this.store.add(title);
+        this.update();
+    }
+
+    fn submit() {
+        if (this.input.text.len > 0) {
+            this.store.add(this.input.text);
+            this.input.text = "";
+            this.update();
+        }
+    }
+
+    fn toggle(i: int) {
+        this.store.toggle(i);
+        this.update();
+    }
+
+    fn delete_selected() {
+        if (this.store.tasks.len > 0) {
+            this.store.remove(this.list.selected);
+            this.update();
+        }
+    }
+
+    fn clear_done() {
+        this.store.clear_done();
+        this.update();
+    }
+
+    fn key(k: int, ch: string) {
+        if (k == KEY_UP) {
+            this.list.move_sel(-1);
+            this.draw();
+            return;
+        }
+        if (k == KEY_DOWN) {
+            this.list.move_sel(1);
+            this.draw();
+            return;
+        }
+        if (k == KEY_DELETE) {
+            this.delete_selected();
+            return;
+        }
+        if (this.input.key(k, ch)) {
+            this.draw();
+        }
+    }
+
+    fn click(x: int, y: int) {
+        this.root.click(this.ui, x, y);
+    }
+
+    // Event closures capture the App while the App owns the widgets that
+    // hold those closures — reference cycles. Called once on exit so RC can
+    // reclaim the tree (and Ui.deinit can close the display).
+    fn teardown() {
+        this.input.onSubmit = null;
+        this.list.onToggle = null;
+        this.root = null;
+    }
+}
+
+fn main() {
+    let app = new App();
+
+    // event wiring: closures capture `app`
+    let add_btn = new Button(Rect(388, 44, 76, 30), "Add");
+    add_btn.onClick = (b) => app.submit();
+    app.root.add(add_btn);
+
+    let clear_btn = new Button(Rect(348, 490, 116, 28), "Clear done");
+    clear_btn.onClick = (b) => app.clear_done();
+    app.root.add(clear_btn);
+
+    app.input.onSubmit = (title) => app.add_task(title);
+    app.list.onToggle = (i) => app.toggle(i);
+
+    app.refresh();
+
+    while (true) {
+        let ev = xs_wait(app.ui.dpy) as int;
+        if (ev == EV_CLOSE) {
+            break;
+        } else if (ev == EV_EXPOSE) {
+            app.draw();
+        } else if (ev == EV_KEY) {
+            let k = xs_key() as int;
+            if (k == KEY_ESC) {
+                break;
+            }
+            app.key(k, str(xs_text()));
+        } else if (ev == EV_CLICK) {
+            app.click(xs_x() as int, xs_y() as int);
+        }
+    }
+
+    app.teardown();
+    print("bye — " + app.store.tasks.len + " task(s) in " + app.store.path);
+}

@@ -232,6 +232,7 @@ static char *strconv_frag(Em *em, Expr *inner) {
     Type *t = inner->type;
     if (t->kind == TY_STRING) return ex_b(em, inner); /* callers wrap only non-strings */
     char *v = ex_v(em, inner, NULL);
+    if (t->kind == TY_CSTRING) return arena_printf(&g_arena, "vt_str_from_cstr(%s)", v);
     if (type_is_float(t)) return arena_printf(&g_arena, "vt_str_from_float(%s)", v);
     if (t->kind == TY_BOOL) return arena_printf(&g_arena, "vt_str_from_bool(%s)", v);
     return arena_printf(&g_arena, "vt_str_from_int((int64_t)(%s))", v);
@@ -297,6 +298,11 @@ static char *emit_call(Em *em, Expr *e, bool *fresh) {
         case B_CSTR:
             *fresh = false;
             return arena_printf(&g_arena, "vt_str_cstr(%s)", ex_b(em, recv));
+        case B_SLICE:
+            *fresh = true;
+            return arena_printf(&g_arena, "vt_str_slice(%s, %s, %s, \"%s\", %d)", ex_b(em, recv),
+                                ex_b(em, a[0]), ex_b(em, a[1]),
+                                c_escape(e->loc.file, strlen(e->loc.file)), e->loc.line);
         default: break;
         }
         fatal_at(e->loc, "internal: bad builtin");

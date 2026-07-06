@@ -44,6 +44,33 @@ for src in examples/[0-9]*.vt; do
     fi
 done
 
+# --- VoltTodo app: regenerate bindings, golden-check the shim binding, build ---
+if [ -f /usr/include/X11/Xlib.h ]; then
+    ./voltbind apps/todo/x11/native/src/xshim.h --lib X11 \
+        --filter 'xs_*' --filter 'EV_*' --filter 'KEY_*' > apps/todo/x11/xshim.vt || exit 1
+    if diff -u tests/xshim.vt.expected apps/todo/x11/xshim.vt >/dev/null 2>&1; then
+        echo "PASS voltbind_xshim"
+    else
+        echo "FAIL voltbind_xshim"
+        diff -u tests/xshim.vt.expected apps/todo/x11/xshim.vt | head -30
+        fail=1
+    fi
+    ./voltbind /usr/include/X11/Xlib.h \
+        --filter 'XOpenDisplay' --filter 'XCloseDisplay' --filter 'XCreateSimpleWindow' \
+        --filter 'XMapWindow' --filter 'XStoreName' --filter 'XFillRectangle' \
+        --filter 'XDrawRectangle' --filter 'XDrawLine' --filter 'XDrawString' \
+        --filter 'XSetForeground' --filter 'XFlush' --filter 'XFreeGC' \
+        > apps/todo/x11/x11.vt || exit 1
+    if ./voltc build apps/todo/todo.vt >/dev/null; then
+        echo "PASS app_todo_builds"
+    else
+        echo "FAIL app_todo_builds"
+        fail=1
+    fi
+else
+    echo "SKIP volttodo (no X11 headers)"
+fi
+
 # --- prebuilt .so deployment: exe must run from a copied-out directory ---
 out=$(./voltc build examples/09_prebuilt_so.vt) || fail=1
 if [ -f "examples/.volt-cache/libgreeter.so" ]; then

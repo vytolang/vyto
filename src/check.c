@@ -330,7 +330,9 @@ static bool str_convertible(const Type *t) {
 /* can `src` (with expr e, may be NULL) be assigned to dst? adapts literals. */
 static bool assignable(Type *dst, Type *src, Expr *e) {
     if (type_identical(dst, src)) return true;
-    if (src->kind == TY_NULL && type_is_ref(dst) && dst->kind != TY_NULL) {
+    if (src->kind == TY_NULL &&
+        ((type_is_ref(dst) && dst->kind != TY_NULL) || dst->kind == TY_RAWPTR ||
+         dst->kind == TY_CSTRING)) {
         if (e) e->type = dst;
         return true;
     }
@@ -447,8 +449,8 @@ static Type *check_call(Ctx *c, Expr *e) {
         if (n == intern("str")) {
             if (e->nargs != 1) fatal_at(e->loc, "str takes 1 argument");
             check_expr(c, e->args[0], NULL);
-            if (!str_convertible(e->args[0]->type))
-                fatal_at(e->args[0]->loc, "str() expects int, float, or bool");
+            if (!str_convertible(e->args[0]->type) && e->args[0]->type->kind != TY_CSTRING)
+                fatal_at(e->args[0]->loc, "str() expects int, float, bool, or cstring");
             e->ref = REF_BUILTIN;
             e->builtin = B_STR;
             return e->type = ty_string();
@@ -540,6 +542,15 @@ static Type *check_call(Ctx *c, Expr *e) {
                 if (e->nargs != 0) fatal_at(e->loc, "cstr takes no arguments");
                 e->ref = REF_BUILTIN; e->builtin = B_CSTR;
                 return e->type = ty_cstring();
+            }
+            if (n == intern("slice")) {
+                if (e->nargs != 2) fatal_at(e->loc, "slice takes 2 arguments");
+                for (int i = 0; i < 2; i++) {
+                    check_expr(c, e->args[i], NULL);
+                    want(c, e->args[i], ty_int(), "slice bound");
+                }
+                e->ref = REF_BUILTIN; e->builtin = B_SLICE;
+                return e->type = ty_string();
             }
             fatal_at(e->loc, "strings have no method '%s'", n);
         }
@@ -653,7 +664,9 @@ static Type *check_expr(Ctx *c, Expr *e, Type *expected) {
     case EX_STR: return e->type = ty_string();
     case EX_BOOL: return e->type = ty_bool();
     case EX_NULL:
-        if (expected && type_is_ref(expected)) return e->type = expected;
+        if (expected && (type_is_ref(expected) || expected->kind == TY_RAWPTR ||
+                         expected->kind == TY_CSTRING))
+            return e->type = expected;
         e->type = mk_type(TY_NULL);
         return e->type;
     case EX_THIS: {
@@ -724,7 +737,9 @@ static Type *check_expr(Ctx *c, Expr *e, Type *expected) {
                 ok = true;
             if (lt->kind == TY_NULL || rt->kind == TY_NULL) {
                 Type *other = lt->kind == TY_NULL ? rt : lt;
-                if (type_is_ref(other) || other->kind == TY_NULL) ok = true;
+                if (type_is_ref(other) || other->kind == TY_NULL ||
+                    other->kind == TY_RAWPTR || other->kind == TY_CSTRING)
+                    ok = true;
             }
             if (lt->kind == TY_CLASS && rt->kind == TY_CLASS &&
                 (class_derives(lt->cdecl, rt->cdecl) || class_derives(rt->cdecl, lt->cdecl)))
