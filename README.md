@@ -65,8 +65,9 @@ Generated C is human-readable — look inside `.volt-cache/`.
 - **Safety**: bounds-checked arrays, checked downcasts, `panic` with
   file:line.
 
-See [docs/SPEC.md](docs/SPEC.md) for the full language reference and
-`examples/` for a tour (01 hello → 07 modules).
+See [docs/SPEC.md](docs/SPEC.md) for the full language reference,
+[docs/PORTABILITY.md](docs/PORTABILITY.md) for the path to other platforms
+(Windows, Android, iOS, embedded, …), and `examples/` for a tour.
 
 ## Layout
 
