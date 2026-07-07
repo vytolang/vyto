@@ -597,11 +597,26 @@ void vs_blit(void *vs, const int *pixels, int srcw, int srch,
         img_w = dstw;
         img_h = dsth;
     }
-    for (int dy = 0; dy < dsth; dy++) {
-        int sy = dy * srch / dsth;
-        for (int dx = 0; dx < dstw; dx++) {
-            int sx = dx * srcw / dstw;
-            XPutPixel(img, dx, dy, pixel_of(s->dpy, pixels[sy * srcw + sx]));
+    /* Fast path: on a little-endian 32bpp TrueColor visual the image row is a
+       plain uint32 array of 0x00RRGGBB — pack directly, skipping 786K XPutPixel
+       calls per frame. Falls back to XPutPixel on paletted/odd visuals. */
+    if (truecolor && img->bits_per_pixel == 32 && img->byte_order == LSBFirst) {
+        for (int dy = 0; dy < dsth; dy++) {
+            int sy = dy * srch / dsth;
+            const int *src = pixels + sy * srcw;
+            uint32_t *row = (uint32_t *)(img->data + dy * img->bytes_per_line);
+            if (srcw == dstw) {
+                for (int dx = 0; dx < dstw; dx++) row[dx] = (uint32_t)(src[dx] & 0xFFFFFF);
+            } else {
+                for (int dx = 0; dx < dstw; dx++)
+                    row[dx] = (uint32_t)(src[dx * srcw / dstw] & 0xFFFFFF);
+            }
+        }
+    } else {
+        for (int dy = 0; dy < dsth; dy++) {
+            int sy = dy * srch / dsth;
+            for (int dx = 0; dx < dstw; dx++)
+                XPutPixel(img, dx, dy, pixel_of(s->dpy, pixels[sy * srcw + dx * srcw / dstw]));
         }
     }
     XPutImage(s->dpy, s->back, s->gc, img, 0, 0, dstx, dsty, (unsigned)dstw, (unsigned)dsth);
