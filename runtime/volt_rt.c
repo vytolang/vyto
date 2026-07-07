@@ -223,16 +223,27 @@ static FILE *file_open(VtString *path, const char *mode, const char *file, int l
 
 VtString *vt_file_read(VtString *path, const char *file, int line) {
     FILE *f = file_open(path, "rb", file, line);
-    if (fseek(f, 0, SEEK_END) != 0) vt_panic_c(file, line, "cannot seek in file");
-    long n = ftell(f);
-    if (n < 0) vt_panic_c(file, line, "cannot read file size");
-    fseek(f, 0, SEEK_SET);
-    VtString *s = str_alloc(n);
-    if (fread(s->data, 1, (size_t)n, f) != (size_t)n) {
-        fclose(f);
-        vt_panic_c(file, line, "short read");
+    /* Read to EOF into a growing buffer rather than trusting the stat size:
+       /proc and /sys files report size 0, and pipes aren't seekable. */
+    size_t cap = 65536, len = 0;
+    char *buf = malloc(cap);
+    if (!buf) { fclose(f); vt_panic_c(file, line, "out of memory reading file"); }
+    for (;;) {
+        if (len == cap) {
+            cap *= 2;
+            char *nb = realloc(buf, cap);
+            if (!nb) { free(buf); fclose(f); vt_panic_c(file, line, "out of memory reading file"); }
+            buf = nb;
+        }
+        size_t got = fread(buf + len, 1, cap - len, f);
+        len += got;
+        if (got == 0) break; /* EOF or error */
     }
+    if (ferror(f)) { free(buf); fclose(f); vt_panic_c(file, line, "error reading file"); }
     fclose(f);
+    VtString *s = str_alloc((int64_t)len);
+    memcpy(s->data, buf, len);
+    free(buf);
     return s;
 }
 

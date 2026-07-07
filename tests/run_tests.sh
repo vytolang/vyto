@@ -116,6 +116,17 @@ else
     fail=1
 fi
 
+# --- readfile/readlines on a growable /proc file (size 0 by stat) ---
+if [ -r /proc/self/status ]; then
+    got=$(./voltc run tests/fixtures/proc_read.vt 2>&1)
+    if [ "$got" = "ok" ]; then
+        echo "PASS proc_read"
+    else
+        echo "FAIL proc_read (got: $got)"
+        fail=1
+    fi
+fi
+
 # --- volt/surface binding: regenerate with voltbind, golden-check ---
 ./voltbind lib/volt/surface/native/src/vsurf.h \
     --lib X11@linux --lib X11@macos --lib gdi32@windows --lib user32@windows \
