@@ -1,0 +1,583 @@
+// volt/ui/form — the input widgets: Label, Button, TextField, Checkbox,
+// ListBox, and the multi-line TextArea editor.
+
+import { Widget, Painter, Theme, Size } from "volt/ui/core";
+import { Rect,
+         KEY_ENTER, KEY_BACKSPACE, KEY_UP, KEY_DOWN, KEY_LEFT,
+         KEY_RIGHT, KEY_DELETE, KEY_HOME, KEY_END } from "volt/surface";
+
+export class Label extends Widget {
+    text: string;
+    strong: bool;   // ink when true, muted when false
+
+    fn init(text: string) {
+        super.init();
+        this.text = text;
+        this.strong = true;
+    }
+
+    override fn measure(s: Painter, th: Theme): Size {
+        return Size(s.text_width(this.text), s.font_height() + 6);
+    }
+
+    override fn draw(s: Painter, th: Theme) {
+        let color = th.muted;
+        if (this.strong) { color = th.ink; }
+        s.text_in(this.bounds, 0, this.text, color);
+    }
+}
+
+export class Button extends Widget {
+    label: string;
+    onClick: fn(Button);
+
+    fn init(label: string) {
+        super.init();
+        this.label = label;
+        this.focusable = true;
+    }
+
+    fn fire() {
+        if (this.onClick != null) {
+            this.onClick(this);
+        }
+    }
+
+    override fn measure(s: Painter, th: Theme): Size {
+        return Size(s.text_width(this.label) + 24, s.font_height() + 12);
+    }
+
+    override fn draw(s: Painter, th: Theme) {
+        s.fill(this.bounds, th.accent);
+        if (this.focused) {
+            s.frame(this.bounds, th.ink);
+        }
+        let tw = s.text_width(this.label);
+        let pad = (this.bounds.w - tw) / 2;
+        s.text_in(this.bounds, pad, this.label, th.white);
+    }
+
+    override fn on_click(x: int, y: int): bool {
+        this.fire();
+        return true;
+    }
+
+    override fn on_key(k: int, ch: string): bool {
+        if (k == KEY_ENTER || k == 32) {
+            this.fire();
+            return true;
+        }
+        return false;
+    }
+
+    override fn drop_handlers() {
+        this.onClick = null;
+    }
+}
+
+export class TextField extends Widget {
+    text: string;
+    placeholder: string;
+    caret: int;                 // byte index into text
+    onSubmit: fn(string);
+
+    fn init(placeholder: string) {
+        super.init();
+        this.text = "";
+        this.placeholder = placeholder;
+        this.caret = 0;
+        this.focusable = true;
+    }
+
+    fn set_text(t: string) {
+        this.text = t;
+        this.caret = t.len;
+    }
+
+    override fn measure(s: Painter, th: Theme): Size {
+        return Size(s.text_width(this.placeholder) + 24, s.font_height() + 12);
+    }
+
+    override fn draw(s: Painter, th: Theme) {
+        s.fill(this.bounds, th.white);
+        let border = th.muted;
+        if (this.focused) { border = th.accent; }
+        s.frame(this.bounds, border);
+        if (this.text.len == 0 && !this.focused) {
+            s.text_in(this.bounds, 8, this.placeholder, th.muted);
+        } else {
+            s.text_in(this.bounds, 8, this.text, th.ink);
+        }
+        if (this.focused) {
+            let cx = this.bounds.x + 8 + s.text_width(this.text.slice(0, this.caret));
+            let cy = this.bounds.y + (this.bounds.h - s.font_height()) / 2;
+            s.fill(Rect(cx, cy, 1, s.font_height()), th.ink);
+        }
+    }
+
+    override fn on_click(x: int, y: int): bool {
+        // on_click has no Surface, so no text metrics here: the caret goes
+        // to the end. (Precise caret placement needs a metrics-aware hook.)
+        this.caret = this.text.len;
+        return true;
+    }
+
+    override fn on_key(k: int, ch: string): bool {
+        if (k == KEY_ENTER) {
+            if (this.onSubmit != null && this.text.len > 0) {
+                let t = this.text;
+                this.text = "";
+                this.caret = 0;
+                this.onSubmit(t);
+            }
+            return true;
+        }
+        if (k == KEY_BACKSPACE) {
+            if (this.caret > 0) {
+                this.text = this.text.slice(0, this.caret - 1)
+                          + this.text.slice(this.caret, this.text.len);
+                this.caret -= 1;
+            }
+            return true;
+        }
+        if (k == KEY_DELETE) {
+            if (this.caret < this.text.len) {
+                this.text = this.text.slice(0, this.caret)
+                          + this.text.slice(this.caret + 1, this.text.len);
+            }
+            return true;
+        }
+        if (k == KEY_LEFT) {
+            if (this.caret > 0) { this.caret -= 1; }
+            return true;
+        }
+        if (k == KEY_RIGHT) {
+            if (this.caret < this.text.len) { this.caret += 1; }
+            return true;
+        }
+        if (k == KEY_HOME) {
+            this.caret = 0;
+            return true;
+        }
+        if (k == KEY_END) {
+            this.caret = this.text.len;
+            return true;
+        }
+        if (k >= 32 && k < 127 && ch.len > 0) {
+            this.text = this.text.slice(0, this.caret) + ch
+                      + this.text.slice(this.caret, this.text.len);
+            this.caret += 1;
+            return true;
+        }
+        return false;
+    }
+
+    override fn drop_handlers() {
+        this.onSubmit = null;
+    }
+}
+
+export class Checkbox extends Widget {
+    label: string;
+    checked: bool;
+    onToggle: fn(bool);
+
+    fn init(label: string) {
+        super.init();
+        this.label = label;
+        this.focusable = true;
+    }
+
+    fn toggle() {
+        this.checked = !this.checked;
+        if (this.onToggle != null) {
+            this.onToggle(this.checked);
+        }
+    }
+
+    override fn measure(s: Painter, th: Theme): Size {
+        return Size(s.text_width(this.label) + 26, s.font_height() + 8);
+    }
+
+    override fn draw(s: Painter, th: Theme) {
+        let box = 14;
+        let by = this.bounds.y + (this.bounds.h - box) / 2;
+        let br = Rect(this.bounds.x, by, box, box);
+        s.fill(br, th.white);
+        let border = th.muted;
+        if (this.focused) { border = th.accent; }
+        s.frame(br, border);
+        if (this.checked) {
+            s.fill(Rect(br.x + 3, br.y + 3, box - 6, box - 6), th.accent);
+        }
+        let tr = Rect(this.bounds.x + box + 6, this.bounds.y,
+                      this.bounds.w - box - 6, this.bounds.h);
+        s.text_in(tr, 0, this.label, th.ink);
+    }
+
+    override fn on_click(x: int, y: int): bool {
+        this.toggle();
+        return true;
+    }
+
+    override fn on_key(k: int, ch: string): bool {
+        if (k == 32 || k == KEY_ENTER) {
+            this.toggle();
+            return true;
+        }
+        return false;
+    }
+
+    override fn drop_handlers() {
+        this.onToggle = null;
+    }
+}
+
+const ROW_H: int = 26;
+
+export class ListBox extends Widget {
+    items: string[];
+    checked: bool[];
+    selected: int;
+    scroll: int;                // first visible row
+    onToggle: fn(int);
+    onDelete: fn(int);
+
+    fn init() {
+        super.init();
+        this.items = [];
+        this.checked = [];
+        this.selected = -1;
+        this.focusable = true;
+    }
+
+    fn set_items(items: string[], checked: bool[]) {
+        this.items = items;
+        this.checked = checked;
+        if (this.selected >= items.len) { this.selected = items.len - 1; }
+        if (this.selected < 0 && items.len > 0) { this.selected = 0; }
+        if (this.scroll > 0 && this.scroll >= items.len) { this.scroll = items.len - 1; }
+        if (this.scroll < 0) { this.scroll = 0; }
+    }
+
+    fn visible_rows(): int {
+        let n = (this.bounds.h - 2) / ROW_H;
+        if (n < 1) { return 1; }
+        return n;
+    }
+
+    fn scroll_into_view() {
+        if (this.selected < 0) { return; }
+        let vis = this.visible_rows();
+        if (this.selected < this.scroll) { this.scroll = this.selected; }
+        if (this.selected >= this.scroll + vis) { this.scroll = this.selected - vis + 1; }
+    }
+
+    fn move_sel(delta: int) {
+        if (this.items.len == 0) { return; }
+        let s = this.selected + delta;
+        if (s < 0) { s = 0; }
+        if (s >= this.items.len) { s = this.items.len - 1; }
+        this.selected = s;
+        this.scroll_into_view();
+    }
+
+    override fn measure(s: Painter, th: Theme): Size {
+        return Size(200, ROW_H * 5 + 2);
+    }
+
+    override fn draw(s: Painter, th: Theme) {
+        s.fill(this.bounds, th.white);
+        let border = th.muted;
+        if (this.focused) { border = th.accent; }
+        s.frame(this.bounds, border);
+        let b = this.bounds;
+        if (this.items.len == 0) {
+            s.text_in(b, 8, "nothing here yet", th.muted);
+            return;
+        }
+        let vis = this.visible_rows();
+        for (let i in 0..vis) {
+            let idx = this.scroll + i;
+            if (idx >= this.items.len) { break; }
+            let r = Rect(b.x + 1, b.y + 1 + i * ROW_H, b.w - 2, ROW_H);
+            if (idx == this.selected) {
+                s.fill(r, th.sel);
+            }
+            let mark = "[ ] ";
+            let color = th.ink;
+            if (this.checked[idx]) {
+                mark = "[x] ";
+                color = th.muted;
+            }
+            s.text_in(r, 8, mark + this.items[idx], color);
+        }
+    }
+
+    override fn on_click(x: int, y: int): bool {
+        let row = (y - this.bounds.y - 1) / ROW_H;
+        let idx = this.scroll + row;
+        if (idx < 0 || idx >= this.items.len) { return false; }
+        if (idx == this.selected) {
+            // clicking the selected row toggles it
+            if (this.onToggle != null) { this.onToggle(idx); }
+        }
+        this.selected = idx;
+        return true;
+    }
+
+    override fn on_key(k: int, ch: string): bool {
+        if (k == KEY_UP) {
+            this.move_sel(-1);
+            return true;
+        }
+        if (k == KEY_DOWN) {
+            this.move_sel(1);
+            return true;
+        }
+        if (k == 32 || k == KEY_ENTER) {
+            if (this.selected >= 0 && this.onToggle != null) {
+                this.onToggle(this.selected);
+                return true;
+            }
+            return false;
+        }
+        if (k == KEY_DELETE) {
+            if (this.selected >= 0 && this.onDelete != null) {
+                this.onDelete(this.selected);
+                return true;
+            }
+            return false;
+        }
+        return false;
+    }
+
+    override fn drop_handlers() {
+        this.onToggle = null;
+        this.onDelete = null;
+    }
+}
+
+// -------------------------------------------------------------- TextArea
+
+const TA_PAD: int = 6;
+
+// Multi-line, no-wrap text editor. Lines are held one-per-entry; the caret
+// is a (row, col) byte position. Vertical scroll (`top`) and horizontal
+// scroll (`left_px`) keep the caret in view; both are recomputed in draw()
+// where surface metrics are available.
+export class TextArea extends Widget {
+    lines: string[];
+    caret_row: int;
+    caret_col: int;
+    top: int;        // first visible line
+    left_px: int;    // horizontal pixel scroll
+    line_h: int;     // cached in draw()
+    view_rows: int;  // cached in draw()
+    onChange: fn();
+
+    fn init() {
+        super.init();
+        this.lines = [""];
+        this.focusable = true;
+        this.line_h = 15;
+        this.view_rows = 1;
+    }
+
+    fn set_text(s: string) {
+        let ls: string[] = [];
+        let start = 0;
+        let i = 0;
+        while (i < s.len) {
+            if (s[i] == 10) { // '\n'
+                let piece = s.slice(start, i);
+                if (piece.len > 0 && piece[piece.len - 1] == 13) { // strip '\r'
+                    piece = piece.slice(0, piece.len - 1);
+                }
+                ls.push(piece);
+                start = i + 1;
+            }
+            i += 1;
+        }
+        let last = s.slice(start, s.len);
+        if (last.len > 0 && last[last.len - 1] == 13) { last = last.slice(0, last.len - 1); }
+        ls.push(last);
+        if (ls.len == 0) { ls.push(""); }
+        this.lines = ls;
+        this.caret_row = 0;
+        this.caret_col = 0;
+        this.top = 0;
+        this.left_px = 0;
+    }
+
+    fn text(): string {
+        let out = "";
+        for (let i in 0..this.lines.len) {
+            if (i > 0) { out += "\n"; }
+            out += this.lines[i];
+        }
+        return out;
+    }
+
+    fn changed() {
+        if (this.onChange != null) { this.onChange(); }
+    }
+
+    fn remove_row(r: int) {
+        let out: string[] = [];
+        for (let i in 0..this.lines.len) {
+            if (i != r) { out.push(this.lines[i]); }
+        }
+        if (out.len == 0) { out.push(""); }
+        this.lines = out;
+    }
+
+    override fn measure(s: Painter, th: Theme): Size {
+        return Size(360, (s.font_height() + 2) * 10 + 2 * TA_PAD);
+    }
+
+    override fn on_key(k: int, ch: string): bool {
+        let line = this.lines[this.caret_row];
+        if (k == KEY_ENTER) {
+            let before = line.slice(0, this.caret_col);
+            let after = line.slice(this.caret_col, line.len);
+            this.lines[this.caret_row] = before;
+            let out: string[] = [];
+            for (let i in 0..this.lines.len) {
+                out.push(this.lines[i]);
+                if (i == this.caret_row) { out.push(after); }
+            }
+            this.lines = out;
+            this.caret_row += 1;
+            this.caret_col = 0;
+            this.changed();
+            return true;
+        }
+        if (k == KEY_BACKSPACE) {
+            if (this.caret_col > 0) {
+                this.lines[this.caret_row] = line.slice(0, this.caret_col - 1)
+                                           + line.slice(this.caret_col, line.len);
+                this.caret_col -= 1;
+                this.changed();
+            } else if (this.caret_row > 0) {
+                let prev = this.lines[this.caret_row - 1];
+                let joincol = prev.len;
+                this.lines[this.caret_row - 1] = prev + line;
+                this.remove_row(this.caret_row);
+                this.caret_row -= 1;
+                this.caret_col = joincol;
+                this.changed();
+            }
+            return true;
+        }
+        if (k == KEY_DELETE) {
+            if (this.caret_col < line.len) {
+                this.lines[this.caret_row] = line.slice(0, this.caret_col)
+                                           + line.slice(this.caret_col + 1, line.len);
+                this.changed();
+            } else if (this.caret_row < this.lines.len - 1) {
+                let next = this.lines[this.caret_row + 1];
+                this.lines[this.caret_row] = line + next;
+                this.remove_row(this.caret_row + 1);
+                this.changed();
+            }
+            return true;
+        }
+        if (k == KEY_LEFT) {
+            if (this.caret_col > 0) { this.caret_col -= 1; }
+            else if (this.caret_row > 0) {
+                this.caret_row -= 1;
+                this.caret_col = this.lines[this.caret_row].len;
+            }
+            return true;
+        }
+        if (k == KEY_RIGHT) {
+            if (this.caret_col < line.len) { this.caret_col += 1; }
+            else if (this.caret_row < this.lines.len - 1) {
+                this.caret_row += 1;
+                this.caret_col = 0;
+            }
+            return true;
+        }
+        if (k == KEY_UP) {
+            if (this.caret_row > 0) {
+                this.caret_row -= 1;
+                if (this.caret_col > this.lines[this.caret_row].len) {
+                    this.caret_col = this.lines[this.caret_row].len;
+                }
+            }
+            return true;
+        }
+        if (k == KEY_DOWN) {
+            if (this.caret_row < this.lines.len - 1) {
+                this.caret_row += 1;
+                if (this.caret_col > this.lines[this.caret_row].len) {
+                    this.caret_col = this.lines[this.caret_row].len;
+                }
+            }
+            return true;
+        }
+        if (k == KEY_HOME) { this.caret_col = 0; return true; }
+        if (k == KEY_END) { this.caret_col = line.len; return true; }
+        if (k >= 32 && k < 127 && ch.len > 0) {
+            this.lines[this.caret_row] = line.slice(0, this.caret_col) + ch
+                                       + line.slice(this.caret_col, line.len);
+            this.caret_col += 1;
+            this.changed();
+            return true;
+        }
+        return false;
+    }
+
+    override fn on_click(x: int, y: int): bool {
+        let row = this.top + (y - this.bounds.y - TA_PAD) / this.line_h;
+        if (row < 0) { row = 0; }
+        if (row >= this.lines.len) { row = this.lines.len - 1; }
+        this.caret_row = row;
+        this.caret_col = this.lines[row].len; // no metrics here: snap to end
+        return true;
+    }
+
+    override fn draw(s: Painter, th: Theme) {
+        this.line_h = s.font_height() + 2;
+        let inner_h = this.bounds.h - 2 * TA_PAD;
+        let inner_w = this.bounds.w - 2 * TA_PAD;
+        this.view_rows = inner_h / this.line_h;
+        if (this.view_rows < 1) { this.view_rows = 1; }
+        // keep the caret row visible
+        if (this.caret_row < this.top) { this.top = this.caret_row; }
+        if (this.caret_row >= this.top + this.view_rows) {
+            this.top = this.caret_row - this.view_rows + 1;
+        }
+        // keep the caret column visible (horizontal scroll)
+        let caret_px = s.text_width(this.lines[this.caret_row].slice(0, this.caret_col));
+        if (caret_px - this.left_px > inner_w) { this.left_px = caret_px - inner_w; }
+        if (caret_px < this.left_px) { this.left_px = caret_px; }
+        if (this.left_px < 0) { this.left_px = 0; }
+
+        s.fill(this.bounds, th.white);
+        let border = th.muted;
+        if (this.focused) { border = th.accent; }
+        s.frame(this.bounds, border);
+
+        let ox = this.bounds.x + TA_PAD - this.left_px;
+        let asc = s.font_ascent();
+        let shown = this.view_rows;
+        for (let i in 0..shown) {
+            let row = this.top + i;
+            if (row >= this.lines.len) { break; }
+            let ty = this.bounds.y + TA_PAD + i * this.line_h + asc;
+            s.text(ox, ty, this.lines[row], th.ink);
+        }
+        if (this.focused && this.caret_row >= this.top
+            && this.caret_row < this.top + this.view_rows) {
+            let cx = ox + caret_px;
+            let cy = this.bounds.y + TA_PAD + (this.caret_row - this.top) * this.line_h;
+            s.fill(Rect(cx, cy, 1, this.line_h), th.ink);
+        }
+    }
+
+    override fn drop_handlers() {
+        this.onChange = null;
+    }
+}

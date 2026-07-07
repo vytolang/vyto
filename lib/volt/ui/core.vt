@@ -1,0 +1,371 @@
+// volt/ui/core — the layout/paint/event spine: Size, Theme, the Painter
+// abstraction, the Widget base class, and the Window that owns the event loop.
+// The widget catalog (layout, form, menu, dialog) builds on these; apps import
+// everything through the volt/ui barrel.
+//
+// Reference cycles: handler closures (onClick, onSubmit, ...) usually capture
+// the object that owns the widget tree. Window.run() breaks those cycles on
+// exit by walking the tree and nulling every handler field
+// (release_all/drop_handlers), so apps never need a manual teardown.
+
+import { Surface, Rect, contains, rgb,
+         EV_EXPOSE, EV_KEY, EV_MOUSE_DOWN, EV_RESIZE, EV_CLOSE,
+         KEY_ESC, KEY_TAB } from "volt/surface";
+
+export struct Size {
+    w: int;
+    h: int;
+}
+
+export class Theme {
+    bg: int;
+    ink: int;
+    accent: int;
+    muted: int;
+    sel: int;
+    white: int;
+    pad: int;      // default container padding
+    spacing: int;  // default gap between container children
+
+    fn init() {
+        this.bg = rgb(245, 243, 237);
+        this.ink = rgb(34, 34, 40);
+        this.accent = rgb(32, 96, 192);
+        this.muted = rgb(150, 148, 140);
+        this.sel = rgb(219, 230, 247);
+        this.white = rgb(255, 255, 255);
+        this.pad = 12;
+        this.spacing = 8;
+    }
+}
+
+// --------------------------------------------------------------- Painter
+
+// The drawing target widgets render through. The default SurfacePainter draws
+// straight to the volt/surface vector API (the lean tier — no blend2d). A
+// GfxPainter in volt/gfx draws through a blend2d Canvas (the rich tier). Widgets
+// only ever see a Painter, so volt/ui itself never depends on blend2d: apps that
+// want AA rendering pass a GfxPainter, everyone else pays nothing.
+export class Painter {
+    virtual fn fill(r: Rect, color: int) { }
+    virtual fn frame(r: Rect, color: int) { }
+    virtual fn line(x0: int, y0: int, x1: int, y1: int, color: int) { }
+    virtual fn text(x: int, y: int, s: string, color: int) { }
+    virtual fn text_in(r: Rect, pad: int, s: string, color: int) { }
+    virtual fn text_width(s: string): int { return 0; }
+    virtual fn font_ascent(): int { return 0; }
+    virtual fn font_height(): int { return 0; }
+    virtual fn width(): int { return 0; }
+    virtual fn height(): int { return 0; }
+    virtual fn present() { }
+}
+
+// Default painter: forwards every call to a volt/surface Surface.
+export class SurfacePainter extends Painter {
+    surf: Surface;
+    fn init(surf: Surface) { this.surf = surf; }
+    override fn fill(r: Rect, color: int) { this.surf.fill(r, color); }
+    override fn frame(r: Rect, color: int) { this.surf.frame(r, color); }
+    override fn line(x0: int, y0: int, x1: int, y1: int, color: int) {
+        this.surf.line(x0, y0, x1, y1, color);
+    }
+    override fn text(x: int, y: int, s: string, color: int) { this.surf.text(x, y, s, color); }
+    override fn text_in(r: Rect, pad: int, s: string, color: int) {
+        this.surf.text_in(r, pad, s, color);
+    }
+    override fn text_width(s: string): int { return this.surf.text_width(s); }
+    override fn font_ascent(): int { return this.surf.font_ascent(); }
+    override fn font_height(): int { return this.surf.font_height(); }
+    override fn width(): int { return this.surf.width(); }
+    override fn height(): int { return this.surf.height(); }
+    override fn present() { this.surf.present(); }
+}
+
+// ---------------------------------------------------------------- Widget
+
+export class Widget {
+    bounds: Rect;
+    parent: weak Widget;
+    children: Widget[];
+    focusable: bool;
+    focused: bool;
+    grow: int;          // flex factor inside Column/Row; 0 = natural size
+    modal: bool;        // overlay traps events; outside clicks don't dismiss
+    win: weak Window;   // set on overlays/menubar so they can drive the Window
+
+    fn init() {
+        this.children = [];
+    }
+
+    fn add(child: Widget) {
+        child.parent = this;
+        this.children.push(child);
+    }
+
+    // natural size, bottom-up
+    virtual fn measure(s: Painter, th: Theme): Size {
+        return Size(this.bounds.w, this.bounds.h);
+    }
+
+    // assign absolute bounds, top-down. The base class keeps children at
+    // their manually set bounds — the absolute-placement escape hatch.
+    virtual fn arrange(s: Painter, th: Theme, r: Rect) {
+        this.bounds = r;
+        for (let c in this.children) {
+            c.arrange(s, th, c.bounds);
+        }
+    }
+
+    // overlays (popups, dialogs) self-position against the whole surface;
+    // normal widgets are placed by their parent's arrange() instead.
+    virtual fn place(s: Painter, th: Theme) { }
+
+    virtual fn draw(s: Painter, th: Theme) {
+        for (let c in this.children) {
+            c.draw(s, th);
+        }
+    }
+
+    // absolute coordinates; return true when state changed (needs redraw)
+    virtual fn on_click(x: int, y: int): bool {
+        return false;
+    }
+
+    // return true when consumed / state changed
+    virtual fn on_key(k: int, ch: string): bool {
+        return false;
+    }
+
+    // subclasses null their own closure fields here (leaf hook only —
+    // release_all() does the tree walk; overrides never recurse)
+    virtual fn drop_handlers() { }
+
+    fn release_all() {
+        this.drop_handlers();
+        for (let c in this.children) {
+            c.release_all();
+        }
+    }
+
+    // deepest widget under the point; later siblings win (drawn on top)
+    fn hit(px: int, py: int): Widget {
+        let n = this.children.len;
+        for (let i in 0..n) {
+            let c = this.children[n - 1 - i];
+            let found = c.hit(px, py);
+            if (found != null) { return found; }
+        }
+        if (contains(this.bounds, px, py)) { return this; }
+        return null;
+    }
+
+    fn collect_focus(out: Widget[]) {
+        if (this.focusable) { out.push(this); }
+        for (let c in this.children) {
+            c.collect_focus(out);
+        }
+    }
+}
+
+// ---------------------------------------------------------------- Window
+
+export class Window {
+    surf: Surface;
+    painter: Painter;   // widgets draw through this; default = SurfacePainter
+    root: Widget;
+    menubar: Widget;    // optional MenuBar; drawn in a top strip above root
+    overlay: Widget;    // optional; popup or modal dialog on top of everything
+    theme: Theme;
+    focusables: Widget[];
+    focus_i: int;
+    running: bool;
+    close_on_esc: bool;
+
+    fn init(title: string, w: int, h: int) {
+        this.surf = new Surface(title, w, h);
+        this.painter = new SurfacePainter(this.surf);
+        this.theme = new Theme();
+        this.focusables = [];
+        this.focus_i = -1;
+        this.close_on_esc = true;
+    }
+
+    // escape hatch: the raw surface underneath
+    fn surface(): Surface { return this.surf; }
+
+    // opt into a custom painter (e.g. volt/gfx GfxPainter for AA rendering).
+    // Call before run(); the painter draws and presents each frame.
+    fn use_painter(p: Painter) { this.painter = p; }
+
+    fn close() { this.running = false; }
+
+    fn open_overlay(o: Widget) {
+        o.win = this;
+        this.overlay = o;
+        this.layout();
+    }
+
+    fn dismiss_overlay() {
+        this.overlay = null;
+        this.layout();
+    }
+
+    fn focused_widget(): Widget {
+        if (this.focus_i < 0 || this.focus_i >= this.focusables.len) { return null; }
+        return this.focusables[this.focus_i];
+    }
+
+    fn set_focus(i: int) {
+        let old = this.focused_widget();
+        if (old != null) { old.focused = false; }
+        this.focus_i = i;
+        let now = this.focused_widget();
+        if (now != null) { now.focused = true; }
+    }
+
+    fn focus_next() {
+        let n = this.focusables.len;
+        if (n == 0) { return; }
+        let i = this.focus_i + 1;
+        if (i >= n) { i = 0; }
+        this.set_focus(i);
+    }
+
+    fn focus_widget(w: Widget) {
+        for (let i in 0..this.focusables.len) {
+            if (this.focusables[i] == w) {
+                this.set_focus(i);
+                return;
+            }
+        }
+    }
+
+    fn layout() {
+        let w = this.surf.width();
+        let h = this.surf.height();
+        let top = 0;
+        if (this.menubar != null) {
+            let sh = this.painter.font_height() + 8;
+            this.menubar.win = this;
+            this.menubar.arrange(this.painter, this.theme, Rect(0, 0, w, sh));
+            top = sh;
+        }
+        if (this.root != null) {
+            this.root.measure(this.painter, this.theme);
+            this.root.arrange(this.painter, this.theme, Rect(0, top, w, h - top));
+        }
+        if (this.overlay != null) {
+            this.overlay.place(this.painter, this.theme);
+        }
+        // focus ring covers the root tree; overlays manage their own focus
+        let old = this.focused_widget();
+        let fresh: Widget[] = [];
+        if (this.root != null) { this.root.collect_focus(fresh); }
+        this.focusables = fresh;
+        this.focus_i = -1;
+        if (old != null) {
+            for (let i in 0..fresh.len) {
+                if (fresh[i] == old) { this.focus_i = i; }
+            }
+            if (this.focus_i < 0) { old.focused = false; }
+        }
+        if (this.focus_i < 0 && fresh.len > 0) {
+            this.set_focus(0);
+        }
+    }
+
+    fn redraw() {
+        this.painter.fill(Rect(0, 0, this.surf.width(), this.surf.height()), this.theme.bg);
+        if (this.root != null) {
+            this.root.draw(this.painter, this.theme);
+        }
+        if (this.menubar != null) {
+            this.menubar.draw(this.painter, this.theme);
+        }
+        if (this.overlay != null) {
+            this.overlay.draw(this.painter, this.theme);
+        }
+        this.painter.present();
+    }
+
+    fn on_key_ev(k: int, ch: string) {
+        if (this.overlay != null) {
+            if (k == KEY_ESC) {
+                this.dismiss_overlay();
+                this.redraw();
+            } else if (this.overlay.on_key(k, ch)) {
+                this.redraw();
+            }
+            return;
+        }
+        if (k == KEY_TAB) {
+            this.focus_next();
+            this.redraw();
+        } else if (k == KEY_ESC && this.close_on_esc) {
+            this.running = false;
+        } else {
+            let f = this.focused_widget();
+            if (f != null && f.on_key(k, ch)) {
+                this.redraw();
+            }
+        }
+    }
+
+    fn on_mouse_ev(x: int, y: int) {
+        if (this.overlay != null) {
+            if (!contains(this.overlay.bounds, x, y) && !this.overlay.modal) {
+                this.dismiss_overlay();
+                this.redraw();
+            } else if (contains(this.overlay.bounds, x, y)) {
+                if (this.overlay.on_click(x, y)) { this.redraw(); }
+            }
+            return;
+        }
+        if (this.menubar != null && contains(this.menubar.bounds, x, y)) {
+            if (this.menubar.on_click(x, y)) { this.redraw(); }
+            return;
+        }
+        let target: Widget = null;
+        if (this.root != null) { target = this.root.hit(x, y); }
+        if (target != null) {
+            let changed = false;
+            if (target.focusable) {
+                this.focus_widget(target);
+                changed = true;
+            }
+            if (target.on_click(x, y)) { changed = true; }
+            if (changed) { this.redraw(); }
+        }
+    }
+
+    fn run() {
+        this.layout();
+        this.redraw();
+        this.running = true;
+        while (this.running) {
+            let ev = this.surf.wait();
+            if (ev == EV_EXPOSE) {
+                this.redraw();
+            } else if (ev == EV_RESIZE) {
+                this.layout();
+                this.redraw();
+            } else if (ev == EV_CLOSE) {
+                this.running = false;
+            } else if (ev == EV_KEY) {
+                this.on_key_ev(this.surf.key(), this.surf.text_ev());
+            } else if (ev == EV_MOUSE_DOWN) {
+                this.on_mouse_ev(this.surf.mouse_x(), this.surf.mouse_y());
+            }
+        }
+        // break handler->owner->tree reference cycles so RC frees everything;
+        // apps never need a manual teardown.
+        if (this.root != null) { this.root.release_all(); }
+        if (this.menubar != null) { this.menubar.release_all(); }
+        if (this.overlay != null) { this.overlay.release_all(); }
+        this.root = null;
+        this.menubar = null;
+        this.overlay = null;
+        this.focusables = [];
+        this.focus_i = -1;
+    }
+}

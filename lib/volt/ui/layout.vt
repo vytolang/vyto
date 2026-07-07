@@ -1,0 +1,175 @@
+// volt/ui/layout — the layout containers: Column and Row (flex stacks) and
+// Spacer. Constraint-driven containers (Padding/Center/Container/…) land here.
+
+import { Widget, Painter, Theme, Size } from "volt/ui/core";
+import { Rect } from "volt/surface";
+
+// vertical stack; children stretched to the inner width
+export class Column extends Widget {
+    padding: int;   // -1 = theme default
+    spacing: int;   // -1 = theme default
+
+    fn init(kids: Widget[]) {
+        super.init();
+        this.padding = -1;
+        this.spacing = -1;
+        for (let k in kids) {
+            this.add(k);
+        }
+    }
+
+    fn pad_of(th: Theme): int {
+        if (this.padding < 0) { return th.pad; }
+        return this.padding;
+    }
+    fn gap_of(th: Theme): int {
+        if (this.spacing < 0) { return th.spacing; }
+        return this.spacing;
+    }
+
+    override fn measure(s: Painter, th: Theme): Size {
+        let pad = this.pad_of(th);
+        let gap = this.gap_of(th);
+        let w = 0;
+        let h = 0;
+        let n = this.children.len;
+        for (let c in this.children) {
+            let cs = c.measure(s, th);
+            if (cs.w > w) { w = cs.w; }
+            h += cs.h;
+        }
+        if (n > 1) { h += gap * (n - 1); }
+        return Size(w + 2 * pad, h + 2 * pad);
+    }
+
+    override fn arrange(s: Painter, th: Theme, r: Rect) {
+        this.bounds = r;
+        let pad = this.pad_of(th);
+        let gap = this.gap_of(th);
+        let inner = Rect(r.x + pad, r.y + pad, r.w - 2 * pad, r.h - 2 * pad);
+        let n = this.children.len;
+        if (n == 0) { return; }
+        // naturals + flex bookkeeping
+        let naturals: int[] = [];
+        let fixed = 0;
+        let total_grow = 0;
+        for (let c in this.children) {
+            let cs = c.measure(s, th);
+            naturals.push(cs.h);
+            fixed += cs.h;
+            total_grow += c.grow;
+        }
+        let leftover = inner.h - fixed - gap * (n - 1);
+        if (leftover < 0) { leftover = 0; }
+        let given = 0;
+        let flex_seen = 0;
+        let flex_total = 0;
+        for (let c in this.children) {
+            if (c.grow > 0) { flex_total += 1; }
+        }
+        let y = inner.y;
+        for (let i in 0..n) {
+            let c = this.children[i];
+            let ch = naturals[i];
+            if (c.grow > 0 && total_grow > 0) {
+                flex_seen += 1;
+                let share = leftover * c.grow / total_grow;
+                if (flex_seen == flex_total) { share = leftover - given; }
+                given += share;
+                ch += share;
+            }
+            c.arrange(s, th, Rect(inner.x, y, inner.w, ch));
+            y += ch + gap;
+        }
+    }
+}
+
+// horizontal stack; children stretched to the inner height
+export class Row extends Widget {
+    padding: int;
+    spacing: int;
+
+    fn init(kids: Widget[]) {
+        super.init();
+        this.padding = -1;
+        this.spacing = -1;
+        for (let k in kids) {
+            this.add(k);
+        }
+    }
+
+    fn pad_of(th: Theme): int {
+        if (this.padding < 0) { return 0; }
+        return this.padding;
+    }
+    fn gap_of(th: Theme): int {
+        if (this.spacing < 0) { return th.spacing; }
+        return this.spacing;
+    }
+
+    override fn measure(s: Painter, th: Theme): Size {
+        let pad = this.pad_of(th);
+        let gap = this.gap_of(th);
+        let w = 0;
+        let h = 0;
+        let n = this.children.len;
+        for (let c in this.children) {
+            let cs = c.measure(s, th);
+            if (cs.h > h) { h = cs.h; }
+            w += cs.w;
+        }
+        if (n > 1) { w += gap * (n - 1); }
+        return Size(w + 2 * pad, h + 2 * pad);
+    }
+
+    override fn arrange(s: Painter, th: Theme, r: Rect) {
+        this.bounds = r;
+        let pad = this.pad_of(th);
+        let gap = this.gap_of(th);
+        let inner = Rect(r.x + pad, r.y + pad, r.w - 2 * pad, r.h - 2 * pad);
+        let n = this.children.len;
+        if (n == 0) { return; }
+        let naturals: int[] = [];
+        let fixed = 0;
+        let total_grow = 0;
+        for (let c in this.children) {
+            let cs = c.measure(s, th);
+            naturals.push(cs.w);
+            fixed += cs.w;
+            total_grow += c.grow;
+        }
+        let leftover = inner.w - fixed - gap * (n - 1);
+        if (leftover < 0) { leftover = 0; }
+        let given = 0;
+        let flex_seen = 0;
+        let flex_total = 0;
+        for (let c in this.children) {
+            if (c.grow > 0) { flex_total += 1; }
+        }
+        let x = inner.x;
+        for (let i in 0..n) {
+            let c = this.children[i];
+            let cw = naturals[i];
+            if (c.grow > 0 && total_grow > 0) {
+                flex_seen += 1;
+                let share = leftover * c.grow / total_grow;
+                if (flex_seen == flex_total) { share = leftover - given; }
+                given += share;
+                cw += share;
+            }
+            c.arrange(s, th, Rect(x, inner.y, cw, inner.h));
+            x += cw + gap;
+        }
+    }
+}
+
+// flexible empty space inside a Column/Row
+export class Spacer extends Widget {
+    fn init() {
+        super.init();
+        this.grow = 1;
+    }
+    override fn measure(s: Painter, th: Theme): Size {
+        return Size(0, 0);
+    }
+}
