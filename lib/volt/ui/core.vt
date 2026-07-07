@@ -135,6 +135,15 @@ export class SurfacePainter extends Painter {
     override fn present() { this.surf.present(); }
 }
 
+// true when two rects share any area (touching edges don't count)
+fn rect_overlaps(a: Rect, b: Rect): bool {
+    if (a.x + a.w <= b.x) { return false; }
+    if (b.x + b.w <= a.x) { return false; }
+    if (a.y + a.h <= b.y) { return false; }
+    if (b.y + b.h <= a.y) { return false; }
+    return true;
+}
+
 // ---------------------------------------------------------------- Widget
 
 export class Widget {
@@ -185,6 +194,28 @@ export class Widget {
     virtual fn draw(s: Painter, th: Theme) {
         for (let c in this.children) {
             c.draw(s, th);
+        }
+    }
+
+    // A container's own painting (background, borders) — separate from its
+    // children so a partial repaint can redraw the container chrome without
+    // wholesale-redrawing every child. Leaf widgets paint in draw() instead.
+    virtual fn draw_chrome(s: Painter, th: Theme) { }
+
+    // Partial-repaint walk: draw only the widgets that intersect the dirty
+    // rect `d`, pruning whole subtrees that fall outside it. A leaf paints
+    // itself; a container paints its chrome and recurses per child (each child
+    // re-tests against d). The persistent back buffer keeps everything outside
+    // d from the previous frame, so only the changed region is repainted.
+    virtual fn draw_within(s: Painter, th: Theme, d: Rect) {
+        if (!rect_overlaps(this.bounds, d)) { return; }
+        if (this.children.len == 0) {
+            this.draw(s, th);
+        } else {
+            this.draw_chrome(s, th);
+            for (let c in this.children) {
+                c.draw_within(s, th, d);
+            }
         }
     }
 
@@ -242,6 +273,8 @@ export class Window {
     focus_i: int;
     running: bool;
     close_on_esc: bool;
+    dirty: Rect;        // accumulated repaint region (valid when has_dirty)
+    has_dirty: bool;
 
     fn init(title: string, w: int, h: int) {
         this.surf = new Surface(title, w, h);
@@ -350,6 +383,57 @@ export class Window {
         this.painter.present();
     }
 
+    // Union a rect into the pending dirty region for the next repaint().
+    fn mark_dirty(r: Rect) {
+        if (!this.has_dirty) {
+            this.dirty = r;
+            this.has_dirty = true;
+            return;
+        }
+        let ax = this.dirty.x;
+        let ay = this.dirty.y;
+        let ar = ax + this.dirty.w;
+        let ab = ay + this.dirty.h;
+        if (r.x < ax) { ax = r.x; }
+        if (r.y < ay) { ay = r.y; }
+        if (r.x + r.w > ar) { ar = r.x + r.w; }
+        if (r.y + r.h > ab) { ab = r.y + r.h; }
+        this.dirty = Rect(ax, ay, ar - ax, ab - ay);
+    }
+
+    // Repaint only the accumulated dirty region: clear its background, redraw
+    // the widgets that intersect it, and present. Everything outside survives
+    // in the back buffer from the last full frame. Falls back to nothing if no
+    // region is dirty. Structural changes (resize, overlays, menus) still use
+    // the full redraw() path.
+    fn repaint() {
+        if (!this.has_dirty) { return; }
+        let w = this.surf.width();
+        let h = this.surf.height();
+        let x0 = this.dirty.x;
+        let y0 = this.dirty.y;
+        let x1 = this.dirty.x + this.dirty.w;
+        let y1 = this.dirty.y + this.dirty.h;
+        if (x0 < 0) { x0 = 0; }
+        if (y0 < 0) { y0 = 0; }
+        if (x1 > w) { x1 = w; }
+        if (y1 > h) { y1 = h; }
+        this.has_dirty = false;
+        if (x1 <= x0 || y1 <= y0) { return; }
+        let d = Rect(x0, y0, x1 - x0, y1 - y0);
+        this.painter.fill(d, this.theme.bg);
+        if (this.root != null) {
+            this.root.draw_within(this.painter, this.theme, d);
+        }
+        if (this.menubar != null && rect_overlaps(this.menubar.bounds, d)) {
+            this.menubar.draw(this.painter, this.theme);
+        }
+        if (this.overlay != null && rect_overlaps(this.overlay.bounds, d)) {
+            this.overlay.draw(this.painter, this.theme);
+        }
+        this.painter.present();
+    }
+
     fn on_key_ev(k: int, ch: string) {
         if (this.overlay != null) {
             if (k == KEY_ESC) {
@@ -361,14 +445,20 @@ export class Window {
             return;
         }
         if (k == KEY_TAB) {
+            let old = this.focused_widget();
             this.focus_next();
-            this.redraw();
+            let now = this.focused_widget();
+            // only the two widgets whose focus border changed need repainting
+            if (old != null) { this.mark_dirty(old.bounds); }
+            if (now != null) { this.mark_dirty(now.bounds); }
+            this.repaint();
         } else if (k == KEY_ESC && this.close_on_esc) {
             this.running = false;
         } else {
             let f = this.focused_widget();
             if (f != null && f.on_key(k, ch)) {
-                this.redraw();
+                this.mark_dirty(f.bounds);
+                this.repaint();
             }
         }
     }
@@ -390,13 +480,20 @@ export class Window {
         let target: Widget = null;
         if (this.root != null) { target = this.root.hit(x, y); }
         if (target != null) {
+            let old = this.focused_widget();
             let changed = false;
             if (target.focusable) {
                 this.focus_widget(target);
                 changed = true;
             }
             if (target.on_click(x, y)) { changed = true; }
-            if (changed) { this.redraw(); }
+            if (changed) {
+                // the clicked widget, plus the previously focused one if focus
+                // moved (its border must clear)
+                if (old != null && old != target) { this.mark_dirty(old.bounds); }
+                this.mark_dirty(target.bounds);
+                this.repaint();
+            }
         }
     }
 
