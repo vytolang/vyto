@@ -266,6 +266,7 @@ struct Module {
     int ndecls;
     Module *next;           /* all loaded modules */
     bool checked;
+    bool resolving;         /* re-export cycle guard */
     int arrow_counter;
     uint64_t src_hash;
 };

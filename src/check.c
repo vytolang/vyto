@@ -137,14 +137,21 @@ static Decl *mod_lookup_own(Module *m, const char *name) {
 static Decl *mod_lookup(Module *m, const char *name) {
     Decl *d = mod_lookup_own(m, name);
     if (d) return d;
+    if (m->resolving) return NULL;   /* re-export cycle guard */
+    m->resolving = true;
     for (int i = 0; i < m->ndecls; i++) {
         Decl *imp = m->decls[i];
         if (imp->kind != D_IMPORT) continue;
         for (int j = 0; j < imp->nimport_names; j++) {
-            if (imp->import_names[j] == name)
-                return mod_lookup_own(imp->import_module, name);
+            if (imp->import_names[j] == name) {
+                /* follow re-exports: the target may itself import this name */
+                Decl *r = mod_lookup(imp->import_module, name);
+                m->resolving = false;
+                return r;
+            }
         }
     }
+    m->resolving = false;
     return NULL;
 }
 
