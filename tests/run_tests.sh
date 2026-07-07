@@ -131,6 +131,21 @@ if [ -f lib/volt/gfx/native/linux-x64/libblend2d.so ]; then
         echo "FAIL gfx_canvas_blit (build failed)"
         fail=1
     fi
+    # volt/ui rendered through GfxPainter (blend2d rich tier)
+    uigfx_bin=apps/uigfx/.volt-cache/uigfx_test
+    if ./voltc build apps/uigfx/uigfx.vt -o "$uigfx_bin" >/dev/null 2>&1; then
+        printf 'close\n' > tests/tmp/uigfx.events
+        got=$(VS_HEADLESS=1 VS_EVENTS=tests/tmp/uigfx.events "$uigfx_bin" 2>&1)
+        if echo "$got" | grep -q "uigfx done"; then
+            echo "PASS gfx_ui_painter"
+        else
+            echo "FAIL gfx_ui_painter (got: $got)"
+            fail=1
+        fi
+    else
+        echo "FAIL gfx_ui_painter (build failed)"
+        fail=1
+    fi
 else
     echo "SKIP gfx_canvas_blit (no libblend2d — run lib/volt/gfx/native/build-blend2d.sh)"
 fi

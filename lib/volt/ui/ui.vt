@@ -48,6 +48,48 @@ export class Theme {
     }
 }
 
+// --------------------------------------------------------------- Painter
+
+// The drawing target widgets render through. The default SurfacePainter draws
+// straight to the volt/surface vector API (the lean tier — no blend2d). A
+// GfxPainter in volt/gfx draws through a blend2d Canvas (the rich tier). Widgets
+// only ever see a Painter, so volt/ui itself never depends on blend2d: apps that
+// want AA rendering pass a GfxPainter, everyone else pays nothing.
+export class Painter {
+    virtual fn fill(r: Rect, color: int) { }
+    virtual fn frame(r: Rect, color: int) { }
+    virtual fn line(x0: int, y0: int, x1: int, y1: int, color: int) { }
+    virtual fn text(x: int, y: int, s: string, color: int) { }
+    virtual fn text_in(r: Rect, pad: int, s: string, color: int) { }
+    virtual fn text_width(s: string): int { return 0; }
+    virtual fn font_ascent(): int { return 0; }
+    virtual fn font_height(): int { return 0; }
+    virtual fn width(): int { return 0; }
+    virtual fn height(): int { return 0; }
+    virtual fn present() { }
+}
+
+// Default painter: forwards every call to a volt/surface Surface.
+export class SurfacePainter extends Painter {
+    surf: Surface;
+    fn init(surf: Surface) { this.surf = surf; }
+    override fn fill(r: Rect, color: int) { this.surf.fill(r, color); }
+    override fn frame(r: Rect, color: int) { this.surf.frame(r, color); }
+    override fn line(x0: int, y0: int, x1: int, y1: int, color: int) {
+        this.surf.line(x0, y0, x1, y1, color);
+    }
+    override fn text(x: int, y: int, s: string, color: int) { this.surf.text(x, y, s, color); }
+    override fn text_in(r: Rect, pad: int, s: string, color: int) {
+        this.surf.text_in(r, pad, s, color);
+    }
+    override fn text_width(s: string): int { return this.surf.text_width(s); }
+    override fn font_ascent(): int { return this.surf.font_ascent(); }
+    override fn font_height(): int { return this.surf.font_height(); }
+    override fn width(): int { return this.surf.width(); }
+    override fn height(): int { return this.surf.height(); }
+    override fn present() { this.surf.present(); }
+}
+
 // ---------------------------------------------------------------- Widget
 
 export class Widget {
@@ -70,13 +112,13 @@ export class Widget {
     }
 
     // natural size, bottom-up
-    virtual fn measure(s: Surface, th: Theme): Size {
+    virtual fn measure(s: Painter, th: Theme): Size {
         return Size(this.bounds.w, this.bounds.h);
     }
 
     // assign absolute bounds, top-down. The base class keeps children at
     // their manually set bounds — the absolute-placement escape hatch.
-    virtual fn arrange(s: Surface, th: Theme, r: Rect) {
+    virtual fn arrange(s: Painter, th: Theme, r: Rect) {
         this.bounds = r;
         for (let c in this.children) {
             c.arrange(s, th, c.bounds);
@@ -85,9 +127,9 @@ export class Widget {
 
     // overlays (popups, dialogs) self-position against the whole surface;
     // normal widgets are placed by their parent's arrange() instead.
-    virtual fn place(s: Surface, th: Theme) { }
+    virtual fn place(s: Painter, th: Theme) { }
 
-    virtual fn draw(s: Surface, th: Theme) {
+    virtual fn draw(s: Painter, th: Theme) {
         for (let c in this.children) {
             c.draw(s, th);
         }
@@ -159,7 +201,7 @@ export class Column extends Widget {
         return this.spacing;
     }
 
-    override fn measure(s: Surface, th: Theme): Size {
+    override fn measure(s: Painter, th: Theme): Size {
         let pad = this.pad_of(th);
         let gap = this.gap_of(th);
         let w = 0;
@@ -174,7 +216,7 @@ export class Column extends Widget {
         return Size(w + 2 * pad, h + 2 * pad);
     }
 
-    override fn arrange(s: Surface, th: Theme, r: Rect) {
+    override fn arrange(s: Painter, th: Theme, r: Rect) {
         this.bounds = r;
         let pad = this.pad_of(th);
         let gap = this.gap_of(th);
@@ -239,7 +281,7 @@ export class Row extends Widget {
         return this.spacing;
     }
 
-    override fn measure(s: Surface, th: Theme): Size {
+    override fn measure(s: Painter, th: Theme): Size {
         let pad = this.pad_of(th);
         let gap = this.gap_of(th);
         let w = 0;
@@ -254,7 +296,7 @@ export class Row extends Widget {
         return Size(w + 2 * pad, h + 2 * pad);
     }
 
-    override fn arrange(s: Surface, th: Theme, r: Rect) {
+    override fn arrange(s: Painter, th: Theme, r: Rect) {
         this.bounds = r;
         let pad = this.pad_of(th);
         let gap = this.gap_of(th);
@@ -301,7 +343,7 @@ export class Spacer extends Widget {
         super.init();
         this.grow = 1;
     }
-    override fn measure(s: Surface, th: Theme): Size {
+    override fn measure(s: Painter, th: Theme): Size {
         return Size(0, 0);
     }
 }
@@ -318,11 +360,11 @@ export class Label extends Widget {
         this.strong = true;
     }
 
-    override fn measure(s: Surface, th: Theme): Size {
+    override fn measure(s: Painter, th: Theme): Size {
         return Size(s.text_width(this.text), s.font_height() + 6);
     }
 
-    override fn draw(s: Surface, th: Theme) {
+    override fn draw(s: Painter, th: Theme) {
         let color = th.muted;
         if (this.strong) { color = th.ink; }
         s.text_in(this.bounds, 0, this.text, color);
@@ -345,11 +387,11 @@ export class Button extends Widget {
         }
     }
 
-    override fn measure(s: Surface, th: Theme): Size {
+    override fn measure(s: Painter, th: Theme): Size {
         return Size(s.text_width(this.label) + 24, s.font_height() + 12);
     }
 
-    override fn draw(s: Surface, th: Theme) {
+    override fn draw(s: Painter, th: Theme) {
         s.fill(this.bounds, th.accent);
         if (this.focused) {
             s.frame(this.bounds, th.ink);
@@ -396,11 +438,11 @@ export class TextField extends Widget {
         this.caret = t.len;
     }
 
-    override fn measure(s: Surface, th: Theme): Size {
+    override fn measure(s: Painter, th: Theme): Size {
         return Size(s.text_width(this.placeholder) + 24, s.font_height() + 12);
     }
 
-    override fn draw(s: Surface, th: Theme) {
+    override fn draw(s: Painter, th: Theme) {
         s.fill(this.bounds, th.white);
         let border = th.muted;
         if (this.focused) { border = th.accent; }
@@ -497,11 +539,11 @@ export class Checkbox extends Widget {
         }
     }
 
-    override fn measure(s: Surface, th: Theme): Size {
+    override fn measure(s: Painter, th: Theme): Size {
         return Size(s.text_width(this.label) + 26, s.font_height() + 8);
     }
 
-    override fn draw(s: Surface, th: Theme) {
+    override fn draw(s: Painter, th: Theme) {
         let box = 14;
         let by = this.bounds.y + (this.bounds.h - box) / 2;
         let br = Rect(this.bounds.x, by, box, box);
@@ -584,11 +626,11 @@ export class ListBox extends Widget {
         this.scroll_into_view();
     }
 
-    override fn measure(s: Surface, th: Theme): Size {
+    override fn measure(s: Painter, th: Theme): Size {
         return Size(200, ROW_H * 5 + 2);
     }
 
-    override fn draw(s: Surface, th: Theme) {
+    override fn draw(s: Painter, th: Theme) {
         s.fill(this.bounds, th.white);
         let border = th.muted;
         if (this.focused) { border = th.accent; }
@@ -734,7 +776,7 @@ export class TextArea extends Widget {
         this.lines = out;
     }
 
-    override fn measure(s: Surface, th: Theme): Size {
+    override fn measure(s: Painter, th: Theme): Size {
         return Size(360, (s.font_height() + 2) * 10 + 2 * TA_PAD);
     }
 
@@ -840,7 +882,7 @@ export class TextArea extends Widget {
         return true;
     }
 
-    override fn draw(s: Surface, th: Theme) {
+    override fn draw(s: Painter, th: Theme) {
         this.line_h = s.font_height() + 2;
         let inner_h = this.bounds.h - 2 * TA_PAD;
         let inner_w = this.bounds.w - 2 * TA_PAD;
@@ -939,7 +981,7 @@ export class MenuBar extends Widget {
         return menu;
     }
 
-    override fn draw(s: Surface, th: Theme) {
+    override fn draw(s: Painter, th: Theme) {
         s.fill(this.bounds, th.bg);
         s.line(this.bounds.x, this.bounds.y + this.bounds.h - 1,
                this.bounds.x + this.bounds.w, this.bounds.y + this.bounds.h - 1, th.muted);
@@ -996,7 +1038,7 @@ export class MenuPopup extends Widget {
         this.row_h = 20;
     }
 
-    override fn place(s: Surface, th: Theme) {
+    override fn place(s: Painter, th: Theme) {
         this.row_h = s.font_height() + 8;
         let w = 40;
         for (let it in this.menu.items) {
@@ -1019,7 +1061,7 @@ export class MenuPopup extends Widget {
         it.fire();
     }
 
-    override fn draw(s: Surface, th: Theme) {
+    override fn draw(s: Painter, th: Theme) {
         s.fill(this.bounds, th.white);
         s.frame(this.bounds, th.muted);
         for (let i in 0..this.menu.items.len) {
@@ -1078,7 +1120,7 @@ export class Dialog extends Widget {
         w.dismiss_overlay();
     }
 
-    override fn draw(s: Surface, th: Theme) {
+    override fn draw(s: Painter, th: Theme) {
         s.fill(this.bounds, th.white);
         s.frame(this.bounds, th.ink);
         let tb = Rect(this.bounds.x, this.bounds.y, this.bounds.w, s.font_height() + 10);
@@ -1163,7 +1205,7 @@ export class FilePicker extends Dialog {
         if (cb != null) { cb(full); }
     }
 
-    override fn place(s: Surface, th: Theme) {
+    override fn place(s: Painter, th: Theme) {
         let dw = 380;
         let dh = 320;
         let x = (s.width() - dw) / 2;
@@ -1240,7 +1282,7 @@ export class MessageDialog extends Dialog {
         this.add(this.ok);
     }
 
-    override fn place(s: Surface, th: Theme) {
+    override fn place(s: Painter, th: Theme) {
         let dw = 320;
         let dh = 140;
         let x = (s.width() - dw) / 2;
@@ -1250,7 +1292,7 @@ export class MessageDialog extends Dialog {
         this.ok.bounds = Rect(x + dw - 12 - 90, y + dh - 12 - ctrl, 90, ctrl);
     }
 
-    override fn draw(s: Surface, th: Theme) {
+    override fn draw(s: Painter, th: Theme) {
         s.fill(this.bounds, th.white);
         s.frame(this.bounds, th.ink);
         let tb = Rect(this.bounds.x, this.bounds.y, this.bounds.w, s.font_height() + 10);
@@ -1277,6 +1319,7 @@ export class MessageDialog extends Dialog {
 
 export class Window {
     surf: Surface;
+    painter: Painter;   // widgets draw through this; default = SurfacePainter
     root: Widget;
     menubar: MenuBar;   // optional; drawn in a top strip above root
     overlay: Widget;    // optional; popup or modal dialog on top of everything
@@ -1288,6 +1331,7 @@ export class Window {
 
     fn init(title: string, w: int, h: int) {
         this.surf = new Surface(title, w, h);
+        this.painter = new SurfacePainter(this.surf);
         this.theme = new Theme();
         this.focusables = [];
         this.focus_i = -1;
@@ -1296,6 +1340,10 @@ export class Window {
 
     // escape hatch: the raw surface underneath
     fn surface(): Surface { return this.surf; }
+
+    // opt into a custom painter (e.g. volt/gfx GfxPainter for AA rendering).
+    // Call before run(); the painter draws and presents each frame.
+    fn use_painter(p: Painter) { this.painter = p; }
 
     fn close() { this.running = false; }
 
@@ -1345,17 +1393,17 @@ export class Window {
         let h = this.surf.height();
         let top = 0;
         if (this.menubar != null) {
-            let sh = this.surf.font_height() + 8;
+            let sh = this.painter.font_height() + 8;
             this.menubar.win = this;
-            this.menubar.arrange(this.surf, this.theme, Rect(0, 0, w, sh));
+            this.menubar.arrange(this.painter, this.theme, Rect(0, 0, w, sh));
             top = sh;
         }
         if (this.root != null) {
-            this.root.measure(this.surf, this.theme);
-            this.root.arrange(this.surf, this.theme, Rect(0, top, w, h - top));
+            this.root.measure(this.painter, this.theme);
+            this.root.arrange(this.painter, this.theme, Rect(0, top, w, h - top));
         }
         if (this.overlay != null) {
-            this.overlay.place(this.surf, this.theme);
+            this.overlay.place(this.painter, this.theme);
         }
         // focus ring covers the root tree; overlays manage their own focus
         let old = this.focused_widget();
@@ -1375,17 +1423,17 @@ export class Window {
     }
 
     fn redraw() {
-        this.surf.fill(Rect(0, 0, this.surf.width(), this.surf.height()), this.theme.bg);
+        this.painter.fill(Rect(0, 0, this.surf.width(), this.surf.height()), this.theme.bg);
         if (this.root != null) {
-            this.root.draw(this.surf, this.theme);
+            this.root.draw(this.painter, this.theme);
         }
         if (this.menubar != null) {
-            this.menubar.draw(this.surf, this.theme);
+            this.menubar.draw(this.painter, this.theme);
         }
         if (this.overlay != null) {
-            this.overlay.draw(this.surf, this.theme);
+            this.overlay.draw(this.painter, this.theme);
         }
-        this.surf.present();
+        this.painter.present();
     }
 
     fn on_key_ev(k: int, ch: string) {

@@ -1,0 +1,69 @@
+// volt/gfx/painter — a GfxPainter that lets volt/ui render through a blend2d
+// Canvas (anti-aliased shapes + proportional text) instead of the surface's
+// vector calls. This is the rich tier: an app opts in with
+//
+//     let win = new Window("App", w, h);
+//     win.use_painter(new GfxPainter(win.surface(), "/path/DejaVuSans.ttf", 15.0));
+//     win.run();
+//
+// It lives in its own module so plain Canvas users (import "volt/gfx") don't
+// pull in volt/ui, and volt/ui apps don't pull in blend2d unless they use this.
+import { Painter } from "volt/ui";
+import { Canvas } from "volt/gfx";
+import { Surface, Rect } from "volt/surface";
+
+export class GfxPainter extends Painter {
+    surf: Surface;
+    canvas: Canvas;
+
+    fn init(surf: Surface, fontPath: string, fontSize: float) {
+        this.surf = surf;
+        this.canvas = new Canvas(surf.width(), surf.height());
+        this.canvas.loadFont(fontPath, fontSize);
+    }
+
+    override fn fill(r: Rect, color: int) {
+        this.canvas.fillRect(r.x as float, r.y as float, r.w as float, r.h as float, color);
+    }
+
+    // 1px outline, matching Surface.frame
+    override fn frame(r: Rect, color: int) {
+        let x = r.x as float;
+        let y = r.y as float;
+        let w = r.w as float;
+        let h = r.h as float;
+        this.canvas.fillRect(x, y, w, 1.0, color);
+        this.canvas.fillRect(x, y + h - 1.0, w, 1.0, color);
+        this.canvas.fillRect(x, y, 1.0, h, color);
+        this.canvas.fillRect(x + w - 1.0, y, 1.0, h, color);
+    }
+
+    override fn line(x0: int, y0: int, x1: int, y1: int, color: int) {
+        this.canvas.strokeLine(x0 as float, y0 as float, x1 as float, y1 as float, 1.0, color);
+    }
+
+    // Surface.text takes a baseline origin; Canvas.text does too.
+    override fn text(x: int, y: int, s: string, color: int) {
+        this.canvas.text(x as float, y as float, s, color);
+    }
+
+    // vertically center in r with a left pad — same formula as Surface.text_in
+    override fn text_in(r: Rect, pad: int, s: string, color: int) {
+        let baseline = r.y + (r.h + this.font_ascent()) / 2 - 1;
+        this.text(r.x + pad, baseline, s, color);
+    }
+
+    override fn text_width(s: string): int { return this.canvas.textWidth(s) as int; }
+    override fn font_ascent(): int { return this.canvas.fontAscent() as int; }
+    override fn font_height(): int { return this.canvas.fontHeight() as int; }
+    override fn width(): int { return this.canvas.width(); }
+    override fn height(): int { return this.canvas.height(); }
+
+    // rasterize the frame and blit it to the window
+    override fn present() {
+        this.canvas.flush();
+        this.surf.blitPtr(this.canvas.pixels(), this.canvas.width(), this.canvas.height(),
+                          Rect(0, 0, this.canvas.width(), this.canvas.height()));
+        this.surf.present();
+    }
+}
