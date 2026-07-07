@@ -318,6 +318,23 @@ void vs_draw_text(void *vs, int x, int y, const char *str, int rgb) {
     TextOutA(s->memdc, x, y - tm.tmAscent, str, (int)strlen(str));
 }
 
+void vs_blit(void *vs, const int *pixels, int srcw, int srch,
+             int dstx, int dsty, int dstw, int dsth) {
+    VSurf *s = vs;
+    if (!s->hwnd || srcw <= 0 || srch <= 0) return;
+    BITMAPINFO bmi;
+    memset(&bmi, 0, sizeof bmi);
+    bmi.bmiHeader.biSize = sizeof bmi.bmiHeader;
+    bmi.bmiHeader.biWidth = srcw;
+    bmi.bmiHeader.biHeight = -srch; /* top-down: first row is y=0 */
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32; /* DWORD is 0x00RRGGBB — matches our ints */
+    bmi.bmiHeader.biCompression = BI_RGB;
+    SetStretchBltMode(s->memdc, COLORONCOLOR); /* nearest-neighbor */
+    StretchDIBits(s->memdc, dstx, dsty, dstw, dsth, 0, 0, srcw, srch, pixels, &bmi,
+                  DIB_RGB_COLORS, SRCCOPY);
+}
+
 void vs_present(void *vs) {
     VSurf *s = vs;
     if (!s->hwnd) return;
@@ -530,6 +547,36 @@ void vs_draw_text(void *vs, int x, int y, const char *str, int rgb) {
     if (!s->dpy) return;
     XSetForeground(s->dpy, s->gc, pixel_of(s->dpy, rgb));
     XDrawString(s->dpy, s->back, s->gc, x, y, str, (int)strlen(str));
+}
+
+/* nearest-neighbor blit of a 0x00RRGGBB pixel buffer into the backbuffer.
+   A dest-sized XImage is cached across calls and reused (single window). */
+void vs_blit(void *vs, const int *pixels, int srcw, int srch,
+             int dstx, int dsty, int dstw, int dsth) {
+    VSurf *s = vs;
+    if (!s->dpy || srcw <= 0 || srch <= 0 || dstw <= 0 || dsth <= 0) return;
+    static XImage *img;
+    static int img_w, img_h;
+    int scr = DefaultScreen(s->dpy);
+    if (!img || img_w != dstw || img_h != dsth) {
+        if (img) XDestroyImage(img); /* frees the malloc'd data too */
+        char *buf = malloc((size_t)dstw * (size_t)dsth * 4);
+        if (!buf) return;
+        img = XCreateImage(s->dpy, DefaultVisual(s->dpy, scr),
+                           (unsigned)DefaultDepth(s->dpy, scr), ZPixmap, 0, buf,
+                           (unsigned)dstw, (unsigned)dsth, 32, 0);
+        if (!img) { free(buf); return; }
+        img_w = dstw;
+        img_h = dsth;
+    }
+    for (int dy = 0; dy < dsth; dy++) {
+        int sy = dy * srch / dsth;
+        for (int dx = 0; dx < dstw; dx++) {
+            int sx = dx * srcw / dstw;
+            XPutPixel(img, dx, dy, pixel_of(s->dpy, pixels[sy * srcw + sx]));
+        }
+    }
+    XPutImage(s->dpy, s->back, s->gc, img, 0, 0, dstx, dsty, (unsigned)dstw, (unsigned)dsth);
 }
 
 void vs_present(void *vs) {

@@ -47,6 +47,10 @@ void vs_fill_rect(void *s, int x, int y, int w, int h, int rgb);
 void vs_draw_rect(void *s, int x, int y, int w, int h, int rgb);
 void vs_draw_line(void *s, int x0, int y0, int x1, int y1, int rgb);
 void vs_draw_text(void *s, int x, int y, const char *str, int rgb);
+/* copy a srcw*srch buffer of 0x00RRGGBB pixels (row-major, pixels[y*srcw+x])
+   into the backbuffer, nearest-neighbor scaled to the dst rect. present() after. */
+void vs_blit(void *s, const int *pixels, int srcw, int srch,
+             int dstx, int dsty, int dstw, int dsth);
 void vs_present(void *s); /* blit backbuffer to the window and flush */
 
 int vs_text_width(void *s, const char *str);

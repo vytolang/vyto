@@ -1030,10 +1030,11 @@ static Type *check_expr(Ctx *c, Expr *e, Type *expected) {
         if ((src->kind == TY_CSTRING && dst->kind == TY_RAWPTR) ||
             (src->kind == TY_RAWPTR && dst->kind == TY_CSTRING))
             return e->type = dst;
-        if (src->kind == TY_ARRAY &&
-            (norm_kind(src->elem->kind) == TY_BYTE || norm_kind(src->elem->kind) == TY_I8) &&
-            (dst->kind == TY_CSTRING || dst->kind == TY_RAWPTR))
-            return e->type = dst; /* borrowed view of the array's buffer */
+        if (src->kind == TY_ARRAY && dst->kind == TY_RAWPTR)
+            return e->type = dst; /* borrowed pointer to the array's element buffer */
+        if (src->kind == TY_ARRAY && dst->kind == TY_CSTRING &&
+            (norm_kind(src->elem->kind) == TY_BYTE || norm_kind(src->elem->kind) == TY_I8))
+            return e->type = dst; /* byte[]/i8[] as a borrowed C string view */
         if (src->kind == TY_FN && dst->kind == TY_RAWPTR)
             return e->type = dst; /* closure as userdata for cthunk callbacks (borrowed) */
         fatal_at(e->loc, "cannot cast %s to %s", type_str(src), type_str(dst));
