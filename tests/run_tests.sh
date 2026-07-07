@@ -129,6 +129,61 @@ for src in tests/ui/[0-9]*.vt; do
     fi
 done
 
+# --- volt/ui named golden tests: TextArea + menus (no env needed) ---
+for name in textarea menu; do
+    got=$(VS_HEADLESS=1 VS_EVENTS="tests/ui/$name.events" ./voltc run "tests/ui/$name.vt" 2>&1)
+    if [ "$got" = "$(cat "tests/ui/$name.expected")" ]; then
+        echo "PASS ui_$name"
+    else
+        echo "FAIL ui_$name"
+        echo "--- expected ---"; cat "tests/ui/$name.expected"
+        echo "--- got ---"; printf '%s\n' "$got"
+        fail=1
+    fi
+done
+
+# --- listdir / isdir builtins + FilePicker over a seeded directory ---
+mkdir -p tests/tmp/pickdir/sub
+printf 'aaa\n' > tests/tmp/pickdir/a.txt
+printf 'bbb\n' > tests/tmp/pickdir/b.txt
+printf 'inner\n' > tests/tmp/pickdir/sub/inner.txt
+got=$(./voltc run tests/fixtures/listdir.vt 2>&1)
+want=".. (dir)
+a.txt (file)
+b.txt (file)
+sub (dir)"
+if [ "$got" = "$want" ]; then
+    echo "PASS listdir"
+else
+    echo "FAIL listdir"; printf '%s\n' "$got"; fail=1
+fi
+got=$(VS_HEADLESS=1 VS_EVENTS=tests/ui/filepicker.events VOLT_PICK_DIR=tests/tmp/pickdir \
+      ./voltc run tests/ui/filepicker.vt 2>&1)
+if [ "$got" = "$(cat tests/ui/filepicker.expected)" ]; then
+    echo "PASS ui_filepicker"
+else
+    echo "FAIL ui_filepicker"
+    echo "--- expected ---"; cat tests/ui/filepicker.expected
+    echo "--- got ---"; printf '%s\n' "$got"
+    fail=1
+fi
+
+# --- VoltPad headless end-to-end: type, Save As through the menu+picker ---
+mkdir -p tests/tmp/notedir
+rm -f tests/tmp/notedir/out.txt
+out=$(VS_HEADLESS=1 VS_EVENTS=tests/ui/notepad_save.events VOLT_NOTE_DIR=tests/tmp/notedir \
+      ./voltc run apps/notepad/notepad.vt 2>&1)
+saved=$(cat tests/tmp/notedir/out.txt 2>/dev/null)
+want_note="hello
+world"
+if [ "$out" = "bye — 11 byte(s), file: tests/tmp/notedir/out.txt" ] && [ "$saved" = "$want_note" ]; then
+    echo "PASS notepad_e2e"
+else
+    echo "FAIL notepad_e2e"
+    printf 'out: %s\nsaved: %s\n' "$out" "$saved"
+    fail=1
+fi
+
 # --- VoltTodo-V2 headless end-to-end: add/toggle, then reload from disk ---
 mkdir -p tests/tmp
 rm -f tests/tmp/todo2.txt
@@ -175,6 +230,12 @@ if [ -f /usr/include/X11/Xlib.h ]; then
         echo "PASS app_uidemo_builds"
     else
         echo "FAIL app_uidemo_builds"
+        fail=1
+    fi
+    if ./voltc build apps/notepad/notepad.vt >/dev/null; then
+        echo "PASS app_notepad_builds"
+    else
+        echo "FAIL app_notepad_builds"
         fail=1
     fi
 else

@@ -125,6 +125,8 @@ typedef enum BuiltinKind {
     B_CTHUNK_LAST,  /* cthunk_last(closure): userdata last */
     B_READFILE,     /* readfile(path): string */
     B_READLINES,    /* readlines(path): string[] */
+    B_LISTDIR,      /* listdir(path): string[] */
+    B_ISDIR,        /* isdir(path): bool */
     B_WRITEFILE,    /* writefile(path, data): bool */
     B_APPENDFILE,   /* appendfile(path, data): bool */
     B_BYTES,        /* bytes(n): byte[] — zeroed, sized buffer for FFI */

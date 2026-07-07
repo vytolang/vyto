@@ -1,0 +1,122 @@
+// VoltPad — a classic Notepad built on volt/ui.
+//
+// Menu bar (File / Help), a multi-line editor, and a status line — all from
+// stdlib widgets, zero platform code. Directory-listing file picker for
+// Open / Save As uses the listdir/isdir builtins.
+//
+//   VOLT_NOTE_FILE=/path/to/file   open this file at startup (default none)
+//   VOLT_NOTE_DIR=/path            starting directory for the file picker
+
+import { Window, Column, Row, Spacer, Label, TextArea,
+         MenuBar, Menu, FilePicker, MessageDialog } from "volt/ui";
+
+extern "C" {
+    fn getenv(name: cstring): cstring;
+    fn access(path: cstring, mode: i32): i32;
+}
+
+fn env_or(name: string, fallback: string): string {
+    let v = getenv(name.cstr());
+    if (v == null) { return fallback; }
+    return str(v);
+}
+
+fn file_exists(path: string): bool {
+    return access(path.cstr(), 0) == 0;
+}
+
+class Pad {
+    editor: TextArea;
+    status: Label;
+    path: string;
+    modified: bool;
+
+    fn init(path0: string) {
+        this.editor = new TextArea();
+        this.editor.grow = 1;
+        this.status = new Label("");
+        this.status.strong = false;
+        this.path = path0;
+        if (path0.len > 0 && file_exists(path0)) {
+            this.editor.set_text(readfile(path0));
+        }
+        this.refresh();
+    }
+
+    fn refresh() {
+        let name = this.path;
+        if (name.len == 0) { name = "(untitled)"; }
+        let star = "";
+        if (this.modified) { star = "  *modified"; }
+        this.status.text = name + "   Ln " + (this.editor.caret_row + 1)
+                         + ", Col " + (this.editor.caret_col + 1) + star;
+    }
+
+    fn touched() {
+        this.modified = true;
+        this.refresh();
+    }
+
+    fn do_new() {
+        this.editor.set_text("");
+        this.path = "";
+        this.modified = false;
+        this.refresh();
+    }
+
+    fn load(p: string) {
+        this.editor.set_text(readfile(p));
+        this.path = p;
+        this.modified = false;
+        this.refresh();
+    }
+
+    fn save_to(p: string) {
+        writefile(p, this.editor.text());
+        this.path = p;
+        this.modified = false;
+        this.refresh();
+    }
+}
+
+fn main() {
+    let start_file = env_or("VOLT_NOTE_FILE", "");
+    let dir = env_or("VOLT_NOTE_DIR", env_or("PWD", "."));
+
+    let win = new Window("VoltPad", 560, 480);
+    let pad = new Pad(start_file);
+
+    // dialogs created once at top level so their handlers are not nested
+    // closures (Volt v0.1 disallows nesting) — menu items just reopen them.
+    let open_pk = new FilePicker(dir, false);
+    open_pk.onAccept = (p) => pad.load(p);
+    let save_pk = new FilePicker(dir, true);
+    save_pk.onAccept = (p) => pad.save_to(p);
+    let about = new MessageDialog("About VoltPad", "VoltPad — a volt/ui Notepad");
+
+    pad.editor.onChange = () => pad.touched();
+
+    let bar = new MenuBar();
+    let file = bar.add_menu(new Menu("File"));
+    file.add("New").onSelect = () => pad.do_new();
+    file.add("Open...").onSelect = () => { open_pk.reload(); win.open_overlay(open_pk); };
+    file.add("Save").onSelect = () => {
+        if (pad.path.len > 0) { pad.save_to(pad.path); }
+        else { save_pk.reload(); win.open_overlay(save_pk); }
+    };
+    file.add("Save As...").onSelect = () => { save_pk.reload(); win.open_overlay(save_pk); };
+    file.add("Exit").onSelect = () => win.close();
+
+    let help = bar.add_menu(new Menu("Help"));
+    help.add("About").onSelect = () => win.open_overlay(about);
+
+    win.menubar = bar;
+    win.close_on_esc = false; // Esc dismisses menus/dialogs, never the editor
+    win.root = new Column([
+        pad.editor,
+        new Row([pad.status, new Spacer()]),
+    ]);
+    win.run();
+
+    print("bye — " + pad.editor.text().len + " byte(s), file: " + pad.path);
+}

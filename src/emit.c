@@ -337,6 +337,13 @@ static char *emit_call(Em *em, Expr *e, bool *fresh) {
             *fresh = true;
             return arena_printf(&g_arena, "vt_file_lines(%s, \"%s\", %d)", ex_b(em, a[0]),
                                 c_escape(e->loc.file, strlen(e->loc.file)), e->loc.line);
+        case B_LISTDIR:
+            *fresh = true;
+            return arena_printf(&g_arena, "vt_dir_list(%s, \"%s\", %d)", ex_b(em, a[0]),
+                                c_escape(e->loc.file, strlen(e->loc.file)), e->loc.line);
+        case B_ISDIR:
+            *fresh = false;
+            return arena_printf(&g_arena, "vt_is_dir(%s)", ex_b(em, a[0]));
         case B_WRITEFILE:
         case B_APPENDFILE:
             *fresh = false;

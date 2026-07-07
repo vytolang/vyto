@@ -2,6 +2,12 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <dirent.h>
+#include <sys/stat.h>
+#endif
 
 /* ---- core RC ---- */
 
@@ -184,6 +190,76 @@ VtArray *vt_file_lines(VtString *path, const char *file, int line) {
     }
     vt_release(whole);
     return a;
+}
+
+static int cstr_cmp(const void *a, const void *b) {
+    return strcmp(*(const char *const *)a, *(const char *const *)b);
+}
+
+/* directory entry names (excluding ".", including ".."), sorted ascending */
+VtArray *vt_dir_list(VtString *path, const char *file, int line) {
+    const char *dir = vt_str_cstr(path);
+    char *names[4096];
+    int n = 0;
+#ifdef _WIN32
+    char pat[1024];
+    snprintf(pat, sizeof pat, "%s\\*", dir);
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(pat, &fd);
+    if (h == INVALID_HANDLE_VALUE) {
+        char buf[512];
+        snprintf(buf, sizeof buf, "cannot open directory: %s", dir);
+        vt_panic_c(file, line, buf);
+    }
+    do {
+        if (strcmp(fd.cFileName, ".") == 0) continue;
+        if (n < 4096) {
+            size_t len = strlen(fd.cFileName) + 1;
+            names[n] = malloc(len);
+            memcpy(names[n], fd.cFileName, len);
+            n++;
+        }
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+#else
+    DIR *d = opendir(dir);
+    if (!d) {
+        char buf[512];
+        snprintf(buf, sizeof buf, "cannot open directory: %s", dir);
+        vt_panic_c(file, line, buf);
+    }
+    struct dirent *de;
+    while ((de = readdir(d))) {
+        if (strcmp(de->d_name, ".") == 0) continue;
+        if (n < 4096) {
+            size_t len = strlen(de->d_name) + 1;
+            names[n] = malloc(len);
+            memcpy(names[n], de->d_name, len);
+            n++;
+        }
+    }
+    closedir(d);
+#endif
+    qsort(names, (size_t)n, sizeof names[0], cstr_cmp);
+    VtArray *a = vt_arr_new(sizeof(VtString *), true);
+    for (int i = 0; i < n; i++) {
+        VtString *s = vt_str_from_cstr(names[i]);
+        vt_arr_push(a, &s); /* push retains */
+        vt_release(s);
+        free(names[i]);
+    }
+    return a;
+}
+
+bool vt_is_dir(VtString *path) {
+    const char *p = vt_str_cstr(path);
+#ifdef _WIN32
+    DWORD a = GetFileAttributesA(p);
+    return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY) != 0;
+#else
+    struct stat st;
+    return stat(p, &st) == 0 && S_ISDIR(st.st_mode);
+#endif
 }
 
 /* ---- arrays ---- */

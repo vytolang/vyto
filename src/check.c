@@ -525,6 +525,24 @@ static Type *check_call(Ctx *c, Expr *e) {
             t->elem = ty_string();
             return e->type = t;
         }
+        if (n == intern("listdir")) {
+            if (e->nargs != 1) fatal_at(e->loc, "listdir takes 1 argument");
+            check_expr(c, e->args[0], ty_string());
+            want(c, e->args[0], ty_string(), "path");
+            e->ref = REF_BUILTIN;
+            e->builtin = B_LISTDIR;
+            Type *t = mk_type(TY_ARRAY);
+            t->elem = ty_string();
+            return e->type = t;
+        }
+        if (n == intern("isdir")) {
+            if (e->nargs != 1) fatal_at(e->loc, "isdir takes 1 argument");
+            check_expr(c, e->args[0], ty_string());
+            want(c, e->args[0], ty_string(), "path");
+            e->ref = REF_BUILTIN;
+            e->builtin = B_ISDIR;
+            return e->type = ty_bool();
+        }
         if (n == intern("writefile") || n == intern("appendfile")) {
             if (e->nargs != 2) fatal_at(e->loc, "%s takes 2 arguments (path, data)", n);
             for (int i = 0; i < 2; i++) {

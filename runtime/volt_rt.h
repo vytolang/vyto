@@ -78,6 +78,8 @@ void vt_panic(const char *file, int line, VtString *msg);
 VtString *vt_file_read(VtString *path, const char *file, int line); /* panics if unreadable */
 bool vt_file_write(VtString *path, VtString *data, bool append);
 struct VtArray *vt_file_lines(VtString *path, const char *file, int line); /* string[] */
+struct VtArray *vt_dir_list(VtString *path, const char *file, int line);   /* string[], sorted */
+bool vt_is_dir(VtString *path);
 
 /* ---- dynamic arrays ---- */
 
