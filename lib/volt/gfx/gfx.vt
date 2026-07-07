@@ -1,0 +1,83 @@
+// volt/gfx — a blend2d-backed 2D canvas: anti-aliased paths, gradients, and
+// proportional text rasterized into a pixel buffer you hand to Surface.blit.
+// The rich-tier paint layer (the vector surface calls can't do AA/clip/text
+// shaping). blend2d ships as a prebuilt shared lib in native/<platform>/.
+//
+//   let cv = new Canvas(w, h);
+//   cv.clear(0x141821);
+//   cv.fillRoundRect(20.0, 20.0, 200.0, 80.0, 12.0, 0x3C60C0);
+//   cv.flush();
+//   surface.blitPtr(cv.pixels(), w, h, Rect(0, 0, w, h));
+
+extern "C" {
+    fn gfx_canvas_new(w: i32, h: i32): rawptr;
+    fn gfx_canvas_free(c: rawptr);
+    fn gfx_width(c: rawptr): i32;
+    fn gfx_height(c: rawptr): i32;
+    fn gfx_clear(c: rawptr, rgb: i32);
+    fn gfx_fill_rect(c: rawptr, x: f64, y: f64, w: f64, h: f64, rgb: i32);
+    fn gfx_fill_round_rect(c: rawptr, x: f64, y: f64, w: f64, h: f64, r: f64, rgb: i32);
+    fn gfx_fill_circle(c: rawptr, cx: f64, cy: f64, radius: f64, rgb: i32);
+    fn gfx_stroke_line(c: rawptr, x0: f64, y0: f64, x1: f64, y1: f64, width: f64, rgb: i32);
+    fn gfx_linear_gradient_rect(c: rawptr, x: f64, y: f64, w: f64, h: f64,
+                                x0: f64, y0: f64, x1: f64, y1: f64, rgb0: i32, rgb1: i32);
+    fn gfx_load_font(c: rawptr, path: cstring, size: f64): i32;
+    fn gfx_text(c: rawptr, x: f64, y: f64, s: cstring, rgb: i32);
+    fn gfx_text_width(c: rawptr, s: cstring): f64;
+    fn gfx_font_ascent(c: rawptr): f64;
+    fn gfx_font_height(c: rawptr): f64;
+    fn gfx_flush(c: rawptr);
+    fn gfx_pixels(c: rawptr): rawptr;
+    fn gfx_stride(c: rawptr): i32;
+}
+
+// A drawable canvas. Colors are 0xRRGGBB (opaque). Coordinates are pixels;
+// float arguments map to blend2d's sub-pixel double geometry.
+export class Canvas {
+    handle: rawptr;
+
+    fn init(w: int, h: int) {
+        this.handle = gfx_canvas_new(w as i32, h as i32);
+    }
+
+    deinit {
+        gfx_canvas_free(this.handle);
+    }
+
+    fn width(): int { return gfx_width(this.handle) as int; }
+    fn height(): int { return gfx_height(this.handle) as int; }
+
+    fn clear(rgb: int) { gfx_clear(this.handle, rgb as i32); }
+
+    fn fillRect(x: float, y: float, w: float, h: float, rgb: int) {
+        gfx_fill_rect(this.handle, x, y, w, h, rgb as i32);
+    }
+    fn fillRoundRect(x: float, y: float, w: float, h: float, r: float, rgb: int) {
+        gfx_fill_round_rect(this.handle, x, y, w, h, r, rgb as i32);
+    }
+    fn fillCircle(cx: float, cy: float, radius: float, rgb: int) {
+        gfx_fill_circle(this.handle, cx, cy, radius, rgb as i32);
+    }
+    fn strokeLine(x0: float, y0: float, x1: float, y1: float, width: float, rgb: int) {
+        gfx_stroke_line(this.handle, x0, y0, x1, y1, width, rgb as i32);
+    }
+    fn linearGradientRect(x: float, y: float, w: float, h: float,
+                          x0: float, y0: float, x1: float, y1: float, rgb0: int, rgb1: int) {
+        gfx_linear_gradient_rect(this.handle, x, y, w, h, x0, y0, x1, y1, rgb0 as i32, rgb1 as i32);
+    }
+
+    fn loadFont(path: string, size: float): bool {
+        return gfx_load_font(this.handle, path.cstr(), size) != 0;
+    }
+    fn text(x: float, y: float, s: string, rgb: int) {
+        gfx_text(this.handle, x, y, s.cstr(), rgb as i32);
+    }
+    fn textWidth(s: string): float { return gfx_text_width(this.handle, s.cstr()); }
+    fn fontAscent(): float { return gfx_font_ascent(this.handle); }
+    fn fontHeight(): float { return gfx_font_height(this.handle); }
+
+    // Finish pending rendering, then expose the raw 0xRRGGBB buffer for blit.
+    fn flush() { gfx_flush(this.handle); }
+    fn pixels(): rawptr { return gfx_pixels(this.handle); }
+    fn stride(): int { return gfx_stride(this.handle) as int; }
+}

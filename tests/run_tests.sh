@@ -116,6 +116,25 @@ else
     fail=1
 fi
 
+# --- volt/gfx: blend2d Canvas -> blitPtr (gated on the prebuilt lib) ---
+if [ -f lib/volt/gfx/native/linux-x64/libblend2d.so ]; then
+    gfx_bin=apps/gfxdemo/.volt-cache/gfxdemo_test
+    if ./voltc build apps/gfxdemo/gfxdemo.vt -o "$gfx_bin" >/dev/null 2>&1; then
+        got=$(VS_HEADLESS=1 VS_EVENTS=/dev/null "$gfx_bin" 2>&1)
+        if echo "$got" | grep -q "gfx demo painted"; then
+            echo "PASS gfx_canvas_blit"
+        else
+            echo "FAIL gfx_canvas_blit (got: $got)"
+            fail=1
+        fi
+    else
+        echo "FAIL gfx_canvas_blit (build failed)"
+        fail=1
+    fi
+else
+    echo "SKIP gfx_canvas_blit (no libblend2d — run lib/volt/gfx/native/build-blend2d.sh)"
+fi
+
 # --- readfile/readlines on a growable /proc file (size 0 by stat) ---
 if [ -r /proc/self/status ]; then
     got=$(./voltc run tests/fixtures/proc_read.vt 2>&1)
