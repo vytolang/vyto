@@ -199,6 +199,19 @@ static bool have_tcc(void) {
     return cached == 1;
 }
 
+/* Does this cc support -fsanitize=signed-integer-overflow and link libubsan?
+   Probed once by compiling a trivial program; degrades to off if unavailable. */
+static bool cc_supports_san(const char *cc) {
+    static int cached = -1;
+    if (cached < 0) {
+        char *cmd = arena_printf(&g_arena,
+            "printf 'int main(void){return 0;}' | %s -fsanitize=signed-integer-overflow "
+            "-fno-sanitize-recover=all -x c - -o /dev/null 2>/dev/null", cc);
+        cached = run_cmd(cmd, false) == 0 ? 1 : 0;
+    }
+    return cached == 1;
+}
+
 static const char *volt_triple(void) {
 #if defined(_WIN32) && defined(_M_X64)
     return "windows-x64";
@@ -316,6 +329,12 @@ int main(int argc, char **argv) {
         cc = have_tcc() && !release ? "tcc" : "cc";
     }
     const char *opt = release ? "-O2" : (strcmp(cc, "tcc") == 0 ? "" : "-O0");
+    /* Debug builds also trap overflow at the C level (defense in depth beyond
+       the emitter's checked arithmetic), catching overflow in native/FFI code.
+       Native host compilers only; skipped for cross/tcc or if unsupported. */
+    const char *san = "";
+    if (!release && !cross && !win_target && strcmp(cc, "tcc") != 0 && cc_supports_san(cc))
+        san = " -fsanitize=signed-integer-overflow -fno-sanitize-recover=all";
 
     SBuf objs;
     sb_init(&objs);
@@ -399,7 +418,7 @@ int main(int argc, char **argv) {
         SBuf h, c;
         sb_init(&h);
         sb_init(&c);
-        emit_module(m, m == entry, &h, &c);
+        emit_module(m, m == entry, !release, &h, &c);
         const char *hpath = arena_printf(&g_arena, "%s/mod_%s.h", cache, m->name);
         const char *cpath = arena_printf(&g_arena, "%s/mod_%s.c", cache, m->name);
         bool hchanged = false, cchanged = false;
@@ -426,8 +445,8 @@ int main(int argc, char **argv) {
                                          release ? "_rel" : "");
         if (m->src_hash || any_h_changed || !file_exists(opath) ||
             file_mtime(arena_printf(&g_arena, "%s/volt_rt.h", rtdir)) > file_mtime(opath)) {
-            char *cmdline = arena_printf(&g_arena, "%s %s -w -I%s -I%s -c -o %s %s", cc, opt,
-                                         rtdir, cache, opath, cpath);
+            char *cmdline = arena_printf(&g_arena, "%s %s%s -w -I%s -I%s -c -o %s %s", cc, opt,
+                                         san, rtdir, cache, opath, cpath);
             if (run_cmd(cmdline, verbose) != 0) fatal("C compilation of module '%s' failed", m->name);
             relink = true;
         }
@@ -457,7 +476,7 @@ int main(int argc, char **argv) {
     for (int i = 0; i < ncopy; i++)
         if (!file_exists(exe) || file_mtime(copy_libs[i]) > file_mtime(exe)) relink = true;
     if (relink || !file_exists(exe)) {
-        char *cmdline = arena_printf(&g_arena, "%s -o %s%s%s%s%s -lm", cc, exe, objs.data,
+        char *cmdline = arena_printf(&g_arena, "%s%s -o %s%s%s%s%s -lm", cc, san, exe, objs.data,
                                      shlibs.data, libs.data, rpath_flag);
         if (run_cmd(cmdline, verbose) != 0) fatal("link failed");
     }

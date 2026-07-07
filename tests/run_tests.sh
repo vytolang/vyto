@@ -91,6 +91,22 @@ for src in examples/[0-9]*.vt; do
     fi
 done
 
+# --- integer overflow: checked (traps) in debug, wraps in --release ---
+got=$(./voltc run tests/fixtures/overflow_trap.vt 2>&1)
+if echo "$got" | grep -q "integer overflow in '+'"; then
+    echo "PASS overflow_trap_debug"
+else
+    echo "FAIL overflow_trap_debug (expected a panic, got: $got)"
+    fail=1
+fi
+got=$(./voltc run tests/fixtures/overflow_trap.vt --release 2>&1)
+if echo "$got" | grep -q -- "-9223372036854775808"; then
+    echo "PASS overflow_wrap_release"
+else
+    echo "FAIL overflow_wrap_release (expected wrap to i64 min, got: $got)"
+    fail=1
+fi
+
 # --- volt/surface binding: regenerate with voltbind, golden-check ---
 ./voltbind lib/volt/surface/native/src/vsurf.h \
     --lib X11@linux --lib X11@macos --lib gdi32@windows --lib user32@windows \

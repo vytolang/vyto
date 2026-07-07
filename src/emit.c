@@ -4,6 +4,21 @@
 
 /* ---------------- names & types ---------------- */
 
+/* Overflow-checked arithmetic on/off (on for debug, off for --release). */
+static bool g_checks = false;
+
+/* Signed integer types that get overflow checks, with their C range macros.
+   Unsigned types wrap by definition; clong/culong are FFI target-width. */
+static bool int_bounds(const Type *t, const char **lo, const char **hi) {
+    switch (t->kind) {
+    case TY_INT: case TY_I64: *lo = "INT64_MIN"; *hi = "INT64_MAX"; return true;
+    case TY_I32: *lo = "INT32_MIN"; *hi = "INT32_MAX"; return true;
+    case TY_I16: *lo = "INT16_MIN"; *hi = "INT16_MAX"; return true;
+    case TY_I8:  *lo = "INT8_MIN";  *hi = "INT8_MAX";  return true;
+    default: return false;
+    }
+}
+
 static const char *struct_cname(StructDecl *sd) {
     if (sd->is_extern) return sd->name;
     return arena_printf(&g_arena, "v_%s_%s", sd->module->name, sd->name);
@@ -487,12 +502,18 @@ static char *ex(Em *em, Expr *e, bool *fresh) {
                             ex_b(em, e->lhs), ex_b(em, e->rhs),
                             c_escape(e->loc.file, strlen(e->loc.file)), e->loc.line);
     }
-    case EX_UN:
+    case EX_UN: {
         if (e->op == T_AMP)
             return arena_printf(&g_arena, "((void*)&%s)", e->lhs->local->cname);
+        const char *lo, *hi;
+        if (g_checks && e->op == T_MINUS && int_bounds(e->type, &lo, &hi))
+            return arena_printf(&g_arena, "vt_ck_neg(%s, %s, %s, \"%s\", %d)",
+                                ex_b(em, e->lhs), lo, hi,
+                                c_escape(e->loc.file, strlen(e->loc.file)), e->loc.line);
         return arena_printf(&g_arena, "(%s%s)",
                             e->op == T_NOT ? "!" : e->op == T_TILDE ? "~" : "-",
                             ex_b(em, e->lhs));
+    }
     case EX_BIN: {
         Type *lt = e->lhs->type, *rt = e->rhs->type;
         if (e->op == T_PLUS && e->type->kind == TY_STRING) {
@@ -519,6 +540,15 @@ static char *ex(Em *em, Expr *e, bool *fresh) {
         case T_AMP: op = "&"; break; case T_PIPE: op = "|"; break;
         case T_CARET: op = "^"; break;
         case T_SHL: op = "<<"; break; case T_SHR: op = ">>"; break;
+        }
+        const char *lo, *hi;
+        if (g_checks && (e->op == T_PLUS || e->op == T_MINUS || e->op == T_STAR) &&
+            int_bounds(e->type, &lo, &hi)) {
+            const char *fn = e->op == T_PLUS ? "vt_ck_add"
+                           : e->op == T_MINUS ? "vt_ck_sub" : "vt_ck_mul";
+            return arena_printf(&g_arena, "%s(%s, %s, %s, %s, \"%s\", %d)", fn,
+                                ex_b(em, e->lhs), ex_b(em, e->rhs), lo, hi,
+                                c_escape(e->loc.file, strlen(e->loc.file)), e->loc.line);
         }
         return arena_printf(&g_arena, "(%s %s %s)", ex_b(em, e->lhs), op, ex_b(em, e->rhs));
     }
@@ -699,6 +729,17 @@ static void emit_assign(Em *em, Expr *e) {
     if (lhs->kind == EX_IDENT) {
         const char *n = lhs->local->cname;
         if (!type_is_ref(lt)) {
+            const char *lo, *hi;
+            if (g_checks && (e->op == T_PLUSEQ || e->op == T_MINUSEQ || e->op == T_STAREQ) &&
+                int_bounds(lt, &lo, &hi)) {
+                const char *fn = e->op == T_PLUSEQ ? "vt_ck_add"
+                               : e->op == T_MINUSEQ ? "vt_ck_sub" : "vt_ck_mul";
+                ind(em);
+                sb_printf(em->out, "%s = %s(%s, %s, %s, %s, \"%s\", %d);\n", n, fn, n,
+                          ex_v(em, e->rhs, lt), lo, hi,
+                          c_escape(e->loc.file, strlen(e->loc.file)), e->loc.line);
+                return;
+            }
             ind(em);
             sb_printf(em->out, "%s %s %s;\n", n, cop, ex_v(em, e->rhs, lt));
             return;
@@ -1135,7 +1176,8 @@ static void emit_class_struct(ClassDecl *cd, SBuf *h, bool *emitted, ClassDecl *
     sb_puts(h, "};\n");
 }
 
-void emit_module(Module *m, bool is_entry, SBuf *h, SBuf *c) {
+void emit_module(Module *m, bool is_entry, bool checks, SBuf *h, SBuf *c) {
+    g_checks = checks;
     /* ---------- header ---------- */
     sb_printf(h, "#ifndef VOLT_MOD_%s_H\n#define VOLT_MOD_%s_H\n", m->name, m->name);
     sb_puts(h, "#include \"volt_rt.h\"\n");

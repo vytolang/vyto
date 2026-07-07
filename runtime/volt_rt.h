@@ -51,6 +51,15 @@ void *vt_checked_cast(void *p, const VtType *t, const char *file, int line);
 /* ---- panic ---- */
 void vt_panic_c(const char *file, int line, const char *msg);
 
+/* ---- checked signed integer arithmetic ----
+   Emitted for signed int/i8/i16/i32/i64 arithmetic in checked (debug) builds;
+   `lo`/`hi` are the target type's range. Panics on overflow instead of
+   wrapping silently. Release builds (--release) emit the raw operator. */
+int64_t vt_ck_add(int64_t a, int64_t b, int64_t lo, int64_t hi, const char *file, int line);
+int64_t vt_ck_sub(int64_t a, int64_t b, int64_t lo, int64_t hi, const char *file, int line);
+int64_t vt_ck_mul(int64_t a, int64_t b, int64_t lo, int64_t hi, const char *file, int line);
+int64_t vt_ck_neg(int64_t a, int64_t lo, int64_t hi, const char *file, int line);
+
 /* ---- strings (immutable) ---- */
 
 typedef struct VtString {

@@ -53,6 +53,63 @@ void vt_panic_c(const char *file, int line, const char *msg) {
     exit(101);
 }
 
+/* ---- checked signed integer arithmetic ----
+   Compute in the int64 domain (which holds any i8..i32 sum/product), detect
+   i64 overflow, then range-check against the target type's [lo,hi]. GCC/Clang
+   use __builtin_*_overflow; tcc/others fall back to portable sign tests. */
+#if defined(__GNUC__) || defined(__clang__)
+#define VT_HAS_OVF_BUILTINS 1
+#endif
+
+static void vt_overflow(const char *file, int line, const char *op) {
+    char msg[64];
+    snprintf(msg, sizeof msg, "integer overflow in '%s'", op);
+    vt_panic_c(file, line, msg);
+}
+
+int64_t vt_ck_add(int64_t a, int64_t b, int64_t lo, int64_t hi, const char *file, int line) {
+    int64_t r;
+#ifdef VT_HAS_OVF_BUILTINS
+    bool of = __builtin_add_overflow(a, b, &r);
+#else
+    r = (int64_t)((uint64_t)a + (uint64_t)b);
+    bool of = ((a ^ r) & (b ^ r)) < 0; /* operands same sign, result differs */
+#endif
+    if (of || r < lo || r > hi) vt_overflow(file, line, "+");
+    return r;
+}
+
+int64_t vt_ck_sub(int64_t a, int64_t b, int64_t lo, int64_t hi, const char *file, int line) {
+    int64_t r;
+#ifdef VT_HAS_OVF_BUILTINS
+    bool of = __builtin_sub_overflow(a, b, &r);
+#else
+    r = (int64_t)((uint64_t)a - (uint64_t)b);
+    bool of = ((a ^ b) & (a ^ r)) < 0;
+#endif
+    if (of || r < lo || r > hi) vt_overflow(file, line, "-");
+    return r;
+}
+
+int64_t vt_ck_mul(int64_t a, int64_t b, int64_t lo, int64_t hi, const char *file, int line) {
+    int64_t r;
+#ifdef VT_HAS_OVF_BUILTINS
+    bool of = __builtin_mul_overflow(a, b, &r);
+#else
+    r = (int64_t)((uint64_t)a * (uint64_t)b);
+    bool of = (a != 0) && (r / a != b || (a == -1 && b == INT64_MIN));
+#endif
+    if (of || r < lo || r > hi) vt_overflow(file, line, "*");
+    return r;
+}
+
+int64_t vt_ck_neg(int64_t a, int64_t lo, int64_t hi, const char *file, int line) {
+    if (a == INT64_MIN) vt_overflow(file, line, "-");
+    int64_t r = -a;
+    if (r < lo || r > hi) vt_overflow(file, line, "-");
+    return r;
+}
+
 void vt_panic(const char *file, int line, VtString *msg) {
     vt_panic_c(file, line, msg ? msg->data : "(null)");
 }
