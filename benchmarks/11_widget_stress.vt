@@ -1,0 +1,169 @@
+// Widget-heavy window stress test. Builds a scrolling form of "cards", each
+// packing every widget volt/ui has (Label, TextArea, TextField, Checkbox,
+// Button, ListBox in Column/Row/Container/Spacer) stuffed with lorem ipsum,
+// then times the three costs that scale with widget count:
+//
+//   layout     — measure + arrange the whole tree (runs on resize)
+//   full draw  — draw every widget (runs on expose/resize)
+//   repaint 1  — dirty-region repaint of a single deep leaf (runs per keystroke)
+//
+// Measured twice: a NullPainter isolates *framework* overhead (tree walk, layout
+// math, virtual dispatch — the part that scales with N), and a real blend2d
+// GfxPainter gives the rich-tier rasterization cost. clock() is libc CPU time
+// (CLOCKS_PER_SEC = 1e6, so deltas are microseconds).
+
+import { Widget, Painter, Theme, Size,
+         Column, Row, Spacer, Container,
+         Label, Button, TextField, Checkbox, ListBox, TextArea } from "volt/ui";
+import { Surface, Rect } from "volt/surface";
+import { GfxPainter } from "volt/gfx/painter";
+
+extern "C" { fn clock(): clong; }
+
+const W: int = 900;
+
+fn lorem(): string {
+    return "Lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor incididunt ut labore et dolore magna aliqua ut enim ad minim veniam";
+}
+fn font(): string {
+    return "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf";
+}
+
+// --- a painter that does no real drawing, but counts calls and supplies
+//     plausible metrics so the layout math runs exactly as it would live ---
+class NullPainter extends Painter {
+    fills: int;
+    texts: int;
+    override fn fill(r: Rect, color: int) { this.fills += 1; }
+    override fn frame(r: Rect, color: int) { this.fills += 1; }
+    override fn line(x0: int, y0: int, x1: int, y1: int, color: int) { }
+    override fn text(x: int, y: int, s: string, color: int) { this.texts += 1; }
+    override fn text_in(r: Rect, pad: int, s: string, color: int) { this.texts += 1; }
+    override fn text_width(s: string): int { return s.len * 7; }
+    override fn font_ascent(): int { return 11; }
+    override fn font_height(): int { return 14; }
+    override fn width(): int { return W; }
+    override fn height(): int { return 700; }
+}
+
+fn block(lines: int): string {
+    let out = "";
+    for (let i in 0..lines) {
+        if (i > 0) { out += "\n"; }
+        out += lorem();
+    }
+    return out;
+}
+
+fn make_card(idx: int): Widget {
+    let title = new Label("Card " + idx + ": " + lorem().slice(0, 40));
+    let body = new TextArea();
+    body.set_text(block(6));
+    let name = new TextField("your name here");
+    let agree = new Checkbox("I agree — " + lorem().slice(0, 30));
+    let submit = new Button("Submit " + idx);
+    let row = new Row([agree, new Spacer(), submit]);
+    let list = new ListBox();
+    let items: string[] = [];
+    let checks: bool[] = [];
+    for (let i in 0..4) { items.push(lorem().slice(0, 24 + i)); checks.push(false); }
+    list.set_items(items, checks);
+    let col = new Column([title, body, name, row, list]);
+    return new Container(-1, -1, 8, 0x202028, col);
+}
+
+fn count(w: Widget): int {
+    let n = 1;
+    for (let c in w.children) { n += count(c); }
+    return n;
+}
+
+// lorem volume packed per card: 6-line TextArea body + title + checkbox label +
+// field + button + 4 list rows
+fn card_chars(): int {
+    return 6 * lorem().len + 40 + 30 + 14 + 10 + (24 + 25 + 26 + 27);
+}
+
+// descend to the deepest first-child leaf — a realistic "one widget changed"
+fn deep_leaf(w: Widget): Widget {
+    let cur = w;
+    while (cur.children.len > 0) { cur = cur.children[0]; }
+    return cur;
+}
+
+fn run_size(cards: int) {
+    let np = new NullPainter();
+    let th = new Theme();
+
+    let kids: Widget[] = [];
+    for (let i in 0..cards) { kids.push(make_card(i)); }
+    let root = new Column(kids);
+
+    let n = count(root);
+
+    // layout: measure + arrange, averaged
+    let L = 40;
+    let t0 = clock();
+    let ms = Size(0, 0);
+    for (let i in 0..L) {
+        ms = root.measure(np, th);
+        root.arrange(np, th, Rect(0, 0, W, ms.h));
+    }
+    let layout_us = (clock() - t0) as int / L;
+
+    // full draw (framework only), averaged; capture call counts once
+    np.fills = 0;
+    np.texts = 0;
+    root.draw(np, th);
+    let full_fills = np.fills;
+    let full_texts = np.texts;
+    let D = 40;
+    t0 = clock();
+    for (let i in 0..D) { root.draw(np, th); }
+    let fulldraw_us = (clock() - t0) as int / D;
+
+    // dirty-region repaint of one deep leaf, averaged over many
+    let leaf = deep_leaf(root.children[cards / 2]);
+    let d = leaf.bounds;
+    np.fills = 0;
+    np.texts = 0;
+    root.draw_within(np, th, d);
+    let within_fills = np.fills;
+    let within_texts = np.texts;
+    let R = 4000;
+    t0 = clock();
+    for (let i in 0..R) { root.draw_within(np, th, d); }
+    let within_ns = (clock() - t0) as int * 1000 / R;  // nanoseconds
+
+    // real blend2d rasterization of the whole tree
+    let gp = new GfxPainter(root_surface_less(), font(), 14.0);
+    let G = 6;
+    t0 = clock();
+    for (let i in 0..G) {
+        root.draw(gp, th);
+        gp.canvas.flush();
+    }
+    let gfx_us = (clock() - t0) as int / G;
+
+    print("N=" + n + " (" + cards + " cards, ~" + (cards * card_chars() / 1000)
+          + "k lorem chars)");
+    print("  layout      " + layout_us + " us");
+    print("  full draw   " + fulldraw_us + " us  (" + full_fills + " fills, "
+          + full_texts + " texts)");
+    print("  repaint 1   " + within_ns + " ns  (" + within_fills + " fills, "
+          + within_texts + " texts drawn — rest pruned)");
+    print("  gfx raster  " + gfx_us + " us  (real blend2d, full tree)");
+}
+
+// GfxPainter needs a Surface for size + present; a headless one is fine here.
+fn root_surface_less(): Surface {
+    return new Surface("bench", W, 700);
+}
+
+fn main() {
+    print("=== volt/ui widget-heavy stress (CPU us, headless) ===");
+    run_size(8);
+    run_size(40);
+    run_size(160);
+    run_size(400);
+}
