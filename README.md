@@ -80,6 +80,7 @@ See [docs/SPEC.md](docs/SPEC.md) for the full language reference,
 ```
 src/       compiler (C99): lexer, recursive-descent parser, checker, C emitter
 runtime/   volt_rt.{c,h}: RC objects, strings, arrays, maps, closures
-examples/  01_hello … 07_modules + golden .expected outputs
+lib/volt/  bundled stdlib modules: math (libm), surface, ui
+examples/  01_hello … 12_math + golden .expected outputs
 docs/      SPEC.md
 ```
