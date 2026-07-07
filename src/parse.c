@@ -119,6 +119,7 @@ static Type *parse_base_type(Parser *p) {
         {"i8", TY_I8}, {"i16", TY_I16}, {"i32", TY_I32}, {"i64", TY_I64},
         {"u8", TY_U8}, {"u16", TY_U16}, {"u32", TY_U32}, {"u64", TY_U64},
         {"f32", TY_F32}, {"f64", TY_F64},
+        {"clong", TY_CLONG}, {"culong", TY_CULONG},
     };
     for (size_t i = 0; i < sizeof prims / sizeof prims[0]; i++) {
         if (name == intern(prims[i].n)) {

@@ -48,6 +48,7 @@ static const char *type_str(const Type *t) {
     case TY_CSTRING: return "cstring"; case TY_RAWPTR: return "rawptr"; case TY_NULL: return "null";
     case TY_I8: return "i8"; case TY_I16: return "i16"; case TY_I32: return "i32"; case TY_I64: return "i64";
     case TY_U8: return "u8"; case TY_U16: return "u16"; case TY_U32: return "u32"; case TY_U64: return "u64";
+    case TY_CLONG: return "clong"; case TY_CULONG: return "culong";
     case TY_F32: return "f32"; case TY_F64: return "f64";
     case TY_STRUCT: return t->sdecl->name;
     case TY_CLASS: return t->cdecl->name;
@@ -66,13 +67,13 @@ static int int_width(TypeKind k) {
     case TY_BYTE: case TY_I8: return 1;
     case TY_I16: case TY_U16: return 2;
     case TY_I32: case TY_U32: return 4;
-    default: return 8; /* TY_INT, TY_U64 */
+    default: return 8; /* TY_INT, TY_U64, TY_CLONG, TY_CULONG (LP64 model) */
     }
 }
 
 static bool int_is_signed(TypeKind k) {
     switch (norm_kind(k)) {
-    case TY_BYTE: case TY_U16: case TY_U32: case TY_U64: return false;
+    case TY_BYTE: case TY_U16: case TY_U32: case TY_U64: case TY_CULONG: return false;
     default: return true;
     }
 }
@@ -183,6 +184,7 @@ static bool valid_extern_field(const Type *t) {
     case TY_INT: case TY_FLOAT: case TY_BOOL: case TY_BYTE:
     case TY_I8: case TY_I16: case TY_I32: case TY_I64:
     case TY_U8: case TY_U16: case TY_U32: case TY_U64: case TY_F32: case TY_F64:
+    case TY_CLONG: case TY_CULONG:
     case TY_CSTRING: case TY_RAWPTR:
         return true;
     case TY_STRUCT: return t->sdecl->is_extern;

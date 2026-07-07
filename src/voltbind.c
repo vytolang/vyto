@@ -477,8 +477,8 @@ static const char *volt_type(const CType *t, bool is_ret) {
     case B_USHORT: return "u16";
     case B_INT: return "i32";
     case B_UINT: return "u32";
-    case B_LONG: return "i64";  /* LP64; Windows would need i32 — good enough for v0.1 */
-    case B_ULONG: return "u64";
+    case B_LONG: return "clong";   /* C long: target-width (64-bit LP64, 32-bit LLP64) */
+    case B_ULONG: return "culong";
     case B_LLONG: return "i64";
     case B_ULLONG: return "u64";
     case B_FLOAT: return "f32";

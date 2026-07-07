@@ -26,6 +26,8 @@ static const char *c_type(Type *t) {
     case TY_U16: return "uint16_t";
     case TY_U32: return "uint32_t";
     case TY_U64: return "uint64_t";
+    case TY_CLONG: return "long";
+    case TY_CULONG: return "unsigned long";
     case TY_F32: return "float";
     case TY_STRING: return "VtString*";
     case TY_CSTRING: return "const char*";

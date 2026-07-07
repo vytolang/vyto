@@ -17,6 +17,7 @@ typedef struct StructDecl StructDecl;
 typedef enum TypeKind {
     TY_VOID, TY_INT, TY_FLOAT, TY_BOOL, TY_BYTE,
     TY_I8, TY_I16, TY_I32, TY_I64, TY_U8, TY_U16, TY_U32, TY_U64, TY_F32, TY_F64,
+    TY_CLONG, TY_CULONG,  /* C long / unsigned long: target-width, emit as raw C `long` */
     TY_STRING, TY_CSTRING, TY_RAWPTR, TY_NULL,
     TY_NAMED,   /* unresolved identifier, resolved by checker */
     TY_STRUCT,  /* ->sdecl */
@@ -52,6 +53,7 @@ static inline bool type_is_int(const Type *t) {
     case TY_INT: case TY_BYTE:
     case TY_I8: case TY_I16: case TY_I32: case TY_I64:
     case TY_U8: case TY_U16: case TY_U32: case TY_U64:
+    case TY_CLONG: case TY_CULONG:
         return true;
     default: return false;
     }
