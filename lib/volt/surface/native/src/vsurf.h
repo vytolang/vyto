@@ -18,7 +18,8 @@ enum {
     VS_EV_RESIZE = 5,
     VS_EV_CLOSE = 6,
     VS_EV_MOUSE_MOVE = 7, /* reserved; not delivered in v1 */
-    VS_EV_TIMER = 8       /* vs_wait_timeout elapsed with no input (game tick) */
+    VS_EV_TIMER = 8,      /* vs_wait_timeout elapsed with no input (game tick) */
+    VS_EV_KEY_UP = 9      /* a key was released (vs_key() gives the code) */
 };
 
 /* simplified key codes from vs_key: printable ASCII, or one of these */

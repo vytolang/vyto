@@ -37,6 +37,7 @@ static void headless_open_script(void) {
 /* one directive per line:
  *   type <text>      each character becomes a key event
  *   key <name>       Enter Backspace Esc Up Down Left Right Delete Tab Home End
+ *   keyup <name>     same names, delivered as a key-release (VS_EV_KEY_UP)
  *   click X Y        mouse down (then up) at X,Y
  *   resize W H
  *   expose
@@ -66,8 +67,9 @@ static int headless_wait(int *w, int *h) {
             type_p = script_line + 5;
             continue;
         }
-        if (strncmp(script_line, "key ", 4) == 0) {
-            const char *k = script_line + 4;
+        if (strncmp(script_line, "key ", 4) == 0 || strncmp(script_line, "keyup ", 6) == 0) {
+            int up = script_line[3] == 'u';
+            const char *k = script_line + (up ? 6 : 4);
             last_text[0] = 0;
             if (strcmp(k, "Enter") == 0) last_key = VS_KEY_ENTER;
             else if (strcmp(k, "Backspace") == 0) last_key = VS_KEY_BACKSPACE;
@@ -81,7 +83,7 @@ static int headless_wait(int *w, int *h) {
             else if (strcmp(k, "Home") == 0) last_key = VS_KEY_HOME;
             else if (strcmp(k, "End") == 0) last_key = VS_KEY_END;
             else continue;
-            return VS_EV_KEY;
+            return up ? VS_EV_KEY_UP : VS_EV_KEY;
         }
         if (sscanf(script_line, "click %d %d", &last_x, &last_y) == 2) {
             pending_up = 1;
@@ -214,6 +216,28 @@ static LRESULT CALLBACK vs_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         break; /* DefWindowProc; TranslateMessage yields WM_CHAR */
+    }
+    case WM_KEYUP: {
+        int k = 0;
+        switch (wp) {
+        case VK_RETURN: k = VS_KEY_ENTER; break;
+        case VK_BACK: k = VS_KEY_BACKSPACE; break;
+        case VK_ESCAPE: k = VS_KEY_ESC; break;
+        case VK_UP: k = VS_KEY_UP; break;
+        case VK_DOWN: k = VS_KEY_DOWN; break;
+        case VK_LEFT: k = VS_KEY_LEFT; break;
+        case VK_RIGHT: k = VS_KEY_RIGHT; break;
+        case VK_DELETE: k = VS_KEY_DELETE; break;
+        case VK_TAB: k = VS_KEY_TAB; break;
+        case VK_HOME: k = VS_KEY_HOME; break;
+        case VK_END: k = VS_KEY_END; break;
+        default:
+            /* no WM_CHAR on release: report printable letters/digits/space by VK */
+            if ((wp >= 'A' && wp <= 'Z') || (wp >= '0' && wp <= '9')) k = (int)wp;
+            else if (wp == VK_SPACE) k = 32;
+        }
+        if (k) q_push(VS_EV_KEY_UP, k, 0, 0, 0);
+        return 0;
     }
     case WM_CHAR:
         if (wp >= 32 && wp < 127) q_push(VS_EV_KEY, (int)wp, 0, 0, (int)wp);
@@ -430,6 +454,7 @@ void *vs_native_gc(void *vs) { return ((VSurf *)vs)->memdc; }
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
 #include <X11/keysym.h>
+#include <X11/XKBlib.h>
 #include <sys/select.h>
 
 typedef struct VSurf {
@@ -488,8 +513,11 @@ void *vs_open(const char *title, int w, int h) {
     s->win = XCreateSimpleWindow(dpy, DefaultRootWindow(dpy), 0, 0, (unsigned)w, (unsigned)h, 1,
                                  BlackPixel(dpy, scr), WhitePixel(dpy, scr));
     XStoreName(dpy, s->win, title);
-    XSelectInput(dpy, s->win, ExposureMask | KeyPressMask | ButtonPressMask | ButtonReleaseMask |
-                                  StructureNotifyMask);
+    XSelectInput(dpy, s->win, ExposureMask | KeyPressMask | KeyReleaseMask | ButtonPressMask |
+                                  ButtonReleaseMask | StructureNotifyMask);
+    /* only emit KeyRelease on real release, not auto-repeat — matters for
+       held-key game input (EV_KEY / EV_KEY_UP pairing) */
+    XkbSetDetectableAutoRepeat(dpy, True, NULL);
     wm_delete = XInternAtom(dpy, "WM_DELETE_WINDOW", False);
     XSetWMProtocols(dpy, s->win, &wm_delete, 1);
     s->gc = XCreateGC(dpy, s->win, 0, 0);
@@ -604,6 +632,35 @@ int vs_font_height(void *vs) {
     return font->ascent + font->descent;
 }
 
+/* decode an X key event into last_key/last_text; 1 if a key we deliver, else 0 */
+static int x11_decode_key(XKeyEvent *ke) {
+    char buf[16];
+    KeySym ks = 0;
+    int n = XLookupString(ke, buf, sizeof buf - 1, &ks, NULL);
+    last_text[0] = 0;
+    switch (ks) {
+    case XK_Return: case XK_KP_Enter: last_key = VS_KEY_ENTER; return 1;
+    case XK_BackSpace: last_key = VS_KEY_BACKSPACE; return 1;
+    case XK_Escape: last_key = VS_KEY_ESC; return 1;
+    case XK_Up: last_key = VS_KEY_UP; return 1;
+    case XK_Down: last_key = VS_KEY_DOWN; return 1;
+    case XK_Left: last_key = VS_KEY_LEFT; return 1;
+    case XK_Right: last_key = VS_KEY_RIGHT; return 1;
+    case XK_Delete: last_key = VS_KEY_DELETE; return 1;
+    case XK_Tab: last_key = VS_KEY_TAB; return 1;
+    case XK_Home: last_key = VS_KEY_HOME; return 1;
+    case XK_End: last_key = VS_KEY_END; return 1;
+    default:
+        if (n == 1 && buf[0] >= 32 && buf[0] < 127) {
+            last_key = buf[0];
+            last_text[0] = buf[0];
+            last_text[1] = 0;
+            return 1;
+        }
+    }
+    return 0; /* modifier or unmapped key */
+}
+
 /* translate one XEvent into a VS_EV_* code, or -1 to ignore and keep waiting */
 static int x11_translate(VSurf *s, XEvent *e) {
     switch (e->type) {
@@ -622,33 +679,10 @@ static int x11_translate(VSurf *s, XEvent *e) {
         }
         return -1;
     }
-    case KeyPress: {
-        char buf[16];
-        KeySym ks = 0;
-        int n = XLookupString(&e->xkey, buf, sizeof buf - 1, &ks, NULL);
-        last_text[0] = 0;
-        switch (ks) {
-        case XK_Return: case XK_KP_Enter: last_key = VS_KEY_ENTER; return VS_EV_KEY;
-        case XK_BackSpace: last_key = VS_KEY_BACKSPACE; return VS_EV_KEY;
-        case XK_Escape: last_key = VS_KEY_ESC; return VS_EV_KEY;
-        case XK_Up: last_key = VS_KEY_UP; return VS_EV_KEY;
-        case XK_Down: last_key = VS_KEY_DOWN; return VS_EV_KEY;
-        case XK_Left: last_key = VS_KEY_LEFT; return VS_EV_KEY;
-        case XK_Right: last_key = VS_KEY_RIGHT; return VS_EV_KEY;
-        case XK_Delete: last_key = VS_KEY_DELETE; return VS_EV_KEY;
-        case XK_Tab: last_key = VS_KEY_TAB; return VS_EV_KEY;
-        case XK_Home: last_key = VS_KEY_HOME; return VS_EV_KEY;
-        case XK_End: last_key = VS_KEY_END; return VS_EV_KEY;
-        default:
-            if (n == 1 && buf[0] >= 32 && buf[0] < 127) {
-                last_key = buf[0];
-                last_text[0] = buf[0];
-                last_text[1] = 0;
-                return VS_EV_KEY;
-            }
-        }
-        return -1; /* modifier or unmapped key: keep waiting */
-    }
+    case KeyPress:
+        return x11_decode_key(&e->xkey) ? VS_EV_KEY : -1;
+    case KeyRelease:
+        return x11_decode_key(&e->xkey) ? VS_EV_KEY_UP : -1;
     case ButtonPress:
         if (e->xbutton.button == Button1) {
             last_x = e->xbutton.x;
