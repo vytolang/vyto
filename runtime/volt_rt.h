@@ -48,6 +48,10 @@ static inline void *vt_retain(void *p) {
 bool vt_isa(const void *p, const VtType *t);
 void *vt_checked_cast(void *p, const VtType *t, const char *file, int line);
 
+/* ---- command-line arguments ---- */
+void vt_set_args(int argc, char **argv); /* stashed by main() */
+struct VtArray *vt_args(void);            /* args as string[], excluding argv[0] */
+
 /* ---- panic ---- */
 void vt_panic_c(const char *file, int line, const char *msg);
 

@@ -564,6 +564,14 @@ static Type *check_call(Ctx *c, Expr *e) {
             t->elem = ty_string();
             return e->type = t;
         }
+        if (n == intern("args")) {
+            if (e->nargs != 0) fatal_at(e->loc, "args takes no arguments");
+            e->ref = REF_BUILTIN;
+            e->builtin = B_ARGS;
+            Type *t = mk_type(TY_ARRAY);
+            t->elem = ty_string();
+            return e->type = t;
+        }
         if (n == intern("isdir")) {
             if (e->nargs != 1) fatal_at(e->loc, "isdir takes 1 argument");
             check_expr(c, e->args[0], ty_string());

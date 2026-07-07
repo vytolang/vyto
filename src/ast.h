@@ -132,6 +132,7 @@ typedef enum BuiltinKind {
     B_WRITEFILE,    /* writefile(path, data): bool */
     B_APPENDFILE,   /* appendfile(path, data): bool */
     B_BYTES,        /* bytes(n): byte[] — zeroed, sized buffer for FFI */
+    B_ARGS,         /* args(): string[] — command-line arguments (excl. program name) */
 } BuiltinKind;
 
 /* ---------------- statements ---------------- */

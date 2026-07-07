@@ -107,6 +107,15 @@ else
     fail=1
 fi
 
+# --- command-line args: args() builtin sees what follows `--` ---
+got=$(./voltc run tests/fixtures/args_echo.vt -- alpha beta 2>&1)
+if [ "$got" = "$(printf 'n=2\nalpha\nbeta')" ]; then
+    echo "PASS args_builtin"
+else
+    echo "FAIL args_builtin (got: $got)"
+    fail=1
+fi
+
 # --- volt/surface binding: regenerate with voltbind, golden-check ---
 ./voltbind lib/volt/surface/native/src/vsurf.h \
     --lib X11@linux --lib X11@macos --lib gdi32@windows --lib user32@windows \
@@ -277,8 +286,8 @@ if [ -f /usr/include/X11/Xlib.h ]; then
     chip8_bin=apps/chip8/.volt-cache/chip8_test
     if ./voltc build apps/chip8/chip8.vt -o "$chip8_bin" >/dev/null; then
         printf 'tick\ntick\nclose\n' > tests/tmp/chip8.events
-        got=$(CHIP8_DEBUG=1 CHIP8_ROM=apps/chip8/ibm.ch8 \
-              VS_HEADLESS=1 VS_EVENTS=tests/tmp/chip8.events "$chip8_bin" 2>&1)
+        got=$(CHIP8_DEBUG=1 VS_HEADLESS=1 VS_EVENTS=tests/tmp/chip8.events \
+              "$chip8_bin" apps/chip8/ibm.ch8 2>&1)
         if echo "$got" | grep -q "OP=0xD015"; then
             echo "PASS app_chip8_runs_ibm"
         else

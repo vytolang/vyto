@@ -53,6 +53,20 @@ void vt_panic_c(const char *file, int line, const char *msg) {
     exit(101);
 }
 
+/* ---- command-line arguments ---- */
+static int g_argc;
+static char **g_argv;
+void vt_set_args(int argc, char **argv) { g_argc = argc; g_argv = argv; }
+VtArray *vt_args(void) {
+    VtArray *a = vt_arr_new(sizeof(VtString *), true);
+    for (int i = 1; i < g_argc; i++) { /* skip argv[0], the program name */
+        VtString *s = vt_str_from_cstr(g_argv[i]);
+        vt_arr_push(a, &s); /* push retains */
+        vt_release(s);
+    }
+    return a;
+}
+
 /* ---- checked signed integer arithmetic ----
    Compute in the int64 domain (which holds any i8..i32 sum/product), detect
    i64 overflow, then range-check against the target type's [lo,hi]. GCC/Clang

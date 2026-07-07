@@ -358,6 +358,9 @@ static char *emit_call(Em *em, Expr *e, bool *fresh) {
             *fresh = true;
             return arena_printf(&g_arena, "vt_dir_list(%s, \"%s\", %d)", ex_b(em, a[0]),
                                 c_escape(e->loc.file, strlen(e->loc.file)), e->loc.line);
+        case B_ARGS:
+            *fresh = true;
+            return arena_printf(&g_arena, "vt_args()");
         case B_ISDIR:
             *fresh = false;
             return arena_printf(&g_arena, "vt_is_dir(%s)", ex_b(em, a[0]));
@@ -1291,7 +1294,8 @@ void emit_module(Module *m, bool is_entry, bool checks, SBuf *h, SBuf *c) {
     sb_puts(c, "\n");
     sb_puts(c, code.data);
     if (is_entry)
-        sb_printf(c, "int main(void) {\n    v_%s_main();\n    return 0;\n}\n", m->name);
+        sb_printf(c, "int main(int argc, char **argv) {\n    vt_set_args(argc, argv);\n"
+                     "    v_%s_main();\n    return 0;\n}\n", m->name);
     sb_free(&aux);
     sb_free(&code);
 }
