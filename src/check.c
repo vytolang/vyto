@@ -396,6 +396,33 @@ static bool assignable(Type *dst, Type *src, Expr *e) {
     return false;
 }
 
+/* An integer-literal-only constant expression — a literal, a negated one, or
+   arithmetic (+ - * /) over such. These are "untyped" and may fold to float in
+   a float context (Go-style), at compile time with no runtime conversion. `%`
+   is excluded because it has no float form. */
+static bool is_int_const_expr(const Expr *e) {
+    if (!e) return false;
+    switch (e->kind) {
+    case EX_INT: return true;
+    case EX_UN: return e->op == T_MINUS && is_int_const_expr(e->lhs);
+    case EX_BIN:
+        switch (e->op) {
+        case T_PLUS: case T_MINUS: case T_STAR: case T_SLASH:
+            return is_int_const_expr(e->lhs) && is_int_const_expr(e->rhs);
+        default: return false;
+        }
+    default: return false;
+    }
+}
+
+/* Retype an int-constant subtree to float f; the emitter then folds its
+   literals to C double constants (and `/` becomes float division). */
+static void fold_to_float(Expr *e, Type *f) {
+    e->type = f;
+    if (e->kind == EX_UN) fold_to_float(e->lhs, f);
+    else if (e->kind == EX_BIN) { fold_to_float(e->lhs, f); fold_to_float(e->rhs, f); }
+}
+
 static void want(Ctx *c, Expr *e, Type *dst, const char *what) {
     (void)c;
     if (!assignable(dst, e->type, e))
@@ -830,6 +857,12 @@ static Type *check_expr(Ctx *c, Expr *e, Type *expected) {
         Type *lt = check_expr(c, e->lhs, NULL);
         Type *rt = check_expr(c, e->rhs, lt->kind == TY_NULL ? NULL : lt);
         if (lt->kind == TY_NULL) { lt = check_expr(c, e->lhs, rt); }
+        /* Fold an untyped integer constant to the float operand (Go-style). */
+        if (type_is_float(lt) && !type_is_float(rt) && is_int_const_expr(e->rhs)) {
+            fold_to_float(e->rhs, lt); rt = lt;
+        } else if (type_is_float(rt) && !type_is_float(lt) && is_int_const_expr(e->lhs)) {
+            fold_to_float(e->lhs, rt); lt = rt;
+        }
         switch (e->op) {
         case T_PLUS:
             if (lt->kind == TY_STRING || rt->kind == TY_STRING) {
