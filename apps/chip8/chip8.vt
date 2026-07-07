@@ -1,0 +1,564 @@
+// CHIP-8 emulator — pure Volt + volt/surface blit.
+// Runs standard CHIP-8 ROMs (not S-CHIP). 64x32 display, 16-key keypad.
+//
+// Usage:  CHIP8_ROM=path/to/rom.ch8 voltc run apps/chip8/chip8.vt
+// Keys:   1234 / QWER / ASDF / ZXCV  ->  123C / 456D / 789E / A0BF
+// ESC:    quit
+
+import { Surface, Rect, rgb,
+         EV_TIMER, EV_KEY, EV_CLOSE, EV_EXPOSE,
+         KEY_UP, KEY_DOWN, KEY_LEFT, KEY_RIGHT, KEY_ESC } from "volt/surface";
+
+// --- libc FFI ---
+extern "C" {
+    fn clock_gettime(clk: i32, ts: rawptr): i32;
+    fn getenv(name: cstring): cstring;
+}
+
+struct Timespec { tv_sec: i64; tv_nsec: i64; }
+const CLOCK_MONOTONIC: i32 = 1;
+
+// --- display constants ---
+const DISP_W: int = 64;
+const DISP_H: int = 32;
+const WIN_W: int = 640;
+const WIN_H: int = 352;
+const TICK_MS: int = 16;          // ~60 Hz
+const OPS_PER_TICK: int = 10;     // ~600 Hz CPU (8-12 typical)
+
+// --- colors ---
+const C_BG: int = 1184274;        // rgb(18, 18, 18)
+const C_ON: int = 3407718;        // rgb(52, 255, 102) phosphor green
+const C_OFF: int = 0;
+const C_STATUS: int = 10066329;   // rgb(153, 153, 153)
+
+// --- CHIP-8 CPU ---
+class Cpu {
+    mem: byte[];          // 4096 bytes
+    v: byte[];            // V0..VF (16 x u8)
+    i: int;               // index register (12-bit)
+    pc: int;              // program counter
+    stack: int[];         // 16-deep return-address stack
+    sp: int;              // stack pointer
+    delay: int;           // delay timer (u8, 60 Hz)
+    sound: int;           // sound timer (u8, 60 Hz)
+    keys: bool[];         // 16-key keypad state
+    fb: i32[];            // 64x32 framebuffer (0xRRGGBB)
+    dirty: bool;          // display changed this frame
+    lastKey: int;         // last key pressed (-1 = none)
+    waitingForKey: bool;  // FX0A: block until key
+    waitReg: int;         // FX0A: register index to store key
+
+    // xorshift PRNG state (seeded from clock_gettime)
+    rngState: u32;
+
+    fn init() {
+        this.mem = bytes(4096);
+        this.v = bytes(16);
+        this.stack = [];
+        this.keys = [];
+        for (let i in 0..16) { this.keys.push(false); }
+        this.fb = [];
+        for (let i in 0..DISP_W * DISP_H) { this.fb.push(C_OFF as i32); }
+        this.reset();
+        this.seedRng();
+    }
+
+    fn reset() {
+        // zero memory
+        for (let i in 0..4096) { this.mem[i] = 0 as byte; }
+        for (let i in 0..16) { this.v[i] = 0 as byte; }
+        this.i = 0;
+        this.pc = 0x200;
+        this.sp = 0;
+        this.stack = [];
+        this.delay = 0;
+        this.sound = 0;
+        this.dirty = false;
+        this.lastKey = -1;
+        this.waitingForKey = false;
+        this.waitReg = 0;
+
+        // clear framebuffer
+        for (let i in 0..DISP_W * DISP_H) { this.fb[i] = C_OFF as i32; }
+
+        // load built-in hex font (16 chars, 5 bytes each) at 0x050
+        this.loadFont();
+    }
+
+    fn loadFont() {
+        // Standard CHIP-8 font: 0-F, 5 bytes each, bitmap 4x5 (top 4 bits of each byte)
+        let font: byte[] = bytes(80);
+        // 0
+        font[0] = 0xF0 as byte; font[1] = 0x90 as byte; font[2] = 0x90 as byte;
+        font[3] = 0x90 as byte; font[4] = 0xF0 as byte;
+        // 1
+        font[5] = 0x20 as byte; font[6] = 0x60 as byte; font[7] = 0x20 as byte;
+        font[8] = 0x20 as byte; font[9] = 0x70 as byte;
+        // 2
+        font[10] = 0xD0 as byte; font[11] = 0x30 as byte; font[12] = 0xD0 as byte;
+        font[13] = 0x90 as byte; font[14] = 0xD0 as byte;
+        // 3
+        font[15] = 0xF0 as byte; font[16] = 0x10 as byte; font[17] = 0xF0 as byte;
+        font[18] = 0x10 as byte; font[19] = 0xF0 as byte;
+        // 4
+        font[20] = 0x90 as byte; font[21] = 0x90 as byte; font[22] = 0xF0 as byte;
+        font[23] = 0x10 as byte; font[24] = 0x10 as byte;
+        // 5
+        font[25] = 0xF0 as byte; font[26] = 0x80 as byte; font[27] = 0xF0 as byte;
+        font[28] = 0x10 as byte; font[29] = 0xF0 as byte;
+        // 6
+        font[30] = 0xF0 as byte; font[31] = 0x80 as byte; font[32] = 0xF0 as byte;
+        font[33] = 0x90 as byte; font[34] = 0xF0 as byte;
+        // 7
+        font[35] = 0xF0 as byte; font[36] = 0x10 as byte; font[37] = 0x20 as byte;
+        font[38] = 0x40 as byte; font[39] = 0x40 as byte;
+        // 8
+        font[40] = 0xF0 as byte; font[41] = 0x90 as byte; font[42] = 0xF0 as byte;
+        font[43] = 0x90 as byte; font[44] = 0xF0 as byte;
+        // 9
+        font[45] = 0xF0 as byte; font[46] = 0x90 as byte; font[47] = 0xF0 as byte;
+        font[48] = 0x10 as byte; font[49] = 0xF0 as byte;
+        // A
+        font[50] = 0xF0 as byte; font[51] = 0x90 as byte; font[52] = 0xF0 as byte;
+        font[53] = 0x90 as byte; font[54] = 0x90 as byte;
+        // B
+        font[55] = 0xE0 as byte; font[56] = 0x90 as byte; font[57] = 0xE0 as byte;
+        font[58] = 0x90 as byte; font[59] = 0xE0 as byte;
+        // C
+        font[60] = 0xF0 as byte; font[61] = 0x80 as byte; font[62] = 0x80 as byte;
+        font[63] = 0x80 as byte; font[64] = 0xF0 as byte;
+        // D
+        font[65] = 0xE0 as byte; font[66] = 0x90 as byte; font[67] = 0x90 as byte;
+        font[68] = 0x90 as byte; font[69] = 0xE0 as byte;
+        // E
+        font[70] = 0xF0 as byte; font[71] = 0x80 as byte; font[72] = 0xF0 as byte;
+        font[73] = 0x80 as byte; font[74] = 0xF0 as byte;
+        // F
+        font[75] = 0xF0 as byte; font[76] = 0x80 as byte; font[77] = 0xF0 as byte;
+        font[78] = 0x80 as byte; font[79] = 0x80 as byte;
+
+        for (let i in 0..80) {
+            this.mem[0x050 + i] = font[i] as byte;
+        }
+    }
+
+    fn seedRng() {
+        let ts = Timespec(0, 0);
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        let seed = (ts.tv_nsec as u32) ^ (ts.tv_sec as u32);
+        if (seed == 0) { seed = 1; }
+        this.rngState = seed;
+    }
+
+    fn nextRand(): u32 {
+        // xorshift32
+        let x = this.rngState;
+        x = x ^ (x << 13);
+        x = x ^ (x >> 17);
+        x = x ^ (x << 5);
+        this.rngState = x;
+        return x;
+    }
+
+    fn loadRom(data: string) {
+        let n = data.len;
+        if (n > 4096 - 0x200) {
+            panic("ROM too large for CHIP-8 memory");
+        }
+        for (let i in 0..n) {
+            this.mem[0x200 + i] = data[i] as byte;
+        }
+    }
+
+    fn fetchOpcode(): int {
+        let hi = this.mem[this.pc] as int;
+        let lo = this.mem[this.pc + 1] as int;
+        return (hi << 8) | lo;
+    }
+
+    fn getV(reg: int): int { return this.v[reg & 0x0F] as int; }
+    fn setV(reg: int, val: int) { this.v[reg & 0x0F] = (val & 0xFF) as byte; }
+
+    fn exec() {
+        let op = this.fetchOpcode();
+        this.pc += 2;
+
+        let hi = op >> 12;
+        let x = (op >> 8) & 0x0F;
+        let y = (op >> 4) & 0x0F;
+        let nnn = op & 0x0FFF;
+        let nn = op & 0xFF;
+        let n = op & 0x0F;
+
+        if (hi == 0x0) {
+            if (op == 0x00E0) {
+                // CLS: clear display
+                for (let i in 0..DISP_W * DISP_H) { this.fb[i] = C_OFF as i32; }
+                this.dirty = true;
+            } else if (op == 0x00EE) {
+                // RET: return from subroutine
+                if (this.sp > 0) {
+                    this.sp -= 1;
+                    this.pc = this.stack[this.sp];
+                }
+            }
+        } else if (hi == 0x1) {
+            // JP NNN
+            this.pc = nnn & 0x0FFF;
+        } else if (hi == 0x2) {
+            // CALL NNN
+            this.stack.push(this.pc);
+            this.pc = nnn & 0x0FFF;
+        } else if (hi == 0x3) {
+            // SE Vx, NN: skip if Vx == NN
+            if (this.getV(x) == nn) { this.pc += 2; }
+        } else if (hi == 0x4) {
+            // SNE Vx, NN: skip if Vx != NN
+            if (this.getV(x) != nn) { this.pc += 2; }
+        } else if (hi == 0x5) {
+            // SE Vx, Vy: skip if Vx == Vy
+            if (this.getV(x) == this.getV(y)) { this.pc += 2; }
+        } else if (hi == 0x6) {
+            // LD Vx, NN
+            this.setV(x, nn);
+        } else if (hi == 0x7) {
+            // ADD Vx, NN (no carry flag)
+            this.setV(x, (this.getV(x) + nn) & 0xFF);
+        } else if (hi == 0x8) {
+            this.execALU(op, x, y);
+        } else if (hi == 0x9) {
+            // SNE Vx, Vy: skip if Vx != Vy
+            if (this.getV(x) != this.getV(y)) { this.pc += 2; }
+        } else if (hi == 0xA) {
+            // LD I, NNN
+            this.i = nnn & 0x0FFF;
+        } else if (hi == 0xB) {
+            // JP V0, NNN
+            this.pc = (nnn & 0x0FFF) + this.getV(0);
+        } else if (hi == 0xC) {
+            // RND Vx, NN
+            this.setV(x, ((this.nextRand() as int) & 0xFF) & nn);
+        } else if (hi == 0xD) {
+            this.execDraw(x, y, n);
+        } else if (hi == 0xE) {
+            this.execKey(op, x);
+        } else if (hi == 0xF) {
+            this.execMisc(op, x);
+        }
+    }
+
+    fn execALU(op: int, x: int, y: int) {
+        let lo = op & 0x0F;
+        let a = this.getV(x);
+        let b = this.getV(y);
+
+        if (lo == 0x0) {
+            // LD Vx, Vy
+            this.setV(x, b);
+        } else if (lo == 0x1) {
+            // OR Vx, Vy
+            this.setV(x, a | b);
+        } else if (lo == 0x2) {
+            // AND Vx, Vy
+            this.setV(x, a & b);
+        } else if (lo == 0x3) {
+            // XOR Vx, Vy
+            this.setV(x, a ^ b);
+        } else if (lo == 0x4) {
+            // ADD Vx, Vy with carry
+            let sum = a + b;
+            this.setV(x, sum & 0xFF);
+            let carry: int = 0;
+            if (sum > 0xFF) { carry = 1; }
+            this.setV(0xF, carry);
+        } else if (lo == 0x5) {
+            // SUB Vx, Vy with borrow
+            let sub = a - b;
+            this.setV(x, sub & 0xFF);
+            let borrow: int = 0;
+            if (a >= b) { borrow = 1; }
+            this.setV(0xF, borrow);
+        } else if (lo == 0x6) {
+            // SHR Vx: Vx >>= 1, VF = LSB
+            this.setV(0xF, a & 1);
+            this.setV(x, a >> 1);
+        } else if (lo == 0x7) {
+            // SUBN Vx, Vy: Vx = Vy - Vx with borrow
+            let sub = b - a;
+            this.setV(x, sub & 0xFF);
+            let nborrow: int = 0;
+            if (b >= a) { nborrow = 1; }
+            this.setV(0xF, nborrow);
+        } else if (lo == 0xE) {
+            // SHL Vx: Vx <<= 1, VF = MSB (bit 7)
+            this.setV(0xF, (a >> 7) & 1);
+            this.setV(x, (a << 1) & 0xFF);
+        }
+    }
+
+    fn execDraw(x: int, y: int, n: int) {
+        let px = this.getV(x) % DISP_W;
+        let py = this.getV(y) % DISP_H;
+        let rows = n;
+        if (rows == 0) { rows = 16; }
+
+        this.setV(0xF, 0);
+
+        for (let row in 0..rows) {
+            let spriteByte = this.mem[this.i + row] as int;
+            let screenY = (py + row) % DISP_H;
+
+            for (let bit in 0..8) {
+                if ((spriteByte & (0x80 >> bit)) != 0) {
+                    let screenX = (px + bit) % DISP_W;
+                    let idx = screenY * DISP_W + screenX;
+                    if (this.fb[idx] != C_OFF) {
+                        this.setV(0xF, 1);
+                        this.fb[idx] = C_OFF as i32;
+                    } else {
+                        this.fb[idx] = C_ON as i32;
+                    }
+                }
+            }
+        }
+        this.dirty = true;
+    }
+
+    fn execKey(op: int, x: int) {
+        let key = this.getV(x);
+        if (op == 0xE09E) {
+            // SKP Vx: skip if key Vx is pressed
+            if (key < 16 && this.keys[key]) { this.pc += 2; }
+        } else if (op == 0xE0A1) {
+            // SKNP Vx: skip if key Vx is NOT pressed
+            if (key >= 16 || !this.keys[key]) { this.pc += 2; }
+        }
+    }
+
+    fn execMisc(op: int, x: int) {
+        let lo = op & 0xFF;
+
+        if (lo == 0x07) {
+            // LD Vx, DT
+            this.setV(x, this.delay);
+        } else if (lo == 0x0A) {
+            // LD Vx, K: wait for key press
+            this.waitingForKey = true;
+            this.waitReg = x;
+        } else if (lo == 0x15) {
+            // LD DT, Vx
+            this.delay = this.getV(x);
+        } else if (lo == 0x18) {
+            // LD ST, Vx
+            this.sound = this.getV(x);
+        } else if (lo == 0x1E) {
+            // ADD I, Vx
+            this.i = (this.i + this.getV(x)) & 0xFFFF;
+        } else if (lo == 0x29) {
+            // LD F, Vx: set I to font sprite addr for digit Vx
+            this.i = 0x050 + (this.getV(x) & 0x0F) * 5;
+        } else if (lo == 0x33) {
+            // LD B, Vx: BCD of Vx
+            let val = this.getV(x);
+            this.mem[this.i] = (val / 100) as byte;
+            this.mem[this.i + 1] = ((val / 10) % 10) as byte;
+            this.mem[this.i + 2] = (val % 10) as byte;
+        } else if (lo == 0x55) {
+            // LD [I], Vx: store V0..Vx in memory starting at I
+            for (let i in 0..x + 1) {
+                this.mem[this.i + i] = this.v[i];
+            }
+        } else if (lo == 0x65) {
+            // LD Vx, [I]: load V0..Vx from memory starting at I
+            for (let i in 0..x + 1) {
+                this.v[i] = this.mem[this.i + i];
+            }
+        }
+    }
+
+    fn tickTimers() {
+        if (this.delay > 0) { this.delay -= 1; }
+        if (this.sound > 0) { this.sound -= 1; }
+    }
+
+    fn step() {
+        if (this.waitingForKey) {
+            if (this.lastKey >= 0) {
+                this.setV(this.waitReg, this.lastKey);
+                this.waitingForKey = false;
+                this.lastKey = -1;
+            }
+            return;
+        }
+        this.exec();
+    }
+}
+
+// --- key mapping: PC key code -> CHIP-8 keypad (0x0-0xF) ---
+fn pcKeyToChip8(k: int): int {
+    // Row 1: 1 2 3 4 -> 1 2 3 C
+    if (k == 49) { return 0x1; }   // '1'
+    if (k == 50) { return 0x2; }   // '2'
+    if (k == 51) { return 0x3; }   // '3'
+    if (k == 52) { return 0xC; }   // '4'
+    // Row 2: Q W E R -> 4 5 6 D
+    if (k == 113) { return 0x4; }  // 'q'
+    if (k == 119) { return 0x5; }  // 'w'
+    if (k == 101) { return 0x6; }  // 'e'
+    if (k == 114) { return 0xD; }  // 'r'
+    // Row 3: A S D F -> 7 8 9 E
+    if (k == 97) { return 0x7; }   // 'a'
+    if (k == 115) { return 0x8; }  // 's'
+    if (k == 100) { return 0x9; }  // 'd'
+    if (k == 102) { return 0xE; }  // 'f'
+    // Row 4: Z X C V -> A 0 B F
+    if (k == 122) { return 0xA; }  // 'z'
+    if (k == 120) { return 0x0; }  // 'x'
+    if (k == 99) { return 0xB; }   // 'c'
+    if (k == 118) { return 0xF; }  // 'v'
+    return -1;
+}
+
+// --- debug helpers ---
+fn hexDigit(n: int): string {
+    if (n < 10) { return "" + n; }
+    if (n == 10) { return "A"; }
+    if (n == 11) { return "B"; }
+    if (n == 12) { return "C"; }
+    if (n == 13) { return "D"; }
+    if (n == 14) { return "E"; }
+    return "F";
+}
+
+fn hex16(val: int): string {
+    let s = "";
+    s = s + hexDigit((val >> 12) & 0xF);
+    s = s + hexDigit((val >> 8) & 0xF);
+    s = s + hexDigit((val >> 4) & 0xF);
+    s = s + hexDigit(val & 0xF);
+    return s;
+}
+
+fn hex8(val: int): string {
+    return hexDigit((val >> 4) & 0xF) + hexDigit(val & 0xF);
+}
+
+fn printRegs(cpu: Cpu) {
+    let line = "  V0=" + hex8(cpu.getV(0));
+    line = line + " V1=" + hex8(cpu.getV(1));
+    line = line + " V2=" + hex8(cpu.getV(2));
+    line = line + " V3=" + hex8(cpu.getV(3));
+    line = line + " V4=" + hex8(cpu.getV(4));
+    line = line + " V5=" + hex8(cpu.getV(5));
+    line = line + " V6=" + hex8(cpu.getV(6));
+    line = line + " V7=" + hex8(cpu.getV(7));
+    print(line);
+    line = "  V8=" + hex8(cpu.getV(8));
+    line = line + " V9=" + hex8(cpu.getV(9));
+    line = line + " VA=" + hex8(cpu.getV(10));
+    line = line + " VB=" + hex8(cpu.getV(11));
+    line = line + " VC=" + hex8(cpu.getV(12));
+    line = line + " VD=" + hex8(cpu.getV(13));
+    line = line + " VE=" + hex8(cpu.getV(14));
+    line = line + " VF=" + hex8(cpu.getV(15));
+    print(line);
+    print("  I=" + hex16(cpu.i) + " SP=" + cpu.sp + " DT=" + cpu.delay + " ST=" + cpu.sound);
+}
+
+// --- main ---
+fn main() {
+    // Load ROM path from environment
+    let romPath = str(getenv("CHIP8_ROM".cstr()));
+    if (romPath.len == 0) {
+        print("CHIP-8 emulator — set CHIP8_ROM=path/to/rom.ch8");
+        print("Keys: 1234 / QWER / ASDF / ZXCV  ->  123C / 456D / 789E / A0BF");
+        print("ESC: quit");
+        return;
+    }
+
+    // Debug mode: CHIP8_DEBUG=1 runs 20 instructions and prints state
+    let debugMode = str(getenv("CHIP8_DEBUG".cstr()));
+    let isDebug = debugMode.len > 0;
+
+    let cpu = new Cpu();
+    let rom = readfile(romPath);
+    cpu.loadRom(rom);
+
+    if (isDebug) {
+        // Run 20 instructions and print CPU state
+        for (let i in 0..20) {
+            let op = cpu.fetchOpcode();
+            print("PC=0x" + hex16(cpu.pc) + " OP=0x" + hex16(op));
+            cpu.exec();
+            printRegs(cpu);
+        }
+        // Print framebuffer pixel count
+        let onCount = 0;
+        for (let i in 0..DISP_W * DISP_H) {
+            if (cpu.fb[i] != C_OFF) { onCount += 1; }
+        }
+        print("Framebuffer: " + onCount + " pixels on");
+        return;
+    }
+
+    let s = new Surface("CHIP-8", WIN_W, WIN_H);
+
+    // initial render
+    s.fill(Rect(0, 0, WIN_W, WIN_H), C_BG);
+    s.blit(cpu.fb, DISP_W, DISP_H, Rect(0, 0, WIN_W, WIN_H - 32));
+    s.text(8, WIN_H - 12, "CHIP-8: " + romPath, C_STATUS);
+    s.present();
+
+    let running = true;
+    let timerAccum = 0;
+
+    while (running) {
+        let ev = s.wait_timeout(TICK_MS);
+
+        if (ev == EV_KEY) {
+            let k = s.key();
+            if (k == KEY_ESC) {
+                running = false;
+            } else {
+                let chipKey = pcKeyToChip8(k);
+                if (chipKey >= 0) {
+                    cpu.keys[chipKey] = true;
+                    cpu.lastKey = chipKey;
+                }
+            }
+        } else if (ev == EV_CLOSE) {
+            running = false;
+        } else if (ev == EV_TIMER) {
+            // Clear keys from previous tick (surface only sends KeyPress, no release)
+            for (let i in 0..16) { cpu.keys[i] = false; }
+
+            // Run CPU instructions
+            for (let i in 0..OPS_PER_TICK) {
+                cpu.step();
+            }
+
+            // Tick timers at 60 Hz
+            timerAccum += TICK_MS;
+            if (timerAccum >= 16) {
+                cpu.tickTimers();
+                timerAccum -= 16;
+            }
+
+            // Redraw if display changed
+            if (cpu.dirty) {
+                s.fill(Rect(0, 0, WIN_W, WIN_H), C_BG);
+                s.blit(cpu.fb, DISP_W, DISP_H, Rect(0, 0, WIN_W, WIN_H - 32));
+                let statusStr = "CHIP-8: " + romPath + "  PC=" + cpu.pc;
+                s.text(8, WIN_H - 12, statusStr, C_STATUS);
+                s.present();
+                cpu.dirty = false;
+            }
+        } else if (ev == EV_EXPOSE) {
+            s.fill(Rect(0, 0, WIN_W, WIN_H), C_BG);
+            s.blit(cpu.fb, DISP_W, DISP_H, Rect(0, 0, WIN_W, WIN_H - 32));
+            s.text(8, WIN_H - 12, "CHIP-8: " + romPath, C_STATUS);
+            s.present();
+        }
+    }
+}
