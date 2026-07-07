@@ -42,6 +42,30 @@ make test                         # runs all examples against golden output
 `voltc build file.vt` compiles to `.volt-cache/<name>` next to the source.
 Generated C is human-readable — look inside `.volt-cache/`.
 
+## Build a standalone executable
+
+`voltc run` builds and runs in one step. To produce a distributable binary,
+use `voltc build` — optionally with `-o` to choose the output path and
+`--release` for the optimized (`cc -O2`) build:
+
+```sh
+./voltc build apps/snake/snake.vt --release -o snake   # → ./snake
+./snake                                                 # run it directly
+```
+
+The result is a **self-contained native executable**: the Volt runtime (ref
+counting, strings, arrays, the surface shim) is statically compiled in — there
+is no `libvolt.so` to ship. It depends only on the platform's own libraries
+(libc, plus e.g. libX11 for a GUI app), so you can copy it anywhere and run it
+without `voltc` installed. A GUI app like snake lands around 48 KB; `strip` (or
+`--cc 'cc -s'`) trims it further.
+
+Cross-compile the same way with `--target` (see below):
+
+```sh
+./voltc build app.vt --release --target linux-arm64 -o app-arm64
+```
+
 ## Why it's fast
 
 - One pass per module: lex → parse → check → emit C. No IR.
