@@ -146,6 +146,19 @@ if [ -f lib/volt/gfx/native/linux-x64/libblend2d.so ]; then
         echo "FAIL gfx_ui_painter (build failed)"
         fail=1
     fi
+    # --bundle: one self-contained exe, no libblend2d.so/libstdc++ alongside
+    if [ -f lib/volt/gfx/native/linux-x64/libblend2d.a ]; then
+        bnd_bin=apps/uigfx/.volt-cache/uigfx_bundled
+        if ./voltc build apps/uigfx/uigfx.vt --bundle -o "$bnd_bin" >/dev/null 2>&1 &&
+           ! ldd "$bnd_bin" 2>/dev/null | grep -qiE "blend2d|stdc\+\+"; then
+            echo "PASS gfx_bundle_static"
+        else
+            echo "FAIL gfx_bundle_static (blend2d/stdc++ still dynamic or build failed)"
+            fail=1
+        fi
+    else
+        echo "SKIP gfx_bundle_static (no libblend2d.a)"
+    fi
 else
     echo "SKIP gfx_canvas_blit (no libblend2d — run lib/volt/gfx/native/build-blend2d.sh)"
 fi

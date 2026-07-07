@@ -242,8 +242,10 @@ static void usage(void) {
     fprintf(stderr,
             "voltc — the Volt compiler\n"
             "usage:\n"
-            "  voltc build <file.vt> [-o out] [--release] [--verbose]\n"
+            "  voltc build <file.vt> [-o out] [--release] [--bundle] [--verbose]\n"
             "              [--target <triple>] [--cc <compiler cmd>]\n"
+            "    --bundle   statically link prebuilt native libs + the C++ runtime\n"
+            "               into one self-contained exe (no shipped .so)\n"
             "  voltc run   <file.vt> [--release] [--verbose] [-- args...]\n"
             "targets: linux-x64 linux-arm64 macos-x64 macos-arm64 windows-x64\n"
             "  --cc (or VOLT_CC) overrides the C compiler; put sysroots/flags inside it,\n"
@@ -275,12 +277,13 @@ int main(int argc, char **argv) {
     if (argc < 3) usage();
     const char *cmd = argv[1];
     const char *input = argv[2];
-    bool release = false, verbose = false;
+    bool release = false, verbose = false, bundle = false;
     const char *outpath = NULL, *target = NULL, *cc_override = NULL;
     int prog_argc = 0;
     char **prog_argv = NULL;
     for (int i = 3; i < argc; i++) {
         if (strcmp(argv[i], "--release") == 0) release = true;
+        else if (strcmp(argv[i], "--bundle") == 0) bundle = true;
         else if (strcmp(argv[i], "--verbose") == 0) verbose = true;
         else if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) outpath = argv[++i];
         else if (strcmp(argv[i], "--target") == 0 && i + 1 < argc) target = argv[++i];
@@ -333,7 +336,7 @@ int main(int argc, char **argv) {
        the emitter's checked arithmetic), catching overflow in native/FFI code.
        Native host compilers only; skipped for cross/tcc or if unsupported. */
     const char *san = "";
-    if (!release && !cross && !win_target && strcmp(cc, "tcc") != 0 && cc_supports_san(cc))
+    if (!release && !bundle && !cross && !win_target && strcmp(cc, "tcc") != 0 && cc_supports_san(cc))
         san = " -fsanitize=signed-integer-overflow -fno-sanitize-recover=all";
 
     SBuf objs;
@@ -355,6 +358,8 @@ int main(int argc, char **argv) {
     /* ---- native packages: bundled C sources and prebuilt shared libraries ---- */
     SBuf shlibs;
     sb_init(&shlibs);
+    SBuf bundle_deps; /* extra -l flags for statically bundled archives (--bundle) */
+    sb_init(&bundle_deps);
     const char *copy_libs[64];
     int ncopy = 0;
     bool need_rpath = false;
@@ -396,18 +401,34 @@ int main(int argc, char **argv) {
             struct dirent *de;
             bool any = false;
             while ((de = readdir(dp))) {
-                if (!has_suffix(de->d_name, ".so") && !has_suffix(de->d_name, ".dylib") &&
-                    !has_suffix(de->d_name, ".dll"))
-                    continue;
+                bool shared = has_suffix(de->d_name, ".so") || has_suffix(de->d_name, ".dylib") ||
+                              has_suffix(de->d_name, ".dll");
+                bool static_lib = has_suffix(de->d_name, ".a");
                 const char *lib = arena_printf(&g_arena, "%s/%s", pdir, de->d_name);
-                sb_printf(&shlibs, " %s", lib);
-                if (ncopy < 64) copy_libs[ncopy++] = lib;
-                need_rpath = true;
-                any = true;
+                if (bundle) {
+                    /* --bundle: statically link the archive into the exe (no
+                       shipped .so), and pull in any deps it declares in a
+                       sidecar "<lib>.deps" file (one line of extra -l flags). */
+                    if (!static_lib) continue;
+                    sb_printf(&shlibs, " %s", lib);
+                    char *deps = read_file(arena_printf(&g_arena, "%s.deps", lib), NULL);
+                    if (deps) {
+                        for (char *p = deps; *p; p++) if (*p == '\n' || *p == '\r') *p = ' ';
+                        sb_printf(&bundle_deps, " %s", deps);
+                    }
+                    any = true;
+                } else {
+                    if (!shared) continue;
+                    sb_printf(&shlibs, " %s", lib);
+                    if (ncopy < 64) copy_libs[ncopy++] = lib;
+                    need_rpath = true;
+                    any = true;
+                }
             }
             closedir(dp);
-            if (!any) fatal("package '%s' has native/%s/ but no shared library in it", m->name,
-                            triple);
+            if (!any) fatal(bundle
+                ? "package '%s' has no static library (.a) in native/%s for --bundle"
+                : "package '%s' has native/%s/ but no shared library in it", m->name, triple);
         } else if (file_exists(arena_printf(&g_arena, "%s/native", mdir)) && !file_exists(nsrc)) {
             fatal("package '%s' ships native binaries but none for this platform (native/%s)",
                   m->name, triple);
@@ -476,8 +497,15 @@ int main(int argc, char **argv) {
     for (int i = 0; i < ncopy; i++)
         if (!file_exists(exe) || file_mtime(copy_libs[i]) > file_mtime(exe)) relink = true;
     if (relink || !file_exists(exe)) {
-        char *cmdline = arena_printf(&g_arena, "%s%s -o %s%s%s%s%s -lm", cc, san, exe, objs.data,
-                                     shlibs.data, libs.data, rpath_flag);
+        /* --bundle: bake the static archives + their deps and the C++/GCC
+           runtimes into the exe (no shipped .so). System libs (libc, libX11)
+           stay dynamic — fully static X11/glibc needs archives that usually
+           aren't installed and is fragile. */
+        const char *bundle_flags = bundle ? " -static-libstdc++ -static-libgcc" : "";
+        const char *bundle_link = bundle
+            ? arena_printf(&g_arena, "%s -lstdc++", bundle_deps.data) : "";
+        char *cmdline = arena_printf(&g_arena, "%s%s%s -o %s%s%s%s%s%s -lm", cc, san, bundle_flags,
+                                     exe, objs.data, shlibs.data, libs.data, bundle_link, rpath_flag);
         if (run_cmd(cmdline, verbose) != 0) fatal("link failed");
     }
     /* ship prebuilt libraries next to the executable */
