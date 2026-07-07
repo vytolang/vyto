@@ -17,7 +17,8 @@ enum {
     VS_EV_MOUSE_UP = 4,
     VS_EV_RESIZE = 5,
     VS_EV_CLOSE = 6,
-    VS_EV_MOUSE_MOVE = 7 /* reserved; not delivered in v1 */
+    VS_EV_MOUSE_MOVE = 7, /* reserved; not delivered in v1 */
+    VS_EV_TIMER = 8       /* vs_wait_timeout elapsed with no input (game tick) */
 };
 
 /* simplified key codes from vs_key: printable ASCII, or one of these */
@@ -52,7 +53,9 @@ int vs_text_width(void *s, const char *str);
 int vs_font_ascent(void *s);
 int vs_font_height(void *s);
 
-int vs_wait(void *s);     /* blocks; returns VS_EV_* */
+int vs_wait(void *s);              /* blocks until an event; returns VS_EV_* */
+int vs_poll(void *s);              /* non-blocking; VS_EV_NONE if none queued */
+int vs_wait_timeout(void *s, int ms); /* blocks <= ms; VS_EV_TIMER on timeout */
 int vs_key(void);         /* last VS_EV_KEY code */
 const char *vs_text(void);/* printable text of last key ("" if none) */
 int vs_x(void);

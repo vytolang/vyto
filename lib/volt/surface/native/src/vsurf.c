@@ -40,6 +40,7 @@ static void headless_open_script(void) {
  *   click X Y        mouse down (then up) at X,Y
  *   resize W H
  *   expose
+ *   tick             a timer tick (VS_EV_TIMER), for game-loop tests
  *   close
  * '#' starts a comment; EOF acts as close. */
 static int headless_wait(int *w, int *h) {
@@ -95,6 +96,7 @@ static int headless_wait(int *w, int *h) {
             }
         }
         if (strcmp(script_line, "expose") == 0) return VS_EV_EXPOSE;
+        if (strcmp(script_line, "tick") == 0) return VS_EV_TIMER;
         if (strcmp(script_line, "close") == 0) return VS_EV_CLOSE;
         /* unknown directive: skip */
     }
@@ -348,25 +350,53 @@ int vs_font_height(void *vs) {
     return (int)tm.tmHeight;
 }
 
+static int q_pop(void) {
+    QEv e = evq[evq_head];
+    evq_head = (evq_head + 1) % 64;
+    evq_len--;
+    last_key = e.key;
+    last_x = e.x;
+    last_y = e.y;
+    last_text[0] = e.text[0];
+    last_text[1] = 0;
+    return e.type;
+}
+
 int vs_wait(void *vs) {
     VSurf *s = vs;
     if (!s->hwnd) return headless_wait(&s->w, &s->h);
+    while (evq_len == 0) {
+        MSG msg;
+        if (GetMessageA(&msg, NULL, 0, 0) <= 0) return VS_EV_CLOSE;
+        TranslateMessage(&msg);
+        DispatchMessageA(&msg);
+    }
+    return q_pop();
+}
+
+int vs_poll(void *vs) {
+    VSurf *s = vs;
+    if (!s->hwnd) return headless_wait(&s->w, &s->h);
+    MSG msg;
+    while (evq_len == 0 && PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
+        TranslateMessage(&msg);
+        DispatchMessageA(&msg);
+    }
+    return evq_len ? q_pop() : VS_EV_NONE;
+}
+
+int vs_wait_timeout(void *vs, int ms) {
+    VSurf *s = vs;
+    if (!s->hwnd) return headless_wait(&s->w, &s->h);
     for (;;) {
-        while (evq_len == 0) {
-            MSG msg;
-            if (GetMessageA(&msg, NULL, 0, 0) <= 0) return VS_EV_CLOSE;
+        if (evq_len) return q_pop();
+        DWORD r = MsgWaitForMultipleObjects(0, NULL, FALSE, (DWORD)ms, QS_ALLINPUT);
+        if (r == WAIT_TIMEOUT) return VS_EV_TIMER;
+        MSG msg;
+        while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
             TranslateMessage(&msg);
             DispatchMessageA(&msg);
         }
-        QEv e = evq[evq_head];
-        evq_head = (evq_head + 1) % 64;
-        evq_len--;
-        last_key = e.key;
-        last_x = e.x;
-        last_y = e.y;
-        last_text[0] = e.text[0];
-        last_text[1] = 0;
-        return e.type;
     }
 }
 
@@ -383,6 +413,7 @@ void *vs_native_gc(void *vs) { return ((VSurf *)vs)->memdc; }
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
 #include <X11/keysym.h>
+#include <sys/select.h>
 
 typedef struct VSurf {
     Display *dpy; /* NULL in headless mode */
@@ -526,75 +557,122 @@ int vs_font_height(void *vs) {
     return font->ascent + font->descent;
 }
 
+/* translate one XEvent into a VS_EV_* code, or -1 to ignore and keep waiting */
+static int x11_translate(VSurf *s, XEvent *e) {
+    switch (e->type) {
+    case Expose:
+        if (e->xexpose.count == 0) return VS_EV_EXPOSE;
+        return -1;
+    case ConfigureNotify: {
+        int w = e->xconfigure.width, h = e->xconfigure.height;
+        if (w != s->w || h != s->h) {
+            s->w = w;
+            s->h = h;
+            XFreePixmap(s->dpy, s->back);
+            s->back = XCreatePixmap(s->dpy, s->win, (unsigned)w, (unsigned)h,
+                                    (unsigned)DefaultDepth(s->dpy, DefaultScreen(s->dpy)));
+            return VS_EV_RESIZE;
+        }
+        return -1;
+    }
+    case KeyPress: {
+        char buf[16];
+        KeySym ks = 0;
+        int n = XLookupString(&e->xkey, buf, sizeof buf - 1, &ks, NULL);
+        last_text[0] = 0;
+        switch (ks) {
+        case XK_Return: case XK_KP_Enter: last_key = VS_KEY_ENTER; return VS_EV_KEY;
+        case XK_BackSpace: last_key = VS_KEY_BACKSPACE; return VS_EV_KEY;
+        case XK_Escape: last_key = VS_KEY_ESC; return VS_EV_KEY;
+        case XK_Up: last_key = VS_KEY_UP; return VS_EV_KEY;
+        case XK_Down: last_key = VS_KEY_DOWN; return VS_EV_KEY;
+        case XK_Left: last_key = VS_KEY_LEFT; return VS_EV_KEY;
+        case XK_Right: last_key = VS_KEY_RIGHT; return VS_EV_KEY;
+        case XK_Delete: last_key = VS_KEY_DELETE; return VS_EV_KEY;
+        case XK_Tab: last_key = VS_KEY_TAB; return VS_EV_KEY;
+        case XK_Home: last_key = VS_KEY_HOME; return VS_EV_KEY;
+        case XK_End: last_key = VS_KEY_END; return VS_EV_KEY;
+        default:
+            if (n == 1 && buf[0] >= 32 && buf[0] < 127) {
+                last_key = buf[0];
+                last_text[0] = buf[0];
+                last_text[1] = 0;
+                return VS_EV_KEY;
+            }
+        }
+        return -1; /* modifier or unmapped key: keep waiting */
+    }
+    case ButtonPress:
+        if (e->xbutton.button == Button1) {
+            last_x = e->xbutton.x;
+            last_y = e->xbutton.y;
+            return VS_EV_MOUSE_DOWN;
+        }
+        return -1;
+    case ButtonRelease:
+        if (e->xbutton.button == Button1) {
+            last_x = e->xbutton.x;
+            last_y = e->xbutton.y;
+            return VS_EV_MOUSE_UP;
+        }
+        return -1;
+    case ClientMessage:
+        if ((Atom)e->xclient.data.l[0] == wm_delete) return VS_EV_CLOSE;
+        return -1;
+    default:
+        return -1;
+    }
+}
+
 int vs_wait(void *vs) {
     VSurf *s = vs;
     if (!s->dpy) return headless_wait(&s->w, &s->h);
-    XEvent e;
     for (;;) {
+        XEvent e;
         XNextEvent(s->dpy, &e);
-        switch (e.type) {
-        case Expose:
-            if (e.xexpose.count == 0) return VS_EV_EXPOSE;
-            break;
-        case ConfigureNotify: {
-            int w = e.xconfigure.width, h = e.xconfigure.height;
-            if (w != s->w || h != s->h) {
-                s->w = w;
-                s->h = h;
-                XFreePixmap(s->dpy, s->back);
-                s->back = XCreatePixmap(s->dpy, s->win, (unsigned)w, (unsigned)h,
-                                        (unsigned)DefaultDepth(s->dpy, DefaultScreen(s->dpy)));
-                return VS_EV_RESIZE;
-            }
-            break;
+        int r = x11_translate(s, &e);
+        if (r >= 0) return r;
+    }
+}
+
+/* non-blocking: next pending event, or VS_EV_NONE if the queue is empty.
+   Flushes output first so this frame's drawing is on screen. */
+int vs_poll(void *vs) {
+    VSurf *s = vs;
+    if (!s->dpy) return headless_wait(&s->w, &s->h);
+    XFlush(s->dpy);
+    while (XPending(s->dpy)) {
+        XEvent e;
+        XNextEvent(s->dpy, &e);
+        int r = x11_translate(s, &e);
+        if (r >= 0) return r;
+    }
+    return VS_EV_NONE;
+}
+
+/* block up to ms milliseconds for an event; VS_EV_TIMER if it elapses with
+   none. The tick source for game loops. */
+int vs_wait_timeout(void *vs, int ms) {
+    VSurf *s = vs;
+    if (!s->dpy) return headless_wait(&s->w, &s->h);
+    int fd = ConnectionNumber(s->dpy);
+    for (;;) {
+        XFlush(s->dpy);
+        while (XPending(s->dpy)) {
+            XEvent e;
+            XNextEvent(s->dpy, &e);
+            int r = x11_translate(s, &e);
+            if (r >= 0) return r;
         }
-        case KeyPress: {
-            char buf[16];
-            KeySym ks = 0;
-            int n = XLookupString(&e.xkey, buf, sizeof buf - 1, &ks, NULL);
-            last_text[0] = 0;
-            switch (ks) {
-            case XK_Return: case XK_KP_Enter: last_key = VS_KEY_ENTER; return VS_EV_KEY;
-            case XK_BackSpace: last_key = VS_KEY_BACKSPACE; return VS_EV_KEY;
-            case XK_Escape: last_key = VS_KEY_ESC; return VS_EV_KEY;
-            case XK_Up: last_key = VS_KEY_UP; return VS_EV_KEY;
-            case XK_Down: last_key = VS_KEY_DOWN; return VS_EV_KEY;
-            case XK_Left: last_key = VS_KEY_LEFT; return VS_EV_KEY;
-            case XK_Right: last_key = VS_KEY_RIGHT; return VS_EV_KEY;
-            case XK_Delete: last_key = VS_KEY_DELETE; return VS_EV_KEY;
-            case XK_Tab: last_key = VS_KEY_TAB; return VS_EV_KEY;
-            case XK_Home: last_key = VS_KEY_HOME; return VS_EV_KEY;
-            case XK_End: last_key = VS_KEY_END; return VS_EV_KEY;
-            default:
-                if (n == 1 && buf[0] >= 32 && buf[0] < 127) {
-                    last_key = buf[0];
-                    last_text[0] = buf[0];
-                    last_text[1] = 0;
-                    return VS_EV_KEY;
-                }
-            }
-            break; /* modifier or unmapped key: keep waiting */
-        }
-        case ButtonPress:
-            if (e.xbutton.button == Button1) {
-                last_x = e.xbutton.x;
-                last_y = e.xbutton.y;
-                return VS_EV_MOUSE_DOWN;
-            }
-            break;
-        case ButtonRelease:
-            if (e.xbutton.button == Button1) {
-                last_x = e.xbutton.x;
-                last_y = e.xbutton.y;
-                return VS_EV_MOUSE_UP;
-            }
-            break;
-        case ClientMessage:
-            if ((Atom)e.xclient.data.l[0] == wm_delete) return VS_EV_CLOSE;
-            break;
-        default:
-            break;
-        }
+        fd_set rf;
+        FD_ZERO(&rf);
+        FD_SET(fd, &rf);
+        struct timeval tv;
+        tv.tv_sec = ms / 1000;
+        tv.tv_usec = (ms % 1000) * 1000;
+        int rc = select(fd + 1, &rf, NULL, NULL, &tv);
+        if (rc <= 0) return VS_EV_TIMER; /* timeout or interrupted: tick */
+        /* data ready: loop and drain via XPending */
     }
 }
 
