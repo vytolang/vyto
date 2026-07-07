@@ -66,6 +66,17 @@ Cross-compile the same way with `--target` (see below):
 ./voltc build app.vt --release --target linux-arm64 -o app-arm64
 ```
 
+Apps that use a **prebuilt native library** (e.g. `volt/gfx`, which links
+blend2d) ship the executable plus that library's `.so` next to it by default —
+the shared lib is then amortized across apps on the device. For single-file
+distribution, `--bundle` statically links every prebuilt native lib (and the
+C++/GCC runtimes) into one executable, so there is no `.so` to ship alongside;
+it then depends only on base system libraries (libc, libX11):
+
+```sh
+./voltc build apps/uigfx/uigfx.vt --release --bundle -o app   # one file, no .so
+```
+
 ## Why it's fast
 
 - One pass per module: lex → parse → check → emit C. No IR.
