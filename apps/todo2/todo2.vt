@@ -1,0 +1,190 @@
+// VoltTodo-V2 — the volt/ui version of VoltTodo, in one file.
+//
+// Compare with apps/todo: no platform imports, no native packages, no
+// hand-rolled event loop, no key routing, no manual cycle teardown — the
+// toolkit owns all of it. Persistence uses the readlines/writefile
+// builtins, so there is no FFI beyond two libc declarations.
+//
+//   VOLT_TODO_FILE=/path/to/file  overrides where tasks are saved
+//                                 (default todo2.txt).
+
+import { Window, Column, Row, Spacer, Label, Button, TextField, ListBox } from "volt/ui";
+
+extern "C" {
+    fn getenv(name: cstring): cstring;
+    fn access(path: cstring, mode: i32): i32;
+}
+
+fn env_or(name: string, fallback: string): string {
+    let v = getenv(name.cstr());
+    if (v == null) { return fallback; }
+    return str(v);
+}
+
+fn file_exists(path: string): bool {
+    return access(path.cstr(), 0) == 0;
+}
+
+// ---- model: tasks + persistence ("1|title" per line) ----
+
+class Task {
+    title: string;
+    done: bool;
+
+    fn init(title: string, done: bool) {
+        this.title = title;
+        this.done = done;
+    }
+}
+
+class Store {
+    tasks: Task[];
+    path: string;
+
+    fn init(path: string) {
+        this.tasks = [];
+        this.path = path;
+        if (file_exists(path)) {
+            for (let line in readlines(path)) {
+                if (line.len >= 2 && line[1] == 124) { // '|'
+                    this.tasks.push(new Task(line.slice(2, line.len), line[0] == 49)); // '1'
+                }
+            }
+        }
+    }
+
+    fn save() {
+        let out = "";
+        for (let t in this.tasks) {
+            let flag = "0";
+            if (t.done) { flag = "1"; }
+            out += flag + "|" + t.title + "\n";
+        }
+        writefile(this.path, out);
+    }
+
+    fn add(title: string) {
+        this.tasks.push(new Task(title, false));
+        this.save();
+    }
+
+    fn toggle(i: int) {
+        if (i >= 0 && i < this.tasks.len) {
+            let t = this.tasks[i];
+            t.done = !t.done;
+            this.save();
+        }
+    }
+
+    fn remove(i: int) {
+        let kept: Task[] = [];
+        for (let j in 0..this.tasks.len) {
+            if (j != i) { kept.push(this.tasks[j]); }
+        }
+        this.tasks = kept;
+        this.save();
+    }
+
+    fn clear_done() {
+        let kept: Task[] = [];
+        for (let t in this.tasks) {
+            if (!t.done) { kept.push(t); }
+        }
+        this.tasks = kept;
+        this.save();
+    }
+
+    fn open_count(): int {
+        let n = 0;
+        for (let t in this.tasks) {
+            if (!t.done) { n += 1; }
+        }
+        return n;
+    }
+
+    fn done_count(): int {
+        return this.tasks.len - this.open_count();
+    }
+}
+
+// ---- app ----
+
+class App {
+    store: Store;
+    input: TextField;
+    list: ListBox;
+    status: Label;
+
+    fn init() {
+        this.store = new Store(env_or("VOLT_TODO_FILE", "todo2.txt"));
+        this.input = new TextField("type a task, press Enter");
+        this.list = new ListBox();
+        this.status = new Label("");
+        this.status.strong = false;
+        this.input.grow = 1;
+        this.list.grow = 1;
+        this.refresh();
+    }
+
+    fn refresh() {
+        let rows: string[] = [];
+        let checked: bool[] = [];
+        for (let t in this.store.tasks) {
+            rows.push(t.title);
+            checked.push(t.done);
+        }
+        this.list.set_items(rows, checked);
+        this.status.text = this.store.open_count() + " open / " + this.store.done_count()
+                         + " done  [Space toggles, Del deletes, Esc quits]";
+    }
+
+    fn add_task(title: string) {
+        this.store.add(title);
+        this.refresh();
+    }
+
+    fn add_from_input() {
+        if (this.input.text.len > 0) {
+            this.add_task(this.input.text);
+            this.input.set_text("");
+        }
+    }
+
+    fn toggle(i: int) {
+        this.store.toggle(i);
+        this.refresh();
+    }
+
+    fn delete_at(i: int) {
+        this.store.remove(i);
+        this.refresh();
+    }
+
+    fn clear_done() {
+        this.store.clear_done();
+        this.refresh();
+    }
+}
+
+fn main() {
+    let win = new Window("VoltTodo", 480, 540);
+    let app = new App();
+
+    let add = new Button("Add");
+    let clear = new Button("Clear done");
+    app.input.onSubmit = (t) => app.add_task(t);
+    app.list.onToggle = (i) => app.toggle(i);
+    app.list.onDelete = (i) => app.delete_at(i);
+    add.onClick = (b) => app.add_from_input();
+    clear.onClick = (b) => app.clear_done();
+
+    win.root = new Column([
+        new Label("VoltTodo"),
+        new Row([app.input, add]),
+        app.list,
+        new Row([app.status, new Spacer(), clear]),
+    ]);
+    win.run();
+
+    print("bye — " + app.store.tasks.len + " task(s) in " + app.store.path);
+}

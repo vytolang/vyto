@@ -129,6 +129,25 @@ for src in tests/ui/[0-9]*.vt; do
     fi
 done
 
+# --- VoltTodo-V2 headless end-to-end: add/toggle, then reload from disk ---
+mkdir -p tests/tmp
+rm -f tests/tmp/todo2.txt
+out=$(VS_HEADLESS=1 VS_EVENTS=tests/ui/todo2.events VOLT_TODO_FILE=tests/tmp/todo2.txt \
+      ./voltc run apps/todo2/todo2.vt 2>&1)
+saved=$(cat tests/tmp/todo2.txt 2>/dev/null)
+out2=$(VS_HEADLESS=1 VS_EVENTS=tests/ui/todo2_reload.events VOLT_TODO_FILE=tests/tmp/todo2.txt \
+       ./voltc run apps/todo2/todo2.vt 2>&1)
+want_saved="0|milk
+1|eggs"
+if [ "$out" = "bye — 2 task(s) in tests/tmp/todo2.txt" ] && [ "$saved" = "$want_saved" ] &&
+   [ "$out2" = "bye — 2 task(s) in tests/tmp/todo2.txt" ]; then
+    echo "PASS todo2_e2e"
+else
+    echo "FAIL todo2_e2e"
+    printf 'run1: %s\nsaved: %s\nrun2: %s\n' "$out" "$saved" "$out2"
+    fail=1
+fi
+
 # --- VoltTodo app: regenerate bindings, golden-check the shim binding, build ---
 if [ -f /usr/include/X11/Xlib.h ]; then
     ./voltbind apps/todo/x11/native/src/xshim.h --lib X11 \
