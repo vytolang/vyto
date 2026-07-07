@@ -254,6 +254,23 @@ if [ -f /usr/include/X11/Xlib.h ]; then
         echo "FAIL app_notepad_builds"
         fail=1
     fi
+    # snake: build to a standalone native exe, then run THAT binary headless
+    # (scripted ticks + keys + close) and require a clean exit — covers the
+    # native-build path and the surface game loop (wait_timeout/EV_TIMER).
+    mkdir -p tests/tmp
+    snake_bin=apps/snake/.volt-cache/snake_test
+    if ./voltc build apps/snake/snake.vt -o "$snake_bin" >/dev/null; then
+        printf 'tick\nkey Up\ntick\nkey Right\ntick\ntick\nclose\n' > tests/tmp/snake.events
+        if VS_HEADLESS=1 VS_EVENTS=tests/tmp/snake.events "$snake_bin" >/dev/null 2>&1; then
+            echo "PASS app_snake_builds_runs"
+        else
+            echo "FAIL app_snake_builds_runs (native binary exited non-zero)"
+            fail=1
+        fi
+    else
+        echo "FAIL app_snake_builds_runs (build failed)"
+        fail=1
+    fi
 else
     echo "SKIP volttodo (no X11 headers)"
 fi
