@@ -17,6 +17,60 @@ export struct Size {
     h: int;
 }
 
+// ------------------------------------------------------------ constraints
+
+// Flutter-style box constraints: the min/max width and height a parent offers
+// a child. The child picks a size within them (layout()); the parent then
+// positions it (arrange()). "Constraints go down, sizes come up, the parent
+// sets position."
+export class BoxConstraints {
+    minW: int;
+    maxW: int;
+    minH: int;
+    maxH: int;
+
+    fn init(minW: int, maxW: int, minH: int, maxH: int) {
+        this.minW = minW;
+        this.maxW = maxW;
+        this.minH = minH;
+        this.maxH = maxH;
+    }
+
+    // clamp a natural size into this box
+    fn constrain(sz: Size): Size {
+        let w = sz.w;
+        let h = sz.h;
+        if (w < this.minW) { w = this.minW; }
+        if (w > this.maxW) { w = this.maxW; }
+        if (h < this.minH) { h = this.minH; }
+        if (h > this.maxH) { h = this.maxH; }
+        return Size(w, h);
+    }
+
+    // shrink the max box by (dw, dh) (e.g. for padding), flooring at the min
+    fn deflate(dw: int, dh: int): BoxConstraints {
+        let maxw = this.maxW - dw;
+        let maxh = this.maxH - dh;
+        if (maxw < 0) { maxw = 0; }
+        if (maxh < 0) { maxh = 0; }
+        let minw = this.minW;
+        let minh = this.minH;
+        if (minw > maxw) { minw = maxw; }
+        if (minh > maxh) { minh = maxh; }
+        return new BoxConstraints(minw, maxw, minh, maxh);
+    }
+}
+
+// a box forced to exactly w x h
+export fn bcTight(w: int, h: int): BoxConstraints {
+    return new BoxConstraints(w, w, h, h);
+}
+
+// a box free to be anything up to w x h (min 0)
+export fn bcLoose(w: int, h: int): BoxConstraints {
+    return new BoxConstraints(0, w, 0, h);
+}
+
 export class Theme {
     bg: int;
     ink: int;
@@ -105,6 +159,14 @@ export class Widget {
     // natural size, bottom-up
     virtual fn measure(s: Painter, th: Theme): Size {
         return Size(this.bounds.w, this.bounds.h);
+    }
+
+    // size within constraints, bottom-up. The default clamps the natural size
+    // (measure) into the box, so existing widgets get constraint behavior for
+    // free; constraint-driven containers (Center, Padding, …) override this to
+    // pass derived constraints to their children.
+    virtual fn layout(s: Painter, th: Theme, bc: BoxConstraints): Size {
+        return bc.constrain(this.measure(s, th));
     }
 
     // assign absolute bounds, top-down. The base class keeps children at

@@ -1,7 +1,7 @@
 // volt/ui/layout — the layout containers: Column and Row (flex stacks) and
 // Spacer. Constraint-driven containers (Padding/Center/Container/…) land here.
 
-import { Widget, Painter, Theme, Size } from "volt/ui/core";
+import { Widget, Painter, Theme, Size, BoxConstraints, bcLoose } from "volt/ui/core";
 import { Rect } from "volt/surface";
 
 // vertical stack; children stretched to the inner width
@@ -171,5 +171,161 @@ export class Spacer extends Widget {
     }
     override fn measure(s: Painter, th: Theme): Size {
         return Size(0, 0);
+    }
+}
+
+// ---------------------------------------------------- constraint containers
+
+// A single-child wrapper. Subclasses override arrange() to place the child;
+// the base measure()/child accessor are shared. A wrapper with no child
+// behaves as an empty box.
+export class Box extends Widget {
+    fn child(): Widget {
+        if (this.children.len == 0) { return null; }
+        return this.children[0];
+    }
+}
+
+// Insets its child by `inset` pixels on every side. The child fills the
+// remaining inner rect (constraints deflated by 2*inset each axis).
+export class Padding extends Box {
+    inset: int;
+
+    fn init(inset: int, child: Widget) {
+        super.init();
+        this.inset = inset;
+        if (child != null) { this.add(child); }
+    }
+
+    override fn measure(s: Painter, th: Theme): Size {
+        let c = this.child();
+        if (c == null) { return Size(2 * this.inset, 2 * this.inset); }
+        let cs = c.measure(s, th);
+        return Size(cs.w + 2 * this.inset, cs.h + 2 * this.inset);
+    }
+
+    override fn arrange(s: Painter, th: Theme, r: Rect) {
+        this.bounds = r;
+        let c = this.child();
+        if (c == null) { return; }
+        let i = this.inset;
+        c.arrange(s, th, Rect(r.x + i, r.y + i, r.w - 2 * i, r.h - 2 * i));
+    }
+}
+
+// Positions its child at the child's natural size, centered in the space this
+// widget is given. The child is loosely constrained (may shrink to fit but is
+// not stretched) — the canonical constraint-driven container.
+export class Center extends Box {
+    fn init(child: Widget) {
+        super.init();
+        if (child != null) { this.add(child); }
+    }
+
+    override fn measure(s: Painter, th: Theme): Size {
+        let c = this.child();
+        if (c == null) { return Size(0, 0); }
+        return c.measure(s, th);
+    }
+
+    override fn arrange(s: Painter, th: Theme, r: Rect) {
+        this.bounds = r;
+        let c = this.child();
+        if (c == null) { return; }
+        let cs = c.layout(s, th, bcLoose(r.w, r.h));  // natural, clamped to r
+        let cx = r.x + (r.w - cs.w) / 2;
+        let cy = r.y + (r.h - cs.h) / 2;
+        c.arrange(s, th, Rect(cx, cy, cs.w, cs.h));
+    }
+}
+
+// Forces a fixed w x h. Its child (if any) fills that box.
+export class SizedBox extends Box {
+    w: int;
+    h: int;
+
+    fn init(w: int, h: int, child: Widget) {
+        super.init();
+        this.w = w;
+        this.h = h;
+        if (child != null) { this.add(child); }
+    }
+
+    override fn measure(s: Painter, th: Theme): Size {
+        return Size(this.w, this.h);
+    }
+
+    override fn arrange(s: Painter, th: Theme, r: Rect) {
+        this.bounds = r;
+        let c = this.child();
+        if (c != null) { c.arrange(s, th, r); }
+    }
+}
+
+// Fills the main axis of a Column/Row by flex factor (default 1). Equivalent
+// to setting `.grow` on a widget, but reads declaratively and wraps any child.
+export class Expanded extends Box {
+    fn init(child: Widget) {
+        super.init();
+        this.grow = 1;
+        if (child != null) { this.add(child); }
+    }
+
+    override fn measure(s: Painter, th: Theme): Size {
+        let c = this.child();
+        if (c == null) { return Size(0, 0); }
+        return c.measure(s, th);
+    }
+
+    override fn arrange(s: Painter, th: Theme, r: Rect) {
+        this.bounds = r;
+        let c = this.child();
+        if (c != null) { c.arrange(s, th, r); }
+    }
+}
+
+// Box-model container: an optional background fill, inner padding, and an
+// optional fixed size. Pass -1 for fixedW/fixedH to size to the child, and -1
+// for bg to skip the fill. The Flutter `Container` workhorse.
+export class Container extends Box {
+    fixedW: int;
+    fixedH: int;
+    pad: int;
+    bg: int;
+
+    fn init(fixedW: int, fixedH: int, pad: int, bg: int, child: Widget) {
+        super.init();
+        this.fixedW = fixedW;
+        this.fixedH = fixedH;
+        this.pad = pad;
+        this.bg = bg;
+        if (child != null) { this.add(child); }
+    }
+
+    override fn measure(s: Painter, th: Theme): Size {
+        let w = 2 * this.pad;
+        let h = 2 * this.pad;
+        let c = this.child();
+        if (c != null) {
+            let cs = c.measure(s, th);
+            w = cs.w + 2 * this.pad;
+            h = cs.h + 2 * this.pad;
+        }
+        if (this.fixedW >= 0) { w = this.fixedW; }
+        if (this.fixedH >= 0) { h = this.fixedH; }
+        return Size(w, h);
+    }
+
+    override fn arrange(s: Painter, th: Theme, r: Rect) {
+        this.bounds = r;
+        let c = this.child();
+        if (c == null) { return; }
+        let p = this.pad;
+        c.arrange(s, th, Rect(r.x + p, r.y + p, r.w - 2 * p, r.h - 2 * p));
+    }
+
+    override fn draw(s: Painter, th: Theme) {
+        if (this.bg >= 0) { s.fill(this.bounds, this.bg); }
+        for (let c in this.children) { c.draw(s, th); }
     }
 }
