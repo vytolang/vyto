@@ -1,0 +1,508 @@
+// VoltGallery — a comprehensive widget & feature showcase for volt/ui.
+//
+// Built on the Phase 4 P0 widget catalog. Exercises every widget and capability:
+// layout containers, form inputs, display widgets, navigation, menus, overlays.
+//
+// Rendering tiers:
+//   Rich (blend2d, AA):  ./voltc run apps/gallery/gallery.vt
+//   Lean (vector):       ./voltc run apps/gallery/gallery.vt -- --surface
+//   Bundle:              ./voltc build apps/gallery/gallery.vt --release --bundle -o gallery
+//
+// The app is framed top-to-bottom: MenuBar, Toolbar, TabView (4 tabs), StatusBar.
+// Every interactive control updates the StatusBar and prints to stdout.
+
+import { Window, Column, Row, Spacer, Label, Button, TextField,
+         Checkbox, ListBox, TextArea, RadioGroup, Switch,
+         SegmentedControl, Stepper, Dropdown, ProgressBar,
+         Text, Card, Badge, Chip,
+         ALIGN_LEFT, ALIGN_CENTER, ALIGN_RIGHT,
+         TabView, Accordion, Toolbar, StatusBar,
+         MenuItem, Menu, MenuBar, MenuPopup,
+         Dialog, FilePicker, MessageDialog,
+         ConfirmDialog, InputDialog, Popover,
+         Align, Stack, Positioned, Wrap, Grid, Flexible, Divider,
+         Padding, Center, SizedBox, Expanded, Container,
+         ScrollView,
+         Widget, Painter, Theme } from "volt/ui";
+import { GfxPainter } from "volt/gfx/painter";
+import { Rect, KEY_ESC, rgb } from "volt/surface";
+
+fn font_path(): string {
+    return "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf";
+}
+
+fn dark_theme(): Theme {
+    let th = new Theme();
+    th.bg = rgb(30, 30, 36);
+    th.ink = rgb(220, 220, 225);
+    th.accent = rgb(80, 140, 220);
+    th.muted = rgb(120, 120, 130);
+    th.sel = rgb(50, 60, 80);
+    th.white = rgb(45, 45, 52);
+    th.pad = 12;
+    th.spacing = 8;
+    return th;
+}
+
+class GalleryState {
+    counter: int;
+    last_action: string;
+    dark: bool;
+    status_left: string;
+    status_right: string;
+
+    fn init() {
+        this.counter = 0;
+        this.last_action = "ready";
+        this.dark = false;
+        this.status_left = "VoltGallery — Tab to cycle focus";
+        this.status_right = "Ready";
+    }
+
+    fn bump(): int {
+        this.counter += 1;
+        return this.counter;
+    }
+
+    fn action(msg: string) {
+        this.last_action = msg;
+        this.status_right = msg;
+        print("action: " + msg);
+    }
+}
+
+fn mk_box(w: int, h: int, color: int): Widget {
+    return new Container(w, h, 0, color, null);
+}
+
+// ------------------------------------------------------- Layout tab
+
+fn build_layout_tab(): Widget {
+    let col = new Column([]);
+    col.padding = 10;
+    col.spacing = 10;
+
+    // Row + Divider
+    let card1 = new Card(8, -1, -1, "Row + Divider", make_row_demo());
+    col.add(card1);
+
+    // Wrap
+    let card2 = new Card(8, -1, -1, "Wrap", make_wrap_demo());
+    col.add(card2);
+
+    // Grid
+    let card3 = new Card(8, -1, -1, "Grid (3 cols)", make_grid_demo());
+    col.add(card3);
+
+    // Stack + Positioned
+    let card4 = new Card(8, -1, -1, "Stack + Positioned", make_stack_demo());
+    col.add(card4);
+
+    // Align + Expanded
+    let card5 = new Card(8, -1, -1, "Align + Expanded", make_align_demo());
+    col.add(card5);
+
+    // Spacer + Padding + Center + Flexible
+    let card6 = new Card(8, -1, -1, "Spacer / Padding / Center / Flexible", make_spacing_demo());
+    col.add(card6);
+
+    return col;
+}
+
+fn make_row_demo(): Widget {
+    let col = new Column([]);
+    col.spacing = 4;
+    col.add(new Label("Three boxes in a Row with a Divider:"));
+    let row = new Row([]);
+    row.add(mk_box(60, 28, rgb(220, 80, 80)));
+    row.add(new SizedBox(6, 0, null));
+    row.add(new Divider(false));
+    row.add(new SizedBox(6, 0, null));
+    row.add(mk_box(60, 28, rgb(80, 180, 80)));
+    row.add(new SizedBox(6, 0, null));
+    row.add(mk_box(60, 28, rgb(80, 80, 220)));
+    col.add(row);
+    return col;
+}
+
+fn make_wrap_demo(): Widget {
+    let col = new Column([]);
+    col.spacing = 4;
+    col.add(new Label("Boxes flow left-to-right, wrapping past maxW:"));
+    let wrap = new Wrap(6, 4, [
+        mk_box(45, 22, rgb(255, 160, 60)),
+        mk_box(55, 22, rgb(160, 60, 255)),
+        mk_box(40, 22, rgb(60, 200, 200)),
+        mk_box(50, 22, rgb(255, 100, 150)),
+        mk_box(45, 22, rgb(100, 255, 100)),
+        mk_box(55, 22, rgb(200, 200, 50)),
+    ]);
+    col.add(wrap);
+    return col;
+}
+
+fn make_grid_demo(): Widget {
+    let col = new Column([]);
+    col.spacing = 4;
+    col.add(new Label("Six boxes in a 3-column Grid:"));
+    let grid = new Grid(3, 4, [
+        mk_box(0, 0, rgb(200, 100, 100)),
+        mk_box(0, 0, rgb(100, 200, 100)),
+        mk_box(0, 0, rgb(100, 100, 200)),
+        mk_box(0, 0, rgb(200, 200, 100)),
+        mk_box(0, 0, rgb(200, 100, 200)),
+        mk_box(0, 0, rgb(100, 200, 200)),
+    ]);
+    // give the grid a fixed height so cells are visible
+    let gbox = new SizedBox(-1, 80, grid);
+    col.add(gbox);
+    return col;
+}
+
+fn make_stack_demo(): Widget {
+    let col = new Column([]);
+    col.spacing = 4;
+    col.add(new Label("Base box with an overlay Positioned at (25,15):"));
+    let stack = new Stack();
+    let base = mk_box(120, 60, rgb(180, 180, 200));
+    let overlay = new Positioned(25, 15, 50, 30, mk_box(0, 0, rgb(255, 100, 100)));
+    stack.add(base);
+    stack.add(overlay);
+    let sbox = new SizedBox(120, 60, stack);
+    col.add(sbox);
+    return col;
+}
+
+fn make_align_demo(): Widget {
+    let col = new Column([]);
+    col.spacing = 4;
+    col.add(new Label("Align at (0.7,0.3) next to an Expanded box:"));
+    let row = new Row([]);
+    row.add(new Align(0.7, 0.3, mk_box(28, 28, rgb(60, 180, 120))));
+    row.add(new SizedBox(8, 0, null));
+    row.add(new Expanded(mk_box(0, 28, rgb(150, 200, 150))));
+    let rbox = new SizedBox(-1, 40, row);
+    col.add(rbox);
+    return col;
+}
+
+fn make_spacing_demo(): Widget {
+    let col = new Column([]);
+    col.spacing = 4;
+    // Spacer: a Row with a flexible gap that pushes the two boxes apart.
+    col.add(new Label("Spacer pushes the two boxes to the edges:"));
+    let row = new Row([]);
+    row.add(mk_box(40, 24, rgb(220, 120, 60)));
+    row.add(new Spacer());
+    row.add(mk_box(40, 24, rgb(60, 120, 220)));
+    col.add(new SizedBox(-1, 24, row));
+    // Padding wrapping a Centered box inside a tinted Container.
+    col.add(new Label("Padding(8) + Center inside a Container:"));
+    let padded = new Padding(8, new Center(mk_box(30, 20, rgb(120, 200, 120))));
+    col.add(new Container(-1, 44, 0, rgb(235, 235, 235), padded));
+    // Flexible: two boxes share the row, shrinking below natural width.
+    col.add(new Label("Two Flexible boxes share the row width:"));
+    let frow = new Row([]);
+    frow.add(new Flexible(mk_box(0, 22, rgb(200, 120, 200))));
+    frow.add(new SizedBox(6, 0, null));
+    frow.add(new Flexible(mk_box(0, 22, rgb(120, 200, 200))));
+    col.add(new SizedBox(-1, 22, frow));
+    return col;
+}
+
+// ------------------------------------------------------- Inputs tab
+
+fn build_inputs_tab(st: GalleryState, win: Window): Widget {
+    let col = new Column([]);
+    col.padding = 10;
+    col.spacing = 8;
+
+    // Button + counter
+    let btn_row = new Row([]);
+    let counter_btn = new Button("Bump counter");
+    let counter_lbl = new Label("count: 0");
+    counter_btn.onClick = (w) => {
+        let c = st.bump();
+        counter_lbl.text = "count: " + c;
+        st.action("bumped to " + c);
+    };
+    btn_row.add(counter_btn);
+    btn_row.add(new SizedBox(10, 0, null));
+    btn_row.add(counter_lbl);
+    col.add(btn_row);
+
+    // TextField
+    let tf = new TextField("type here, then press Enter");
+    tf.onSubmit = (t) => st.action("submitted: " + t);
+    col.add(tf);
+
+    // Checkbox + Switch side by side
+    let cs_row = new Row([]);
+    let cb = new Checkbox("Enable feature");
+    cb.onToggle = (on) => st.action("checkbox: " + on);
+    let sw = new Switch(false);
+    sw.onToggle = (on) => st.action("switch: " + on);
+    cs_row.add(cb);
+    cs_row.add(new SizedBox(20, 0, null));
+    cs_row.add(new Label("Switch:"));
+    cs_row.add(new SizedBox(4, 0, null));
+    cs_row.add(sw);
+    col.add(cs_row);
+
+    // RadioGroup
+    col.add(new Label("RadioGroup — pick a size:"));
+    let rg = new RadioGroup(["Small", "Medium", "Large"], [1, 2, 3]);
+    rg.onChange = (v) => st.action("radio: " + v);
+    col.add(rg);
+
+    // SegmentedControl
+    col.add(new Label("SegmentedControl — pick a view:"));
+    let sc = new SegmentedControl(["Day", "Week", "Month"]);
+    sc.onSelect = (i) => st.action("view: " + i);
+    col.add(sc);
+
+    // Stepper + ProgressBar
+    col.add(new Label("Stepper drives ProgressBar:"));
+    let sp_row = new Row([]);
+    let stepper = new Stepper(50, 0, 100);
+    let pb = new ProgressBar(0.5, -1, -1);
+    stepper.onChange = (v) => {
+        pb.set_progress(v as float / 100.0);
+        st.action("progress: " + v + "%");
+    };
+    sp_row.add(new Label("Value:"));
+    sp_row.add(new SizedBox(4, 0, null));
+    sp_row.add(stepper);
+    sp_row.add(new SizedBox(10, 0, null));
+    sp_row.add(pb);
+    col.add(sp_row);
+
+    // Dropdown
+    col.add(new Label("Dropdown — pick a color:"));
+    let dd = new Dropdown(["Red", "Green", "Blue"]);
+    dd.onSelect = (i) => st.action("dropdown: " + i);
+    col.add(dd);
+
+    // ListBox
+    col.add(new Label("ListBox — click a row to toggle:"));
+    let lb = new ListBox();
+    let items: string[] = ["alpha", "beta", "gamma", "delta"];
+    let checks: bool[] = [false, true, false, false];
+    lb.set_items(items, checks);
+    lb.onToggle = (i) => st.action("listbox: " + items[i]);
+    let lb_box = new SizedBox(-1, 90, lb);
+    col.add(lb_box);
+
+    // TextArea
+    col.add(new Label("TextArea (multi-line editor):"));
+    let ta = new TextArea();
+    let ta_box = new SizedBox(-1, 100, ta);
+    col.add(ta_box);
+
+    return col;
+}
+
+// ------------------------------------------------------- Display tab
+
+fn build_display_tab(st: GalleryState): Widget {
+    let col = new Column([]);
+    col.padding = 10;
+    col.spacing = 8;
+
+    let lorem = "The quick brown fox jumps over the lazy dog. "
+              + "Pack my box with five dozen liquor jugs. "
+              + "How vexingly quick daft zebras jump.";
+
+    // Text — three alignments, each in a Card
+    let t1 = new Text(lorem);
+    t1.align = ALIGN_LEFT;
+    col.add(new Card(8, -1, -1, "Text — ALIGN_LEFT", t1));
+
+    let t2 = new Text(lorem);
+    t2.align = ALIGN_CENTER;
+    col.add(new Card(8, -1, -1, "Text — ALIGN_CENTER", t2));
+
+    let t3 = new Text(lorem);
+    t3.align = ALIGN_RIGHT;
+    col.add(new Card(8, -1, -1, "Text — ALIGN_RIGHT", t3));
+
+    // Badges
+    let badge_card = new Card(8, -1, -1, "Badges", null);
+    let bc_row = new Row([]);
+    bc_row.add(mk_box(36, 36, rgb(200, 200, 200)));
+    let badge1 = new Badge("5", rgb(220, 60, 60), rgb(255, 255, 255), mk_box(36, 36, rgb(200, 200, 200)));
+    bc_row.add(new SizedBox(12, 0, null));
+    bc_row.add(badge1);
+    bc_row.add(new SizedBox(12, 0, null));
+    let badge2 = new Badge("NEW", rgb(60, 160, 60), rgb(255, 255, 255), mk_box(36, 36, rgb(200, 200, 200)));
+    bc_row.add(badge2);
+    badge_card.add(bc_row);
+    col.add(badge_card);
+
+    // Chips
+    let chip_card = new Card(8, -1, -1, "Chips (click x to delete)", null);
+    let cc_row = new Row([]);
+    let chip1 = new Chip("tag", false, -1);
+    let chip2 = new Chip("deletable", true, -1);
+    chip2.onDelete = (c) => {
+        st.action("chip deleted: deletable");
+        c.bounds = Rect(0, 0, 0, 0);
+    };
+    let chip3 = new Chip("removable", true, -1);
+    chip3.onDelete = (c) => {
+        st.action("chip deleted: removable");
+        c.bounds = Rect(0, 0, 0, 0);
+    };
+    cc_row.add(chip1);
+    cc_row.add(new SizedBox(6, 0, null));
+    cc_row.add(chip2);
+    cc_row.add(new SizedBox(6, 0, null));
+    cc_row.add(chip3);
+    chip_card.add(cc_row);
+    col.add(chip_card);
+
+    return col;
+}
+
+// ------------------------------------------------------- Overlays tab
+
+fn build_overlays_tab(st: GalleryState, win: Window): Widget {
+    let col = new Column([]);
+    col.padding = 10;
+    col.spacing = 8;
+
+    col.add(new Label("Click a button to launch an overlay:"));
+
+    // Pre-create dialogs
+    let confirm_dlg = new ConfirmDialog("Confirm Action", "Are you sure you want to proceed with this action?");
+    let input_dlg = new InputDialog("Enter Name", "Please enter your name:", "");
+    let about_dlg = new MessageDialog("About VoltGallery",
+        "VoltGallery — Phase 4 P0 Widget Showcase\n"
+        + "Every volt/ui widget, live and interactive.\n"
+        + "Dirty-region repaint, focus ring, theming.");
+    let file_dlg = new FilePicker(".", false);
+
+    // Dialog buttons in two rows
+    let row1 = new Row([]);
+    let confirm_btn = new Button("ConfirmDialog");
+    confirm_btn.onClick = (w) => win.open_overlay(confirm_dlg);
+    let input_btn = new Button("InputDialog");
+    input_btn.onClick = (w) => win.open_overlay(input_dlg);
+    let about_btn = new Button("About");
+    about_btn.onClick = (w) => win.open_overlay(about_dlg);
+    row1.add(confirm_btn);
+    row1.add(new SizedBox(8, 0, null));
+    row1.add(input_btn);
+    row1.add(new SizedBox(8, 0, null));
+    row1.add(about_btn);
+    col.add(row1);
+
+    let row2 = new Row([]);
+    let file_btn = new Button("FilePicker");
+    file_btn.onClick = (w) => win.open_overlay(file_dlg);
+    let pop_btn = new Button("Popover");
+    pop_btn.onClick = (w) => {
+        let popover = new Popover(pop_btn.bounds.x, pop_btn.bounds.y + pop_btn.bounds.h);
+        popover.add(new Label("Hello from Popover!"));
+        win.open_overlay(popover);
+        st.action("popover opened");
+    };
+    row2.add(file_btn);
+    row2.add(new SizedBox(8, 0, null));
+    row2.add(pop_btn);
+    col.add(row2);
+
+    // Wire dialog callbacks
+    confirm_dlg.onConfirm = () => st.action("confirmed!");
+    confirm_dlg.onCancel = () => st.action("cancelled");
+    input_dlg.onAccept = (t) => st.action("you typed: " + t);
+    input_dlg.onCancel = () => st.action("input cancelled");
+    file_dlg.onAccept = (p) => st.action("picked: " + p);
+
+    // Accordion
+    col.add(new Label("Accordion — click a header to expand:"));
+    let acc = new Accordion(["Section 1: Layout", "Section 2: Input", "Section 3: Display"]);
+    acc.add_section(new Label("Layout uses two-pass measure/arrange with BoxConstraints."));
+    acc.add_section(new Label("Input widgets handle focus, keyboard, and mouse events."));
+    acc.add_section(new Label("Display widgets are read-only: Text, Card, Badge, Chip."));
+    col.add(acc);
+
+    return col;
+}
+
+// ------------------------------------------------------- Main
+
+fn main() {
+    let use_surface = false;
+    let a = args();
+    for (let i in 0..a.len) {
+        if (a[i] == "--surface") { use_surface = true; }
+    }
+
+    let win = new Window("VoltGallery", 800, 640);
+
+    if (!use_surface) {
+        win.use_painter(new GfxPainter(win.surface(), font_path(), 15.0));
+    }
+
+    let st = new GalleryState();
+
+    // MenuBar
+    let bar = new MenuBar();
+    let file_menu = bar.add_menu(new Menu("File"));
+    file_menu.add("Exit").onSelect = () => win.close();
+    let view_menu = bar.add_menu(new Menu("View"));
+    view_menu.add("Toggle Theme").onSelect = () => {
+        st.dark = !st.dark;
+        if (st.dark) {
+            win.theme = dark_theme();
+            st.action("dark theme");
+        } else {
+            win.theme = new Theme();
+            st.action("light theme");
+        }
+        win.layout();
+        win.redraw();
+    };
+    let help_menu = bar.add_menu(new Menu("Help"));
+    let about_dlg_menu = new MessageDialog("About VoltGallery",
+        "VoltGallery — Phase 4 P0 Widget Showcase\n"
+        + "Rich tier: blend2d AA rendering\n"
+        + "Lean tier: vector surface\n"
+        + "Dirty-region repaint, focus ring, theming.");
+    help_menu.add("About").onSelect = () => win.open_overlay(about_dlg_menu);
+    win.menubar = bar;
+
+    // Toolbar
+    let tb_btn = new Button("Bump");
+    tb_btn.onClick = (w) => {
+        let c = st.bump();
+        st.action("toolbar bump: " + c);
+    };
+    let tb_reset = new Button("Reset");
+    tb_reset.onClick = (w) => {
+        st.counter = 0;
+        st.action("reset");
+    };
+    let toolbar = new Toolbar(8, 6, [tb_btn, tb_reset]);
+
+    // TabView — the primary navigation, grows to fill available space
+    let tv = new TabView(["Layout", "Inputs", "Display", "Overlays"]);
+    tv.grow = 1;
+    tv.onSwitch = (i) => st.action("tab: " + i);
+    // Each tab panel is wrapped in a ScrollView so overflowing content scrolls.
+    tv.add_panel(new ScrollView(build_layout_tab()));
+    tv.add_panel(new ScrollView(build_inputs_tab(st, win)));
+    tv.add_panel(new ScrollView(build_display_tab(st)));
+    tv.add_panel(new ScrollView(build_overlays_tab(st, win)));
+
+    // StatusBar
+    let sb = new StatusBar("VoltGallery — Tab to cycle focus", "Ready");
+
+    // Root: Toolbar (natural) + TabView (fills) + StatusBar (natural)
+    win.root = new Column([toolbar, tv, sb]);
+
+    win.run();
+
+    print("bye — counter=" + st.counter + " last=" + st.last_action);
+}

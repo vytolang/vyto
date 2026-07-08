@@ -213,7 +213,7 @@ for src in tests/ui/[0-9]*.vt; do
 done
 
 # --- volt/ui named golden tests: TextArea + menus (no env needed) ---
-for name in textarea menu; do
+for name in textarea menu gallery; do
     got=$(VS_HEADLESS=1 VS_EVENTS="tests/ui/$name.events" ./voltc run "tests/ui/$name.vt" 2>&1)
     if [ "$got" = "$(cat "tests/ui/$name.expected")" ]; then
         echo "PASS ui_$name"
