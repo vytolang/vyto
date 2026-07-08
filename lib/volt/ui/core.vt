@@ -9,8 +9,8 @@
 // (release_all/drop_handlers), so apps never need a manual teardown.
 
 import { Surface, Rect, contains, rgb,
-         EV_EXPOSE, EV_KEY, EV_MOUSE_DOWN, EV_RESIZE, EV_CLOSE,
-         KEY_ESC, KEY_TAB } from "volt/surface";
+          EV_EXPOSE, EV_KEY, EV_MOUSE_DOWN, EV_MOUSE_WHEEL, EV_RESIZE, EV_CLOSE,
+          KEY_ESC, KEY_TAB } from "volt/surface";
 
 export struct Size {
     w: int;
@@ -229,6 +229,23 @@ export class Widget {
         return false;
     }
 
+    // mouse wheel scrolled while the cursor is over this widget; delta is
+    // positive for down, negative for up. Return true when consumed.
+    virtual fn on_scroll(delta: int): bool {
+        return false;
+    }
+
+    // Walk from this widget up the parent chain calling on_scroll until one
+    // consumes it. Used by Window.on_wheel_ev.
+    fn on_scroll_at(x: int, y: int, delta: int): bool {
+        let w: Widget = this;
+        while (w != null) {
+            if (w.on_scroll(delta)) { return true; }
+            w = w.parent;
+        }
+        return false;
+    }
+
     // subclasses null their own closure fields here (leaf hook only —
     // release_all() does the tree walk; overrides never recurse)
     virtual fn drop_handlers() { }
@@ -240,8 +257,17 @@ export class Widget {
         }
     }
 
+    // set the Window weak-ref on this widget and all descendants so widgets
+    // like Dropdown can reach the Window to open overlays.
+    fn propagate_win(w: weak Window) {
+        this.win = w;
+        for (let c in this.children) {
+            c.propagate_win(w);
+        }
+    }
+
     // deepest widget under the point; later siblings win (drawn on top)
-    fn hit(px: int, py: int): Widget {
+    virtual fn hit(px: int, py: int): Widget {
         let n = this.children.len;
         for (let i in 0..n) {
             let c = this.children[n - 1 - i];
@@ -252,7 +278,7 @@ export class Widget {
         return null;
     }
 
-    fn collect_focus(out: Widget[]) {
+    virtual fn collect_focus(out: Widget[]) {
         if (this.focusable) { out.push(this); }
         for (let c in this.children) {
             c.collect_focus(out);
@@ -348,6 +374,7 @@ export class Window {
         if (this.root != null) {
             this.root.measure(this.painter, this.theme);
             this.root.arrange(this.painter, this.theme, Rect(0, top, w, h - top));
+            this.root.propagate_win(this);
         }
         if (this.overlay != null) {
             this.overlay.place(this.painter, this.theme);
@@ -488,12 +515,29 @@ export class Window {
             }
             if (target.on_click(x, y)) { changed = true; }
             if (changed) {
-                // the clicked widget, plus the previously focused one if focus
-                // moved (its border must clear)
-                if (old != null && old != target) { this.mark_dirty(old.bounds); }
-                this.mark_dirty(target.bounds);
-                this.repaint();
+                // A click handler may change state visible elsewhere in the
+                // tree (Label text, StatusBar, ProgressBar …), so do a full
+                // redraw — the dirty-region optimization only covers the
+                // clicked widget itself.
+                this.redraw();
             }
+        }
+    }
+
+    // Mouse wheel: walk from the deepest widget under the cursor up the
+    // parent chain until a widget consumes the scroll (e.g. ScrollView).
+    // A full redraw is cheap and always correct for scroll changes.
+    fn on_wheel_ev(x: int, y: int, delta: int) {
+        if (this.overlay != null) {
+            if (contains(this.overlay.bounds, x, y)) {
+                if (this.overlay.on_scroll_at(x, y, delta)) { this.redraw(); }
+            }
+            return;
+        }
+        let target: Widget = null;
+        if (this.root != null) { target = this.root.hit(x, y); }
+        if (target != null) {
+            if (target.on_scroll_at(x, y, delta)) { this.redraw(); }
         }
     }
 
@@ -514,6 +558,9 @@ export class Window {
                 this.on_key_ev(this.surf.key(), this.surf.text_ev());
             } else if (ev == EV_MOUSE_DOWN) {
                 this.on_mouse_ev(this.surf.mouse_x(), this.surf.mouse_y());
+            } else if (ev == EV_MOUSE_WHEEL) {
+                this.on_wheel_ev(this.surf.mouse_x(), this.surf.mouse_y(),
+                                 this.surf.wheel());
             }
         }
         // break handler->owner->tree reference cycles so RC frees everything;

@@ -1,7 +1,8 @@
 // volt/ui/form — the input widgets: Label, Button, TextField, Checkbox,
-// ListBox, and the multi-line TextArea editor.
+// ListBox, the multi-line TextArea editor, RadioButton/RadioGroup, Switch,
+// SegmentedControl, Stepper, Dropdown, ProgressBar.
 
-import { Widget, Painter, Theme, Size } from "volt/ui/core";
+import { Widget, Painter, Theme, Size, BoxConstraints, bcLoose } from "volt/ui/core";
 import { Rect,
          KEY_ENTER, KEY_BACKSPACE, KEY_UP, KEY_DOWN, KEY_LEFT,
          KEY_RIGHT, KEY_DELETE, KEY_HOME, KEY_END } from "volt/surface";
@@ -318,11 +319,10 @@ export class ListBox extends Widget {
         let row = (y - this.bounds.y - 1) / ROW_H;
         let idx = this.scroll + row;
         if (idx < 0 || idx >= this.items.len) { return false; }
-        if (idx == this.selected) {
-            // clicking the selected row toggles it
-            if (this.onToggle != null) { this.onToggle(idx); }
-        }
+        // toggle the checked state and fire the callback on every click
+        this.checked[idx] = !this.checked[idx];
         this.selected = idx;
+        if (this.onToggle != null) { this.onToggle(idx); }
         return true;
     }
 
@@ -362,19 +362,21 @@ export class ListBox extends Widget {
 
 const TA_PAD: int = 6;
 
-// Multi-line, no-wrap text editor. Lines are held one-per-entry; the caret
-// is a (row, col) byte position. Vertical scroll (`top`) and horizontal
-// scroll (`left_px`) keep the caret in view; both are recomputed in draw()
-// where surface metrics are available.
+// Multi-line text editor with word wrapping. Lines are held one-per-entry;
+// the caret is a (row, col) byte position. Wrapping is recomputed in draw()
+// where surface metrics are available. Vertical scroll (`top`) keeps the
+// caret in view.
 export class TextArea extends Widget {
     lines: string[];
     caret_row: int;
     caret_col: int;
-    top: int;        // first visible line
-    left_px: int;    // horizontal pixel scroll
+    top: int;        // first visible visual row
     line_h: int;     // cached in draw()
     view_rows: int;  // cached in draw()
     onChange: fn();
+    wrap_map: int[];   // visual_row -> logical_row
+    wrap_col: int[];   // visual_row -> starting col within logical row
+    wrap_count: int;   // total visual rows
 
     fn init() {
         super.init();
@@ -382,6 +384,10 @@ export class TextArea extends Widget {
         this.focusable = true;
         this.line_h = 15;
         this.view_rows = 1;
+        this.top = 0;
+        this.wrap_map = [];
+        this.wrap_col = [];
+        this.wrap_count = 1;
     }
 
     fn set_text(s: string) {
@@ -407,7 +413,6 @@ export class TextArea extends Widget {
         this.caret_row = 0;
         this.caret_col = 0;
         this.top = 0;
-        this.left_px = 0;
     }
 
     fn text(): string {
@@ -423,6 +428,70 @@ export class TextArea extends Widget {
         if (this.onChange != null) { this.onChange(); }
     }
 
+    // Compute word-wrap for all logical lines at the given width.
+    // Fills wrap_map/wrap_col: for each visual row, which logical row it
+    // belongs to and the starting character column.
+    fn compute_wrap(s: Painter, max_w: int) {
+        this.wrap_map = [];
+        this.wrap_col = [];
+        if (max_w <= 0) { max_w = 1; }
+        for (let li in 0..this.lines.len) {
+            let line = this.lines[li];
+            if (line.len == 0) {
+                this.wrap_map.push(li);
+                this.wrap_col.push(0);
+                continue;
+            }
+            let col = 0;
+            while (col < line.len) {
+                // try to fit as much as possible from col onward
+                let end = line.len;
+                while (end > col && s.text_width(line.slice(col, end)) > max_w) {
+                    end -= 1;
+                }
+                if (end == col) { end = col + 1; } // at least one char
+                // try to break at a space
+                if (end < line.len && line[end] != 32) {
+                    let brk = end;
+                    while (brk > col && line[brk] != 32) { brk -= 1; }
+                    if (brk > col) { end = brk; }
+                }
+                this.wrap_map.push(li);
+                this.wrap_col.push(col);
+                col = end;
+                // skip the space
+                if (col < line.len && line[col] == 32) { col += 1; }
+            }
+        }
+        if (this.wrap_map.len == 0) {
+            this.wrap_map.push(0);
+            this.wrap_col.push(0);
+        }
+        this.wrap_count = this.wrap_map.len;
+    }
+
+    // Find the visual row for a given logical (row, col) caret position.
+    fn visual_row_of(row: int, col: int): int {
+        for (let vi in 0..this.wrap_map.len) {
+            if (this.wrap_map[vi] == row) {
+                let start = this.wrap_col[vi];
+                // is col within this visual row? check next visual row's start
+                let next_vi = vi + 1;
+                if (next_vi >= this.wrap_map.len || this.wrap_map[next_vi] != row) {
+                    // last visual row of this logical row
+                    return vi;
+                }
+                if (col >= start && col < this.wrap_col[next_vi]) {
+                    return vi;
+                }
+                if (col < start) {
+                    return vi;
+                }
+            }
+        }
+        return this.wrap_map.len - 1;
+    }
+
     fn remove_row(r: int) {
         let out: string[] = [];
         for (let i in 0..this.lines.len) {
@@ -433,7 +502,10 @@ export class TextArea extends Widget {
     }
 
     override fn measure(s: Painter, th: Theme): Size {
-        return Size(360, (s.font_height() + 2) * 10 + 2 * TA_PAD);
+        let lh = s.font_height() + 2;
+        let rows = this.lines.len;
+        if (rows < 4) { rows = 4; }
+        return Size(360, lh * rows + 2 * TA_PAD);
     }
 
     override fn on_key(k: int, ch: string): bool {
@@ -530,11 +602,12 @@ export class TextArea extends Widget {
     }
 
     override fn on_click(x: int, y: int): bool {
-        let row = this.top + (y - this.bounds.y - TA_PAD) / this.line_h;
-        if (row < 0) { row = 0; }
-        if (row >= this.lines.len) { row = this.lines.len - 1; }
-        this.caret_row = row;
-        this.caret_col = this.lines[row].len; // no metrics here: snap to end
+        let vrow = this.top + (y - this.bounds.y - TA_PAD) / this.line_h;
+        if (vrow < 0) { vrow = 0; }
+        if (vrow >= this.wrap_count) { vrow = this.wrap_count - 1; }
+        this.caret_row = this.wrap_map[vrow];
+        // snap caret to end of the visual row's logical line
+        this.caret_col = this.lines[this.caret_row].len;
         return true;
     }
 
@@ -544,40 +617,622 @@ export class TextArea extends Widget {
         let inner_w = this.bounds.w - 2 * TA_PAD;
         this.view_rows = inner_h / this.line_h;
         if (this.view_rows < 1) { this.view_rows = 1; }
-        // keep the caret row visible
-        if (this.caret_row < this.top) { this.top = this.caret_row; }
-        if (this.caret_row >= this.top + this.view_rows) {
-            this.top = this.caret_row - this.view_rows + 1;
+
+        // compute word-wrap at the current width
+        this.compute_wrap(s, inner_w);
+
+        // keep the caret visible
+        let caret_vrow = this.visual_row_of(this.caret_row, this.caret_col);
+        if (caret_vrow < this.top) { this.top = caret_vrow; }
+        if (caret_vrow >= this.top + this.view_rows) {
+            this.top = caret_vrow - this.view_rows + 1;
         }
-        // keep the caret column visible (horizontal scroll)
-        let caret_px = s.text_width(this.lines[this.caret_row].slice(0, this.caret_col));
-        if (caret_px - this.left_px > inner_w) { this.left_px = caret_px - inner_w; }
-        if (caret_px < this.left_px) { this.left_px = caret_px; }
-        if (this.left_px < 0) { this.left_px = 0; }
 
         s.fill(this.bounds, th.white);
         let border = th.muted;
         if (this.focused) { border = th.accent; }
         s.frame(this.bounds, border);
 
-        let ox = this.bounds.x + TA_PAD - this.left_px;
+        let ox = this.bounds.x + TA_PAD;
         let asc = s.font_ascent();
-        let shown = this.view_rows;
-        for (let i in 0..shown) {
-            let row = this.top + i;
-            if (row >= this.lines.len) { break; }
+        for (let i in 0..this.view_rows) {
+            let vrow = this.top + i;
+            if (vrow >= this.wrap_count) { break; }
+            let li = this.wrap_map[vrow];
+            let col = this.wrap_col[vrow];
+            let line = this.lines[li];
+            // determine the end column for this visual row
+            let end = line.len;
+            let next_vrow = vrow + 1;
+            if (next_vrow < this.wrap_count && this.wrap_map[next_vrow] == li) {
+                end = this.wrap_col[next_vrow];
+                // trim trailing space from display
+                if (end > col && line[end - 1] == 32) { end -= 1; }
+            }
+            let piece = line.slice(col, end);
             let ty = this.bounds.y + TA_PAD + i * this.line_h + asc;
-            s.text(ox, ty, this.lines[row], th.ink);
+            s.text(ox, ty, piece, th.ink);
         }
-        if (this.focused && this.caret_row >= this.top
-            && this.caret_row < this.top + this.view_rows) {
-            let cx = ox + caret_px;
-            let cy = this.bounds.y + TA_PAD + (this.caret_row - this.top) * this.line_h;
+        // caret
+        if (this.focused && caret_vrow >= this.top
+            && caret_vrow < this.top + this.view_rows) {
+            let li = this.wrap_map[caret_vrow];
+            let col = this.wrap_col[caret_vrow];
+            let line = this.lines[li];
+            let caret_piece = line.slice(col, this.caret_col);
+            let cx = ox + s.text_width(caret_piece);
+            let cy = this.bounds.y + TA_PAD + (caret_vrow - this.top) * this.line_h;
             s.fill(Rect(cx, cy, 1, this.line_h), th.ink);
         }
     }
 
     override fn drop_handlers() {
         this.onChange = null;
+    }
+}
+
+// ------------------------------------------------------- RadioButton / RadioGroup
+
+// A single radio button (used inside a RadioGroup).
+export class RadioButton extends Widget {
+    label: string;
+    selected: bool;
+    value: int;
+    group: RadioGroup;
+
+    fn init(label: string, value: int, group: RadioGroup) {
+        super.init();
+        this.label = label;
+        this.value = value;
+        this.group = group;
+        this.focusable = true;
+    }
+
+    fn select() {
+        if (this.group != null) { this.group.pick(this.value); }
+    }
+
+    override fn measure(s: Painter, th: Theme): Size {
+        return Size(s.text_width(this.label) + 26, s.font_height() + 8);
+    }
+
+    override fn draw(s: Painter, th: Theme) {
+        let box = 14;
+        let by = this.bounds.y + (this.bounds.h - box) / 2;
+        let cx = this.bounds.x + box / 2;
+        let cy = by + box / 2;
+        // circle outline
+        let border = th.muted;
+        if (this.focused) { border = th.accent; }
+        s.frame(Rect(this.bounds.x, by, box, box), border);
+        if (this.selected) {
+            // filled dot
+            s.fill(Rect(cx - 3, cy - 3, 6, 6), th.accent);
+        }
+        let tr = Rect(this.bounds.x + box + 6, this.bounds.y,
+                      this.bounds.w - box - 6, this.bounds.h);
+        s.text_in(tr, 0, this.label, th.ink);
+    }
+
+    override fn on_click(x: int, y: int): bool {
+        this.select();
+        return true;
+    }
+
+    override fn on_key(k: int, ch: string): bool {
+        if (k == 32 || k == KEY_ENTER) { this.select(); return true; }
+        return false;
+    }
+
+    override fn drop_handlers() {
+        this.group = null;
+    }
+}
+
+// RadioGroup: owns exclusive selection among RadioButtons.
+export class RadioGroup extends Widget {
+    labels: string[];
+    values: int[];
+    buttons: RadioButton[];
+    selected: int;
+    onChange: fn(int);
+
+    fn init(labels: string[], values: int[]) {
+        super.init();
+        this.labels = labels;
+        this.values = values;
+        this.buttons = [];
+        this.selected = -1;
+        if (values.len > 0) { this.selected = 0; }
+        for (let i in 0..labels.len) {
+            let rb = new RadioButton(labels[i], values[i], this);
+            this.buttons.push(rb);
+            this.add(rb);
+        }
+    }
+
+    fn pick(v: int) {
+        for (let i in 0..this.buttons.len) {
+            this.buttons[i].selected = this.values[i] == v;
+        }
+        this.selected = -1;
+        for (let i in 0..this.values.len) {
+            if (this.values[i] == v) { this.selected = i; }
+        }
+        if (this.onChange != null) { this.onChange(v); }
+    }
+
+    override fn measure(s: Painter, th: Theme): Size {
+        let w = 0;
+        let h = 0;
+        let n = this.children.len;
+        for (let c in this.children) {
+            let cs = c.measure(s, th);
+            if (cs.w > w) { w = cs.w; }
+            h += cs.h;
+        }
+        if (n > 1) { h += th.spacing * (n - 1); }
+        return Size(w, h);
+    }
+
+    override fn arrange(s: Painter, th: Theme, r: Rect) {
+        this.bounds = r;
+        let y = r.y;
+        let n = this.children.len;
+        for (let i in 0..n) {
+            let c = this.children[i];
+            let cs = c.measure(s, th);
+            c.arrange(s, th, Rect(r.x, y, r.w, cs.h));
+            y += cs.h + th.spacing;
+        }
+    }
+
+    override fn drop_handlers() {
+        for (let rb in this.buttons) {
+            rb.group = null;
+        }
+        this.onChange = null;
+    }
+}
+
+// ---------------------------------------------------------------- Switch
+
+// Styled on/off toggle (Checkbox semantics, slider visual).
+export class Switch extends Widget {
+    on: bool;
+    onToggle: fn(bool);
+
+    fn init(on: bool) {
+        super.init();
+        this.on = on;
+        this.focusable = true;
+    }
+
+    fn toggle() {
+        this.on = !this.on;
+        if (this.onToggle != null) { this.onToggle(this.on); }
+    }
+
+    fn sw_w(s: Painter): int { return s.font_height() * 2 + 8; }
+    fn sw_h(s: Painter): int { return s.font_height() + 4; }
+
+    override fn measure(s: Painter, th: Theme): Size {
+        let w = this.sw_w(s);
+        let h = this.sw_h(s);
+        return Size(w + 20, h);
+    }
+
+    override fn draw(s: Painter, th: Theme) {
+        let sw = this.sw_w(s);
+        let sh = this.sw_h(s);
+        let bx = this.bounds.x;
+        let by = this.bounds.y + (this.bounds.h - sh) / 2;
+        let br = Rect(bx, by, sw, sh);
+        if (this.on) {
+            s.fill(br, th.accent);
+        } else {
+            s.fill(br, th.muted);
+        }
+        // knob
+        let kw = sh - 4;
+        let kx = bx + 2;
+        if (this.on) { kx = bx + sw - kw - 2; }
+        let ky = by + 2;
+        s.fill(Rect(kx, ky, kw, kw), th.white);
+        if (this.focused) {
+            s.frame(br, th.ink);
+        }
+        // label
+        let lbl = "off";
+        if (this.on) { lbl = "on"; }
+        let lr = Rect(bx + sw + 6, this.bounds.y, this.bounds.w - sw - 6, this.bounds.h);
+        s.text_in(lr, 0, lbl, th.ink);
+    }
+
+    override fn on_click(x: int, y: int): bool {
+        this.toggle();
+        return true;
+    }
+
+    override fn on_key(k: int, ch: string): bool {
+        if (k == 32 || k == KEY_ENTER) { this.toggle(); return true; }
+        return false;
+    }
+
+    override fn drop_handlers() {
+        this.onToggle = null;
+    }
+}
+
+// ------------------------------------------------------- SegmentedControl
+
+// Single-select horizontal button group.
+export class SegmentedControl extends Widget {
+    labels: string[];
+    selected: int;
+    onSelect: fn(int);
+    cached_seg_w: int;
+
+    fn init(labels: string[]) {
+        super.init();
+        this.labels = labels;
+        this.selected = 0;
+        this.cached_seg_w = 0;
+        this.focusable = true;
+    }
+
+    fn seg_w(s: Painter): int {
+        let w = 0;
+        for (let l in this.labels) {
+            let lw = s.text_width(l) + 20;
+            if (lw > w) { w = lw; }
+        }
+        return w;
+    }
+
+    override fn measure(s: Painter, th: Theme): Size {
+        let sw = this.seg_w(s);
+        this.cached_seg_w = sw;
+        return Size(sw * this.labels.len, s.font_height() + 12);
+    }
+
+    override fn arrange(s: Painter, th: Theme, r: Rect) {
+        this.bounds = r;
+        this.cached_seg_w = this.seg_w(s);
+    }
+
+    override fn draw(s: Painter, th: Theme) {
+        let n = this.labels.len;
+        if (n == 0) { return; }
+        let sh = this.bounds.h;
+        let x0 = this.bounds.x;
+        let w = this.bounds.w;
+        // Segments split the full control width evenly (integer math avoids
+        // rounding gaps between adjacent cells).
+        for (let i in 0..n) {
+            let sx = x0 + i * w / n;
+            let sxn = x0 + (i + 1) * w / n;
+            let sr = Rect(sx, this.bounds.y, sxn - sx, sh);
+            if (i == this.selected) {
+                s.fill(sr, th.accent);
+                s.text_in(sr, 10, this.labels[i], th.white);
+            } else {
+                s.fill(sr, th.white);
+                s.text_in(sr, 10, this.labels[i], th.ink);
+            }
+            if (i < n - 1) {
+                s.line(sr.x + sr.w, sr.y, sr.x + sr.w, sr.y + sr.h, th.muted);
+            }
+        }
+        s.frame(this.bounds, th.muted);
+        if (this.focused) {
+            s.frame(this.bounds, th.accent);
+        }
+    }
+
+    fn pick(i: int) {
+        if (i < 0 || i >= this.labels.len) { return; }
+        this.selected = i;
+        if (this.onSelect != null) { this.onSelect(i); }
+    }
+
+    override fn on_click(x: int, y: int): bool {
+        let n = this.labels.len;
+        if (n == 0 || this.bounds.w <= 0) { return false; }
+        let rel = x - this.bounds.x;
+        if (rel < 0 || rel >= this.bounds.w) { return false; }
+        let idx = rel * n / this.bounds.w;
+        if (idx < 0 || idx >= n) { return false; }
+        this.pick(idx);
+        return true;
+    }
+
+    override fn on_key(k: int, ch: string): bool {
+        if (k == KEY_LEFT) {
+            if (this.selected > 0) { this.pick(this.selected - 1); }
+            return true;
+        }
+        if (k == KEY_RIGHT) {
+            if (this.selected < this.labels.len - 1) { this.pick(this.selected + 1); }
+            return true;
+        }
+        if (k == KEY_ENTER || k == 32) { return true; }
+        return false;
+    }
+
+    override fn drop_handlers() {
+        this.onSelect = null;
+    }
+}
+
+// ---------------------------------------------------------------- Stepper
+
+// Numeric value with - / + buttons and bounds.
+export class Stepper extends Widget {
+    value: int;
+    min_val: int;
+    max_val: int;
+    onChange: fn(int);
+    cached_btn_w: int;
+
+    fn init(value: int, min_val: int, max_val: int) {
+        super.init();
+        this.value = value;
+        this.min_val = min_val;
+        this.max_val = max_val;
+        this.cached_btn_w = 30;
+        this.focusable = true;
+    }
+
+    fn step(delta: int) {
+        let v = this.value + delta;
+        if (v < this.min_val) { v = this.min_val; }
+        if (v > this.max_val) { v = this.max_val; }
+        if (v != this.value) {
+            this.value = v;
+            if (this.onChange != null) { this.onChange(v); }
+        }
+    }
+
+    fn btn_w(s: Painter): int { return s.text_width("-") + 20; }
+
+    override fn measure(s: Painter, th: Theme): Size {
+        let bw = this.btn_w(s);
+        this.cached_btn_w = bw;
+        let bh = s.font_height() + 12;
+        let vw = s.text_width("99999") + 16;
+        return Size(bw * 2 + vw + 8, bh);
+    }
+
+    override fn arrange(s: Painter, th: Theme, r: Rect) {
+        this.bounds = r;
+        this.cached_btn_w = this.btn_w(s);
+    }
+
+    override fn draw(s: Painter, th: Theme) {
+        this.cached_btn_w = this.btn_w(s);
+        let bh = s.font_height() + 12;
+        let by = this.bounds.y + (this.bounds.h - bh) / 2;
+        // Three equal columns fill the control width: [ - | value | + ].
+        let x0 = this.bounds.x;
+        let w = this.bounds.w;
+        let t1 = x0 + w / 3;
+        let t2 = x0 + 2 * w / 3;
+        // minus
+        let mr = Rect(x0, by, t1 - x0, bh);
+        s.fill(mr, th.white);
+        s.frame(mr, th.muted);
+        s.text_in(mr, 8, "-", th.ink);
+        // value
+        let vr = Rect(t1, by, t2 - t1, bh);
+        s.fill(vr, th.white);
+        s.frame(vr, th.muted);
+        s.text_in(vr, 8, "" + this.value, th.ink);
+        // plus
+        let pr = Rect(t2, by, x0 + w - t2, bh);
+        s.fill(pr, th.white);
+        s.frame(pr, th.muted);
+        s.text_in(pr, 8, "+", th.ink);
+        if (this.focused) {
+            s.frame(this.bounds, th.accent);
+        }
+    }
+
+    override fn on_click(x: int, y: int): bool {
+        let bh = this.bounds.h;
+        let by = this.bounds.y;
+        if (y < by || y >= by + bh) { return false; }
+        let rel = x - this.bounds.x;
+        let w = this.bounds.w;
+        if (rel < 0 || rel >= w) { return false; }
+        // left third decrements, right third increments (matches draw()).
+        if (rel < w / 3) { this.step(-1); return true; }
+        if (rel >= 2 * w / 3) { this.step(1); return true; }
+        return false;
+    }
+
+    override fn on_key(k: int, ch: string): bool {
+        if (k == KEY_LEFT || k == KEY_DOWN) { this.step(-1); return true; }
+        if (k == KEY_RIGHT || k == KEY_UP) { this.step(1); return true; }
+        return false;
+    }
+
+    override fn drop_handlers() {
+        this.onChange = null;
+    }
+}
+
+// --------------------------------------------------------------- Dropdown
+
+// A button that opens a MenuPopup-style overlay list; onSelect(index).
+export class Dropdown extends Widget {
+    items: string[];
+    selected: int;
+    onSelect: fn(int);
+
+    fn init(items: string[]) {
+        super.init();
+        this.items = items;
+        this.selected = 0;
+        this.focusable = true;
+    }
+
+    fn open_popup() {
+        let popup = new DropdownPopup(this);
+        let w = this.win;
+        if (w != null) { w.open_overlay(popup); }
+    }
+
+    fn pick(i: int) {
+        if (i < 0 || i >= this.items.len) { return; }
+        this.selected = i;
+        if (this.onSelect != null) { this.onSelect(i); }
+    }
+
+    override fn measure(s: Painter, th: Theme): Size {
+        let w = 40;
+        for (let it in this.items) {
+            let iw = s.text_width(it) + 40;
+            if (iw > w) { w = iw; }
+        }
+        return Size(w, s.font_height() + 12);
+    }
+
+    override fn draw(s: Painter, th: Theme) {
+        s.fill(this.bounds, th.white);
+        let border = th.muted;
+        if (this.focused) { border = th.accent; }
+        s.frame(this.bounds, border);
+        let label = "";
+        if (this.selected >= 0 && this.selected < this.items.len) {
+            label = this.items[this.selected];
+        }
+        s.text_in(this.bounds, 8, label, th.ink);
+        // arrow
+        let aw = s.text_width("v");
+        let ar = Rect(this.bounds.x + this.bounds.w - aw - 8, this.bounds.y,
+                      aw + 8, this.bounds.h);
+        s.text_in(ar, 0, "v", th.muted);
+    }
+
+    override fn on_click(x: int, y: int): bool {
+        this.open_popup();
+        return true;
+    }
+
+    override fn on_key(k: int, ch: string): bool {
+        if (k == KEY_ENTER || k == 32) { this.open_popup(); return true; }
+        return false;
+    }
+
+    override fn drop_handlers() {
+        this.onSelect = null;
+    }
+}
+
+// Dropdown popup overlay
+class DropdownPopup extends Widget {
+    dd: Dropdown;
+    sel: int;
+    row_h: int;
+
+    fn init(dd: Dropdown) {
+        super.init();
+        this.dd = dd;
+        this.sel = dd.selected;
+        this.row_h = 20;
+    }
+
+    override fn place(s: Painter, th: Theme) {
+        this.row_h = s.font_height() + 8;
+        let w = 40;
+        for (let it in this.dd.items) {
+            let iw = s.text_width(it) + 16;
+            if (iw > w) { w = iw; }
+        }
+        let h = this.dd.items.len * this.row_h + 2;
+        let x = this.dd.bounds.x;
+        let y = this.dd.bounds.y + this.dd.bounds.h;
+        if (x + w > s.width()) { x = s.width() - w; }
+        if (y + h > s.height()) { y = this.dd.bounds.y - h; }
+        this.bounds = Rect(x, y, w, h);
+    }
+
+    fn choose() {
+        if (this.sel < 0 || this.sel >= this.dd.items.len) { return; }
+        // Capture references before dismiss_overlay() drops us from the
+        // Window's overlay slot — after that, `this` may be freed.
+        let dd = this.dd;
+        let sel = this.sel;
+        let w = this.win;
+        w.dismiss_overlay();
+        dd.pick(sel);
+    }
+
+    override fn draw(s: Painter, th: Theme) {
+        s.fill(this.bounds, th.white);
+        s.frame(this.bounds, th.muted);
+        for (let i in 0..this.dd.items.len) {
+            let r = Rect(this.bounds.x + 1, this.bounds.y + 1 + i * this.row_h,
+                         this.bounds.w - 2, this.row_h);
+            if (i == this.sel) { s.fill(r, th.sel); }
+            s.text_in(r, 8, this.dd.items[i], th.ink);
+        }
+    }
+
+    override fn on_key(k: int, ch: string): bool {
+        if (k == KEY_UP) { if (this.sel > 0) { this.sel -= 1; } return true; }
+        if (k == KEY_DOWN) { if (this.sel < this.dd.items.len - 1) { this.sel += 1; } return true; }
+        if (k == KEY_ENTER || k == 32) { this.choose(); return true; }
+        return false;
+    }
+
+    override fn on_click(x: int, y: int): bool {
+        let row = (y - this.bounds.y - 1) / this.row_h;
+        if (row >= 0 && row < this.dd.items.len) {
+            this.sel = row;
+            this.choose();
+        }
+        return true;
+    }
+}
+
+// ------------------------------------------------------------ ProgressBar
+
+// Determinate fill 0.0..1.0.
+// TODO: indeterminate variant needs animation clock (Phase 5).
+export class ProgressBar extends Widget {
+    progress: float;
+    bg: int;
+    fill: int;
+
+    fn init(progress: float, bg: int, fill: int) {
+        super.init();
+        this.progress = progress;
+        this.bg = bg;
+        this.fill = fill;
+    }
+
+    fn set_progress(p: float) {
+        if (p < 0.0) { p = 0.0; }
+        if (p > 1.0) { p = 1.0; }
+        this.progress = p;
+    }
+
+    override fn measure(s: Painter, th: Theme): Size {
+        return Size(200, s.font_height());
+    }
+
+    override fn draw(s: Painter, th: Theme) {
+        let bg = this.bg;
+        if (bg < 0) { bg = th.muted; }
+        s.fill(this.bounds, bg);
+        let fw = (this.bounds.w as float * this.progress) as int;
+        if (fw > 0) {
+            let f = this.fill;
+            if (f < 0) { f = th.accent; }
+            s.fill(Rect(this.bounds.x, this.bounds.y, fw, this.bounds.h), f);
+        }
+        s.frame(this.bounds, th.muted);
     }
 }

@@ -1,0 +1,340 @@
+// volt/ui/display — read-only display widgets: Text (word-wrapped multi-line),
+// Card (elevated panel), Badge (count chip), Chip (compact label).
+
+import { Widget, Painter, Theme, Size, BoxConstraints, bcLoose } from "volt/ui/core";
+import { Rect } from "volt/surface";
+
+// Alignment constants for Text
+const ALIGN_LEFT: int = 0;
+const ALIGN_CENTER: int = 1;
+const ALIGN_RIGHT: int = 2;
+
+// --------------------------------------------------------------- Text / Paragraph
+
+// Read-only, word-wrapped, multi-line text. The first widget whose height
+// depends on the offered width — layout() does greedy word-wrap.
+export class Text extends Widget {
+    text: string;
+    align: int;       // ALIGN_LEFT / ALIGN_CENTER / ALIGN_RIGHT
+    color: int;       // -1 = theme.ink
+    cached_lines: string[];
+    cached_w: int;
+    cached_count: int;
+
+    fn init(text: string) {
+        super.init();
+        this.text = text;
+        this.align = ALIGN_LEFT;
+        this.color = -1;
+        this.cached_lines = [];
+        this.cached_w = -1;
+        this.cached_count = 0;
+    }
+
+    fn wrap_lines(s: Painter, max_w: int) {
+        this.cached_lines = [];
+        this.cached_w = max_w;
+        if (max_w <= 0) {
+            this.cached_count = 0;
+            return;
+        }
+        let words = split_words(this.text);
+        let line = "";
+        for (let w in words) {
+            let trial = "";
+            if (line.len == 0) { trial = w; } else { trial = line + " " + w; }
+            if (s.text_width(trial) > max_w && line.len > 0) {
+                this.cached_lines.push(line);
+                line = w;
+            } else {
+                line = trial;
+            }
+        }
+        if (line.len > 0) { this.cached_lines.push(line); }
+        this.cached_count = this.cached_lines.len;
+    }
+
+    // Estimate: single-line width. Real wrapping happens in layout() or
+    // draw() when the actual width is known. This lets Container/Column
+    // at least know the text exists.
+    override fn measure(s: Painter, th: Theme): Size {
+        let w = s.text_width(this.text);
+        let h = s.font_height();
+        return Size(w, h);
+    }
+
+    // Re-wrap if the bounds width differs from what we cached.
+    fn ensure_wrapped(s: Painter) {
+        let bw = this.bounds.w;
+        if (this.cached_w != bw || this.cached_count == 0) {
+            this.wrap_lines(s, bw);
+        }
+    }
+
+    override fn layout(s: Painter, th: Theme, bc: BoxConstraints): Size {
+        let max_w = bc.maxW;
+        if (max_w < 0) { max_w = 0; }
+        this.wrap_lines(s, max_w);
+        let used_w = 0;
+        for (let ln in this.cached_lines) {
+            let lw = s.text_width(ln);
+            if (lw > used_w) { used_w = lw; }
+        }
+        if (used_w > max_w) { used_w = max_w; }
+        let lh = s.font_height();
+        let total_h = this.cached_count * lh;
+        if (this.cached_count > 1) { total_h += (this.cached_count - 1) * 2; }
+        if (total_h < lh) { total_h = lh; }
+        return bc.constrain(Size(used_w, total_h));
+    }
+
+    override fn draw(s: Painter, th: Theme) {
+        this.ensure_wrapped(s);
+        let c = this.color;
+        if (c < 0) { c = th.ink; }
+        let lh = s.font_height();
+        let asc = s.font_ascent();
+        let y = this.bounds.y + asc;
+        for (let i in 0..this.cached_count) {
+            let ln = this.cached_lines[i];
+            let tw = s.text_width(ln);
+            let x = this.bounds.x;
+            if (this.align == ALIGN_CENTER) {
+                x = this.bounds.x + (this.bounds.w - tw) / 2;
+            } else if (this.align == ALIGN_RIGHT) {
+                x = this.bounds.x + this.bounds.w - tw;
+            }
+            s.text(x, y, ln, c);
+            y += lh + 2;
+        }
+    }
+}
+
+// Helper: split a string into words on whitespace.
+fn split_words(s: string): string[] {
+    let out: string[] = [];
+    let start = 0;
+    let i = 0;
+    while (i < s.len) {
+        if (s[i] == 32 || s[i] == 9 || s[i] == 10) {
+            if (i > start) { out.push(s.slice(start, i)); }
+            start = i + 1;
+        }
+        i += 1;
+    }
+    if (i > start) { out.push(s.slice(start, i)); }
+    return out;
+}
+
+// ---------------------------------------------------------------- Card
+
+// Container-like elevated panel with bg fill, padding, and an optional title.
+// On the gfx tier a shadow/rounded corner is nice; here we use a plain frame.
+export class Card extends Widget {
+    title: string;
+    pad: int;
+    bg: int;
+    border: int;
+
+    fn init(pad: int, bg: int, border: int, title: string, child: Widget) {
+        super.init();
+        this.pad = pad;
+        this.bg = bg;
+        this.border = border;
+        this.title = title;
+        if (child != null) { this.add(child); }
+    }
+
+    fn child(): Widget {
+        if (this.children.len == 0) { return null; }
+        return this.children[0];
+    }
+
+    fn title_h(s: Painter): int {
+        if (this.title.len == 0) { return 0; }
+        return s.font_height() + 8;
+    }
+
+    override fn measure(s: Painter, th: Theme): Size {
+        let c = this.child();
+        let w = 2 * this.pad;
+        let h = 2 * this.pad + this.title_h(s);
+        if (c != null) {
+            // Use layout() so Text wraps at the available width and reports
+            // the correct multi-line height.
+            let bc = new BoxConstraints(0, 100000, 0, 100000);
+            let cs = c.layout(s, th, bc);
+            w = cs.w + 2 * this.pad;
+            h += cs.h;
+        }
+        return Size(w, h);
+    }
+
+    override fn arrange(s: Painter, th: Theme, r: Rect) {
+        this.bounds = r;
+        let c = this.child();
+        if (c == null) { return; }
+        let th_h = this.title_h(s);
+        let p = this.pad;
+        let inner = Rect(r.x + p, r.y + th_h + p, r.w - 2 * p, r.h - th_h - 2 * p);
+        // Re-layout at actual inner width so wrapping matches
+        let cs = c.layout(s, th, new BoxConstraints(0, inner.w, 0, inner.h));
+        c.arrange(s, th, Rect(inner.x, inner.y, inner.w, cs.h));
+    }
+
+    override fn draw(s: Painter, th: Theme) {
+        this.draw_chrome(s, th);
+        let c = this.child();
+        if (c != null) { c.draw(s, th); }
+    }
+
+    override fn draw_chrome(s: Painter, th: Theme) {
+        let bg = this.bg;
+        if (bg < 0) { bg = th.white; }
+        s.fill(this.bounds, bg);
+        let br = this.border;
+        if (br < 0) { br = th.muted; }
+        s.frame(this.bounds, br);
+        if (this.title.len > 0) {
+            let th_h = this.title_h(s);
+            let tr = Rect(this.bounds.x, this.bounds.y, this.bounds.w, th_h);
+            s.fill(tr, th.accent);
+            s.text_in(tr, this.pad, this.title, th.white);
+        }
+    }
+}
+
+// ---------------------------------------------------------------- Badge
+
+// Small count/label chip overlaid on the top-right corner of a child.
+export class Badge extends Widget {
+    label: string;
+    bg: int;
+    color: int;
+
+    fn init(label: string, bg: int, color: int, child: Widget) {
+        super.init();
+        this.label = label;
+        this.bg = bg;
+        this.color = color;
+        if (child != null) { this.add(child); }
+    }
+
+    fn child(): Widget {
+        if (this.children.len == 0) { return null; }
+        return this.children[0];
+    }
+
+    fn badge_size(s: Painter): Size {
+        let tw = s.text_width(this.label);
+        let pad = 6;
+        return Size(tw + 2 * pad, s.font_height() + 2 * pad);
+    }
+
+    override fn measure(s: Painter, th: Theme): Size {
+        let c = this.child();
+        if (c == null) { return this.badge_size(s); }
+        let cs = c.measure(s, th);
+        return cs;
+    }
+
+    override fn arrange(s: Painter, th: Theme, r: Rect) {
+        this.bounds = r;
+        let c = this.child();
+        if (c == null) { return; }
+        c.arrange(s, th, r);
+    }
+
+    override fn draw(s: Painter, th: Theme) {
+        let kid = this.child();
+        if (kid != null) { kid.draw(s, th); }
+        let bs = this.badge_size(s);
+        let bx = this.bounds.x + this.bounds.w - bs.w;
+        let by = this.bounds.y;
+        let br = Rect(bx, by, bs.w, bs.h);
+        let bg = this.bg;
+        if (bg < 0) { bg = th.accent; }
+        let col = this.color;
+        if (col < 0) { col = th.white; }
+        s.fill(br, bg);
+        s.text_in(br, 6, this.label, col);
+    }
+}
+
+// ---------------------------------------------------------------- Chip
+
+// Compact rounded label, optionally with an onDelete closure.
+export class Chip extends Widget {
+    label: string;
+    deletable: bool;
+    onDelete: fn(Chip);
+    bg: int;
+
+    fn init(label: string, deletable: bool, bg: int) {
+        super.init();
+        this.label = label;
+        this.deletable = deletable;
+        this.bg = bg;
+        this.focusable = true;
+    }
+
+    fn fire_delete() {
+        if (this.onDelete != null) { this.onDelete(this); }
+    }
+
+    fn chip_h(s: Painter): int { return s.font_height() + 10; }
+
+    fn delete_w(s: Painter): int {
+        if (!this.deletable) { return 0; }
+        return s.text_width("x") + 12;
+    }
+
+    override fn measure(s: Painter, th: Theme): Size {
+        let tw = s.text_width(this.label);
+        let dw = this.delete_w(s);
+        let pad = 10;
+        return Size(tw + dw + 2 * pad, this.chip_h(s));
+    }
+
+    override fn draw(s: Painter, th: Theme) {
+        let bg = this.bg;
+        if (bg < 0) { bg = th.sel; }
+        // rounded look via frame
+        s.fill(this.bounds, bg);
+        s.frame(this.bounds, th.muted);
+        let dw = this.delete_w(s);
+        let pad = 10;
+        let tr = Rect(this.bounds.x + pad, this.bounds.y,
+                      this.bounds.w - pad - dw, this.bounds.h);
+        s.text_in(tr, 4, this.label, th.ink);
+        if (this.deletable) {
+            let xr = Rect(this.bounds.x + this.bounds.w - dw, this.bounds.y,
+                          dw, this.bounds.h);
+            s.text_in(xr, 4, "x", th.muted);
+        }
+        if (this.focused) {
+            s.frame(this.bounds, th.accent);
+        }
+    }
+
+    override fn on_click(x: int, y: int): bool {
+        if (this.deletable) {
+            let dw = 0;
+            // approximate: if click is in the right portion, delete
+            let xr = this.bounds.x + this.bounds.w - 24;
+            if (x >= xr) { this.fire_delete(); return true; }
+        }
+        return false;
+    }
+
+    override fn on_key(k: int, ch: string): bool {
+        if (k == 32 || k == 127) { // space or delete key
+            if (this.deletable) { this.fire_delete(); return true; }
+        }
+        return false;
+    }
+
+    override fn drop_handlers() {
+        this.onDelete = null;
+    }
+}

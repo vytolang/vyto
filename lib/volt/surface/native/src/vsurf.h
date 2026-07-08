@@ -19,7 +19,8 @@ enum {
     VS_EV_CLOSE = 6,
     VS_EV_MOUSE_MOVE = 7, /* reserved; not delivered in v1 */
     VS_EV_TIMER = 8,      /* vs_wait_timeout elapsed with no input (game tick) */
-    VS_EV_KEY_UP = 9      /* a key was released (vs_key() gives the code) */
+    VS_EV_KEY_UP = 9,     /* a key was released (vs_key() gives the code) */
+    VS_EV_MOUSE_WHEEL = 10 /* mouse wheel scrolled (vs_wheel() gives the delta) */
 };
 
 /* simplified key codes from vs_key: printable ASCII, or one of these */
@@ -65,6 +66,7 @@ int vs_key(void);         /* last VS_EV_KEY code */
 const char *vs_text(void);/* printable text of last key ("" if none) */
 int vs_x(void);
 int vs_y(void);
+int vs_wheel(void);       /* last VS_EV_MOUSE_WHEEL delta (positive = down) */
 
 /* escape hatches: native handles for the "drop one layer" case */
 void *vs_native_display(void *s);

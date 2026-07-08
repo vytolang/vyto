@@ -1,0 +1,269 @@
+// volt/ui/feedback — modal dialogs and floating panels: ConfirmDialog,
+// InputDialog, Popover. Builds on the Window overlay path.
+
+import { Widget, Painter, Theme, Window, BoxConstraints } from "volt/ui/core";
+import { Button, TextField, Label } from "volt/ui/form";
+import { Text } from "volt/ui/display";
+import { Rect, contains, KEY_ENTER } from "volt/surface";
+
+// ------------------------------------------------------- ConfirmDialog
+
+// Modal yes/no dialog; extends Dialog pattern.
+export class ConfirmDialog extends Widget {
+    title: string;
+    message: string;
+    onConfirm: fn();
+    onCancel: fn();
+    ok_btn: Button;
+    cancel_btn: Button;
+    msg_text: Text;
+
+    fn init(title: string, message: string) {
+        super.init();
+        this.title = title;
+        this.message = message;
+        this.modal = true;
+        this.ok_btn = new Button("OK");
+        this.cancel_btn = new Button("Cancel");
+        this.msg_text = new Text(message);
+        this.add(this.msg_text);
+        this.add(this.ok_btn);
+        this.add(this.cancel_btn);
+    }
+
+    fn do_confirm() {
+        let cb = this.onConfirm;
+        let w = this.win;
+        w.dismiss_overlay();
+        if (cb != null) { cb(); }
+    }
+
+    fn do_cancel() {
+        let cb = this.onCancel;
+        let w = this.win;
+        w.dismiss_overlay();
+        if (cb != null) { cb(); }
+    }
+
+    override fn place(s: Painter, th: Theme) {
+        let dw = 300;
+        let fh = s.font_height();
+        let ctrl_h = fh + 12;
+        // measure wrapped text
+        this.msg_text.layout(s, th, new BoxConstraints(0, dw - 32, 0, 300));
+        let msg_h = this.msg_text.cached_count * (fh + 2);
+        if (msg_h < fh + 4) { msg_h = fh + 4; }
+        let dh = fh + 16 + msg_h + 16 + ctrl_h + 16;
+        let x = (s.width() - dw) / 2;
+        let y = (s.height() - dh) / 2;
+        this.bounds = Rect(x, y, dw, dh);
+        let msg_y = y + fh + 16;
+        this.msg_text.bounds = Rect(x + 16, msg_y, dw - 32, msg_h);
+        let bw = 80;
+        let btn_y = y + dh - 16 - ctrl_h;
+        this.cancel_btn.bounds = Rect(x + dw - 16 - bw, btn_y, bw, ctrl_h);
+        this.ok_btn.bounds = Rect(x + dw - 16 - 2 * bw - 8, btn_y, bw, ctrl_h);
+    }
+
+    override fn draw(s: Painter, th: Theme) {
+        s.fill(this.bounds, th.white);
+        s.frame(this.bounds, th.ink);
+        let fh = s.font_height();
+        // title bar
+        let tb = Rect(this.bounds.x, this.bounds.y, this.bounds.w, fh + 10);
+        s.fill(tb, th.accent);
+        s.text_in(tb, 12, this.title, th.white);
+        // message
+        this.msg_text.draw(s, th);
+        // buttons
+        this.ok_btn.draw(s, th);
+        this.cancel_btn.draw(s, th);
+    }
+
+    override fn on_key(k: int, ch: string): bool {
+        if (k == KEY_ENTER) { this.do_confirm(); return true; }
+        return false;
+    }
+
+    override fn on_click(x: int, y: int): bool {
+        if (contains(this.ok_btn.bounds, x, y)) { this.do_confirm(); return true; }
+        if (contains(this.cancel_btn.bounds, x, y)) { this.do_cancel(); return true; }
+        return true; // swallow clicks inside the modal
+    }
+
+    override fn drop_handlers() {
+        this.onConfirm = null;
+        this.onCancel = null;
+    }
+}
+
+// ------------------------------------------------------- InputDialog
+
+// Modal prompt with a TextField; onAccept(text).
+export class InputDialog extends Widget {
+    title: string;
+    prompt: string;
+    initial: string;
+    onAccept: fn(string);
+    onCancel: fn();
+    field: TextField;
+    ok_btn: Button;
+    cancel_btn: Button;
+    prompt_text: Text;
+
+    fn init(title: string, prompt: string, initial: string) {
+        super.init();
+        this.title = title;
+        this.prompt = prompt;
+        this.initial = initial;
+        this.modal = true;
+        this.field = new TextField("");
+        this.field.set_text(initial);
+        this.ok_btn = new Button("OK");
+        this.cancel_btn = new Button("Cancel");
+        this.prompt_text = new Text(prompt);
+        this.add(this.prompt_text);
+        this.add(this.field);
+        this.add(this.ok_btn);
+        this.add(this.cancel_btn);
+    }
+
+    fn do_accept() {
+        let cb = this.onAccept;
+        let t = this.field.text;
+        let w = this.win;
+        w.dismiss_overlay();
+        if (cb != null) { cb(t); }
+    }
+
+    fn do_cancel() {
+        let cb = this.onCancel;
+        let w = this.win;
+        w.dismiss_overlay();
+        if (cb != null) { cb(); }
+    }
+
+    override fn place(s: Painter, th: Theme) {
+        let dw = 340;
+        let fh = s.font_height();
+        let ctrl_h = fh + 12;
+        // measure prompt text
+        this.prompt_text.layout(s, th, new BoxConstraints(0, dw - 24, 0, 100));
+        let prompt_h = this.prompt_text.cached_count * (fh + 2);
+        if (prompt_h < fh) { prompt_h = fh; }
+        let dh = fh + 16 + prompt_h + 8 + ctrl_h + 12 + ctrl_h + 16;
+        let x = (s.width() - dw) / 2;
+        let y = (s.height() - dh) / 2;
+        this.bounds = Rect(x, y, dw, dh);
+        let prompt_y = y + fh + 16;
+        this.prompt_text.bounds = Rect(x + 12, prompt_y, dw - 24, prompt_h);
+        let field_y = prompt_y + prompt_h + 8;
+        this.field.bounds = Rect(x + 12, field_y, dw - 24, ctrl_h);
+        let btn_y = field_y + ctrl_h + 12;
+        let bw = 80;
+        this.cancel_btn.bounds = Rect(x + dw - 16 - bw, btn_y, bw, ctrl_h);
+        this.ok_btn.bounds = Rect(x + dw - 16 - 2 * bw - 8, btn_y, bw, ctrl_h);
+    }
+
+    override fn draw(s: Painter, th: Theme) {
+        s.fill(this.bounds, th.white);
+        s.frame(this.bounds, th.ink);
+        let fh = s.font_height();
+        let tb = Rect(this.bounds.x, this.bounds.y, this.bounds.w, fh + 10);
+        s.fill(tb, th.accent);
+        s.text_in(tb, 12, this.title, th.white);
+        this.prompt_text.draw(s, th);
+        this.field.draw(s, th);
+        this.ok_btn.draw(s, th);
+        this.cancel_btn.draw(s, th);
+    }
+
+    override fn on_key(k: int, ch: string): bool {
+        if (k == KEY_ENTER) { this.do_accept(); return true; }
+        return this.field.on_key(k, ch);
+    }
+
+    override fn on_click(x: int, y: int): bool {
+        if (contains(this.ok_btn.bounds, x, y)) { this.do_accept(); return true; }
+        if (contains(this.cancel_btn.bounds, x, y)) { this.do_cancel(); return true; }
+        if (contains(this.field.bounds, x, y)) { this.field.on_click(x, y); return true; }
+        return true;
+    }
+
+    override fn drop_handlers() {
+        this.onAccept = null;
+        this.onCancel = null;
+    }
+}
+
+// ---------------------------------------------------------------- Popover
+
+// A non-modal floating panel anchored to a point; dismiss on outside click.
+// Modelled on MenuPopup's placement.
+export class Popover extends Widget {
+    anchor_x: int;
+    anchor_y: int;
+    dismiss_on_outside: bool;
+
+    fn init(ax: int, ay: int) {
+        super.init();
+        this.anchor_x = ax;
+        this.anchor_y = ay;
+        this.modal = false;
+        this.dismiss_on_outside = true;
+    }
+
+    override fn place(s: Painter, th: Theme) {
+        // measure children to compute size
+        let w = 40;
+        let h = 20;
+        for (let c in this.children) {
+            let cs = c.measure(s, th);
+            if (cs.w + 16 > w) { w = cs.w + 16; }
+            h += cs.h + 8;
+        }
+        let x = this.anchor_x;
+        let y = this.anchor_y;
+        if (x + w > s.width()) { x = s.width() - w; }
+        if (y + h > s.height()) { y = this.anchor_y - h; }
+        if (x < 0) { x = 0; }
+        if (y < 0) { y = 0; }
+        this.bounds = Rect(x, y, w, h);
+        // arrange children
+        let cy = y + 8;
+        for (let c in this.children) {
+            let cs = c.measure(s, th);
+            c.arrange(s, th, Rect(x + 8, cy, w - 16, cs.h));
+            cy += cs.h + 8;
+        }
+    }
+
+    override fn draw(s: Painter, th: Theme) {
+        s.fill(this.bounds, th.white);
+        s.frame(this.bounds, th.muted);
+        for (let c in this.children) { c.draw(s, th); }
+    }
+
+    override fn on_click(x: int, y: int): bool {
+        if (!contains(this.bounds, x, y)) {
+            if (this.dismiss_on_outside) {
+                let w = this.win;
+                if (w != null) { w.dismiss_overlay(); }
+            }
+            return true;
+        }
+        for (let c in this.children) {
+            if (contains(c.bounds, x, y)) {
+                if (c.on_click(x, y)) { return true; }
+            }
+        }
+        return true;
+    }
+
+    override fn on_key(k: int, ch: string): bool {
+        for (let c in this.children) {
+            if (c.on_key(k, ch)) { return true; }
+        }
+        return false;
+    }
+}

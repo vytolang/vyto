@@ -11,7 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-static int last_key, last_x, last_y;
+static int last_key, last_x, last_y, last_wheel;
 static char last_text[32];
 
 /* ---- headless backend (platform-independent) ---- */
@@ -100,6 +100,19 @@ static int headless_wait(int *w, int *h) {
         if (strcmp(script_line, "expose") == 0) return VS_EV_EXPOSE;
         if (strcmp(script_line, "tick") == 0) return VS_EV_TIMER;
         if (strcmp(script_line, "close") == 0) return VS_EV_CLOSE;
+        {
+            int sc, sx, sy;
+            if (sscanf(script_line, "scroll %d %d %d", &sc, &sx, &sy) == 3) {
+                last_wheel = sc;
+                last_x = sx;
+                last_y = sy;
+                return VS_EV_MOUSE_WHEEL;
+            }
+            if (sscanf(script_line, "scroll %d", &sc) == 1) {
+                last_wheel = sc;
+                return VS_EV_MOUSE_WHEEL;
+            }
+        }
         /* unknown directive: skip */
     }
 }
@@ -108,6 +121,7 @@ int vs_key(void) { return last_key; }
 const char *vs_text(void) { return last_text; }
 int vs_x(void) { return last_x; }
 int vs_y(void) { return last_y; }
+int vs_wheel(void) { return last_wheel; }
 
 #ifdef _WIN32
 /* ================================================================ Win32 */
@@ -196,6 +210,17 @@ static LRESULT CALLBACK vs_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_LBUTTONUP:
         q_push(VS_EV_MOUSE_UP, 0, (short)LOWORD(lp), (short)HIWORD(lp), 0);
         return 0;
+    case WM_MOUSEWHEEL: {
+        POINT pt;
+        pt.x = (short)LOWORD(lp);
+        pt.y = (short)HIWORD(lp);
+        ScreenToClient(hwnd, &pt);
+        int delta = GET_WHEEL_DELTA_WPARAM(wp);
+        /* normalize: one wheel notch = WHEEL_DELTA (120); map to +/-3 lines */
+        int lines = (delta * 3) / 120;
+        q_push(VS_EV_MOUSE_WHEEL, lines, pt.x, pt.y, 0);
+        return 0;
+    }
     case WM_KEYDOWN: {
         int k = 0;
         switch (wp) {
@@ -398,6 +423,7 @@ static int q_pop(void) {
     last_key = e.key;
     last_x = e.x;
     last_y = e.y;
+    last_wheel = (e.type == VS_EV_MOUSE_WHEEL) ? e.key : 0;
     last_text[0] = e.text[0];
     last_text[1] = 0;
     return e.type;
@@ -703,6 +729,18 @@ static int x11_translate(VSurf *s, XEvent *e) {
             last_x = e->xbutton.x;
             last_y = e->xbutton.y;
             return VS_EV_MOUSE_DOWN;
+        }
+        if (e->xbutton.button == Button4) {
+            last_x = e->xbutton.x;
+            last_y = e->xbutton.y;
+            last_wheel = -3; /* up = negative (content moves down) */
+            return VS_EV_MOUSE_WHEEL;
+        }
+        if (e->xbutton.button == Button5) {
+            last_x = e->xbutton.x;
+            last_y = e->xbutton.y;
+            last_wheel = 3; /* down = positive (content moves up) */
+            return VS_EV_MOUSE_WHEEL;
         }
         return -1;
     case ButtonRelease:

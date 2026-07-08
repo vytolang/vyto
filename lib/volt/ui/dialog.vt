@@ -1,8 +1,9 @@
 // volt/ui/dialog — modal panels: the Dialog base, a FilePicker (directory
 // listing + filename field + OK/Cancel), and a MessageDialog notice.
 
-import { Widget, Painter, Theme, Window } from "volt/ui/core";
+import { Widget, Painter, Theme, Window, BoxConstraints } from "volt/ui/core";
 import { Button, TextField, ListBox } from "volt/ui/form";
+import { Text } from "volt/ui/display";
 import { Rect, contains, KEY_ENTER, KEY_TAB } from "volt/surface";
 
 // Modal panel base: centered, dims nothing (no alpha) but traps events via
@@ -175,21 +176,32 @@ export class FilePicker extends Dialog {
 export class MessageDialog extends Dialog {
     message: string;
     ok: Button;
+    msg_text: Text;
 
     fn init(title: string, message: string) {
         super.init(title);
         this.message = message;
         this.ok = new Button("OK");
+        this.msg_text = new Text(message);
+        this.add(this.msg_text);
         this.add(this.ok);
     }
 
     override fn place(s: Painter, th: Theme) {
         let dw = 320;
-        let dh = 140;
+        let fh = s.font_height();
+        let titleh = fh + 10;
+        let ctrl = fh + 12;
+        // measure wrapped text
+        this.msg_text.layout(s, th, new BoxConstraints(0, dw - 32, 0, 400));
+        let msg_h = this.msg_text.cached_count * (fh + 2);
+        if (msg_h < fh + 10) { msg_h = fh + 10; }
+        let dh = titleh + 16 + msg_h + 16 + ctrl + 12;
         let x = (s.width() - dw) / 2;
         let y = (s.height() - dh) / 2;
         this.bounds = Rect(x, y, dw, dh);
-        let ctrl = s.font_height() + 12;
+        let msg_y = y + titleh + 16;
+        this.msg_text.bounds = Rect(x + 16, msg_y, dw - 32, msg_h);
         this.ok.bounds = Rect(x + dw - 12 - 90, y + dh - 12 - ctrl, 90, ctrl);
     }
 
@@ -199,9 +211,7 @@ export class MessageDialog extends Dialog {
         let tb = Rect(this.bounds.x, this.bounds.y, this.bounds.w, s.font_height() + 10);
         s.fill(tb, th.accent);
         s.text_in(tb, 12, this.title, th.white);
-        let mr = Rect(this.bounds.x + 16, this.bounds.y + s.font_height() + 10,
-                      this.bounds.w - 32, s.font_height() + 20);
-        s.text_in(mr, 0, this.message, th.ink);
+        this.msg_text.draw(s, th);
         this.ok.draw(s, th);
     }
 
@@ -211,6 +221,7 @@ export class MessageDialog extends Dialog {
     }
 
     override fn on_click(x: int, y: int): bool {
+        if (contains(this.ok.bounds, x, y)) { this.dismiss(); return true; }
         this.dismiss();
         return true;
     }
