@@ -338,6 +338,10 @@ int main(int argc, char **argv) {
     const char *san = "";
     if (!release && !bundle && !cross && !win_target && strcmp(cc, "tcc") != 0 && cc_supports_san(cc))
         san = " -fsanitize=signed-integer-overflow -fno-sanitize-recover=all";
+    /* Object-cache key for module .o files. A ubsan-instrumented debug object
+       cannot be reused for a --bundle/release link (which omits the ubsan
+       runtime), so debug+san and plain builds must not share the same path. */
+    const char *osuf = release ? "_rel" : (san[0] ? "_dbg" : "");
 
     SBuf objs;
     sb_init(&objs);
@@ -448,8 +452,7 @@ int main(int argc, char **argv) {
             fatal("cannot write %s", cpath);
         sb_free(&h);
         sb_free(&c);
-        const char *opath = arena_printf(&g_arena, "%s/mod_%s%s.o", cache, m->name,
-                                         release ? "_rel" : "");
+        const char *opath = arena_printf(&g_arena, "%s/mod_%s%s.o", cache, m->name, osuf);
         /* headers are cheap to over-invalidate: recompile when any header changed */
         m->src_hash = hchanged || cchanged; /* reuse field as "dirty" for this build */
         sb_printf(&objs, " %s", opath);
@@ -462,8 +465,7 @@ int main(int argc, char **argv) {
 
     for (Module *m = g_modules; m; m = m->next) {
         const char *cpath = arena_printf(&g_arena, "%s/mod_%s.c", cache, m->name);
-        const char *opath = arena_printf(&g_arena, "%s/mod_%s%s.o", cache, m->name,
-                                         release ? "_rel" : "");
+        const char *opath = arena_printf(&g_arena, "%s/mod_%s%s.o", cache, m->name, osuf);
         if (m->src_hash || any_h_changed || !file_exists(opath) ||
             file_mtime(arena_printf(&g_arena, "%s/volt_rt.h", rtdir)) > file_mtime(opath)) {
             char *cmdline = arena_printf(&g_arena, "%s %s%s -w -I%s -I%s -c -o %s %s", cc, opt,
