@@ -346,6 +346,19 @@ void *gfx_image_load_file(const char *path) {
     return im;
 }
 
+void *gfx_image_load_bytes(const void *data, int len) {
+    if (!data || len <= 0) return NULL;
+    GfxImage *im = (GfxImage *)malloc(sizeof(GfxImage));
+    if (!im) return NULL;
+    bl_image_init(&im->img);
+    if (bl_image_read_from_data(&im->img, data, (size_t)len, NULL) != BL_SUCCESS) {
+        bl_image_destroy(&im->img);
+        free(im);
+        return NULL;
+    }
+    return im;
+}
+
 void gfx_image_free(void *img) {
     if (!img) return;
     GfxImage *im = (GfxImage *)img;

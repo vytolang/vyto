@@ -9,8 +9,9 @@
 // It lives in its own module so plain Canvas users (import "volt/gfx") don't
 // pull in volt/ui, and volt/ui apps don't pull in blend2d unless they use this.
 import { Painter, WEIGHT_REG, WEIGHT_MED, WEIGHT_BOLD } from "volt/ui";
-import { Canvas, loadImage, freeImage } from "volt/gfx";
+import { Canvas, loadImage, loadImageBytes, freeImage } from "volt/gfx";
 import { Surface, Rect, rgb } from "volt/surface";
+import { fetchUrl, fetchFree, fetchLen, fetchData } from "volt/net";
 
 // Build a candidate bold/medium face path from a regular TTF path by inserting
 // "Bold"/"Medium" before the extension — works for the DejaVu family shipped
@@ -138,6 +139,16 @@ export class GfxPainter extends Painter {
     }
 
     override fn load_image(path: string): rawptr { return loadImage(path); }
+    // Bridges volt/net (fetch) to volt/gfx (decode) — the only place they
+    // meet, same boundary role this file already plays for load_image so
+    // volt/ui stays free of both blend2d and libcurl.
+    override fn load_image_url(url: string): rawptr {
+        let h = fetchUrl(url);
+        if (h == null) { return null; }
+        let handle = loadImageBytes(fetchData(h), fetchLen(h));
+        fetchFree(h);
+        return handle;
+    }
     override fn draw_image(handle: rawptr, r: Rect) {
         // a failed decode (bad path, or the palette-PNG limitation — see
         // gfx_shim.h) still needs to draw *something*, same graceful-degrade

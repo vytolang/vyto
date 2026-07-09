@@ -102,6 +102,10 @@ int gfx_stride(GfxCanvas *c);   /* bytes per row */
    reliable recipe, verified against this build) rather than assuming the
    path is bad. */
 void *gfx_image_load_file(const char *path); /* NULL on failure (bad path or undecodable) */
+/* same decode/lifecycle as gfx_image_load_file, but from an in-memory buffer
+   (e.g. HTTP-fetched bytes) instead of a path — see volt/net + GfxPainter's
+   load_image_url for the caller. NULL on failure (undecodable or len<=0). */
+void *gfx_image_load_bytes(const void *data, int len);
 void gfx_image_free(void *img);
 int gfx_image_width(void *img);
 int gfx_image_height(void *img);

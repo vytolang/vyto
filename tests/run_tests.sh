@@ -159,6 +159,16 @@ if [ -f lib/volt/gfx/native/linux-x64/libblend2d.so ]; then
     else
         echo "SKIP gfx_bundle_static (no libblend2d.a)"
     fi
+    # gfx_image_load_bytes: in-memory decode (no curl/network) backing
+    # Image/Avatar's http:// loading path — see volt/gfx/painter.vt's
+    # load_image_url and lib/volt/net.
+    got=$(./voltc run tests/fixtures/gfx_load_bytes.vt 2>&1)
+    if [ "$got" = "w=300 h=300" ]; then
+        echo "PASS gfx_load_bytes"
+    else
+        echo "FAIL gfx_load_bytes (got: $got)"
+        fail=1
+    fi
 else
     echo "SKIP gfx_canvas_blit (no libblend2d — run lib/volt/gfx/native/build-blend2d.sh)"
 fi
