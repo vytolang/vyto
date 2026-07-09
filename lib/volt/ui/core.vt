@@ -389,6 +389,51 @@ export class Painter {
         if (raised) { color = light; }
         this.stroke_round(r, radius, width, color);
     }
+
+    // Arbitrary filled polygon (xs/ys parallel arrays, same point at index
+    // i) — for icon glyphs a rect/round-rect/circle can't express: stars,
+    // hearts, roofs, speech-bubble tails. Base fallback: the bounding box of
+    // the points, filled flat — a rough but honest stand-in on the lean tier.
+    virtual fn polygon(xs: i32[], ys: i32[], color: int) {
+        if (xs.len == 0) { return; }
+        let minx = xs[0]; let maxx = xs[0];
+        let miny = ys[0]; let maxy = ys[0];
+        for (let i in 0..xs.len) {
+            if (xs[i] < minx) { minx = xs[i]; }
+            if (xs[i] > maxx) { maxx = xs[i]; }
+            if (ys[i] < miny) { miny = ys[i]; }
+            if (ys[i] > maxy) { maxy = ys[i]; }
+        }
+        this.fill(Rect(minx as int, miny as int, (maxx - minx) as int, (maxy - miny) as int), color);
+    }
+
+    // Partial ring stroke (e.g. a wifi/signal glyph). Degrees, 0 = +x axis,
+    // clockwise. Base fallback: a full circle instead of a partial arc —
+    // plainer, still visibly the right shape family.
+    virtual fn stroke_arc(cx: int, cy: int, rx: int, ry: int,
+                          start_deg: int, sweep_deg: int, width: int, color: int) {
+        this.stroke_circle(cx, cy, (rx + ry) / 2, width, color);
+    }
+
+    // Decoded-image loading is a rich-tier-only capability (needs blend2d);
+    // the base/lean tier can never decode a file, so it returns null rather
+    // than pretending. Widgets that call this must handle a null handle.
+    virtual fn load_image(path: string): rawptr {
+        return null;
+    }
+    // Base fallback: a flat neutral placeholder — visibly "there's an image
+    // here" rather than a blank hole, matching every other WS2 primitive's
+    // graceful-degrade contract. No Theme is available at this layer, so the
+    // color is a fixed neutral gray, not theme-derived.
+    virtual fn draw_image(handle: rawptr, r: Rect) {
+        this.fill(r, rgb(200, 200, 200));
+    }
+    // Release a handle from load_image. Widgets that hold an image call this
+    // from their own `deinit` via `this.win.painter.free_image(...)` — never
+    // straight to volt/gfx, so display.vt keeps the "volt/ui doesn't depend
+    // on blend2d" boundary painter.vt exists to enforce. Base: no-op (the
+    // base/lean tier's load_image never returns a real handle to free).
+    virtual fn free_image(handle: rawptr) { }
 }
 
 // Default painter: forwards every call to a volt/surface Surface.

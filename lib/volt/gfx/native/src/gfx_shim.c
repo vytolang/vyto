@@ -158,6 +158,40 @@ void gfx_bevel_round(GfxCanvas *c, double x, double y, double w, double h,
     bl_context_stroke_geometry_rgba32(&c->ctx, BL_GEOMETRY_TYPE_LINE, &right, bot_right_color);
 }
 
+/* Arbitrary filled polygon — for icon glyphs a rect/round-rect/circle can't
+   express (stars, hearts, roofs, speech-bubble tails). blend2d's C API has
+   no C++ BLArrayView<T> template to reach for; in plain C it's the untyped
+   `{ const void* data; size_t size; }` the BL_DEFINE_ARRAY_VIEW macro
+   expands to (core/api.h) — build a BLPoint[] and hand blend2d that. */
+void gfx_fill_polygon(GfxCanvas *c, const double *xs, const double *ys, int n, int color) {
+    if (n < 3) return;
+    BLPoint *pts = (BLPoint *)malloc(sizeof(BLPoint) * (size_t)n);
+    if (!pts) return;
+    for (int i = 0; i < n; i++) {
+        pts[i].x = xs[i];
+        pts[i].y = ys[i];
+    }
+    BLArrayView view;
+    view.data = pts;
+    view.size = (size_t)n;
+    bl_context_set_fill_style_rgba32(&c->ctx, rgba32_of(color));
+    bl_context_fill_geometry(&c->ctx, BL_GEOMETRY_TYPE_POLYGOND, &view);
+    free(pts);
+}
+
+/* Partial ring stroke (a wifi/signal-style arc) via blend2d's BLArc +
+   BL_GEOMETRY_TYPE_ARC. Angles are degrees at this boundary (0 = +x axis,
+   clockwise) and converted to radians here — every other angle-free
+   primitive in this shim already favors plain, ergonomic units at the
+   Volt-facing edge. */
+void gfx_stroke_arc(GfxCanvas *c, double cx, double cy, double rx, double ry,
+                    double start_deg, double sweep_deg, double width, int color) {
+    const double deg2rad = 3.14159265358979323846 / 180.0;
+    BLArc a = { cx, cy, rx, ry, start_deg * deg2rad, sweep_deg * deg2rad };
+    bl_context_set_stroke_width(&c->ctx, width);
+    bl_context_stroke_geometry_rgba32(&c->ctx, BL_GEOMETRY_TYPE_ARC, &a, rgba32_of(color));
+}
+
 /* Soft shadow: draw the round-rect `layers` times, growing outward by a
    fraction of `blur` and fading the alpha, offset by `dy`. blend2d composites
    each translucent fill over the existing pixels, producing a gaussian-ish
@@ -287,4 +321,54 @@ int gfx_stride(GfxCanvas *c) {
     BLImageData d;
     bl_image_get_data(&c->img, &d);
     return (int)d.stride;
+}
+
+/* ---- decoded images (PNG/JPEG/BMP/QOI — all built into libblend2d, no
+   extra codec dependency) — a load-once opaque handle, same shape as the
+   font lifecycle above. */
+
+typedef struct GfxImage GfxImage;
+struct GfxImage {
+    BLImageCore img;
+};
+
+void *gfx_image_load_file(const char *path) {
+    GfxImage *im = (GfxImage *)malloc(sizeof(GfxImage));
+    if (!im) return NULL;
+    bl_image_init(&im->img);
+    /* NULL codecs = auto-detect by sniffing the file header against the
+       built-in codec registry (PNG/JPEG/BMP/QOI) */
+    if (bl_image_read_from_file(&im->img, path, NULL) != BL_SUCCESS) {
+        bl_image_destroy(&im->img);
+        free(im);
+        return NULL;
+    }
+    return im;
+}
+
+void gfx_image_free(void *img) {
+    if (!img) return;
+    GfxImage *im = (GfxImage *)img;
+    bl_image_destroy(&im->img);
+    free(im);
+}
+
+int gfx_image_width(void *img) {
+    if (!img) return 0;
+    BLImageData d;
+    bl_image_get_data(&((GfxImage *)img)->img, &d);
+    return d.size.w;
+}
+
+int gfx_image_height(void *img) {
+    if (!img) return 0;
+    BLImageData d;
+    bl_image_get_data(&((GfxImage *)img)->img, &d);
+    return d.size.h;
+}
+
+void gfx_draw_image(GfxCanvas *c, void *img, double x, double y, double w, double h) {
+    if (!img) return;
+    BLRect r = { x, y, w, h };
+    bl_context_blit_scaled_image_d(&c->ctx, &r, &((GfxImage *)img)->img, NULL);
 }

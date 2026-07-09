@@ -1,0 +1,408 @@
+// VoltPhone — an iPhone-shaped simulator shell demonstrating the iOS skin
+// (skin_ios()/theme_ios()) plus the three new display widgets it motivated:
+// Icon (a hand-drawn vector glyph set — no icon font/vector asset exists in
+// the toolkit yet), Avatar (circular initials/photo badge), and Image (a
+// decoded bitmap). Home screen + three tap-into screens, one per new widget:
+//   Settings  — Icon-heavy (colored glyph rows + chevrons)
+//   Contacts  — Avatar-heavy (initials badges in a list)
+//   Photos    — Image-heavy (a grid of decoded sample photos)
+//
+// Rendering tiers:
+//   Rich (blend2d, AA):  ./voltc run apps/iphone/iphone.vt
+//   Lean (vector):       ./voltc run apps/iphone/iphone.vt -- --surface
+//     (Image degrades to a flat placeholder on the lean tier — it can never
+//     decode a file without blend2d; see Painter.draw_image.)
+//
+// Jump straight to a screen for a screenshot/demo pass:
+//   ./voltc run apps/iphone/iphone.vt -- --screen=settings
+//   (home | settings | contacts | photos)
+
+import { Window, Widget, Painter, Theme, Size, Column, Row, Spacer, Label, Card,
+         Container, Center, SizedBox, Padding, Grid, Icon, Avatar, Image,
+         ICON_CHEVRON_LEFT, ICON_SIGNAL, ICON_WIFI, ICON_BATTERY, ICON_GEAR,
+         ICON_BELL, ICON_PERSON, ICON_CAMERA,
+         ICON_MAIL, ICON_MESSAGE, ICON_PHOTO, ICON_MUSIC, ICON_MAP_PIN,
+         ICON_HEART, ICON_STAR, ICON_HOME, ICON_SEARCH,
+         ICON_CHEVRON_RIGHT, skin_ios, theme_ios, Skin } from "volt/ui";
+import { GfxPainter } from "volt/gfx/painter";
+import { Rect, rgb, mix, contains } from "volt/surface";
+
+fn font_path(): string {
+    return "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf";
+}
+
+fn asset(name: string): string {
+    return "apps/iphone/assets/" + name;
+}
+
+fn rect_overlaps(a: Rect, b: Rect): bool {
+    if (a.x + a.w <= b.x) { return false; }
+    if (b.x + b.w <= a.x) { return false; }
+    if (a.y + a.h <= b.y) { return false; }
+    if (b.y + b.h <= a.y) { return false; }
+    return true;
+}
+
+// ------------------------------------------------------- DeviceFrame
+
+// The rounded phone body + screen. App-local (not part of the shared
+// widget catalog): Card's PanelChrome route hardcodes th.radius_md, too
+// small for a convincing device-bezel curve at this scale, so this calls
+// PanelChrome directly with an explicit large radius — same underlying
+// mechanism Card uses, just without Card's fixed-radius constraint.
+class DeviceFrame extends Widget {
+    screenBg: int;
+    bezelColor: int;
+
+    fn init(screenBg: int, bezelColor: int, child: Widget) {
+        super.init();
+        this.screenBg = screenBg;
+        this.bezelColor = bezelColor;
+        if (child != null) { this.add(child); }
+    }
+
+    fn child(): Widget {
+        if (this.children.len == 0) { return null; }
+        return this.children[0];
+    }
+
+    override fn measure(s: Painter, th: Theme): Size { 
+        return Size(390, 844); 
+    }
+
+    override fn arrange(s: Painter, th: Theme, r: Rect) {
+        this.bounds = r;
+        let c = this.child();
+        if (c == null) { return; }
+        let pad = 14;
+        let inner = Rect(r.x + pad, r.y + pad, r.w - 2 * pad, r.h - 2 * pad);
+        c.arrange(s, th, inner);
+    }
+
+    override fn draw(s: Painter, th: Theme) {
+        this.win.skin.panel.paint(s, th, this.bounds, 48, this.bezelColor, this.bezelColor, 3);
+        let pad = 14;
+        let inner = Rect(this.bounds.x + pad, this.bounds.y + pad,
+                         this.bounds.w - 2 * pad, this.bounds.h - 2 * pad);
+        s.fill_round(inner, 36, this.screenBg);
+        s.clip_push(inner, 36);
+        let c = this.child();
+        if (c != null) { c.draw(s, th); }
+        s.clip_pop();
+    }
+
+    // Widget.draw_within's container branch paints draw_chrome() then
+    // recurses into children directly, bypassing the bezel/screen fill and
+    // clip that live in draw() above — those only run on a full draw(). Any
+    // partial repaint touching this widget (hover, press, focus…) would
+    // clear its dirty rect to window bg and never restore the bezel/screen,
+    // making them flicker away. Force every partial repaint that overlaps
+    // this widget to fall back to the full draw() instead.
+    override fn draw_within(s: Painter, th: Theme, d: Rect) {
+        if (!rect_overlaps(this.bounds, d)) { return; }
+        this.draw(s, th);
+    }
+}
+
+// ------------------------------------------------------- AppTile
+
+// An icon + caption, tappable — the home screen / dock building block.
+// App-local: composes an existing Icon (in "app icon" bg-mode) + Label,
+// the same child-composition idiom Card/Badge already use, just with a
+// tap handler added (neither Icon nor Label carry one — they're passive
+// display widgets, matching the Badge/Chip precedent).
+class AppTile extends Widget {
+    onTap: fn();
+    icon: Icon;
+    caption: Label;
+
+    fn init(iconId: int, text: string, bg: int, iconSize: int) {
+        super.init();
+        this.icon = new Icon(iconId, iconSize);
+        this.icon.bg = bg;
+        this.icon.color = rgb(255, 255, 255);
+        this.icon.bg_radius = 16;
+        this.caption = new Label(text);
+        this.caption.strong = false;
+        this.add(this.icon);
+        this.add(this.caption);
+        this.focusable = true;
+    }
+
+    override fn measure(s: Painter, th: Theme): Size {
+        let is = this.icon.measure(s, th);
+        let ls = this.caption.measure(s, th);
+        let w = is.w;
+        if (ls.w > w) { w = ls.w; }
+        return Size(w, is.h + 4 + ls.h);
+    }
+
+    override fn arrange(s: Painter, th: Theme, r: Rect) {
+        this.bounds = r;
+        let is = this.icon.measure(s, th);
+        let ix = r.x + (r.w - is.w) / 2;
+        this.icon.arrange(s, th, Rect(ix, r.y, is.w, is.h));
+        let ls = this.caption.measure(s, th);
+        let lx = r.x + (r.w - ls.w) / 2;
+        this.caption.arrange(s, th, Rect(lx, r.y + is.h + 4, ls.w, ls.h));
+    }
+
+    override fn draw(s: Painter, th: Theme) {
+        this.icon.draw(s, th);
+        this.caption.draw(s, th);
+    }
+
+    override fn on_click(x: int, y: int): bool {
+        if (this.onTap != null) { this.onTap(); }
+        return true;
+    }
+
+    // Widget.hit() walks to the deepest leaf under the cursor, and this
+    // widget's icon/caption are real children (added via this.add() in
+    // init) — so a tap would hit-test to the inner Icon/Label instead of
+    // this AppTile, and neither of those overrides on_click, silently
+    // swallowing the tap. Treat this widget as an atomic tappable unit
+    // instead, same as Button (which has no children to dive into).
+    override fn hit(px: int, py: int): Widget {
+        if (contains(this.bounds, px, py)) { return this; }
+        return null;
+    }
+
+    override fn drop_handlers() { this.onTap = null; }
+}
+
+// ------------------------------------------------------- chrome builders
+
+fn status_bar(): Widget {
+    let row = new Row([]);
+    row.add(new Label("9:41"));
+    row.add(new Spacer());
+    row.add(new Icon(ICON_SIGNAL, 16));
+    row.add(new SizedBox(6, 0, null));
+    row.add(new Icon(ICON_WIFI, 16));
+    row.add(new SizedBox(6, 0, null));
+    row.add(new Icon(ICON_BATTERY, 16));
+    return new SizedBox(-1, 34, new Padding(14, row));
+}
+
+fn home_indicator(): Widget {
+    return new SizedBox(-1, 22, new Center(new Container(134, 5, 0, rgb(60, 60, 60), null)));
+}
+
+// Nav bar for a pushed screen: back chevron + title.
+fn nav_bar(title: string, onBack: fn()): Widget {
+    let back = new AppTile(ICON_CHEVRON_LEFT, "", -1, 56);
+    back.icon.color = rgb(0, 122, 255);
+    back.icon.bg = -1;
+    back.onTap = onBack;
+    let row = new Row([]);
+    row.add(new SizedBox(40, 40, back));
+    row.add(new SizedBox(8, 0, null));
+    let t = new Label(title);
+    row.add(t);
+    return new SizedBox(-1, 44, new Padding(10, row));
+}
+
+// ------------------------------------------------------- screens
+
+fn build_home_screen(showScreen: fn(Widget, bool)): Widget {
+    let col = new Column([]);
+    col.spacing = 18;
+    col.padding = 20;
+
+    let tiles: Widget[] = [];
+    let settingsTile = new AppTile(ICON_GEAR, "Settings", rgb(142, 142, 147), 56);
+    tiles.push(settingsTile);
+    let contactsTile = new AppTile(ICON_PERSON, "Contacts", rgb(52, 199, 89), 56);
+    tiles.push(contactsTile);
+    let photosTile = new AppTile(ICON_PHOTO, "Photos", rgb(255, 149, 0), 56);
+    tiles.push(photosTile);
+    tiles.push(new AppTile(ICON_MAIL, "Mail", rgb(0, 122, 255), 56));
+    tiles.push(new AppTile(ICON_MESSAGE, "Messages", rgb(76, 217, 100), 56));
+    tiles.push(new AppTile(ICON_CAMERA, "Camera", rgb(90, 90, 95), 56));
+    tiles.push(new AppTile(ICON_MUSIC, "Music", rgb(252, 61, 57), 56));
+    tiles.push(new AppTile(ICON_MAP_PIN, "Maps", rgb(102, 187, 106), 56));
+    tiles.push(new AppTile(ICON_HEART, "Health", rgb(255, 59, 92), 56));
+    tiles.push(new AppTile(ICON_STAR, "Favorites", rgb(255, 204, 0), 56));
+    tiles.push(new AppTile(ICON_SEARCH, "Search", rgb(142, 142, 147), 56));
+    tiles.push(new AppTile(ICON_BELL, "Alerts", rgb(255, 69, 58), 56));
+
+    let grid = new Grid(4, 18, []);
+    for (let t in tiles) { grid.add(t); }
+    col.add(grid);
+    col.add(new Spacer());
+
+    // Dock: 4 primary apps in a rounded panel.
+    let dockRow = new Row([]);
+    dockRow.add(new AppTile(ICON_MESSAGE, "", rgb(76, 217, 100), 44));
+    dockRow.add(new SizedBox(16, 0, null));
+    dockRow.add(new AppTile(ICON_MAIL, "", rgb(0, 122, 255), 44));
+    dockRow.add(new SizedBox(16, 0, null));
+    dockRow.add(new AppTile(ICON_CAMERA, "", rgb(90, 90, 95), 44));
+    dockRow.add(new SizedBox(16, 0, null));
+    dockRow.add(new AppTile(ICON_MUSIC, "", rgb(252, 61, 57), 44));
+    let dock = new Card(10, rgb(230, 230, 235), -1, "", dockRow);
+    col.add(dock);
+
+    let root = new Column([]);
+    root.add(status_bar());
+    root.add(new SizedBox(-1, 8, null));
+    let scroller = new Padding(0, col);
+    root.add(scroller);
+    root.add(home_indicator());
+
+    settingsTile.onTap = () => { showScreen(build_settings_screen(showScreen), false); };
+    contactsTile.onTap = () => { showScreen(build_contacts_screen(showScreen), false); };
+    photosTile.onTap = () => { showScreen(build_photos_screen(showScreen), false); };
+
+    return root;
+}
+
+fn settings_row(iconId: int, label: string, bg: int): Widget {
+    let icon = new Icon(iconId, 28);
+    icon.bg = bg;
+    icon.color = rgb(255, 255, 255);
+    icon.bg_radius = 8;
+    let row = new Row([]);
+    row.add(new SizedBox(36, 36, icon));
+    row.add(new SizedBox(12, 0, null));
+    row.add(new Label(label));
+    row.add(new Spacer());
+    row.add(new Icon(ICON_CHEVRON_RIGHT, 18));
+    return new SizedBox(-1, 48, new Padding(10, row));
+}
+
+fn settings_rows(): Widget {
+    let inner = new Column([]);
+    inner.add(settings_row(ICON_WIFI, "Wi-Fi", rgb(0, 122, 255)));
+    inner.add(settings_row(ICON_MESSAGE, "Bluetooth", rgb(0, 122, 255)));
+    inner.add(settings_row(ICON_BELL, "Notifications", rgb(255, 59, 48)));
+    inner.add(settings_row(ICON_HEART, "Sounds & Haptics", rgb(255, 45, 85)));
+    inner.add(settings_row(ICON_GEAR, "General", rgb(142, 142, 147)));
+    inner.add(settings_row(ICON_STAR, "Control Center", rgb(60, 60, 67)));
+    inner.add(settings_row(ICON_PERSON, "Privacy & Security", rgb(0, 122, 255)));
+    return inner;
+}
+
+fn build_settings_screen(showScreen: fn(Widget, bool)): Widget {
+    let root = new Column([]);
+    root.add(status_bar());
+    root.add(nav_bar("Settings", () => { showScreen(build_home_screen(showScreen), true); }));
+
+    let list = new Column([]);
+    list.padding = 12;
+    list.spacing = 2;
+    let card = new Card(4, rgb(255, 255, 255), -1, "", settings_rows());
+    list.add(card);
+    root.add(new Padding(0, list));
+    root.add(new Spacer());
+    root.add(home_indicator());
+    return root;
+}
+
+fn contact_row(initials: string, name: string, preview: string, bg: int): Widget {
+    let av = new Avatar(initials, 46);
+    av.bg = bg;
+    let namesCol = new Column([]);
+    namesCol.spacing = 2;
+    let nameLbl = new Label(name);
+    let previewLbl = new Label(preview);
+    previewLbl.strong = false;
+    namesCol.add(nameLbl);
+    namesCol.add(previewLbl);
+    let row = new Row([]);
+    row.add(new SizedBox(46, 46, av));
+    row.add(new SizedBox(12, 0, null));
+    row.add(namesCol);
+    return new SizedBox(-1, 62, new Padding(10, row));
+}
+
+fn contact_rows(): Widget {
+    let inner = new Column([]);
+    inner.add(contact_row("AK", "Ada Kelvin", "Sent the mockups over", rgb(0, 122, 255)));
+    inner.add(contact_row("BR", "Ben Ruiz", "Call me when you're free", rgb(255, 149, 0)));
+    inner.add(contact_row("CM", "Chidi Moro", "See you at 6?", rgb(52, 199, 89)));
+    inner.add(contact_row("DS", "Dana Singh", "Thanks!", rgb(255, 59, 92)));
+    inner.add(contact_row("EW", "Eli Wong", "Pushed the fix", rgb(175, 82, 222)));
+    inner.add(contact_row("FL", "Farah Lund", "On my way", rgb(255, 204, 0)));
+    return inner;
+}
+
+fn build_contacts_screen(showScreen: fn(Widget, bool)): Widget {
+    let root = new Column([]);
+    root.add(status_bar());
+    root.add(nav_bar("Contacts", () => { showScreen(build_home_screen(showScreen), true); }));
+
+    let list = new Column([]);
+    list.padding = 12;
+    list.spacing = 2;
+    let card = new Card(4, rgb(255, 255, 255), -1, "", contact_rows());
+    list.add(card);
+    root.add(new Padding(0, list));
+    root.add(new Spacer());
+    root.add(home_indicator());
+    return root;
+}
+
+fn build_photos_screen(showScreen: fn(Widget, bool)): Widget {
+    let root = new Column([]);
+    root.add(status_bar());
+    root.add(nav_bar("Photos", () => { showScreen(build_home_screen(showScreen), true); }));
+
+    let grid = new Grid(3, 6, []);
+    let radii: int[] = [0, 12, 0, 12, 0, 12, 0, 12];
+    let names: string[] = ["sunset.png", "ocean.png", "forest.png", "desert.png",
+        "sunset.png", "ocean.png", "forest.png", "desert.png"];
+    let i = 0;
+    while (i < names.len) {
+        let img = new Image(asset(names[i]), 108, 108);
+        img.radius = radii[i];
+        grid.add(img);
+        i += 1;
+    }
+    root.add(new Padding(6, grid));
+    root.add(new Spacer());
+    root.add(home_indicator());
+    return root;
+}
+
+// ------------------------------------------------------- main
+
+fn main() {
+    let useSurface = false;
+    let startScreen = "home";
+    let a = args();
+    for (let i in 0..a.len) {
+        if (a[i] == "--surface") { useSurface = true; }
+        if (a[i].len > 9 && a[i].slice(0, 9) == "--screen=") {
+            startScreen = a[i].slice(9, a[i].len);
+        }
+    }
+
+    let win = new Window("VoltPhone", 500, 900);
+    if (!useSurface) {
+        win.use_painter(new GfxPainter(win.surface(), font_path(), 15.0));
+    }
+    win.skin = skin_ios();
+    win.theme = theme_ios();
+
+    let deviceBezel = rgb(28, 28, 30);
+    let screenBg = rgb(242, 242, 247);
+
+    let showScreen: fn(Widget, bool) = null;
+    showScreen = (content, isHome) => {
+        let frame = new DeviceFrame(screenBg, deviceBezel, content);
+        win.root = new Center(frame);
+        win.layout();
+        win.redraw();
+    };
+
+    let initial: Widget = null;
+    if (startScreen == "settings") { initial = build_settings_screen(showScreen); }
+    else if (startScreen == "contacts") { initial = build_contacts_screen(showScreen); }
+    else if (startScreen == "photos") { initial = build_photos_screen(showScreen); }
+    else { initial = build_home_screen(showScreen); }
+
+    showScreen(initial, startScreen == "home");
+    win.run();
+}

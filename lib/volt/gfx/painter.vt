@@ -9,8 +9,8 @@
 // It lives in its own module so plain Canvas users (import "volt/gfx") don't
 // pull in volt/ui, and volt/ui apps don't pull in blend2d unless they use this.
 import { Painter, WEIGHT_REG, WEIGHT_MED, WEIGHT_BOLD } from "volt/ui";
-import { Canvas } from "volt/gfx";
-import { Surface, Rect } from "volt/surface";
+import { Canvas, loadImage, freeImage } from "volt/gfx";
+import { Surface, Rect, rgb } from "volt/surface";
 
 // Build a candidate bold/medium face path from a regular TTF path by inserting
 // "Bold"/"Medium" before the extension — works for the DejaVu family shipped
@@ -118,6 +118,38 @@ export class GfxPainter extends Painter {
         this.canvas.bevelRound(r.x as float, r.y as float, r.w as float, r.h as float,
                                radius as float, width as float, light, dark, raised);
     }
+
+    // Volt has no bulk array-element-type cast, so int points become float
+    // points one at a time — icon glyphs are small (rarely >20 points), so
+    // this loop is not a hot-path concern.
+    override fn polygon(xs: i32[], ys: i32[], color: int) {
+        let fxs: float[] = [];
+        let fys: float[] = [];
+        for (let i in 0..xs.len) {
+            fxs.push(xs[i] as float);
+            fys.push(ys[i] as float);
+        }
+        this.canvas.fillPolygon(fxs, fys, color);
+    }
+    override fn stroke_arc(cx: int, cy: int, rx: int, ry: int,
+                           start_deg: int, sweep_deg: int, width: int, color: int) {
+        this.canvas.strokeArc(cx as float, cy as float, rx as float, ry as float,
+                              start_deg as float, sweep_deg as float, width as float, color);
+    }
+
+    override fn load_image(path: string): rawptr { return loadImage(path); }
+    override fn draw_image(handle: rawptr, r: Rect) {
+        // a failed decode (bad path, or the palette-PNG limitation — see
+        // gfx_shim.h) still needs to draw *something*, same graceful-degrade
+        // contract as the base Painter's placeholder — don't let a null
+        // handle silently blit nothing.
+        if (handle == null) {
+            this.fill(r, rgb(200, 200, 200));
+            return;
+        }
+        this.canvas.drawImage(handle, r.x as float, r.y as float, r.w as float, r.h as float);
+    }
+    override fn free_image(handle: rawptr) { freeImage(handle); }
 
     // -- typography (WS3) --------------------------------------------------------
     override fn set_weight(w: int) {

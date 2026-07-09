@@ -32,6 +32,9 @@ extern "C" {
                         r: f64, blur: f64, dy: f64, rgb: i32);
     fn gfx_clip_push(c: rawptr, x: f64, y: f64, w: f64, h: f64, r: f64);
     fn gfx_clip_pop(c: rawptr);
+    fn gfx_fill_polygon(c: rawptr, xs: rawptr, ys: rawptr, n: i32, rgb: i32);
+    fn gfx_stroke_arc(c: rawptr, cx: f64, cy: f64, rx: f64, ry: f64,
+                      startDeg: f64, sweepDeg: f64, width: f64, rgb: i32);
     fn gfx_load_font(c: rawptr, path: cstring, size: f64): i32;
     fn gfx_load_font_weight(c: rawptr, path: cstring, size: f64, weight: i32): i32;
     fn gfx_set_font_weight(c: rawptr, weight: i32);
@@ -42,6 +45,11 @@ extern "C" {
     fn gfx_flush(c: rawptr);
     fn gfx_pixels(c: rawptr): rawptr;
     fn gfx_stride(c: rawptr): i32;
+    fn gfx_image_load_file(path: cstring): rawptr;
+    fn gfx_image_free(img: rawptr);
+    fn gfx_image_width(img: rawptr): i32;
+    fn gfx_image_height(img: rawptr): i32;
+    fn gfx_draw_image(c: rawptr, img: rawptr, x: f64, y: f64, w: f64, h: f64);
 }
 
 // A drawable canvas. Colors are packed 0xAARRGGBB (alpha byte 0 = opaque for
@@ -110,6 +118,18 @@ export class Canvas {
     }
     fn clipPop() { gfx_clip_pop(this.handle); }
 
+    // xs/ys are parallel arrays (n >= 3); f64[] to line up with the C
+    // double* the shim expects (plain float[] already maps to f64/double,
+    // per SPEC — no width mismatch here, unlike i32 colors elsewhere).
+    fn fillPolygon(xs: float[], ys: float[], rgb: int) {
+        gfx_fill_polygon(this.handle, xs as rawptr, ys as rawptr, xs.len as i32, rgb as i32);
+    }
+    // angles in degrees, 0 = +x axis, clockwise; rx==ry for a circular arc.
+    fn strokeArc(cx: float, cy: float, rx: float, ry: float,
+                startDeg: float, sweepDeg: float, width: float, rgb: int) {
+        gfx_stroke_arc(this.handle, cx, cy, rx, ry, startDeg, sweepDeg, width, rgb as i32);
+    }
+
     fn loadFont(path: string, size: float): bool {
         return gfx_load_font(this.handle, path.cstr(), size) != 0;
     }
@@ -130,4 +150,28 @@ export class Canvas {
     fn flush() { gfx_flush(this.handle); }
     fn pixels(): rawptr { return gfx_pixels(this.handle); }
     fn stride(): int { return gfx_stride(this.handle) as int; }
+
+    // Draw a decoded image (see loadImage below) scaled into x,y,w,h.
+    fn drawImage(img: rawptr, x: float, y: float, w: float, h: float) {
+        gfx_draw_image(this.handle, img, x, y, w, h);
+    }
 }
+
+// Decoded-image handles are independent of any Canvas (PNG/JPEG/BMP/QOI —
+// all built into libblend2d already). Load once, draw every frame via
+// Canvas.drawImage, free when done.
+//     let img = loadImage("photo.png");   // rawptr, null on failure
+//     canvas.drawImage(img, 10.0, 10.0, 200.0, 150.0);
+//     freeImage(img);
+//
+// Some PNGs fail to decode on this vendored blend2d build (returns null) —
+// confirmed by direct testing, exact trigger not fully isolated (not simply
+// "palette PNGs" — see the gfx_image_load_file comment in gfx_shim.h for
+// what's actually confirmed and a regeneration recipe that's verified to
+// work). Watch for this if a known-good file mysteriously loads null.
+export fn loadImage(path: string): rawptr {
+    return gfx_image_load_file(path.cstr());
+}
+export fn freeImage(img: rawptr) { gfx_image_free(img); }
+export fn imageWidth(img: rawptr): int { return gfx_image_width(img) as int; }
+export fn imageHeight(img: rawptr): int { return gfx_image_height(img) as int; }

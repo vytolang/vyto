@@ -55,6 +55,17 @@ void gfx_bevel_round(GfxCanvas *c, double x, double y, double w, double h,
 void gfx_shadow_round(GfxCanvas *c, double x, double y, double w, double h,
                       double r, double blur, double dy, int color);
 
+/* arbitrary filled polygon: xs/ys are parallel arrays of length n (n>=3).
+   For icon glyphs a rect/round-rect/circle can't express — stars, hearts,
+   roofs, speech-bubble tails. */
+void gfx_fill_polygon(GfxCanvas *c, const double *xs, const double *ys, int n, int color);
+
+/* partial ring stroke (e.g. a wifi/signal arc). Angles in degrees, 0 = +x
+   axis, clockwise; rx/ry let it draw an ellipse arc, pass rx==ry for a
+   circular one. */
+void gfx_stroke_arc(GfxCanvas *c, double cx, double cy, double rx, double ry,
+                    double start_deg, double sweep_deg, double width, int color);
+
 /* clip stack: save state (incl. clip) and intersect the clip with a rect.
    radius==0 → rectangular clip; radius>0 falls back to the bounding rect
    (the blend2d C core exposes only rect clip). */
@@ -75,5 +86,25 @@ double gfx_font_height(GfxCanvas *c);
 void gfx_flush(GfxCanvas *c);
 void *gfx_pixels(GfxCanvas *c); /* 0xAARRGGBB per pixel (opaque when bg cleared opaque) */
 int gfx_stride(GfxCanvas *c);   /* bytes per row */
+
+/* decoded images — PNG/JPEG/BMP/QOI, all built into libblend2d already (no
+   extra codec dependency). Load-once opaque handle, same lifecycle shape as
+   the font weights above: load, use every frame, free when the widget dies.
+   Known limitation of this vendored blend2d build, confirmed by direct
+   testing: SOME PNGs fail to decode (BL_ERROR_IMAGE_UNKNOWN_FILE_FORMAT)
+   even though codec *detection* succeeds — only the decode step fails. The
+   exact trigger isn't fully isolated (a 16-bit-depth indexed/palette PNG
+   from `convert -draw circle...` reproduced it; `identify` reporting
+   "Type: Palette" is NOT by itself predictive — several confirmed-working
+   test assets also report Palette). If you hit an unexpected NULL on a
+   file that looks fine, regenerate it from a photo/gradient/plasma source
+   (`convert -size WxH gradient:C1-C2 -alpha off -depth 8 out.png` is a
+   reliable recipe, verified against this build) rather than assuming the
+   path is bad. */
+void *gfx_image_load_file(const char *path); /* NULL on failure (bad path or undecodable) */
+void gfx_image_free(void *img);
+int gfx_image_width(void *img);
+int gfx_image_height(void *img);
+void gfx_draw_image(GfxCanvas *c, void *img, double x, double y, double w, double h); /* scaled into x,y,w,h */
 
 #endif

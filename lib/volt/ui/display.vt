@@ -1,9 +1,12 @@
 // volt/ui/display — read-only display widgets: Text (word-wrapped multi-line),
-// Card (elevated panel), Badge (count chip), Chip (compact label).
+// Card (elevated panel), Badge (count chip), Chip (compact label), Icon
+// (hand-drawn vector glyph set), Avatar (circular initials/photo badge).
+// Image lives in its own module, volt/ui/image.vt — see its file header.
 
 import { Widget, Painter, Theme, Size, BoxConstraints, bcLoose,
          WEIGHT_REG, WEIGHT_BOLD } from "volt/ui/core";
 import { Rect, mix } from "volt/surface";
+import { sin, cos, PI } from "volt/math";
 
 // Alignment constants for Text
 const ALIGN_LEFT: int = 0;
@@ -356,3 +359,270 @@ export class Chip extends Widget {
         this.onDelete = null;
     }
 }
+
+// ---------------------------------------------------------------- Icon
+
+// Small vector glyph set — no icon font/vector asset exists in this toolkit
+// yet (a long-open roadmap gap), so these are hand-drawn from Painter
+// primitives: fill/fill_round/circle/stroke_circle/line/polygon/stroke_arc.
+// No Chrome family backs this (matches Badge/Chip precedent) — icons aren't
+// shape-pluggable the way buttons/fields/toggles/panels/tracks are; a skin
+// wanting different iconography would want a different glyph set entirely,
+// out of scope here.
+const ICON_CHEVRON_LEFT: int = 0;
+const ICON_CHEVRON_RIGHT: int = 1;
+const ICON_CHEVRON_DOWN: int = 2;
+const ICON_CLOSE: int = 3;
+const ICON_CHECK: int = 4;
+const ICON_PLUS: int = 5;
+const ICON_SEARCH: int = 6;
+const ICON_GEAR: int = 7;
+const ICON_HOME: int = 8;
+const ICON_BELL: int = 9;
+const ICON_PERSON: int = 10;
+const ICON_WIFI: int = 11;
+const ICON_SIGNAL: int = 12;
+const ICON_BATTERY: int = 13;
+const ICON_CAMERA: int = 14;
+const ICON_MAIL: int = 15;
+const ICON_MESSAGE: int = 16;
+const ICON_PHOTO: int = 17;
+const ICON_STAR: int = 18;
+const ICON_HEART: int = 19;
+const ICON_MAP_PIN: int = 20;
+const ICON_MUSIC: int = 21;
+
+export class Icon extends Widget {
+    icon: int;
+    size: int;
+    color: int;      // -1 = th.on_surface
+    bg: int;          // -1 = transparent glyph-only; >=0 = filled rounded-square behind it ("app icon" mode)
+    bg_radius: int;
+
+    fn init(icon: int, size: int) {
+        super.init();
+        this.icon = icon;
+        this.size = size;
+        this.color = -1;
+        this.bg = -1;
+        this.bg_radius = size / 4;
+    }
+
+    override fn measure(s: Painter, th: Theme): Size {
+        return Size(this.size, this.size);
+    }
+
+    // unit-square (0..1) -> pixel coordinates within this.bounds
+    fn fx(u: float): int { return this.bounds.x + (u * (this.bounds.w as float)) as int; }
+    fn fy(u: float): int { return this.bounds.y + (u * (this.bounds.h as float)) as int; }
+
+    // Painter.line is 1px; three parallel 1px lines (offset +1 in each axis)
+    // fake a ~2-3px stroke at icon scale, regardless of the line's angle.
+    fn thick_line(s: Painter, x0: int, y0: int, x1: int, y1: int, color: int) {
+        s.line(x0, y0, x1, y1, color);
+        s.line(x0 + 1, y0, x1 + 1, y1, color);
+        s.line(x0, y0 + 1, x1, y1 + 1, color);
+    }
+
+    override fn draw(s: Painter, th: Theme) {
+        if (this.bg >= 0) {
+            s.fill_round(this.bounds, this.bg_radius, this.bg);
+        }
+        let col = this.color;
+        if (col < 0) { col = th.on_surface; }
+        this.draw_glyph(s, col);
+    }
+
+    fn draw_glyph(s: Painter, color: int) {
+        let sz = this.bounds.w as float;
+        if (this.icon == ICON_CHEVRON_LEFT) {
+            this.thick_line(s, this.fx(0.60), this.fy(0.25), this.fx(0.38), this.fy(0.50), color);
+            this.thick_line(s, this.fx(0.38), this.fy(0.50), this.fx(0.60), this.fy(0.75), color);
+        } else if (this.icon == ICON_CHEVRON_RIGHT) {
+            this.thick_line(s, this.fx(0.40), this.fy(0.25), this.fx(0.62), this.fy(0.50), color);
+            this.thick_line(s, this.fx(0.62), this.fy(0.50), this.fx(0.40), this.fy(0.75), color);
+        } else if (this.icon == ICON_CHEVRON_DOWN) {
+            this.thick_line(s, this.fx(0.25), this.fy(0.40), this.fx(0.50), this.fy(0.62), color);
+            this.thick_line(s, this.fx(0.50), this.fy(0.62), this.fx(0.75), this.fy(0.40), color);
+        } else if (this.icon == ICON_CLOSE) {
+            this.thick_line(s, this.fx(0.28), this.fy(0.28), this.fx(0.72), this.fy(0.72), color);
+            this.thick_line(s, this.fx(0.72), this.fy(0.28), this.fx(0.28), this.fy(0.72), color);
+        } else if (this.icon == ICON_CHECK) {
+            this.thick_line(s, this.fx(0.22), this.fy(0.52), this.fx(0.42), this.fy(0.72), color);
+            this.thick_line(s, this.fx(0.42), this.fy(0.72), this.fx(0.80), this.fy(0.28), color);
+        } else if (this.icon == ICON_PLUS) {
+            this.thick_line(s, this.fx(0.5), this.fy(0.22), this.fx(0.5), this.fy(0.78), color);
+            this.thick_line(s, this.fx(0.22), this.fy(0.5), this.fx(0.78), this.fy(0.5), color);
+        } else if (this.icon == ICON_SEARCH) {
+            s.stroke_circle(this.fx(0.42), this.fy(0.42), (0.20 * sz) as int, 2, color);
+            this.thick_line(s, this.fx(0.58), this.fy(0.58), this.fx(0.80), this.fy(0.80), color);
+        } else if (this.icon == ICON_GEAR) {
+            let cx = this.fx(0.5); let cy = this.fy(0.5);
+            s.stroke_circle(cx, cy, (0.28 * sz) as int, 2, color);
+            s.circle(cx, cy, (0.10 * sz) as int, color);
+            let i = 0;
+            while (i < 6) {
+                let a = (i as float) * (PI / 3.0);
+                let x0 = cx + ((0.28 * sz) * cos(a)) as int;
+                let y0 = cy + ((0.28 * sz) * sin(a)) as int;
+                let x1 = cx + ((0.42 * sz) * cos(a)) as int;
+                let y1 = cy + ((0.42 * sz) * sin(a)) as int;
+                this.thick_line(s, x0, y0, x1, y1, color);
+                i += 1;
+            }
+        } else if (this.icon == ICON_HOME) {
+            // roof and walls close in width (real overhang, not an arrow shaft)
+            let xs: i32[] = [this.fx(0.5) as i32, this.fx(0.82) as i32, this.fx(0.18) as i32];
+            let ys: i32[] = [this.fy(0.15) as i32, this.fy(0.46) as i32, this.fy(0.46) as i32];
+            s.polygon(xs, ys, color);
+            s.fill(Rect(this.fx(0.22), this.fy(0.44), this.fx(0.78) - this.fx(0.22), this.fy(0.85) - this.fy(0.44)), color);
+        } else if (this.icon == ICON_BELL) {
+            // clapper centered on the body's bottom edge so it reads as one
+            // connected shape, not two disjoint blobs
+            s.fill_round(Rect(this.fx(0.26), this.fy(0.18), this.fx(0.74) - this.fx(0.26), this.fy(0.64) - this.fy(0.18)),
+                        (0.20 * sz) as int, color);
+            s.circle(this.fx(0.5), this.fy(0.64), (0.06 * sz) as int, color);
+        } else if (this.icon == ICON_PERSON) {
+            // body top overlaps the head's bottom edge — no gap between them
+            s.circle(this.fx(0.5), this.fy(0.30), (0.16 * sz) as int, color);
+            s.fill_round(Rect(this.fx(0.26), this.fy(0.40), this.fx(0.74) - this.fx(0.26), this.fy(0.82) - this.fy(0.40)),
+                        (0.16 * sz) as int, color);
+        } else if (this.icon == ICON_WIFI) {
+            let cx = this.fx(0.5); let cy = this.fy(0.65);
+            s.stroke_arc(cx, cy, (0.12 * sz) as int, (0.12 * sz) as int, 200, 140, 2, color);
+            s.stroke_arc(cx, cy, (0.24 * sz) as int, (0.24 * sz) as int, 200, 140, 2, color);
+            s.stroke_arc(cx, cy, (0.36 * sz) as int, (0.36 * sz) as int, 200, 140, 2, color);
+            s.circle(cx, cy, (0.04 * sz) as int, color);
+        } else if (this.icon == ICON_SIGNAL) {
+            let bw = 0.15 * sz;
+            s.fill(Rect(this.fx(0.15), this.fy(0.55), bw as int, this.fy(0.85) - this.fy(0.55)), color);
+            s.fill(Rect(this.fx(0.38), this.fy(0.40), bw as int, this.fy(0.85) - this.fy(0.40)), color);
+            s.fill(Rect(this.fx(0.61), this.fy(0.25), bw as int, this.fy(0.85) - this.fy(0.25)), color);
+            s.fill(Rect(this.fx(0.84) - (bw as int), this.fy(0.15), bw as int, this.fy(0.85) - this.fy(0.15)), color);
+        } else if (this.icon == ICON_BATTERY) {
+            s.stroke_round(Rect(this.fx(0.10), this.fy(0.30), this.fx(0.82) - this.fx(0.10), this.fy(0.70) - this.fy(0.30)),
+                          (0.04 * sz) as int, 2, color);
+            s.fill(Rect(this.fx(0.84), this.fy(0.40), this.fx(0.90) - this.fx(0.84), this.fy(0.60) - this.fy(0.40)), color);
+            s.fill(Rect(this.fx(0.15), this.fy(0.36), this.fx(0.55) - this.fx(0.15), this.fy(0.64) - this.fy(0.36)), color);
+        } else if (this.icon == ICON_CAMERA) {
+            s.fill_round(Rect(this.fx(0.15), this.fy(0.35), this.fx(0.85) - this.fx(0.15), this.fy(0.80) - this.fy(0.35)),
+                        (0.06 * sz) as int, color);
+            s.fill_round(Rect(this.fx(0.36), this.fy(0.22), this.fx(0.64) - this.fx(0.36), this.fy(0.38) - this.fy(0.22)),
+                        (0.02 * sz) as int, color);
+            s.stroke_circle(this.fx(0.5), this.fy(0.58), (0.14 * sz) as int, 2, color);
+        } else if (this.icon == ICON_MAIL) {
+            s.stroke_round(Rect(this.fx(0.12), this.fy(0.25), this.fx(0.88) - this.fx(0.12), this.fy(0.75) - this.fy(0.25)),
+                          (0.04 * sz) as int, 2, color);
+            this.thick_line(s, this.fx(0.12), this.fy(0.25), this.fx(0.5), this.fy(0.52), color);
+            this.thick_line(s, this.fx(0.5), this.fy(0.52), this.fx(0.88), this.fy(0.25), color);
+        } else if (this.icon == ICON_MESSAGE) {
+            s.fill_round(Rect(this.fx(0.12), this.fy(0.20), this.fx(0.88) - this.fx(0.12), this.fy(0.68) - this.fy(0.20)),
+                        (0.14 * sz) as int, color);
+            let xs: i32[] = [this.fx(0.30) as i32, this.fx(0.42) as i32, this.fx(0.24) as i32];
+            let ys: i32[] = [this.fy(0.65) as i32, this.fy(0.65) as i32, this.fy(0.85) as i32];
+            s.polygon(xs, ys, color);
+        } else if (this.icon == ICON_PHOTO) {
+            s.stroke_round(Rect(this.fx(0.10), this.fy(0.18), this.fx(0.90) - this.fx(0.10), this.fy(0.82) - this.fy(0.18)),
+                          (0.06 * sz) as int, 2, color);
+            s.circle(this.fx(0.32), this.fy(0.35), (0.08 * sz) as int, color);
+            let xs: i32[] = [this.fx(0.15) as i32, this.fx(0.40) as i32, this.fx(0.60) as i32, this.fx(0.75) as i32, this.fx(0.88) as i32];
+            let ys: i32[] = [this.fy(0.75) as i32, this.fy(0.45) as i32, this.fy(0.65) as i32, this.fy(0.50) as i32, this.fy(0.75) as i32];
+            s.polygon(xs, ys, color);
+        } else if (this.icon == ICON_STAR) {
+            let cx = this.fx(0.5); let cy = this.fy(0.5);
+            let outer = 0.42 * sz; let inner = 0.18 * sz;
+            let xs: i32[] = [];
+            let ys: i32[] = [];
+            let i = 0;
+            while (i < 10) {
+                let r = outer;
+                if (i % 2 == 1) { r = inner; }
+                let a = (-PI / 2.0) + (i as float) * (PI / 5.0);
+                xs.push((cx as float + r * cos(a)) as i32);
+                ys.push((cy as float + r * sin(a)) as i32);
+                i += 1;
+            }
+            s.polygon(xs, ys, color);
+        } else if (this.icon == ICON_HEART) {
+            s.circle(this.fx(0.32), this.fy(0.38), (0.18 * sz) as int, color);
+            s.circle(this.fx(0.68), this.fy(0.38), (0.18 * sz) as int, color);
+            let xs: i32[] = [this.fx(0.14) as i32, this.fx(0.86) as i32, this.fx(0.5) as i32];
+            let ys: i32[] = [this.fy(0.42) as i32, this.fy(0.42) as i32, this.fy(0.88) as i32];
+            s.polygon(xs, ys, color);
+        } else if (this.icon == ICON_MAP_PIN) {
+            s.circle(this.fx(0.5), this.fy(0.35), (0.22 * sz) as int, color);
+            let xs: i32[] = [this.fx(0.32) as i32, this.fx(0.68) as i32, this.fx(0.5) as i32];
+            let ys: i32[] = [this.fy(0.48) as i32, this.fy(0.48) as i32, this.fy(0.85) as i32];
+            s.polygon(xs, ys, color);
+        } else if (this.icon == ICON_MUSIC) {
+            s.circle(this.fx(0.28), this.fy(0.72), (0.10 * sz) as int, color);
+            this.thick_line(s, this.fx(0.36), this.fy(0.72), this.fx(0.36), this.fy(0.22), color);
+            let xs: i32[] = [this.fx(0.36) as i32, this.fx(0.62) as i32, this.fx(0.36) as i32];
+            let ys: i32[] = [this.fy(0.22) as i32, this.fy(0.30) as i32, this.fy(0.38) as i32];
+            s.polygon(xs, ys, color);
+        }
+    }
+}
+
+// ---------------------------------------------------------------- Avatar
+
+// A circular contact/profile badge: initials-on-a-color-fill by default, or
+// a real photo (clipped to a circle) when imagePath is set. No Chrome family
+// (same reasoning as Icon) — reuses load_image/draw_image/clip_push/clip_pop
+// directly rather than composing an Image widget instance, the same
+// relationship Card has to Button (no widget-in-widget composition for a
+// two-line paint job).
+export class Avatar extends Widget {
+    initials: string;
+    bg: int;             // -1 = th.primary
+    color: int;          // -1 = th.on_primary
+    size: int;
+    imagePath: string;   // "" = initials mode
+    handle: rawptr;       // lazy-loaded image handle, image mode only
+
+    fn init(initials: string, size: int) {
+        super.init();
+        this.initials = initials;
+        this.size = size;
+        this.bg = -1;
+        this.color = -1;
+        this.imagePath = "";
+    }
+
+    override fn measure(s: Painter, th: Theme): Size {
+        return Size(this.size, this.size);
+    }
+
+    override fn draw(s: Painter, th: Theme) {
+        let r = this.size / 2;
+        if (this.imagePath.len > 0) {
+            if (this.handle == null) { this.handle = s.load_image(this.imagePath); }
+            if (this.handle != null) {
+                s.clip_push(this.bounds, r);
+                s.draw_image(this.handle, this.bounds);
+                s.clip_pop();
+                return;
+            }
+            // fall through to initials if the file failed to decode
+        }
+        let bg = this.bg;
+        if (bg < 0) { bg = th.primary; }
+        let col = this.color;
+        if (col < 0) { col = th.on_primary; }
+        let cx = this.bounds.x + r;
+        let cy = this.bounds.y + r;
+        s.circle(cx, cy, r, bg);
+        s.set_weight(WEIGHT_BOLD);
+        let tw = s.text_width(this.initials);
+        let pad = (this.bounds.w - tw) / 2;
+        s.text_in(this.bounds, pad, this.initials, col);
+        s.set_weight(WEIGHT_REG);
+    }
+
+    deinit {
+        if (this.handle != null && this.win != null) {
+            this.win.painter.free_image(this.handle);
+        }
+    }
+}
+
