@@ -64,6 +64,25 @@ int64_t vt_ck_sub(int64_t a, int64_t b, int64_t lo, int64_t hi, const char *file
 int64_t vt_ck_mul(int64_t a, int64_t b, int64_t lo, int64_t hi, const char *file, int line);
 int64_t vt_ck_neg(int64_t a, int64_t lo, int64_t hi, const char *file, int line);
 
+/* Checked shifts: panic when the shift amount is negative or >= the operand
+   width (C UB otherwise). vt_ck_shr is an arithmetic (signed) shift,
+   vt_ck_shru a logical (unsigned) one. */
+int64_t vt_ck_shl(int64_t a, int64_t b, int bits, const char *file, int line);
+int64_t vt_ck_shr(int64_t a, int64_t b, int bits, const char *file, int line);
+uint64_t vt_ck_shru(uint64_t a, int64_t b, int bits, const char *file, int line);
+
+/* Strings, arrays, and maps all start with { VtObj hdr; int64_t len; } —
+   vt_len is the shared, null-checked `.len` accessor. */
+typedef struct VtLenHdr {
+    VtObj hdr;
+    int64_t len;
+} VtLenHdr;
+
+static inline int64_t vt_len(const void *p, const char *file, int line) {
+    if (!p) vt_panic_c(file, line, ".len of null value");
+    return ((const VtLenHdr *)p)->len;
+}
+
 /* ---- strings (immutable) ---- */
 
 typedef struct VtString {
@@ -108,6 +127,7 @@ VtArray *vt_arr_new(int32_t elem_size, bool elem_ref);
 VtArray *vt_arr_bytes(int64_t n); /* zeroed byte buffer, len = n */
 static inline void *vt_arr_data(VtArray *a) { return a ? a->data : NULL; }
 void vt_arr_push(VtArray *a, const void *elem);                        /* retains if ref */
+void vt_arr_push_at(VtArray *a, const void *elem, const char *file, int line); /* null-checked push */
 void vt_arr_pop(VtArray *a, void *out, const char *file, int line);    /* transfers ownership */
 void *vt_arr_at(VtArray *a, int64_t i, const char *file, int line);    /* bounds-checked slot ptr */
 void vt_arr_set(VtArray *a, int64_t i, const void *elem, const char *file, int line);
@@ -129,10 +149,10 @@ typedef struct VtMap {
 } VtMap;
 
 VtMap *vt_map_new(bool val_ref);
-void vt_map_set(VtMap *m, VtString *key, uint64_t val);
+void vt_map_set(VtMap *m, VtString *key, uint64_t val, const char *file, int line);
 uint64_t vt_map_get(VtMap *m, VtString *key, const char *file, int line); /* borrowed */
-bool vt_map_has(VtMap *m, VtString *key);
-void vt_map_remove(VtMap *m, VtString *key);
+bool vt_map_has(VtMap *m, VtString *key, const char *file, int line);
+void vt_map_remove(VtMap *m, VtString *key, const char *file, int line);
 
 static inline uint64_t vt_f64bits(double d) { uint64_t u; memcpy(&u, &d, 8); return u; }
 static inline double vt_bits2f64(uint64_t u) { double d; memcpy(&d, &u, 8); return d; }

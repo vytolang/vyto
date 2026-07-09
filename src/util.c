@@ -37,12 +37,20 @@ char *arena_strndup(Arena *a, const char *s, size_t n) {
 char *arena_strdup(Arena *a, const char *s) { return arena_strndup(a, s, strlen(s)); }
 
 char *arena_printf(Arena *a, const char *fmt, ...) {
-    va_list ap;
+    va_list ap, ap2;
     va_start(ap, fmt);
+    va_copy(ap2, ap);
     char tmp[4096];
     int n = vsnprintf(tmp, sizeof tmp, fmt, ap);
     va_end(ap);
-    return arena_strndup(a, tmp, (size_t)n);
+    if (n < (int)sizeof tmp) {
+        va_end(ap2);
+        return arena_strndup(a, tmp, (size_t)n);
+    }
+    char *p = arena_alloc(a, (size_t)n + 1);
+    vsnprintf(p, (size_t)n + 1, fmt, ap2);
+    va_end(ap2);
+    return p;
 }
 
 /* ---- interning: simple open hash table ---- */
@@ -107,13 +115,18 @@ void sb_puts(SBuf *sb, const char *s) {
 }
 
 void sb_printf(SBuf *sb, const char *fmt, ...) {
-    va_list ap;
+    va_list ap, ap2;
     va_start(ap, fmt);
+    va_copy(ap2, ap);
     char tmp[8192];
     int n = vsnprintf(tmp, sizeof tmp, fmt, ap);
     va_end(ap);
     sb_grow(sb, (size_t)n);
-    memcpy(sb->data + sb->len, tmp, (size_t)n);
+    if (n < (int)sizeof tmp)
+        memcpy(sb->data + sb->len, tmp, (size_t)n);
+    else
+        vsnprintf(sb->data + sb->len, (size_t)n + 1, fmt, ap2);
+    va_end(ap2);
     sb->len += (size_t)n;
     sb->data[sb->len] = 0;
 }

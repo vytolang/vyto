@@ -9,6 +9,7 @@ struct Local {
     const char *cname; /* unique C identifier within the function */
     bool is_param;
     bool is_this;
+    bool assigned; /* body assigns to it; ref-typed params need a defensive retain */
     struct Local *next_in_fn;
 };
 

@@ -685,8 +685,14 @@ int main(int argc, char **argv) {
     SBuf incs;
     sb_init(&incs);
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--lib") == 0 && i + 1 < argc) libs[nlibs++] = argv[++i];
-        else if (strcmp(argv[i], "--filter") == 0 && i + 1 < argc) filters[nfilters++] = argv[++i];
+        if (strcmp(argv[i], "--lib") == 0 && i + 1 < argc) {
+            if (nlibs >= (int)(sizeof libs / sizeof libs[0])) fatal("too many --lib flags (max 16)");
+            libs[nlibs++] = argv[++i];
+        }
+        else if (strcmp(argv[i], "--filter") == 0 && i + 1 < argc) {
+            if (nfilters >= 64) fatal("too many --filter flags (max 64)");
+            filters[nfilters++] = argv[++i];
+        }
         else if (strcmp(argv[i], "--cc") == 0 && i + 1 < argc) cc = argv[++i];
         else if (strcmp(argv[i], "-I") == 0 && i + 1 < argc) sb_printf(&incs, " -I'%s'", argv[++i]);
         else if (!header) header = argv[i];

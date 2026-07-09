@@ -463,11 +463,19 @@ int main(int argc, char **argv) {
     for (Module *m = g_modules; m; m = m->next)
         if (m->src_hash) any_h_changed = true;
 
+    /* newest header on disk: an interrupted previous build may have left
+       fresh .c/.h files with stale .o files and no "changed" flag this run */
+    long latest_h = file_mtime(arena_printf(&g_arena, "%s/volt_rt.h", rtdir));
+    for (Module *m = g_modules; m; m = m->next) {
+        long t = file_mtime(arena_printf(&g_arena, "%s/mod_%s.h", cache, m->name));
+        if (t > latest_h) latest_h = t;
+    }
+
     for (Module *m = g_modules; m; m = m->next) {
         const char *cpath = arena_printf(&g_arena, "%s/mod_%s.c", cache, m->name);
         const char *opath = arena_printf(&g_arena, "%s/mod_%s%s.o", cache, m->name, osuf);
         if (m->src_hash || any_h_changed || !file_exists(opath) ||
-            file_mtime(arena_printf(&g_arena, "%s/volt_rt.h", rtdir)) > file_mtime(opath)) {
+            file_mtime(cpath) > file_mtime(opath) || latest_h > file_mtime(opath)) {
             char *cmdline = arena_printf(&g_arena, "%s %s%s -w -I%s -I%s -c -o %s %s", cc, opt,
                                          san, rtdir, cache, opath, cpath);
             if (run_cmd(cmdline, verbose) != 0) fatal("C compilation of module '%s' failed", m->name);

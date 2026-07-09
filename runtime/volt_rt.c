@@ -124,6 +124,27 @@ int64_t vt_ck_neg(int64_t a, int64_t lo, int64_t hi, const char *file, int line)
     return r;
 }
 
+static void vt_bad_shift(const char *file, int line, int64_t b, int bits) {
+    char msg[64];
+    snprintf(msg, sizeof msg, "shift amount %lld out of range [0, %d)", (long long)b, bits);
+    vt_panic_c(file, line, msg);
+}
+
+int64_t vt_ck_shl(int64_t a, int64_t b, int bits, const char *file, int line) {
+    if (b < 0 || b >= bits) vt_bad_shift(file, line, b, bits);
+    return (int64_t)((uint64_t)a << b); /* wraps like the release-mode C operator */
+}
+
+int64_t vt_ck_shr(int64_t a, int64_t b, int bits, const char *file, int line) {
+    if (b < 0 || b >= bits) vt_bad_shift(file, line, b, bits);
+    return a >> b;
+}
+
+uint64_t vt_ck_shru(uint64_t a, int64_t b, int bits, const char *file, int line) {
+    if (b < 0 || b >= bits) vt_bad_shift(file, line, b, bits);
+    return a >> b;
+}
+
 void vt_panic(const char *file, int line, VtString *msg) {
     vt_panic_c(file, line, msg ? msg->data : "(null)");
 }
@@ -189,7 +210,8 @@ VtString *vt_str_from_cstr(const char *p) {
 }
 
 VtString *vt_str_slice(VtString *s, int64_t lo, int64_t hi, const char *file, int line) {
-    int64_t len = s ? s->len : 0;
+    if (!s) vt_panic_c(file, line, "slice of null string");
+    int64_t len = s->len;
     if (lo < 0 || hi < lo || hi > len) {
         char buf[96];
         snprintf(buf, sizeof buf, "slice [%lld, %lld) out of bounds (len %lld)", (long long)lo,
@@ -278,11 +300,26 @@ static int cstr_cmp(const void *a, const void *b) {
     return strcmp(*(const char *const *)a, *(const char *const *)b);
 }
 
+static char **dir_names_push(char **names, int *n, int *cap, const char *name) {
+    if (*n == *cap) {
+        *cap *= 2;
+        names = realloc(names, (size_t)*cap * sizeof *names);
+        if (!names) { fprintf(stderr, "volt: out of memory\n"); exit(101); }
+    }
+    size_t len = strlen(name) + 1;
+    names[*n] = malloc(len);
+    if (!names[*n]) { fprintf(stderr, "volt: out of memory\n"); exit(101); }
+    memcpy(names[*n], name, len);
+    (*n)++;
+    return names;
+}
+
 /* directory entry names (excluding ".", including ".."), sorted ascending */
 VtArray *vt_dir_list(VtString *path, const char *file, int line) {
     const char *dir = vt_str_cstr(path);
-    char *names[4096];
-    int n = 0;
+    int n = 0, cap = 256;
+    char **names = malloc((size_t)cap * sizeof *names);
+    if (!names) { fprintf(stderr, "volt: out of memory\n"); exit(101); }
 #ifdef _WIN32
     char pat[1024];
     snprintf(pat, sizeof pat, "%s\\*", dir);
@@ -295,12 +332,7 @@ VtArray *vt_dir_list(VtString *path, const char *file, int line) {
     }
     do {
         if (strcmp(fd.cFileName, ".") == 0) continue;
-        if (n < 4096) {
-            size_t len = strlen(fd.cFileName) + 1;
-            names[n] = malloc(len);
-            memcpy(names[n], fd.cFileName, len);
-            n++;
-        }
+        names = dir_names_push(names, &n, &cap, fd.cFileName);
     } while (FindNextFileA(h, &fd));
     FindClose(h);
 #else
@@ -313,12 +345,7 @@ VtArray *vt_dir_list(VtString *path, const char *file, int line) {
     struct dirent *de;
     while ((de = readdir(d))) {
         if (strcmp(de->d_name, ".") == 0) continue;
-        if (n < 4096) {
-            size_t len = strlen(de->d_name) + 1;
-            names[n] = malloc(len);
-            memcpy(names[n], de->d_name, len);
-            n++;
-        }
+        names = dir_names_push(names, &n, &cap, de->d_name);
     }
     closedir(d);
 #endif
@@ -330,6 +357,7 @@ VtArray *vt_dir_list(VtString *path, const char *file, int line) {
         vt_release(s);
         free(names[i]);
     }
+    free(names);
     return a;
 }
 
@@ -382,7 +410,13 @@ void vt_arr_push(VtArray *a, const void *elem) {
     a->len++;
 }
 
+void vt_arr_push_at(VtArray *a, const void *elem, const char *file, int line) {
+    if (!a) vt_panic_c(file, line, "push to null array");
+    vt_arr_push(a, elem);
+}
+
 void vt_arr_pop(VtArray *a, void *out, const char *file, int line) {
+    if (!a) vt_panic_c(file, line, "pop from null array");
     if (a->len == 0) vt_panic_c(file, line, "pop from empty array");
     a->len--;
     memcpy(out, a->data + a->len * a->elem_size, (size_t)a->elem_size);
@@ -431,6 +465,7 @@ VtMap *vt_map_new(bool val_ref) {
     VtMap *m = vt_alloc(sizeof(VtMap), &vt_map_type);
     m->nbuckets = 64;
     m->buckets = calloc((size_t)m->nbuckets, sizeof(VtMapEntry *));
+    if (!m->buckets) { fprintf(stderr, "volt: out of memory\n"); exit(101); }
     m->val_ref = val_ref;
     return m;
 }
@@ -447,7 +482,28 @@ static VtMapEntry **map_slot(VtMap *m, VtString *key) {
     return pe;
 }
 
-void vt_map_set(VtMap *m, VtString *key, uint64_t val) {
+/* double the table once chains average 4 deep; entries are relinked in place */
+static void map_grow(VtMap *m) {
+    int64_t nb = m->nbuckets * 2;
+    VtMapEntry **nbk = calloc((size_t)nb, sizeof *nbk);
+    if (!nbk) return; /* keep the old (correct, slower) table on OOM */
+    for (int64_t i = 0; i < m->nbuckets; i++) {
+        VtMapEntry *e = m->buckets[i];
+        while (e) {
+            VtMapEntry *next = e->next;
+            uint64_t h = map_hash(e->key) % (uint64_t)nb;
+            e->next = nbk[h];
+            nbk[h] = e;
+            e = next;
+        }
+    }
+    free(m->buckets);
+    m->buckets = nbk;
+    m->nbuckets = nb;
+}
+
+void vt_map_set(VtMap *m, VtString *key, uint64_t val, const char *file, int line) {
+    if (!m) vt_panic_c(file, line, "set on null map");
     VtMapEntry **pe = map_slot(m, key);
     if (*pe) {
         if (m->val_ref) {
@@ -466,9 +522,11 @@ void vt_map_set(VtMap *m, VtString *key, uint64_t val) {
     if (m->val_ref) vt_retain((void *)(uintptr_t)val);
     *pe = e;
     m->len++;
+    if (m->len > m->nbuckets * 4) map_grow(m);
 }
 
 uint64_t vt_map_get(VtMap *m, VtString *key, const char *file, int line) {
+    if (!m) vt_panic_c(file, line, "get on null map");
     VtMapEntry **pe = map_slot(m, key);
     if (!*pe) {
         char buf[160];
@@ -478,9 +536,13 @@ uint64_t vt_map_get(VtMap *m, VtString *key, const char *file, int line) {
     return (*pe)->val;
 }
 
-bool vt_map_has(VtMap *m, VtString *key) { return *map_slot(m, key) != NULL; }
+bool vt_map_has(VtMap *m, VtString *key, const char *file, int line) {
+    if (!m) vt_panic_c(file, line, "has on null map");
+    return *map_slot(m, key) != NULL;
+}
 
-void vt_map_remove(VtMap *m, VtString *key) {
+void vt_map_remove(VtMap *m, VtString *key, const char *file, int line) {
+    if (!m) vt_panic_c(file, line, "remove on null map");
     VtMapEntry **pe = map_slot(m, key);
     if (!*pe) return;
     VtMapEntry *e = *pe;

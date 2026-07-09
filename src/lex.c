@@ -1,5 +1,7 @@
 #include "lex.h"
 
+#include <errno.h>
+
 static const struct { const char *name; TokKind kind; } keywords[] = {
     {"fn", T_FN}, {"let", T_LET}, {"const", T_CONST}, {"struct", T_STRUCT},
     {"class", T_CLASS}, {"extends", T_EXTENDS}, {"virtual", T_VIRTUAL},
@@ -88,10 +90,18 @@ static void scan(Lexer *lx, Token *t) {
         const char *start = lx->p;
         if (c == '0' && (lx_look2(lx) == 'x' || lx_look2(lx) == 'X')) {
             lx_getc(lx); lx_getc(lx);
-            int64_t v = 0;
-            while (hexval(lx_look(lx)) >= 0) v = v * 16 + hexval(lx_getc(lx));
+            if (hexval(lx_look(lx)) < 0)
+                fatal_at(t->loc, "hex literal needs at least one digit");
+            /* accumulate in uint64 so all 64-bit masks work; error past that */
+            uint64_t v = 0;
+            while (hexval(lx_look(lx)) >= 0) {
+                int h = hexval(lx_getc(lx));
+                if (v > (UINT64_MAX - (uint64_t)h) / 16)
+                    fatal_at(t->loc, "hex literal too large for 64 bits");
+                v = v * 16 + (uint64_t)h;
+            }
             t->kind = T_INT;
-            t->ival = v;
+            t->ival = (int64_t)v;
             return;
         }
         while (lx_look(lx) >= '0' && lx_look(lx) <= '9') lx_getc(lx);
@@ -113,7 +123,12 @@ static void scan(Lexer *lx, Token *t) {
         memcpy(buf, start, n);
         buf[n] = 0;
         if (isfloat) { t->kind = T_FLOAT; t->fval = strtod(buf, NULL); }
-        else { t->kind = T_INT; t->ival = strtoll(buf, NULL, 10); }
+        else {
+            errno = 0;
+            t->kind = T_INT;
+            t->ival = strtoll(buf, NULL, 10);
+            if (errno == ERANGE) fatal_at(t->loc, "integer literal too large");
+        }
         return;
     }
 

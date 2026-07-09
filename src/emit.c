@@ -19,6 +19,23 @@ static bool int_bounds(const Type *t, const char **lo, const char **hi) {
     }
 }
 
+static int type_bits(const Type *t) {
+    switch (t->kind) {
+    case TY_BYTE: case TY_U8: case TY_I8: return 8;
+    case TY_I16: case TY_U16: return 16;
+    case TY_I32: case TY_U32: return 32;
+    default: return 64; /* int, i64, u64, clong, culong */
+    }
+}
+
+static bool type_unsigned_int(const Type *t) {
+    switch (t->kind) {
+    case TY_BYTE: case TY_U8: case TY_U16: case TY_U32: case TY_U64: case TY_CULONG:
+        return true;
+    default: return false;
+    }
+}
+
 static const char *struct_cname(StructDecl *sd) {
     if (sd->is_extern) return sd->name;
     return arena_printf(&g_arena, "v_%s_%s", sd->module->name, sd->name);
@@ -168,6 +185,21 @@ static void flush_temps(Em *em, int wm, bool emit_code) {
     em->nstmt = wm;
 }
 
+/* Ref-typed params arrive borrowed from the caller. If the body assigns to
+   one, the assignment releases the old value — so take a defensive +1 on
+   entry and register it for release on every exit path. Without this,
+   assigning to a ref param frees the caller's reference (use-after-free). */
+static void retain_assigned_params(Em *em, FnDecl *fd) {
+    for (int i = 0; i < fd->nparams; i++) {
+        Local *l = fd->params[i].local;
+        if (l && l->assigned && type_is_ref(l->type)) {
+            ind(em);
+            sb_printf(em->out, "vt_retain(%s);\n", l->cname);
+            ereg(em, l->cname, l->type);
+        }
+    }
+}
+
 /* ---------------- expressions ---------------- */
 
 static char *ex(Em *em, Expr *e, bool *fresh);
@@ -289,8 +321,9 @@ static char *emit_call(Em *em, Expr *e, bool *fresh) {
             Type *et = recv->type->elem;
             const char *tv = newtemp(em, et, false); /* borrowed value; push retains internally */
             *fresh = false;
-            return arena_printf(&g_arena, "(%s = %s, vt_arr_push(%s, &%s))", tv,
-                                ex_v(em, a[0], et), ex_b(em, recv), tv);
+            return arena_printf(&g_arena, "(%s = %s, vt_arr_push_at(%s, &%s, \"%s\", %d))", tv,
+                                ex_v(em, a[0], et), ex_b(em, recv), tv,
+                                c_escape(e->loc.file, strlen(e->loc.file)), e->loc.line);
         }
         case B_POP: {
             Type *et = recv->type->elem;
@@ -301,8 +334,9 @@ static char *emit_call(Em *em, Expr *e, bool *fresh) {
         }
         case B_MAP_SET:
             *fresh = false;
-            return arena_printf(&g_arena, "vt_map_set(%s, %s, %s)", ex_b(em, recv), ex_b(em, a[0]),
-                                bits_of(em, a[1], recv->type->elem));
+            return arena_printf(&g_arena, "vt_map_set(%s, %s, %s, \"%s\", %d)", ex_b(em, recv),
+                                ex_b(em, a[0]), bits_of(em, a[1], recv->type->elem),
+                                c_escape(e->loc.file, strlen(e->loc.file)), e->loc.line);
         case B_MAP_GET:
             *fresh = false; /* borrowed */
             return unbits(arena_printf(&g_arena, "vt_map_get(%s, %s, \"%s\", %d)", ex_b(em, recv),
@@ -311,10 +345,14 @@ static char *emit_call(Em *em, Expr *e, bool *fresh) {
                           recv->type->elem);
         case B_MAP_HAS:
             *fresh = false;
-            return arena_printf(&g_arena, "vt_map_has(%s, %s)", ex_b(em, recv), ex_b(em, a[0]));
+            return arena_printf(&g_arena, "vt_map_has(%s, %s, \"%s\", %d)", ex_b(em, recv),
+                                ex_b(em, a[0]), c_escape(e->loc.file, strlen(e->loc.file)),
+                                e->loc.line);
         case B_MAP_REMOVE:
             *fresh = false;
-            return arena_printf(&g_arena, "vt_map_remove(%s, %s)", ex_b(em, recv), ex_b(em, a[0]));
+            return arena_printf(&g_arena, "vt_map_remove(%s, %s, \"%s\", %d)", ex_b(em, recv),
+                                ex_b(em, a[0]), c_escape(e->loc.file, strlen(e->loc.file)),
+                                e->loc.line);
         case B_CSTR:
             *fresh = false;
             return arena_printf(&g_arena, "vt_str_cstr(%s)", ex_b(em, recv));
@@ -460,7 +498,8 @@ static char *ex(Em *em, Expr *e, bool *fresh) {
         case REF_CONST:
             return arena_printf(&g_arena, "v_%s_%s", e->decl->module->name, e->name);
         case REF_GLOBAL_FN: {
-            /* function used as a closure value: emit a thunk once */
+            /* function used as a closure value: emit a thunk once, and hand
+               out a lazily-built singleton so `f == f` holds (stable identity) */
             FnDecl *fd = e->decl->fn;
             if (!e->decl->wrapper_emitted) {
                 e->decl->wrapper_emitted = true;
@@ -474,10 +513,12 @@ static char *ex(Em *em, Expr *e, bool *fresh) {
                 sb_printf(ax, "%s(", fn_cname(fd));
                 for (int i = 0; i < fd->nparams; i++) sb_printf(ax, "%sa%d", i ? ", " : "", i);
                 sb_puts(ax, "); }\n");
+                sb_printf(ax, "static VtClosure* v_%s__c_%s;\n", fd->module->name, fd->name);
             }
-            *fresh = true;
-            return arena_printf(&g_arena, "vt_closure_new((void*)v_%s__w_%s, 0)", fd->module->name,
-                                fd->name);
+            *fresh = false; /* the cache owns its reference; consumers retain */
+            const char *cv = arena_printf(&g_arena, "v_%s__c_%s", fd->module->name, fd->name);
+            return arena_printf(&g_arena, "(%s ? %s : (%s = vt_closure_new((void*)v_%s__w_%s, 0)))",
+                                cv, cv, cv, fd->module->name, fd->name);
         }
         default:
             fatal_at(e->loc, "internal: bad ident ref");
@@ -485,7 +526,8 @@ static char *ex(Em *em, Expr *e, bool *fresh) {
         break;
     case EX_MEMBER: {
         if (e->ref == REF_BUILTIN && e->builtin == B_LEN)
-            return arena_printf(&g_arena, "((%s)->len)", ex_b(em, e->lhs));
+            return arena_printf(&g_arena, "vt_len(%s, \"%s\", %d)", ex_b(em, e->lhs),
+                                c_escape(e->loc.file, strlen(e->loc.file)), e->loc.line);
         if (e->sd) { /* struct field */
             const char *fname = e->sd->is_extern ? e->name
                                                  : arena_printf(&g_arena, "f_%s", e->name);
@@ -551,6 +593,14 @@ static char *ex(Em *em, Expr *e, bool *fresh) {
                            : e->op == T_MINUS ? "vt_ck_sub" : "vt_ck_mul";
             return arena_printf(&g_arena, "%s(%s, %s, %s, %s, \"%s\", %d)", fn,
                                 ex_b(em, e->lhs), ex_b(em, e->rhs), lo, hi,
+                                c_escape(e->loc.file, strlen(e->loc.file)), e->loc.line);
+        }
+        /* shifts: guard the amount (negative / >= width is C UB) */
+        if (g_checks && (e->op == T_SHL || e->op == T_SHR) && type_is_int(e->type)) {
+            const char *fn = e->op == T_SHL ? "vt_ck_shl"
+                           : type_unsigned_int(e->type) ? "vt_ck_shru" : "vt_ck_shr";
+            return arena_printf(&g_arena, "((%s)%s(%s, %s, %d, \"%s\", %d))", c_type(e->type), fn,
+                                ex_b(em, e->lhs), ex_b(em, e->rhs), type_bits(e->type),
                                 c_escape(e->loc.file, strlen(e->loc.file)), e->loc.line);
         }
         return arena_printf(&g_arena, "(%s %s %s)", ex_b(em, e->lhs), op, ex_b(em, e->rhs));
@@ -675,6 +725,7 @@ static void emit_arrow_defs(Em *em, Expr *e) {
     aem.out = &out;
     aem.indent = 1;
     epush(&aem, false);
+    retain_assigned_params(&aem, fd);
     emit_stmts(&aem, fd->body, fd->nbody);
     escope_release(&aem, aem.scope);
 
@@ -760,10 +811,25 @@ static void emit_assign(Em *em, Expr *e) {
         return;
     }
 
+    bool ck_compound = g_checks &&
+                       (e->op == T_PLUSEQ || e->op == T_MINUSEQ || e->op == T_STAREQ);
+    const char *ck_fn = e->op == T_PLUSEQ ? "vt_ck_add"
+                      : e->op == T_MINUSEQ ? "vt_ck_sub" : "vt_ck_mul";
+
     if (lhs->kind == EX_MEMBER) {
         if (lhs->sd) { /* struct field: plain C lvalue */
             const char *fname = lhs->sd->is_extern ? lhs->name
                                                    : arena_printf(&g_arena, "f_%s", lhs->name);
+            const char *lo, *hi;
+            if (ck_compound && int_bounds(lt, &lo, &hi)) {
+                /* pointer temp: evaluate the receiver once */
+                ind(em);
+                sb_printf(em->out,
+                          "{ %s *_pf = &(%s).%s; *_pf = %s(*_pf, %s, %s, %s, \"%s\", %d); }\n",
+                          c_type(lt), ex_b(em, lhs->lhs), fname, ck_fn, ex_v(em, e->rhs, lt), lo,
+                          hi, c_escape(e->loc.file, strlen(e->loc.file)), e->loc.line);
+                return;
+            }
             ind(em);
             sb_printf(em->out, "(%s).%s %s %s;\n", ex_b(em, lhs->lhs), fname, cop,
                       ex_v(em, e->rhs, lt));
@@ -779,6 +845,14 @@ static void emit_assign(Em *em, Expr *e) {
         const char *slot = arena_printf(&g_arena, "((%s*)%s)->f_%s", class_cname(lhs->cls), tr,
                                         lhs->name);
         if (!type_is_ref(lt)) {
+            const char *lo, *hi;
+            if (ck_compound && int_bounds(lt, &lo, &hi)) {
+                ind(em);
+                sb_printf(em->out, "%s = %s(%s, %s, %s, %s, \"%s\", %d);\n", slot, ck_fn, slot,
+                          ex_v(em, e->rhs, lt), lo, hi,
+                          c_escape(e->loc.file, strlen(e->loc.file)), e->loc.line);
+                return;
+            }
             ind(em);
             sb_printf(em->out, "%s %s %s;\n", slot, cop, ex_v(em, e->rhs, lt));
             return;
@@ -821,11 +895,18 @@ static void emit_assign(Em *em, Expr *e) {
         sb_printf(em->out, "%s = vt_str_concat(*(VtString**)vt_arr_at(%s, %s, %s), %s);\n", tv, ta,
                   ti, fl, ex_b(em, e->rhs));
     } else {
-        /* the compound operator minus its trailing '=' is the plain binary op */
-        char *bop = arena_strndup(&g_arena, cop, strlen(cop) - 1);
-        ind(em);
-        sb_printf(em->out, "%s = *(%s*)vt_arr_at(%s, %s, %s) %s %s;\n", tv, c_type(et), ta, ti, fl,
-                  bop, ex_v(em, e->rhs, et));
+        const char *lo, *hi;
+        if (ck_compound && int_bounds(et, &lo, &hi)) {
+            ind(em);
+            sb_printf(em->out, "%s = %s(*(%s*)vt_arr_at(%s, %s, %s), %s, %s, %s, %s);\n", tv,
+                      ck_fn, c_type(et), ta, ti, fl, ex_v(em, e->rhs, et), lo, hi, fl);
+        } else {
+            /* the compound operator minus its trailing '=' is the plain binary op */
+            char *bop = arena_strndup(&g_arena, cop, strlen(cop) - 1);
+            ind(em);
+            sb_printf(em->out, "%s = *(%s*)vt_arr_at(%s, %s, %s) %s %s;\n", tv, c_type(et), ta, ti,
+                      fl, bop, ex_v(em, e->rhs, et));
+        }
     }
     ind(em);
     sb_printf(em->out, "vt_arr_set(%s, %s, &%s, %s);\n", ta, ti, tv, fl);
@@ -941,7 +1022,8 @@ static void emit_stmt(Em *em, Stmt *s) {
         sb_printf(em->out, "%s = %s;\n", ta, ex_b(em, s->iter));
         ind(em);
         const char *iv = arena_printf(&g_arena, "_i%d", em->tempc++);
-        sb_printf(em->out, "for (int64_t %s = 0; %s < %s->len; %s++) {\n", iv, iv, ta, iv);
+        sb_printf(em->out, "for (int64_t %s = 0; %s < vt_len(%s, \"%s\", %d); %s++) {\n", iv, iv,
+                  ta, c_escape(s->loc.file, strlen(s->loc.file)), s->loc.line, iv);
         em->indent++;
         epush(em, true);
         ind(em);
@@ -1054,6 +1136,7 @@ static void emit_fn(Em *base, FnDecl *fd, ClassDecl *cls, SBuf *dst) {
     em.out = &out;
     em.indent = 1;
     epush(&em, false);
+    retain_assigned_params(&em, fd);
     emit_stmts(&em, fd->body, fd->nbody);
     escope_release(&em, em.scope);
 

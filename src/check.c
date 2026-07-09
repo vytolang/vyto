@@ -78,6 +78,25 @@ static bool int_is_signed(TypeKind k) {
     }
 }
 
+/* does the integer literal value v fit dst? u64/culong accept any 64-bit
+   pattern (masks); int/i64/clong span all of int64. */
+static bool int_lit_fits(int64_t v, const Type *dst) {
+    switch (norm_kind(dst->kind)) {
+    case TY_BYTE: return v >= 0 && v <= 255;
+    case TY_I8: return v >= -128 && v <= 127;
+    case TY_I16: return v >= -32768 && v <= 32767;
+    case TY_U16: return v >= 0 && v <= 65535;
+    case TY_I32: return v >= INT32_MIN && v <= INT32_MAX;
+    case TY_U32: return v >= 0 && v <= 4294967295LL;
+    default: return true;
+    }
+}
+
+static void want_lit_fits(int64_t v, const Type *dst, Loc loc) {
+    if (!int_lit_fits(v, dst))
+        fatal_at(loc, "integer literal %lld out of range for %s", (long long)v, type_str(dst));
+}
+
 /* value-preserving implicit conversion: src fits in dst for every value */
 static bool int_widens(const Type *src, const Type *dst) {
     if (!type_is_int(src) || !type_is_int(dst)) return false;
@@ -357,6 +376,7 @@ static Local *define_local(Ctx *c, const char *name, Type *type, bool is_param, 
 
 static Type *check_expr(Ctx *c, Expr *e, Type *expected);
 static void check_block(Ctx *c, Stmt **body, int n);
+static void require_returns(FnDecl *fd);
 
 static Expr *strconv(Expr *e) {
     if (e->type->kind == TY_STRING) return e;
@@ -387,12 +407,18 @@ static bool assignable(Type *dst, Type *src, Expr *e) {
         if (e) e->type = dst;
         return true;
     }
-    if (e && e->kind == EX_INT && type_is_num(dst)) { e->type = dst; return true; }
+    if (e && e->kind == EX_INT && type_is_num(dst)) {
+        if (type_is_int(dst)) want_lit_fits(e->ival, dst, e->loc);
+        e->type = dst;
+        return true;
+    }
     if (e && e->kind == EX_FLOAT && type_is_float(dst)) { e->type = dst; return true; }
     if (e && e->kind == EX_UN && e->op == T_MINUS && e->lhs &&
         (e->lhs->kind == EX_INT || e->lhs->kind == EX_FLOAT)) {
         if ((e->lhs->kind == EX_INT && type_is_num(dst)) ||
             (e->lhs->kind == EX_FLOAT && type_is_float(dst))) {
+            if (e->lhs->kind == EX_INT && type_is_int(dst))
+                want_lit_fits(-e->lhs->ival, dst, e->loc);
             e->type = e->lhs->type = dst;
             return true;
         }
@@ -802,13 +828,17 @@ static void check_arrow(Ctx *c, Expr *e, Type *expected) {
         fd->body[0]->kind = ST_EXPR;
     check_block(&ac, fd->body, fd->nbody);
     scope_pop(&ac);
+    require_returns(fd);
     e->type = expected;
 }
 
 static Type *check_expr(Ctx *c, Expr *e, Type *expected) {
     switch (e->kind) {
     case EX_INT:
-        if (expected && type_is_num(expected)) return e->type = expected;
+        if (expected && type_is_num(expected)) {
+            if (type_is_int(expected)) want_lit_fits(e->ival, expected, e->loc);
+            return e->type = expected;
+        }
         return e->type = ty_int();
     case EX_FLOAT:
         if (expected && type_is_float(expected)) return e->type = expected;
@@ -846,6 +876,13 @@ static Type *check_expr(Ctx *c, Expr *e, Type *expected) {
         fatal_at(e->loc, "'%s' cannot be used as a value", e->name);
     }
     case EX_UN: {
+        /* negated integer literal: range-check the negative value directly,
+           so `let x: i8 = -128;` works even though +128 doesn't fit i8 */
+        if (e->op == T_MINUS && e->lhs->kind == EX_INT && expected && type_is_int(expected)) {
+            want_lit_fits(-e->lhs->ival, expected, e->loc);
+            e->lhs->type = expected;
+            return e->type = expected;
+        }
         check_expr(c, e->lhs,
                    expected && (e->op == T_MINUS || e->op == T_TILDE) ? expected : NULL);
         if (e->op == T_NOT) {
@@ -948,6 +985,7 @@ static Type *check_expr(Ctx *c, Expr *e, Type *expected) {
             if (!l) fatal_at(lhs->loc, "unknown variable '%s'", lhs->name);
             if (lhs->ref == REF_CAPTURE)
                 fatal_at(lhs->loc, "cannot assign to captured variable (captures are by value)");
+            l->assigned = true;
             lt = lhs->type = l->type;
         } else if (lhs->kind == EX_MEMBER) {
             lt = check_member(c, lhs);
@@ -1148,6 +1186,60 @@ static void check_block(Ctx *c, Stmt **body, int n) {
     for (int i = 0; i < n; i++) check_stmt(c, body[i]);
 }
 
+/* ---------------- return-path analysis ---------------- */
+
+static bool stmts_return(Stmt **body, int n);
+
+/* a break that would exit THIS loop (doesn't descend into nested loops) */
+static bool block_has_break(Stmt **body, int n) {
+    for (int i = 0; i < n; i++) {
+        Stmt *s = body[i];
+        switch (s->kind) {
+        case ST_BREAK: return true;
+        case ST_IF:
+            if (block_has_break(s->body, s->nbody)) return true;
+            if (s->els && block_has_break(s->els, s->nels)) return true;
+            break;
+        case ST_BLOCK:
+            if (block_has_break(s->body, s->nbody)) return true;
+            break;
+        default: break; /* nested loops own their breaks */
+        }
+    }
+    return false;
+}
+
+/* does this statement guarantee the function returns (or diverges)? */
+static bool stmt_returns(Stmt *s) {
+    switch (s->kind) {
+    case ST_RETURN: return true;
+    case ST_EXPR: /* panic() diverges */
+        return s->expr->kind == EX_CALL && s->expr->ref == REF_BUILTIN &&
+               s->expr->builtin == B_PANIC;
+    case ST_IF:
+        return s->els && stmts_return(s->body, s->nbody) && stmts_return(s->els, s->nels);
+    case ST_BLOCK:
+        return stmts_return(s->body, s->nbody);
+    case ST_WHILE: /* while(true) with no break never falls through */
+        return s->expr->kind == EX_BOOL && s->expr->ival &&
+               !block_has_break(s->body, s->nbody);
+    default: return false;
+    }
+}
+
+static bool stmts_return(Stmt **body, int n) {
+    for (int i = 0; i < n; i++)
+        if (stmt_returns(body[i])) return true; /* rest is unreachable */
+    return false;
+}
+
+static void require_returns(FnDecl *fd) {
+    if (fd->ret->kind == TY_VOID) return;
+    if (!stmts_return(fd->body, fd->nbody))
+        fatal_at(fd->loc, "function '%s' must return a value on every path",
+                 fd->name ? fd->name : "(closure)");
+}
+
 /* ---------------- functions & modules ---------------- */
 
 static void check_fn_body(Module *m, FnDecl *fd, ClassDecl *cls) {
@@ -1168,6 +1260,7 @@ static void check_fn_body(Module *m, FnDecl *fd, ClassDecl *cls) {
             define_local(&c, fd->params[i].name, fd->params[i].type, true, fd->params[i].loc);
     check_block(&c, fd->body, fd->nbody);
     scope_pop(&c);
+    require_returns(fd);
 }
 
 static void check_const(Module *m, Decl *d) {
