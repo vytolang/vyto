@@ -32,6 +32,23 @@ void gfx_stroke_circle(GfxCanvas *c, double cx, double cy, double radius, double
 void gfx_linear_gradient_rect(GfxCanvas *c, double x, double y, double w, double h,
                               double x0, double y0, double x1, double y1, int c0, int c1);
 
+/* multi-stop linear gradient: `colors`/`positions` are parallel arrays of
+   length `n` (positions in [0,1], ascending). For OS skins needing more than
+   a 2-color ramp (e.g. a glossy highlight band). gradient_v/gfx_linear_
+   gradient_rect stay as the dedicated 2-stop path — this is additive, not a
+   replacement. */
+void gfx_linear_gradient_rect_n(GfxCanvas *c, double x, double y, double w, double h,
+                                double x0, double y0, double x1, double y1,
+                                const int *colors, const double *positions, int n);
+
+/* bevel border: paired light/dark straight strokes on opposite edges (no
+   corner arcs — a dependency-free approximation, not a true rounded bevel).
+   `raised`: light on top+left, dark on bottom+right (a raised 3D look);
+   false swaps them (a pressed/sunken look). `radius` insets the strokes off
+   the corners so they don't overlap; pass the same radius as the fill. */
+void gfx_bevel_round(GfxCanvas *c, double x, double y, double w, double h,
+                     double radius, double width, int light, int dark, int raised);
+
 /* soft shadow: layered translucent round-rects centered on (x,y,w,h) with the
    given radius, growing by `blur` and offset by `dy`. `color` is 0xAARRGGBB;
    alpha controls darkness. Dependency-free gaussian approximation. */

@@ -20,7 +20,8 @@ enum {
     VS_EV_MOUSE_MOVE = 7, /* reserved; not delivered in v1 */
     VS_EV_TIMER = 8,      /* vs_wait_timeout elapsed with no input (game tick) */
     VS_EV_KEY_UP = 9,     /* a key was released (vs_key() gives the code) */
-    VS_EV_MOUSE_WHEEL = 10 /* mouse wheel scrolled (vs_wheel() gives the delta) */
+    VS_EV_MOUSE_WHEEL = 10, /* mouse wheel scrolled (vs_wheel() gives the delta) */
+    VS_EV_MOUSE_RDOWN = 11  /* right button pressed (vs_mouse_x/y() give position) */
 };
 
 /* simplified key codes from vs_key: printable ASCII, or one of these */

@@ -9,9 +9,10 @@
 // (release_all/drop_handlers), so apps never need a manual teardown.
 
 import { Surface, Rect, contains, rgb, rgba, with_alpha, alpha_of, mix,
-          EV_EXPOSE, EV_KEY, EV_MOUSE_DOWN, EV_MOUSE_UP, EV_MOUSE_MOVE, EV_MOUSE_WHEEL,
-          EV_RESIZE, EV_CLOSE,
+          EV_EXPOSE, EV_KEY, EV_MOUSE_DOWN, EV_MOUSE_UP, EV_MOUSE_MOVE, EV_MOUSE_WHEEL, EV_MOUSE_RDOWN,
+          EV_RESIZE, EV_CLOSE, EV_TIMER,
           KEY_ESC, KEY_TAB } from "volt/surface";
+import { Tween } from "volt/ui/anim";
 
 export struct Size {
     w: int;
@@ -87,19 +88,6 @@ export fn rect_inset(r: Rect, dx: int): Rect {
 export fn paint_focus_ring(s: Painter, th: Theme, r: Rect, radius: int) {
     let ring = rect_inset(r, -2);
     s.stroke_round(ring, radius + 2, 2, th.focus_ring);
-}
-
-// An elevated rounded surface: drop a soft shadow, then fill the panel. The
-// caller draws border + content on top. radius = th.radius_md typical.
-export fn paint_panel(s: Painter, th: Theme, r: Rect, radius: int, fill: int, elevation: int) {
-    if (elevation > 0) {
-        let blur = th.elevation1_blur;
-        let dy = th.elevation1_dy;
-        if (elevation >= 2) { blur = th.elevation2_blur; dy = th.elevation2_dy; }
-        if (elevation >= 3) { blur = th.elevation3_blur; dy = th.elevation3_dy; }
-        s.shadow(r, radius, blur, dy, th.shadow_color);
-    }
-    s.fill_round(r, radius, fill);
 }
 
 // Resolve the visible fill of a control given its hover/press state. Uses
@@ -383,6 +371,24 @@ export class Painter {
     virtual fn shadow(r: Rect, radius: int, blur: int, dy: int, color: int) { }
     virtual fn clip_push(r: Rect, radius: int) { }
     virtual fn clip_pop() { }
+
+    // Multi-stop gradient (colors/positions parallel arrays, positions
+    // ascending in [0,1]) — for skins needing more than gradient_v's 2-color
+    // ramp (e.g. a glossy highlight band). Base fallback: mix of the first
+    // and last stop, ignoring intermediate ones — plain but never blank.
+    virtual fn gradient_n(r: Rect, radius: int, colors: i32[], positions: float[]) {
+        if (colors.len == 0) { return; }
+        this.fill_round(r, radius, mix(colors[0] as int, colors[colors.len - 1] as int, 0.5));
+    }
+
+    // Bevel border: a raised (light top/left, dark bottom/right) or sunken
+    // (swapped) 3D edge, for retro OS skins (Windows Luna/Aero). Base
+    // fallback: a plain single-tone stroke (no bevel on the lean tier).
+    virtual fn bevel(r: Rect, radius: int, width: int, light: int, dark: int, raised: bool) {
+        let color = dark;
+        if (raised) { color = light; }
+        this.stroke_round(r, radius, width, color);
+    }
 }
 
 // Default painter: forwards every call to a volt/surface Surface.
@@ -404,6 +410,196 @@ export class SurfacePainter extends Painter {
     override fn width(): int { return this.surf.width(); }
     override fn height(): int { return this.surf.height(); }
     override fn present() { this.surf.present(); }
+}
+
+// ------------------------------------------------------------------ Chrome
+//
+// Pluggable widget *shape*. Every widget's draw() delegates its shape
+// painting (background, border, shadow, gradient — never layout, focus,
+// keyboard, or event logic) to one of these six families via `this.win.skin`.
+// A skin subclasses only the families it needs to reskin; the rest inherit
+// this default look (today's exact rendering, moved here verbatim).
+//
+// Lives in core.vt, not a separate module: Window needs the Skin type for
+// its `skin` field, and Skin needs Painter/Theme/Rect from this file — a
+// two-module cycle compiles at the Volt language level but fails C codegen
+// (forward-declaration ordering across generated headers), so the type has
+// to live where Window does. Same-file forward references (Skin used before
+// fully defined, Chrome classes referencing Skin) are fine — this file
+// already has that shape (e.g. RadioButton/RadioGroup below).
+//
+// Some paint methods take a trailing `skin: Skin` even though they only use
+// `skin.focus`: several widgets interleave their focus ring between other
+// paint calls rather than drawing it last (e.g. TextField's ring sits
+// between its fill and border stroke), so the ring has to be paintable from
+// inside the Chrome method to preserve that ordering, not bolted on
+// afterward by the widget.
+
+export class ButtonChrome {
+    virtual fn paint(s: Painter, th: Theme, r: Rect, label: string,
+                     hovered: bool, pressed: bool, focused: bool, skin: Skin) {
+        let radius = th.radius_md;
+        s.shadow(r, radius, th.elevation1_blur, th.elevation1_dy, th.shadow_color);
+        let top = th.primary;
+        if (hovered) { top = th.primary_hover; }
+        if (pressed) { top = th.primary_press; }
+        s.gradient_v(r, radius, top, th.primary_700);
+        if (focused) { skin.focus.paint(s, th, r, radius); }
+        s.set_weight(WEIGHT_BOLD);
+        let tw = s.text_width(label);
+        let pad = (r.w - tw) / 2;
+        s.text_in(r, pad, label, th.on_primary);
+        s.set_weight(WEIGHT_REG);
+    }
+}
+
+// Bordered/rounded input-box shape shared by TextField, TextArea, Dropdown
+// (closed state), and Stepper. `hovered` should be passed as `false` by
+// callers that don't have their own hover concept (TextArea, Stepper) to
+// reproduce their current unconditional look exactly.
+export class FieldChrome {
+    virtual fn radius(th: Theme): int { return th.radius_md; }
+
+    virtual fn paint_box(s: Painter, th: Theme, r: Rect, focused: bool, hovered: bool, skin: Skin) {
+        let radius = this.radius(th);
+        let bg = th.surface_raised;
+        if (hovered && !focused) { bg = mix(th.surface_raised, th.on_surface, 0.04); }
+        s.fill_round(r, radius, bg);
+        let border = th.border;
+        if (focused) {
+            border = th.primary;
+        } else if (hovered) {
+            border = mix(th.border, th.on_surface, 0.20);
+        }
+        s.stroke_round(r, radius, 1, border);
+        if (focused) { skin.focus.paint(s, th, r, radius); }
+    }
+}
+
+// Checkbox/RadioButton/Switch — bundled as one family since real skins
+// always restyle these three together as a set.
+export class ToggleChrome {
+    virtual fn paint_checkbox(s: Painter, th: Theme, r: Rect, checked: bool,
+                              hovered: bool, focused: bool, skin: Skin) {
+        let radius = th.radius_sm;
+        let bg = th.surface_raised;
+        if (checked) { bg = th.primary; }
+        else if (hovered) { bg = mix(th.surface_raised, th.on_surface, 0.05); }
+        s.fill_round(r, radius, bg);
+        let border = th.border;
+        if (checked) { border = th.primary; }
+        else if (hovered) { border = mix(th.border, th.on_surface, 0.20); }
+        s.stroke_round(r, radius, 1, border);
+        if (checked) {
+            // filled check mark (a small rounded inner square approximating a tick)
+            s.fill_round(Rect(r.x + 4, r.y + 4, r.w - 8, r.h - 8), radius, th.on_primary);
+        }
+        if (focused) { skin.focus.paint(s, th, r, radius); }
+    }
+
+    virtual fn paint_radio(s: Painter, th: Theme, r: Rect, selected: bool,
+                           hovered: bool, focused: bool, skin: Skin) {
+        let cx = r.x + r.w / 2;
+        let cy = r.y + r.h / 2;
+        let radius = r.w / 2;
+        let ring_col = th.border;
+        if (selected) { ring_col = th.primary; }
+        else if (hovered) { ring_col = mix(th.border, th.on_surface, 0.20); }
+        s.stroke_circle(cx, cy, radius - 1, 2, ring_col);
+        if (selected) { s.circle(cx, cy, 4, th.primary); }
+        if (focused) { skin.focus.paint(s, th, r, radius); }
+    }
+
+    virtual fn paint_switch(s: Painter, th: Theme, r: Rect, on: bool,
+                            hovered: bool, pressed: bool, focused: bool, skin: Skin) {
+        let radius = r.h / 2;   // a true pill
+        let track = th.neutral_300;
+        if (on) { track = th.primary; }
+        else if (hovered) { track = mix(th.neutral_300, th.on_surface, 0.18); }
+        if (on && pressed) { track = th.primary_press; }
+        s.fill_round(r, radius, track);
+        let kw = r.h - 4;
+        let kx = r.x + 2 + kw / 2;
+        if (on) { kx = r.x + r.w - 2 - kw / 2; }
+        let ky = r.y + r.h / 2;
+        s.circle(kx, ky, kw / 2, th.surface_raised);
+        s.stroke_circle(kx, ky, kw / 2, 1, th.border);
+        if (focused) { skin.focus.paint(s, th, r, radius); }
+    }
+}
+
+// Elevated rounded surface shared by every floating/modal panel: Card,
+// Dialog and its titled-modal siblings (MessageDialog/ConfirmDialog/
+// InputDialog), MenuPopup, DropdownPopup, Popover. Absorbs and extends the
+// old `paint_panel` free function (shadow+fill only) with the border stroke
+// every one of those call sites already added by hand.
+export class PanelChrome {
+    virtual fn paint(s: Painter, th: Theme, r: Rect, radius: int, fill: int, border: int, elevation: int) {
+        if (elevation > 0) {
+            let blur = th.elevation1_blur;
+            let dy = th.elevation1_dy;
+            if (elevation >= 2) { blur = th.elevation2_blur; dy = th.elevation2_dy; }
+            if (elevation >= 3) { blur = th.elevation3_blur; dy = th.elevation3_dy; }
+            s.shadow(r, radius, blur, dy, th.shadow_color);
+        }
+        s.fill_round(r, radius, fill);
+        s.stroke_round(r, radius, 1, border);
+    }
+
+    // Panel + a title bar (bold text, left-padded) + a hairline divider under
+    // it. Returns the title-bar height so a caller that needs to lay out
+    // content below it can. Confirmed byte-identical across Dialog/
+    // MessageDialog/ConfirmDialog/InputDialog before this consolidation.
+    virtual fn paint_titled(s: Painter, th: Theme, r: Rect, radius: int, fill: int, border: int,
+                            elevation: int, title: string): int {
+        this.paint(s, th, r, radius, fill, border, elevation);
+        let tb_h = s.font_height() + 10;
+        let tb = Rect(r.x, r.y, r.w, tb_h);
+        s.set_weight(WEIGHT_BOLD);
+        s.text_in(tb, 12, title, th.on_surface);
+        s.set_weight(WEIGHT_REG);
+        s.line(r.x + 12, r.y + tb_h, r.x + r.w - 12, r.y + tb_h, th.divider);
+        return tb_h;
+    }
+}
+
+// Linear value/fill indicator shared by ProgressBar and SegmentedControl's
+// selected-segment paint.
+export class TrackChrome {
+    virtual fn paint_track(s: Painter, th: Theme, r: Rect, radius: int, bg: int) {
+        s.fill_round(r, radius, bg);
+    }
+    virtual fn paint_fill(s: Painter, th: Theme, r: Rect, radius: int, top: int, bottom: int) {
+        s.gradient_v(r, radius, top, bottom);
+    }
+}
+
+// Focus indication — its own family since skins vary this independently of
+// everything else (XP's dotted rect, GTK's dashed outline, macOS's halo).
+export class FocusChrome {
+    virtual fn paint(s: Painter, th: Theme, r: Rect, radius: int) {
+        paint_focus_ring(s, th, r, radius);
+    }
+}
+
+// The bag every Window carries. Defaults to today's exact look — landing
+// this architecture is a pure refactor, zero visual change, by construction.
+export class Skin {
+    button: ButtonChrome;
+    field: FieldChrome;
+    toggle: ToggleChrome;
+    panel: PanelChrome;
+    track: TrackChrome;
+    focus: FocusChrome;
+
+    fn init() {
+        this.button = new ButtonChrome();
+        this.field  = new FieldChrome();
+        this.toggle = new ToggleChrome();
+        this.panel  = new PanelChrome();
+        this.track  = new TrackChrome();
+        this.focus  = new FocusChrome();
+    }
 }
 
 // true when two rects share any area (touching edges don't count)
@@ -497,6 +693,22 @@ export class Widget {
         return false;
     }
 
+    // Fired on every mouse move while this widget holds the press capture
+    // (Window.press_w), with the delta since the last move/press. dx/dy are
+    // in the same coordinate space as on_click. Return true when consumed /
+    // state changed (needs redraw). No built-in widget uses this yet — it's
+    // the hook a future Slider/splitter drags against.
+    virtual fn on_drag(dx: int, dy: int): bool {
+        return false;
+    }
+
+    // Right-button press at absolute coordinates. Return true when consumed
+    // / state changed (needs redraw). No built-in widget uses this yet —
+    // it's the hook a future context-menu widget dispatches from.
+    virtual fn on_context(x: int, y: int): bool {
+        return false;
+    }
+
     // return true when consumed / state changed
     virtual fn on_key(k: int, ch: string): bool {
         return false;
@@ -576,14 +788,40 @@ export class Window {
     has_dirty: bool;
     hover_w: Widget;     // WS6: widget currently under the cursor (draws hover state)
     press_w: Widget;    // WS6: widget capturing the current mouse press
+    skin: Skin;          // pluggable widget shape; defaults to today's look
+    drag_x: int;         // WS9a: last mouse position while press_w holds capture
+    drag_y: int;
+    animations: Tween[]; // WS9c: active Tweens; run() ticks the wait clock only while non-empty
 
     fn init(title: string, w: int, h: int) {
         this.surf = new Surface(title, w, h);
         this.painter = new SurfacePainter(this.surf);
         this.theme = new Theme();
+        this.skin = new Skin();
+        this.animations = [];
         this.focusables = [];
         this.focus_i = -1;
         this.close_on_esc = true;
+    }
+
+    // Register a Tween to be advanced on the ~60fps clock; call from a
+    // widget's own draw() the first time it needs animating (this.win is
+    // guaranteed non-null there, unlike at construction time).
+    fn add_animation(t: Tween) {
+        this.animations.push(t);
+    }
+
+    // Advance every active Tween by dt_ms, drop completed (non-looping)
+    // ones, and redraw once if anything ticked.
+    fn tick(dt_ms: int) {
+        let alive: Tween[] = [];
+        let changed = false;
+        for (let t in this.animations) {
+            if (t.advance(dt_ms)) { changed = true; }
+            if (!t.done) { alive.push(t); }
+        }
+        this.animations = alive;
+        if (changed) { this.redraw(); }
     }
 
     // escape hatch: the raw surface underneath
@@ -596,7 +834,7 @@ export class Window {
     fn close() { this.running = false; }
 
     fn open_overlay(o: Widget) {
-        o.win = this;
+        o.propagate_win(this);
         this.overlay = o;
         this.layout();
     }
@@ -766,6 +1004,8 @@ export class Window {
     }
 
     fn on_mouse_ev(x: int, y: int) {
+        this.drag_x = x;
+        this.drag_y = y;
         if (this.overlay != null) {
             if (!contains(this.overlay.bounds, x, y) && !this.overlay.modal) {
                 this.dismiss_overlay();
@@ -803,12 +1043,44 @@ export class Window {
         }
     }
 
+    // WS9b: right-button press. Hit-tests the same tree as on_mouse_ev but
+    // dispatches on_context instead of on_click, and doesn't touch focus or
+    // press capture — a right-click opening a context menu shouldn't steal
+    // either from whatever the left button is doing.
+    fn on_context_ev(x: int, y: int) {
+        if (this.overlay != null) {
+            if (contains(this.overlay.bounds, x, y)) {
+                if (this.overlay.on_context(x, y)) { this.redraw(); }
+            }
+            return;
+        }
+        if (this.menubar != null && contains(this.menubar.bounds, x, y)) {
+            if (this.menubar.on_context(x, y)) { this.redraw(); }
+            return;
+        }
+        let target: Widget = null;
+        if (this.root != null) { target = this.root.hit(x, y); }
+        if (target != null) {
+            if (target.on_context(x, y)) { this.redraw(); }
+        }
+    }
+
     // hover source: track the deepest widget under the moving cursor. When it
     // changes, the previous and new widgets are dirtied so they repaint with/
     // without the hover overlay. The lean tier has no alpha so the overlay is
     // a no-op there, but hover state is still tracked for any widget that
     // branches on it. Empty areas clear hover.
+    //
+    // WS9a: also the drag source — while press_w holds the capture, forward
+    // the delta since the last move/press to it via on_drag.
     fn on_mouse_move(x: int, y: int) {
+        if (this.press_w != null) {
+            let dx = x - this.drag_x;
+            let dy = y - this.drag_y;
+            this.drag_x = x;
+            this.drag_y = y;
+            if (this.press_w.on_drag(dx, dy)) { this.redraw(); }
+        }
         let target: Widget = null;
         if (this.overlay != null) {
             if (contains(this.overlay.bounds, x, y)) {
@@ -884,8 +1156,19 @@ export class Window {
         this.redraw();
         this.running = true;
         while (this.running) {
-            let ev = this.surf.wait();
-            if (ev == EV_EXPOSE) {
+            // WS9c: only pay for the timer tick while something is actually
+            // animating — a static app blocks on wait() exactly as before,
+            // zero behavior change (verified: no widget registers a Tween
+            // unless it opts into one, e.g. ProgressBar.indeterminate).
+            let ev = 0;
+            if (this.animations.len > 0) {
+                ev = this.surf.wait_timeout(16);
+            } else {
+                ev = this.surf.wait();
+            }
+            if (ev == EV_TIMER) {
+                this.tick(16);
+            } else if (ev == EV_EXPOSE) {
                 this.redraw();
             } else if (ev == EV_RESIZE) {
                 this.layout();
@@ -903,6 +1186,8 @@ export class Window {
             } else if (ev == EV_MOUSE_WHEEL) {
                 this.on_wheel_ev(this.surf.mouse_x(), this.surf.mouse_y(),
                                  this.surf.wheel());
+            } else if (ev == EV_MOUSE_RDOWN) {
+                this.on_context_ev(this.surf.mouse_x(), this.surf.mouse_y());
             }
         }
         // break handler->owner->tree reference cycles so RC frees everything;

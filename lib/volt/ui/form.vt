@@ -3,8 +3,8 @@
 // SegmentedControl, Stepper, Dropdown, ProgressBar.
 
 import { Widget, Painter, Theme, Size, BoxConstraints, bcLoose,
-         WEIGHT_REG, WEIGHT_BOLD,
-         rect_inset, paint_focus_ring, paint_panel, resolve_state_fill } from "volt/ui/core";
+         WEIGHT_REG, WEIGHT_BOLD } from "volt/ui/core";
+import { Tween } from "volt/ui/anim";
 import { Rect, rgb, mix,
           KEY_ENTER, KEY_BACKSPACE, KEY_UP, KEY_DOWN, KEY_LEFT,
           KEY_RIGHT, KEY_DELETE, KEY_HOME, KEY_END } from "volt/surface";
@@ -56,25 +56,8 @@ export class Button extends Widget {
     }
 
     override fn draw(s: Painter, th: Theme) {
-        let radius = th.radius_md;
-        // soft elevation: a primary button sits slightly raised. The gradient
-        // below supplies the fill, so only the shadow is painted here —
-        // an intervening flat fill_round would just be overpainted.
-        s.shadow(this.bounds, radius, th.elevation1_blur, th.elevation1_dy, th.shadow_color);
-        // vertical gradient for depth (rich tier AA-round + gradient; lean tier
-        // resolves to a flat mid primary — still reads as a primary button).
-        let top = th.primary;
-        if (this.hovered) { top = th.primary_hover; }
-        if (this.pressed) { top = th.primary_press; }
-        s.gradient_v(this.bounds, radius, top, th.primary_700);
-        if (this.focused) {
-            paint_focus_ring(s, th, this.bounds, radius);
-        }
-        s.set_weight(WEIGHT_BOLD);
-        let tw = s.text_width(this.label);
-        let pad = (this.bounds.w - tw) / 2;
-        s.text_in(this.bounds, pad, this.label, th.on_primary);
-        s.set_weight(WEIGHT_REG);
+        this.win.skin.button.paint(s, th, this.bounds, this.label,
+                                   this.hovered, this.pressed, this.focused, this.win.skin);
     }
 
     override fn on_click(x: int, y: int): bool {
@@ -119,19 +102,7 @@ export class TextField extends Widget {
     }
 
     override fn draw(s: Painter, th: Theme) {
-        let radius = th.radius_md;
-        let bg = th.surface_raised;
-        if (this.hovered && !this.focused) { bg = mix(th.surface_raised, th.on_surface, 0.04); }
-        s.fill_round(this.bounds, radius, bg);
-        let border = th.border;
-        if (this.focused) {
-            // focus = accent-tinted border + soft glow just outside
-            border = th.primary;
-            paint_focus_ring(s, th, this.bounds, radius);
-        } else if (this.hovered) {
-            border = mix(th.border, th.on_surface, 0.20);
-        }
-        s.stroke_round(this.bounds, radius, 1, border);
+        this.win.skin.field.paint_box(s, th, this.bounds, this.focused, this.hovered, this.win.skin);
         let text_col = th.on_surface;
         if (this.text.len == 0 && !this.focused) {
             s.text_in(this.bounds, 8, this.placeholder, th.on_surface_muted);
@@ -234,21 +205,7 @@ export class Checkbox extends Widget {
         let box = 16;
         let by = this.bounds.y + (this.bounds.h - box) / 2;
         let br = Rect(this.bounds.x, by, box, box);
-        let radius = th.radius_sm;
-        // filled state uses primary; unchecked uses a raised surface with border
-        let bg = th.surface_raised;
-        if (this.checked) { bg = th.primary; }
-        else if (this.hovered) { bg = mix(th.surface_raised, th.on_surface, 0.05); }
-        s.fill_round(br, radius, bg);
-        let border = th.border;
-        if (this.checked) { border = th.primary; }
-        else if (this.hovered) { border = mix(th.border, th.on_surface, 0.20); }
-        s.stroke_round(br, radius, 1, border);
-        if (this.checked) {
-            // filled check mark (a small rounded inner square approximating a tick)
-            s.fill_round(Rect(br.x + 4, br.y + 4, box - 8, box - 8), radius, th.on_primary);
-        }
-        if (this.focused) { paint_focus_ring(s, th, br, radius); }
+        this.win.skin.toggle.paint_checkbox(s, th, br, this.checked, this.hovered, this.focused, this.win.skin);
         let tr = Rect(this.bounds.x + box + 6, this.bounds.y,
                       this.bounds.w - box - 6, this.bounds.h);
         s.set_weight(th.type_body_weight);
@@ -333,7 +290,7 @@ export class ListBox extends Widget {
         let border = th.border;
         if (this.focused) {
             border = th.primary;
-            paint_focus_ring(s, th, this.bounds, radius);
+            this.win.skin.focus.paint(s, th, this.bounds, radius);
         }
         s.stroke_round(this.bounds, radius, 1, border);
         let b = this.bounds;
@@ -674,15 +631,14 @@ export class TextArea extends Widget {
             this.top = caret_vrow - this.view_rows + 1;
         }
 
-        s.fill_round(this.bounds, th.radius_md, th.surface_raised);
-        let border = th.border;
-        if (this.focused) {
-            border = th.primary;
-            paint_focus_ring(s, th, this.bounds, th.radius_md);
-        }
-        s.stroke_round(this.bounds, th.radius_md, 1, border);
-        // mask overflow so wrapped/long rows don't paint past the rounded box
-        s.clip_push(this.bounds, th.radius_md);
+        let field = this.win.skin.field;
+        // hovered=false: TextArea has no hover concept, matching its original
+        // unconditional (non-tinted) box fill exactly.
+        field.paint_box(s, th, this.bounds, this.focused, false, this.win.skin);
+        // mask overflow so wrapped/long rows don't paint past the rounded box —
+        // radius must track paint_box's, or the clip visibly mismatches the
+        // border once a skin changes it.
+        s.clip_push(this.bounds, field.radius(th));
 
         let ox = this.bounds.x + TA_PAD;
         let asc = s.font_ascent();
@@ -751,19 +707,8 @@ export class RadioButton extends Widget {
     override fn draw(s: Painter, th: Theme) {
         let box = 16;
         let by = this.bounds.y + (this.bounds.h - box) / 2;
-        let cx = this.bounds.x + box / 2;
-        let cy = by + box / 2;
-        let r = box / 2;
-        // outer ring
-        let ring_col = th.border;
-        if (this.selected) { ring_col = th.primary; }
-        else if (this.hovered) { ring_col = mix(th.border, th.on_surface, 0.20); }
-        s.stroke_circle(cx, cy, r - 1, 2, ring_col);
-        if (this.selected) {
-            // filled dot
-            s.circle(cx, cy, 4, th.primary);
-        }
-        if (this.focused) { paint_focus_ring(s, th, Rect(this.bounds.x, by, box, box), box / 2); }
+        let br = Rect(this.bounds.x, by, box, box);
+        this.win.skin.toggle.paint_radio(s, th, br, this.selected, this.hovered, this.focused, this.win.skin);
         let tr = Rect(this.bounds.x + box + 6, this.bounds.y,
                       this.bounds.w - box - 6, this.bounds.h);
         s.set_weight(th.type_body_weight);
@@ -885,22 +830,8 @@ export class Switch extends Widget {
         let bx = this.bounds.x;
         let by = this.bounds.y + (this.bounds.h - sh) / 2;
         let br = Rect(bx, by, sw, sh);
-        let radius = sh / 2;    // a true pill
-        let track = th.neutral_300;
-        if (this.on) { track = th.primary; }
-        else if (this.hovered) { track = mix(th.neutral_300, th.on_surface, 0.18); }
-        if (this.on && this.pressed) { track = th.primary_press; }
-        s.fill_round(br, radius, track);
-        // knob — a circular thumb inset 2px, AA on the rich tier
-        let kw = sh - 4;
-        let kx = bx + 2 + kw / 2;
-        if (this.on) { kx = bx + sw - 2 - kw / 2; }
-        let ky = by + sh / 2;
-        s.circle(kx, ky, kw / 2, th.surface_raised);
-        // subtle stroke around the knob on the rich tier so it separates from
-        // a same-color track when off
-        s.stroke_circle(kx, ky, kw / 2, 1, th.border);
-        if (this.focused) { paint_focus_ring(s, th, br, radius); }
+        this.win.skin.toggle.paint_switch(s, th, br, this.on, this.hovered, this.pressed,
+                                          this.focused, this.win.skin);
         // label
         let lbl = "off";
         if (this.on) { lbl = "on"; }
@@ -970,7 +901,7 @@ export class SegmentedControl extends Widget {
         let w = this.bounds.w;
         let radius = th.radius_md;
         // backdrop pill: surface_sunken track the segments sit in
-        s.fill_round(this.bounds, radius, th.surface_sunken);
+        this.win.skin.track.paint_track(s, th, this.bounds, radius, th.surface_sunken);
         // Segments split the full control width evenly (integer math avoids
         // rounding gaps between adjacent cells). The selected segment is a
         // rounded primary pill; the others are transparent.
@@ -983,7 +914,7 @@ export class SegmentedControl extends Widget {
             if (i == this.selected) {
                 let top = th.primary;
                 if (this.pressed) { top = th.primary_press; }
-                s.gradient_v(sr, radius, top, th.primary_700);
+                this.win.skin.track.paint_fill(s, th, sr, radius, top, th.primary_700);
                 s.set_weight(WEIGHT_BOLD);
                 s.text_in(sr, 0, this.labels[i], th.on_primary);
                 s.set_weight(WEIGHT_REG);
@@ -995,7 +926,7 @@ export class SegmentedControl extends Widget {
                 s.text_in(sr, 0, this.labels[i], col);
             }
         }
-        if (this.focused) { paint_focus_ring(s, th, this.bounds, radius); }
+        if (this.focused) { this.win.skin.focus.paint(s, th, this.bounds, radius); }
     }
 
     // hit-test a segment index from absolute x — used for per-segment hover.
@@ -1094,9 +1025,10 @@ export class Stepper extends Widget {
         let w = this.bounds.w;
         let t1 = x0 + w / 3;
         let t2 = x0 + 2 * w / 3;
-        // shared surface: a single rounded panel with the value centered
-        s.fill_round(this.bounds, radius, th.surface_raised);
-        s.stroke_round(this.bounds, radius, 1, th.border);
+        // shared surface: a single rounded panel with the value centered. No
+        // focus ring here (unlike other FieldChrome consumers) — Stepper's
+        // ring is drawn last, after its text, matching its original order.
+        this.win.skin.field.paint_box(s, th, this.bounds, false, false, this.win.skin);
         // minus / plus buttons read as soft square icons
         let mr = Rect(x0, by, t1 - x0, bh);
         let pr = Rect(t2, by, x0 + w - t2, bh);
@@ -1111,7 +1043,7 @@ export class Stepper extends Widget {
         s.set_weight(WEIGHT_BOLD);
         s.text_in(vr, 0, "" + this.value, th.on_surface);
         s.set_weight(WEIGHT_REG);
-        if (this.focused) { paint_focus_ring(s, th, this.bounds, radius); }
+        if (this.focused) { this.win.skin.focus.paint(s, th, this.bounds, radius); }
     }
 
     override fn on_click(x: int, y: int): bool {
@@ -1175,18 +1107,10 @@ export class Dropdown extends Widget {
     }
 
     override fn draw(s: Painter, th: Theme) {
-        let radius = th.radius_md;
-        let bg = th.surface_raised;
-        if (this.hovered) { bg = mix(th.surface_raised, th.on_surface, 0.04); }
-        s.fill_round(this.bounds, radius, bg);
-        let border = th.border;
-        if (this.focused) {
-            border = th.primary;
-            paint_focus_ring(s, th, this.bounds, radius);
-        } else if (this.hovered) {
-            border = mix(th.border, th.on_surface, 0.20);
-        }
-        s.stroke_round(this.bounds, radius, 1, border);
+        // note: pre-Chrome this tinted bg on hover even while focused; unified
+        // with TextField's stricter `hovered && !focused` (focus border already
+        // communicates state, so redundant hover tint is a wash either way).
+        this.win.skin.field.paint_box(s, th, this.bounds, this.focused, this.hovered, this.win.skin);
         let label = "";
         if (this.selected >= 0 && this.selected < this.items.len) {
             label = this.items[this.selected];
@@ -1258,9 +1182,7 @@ class DropdownPopup extends Widget {
     override fn draw(s: Painter, th: Theme) {
         let radius = th.radius_md;
         // elevated dropdown menu: a soft shadow trails the panel
-        s.shadow(this.bounds, radius, th.elevation2_blur, th.elevation2_dy, th.shadow_color);
-        s.fill_round(this.bounds, radius, th.surface_raised);
-        s.stroke_round(this.bounds, radius, 1, th.border);
+        this.win.skin.panel.paint(s, th, this.bounds, radius, th.surface_raised, th.border, 2);
         for (let i in 0..this.dd.items.len) {
             let r = Rect(this.bounds.x + 2, this.bounds.y + 1 + i * this.row_h,
                          this.bounds.w - 4, this.row_h);
@@ -1300,12 +1222,21 @@ export class ProgressBar extends Widget {
     progress: float;
     bg: int;
     fill: int;
+    // WS9c: an animated sweep instead of a fixed fill, for "working, unknown
+    // ETA" states. Toggling this back off doesn't stop the underlying Tween
+    // (it just keeps ticking unseen) — acceptable for this scoped consumer;
+    // a real pause/stop would need this to be a setter, not a plain field.
+    indeterminate: bool;
+    sweep_t: float;
+    tween: Tween;
 
     fn init(progress: float, bg: int, fill: int) {
         super.init();
         this.progress = progress;
         this.bg = bg;
         this.fill = fill;
+        this.indeterminate = false;
+        this.sweep_t = 0.0;
     }
 
     fn set_progress(p: float) {
@@ -1322,14 +1253,29 @@ export class ProgressBar extends Widget {
         let radius = th.radius_md;
         let track = this.bg;
         if (track < 0) { track = th.surface_sunken; }
-        s.fill_round(this.bounds, radius, track);
+        this.win.skin.track.paint_track(s, th, this.bounds, radius, track);
+        let f = this.fill;
+        if (f < 0) { f = th.primary; }
+        if (this.indeterminate) {
+            if (this.tween == null) {
+                this.tween = new Tween(1200, true);
+                let pb = this;
+                this.tween.on_tick = (t) => { pb.sweep_t = t; };
+                this.win.add_animation(this.tween);
+            }
+            let band_w = this.bounds.w / 3;
+            if (band_w < 8) { band_w = 8; }
+            let travel = this.bounds.w - band_w;
+            let fx = this.bounds.x + (this.sweep_t * (travel as float)) as int;
+            let fr = Rect(fx, this.bounds.y, band_w, this.bounds.h);
+            this.win.skin.track.paint_fill(s, th, fr, radius, f, th.primary_700);
+            return;
+        }
         let fw = (this.bounds.w as float * this.progress) as int;
         if (fw > 2) {
-            let f = this.fill;
-            if (f < 0) { f = th.primary; }
             // gradient fill for depth (rich tier); the leading edge stays rounded
             let fr = Rect(this.bounds.x, this.bounds.y, fw, this.bounds.h);
-            s.gradient_v(fr, radius, f, th.primary_700);
+            this.win.skin.track.paint_fill(s, th, fr, radius, f, th.primary_700);
         }
     }
 }

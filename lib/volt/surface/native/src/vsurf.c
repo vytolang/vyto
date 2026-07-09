@@ -39,6 +39,12 @@ static void headless_open_script(void) {
  *   key <name>       Enter Backspace Esc Up Down Left Right Delete Tab Home End
  *   keyup <name>     same names, delivered as a key-release (VS_EV_KEY_UP)
  *   click X Y        mouse down (then up) at X,Y
+ *   down X Y         mouse down at X,Y, no paired up — for drag-hold tests;
+ *                    pair with a later "up X Y"
+ *   up X Y           mouse up at X,Y
+ *   rclick X Y       right-button mouse down at X,Y (VS_EV_MOUSE_RDOWN, no
+ *                    paired up event — matches the real backends, which
+ *                    don't deliver a right-button release)
  *   resize W H
  *   expose
  *   tick             a timer tick (VS_EV_TIMER), for game-loop tests
@@ -88,6 +94,15 @@ static int headless_wait(int *w, int *h) {
         if (sscanf(script_line, "click %d %d", &last_x, &last_y) == 2) {
             pending_up = 1;
             return VS_EV_MOUSE_DOWN;
+        }
+        if (sscanf(script_line, "rclick %d %d", &last_x, &last_y) == 2) {
+            return VS_EV_MOUSE_RDOWN;
+        }
+        if (sscanf(script_line, "down %d %d", &last_x, &last_y) == 2) {
+            return VS_EV_MOUSE_DOWN;
+        }
+        if (sscanf(script_line, "up %d %d", &last_x, &last_y) == 2) {
+            return VS_EV_MOUSE_UP;
         }
         {
             int nw, nh;
@@ -217,6 +232,9 @@ static LRESULT CALLBACK vs_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     case WM_LBUTTONUP:
         q_push(VS_EV_MOUSE_UP, 0, (short)LOWORD(lp), (short)HIWORD(lp), 0);
+        return 0;
+    case WM_RBUTTONDOWN:
+        q_push(VS_EV_MOUSE_RDOWN, 0, (short)LOWORD(lp), (short)HIWORD(lp), 0);
         return 0;
     case WM_MOUSEMOVE:
         q_push(VS_EV_MOUSE_MOVE, 0, (short)LOWORD(lp), (short)HIWORD(lp), 0);
@@ -740,6 +758,11 @@ static int x11_translate(VSurf *s, XEvent *e) {
             last_x = e->xbutton.x;
             last_y = e->xbutton.y;
             return VS_EV_MOUSE_DOWN;
+        }
+        if (e->xbutton.button == Button3) {
+            last_x = e->xbutton.x;
+            last_y = e->xbutton.y;
+            return VS_EV_MOUSE_RDOWN;
         }
         if (e->xbutton.button == Button4) {
             last_x = e->xbutton.x;

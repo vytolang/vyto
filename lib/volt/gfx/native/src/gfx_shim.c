@@ -122,6 +122,42 @@ void gfx_linear_gradient_rect(GfxCanvas *c, double x, double y, double w, double
     bl_gradient_destroy(&g);
 }
 
+void gfx_linear_gradient_rect_n(GfxCanvas *c, double x, double y, double w, double h,
+                                double x0, double y0, double x1, double y1,
+                                const int *colors, const double *positions, int n) {
+    if (n <= 0) return;
+    BLGradientCore g;
+    BLLinearGradientValues lv = { x0, y0, x1, y1 };
+    bl_gradient_init_as(&g, BL_GRADIENT_TYPE_LINEAR, &lv, BL_EXTEND_MODE_PAD, NULL, 0, NULL);
+    for (int i = 0; i < n; i++) {
+        bl_gradient_add_stop_rgba32(&g, positions[i], rgba32_of(colors[i]));
+    }
+    BLRect r = { x, y, w, h };
+    bl_context_fill_geometry_ext(&c->ctx, BL_GEOMETRY_TYPE_RECTD, &r, (const BLUnknown *)&g);
+    bl_gradient_destroy(&g);
+}
+
+/* Straight-edge bevel: no arc primitive is used, so the four strokes are
+   inset by `radius` off each corner (matching a round-rect's flat-edge
+   span) rather than following the curve — reads fine at typical UI radii
+   (2-4px), and stays dependency-free. */
+void gfx_bevel_round(GfxCanvas *c, double x, double y, double w, double h,
+                     double radius, double width, int light, int dark, int raised) {
+    if (radius < 0.0) radius = 0.0;
+    uint32_t top_left_color = raised ? rgba32_of(light) : rgba32_of(dark);
+    uint32_t bot_right_color = raised ? rgba32_of(dark) : rgba32_of(light);
+    double hw = width / 2.0;
+    bl_context_set_stroke_width(&c->ctx, width);
+    BLLine top = { x + radius, y + hw, x + w - radius, y + hw };
+    bl_context_stroke_geometry_rgba32(&c->ctx, BL_GEOMETRY_TYPE_LINE, &top, top_left_color);
+    BLLine left = { x + hw, y + radius, x + hw, y + h - radius };
+    bl_context_stroke_geometry_rgba32(&c->ctx, BL_GEOMETRY_TYPE_LINE, &left, top_left_color);
+    BLLine bottom = { x + radius, y + h - hw, x + w - radius, y + h - hw };
+    bl_context_stroke_geometry_rgba32(&c->ctx, BL_GEOMETRY_TYPE_LINE, &bottom, bot_right_color);
+    BLLine right = { x + w - hw, y + radius, x + w - hw, y + h - radius };
+    bl_context_stroke_geometry_rgba32(&c->ctx, BL_GEOMETRY_TYPE_LINE, &right, bot_right_color);
+}
+
 /* Soft shadow: draw the round-rect `layers` times, growing outward by a
    fraction of `blur` and fading the alpha, offset by `dy`. blend2d composites
    each translucent fill over the existing pixels, producing a gaussian-ish
