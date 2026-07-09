@@ -1,0 +1,664 @@
+// VoltChat — WhatsApp Desktop UI clone built on volt/ui.
+//
+// Rendering tiers:
+//   Rich (blend2d, AA):  ./voltc run apps/whatsapp/whatsapp.vt
+//   Lean (vector):       ./voltc run apps/whatsapp/whatsapp.vt -- --surface
+//
+// Two-pane layout: sidebar (340px) with chat list + search, conversation pane
+// with message bubbles + composer. All data in-memory; no networking.
+//
+// Widget limitations: no rounded-rect primitive in Painter, so avatars and
+// bubbles are squared rectangles. Workaround: flat fills read clean at this
+// scale and match the dark theme aesthetic.
+
+import { Window, Column, Row, Spacer, Label, Button, TextField,
+         Text, Badge,
+         ALIGN_LEFT, ALIGN_CENTER, ALIGN_RIGHT,
+         MenuBar, Menu, StatusBar,
+         Divider, Padding, SizedBox, Expanded, Container,
+         ScrollView,
+         Widget, Painter, Theme, Size, BoxConstraints,
+         Popover } from "volt/ui";
+import { GfxPainter } from "volt/gfx/painter";
+import { Rect, rgb } from "volt/surface";
+
+fn font_path(): string {
+    return "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf";
+}
+
+// ------------------------------------------------------- Theme
+
+fn BUBBLE_OUT(): int { return rgb(0, 92, 75); }
+fn CHAT_BG(): int { return rgb(11, 20, 26); }
+
+fn whatsapp_dark(): Theme {
+    let th = new Theme();
+    th.bg = rgb(17, 27, 33);
+    th.white = rgb(32, 44, 51);
+    th.ink = rgb(233, 237, 239);
+    th.muted = rgb(134, 150, 160);
+    th.accent = rgb(0, 168, 132);
+    th.sel = rgb(42, 57, 66);
+    th.pad = 12;
+    th.spacing = 8;
+    return th;
+}
+
+fn whatsapp_light(): Theme {
+    let th = new Theme();
+    th.bg = rgb(255, 255, 255);
+    th.white = rgb(240, 240, 240);
+    th.ink = rgb(34, 34, 40);
+    th.muted = rgb(130, 130, 140);
+    th.accent = rgb(0, 168, 132);
+    th.sel = rgb(220, 240, 235);
+    th.pad = 12;
+    th.spacing = 8;
+    return th;
+}
+
+// ------------------------------------------------------- Data model
+
+class Message {
+    text: string;
+    time: string;
+    outgoing: bool;
+
+    fn init(text: string, time: string, outgoing: bool) {
+        this.text = text;
+        this.time = time;
+        this.outgoing = outgoing;
+    }
+}
+
+class Conversation {
+    name: string;
+    avatarColor: int;
+    messages: Message[];
+    unread: int;
+    lastSeen: string;
+
+    fn init(name: string, avatarColor: int, lastSeen: string) {
+        this.name = name;
+        this.avatarColor = avatarColor;
+        this.messages = [];
+        this.unread = 0;
+        this.lastSeen = lastSeen;
+    }
+
+    fn last_message_text(): string {
+        let n = this.messages.len;
+        if (n == 0) { return ""; }
+        return this.messages[n - 1].text;
+    }
+
+    fn last_message_time(): string {
+        let n = this.messages.len;
+        if (n == 0) { return ""; }
+        return this.messages[n - 1].time;
+    }
+}
+
+class ChatState {
+    conversations: Conversation[];
+    active: int;
+    search_query: string;
+    dark: bool;
+
+    fn init() {
+        this.conversations = [];
+        this.active = 0;
+        this.search_query = "";
+        this.dark = true;
+        this.seed();
+    }
+
+    fn seed() {
+        let c1 = new Conversation("Alice", rgb(80, 160, 220), "online");
+        c1.messages.push(new Message("Hey, how are you?", "09:41", false));
+        c1.messages.push(new Message("I'm good, thanks! Working on the new UI.", "09:42", true));
+        c1.messages.push(new Message("That sounds great! Can you share a preview?", "09:43", false));
+        c1.messages.push(new Message("Sure, I'll send screenshots later today.", "09:44", true));
+        c1.unread = 1;
+
+        let c2 = new Conversation("Bob", rgb(220, 120, 80), "last seen 2h ago");
+        c2.messages.push(new Message("Did you see the game last night?", "08:15", false));
+        c2.messages.push(new Message("Yes! What an incredible finish.", "08:20", true));
+        c2.messages.push(new Message("We should watch the replay together.", "08:21", false));
+        c2.unread = 2;
+
+        let c3 = new Conversation("Team Chat", rgb(100, 200, 120), "online");
+        c3.messages.push(new Message("Standup in 10 minutes.", "10:00", false));
+        c3.messages.push(new Message("I'll be there.", "10:01", true));
+        c3.messages.push(new Message("Please review PR #42 when you get a chance.", "10:05", false));
+        c3.messages.push(new Message("On it!", "10:06", true));
+        c3.unread = 0;
+
+        let c4 = new Conversation("Charlie", rgb(180, 100, 220), "last seen yesterday");
+        c4.messages.push(new Message("Thanks for the recommendation!", "yesterday", false));
+        c4.messages.push(new Message("No problem, let me know how you like it.", "yesterday", true));
+        c4.unread = 0;
+
+        let c5 = new Conversation("Diana", rgb(220, 180, 60), "online");
+        c5.messages.push(new Message("Are we still on for lunch?", "11:30", false));
+        c5.messages.push(new Message("Yes, noon at the usual place?", "11:31", true));
+        c5.messages.push(new Message("Perfect, see you there!", "11:32", false));
+        c5.unread = 3;
+
+        let c6 = new Conversation("Eve", rgb(60, 200, 200), "last seen 30m ago");
+        c6.messages.push(new Message("The deployment went smoothly.", "07:00", false));
+        c6.messages.push(new Message("Great work! Any issues?", "07:05", true));
+        c6.messages.push(new Message("None so far. Monitoring the dashboards.", "07:06", false));
+        c6.unread = 0;
+
+        let c7 = new Conversation("Frank", rgb(200, 100, 100), "last seen 5h ago");
+        c7.messages.push(new Message("Happy birthday!", "00:01", true));
+        c7.messages.push(new Message("Thank you so much!", "08:30", false));
+        c7.unread = 0;
+
+        this.conversations.push(c1);
+        this.conversations.push(c2);
+        this.conversations.push(c3);
+        this.conversations.push(c4);
+        this.conversations.push(c5);
+        this.conversations.push(c6);
+        this.conversations.push(c7);
+    }
+
+    fn active_conv(): Conversation {
+        return this.conversations[this.active];
+    }
+
+    fn filtered_indices(): int[] {
+        let out: int[] = [];
+        let q = this.search_query;
+        for (let i in 0..this.conversations.len) {
+            if (q.len == 0) {
+                out.push(i);
+            } else {
+                let name = this.conversations[i].name;
+                if (str_contains_lower(name, q)) {
+                    out.push(i);
+                }
+            }
+        }
+        return out;
+    }
+}
+
+fn str_contains_lower(haystack: string, needle: string): bool {
+    return str_contains(haystack, needle);
+}
+
+fn str_contains(haystack: string, needle: string): bool {
+    if (needle.len == 0) { return true; }
+    if (needle.len > haystack.len) { return false; }
+    for (let i in 0..(haystack.len - needle.len + 1)) {
+        let match = true;
+        for (let j in 0..needle.len) {
+            if (haystack[i + j] != needle[j]) {
+                match = false;
+            }
+        }
+        if (match) { return true; }
+    }
+    return false;
+}
+
+// ------------------------------------------------------- Custom widgets
+
+class Avatar extends Widget {
+    color: int;
+    initial: string;
+
+    fn init(color: int, initial: string) {
+        super.init();
+        this.color = color;
+        this.initial = initial;
+    }
+
+    override fn measure(s: Painter, th: Theme): Size {
+        return Size(40, 40);
+    }
+
+    override fn draw(s: Painter, th: Theme) {
+        s.fill(this.bounds, this.color);
+        let tw = s.text_width(this.initial);
+        let asc = s.font_ascent();
+        let x = this.bounds.x + (this.bounds.w - tw) / 2;
+        let y = this.bounds.y + (this.bounds.h - s.font_height()) / 2 + asc;
+        s.text(x, y, this.initial, rgb(255, 255, 255));
+    }
+}
+
+class ChatRow extends Widget {
+    avatar: Avatar;
+    name: string;
+    preview: string;
+    time: string;
+    unread: int;
+    selected: bool;
+    conv_index: int;
+    on_select: fn(int);
+
+    fn init(conv_index: int, name: string, avatarColor: int, preview: string,
+            time: string, unread: int, selected: bool) {
+        super.init();
+        this.conv_index = conv_index;
+        this.avatar = new Avatar(avatarColor, name.slice(0, 1));
+        this.name = name;
+        this.preview = preview;
+        this.time = time;
+        this.unread = unread;
+        this.selected = selected;
+        this.on_select = null;
+        this.focusable = false;
+    }
+
+    override fn measure(s: Painter, th: Theme): Size {
+        return Size(340, 64);
+    }
+
+    override fn draw(s: Painter, th: Theme) {
+        let bg = th.bg;
+        if (this.selected) { bg = th.sel; }
+        s.fill(this.bounds, bg);
+
+        let avatar_r = Rect(this.bounds.x + 12, this.bounds.y + 12, 40, 40);
+        this.avatar.bounds = avatar_r;
+        this.avatar.draw(s, th);
+
+        let text_x = this.bounds.x + 64;
+        let text_w = this.bounds.w - 64 - 50;
+
+        let name_r = Rect(text_x, this.bounds.y + 12, text_w, s.font_height());
+        s.text_in(name_r, 0, this.name, th.ink);
+
+        let preview_r = Rect(text_x, this.bounds.y + 12 + s.font_height() + 4, text_w, s.font_height());
+        s.text_in(preview_r, 0, this.preview, th.muted);
+
+        let right_x = this.bounds.x + this.bounds.w - 48;
+        let time_r = Rect(right_x, this.bounds.y + 12, 40, s.font_height());
+        s.text_in(time_r, 0, this.time, th.muted);
+
+        if (this.unread > 0) {
+            let label = "" + this.unread;
+            let bw = s.text_width(label) + 12;
+            let bh = s.font_height() + 4;
+            let bx = right_x + (40 - bw) / 2;
+            let by = this.bounds.y + 12 + s.font_height() + 6;
+            let badge_r = Rect(bx, by, bw, bh);
+            s.fill(badge_r, th.accent);
+            s.text_in(badge_r, 6, label, rgb(255, 255, 255));
+        }
+
+        s.line(this.bounds.x + 64, this.bounds.y + this.bounds.h - 1,
+               this.bounds.x + this.bounds.w, this.bounds.y + this.bounds.h - 1,
+               rgb(32, 44, 51));
+    }
+
+    override fn on_click(x: int, y: int): bool {
+        if (this.on_select != null) {
+            this.on_select(this.conv_index);
+            return true;
+        }
+        return false;
+    }
+
+    override fn drop_handlers() {
+        this.on_select = null;
+    }
+}
+
+class MessageBubble extends Widget {
+    text: string;
+    time: string;
+    outgoing: bool;
+    lines: string[];
+    cached_w: int;
+
+    fn init(text: string, time: string, outgoing: bool) {
+        super.init();
+        this.text = text;
+        this.time = time;
+        this.outgoing = outgoing;
+        this.lines = [];
+        this.cached_w = -1;
+    }
+
+    fn wrap_text(s: Painter, max_w: int) {
+        if (this.cached_w == max_w && this.lines.len > 0) { return; }
+        this.lines = [];
+        this.cached_w = max_w;
+        if (max_w <= 0) { return; }
+        let words = bubble_split_words(this.text);
+        let line = "";
+        for (let w in words) {
+            let trial = "";
+            if (line.len == 0) { trial = w; } else { trial = line + " " + w; }
+            if (s.text_width(trial) > max_w && line.len > 0) {
+                this.lines.push(line);
+                line = w;
+            } else {
+                line = trial;
+            }
+        }
+        if (line.len > 0) { this.lines.push(line); }
+    }
+
+    override fn measure(s: Painter, th: Theme): Size {
+        let tw = s.text_width(this.text);
+        let max_bubble_w = 360;
+        let w = tw + 24;
+        if (w > max_bubble_w) { w = max_bubble_w; }
+        this.wrap_text(s, w - 24);
+        let lh = s.font_height();
+        let h = this.lines.len * (lh + 2) + lh + 8;
+        return Size(w, h);
+    }
+
+    override fn draw(s: Painter, th: Theme) {
+        let bg = th.white;
+        if (this.outgoing) { bg = BUBBLE_OUT(); }
+        s.fill(this.bounds, bg);
+
+        let text_color = rgb(233, 237, 239);
+        let pad = 12;
+        let lh = s.font_height();
+        let asc = s.font_ascent();
+        let y = this.bounds.y + pad + asc;
+
+        this.wrap_text(s, this.bounds.w - 2 * pad);
+
+        for (let i in 0..this.lines.len) {
+            s.text(this.bounds.x + pad, y, this.lines[i], text_color);
+            y += lh + 2;
+        }
+
+        y += 2;
+        s.text(this.bounds.x + this.bounds.w - s.text_width(this.time) - pad,
+               y, this.time, rgb(134, 150, 160));
+    }
+}
+
+fn bubble_split_words(s: string): string[] {
+    let out: string[] = [];
+    let start = 0;
+    let i = 0;
+    while (i < s.len) {
+        if (s[i] == 32 || s[i] == 9 || s[i] == 10) {
+            if (i > start) { out.push(s.slice(start, i)); }
+            start = i + 1;
+        }
+        i += 1;
+    }
+    if (i > start) { out.push(s.slice(start, i)); }
+    return out;
+}
+
+// ------------------------------------------------------- App builder
+
+class AppRefs {
+    win: Window;
+    state: ChatState;
+    sidebar_col: Column;
+    conv_col: Column;
+    status_bar: StatusBar;
+    search_field: TextField;
+    conv_scroll: ScrollView;
+    list_scroll: ScrollView;
+    composer_field: TextField;
+
+    fn init(win: Window, state: ChatState, sidebar_col: Column, conv_col: Column,
+            status_bar: StatusBar, search_field: TextField, conv_scroll: ScrollView,
+            list_scroll: ScrollView, composer_field: TextField) {
+        this.win = win;
+        this.state = state;
+        this.sidebar_col = sidebar_col;
+        this.conv_col = conv_col;
+        this.status_bar = status_bar;
+        this.search_field = search_field;
+        this.conv_scroll = conv_scroll;
+        this.list_scroll = list_scroll;
+        this.composer_field = composer_field;
+    }
+}
+
+fn build_chat_list(state: ChatState, refs: AppRefs): Column {
+    let col = new Column([]);
+    col.spacing = 0;
+    col.padding = 0;
+    let indices = state.filtered_indices();
+    for (let idx in indices) {
+        let conv = state.conversations[idx];
+        let row = new ChatRow(idx, conv.name, conv.avatarColor,
+                              conv.last_message_text(),
+                              conv.last_message_time(),
+                              conv.unread,
+                              idx == state.active);
+        row.on_select = (i) => {
+            refs.state.active = i;
+            refs.state.conversations[i].unread = 0;
+            rebuild_conversation(refs);
+            rebuild_chat_list(refs);
+            update_status(refs);
+            refs.win.layout();
+            refs.win.redraw();
+        };
+        col.add(row);
+    }
+    return col;
+}
+
+fn rebuild_chat_list(refs: AppRefs) {
+    let list_col = build_chat_list(refs.state, refs);
+    refs.list_scroll.children = [];
+    refs.list_scroll.add(list_col);
+}
+
+fn build_conversation_content(state: ChatState): Column {
+    let col = new Column([]);
+    col.spacing = 4;
+    col.padding = 8;
+    let conv = state.active_conv();
+    for (let msg in conv.messages) {
+        let bubble = new MessageBubble(msg.text, msg.time, msg.outgoing);
+        if (msg.outgoing) {
+            let row = new Row([]);
+            row.spacing = 0;
+            row.padding = 0;
+            row.add(new Spacer());
+            row.add(new Container(-1, -1, 0, -1, bubble));
+            col.add(row);
+        } else {
+            let row = new Row([]);
+            row.spacing = 0;
+            row.padding = 0;
+            row.add(new Container(-1, -1, 0, -1, bubble));
+            row.add(new Spacer());
+            col.add(row);
+        }
+    }
+    return col;
+}
+
+fn rebuild_conversation(refs: AppRefs) {
+    let conv = refs.state.active_conv();
+    let msg_col = build_conversation_content(refs.state);
+    refs.conv_scroll.children = [];
+    refs.conv_scroll.add(msg_col);
+    refs.conv_scroll.scroll_y = 99999;
+}
+
+fn update_status(refs: AppRefs) {
+    let conv = refs.state.active_conv();
+    refs.status_bar.left_text = conv.name + " — " + conv.messages.len + " messages";
+    refs.status_bar.right_text = conv.lastSeen;
+}
+
+fn send_message(refs: AppRefs) {
+    let text = refs.composer_field.text;
+    if (text.len == 0) { return; }
+    let conv = refs.state.active_conv();
+    conv.messages.push(new Message(text, "now", true));
+    refs.composer_field.text = "";
+    refs.composer_field.caret = 0;
+    rebuild_conversation(refs);
+    rebuild_chat_list(refs);
+    update_status(refs);
+    refs.win.layout();
+    refs.win.redraw();
+}
+
+fn main() {
+    let use_surface = false;
+    let a = args();
+    for (let i in 0..a.len) {
+        if (a[i] == "--surface") { use_surface = true; }
+    }
+
+    let win = new Window("VoltChat", 980, 660);
+
+    if (!use_surface) {
+        win.use_painter(new GfxPainter(win.surface(), font_path(), 15.0));
+    }
+
+    let state = new ChatState();
+    win.theme = whatsapp_dark();
+
+    let search_field = new TextField("Search or start new chat");
+    let composer_field = new TextField("Type a message");
+
+    let sidebar_col = new Column([]);
+    sidebar_col.spacing = 0;
+    sidebar_col.padding = 0;
+
+    let conv_col = new Column([]);
+    conv_col.spacing = 0;
+    conv_col.padding = 0;
+
+    let status_bar = new StatusBar("VoltChat", "Ready");
+
+    let conv_scroll = new ScrollView(null);
+    conv_scroll.grow = 1;
+
+    let list_scroll = new ScrollView(null);
+    list_scroll.grow = 1;
+
+    let refs = new AppRefs(win, state, sidebar_col, conv_col, status_bar,
+                           search_field, conv_scroll, list_scroll, composer_field);
+
+    search_field.onSubmit = (t) => {
+        refs.state.search_query = t;
+        rebuild_chat_list(refs);
+        refs.win.layout();
+        refs.win.redraw();
+    };
+
+    composer_field.onSubmit = (t) => {
+        send_message(refs);
+    };
+
+    let send_btn = new Button("Send");
+    send_btn.onClick = (w) => {
+        send_message(refs);
+    };
+
+    let menu_btn = new Button("Menu");
+    let menu_popover: Widget = null;
+
+    let sidebar_header = new Container(-1, 56, 8, -1, null);
+    let header_row = new Row([]);
+    header_row.spacing = 8;
+    header_row.padding = 0;
+    header_row.add(new Avatar(rgb(0, 168, 132), "M"));
+    header_row.add(new Spacer());
+    let new_chat_btn = new Button("+");
+    new_chat_btn.onClick = (w) => {
+        print("new chat clicked");
+    };
+    header_row.add(new_chat_btn);
+    menu_btn.onClick = (w) => {
+        let pop = new Popover(w.bounds.x, w.bounds.y + w.bounds.h);
+        pop.add(new Label("New group"));
+        pop.add(new Label("Settings"));
+        pop.add(new Label("Log out"));
+        refs.win.open_overlay(pop);
+    };
+    header_row.add(menu_btn);
+    sidebar_header.add(header_row);
+
+    let search_container = new Container(-1, -1, 4, -1, search_field);
+
+    let initial_list = build_chat_list(state, refs);
+    list_scroll.add(initial_list);
+
+    sidebar_col.add(sidebar_header);
+    sidebar_col.add(search_container);
+    sidebar_col.add(list_scroll);
+
+    let conv = state.active_conv();
+    let conv_header = new Container(-1, 56, 8, -1, null);
+    let conv_header_row = new Row([]);
+    conv_header_row.spacing = 8;
+    conv_header_row.padding = 0;
+    let conv_avatar = new Avatar(conv.avatarColor, conv.name.slice(0, 1));
+    conv_header_row.add(conv_avatar);
+    let name_label = new Label(conv.name);
+    name_label.strong = true;
+    conv_header_row.add(name_label);
+    let status_label = new Label(conv.lastSeen);
+    status_label.strong = false;
+    conv_header_row.add(status_label);
+    conv_header_row.add(new Spacer());
+    let conv_search_btn = new Button("Search");
+    conv_search_btn.onClick = (w) => {
+        print("conversation search");
+    };
+    conv_header_row.add(conv_search_btn);
+    conv_header.add(conv_header_row);
+
+    let composer_row = new Row([]);
+    composer_row.spacing = 8;
+    composer_row.padding = 8;
+    composer_row.add(new Expanded(composer_field));
+    composer_row.add(send_btn);
+    let composer_container = new Container(-1, -1, 0, -1, composer_row);
+
+    let msg_scroll = new ScrollView(build_conversation_content(state));
+    msg_scroll.grow = 1;
+
+    let chat_bg = new Container(-1, -1, 0, CHAT_BG(), null);
+
+    conv_col.add(conv_header);
+    conv_col.add(msg_scroll);
+    conv_col.add(composer_container);
+
+    let sidebar_sized = new SizedBox(340, -1, sidebar_col);
+
+    win.root = new Row([sidebar_sized, new Divider(true), new Expanded(conv_col)]);
+
+    let bar = new MenuBar();
+    let file_menu = bar.add_menu(new Menu("File"));
+    file_menu.add("Exit").onSelect = () => win.close();
+    let view_menu = bar.add_menu(new Menu("View"));
+    view_menu.add("Toggle Theme").onSelect = () => {
+        state.dark = !state.dark;
+        if (state.dark) {
+            win.theme = whatsapp_dark();
+        } else {
+            win.theme = whatsapp_light();
+        }
+        win.layout();
+        win.redraw();
+    };
+    win.menubar = bar;
+
+    refs.status_bar = status_bar;
+    refs.conv_scroll = msg_scroll;
+    update_status(refs);
+
+    win.run();
+
+    print("bye — VoltChat closed");
+}
