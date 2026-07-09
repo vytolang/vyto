@@ -101,6 +101,14 @@ static int headless_wait(int *w, int *h) {
         if (strcmp(script_line, "tick") == 0) return VS_EV_TIMER;
         if (strcmp(script_line, "close") == 0) return VS_EV_CLOSE;
         {
+            int mx, my;
+            if (sscanf(script_line, "move %d %d", &mx, &my) == 2) {
+                last_x = mx;
+                last_y = my;
+                return VS_EV_MOUSE_MOVE;
+            }
+        }
+        {
             int sc, sx, sy;
             if (sscanf(script_line, "scroll %d %d %d", &sc, &sx, &sy) == 3) {
                 last_wheel = sc;
@@ -209,6 +217,9 @@ static LRESULT CALLBACK vs_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     case WM_LBUTTONUP:
         q_push(VS_EV_MOUSE_UP, 0, (short)LOWORD(lp), (short)HIWORD(lp), 0);
+        return 0;
+    case WM_MOUSEMOVE:
+        q_push(VS_EV_MOUSE_MOVE, 0, (short)LOWORD(lp), (short)HIWORD(lp), 0);
         return 0;
     case WM_MOUSEWHEEL: {
         POINT pt;
@@ -540,7 +551,7 @@ void *vs_open(const char *title, int w, int h) {
                                  BlackPixel(dpy, scr), WhitePixel(dpy, scr));
     XStoreName(dpy, s->win, title);
     XSelectInput(dpy, s->win, ExposureMask | KeyPressMask | KeyReleaseMask | ButtonPressMask |
-                                  ButtonReleaseMask | StructureNotifyMask);
+                                  ButtonReleaseMask | PointerMotionMask | StructureNotifyMask);
     /* only emit KeyRelease on real release, not auto-repeat — matters for
        held-key game input (EV_KEY / EV_KEY_UP pairing) */
     XkbSetDetectableAutoRepeat(dpy, True, NULL);
@@ -750,6 +761,13 @@ static int x11_translate(VSurf *s, XEvent *e) {
             return VS_EV_MOUSE_UP;
         }
         return -1;
+    case MotionNotify:
+        /* hover source — coalesce: only deliver if the cursor actually moved.
+           X11 often fires many MotionNotify per pixel; throttle by storing the
+           latest and letting vs_wait dedupe via the change check in Window. */
+        last_x = e->xmotion.x;
+        last_y = e->xmotion.y;
+        return VS_EV_MOUSE_MOVE;
     case ClientMessage:
         if ((Atom)e->xclient.data.l[0] == wm_delete) return VS_EV_CLOSE;
         return -1;

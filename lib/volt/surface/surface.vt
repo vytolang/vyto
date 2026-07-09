@@ -20,6 +20,7 @@ export const EV_MOUSE_DOWN: int = 3;
 export const EV_MOUSE_UP: int = 4;
 export const EV_RESIZE: int = 5;
 export const EV_CLOSE: int = 6;
+export const EV_MOUSE_MOVE: int = 7;  // cursor moved over the surface (hover source)
 export const EV_TIMER: int = 8;   // vs_wait_timeout elapsed with no input
 export const EV_KEY_UP: int = 9;  // a key was released; key() gives the code
 export const EV_MOUSE_WHEEL: int = 10; // mouse wheel scrolled; wheel() gives the delta
@@ -51,6 +52,59 @@ export fn contains(r: Rect, px: int, py: int): bool {
 
 export fn rgb(r: int, g: int, b: int): int {
     return (r << 16) | (g << 8) | b;
+}
+
+// ---- alpha/RGBA color model --------------------------------------------
+// Colors are packed 0xAARRGGBB. By convention the legacy opaque 0xRRGGBB
+// values (alpha byte 0) stay OPAQUE across the paint stack — the rich tier
+// (blend2d) treats alpha 0 as opaque, and the lean tier can't alpha-blend so
+// it falls back to opaque/mixed colors. Set a non-zero alpha byte to express
+// translucency: the rich tier composites, the lean tier approximates by
+// `mix`ing against the known background instead.
+
+// a in 0..255. a==0 is stored as 0xFF (opaque) to keep the "alpha 0 = opaque"
+// rule, so callers that want "fully transparent" should pass a=1.
+export fn rgba(r: int, g: int, b: int, a: int): int {
+    let aa = a & 0xFF;
+    if (aa == 0) { aa = 0xFF; }
+    return (aa << 24) | ((r & 0xFF) << 16) | ((g & 0xFF) << 8) | (b & 0xFF);
+}
+
+// overlay a fresh alpha on any color (opaque or packed). a in 0..255.
+export fn with_alpha(color: int, a: int): int {
+    let aa = a & 0xFF;
+    if (aa == 0) { aa = 0xFF; }
+    return (aa << 24) | (color & 0xFFFFFF);
+}
+
+// the alpha byte of a packed color (0..255), or 255 for an opaque 0xRRGGBB.
+export fn alpha_of(color: int): int {
+    let a = (color >> 24) & 0xFF;
+    if (a == 0) { return 0xFF; }
+    return a;
+}
+
+// opaque RGB triple of a color.
+export fn red_of(c: int): int   { return (c >> 16) & 0xFF; }
+export fn green_of(c: int): int { return (c >> 8) & 0xFF; }
+export fn blue_of(c: int): int { return c & 0xFF; }
+
+// linearly interpolate two colors at t in 0.0..1.0; works on opaque or
+// packed-alpha colors (the alpha bytes are interpolated too).
+export fn mix(c0: int, c1: int, t: float): int {
+    if (t < 0.0) { t = 0.0; }
+    if (t > 1.0) { t = 1.0; }
+    let a0 = alpha_of(c0);
+    let a1 = alpha_of(c1);
+    let r0 = red_of(c0);  let g0 = green_of(c0);  let b0 = blue_of(c0);
+    let r1 = red_of(c1);  let g1 = green_of(c1);  let b1 = blue_of(c1);
+    let r = ((r0 as float) + (r1 - r0) as float * t) as int;
+    let g = ((g0 as float) + (g1 - g0) as float * t) as int;
+    let b = ((b0 as float) + (b1 - b0) as float * t) as int;
+    let a = ((a0 as float) + (a1 - a0) as float * t) as int;
+    let aa = a & 0xFF;
+    if (aa == 0) { aa = 0xFF; }
+    return (aa << 24) | ((r & 0xFF) << 16) | ((g & 0xFF) << 8) | (b & 0xFF);
 }
 
 export class Surface {

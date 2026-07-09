@@ -19,9 +19,17 @@ extern "C" {
     fn gfx_fill_round_rect(c: rawptr, x: f64, y: f64, w: f64, h: f64, r: f64, rgb: i32);
     fn gfx_fill_circle(c: rawptr, cx: f64, cy: f64, radius: f64, rgb: i32);
     fn gfx_stroke_line(c: rawptr, x0: f64, y0: f64, x1: f64, y1: f64, width: f64, rgb: i32);
+    fn gfx_stroke_round_rect(c: rawptr, x: f64, y: f64, w: f64, h: f64, r: f64, width: f64, rgb: i32);
+    fn gfx_stroke_circle(c: rawptr, cx: f64, cy: f64, radius: f64, width: f64, rgb: i32);
     fn gfx_linear_gradient_rect(c: rawptr, x: f64, y: f64, w: f64, h: f64,
                                 x0: f64, y0: f64, x1: f64, y1: f64, rgb0: i32, rgb1: i32);
+    fn gfx_shadow_round(c: rawptr, x: f64, y: f64, w: f64, h: f64,
+                        r: f64, blur: f64, dy: f64, rgb: i32);
+    fn gfx_clip_push(c: rawptr, x: f64, y: f64, w: f64, h: f64, r: f64);
+    fn gfx_clip_pop(c: rawptr);
     fn gfx_load_font(c: rawptr, path: cstring, size: f64): i32;
+    fn gfx_load_font_weight(c: rawptr, path: cstring, size: f64, weight: i32): i32;
+    fn gfx_set_font_weight(c: rawptr, weight: i32);
     fn gfx_text(c: rawptr, x: f64, y: f64, s: cstring, rgb: i32);
     fn gfx_text_width(c: rawptr, s: cstring): f64;
     fn gfx_font_ascent(c: rawptr): f64;
@@ -31,8 +39,9 @@ extern "C" {
     fn gfx_stride(c: rawptr): i32;
 }
 
-// A drawable canvas. Colors are 0xRRGGBB (opaque). Coordinates are pixels;
-// float arguments map to blend2d's sub-pixel double geometry.
+// A drawable canvas. Colors are packed 0xAARRGGBB (alpha byte 0 = opaque for
+// backward compatibility). Coordinates are pixels; float arguments map to
+// blend2d's sub-pixel double geometry.
 export class Canvas {
     handle: rawptr;
 
@@ -61,13 +70,34 @@ export class Canvas {
     fn strokeLine(x0: float, y0: float, x1: float, y1: float, width: float, rgb: int) {
         gfx_stroke_line(this.handle, x0, y0, x1, y1, width, rgb as i32);
     }
+    fn strokeRoundRect(x: float, y: float, w: float, h: float,
+                       r: float, width: float, rgb: int) {
+        gfx_stroke_round_rect(this.handle, x, y, w, h, r, width, rgb as i32);
+    }
+    fn strokeCircle(cx: float, cy: float, radius: float, width: float, rgb: int) {
+        gfx_stroke_circle(this.handle, cx, cy, radius, width, rgb as i32);
+    }
     fn linearGradientRect(x: float, y: float, w: float, h: float,
                           x0: float, y0: float, x1: float, y1: float, rgb0: int, rgb1: int) {
         gfx_linear_gradient_rect(this.handle, x, y, w, h, x0, y0, x1, y1, rgb0 as i32, rgb1 as i32);
     }
+    fn shadowRound(x: float, y: float, w: float, h: float,
+                   r: float, blur: float, dy: float, rgb: int) {
+        gfx_shadow_round(this.handle, x, y, w, h, r, blur, dy, rgb as i32);
+    }
+    fn clipPush(x: float, y: float, w: float, h: float, r: float) {
+        gfx_clip_push(this.handle, x, y, w, h, r);
+    }
+    fn clipPop() { gfx_clip_pop(this.handle); }
 
     fn loadFont(path: string, size: float): bool {
         return gfx_load_font(this.handle, path.cstr(), size) != 0;
+    }
+    fn loadFontWeight(path: string, size: float, weight: int): bool {
+        return gfx_load_font_weight(this.handle, path.cstr(), size, weight as i32) != 0;
+    }
+    fn setWeight(weight: int) {
+        gfx_set_font_weight(this.handle, weight as i32);
     }
     fn text(x: float, y: float, s: string, rgb: int) {
         gfx_text(this.handle, x, y, s.cstr(), rgb as i32);
@@ -76,7 +106,7 @@ export class Canvas {
     fn fontAscent(): float { return gfx_font_ascent(this.handle); }
     fn fontHeight(): float { return gfx_font_height(this.handle); }
 
-    // Finish pending rendering, then expose the raw 0xRRGGBB buffer for blit.
+    // Finish pending rendering, then expose the raw 0xAARRGGBB buffer for blit.
     fn flush() { gfx_flush(this.handle); }
     fn pixels(): rawptr { return gfx_pixels(this.handle); }
     fn stride(): int { return gfx_stride(this.handle) as int; }

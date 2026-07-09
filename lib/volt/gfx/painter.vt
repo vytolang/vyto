@@ -8,18 +8,43 @@
 //
 // It lives in its own module so plain Canvas users (import "volt/gfx") don't
 // pull in volt/ui, and volt/ui apps don't pull in blend2d unless they use this.
-import { Painter } from "volt/ui";
+import { Painter, WEIGHT_REG, WEIGHT_MED, WEIGHT_BOLD } from "volt/ui";
 import { Canvas } from "volt/gfx";
 import { Surface, Rect } from "volt/surface";
+
+// Build a candidate bold/medium face path from a regular TTF path by inserting
+// "Bold"/"Medium" before the extension — works for the DejaVu family shipped
+// with most distros. Returns the empty string when no candidate is derivable.
+fn derive_variant_path(regular: string, tag: string): string {
+    let dot = -1;
+    let i = regular.len - 1;
+    while (i >= 0) {
+        if (regular[i] == 46) { dot = i; break; } // '.'
+        i -= 1;
+    }
+    if (dot < 0) { return ""; }
+    return regular.slice(0, dot) + tag + regular.slice(dot, regular.len);
+}
 
 export class GfxPainter extends Painter {
     surf: Surface;
     canvas: Canvas;
+    weight: int;    // current active weight (WeIGHT_REG/MED/BOLD)
 
     fn init(surf: Surface, fontPath: string, fontSize: float) {
         this.surf = surf;
         this.canvas = new Canvas(surf.width(), surf.height());
-        this.canvas.loadFont(fontPath, fontSize);
+        this.weight = WEIGHT_REG;
+        // regular weight always loads; medium/bold are best-effort — widgets
+        // fall back to regular if a variant TTF isn't on disk.
+        this.canvas.loadFontWeight(fontPath, fontSize, WEIGHT_REG);
+        if (!this.canvas.loadFontWeight(derive_variant_path(fontPath, "-Medium"), fontSize, WEIGHT_MED)) {
+            // reuse regular for medium so set_weight(med) never blanks text
+            this.canvas.loadFontWeight(fontPath, fontSize, WEIGHT_MED);
+        }
+        if (!this.canvas.loadFontWeight(derive_variant_path(fontPath, "-Bold"), fontSize, WEIGHT_BOLD)) {
+            this.canvas.loadFontWeight(derive_variant_path(fontPath, "Bold"), fontSize, WEIGHT_BOLD);
+        }
     }
 
     override fn fill(r: Rect, color: int) {
@@ -40,6 +65,51 @@ export class GfxPainter extends Painter {
 
     override fn line(x0: int, y0: int, x1: int, y1: int, color: int) {
         this.canvas.strokeLine(x0 as float, y0 as float, x1 as float, y1 as float, 1.0, color);
+    }
+
+    // -- widened vocabulary (WS2) ------------------------------------------------
+    override fn fill_round(r: Rect, radius: int, color: int) {
+        this.canvas.fillRoundRect(r.x as float, r.y as float, r.w as float, r.h as float,
+                                  radius as float, color);
+    }
+    override fn stroke_round(r: Rect, radius: int, width: int, color: int) {
+        this.canvas.strokeRoundRect(r.x as float, r.y as float, r.w as float, r.h as float,
+                                    radius as float, width as float, color);
+    }
+    override fn circle(cx: int, cy: int, radius: int, color: int) {
+        this.canvas.fillCircle(cx as float, cy as float, radius as float, color);
+    }
+    override fn stroke_circle(cx: int, cy: int, radius: int, width: int, color: int) {
+        this.canvas.strokeCircle(cx as float, cy as float, radius as float, width as float, color);
+    }
+    override fn gradient_v(r: Rect, radius: int, top: int, bottom: int) {
+        // vertical gradient top→bottom; blend2d maps it onto a round-rect by
+        // first painting the gradient rect then clipping — simpler: stroke a
+        // gradient rect and let it fill the rounded shape via the round rect.
+        // blend2d gradients are rectangular, so we paint the gradient into the
+        // rect and AA the rounded corners by overlaying a same-colored round
+        // rect is NOT needed: use linearGradientRect with the same rect; the
+        // rounded corners are achieved by clipping to the round shape first.
+        this.canvas.clipPush(r.x as float, r.y as float, r.w as float, r.h as float, radius as float);
+        this.canvas.linearGradientRect(r.x as float, r.y as float, r.w as float, r.h as float,
+                                       r.x as float, r.y as float,
+                                       r.x as float, (r.y + r.h) as float,
+                                       top, bottom);
+        this.canvas.clipPop();
+    }
+    override fn shadow(r: Rect, radius: int, blur: int, dy: int, color: int) {
+        this.canvas.shadowRound(r.x as float, r.y as float, r.w as float, r.h as float,
+                                radius as float, blur as float, dy as float, color);
+    }
+    override fn clip_push(r: Rect, radius: int) {
+        this.canvas.clipPush(r.x as float, r.y as float, r.w as float, r.h as float, radius as float);
+    }
+    override fn clip_pop() { this.canvas.clipPop(); }
+
+    // -- typography (WS3) --------------------------------------------------------
+    override fn set_weight(w: int) {
+        this.weight = w;
+        this.canvas.setWeight(w);
     }
 
     // Surface.text takes a baseline origin; Canvas.text does too.

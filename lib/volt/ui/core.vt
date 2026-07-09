@@ -8,8 +8,9 @@
 // exit by walking the tree and nulling every handler field
 // (release_all/drop_handlers), so apps never need a manual teardown.
 
-import { Surface, Rect, contains, rgb,
-          EV_EXPOSE, EV_KEY, EV_MOUSE_DOWN, EV_MOUSE_WHEEL, EV_RESIZE, EV_CLOSE,
+import { Surface, Rect, contains, rgb, rgba, with_alpha, alpha_of, mix,
+          EV_EXPOSE, EV_KEY, EV_MOUSE_DOWN, EV_MOUSE_UP, EV_MOUSE_MOVE, EV_MOUSE_WHEEL,
+          EV_RESIZE, EV_CLOSE,
           KEY_ESC, KEY_TAB } from "volt/surface";
 
 export struct Size {
@@ -71,26 +72,262 @@ export fn bcLoose(w: int, h: int): BoxConstraints {
     return new BoxConstraints(0, w, 0, h);
 }
 
+// --------------------------------------------------------------- paint helpers
+// Small reusable chrome routines shared by the widget draws so every control
+// composites the same way: rounded surface, elevation shadow, focus glow.
+// These work on any Painter — the lean tier falls back to plain fill/frame.
+
+// Inset/expand a rect by `dx` on every side (dx<0 expands outward).
+export fn rect_inset(r: Rect, dx: int): Rect {
+    return Rect(r.x - dx, r.y - dx, r.w + 2 * dx, r.h + 2 * dx);
+}
+
+// A soft focus glow: a 2px stroke_round just outside the control, painted in
+// the theme's rgba focus_ring color. The lean tier falls back to a 1px frame.
+export fn paint_focus_ring(s: Painter, th: Theme, r: Rect, radius: int) {
+    let ring = rect_inset(r, -2);
+    s.stroke_round(ring, radius + 2, 2, th.focus_ring);
+}
+
+// An elevated rounded surface: drop a soft shadow, then fill the panel. The
+// caller draws border + content on top. radius = th.radius_md typical.
+export fn paint_panel(s: Painter, th: Theme, r: Rect, radius: int, fill: int, elevation: int) {
+    if (elevation > 0) {
+        let blur = th.elevation1_blur;
+        let dy = th.elevation1_dy;
+        if (elevation >= 2) { blur = th.elevation2_blur; dy = th.elevation2_dy; }
+        if (elevation >= 3) { blur = th.elevation3_blur; dy = th.elevation3_dy; }
+        s.shadow(r, radius, blur, dy, th.shadow_color);
+    }
+    s.fill_round(r, radius, fill);
+}
+
+// Resolve the visible fill of a control given its hover/press state. Uses
+// opaque mix() so the lean tier (no alpha) renders the same tint as the rich
+// tier — alpha compositing is reserved for true overlays the widget code may
+// add on top. `base` is the resting fill; hover/press are opaque tint colors.
+export fn resolve_state_fill(base: int, hovered: bool, pressed: bool,
+                             hover_tint: int, press_tint: int): int {
+    if (pressed) { return mix(base, press_tint, 0.5); }
+    if (hovered) { return mix(base, hover_tint, 0.5); }
+    return base;
+}
+
+// ----------------------------------------------------------------- Theme
+//
+// A themeable design system: color ramps, semantic roles, scales, and type
+// roles. The legacy field names (bg, ink, accent, muted, sel, white, pad,
+// spacing) are kept as computed aliases over the semantic roles so existing
+// apps and the existing widget draws keep compiling — only the NEW widget
+// draws use the semantic roles directly. Two polished built-in themes ship:
+//   `new Theme()`         — refined light   (also `theme_light()`)
+//   `theme_dark()`        — true dark, deeper than the gallery's old dark
+
 export class Theme {
-    bg: int;
-    ink: int;
-    accent: int;
-    muted: int;
-    sel: int;
-    white: int;
-    pad: int;      // default container padding
-    spacing: int;  // default gap between container children
+    // --- legacy aliases (kept for backward compatibility; mirrors of the
+    //     semantic roles) ---
+    bg: int;       // = surface
+    ink: int;      // = on_surface
+    accent: int;   // = primary
+    muted: int;    // = on_surface_muted
+    sel: int;      // = secondary
+    white: int;    // = surface_raised
+    pad: int;      // = space_3 (12)
+    spacing: int;  // = space_2 (8)
+
+    // --- color ramps ---
+    primary_300: int;
+    primary_500: int;
+    primary_700: int;
+    neutral_100: int;
+    neutral_200: int;
+    neutral_300: int;
+    neutral_400: int;
+    neutral_500: int;
+    neutral_700: int;
+    neutral_900: int;
+
+    // --- semantic roles (rgba-packed when alpha matters) ---
+    surface: int;          // page background
+    surface_raised: int;   // cards, popups, inputs
+    surface_sunken: int;   // wells, track of progress bar
+    on_surface: int;       // primary text
+    on_surface_muted: int; // secondary text / captions
+    on_surface_subtle: int;
+    primary: int;
+    on_primary: int;
+    primary_hover: int;   // computed: mix(primary -> on_primary, 0.10)
+    primary_press: int;   // computed: mix(primary -> darker)
+    secondary: int;       // subtle filled surface
+    on_secondary: int;
+    hover_overlay: int;    // rgba white, low alpha — composited over a control
+    press_overlay: int;    // rgba black, low alpha
+    disabled: int;
+    disabled_fg: int;
+    border: int;
+    divider: int;
+    focus_ring: int;      // rgba primary, ~0.55 alpha
+    shadow_color: int;    // rgba neutral, soft-drop shadow tint
+    selection: int;       // list row highlight
+
+    // --- scales ---
+    radius_sm: int;
+    radius_md: int;
+    radius_lg: int;
+    elevation1_blur: int;
+    elevation1_dy: int;
+    elevation2_blur: int;
+    elevation2_dy: int;
+    elevation3_blur: int;
+    elevation3_dy: int;
+    space_1: int;
+    space_2: int;
+    space_3: int;
+    space_4: int;
+    space_5: int;
+    space_6: int;
+
+    // --- type roles: weight + color per role (size stays at the painter's
+    //     loaded font size; weight is the headline hierarchy lever) ---
+    type_title_weight: int;
+    type_body_weight: int;
+    type_label_weight: int;
+    type_caption_weight: int;
+    type_color_title: int;
+    type_color_body: int;
+    type_color_caption: int;
 
     fn init() {
-        this.bg = rgb(245, 243, 237);
-        this.ink = rgb(34, 34, 40);
-        this.accent = rgb(32, 96, 192);
-        this.muted = rgb(150, 148, 140);
-        this.sel = rgb(219, 230, 247);
-        this.white = rgb(255, 255, 255);
-        this.pad = 12;
-        this.spacing = 8;
+        // Refined light theme (the default).
+        this.surface         = rgb(247, 247, 249);
+        this.surface_raised  = rgb(255, 255, 255);
+        this.surface_sunken  = rgb(238, 239, 242);
+        this.on_surface      = rgb(28, 28, 34);
+        this.on_surface_muted= rgb(108, 112, 124);
+        this.on_surface_subtle = rgb(150, 154, 165);
+        this.primary         = rgb(46, 98, 210);
+        this.on_primary      = rgb(255, 255, 255);
+        this.secondary       = rgb(232, 236, 246);
+        this.on_secondary    = rgb(40, 44, 58);
+        this.disabled        = rgb(214, 216, 224);
+        this.disabled_fg     = rgb(150, 152, 162);
+        this.border          = rgb(214, 218, 226);
+        this.divider         = rgb(228, 231, 238);
+        this.selection       = mix(this.surface, this.primary, 0.16);
+        this.shadow_color    = rgba(35, 40, 60, 55);
+
+        // ramps
+        this.primary_500     = this.primary;
+        this.primary_300     = mix(this.primary, this.surface_raised, 0.5);
+        this.primary_700     = mix(this.primary, rgb(18, 22, 36), 0.28);
+        this.neutral_100     = rgb(248, 248, 250);
+        this.neutral_200     = rgb(236, 237, 240);
+        this.neutral_300     = rgb(220, 222, 228);
+        this.neutral_400     = rgb(198, 200, 208);
+        this.neutral_500     = rgb(160, 162, 172);
+        this.neutral_700     = rgb(96, 98, 108);
+        this.neutral_900     = rgb(28, 28, 34);
+
+        // interaction overlays (alpha-packed; rich tier composites them)
+        this.hover_overlay   = rgba(255, 255, 255, 36);
+        this.press_overlay   = rgba(0, 0, 0, 24);
+        this.focus_ring      = with_alpha(this.primary, 150);
+
+        // primary button depth
+        this.primary_hover   = mix(this.primary, this.on_primary, 0.10);
+        this.primary_press   = mix(this.primary, this.primary_700, 0.35);
+
+        // scales (8pt grid)
+        this.radius_sm = 4;
+        this.radius_md = 8;
+        this.radius_lg = 14;
+        this.elevation1_blur = 6;  this.elevation1_dy = 2;
+        this.elevation2_blur = 12; this.elevation2_dy = 4;
+        this.elevation3_blur = 20; this.elevation3_dy = 8;
+        this.space_1 = 4;
+        this.space_2 = 8;
+        this.space_3 = 12;
+        this.space_4 = 16;
+        this.space_5 = 24;
+        this.space_6 = 32;
+
+        // type roles
+        this.type_title_weight   = WEIGHT_BOLD;
+        this.type_body_weight    = WEIGHT_REG;
+        this.type_label_weight   = WEIGHT_MED;
+        this.type_caption_weight = WEIGHT_REG;
+        this.type_color_title    = this.on_surface;
+        this.type_color_body     = this.on_surface;
+        this.type_color_caption  = this.on_surface_muted;
+
+        // legacy aliases
+        this.bg      = this.surface;
+        this.ink     = this.on_surface;
+        this.accent  = this.primary;
+        this.muted   = this.on_surface_muted;
+        this.sel     = this.secondary;
+        this.white   = this.surface_raised;
+        this.pad     = this.space_3;
+        this.spacing = this.space_2;
     }
+}
+
+// Refined light theme (identical to `new Theme()`; provided for symmetry with
+// `theme_dark()` so apps can name what they ship).
+export fn theme_light(): Theme { return new Theme(); }
+
+// A genuinely attractive true-dark theme: deep neutral surfaces, a brighter
+// primary, stronger shadows on dark. The semantic roles are fully populated
+// so every widget draws consistently — this is the theme people screenshot.
+export fn theme_dark(): Theme {
+    let th = new Theme();
+    th.surface           = rgb(24, 24, 28);
+    th.surface_raised    = rgb(34, 34, 40);
+    th.surface_sunken    = rgb(18, 18, 22);
+    th.on_surface        = rgb(226, 227, 233);
+    th.on_surface_muted  = rgb(150, 153, 165);
+    th.on_surface_subtle = rgb(108, 112, 124);
+    th.primary           = rgb(96, 148, 238);
+    th.on_primary        = rgb(16, 18, 26);
+    th.secondary         = rgb(48, 48, 56);
+    th.on_secondary      = rgb(220, 222, 232);
+    th.disabled          = rgb(60, 62, 70);
+    th.disabled_fg       = rgb(96, 98, 108);
+    th.border            = rgb(56, 56, 66);
+    th.divider           = rgb(44, 44, 54);
+    th.selection         = mix(th.surface, th.primary, 0.30);
+    th.shadow_color      = rgba(0, 0, 0, 150);
+
+    th.primary_500       = th.primary;
+    th.primary_300       = mix(th.primary, th.on_primary, 0.45);
+    th.primary_700       = mix(th.primary, rgb(0, 0, 0), 0.30);
+    th.neutral_100      = rgb(56, 56, 64);
+    th.neutral_200      = rgb(44, 44, 52);
+    th.neutral_300      = rgb(38, 38, 46);
+    th.neutral_400      = rgb(80, 80, 90);
+    th.neutral_500      = rgb(120, 120, 130);
+    th.neutral_700      = rgb(170, 170, 180);
+    th.neutral_900      = rgb(232, 232, 238);
+
+    th.hover_overlay     = rgba(255, 255, 255, 20);
+    th.press_overlay     = rgba(0, 0, 0, 42);
+    th.focus_ring        = with_alpha(th.primary, 175);
+
+    th.primary_hover     = mix(th.primary, th.on_primary, 0.16);
+    th.primary_press     = mix(th.primary, th.primary_700, 0.40);
+
+    th.type_color_title  = th.on_surface;
+    th.type_color_body   = th.on_surface;
+    th.type_color_caption = th.on_surface_muted;
+
+    // refresh legacy aliases
+    th.bg      = th.surface;
+    th.ink     = th.on_surface;
+    th.accent  = th.primary;
+    th.muted   = th.on_surface_muted;
+    th.sel     = th.secondary;
+    th.white   = th.surface_raised;
+    return th;
 }
 
 // --------------------------------------------------------------- Painter
@@ -100,6 +337,14 @@ export class Theme {
 // GfxPainter in volt/gfx draws through a blend2d Canvas (the rich tier). Widgets
 // only ever see a Painter, so volt/ui itself never depends on blend2d: apps that
 // want AA rendering pass a GfxPainter, everyone else pays nothing.
+// Font weights the painter can select for a draw call. 0 = regular,
+// 1 = medium/semi, 2 = bold. The lean tier ignores weight (its bitmap font is
+// a single weight); the rich tier maps it to blend2d font slots. Widgets pull
+// the weight of a `type_*` role from the Theme.
+export const WEIGHT_REG: int = 0;
+export const WEIGHT_MED: int = 1;
+export const WEIGHT_BOLD: int = 2;
+
 export class Painter {
     virtual fn fill(r: Rect, color: int) { }
     virtual fn frame(r: Rect, color: int) { }
@@ -112,6 +357,32 @@ export class Painter {
     virtual fn width(): int { return 0; }
     virtual fn height(): int { return 0; }
     virtual fn present() { }
+
+    // -- WS3: weight selection for the next text draws -------------------
+    virtual fn set_weight(w: int) { }
+
+    // -- WS2: widened paint vocabulary ----------------------------------
+    // Rounded fill/stroke; circle fill; vertical gradient (top→bottom);
+    // soft drop shadow; clip stack. The base class falls back to the plain
+    // primitives so any Painter (incl. a test RecordPainter or the lean
+    // SurfacePainter, which overrides the ones it can do) keeps rendering
+    // correctly, just plainer. Packed colors (0xAARRGGBB) are honored by the
+    // rich tier; the base/lean tiers treat alpha 0 as opaque.
+    virtual fn fill_round(r: Rect, radius: int, color: int) { this.fill(r, color); }
+    virtual fn stroke_round(r: Rect, radius: int, width: int, color: int) { this.frame(r, color); }
+    virtual fn circle(cx: int, cy: int, radius: int, color: int) {
+        this.fill(Rect(cx - radius, cy - radius, radius * 2, radius * 2), color);
+    }
+    virtual fn stroke_circle(cx: int, cy: int, radius: int, width: int, color: int) {
+        this.frame(Rect(cx - radius, cy - radius, radius * 2, radius * 2), color);
+    }
+    virtual fn gradient_v(r: Rect, radius: int, top: int, bottom: int) {
+        // base fallback: the mid color (alpha-aware mix against itself)
+        this.fill_round(r, radius, mix(top, bottom, 0.5));
+    }
+    virtual fn shadow(r: Rect, radius: int, blur: int, dy: int, color: int) { }
+    virtual fn clip_push(r: Rect, radius: int) { }
+    virtual fn clip_pop() { }
 }
 
 // Default painter: forwards every call to a volt/surface Surface.
@@ -152,6 +423,8 @@ export class Widget {
     children: Widget[];
     focusable: bool;
     focused: bool;
+    hovered: bool;     // WS6: cursor is over this widget
+    pressed: bool;     // WS6: a button is held down over this widget
     grow: int;          // flex factor inside Column/Row; 0 = natural size
     modal: bool;        // overlay traps events; outside clicks don't dismiss
     win: weak Window;   // set on overlays/menubar so they can drive the Window
@@ -301,6 +574,8 @@ export class Window {
     close_on_esc: bool;
     dirty: Rect;        // accumulated repaint region (valid when has_dirty)
     has_dirty: bool;
+    hover_w: Widget;     // WS6: widget currently under the cursor (draws hover state)
+    press_w: Widget;    // WS6: widget capturing the current mouse press
 
     fn init(title: string, w: int, h: int) {
         this.surf = new Surface(title, w, h);
@@ -501,6 +776,8 @@ export class Window {
             return;
         }
         if (this.menubar != null && contains(this.menubar.bounds, x, y)) {
+            this.set_hover(this.menubar.hit(x, y));
+            this.set_press(this.hover_w);
             if (this.menubar.on_click(x, y)) { this.redraw(); }
             return;
         }
@@ -508,6 +785,8 @@ export class Window {
         if (this.root != null) { target = this.root.hit(x, y); }
         if (target != null) {
             let old = this.focused_widget();
+            this.set_hover(target);
+            this.set_press(target);
             let changed = false;
             if (target.focusable) {
                 this.focus_widget(target);
@@ -522,6 +801,65 @@ export class Window {
                 this.redraw();
             }
         }
+    }
+
+    // hover source: track the deepest widget under the moving cursor. When it
+    // changes, the previous and new widgets are dirtied so they repaint with/
+    // without the hover overlay. The lean tier has no alpha so the overlay is
+    // a no-op there, but hover state is still tracked for any widget that
+    // branches on it. Empty areas clear hover.
+    fn on_mouse_move(x: int, y: int) {
+        let target: Widget = null;
+        if (this.overlay != null) {
+            if (contains(this.overlay.bounds, x, y)) {
+                target = this.overlay.hit(x, y);
+            } else if (!this.overlay.modal) {
+                target = null;
+            }
+            this.set_hover(target);
+            return;
+        }
+        if (this.menubar != null && contains(this.menubar.bounds, x, y)) {
+            this.set_hover(this.menubar.hit(x, y));
+            return;
+        }
+        if (this.root != null) { target = this.root.hit(x, y); }
+        this.set_hover(target);
+    }
+
+    fn on_mouse_up(x: int, y: int) {
+        // release the press capture; repaint the affected widget so it drops
+        // its pressed overlay.
+        let pw = this.press_w;
+        this.press_w = null;
+        if (pw != null) {
+            pw.pressed = false;
+            this.mark_dirty(pw.bounds);
+            this.repaint();
+        }
+    }
+
+    // Set the current hover widget, dirtying the previous and new one when
+    // they differ so each repaints with/without its hover overlay.
+    fn set_hover(w: Widget) {
+        if (w == this.hover_w) { return; }
+        let old = this.hover_w;
+        this.hover_w = w;
+        if (old != null) {
+            old.hovered = false;
+            this.mark_dirty(old.bounds);
+        }
+        if (w != null) {
+            w.hovered = true;
+            this.mark_dirty(w.bounds);
+        }
+        this.repaint();
+    }
+
+    fn set_press(w: Widget) {
+        if (this.press_w != null) { this.press_w.pressed = false; }
+        this.press_w = w;
+        if (w != null) { w.pressed = true; }
     }
 
     // Mouse wheel: walk from the deepest widget under the cursor up the
@@ -558,6 +896,10 @@ export class Window {
                 this.on_key_ev(this.surf.key(), this.surf.text_ev());
             } else if (ev == EV_MOUSE_DOWN) {
                 this.on_mouse_ev(this.surf.mouse_x(), this.surf.mouse_y());
+            } else if (ev == EV_MOUSE_UP) {
+                this.on_mouse_up(this.surf.mouse_x(), this.surf.mouse_y());
+            } else if (ev == EV_MOUSE_MOVE) {
+                this.on_mouse_move(this.surf.mouse_x(), this.surf.mouse_y());
             } else if (ev == EV_MOUSE_WHEEL) {
                 this.on_wheel_ev(this.surf.mouse_x(), this.surf.mouse_y(),
                                  this.surf.wheel());
@@ -571,6 +913,8 @@ export class Window {
         this.root = null;
         this.menubar = null;
         this.overlay = null;
+        this.hover_w = null;
+        this.press_w = null;
         this.focusables = [];
         this.focus_i = -1;
     }

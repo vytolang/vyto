@@ -2,10 +2,12 @@
 // ListBox, the multi-line TextArea editor, RadioButton/RadioGroup, Switch,
 // SegmentedControl, Stepper, Dropdown, ProgressBar.
 
-import { Widget, Painter, Theme, Size, BoxConstraints, bcLoose } from "volt/ui/core";
-import { Rect,
-         KEY_ENTER, KEY_BACKSPACE, KEY_UP, KEY_DOWN, KEY_LEFT,
-         KEY_RIGHT, KEY_DELETE, KEY_HOME, KEY_END } from "volt/surface";
+import { Widget, Painter, Theme, Size, BoxConstraints, bcLoose,
+         WEIGHT_REG, WEIGHT_BOLD,
+         rect_inset, paint_focus_ring, paint_panel, resolve_state_fill } from "volt/ui/core";
+import { Rect, rgb, mix,
+          KEY_ENTER, KEY_BACKSPACE, KEY_UP, KEY_DOWN, KEY_LEFT,
+          KEY_RIGHT, KEY_DELETE, KEY_HOME, KEY_END } from "volt/surface";
 
 export class Label extends Widget {
     text: string;
@@ -22,9 +24,12 @@ export class Label extends Widget {
     }
 
     override fn draw(s: Painter, th: Theme) {
-        let color = th.muted;
-        if (this.strong) { color = th.ink; }
+        let color = th.type_color_body;
+        let weight = th.type_body_weight;
+        if (!this.strong) { color = th.type_color_caption; weight = th.type_caption_weight; }
+        s.set_weight(weight);
         s.text_in(this.bounds, 0, this.text, color);
+        s.set_weight(WEIGHT_REG);
     }
 }
 
@@ -45,17 +50,31 @@ export class Button extends Widget {
     }
 
     override fn measure(s: Painter, th: Theme): Size {
-        return Size(s.text_width(this.label) + 24, s.font_height() + 12);
+        let w = s.text_width(this.label) + 2 * th.space_4;
+        let h = s.font_height() + 12;
+        return Size(w, h);
     }
 
     override fn draw(s: Painter, th: Theme) {
-        s.fill(this.bounds, th.accent);
+        let radius = th.radius_md;
+        // soft elevation: a primary button sits slightly raised. The gradient
+        // below supplies the fill, so only the shadow is painted here —
+        // an intervening flat fill_round would just be overpainted.
+        s.shadow(this.bounds, radius, th.elevation1_blur, th.elevation1_dy, th.shadow_color);
+        // vertical gradient for depth (rich tier AA-round + gradient; lean tier
+        // resolves to a flat mid primary — still reads as a primary button).
+        let top = th.primary;
+        if (this.hovered) { top = th.primary_hover; }
+        if (this.pressed) { top = th.primary_press; }
+        s.gradient_v(this.bounds, radius, top, th.primary_700);
         if (this.focused) {
-            s.frame(this.bounds, th.ink);
+            paint_focus_ring(s, th, this.bounds, radius);
         }
+        s.set_weight(WEIGHT_BOLD);
         let tw = s.text_width(this.label);
         let pad = (this.bounds.w - tw) / 2;
-        s.text_in(this.bounds, pad, this.label, th.white);
+        s.text_in(this.bounds, pad, this.label, th.on_primary);
+        s.set_weight(WEIGHT_REG);
     }
 
     override fn on_click(x: int, y: int): bool {
@@ -100,19 +119,30 @@ export class TextField extends Widget {
     }
 
     override fn draw(s: Painter, th: Theme) {
-        s.fill(this.bounds, th.white);
-        let border = th.muted;
-        if (this.focused) { border = th.accent; }
-        s.frame(this.bounds, border);
+        let radius = th.radius_md;
+        let bg = th.surface_raised;
+        if (this.hovered && !this.focused) { bg = mix(th.surface_raised, th.on_surface, 0.04); }
+        s.fill_round(this.bounds, radius, bg);
+        let border = th.border;
+        if (this.focused) {
+            // focus = accent-tinted border + soft glow just outside
+            border = th.primary;
+            paint_focus_ring(s, th, this.bounds, radius);
+        } else if (this.hovered) {
+            border = mix(th.border, th.on_surface, 0.20);
+        }
+        s.stroke_round(this.bounds, radius, 1, border);
+        let text_col = th.on_surface;
         if (this.text.len == 0 && !this.focused) {
-            s.text_in(this.bounds, 8, this.placeholder, th.muted);
+            s.text_in(this.bounds, 8, this.placeholder, th.on_surface_muted);
         } else {
-            s.text_in(this.bounds, 8, this.text, th.ink);
+            s.set_weight(WEIGHT_REG);
+            s.text_in(this.bounds, 8, this.text, text_col);
         }
         if (this.focused) {
             let cx = this.bounds.x + 8 + s.text_width(this.text.slice(0, this.caret));
             let cy = this.bounds.y + (this.bounds.h - s.font_height()) / 2;
-            s.fill(Rect(cx, cy, 1, s.font_height()), th.ink);
+            s.fill(Rect(cx, cy, 1, s.font_height()), th.primary);
         }
     }
 
@@ -201,19 +231,29 @@ export class Checkbox extends Widget {
     }
 
     override fn draw(s: Painter, th: Theme) {
-        let box = 14;
+        let box = 16;
         let by = this.bounds.y + (this.bounds.h - box) / 2;
         let br = Rect(this.bounds.x, by, box, box);
-        s.fill(br, th.white);
-        let border = th.muted;
-        if (this.focused) { border = th.accent; }
-        s.frame(br, border);
+        let radius = th.radius_sm;
+        // filled state uses primary; unchecked uses a raised surface with border
+        let bg = th.surface_raised;
+        if (this.checked) { bg = th.primary; }
+        else if (this.hovered) { bg = mix(th.surface_raised, th.on_surface, 0.05); }
+        s.fill_round(br, radius, bg);
+        let border = th.border;
+        if (this.checked) { border = th.primary; }
+        else if (this.hovered) { border = mix(th.border, th.on_surface, 0.20); }
+        s.stroke_round(br, radius, 1, border);
         if (this.checked) {
-            s.fill(Rect(br.x + 3, br.y + 3, box - 6, box - 6), th.accent);
+            // filled check mark (a small rounded inner square approximating a tick)
+            s.fill_round(Rect(br.x + 4, br.y + 4, box - 8, box - 8), radius, th.on_primary);
         }
+        if (this.focused) { paint_focus_ring(s, th, br, radius); }
         let tr = Rect(this.bounds.x + box + 6, this.bounds.y,
                       this.bounds.w - box - 6, this.bounds.h);
-        s.text_in(tr, 0, this.label, th.ink);
+        s.set_weight(th.type_body_weight);
+        s.text_in(tr, 0, this.label, th.on_surface);
+        s.set_weight(WEIGHT_REG);
     }
 
     override fn on_click(x: int, y: int): bool {
@@ -288,13 +328,17 @@ export class ListBox extends Widget {
     }
 
     override fn draw(s: Painter, th: Theme) {
-        s.fill(this.bounds, th.white);
-        let border = th.muted;
-        if (this.focused) { border = th.accent; }
-        s.frame(this.bounds, border);
+        let radius = th.radius_md;
+        s.fill_round(this.bounds, radius, th.surface_raised);
+        let border = th.border;
+        if (this.focused) {
+            border = th.primary;
+            paint_focus_ring(s, th, this.bounds, radius);
+        }
+        s.stroke_round(this.bounds, radius, 1, border);
         let b = this.bounds;
         if (this.items.len == 0) {
-            s.text_in(b, 8, "nothing here yet", th.muted);
+            s.text_in(b, 8, "nothing here yet", th.on_surface_muted);
             return;
         }
         let vis = this.visible_rows();
@@ -303,13 +347,15 @@ export class ListBox extends Widget {
             if (idx >= this.items.len) { break; }
             let r = Rect(b.x + 1, b.y + 1 + i * ROW_H, b.w - 2, ROW_H);
             if (idx == this.selected) {
-                s.fill(r, th.sel);
+                // selection pill: a rounded secondary fill inset from the row
+                let pr = Rect(r.x + 2, r.y + 2, r.w - 4, r.h - 4);
+                s.fill_round(pr, th.radius_sm, th.selection);
             }
             let mark = "[ ] ";
-            let color = th.ink;
+            let color = th.on_surface;
             if (this.checked[idx]) {
                 mark = "[x] ";
-                color = th.muted;
+                color = th.on_surface_muted;
             }
             s.text_in(r, 8, mark + this.items[idx], color);
         }
@@ -628,10 +674,15 @@ export class TextArea extends Widget {
             this.top = caret_vrow - this.view_rows + 1;
         }
 
-        s.fill(this.bounds, th.white);
-        let border = th.muted;
-        if (this.focused) { border = th.accent; }
-        s.frame(this.bounds, border);
+        s.fill_round(this.bounds, th.radius_md, th.surface_raised);
+        let border = th.border;
+        if (this.focused) {
+            border = th.primary;
+            paint_focus_ring(s, th, this.bounds, th.radius_md);
+        }
+        s.stroke_round(this.bounds, th.radius_md, 1, border);
+        // mask overflow so wrapped/long rows don't paint past the rounded box
+        s.clip_push(this.bounds, th.radius_md);
 
         let ox = this.bounds.x + TA_PAD;
         let asc = s.font_ascent();
@@ -662,8 +713,9 @@ export class TextArea extends Widget {
             let caret_piece = line.slice(col, this.caret_col);
             let cx = ox + s.text_width(caret_piece);
             let cy = this.bounds.y + TA_PAD + (caret_vrow - this.top) * this.line_h;
-            s.fill(Rect(cx, cy, 1, this.line_h), th.ink);
+            s.fill(Rect(cx, cy, 1, this.line_h), th.primary);
         }
+        s.clip_pop();
     }
 
     override fn drop_handlers() {
@@ -697,21 +749,26 @@ export class RadioButton extends Widget {
     }
 
     override fn draw(s: Painter, th: Theme) {
-        let box = 14;
+        let box = 16;
         let by = this.bounds.y + (this.bounds.h - box) / 2;
         let cx = this.bounds.x + box / 2;
         let cy = by + box / 2;
-        // circle outline
-        let border = th.muted;
-        if (this.focused) { border = th.accent; }
-        s.frame(Rect(this.bounds.x, by, box, box), border);
+        let r = box / 2;
+        // outer ring
+        let ring_col = th.border;
+        if (this.selected) { ring_col = th.primary; }
+        else if (this.hovered) { ring_col = mix(th.border, th.on_surface, 0.20); }
+        s.stroke_circle(cx, cy, r - 1, 2, ring_col);
         if (this.selected) {
             // filled dot
-            s.fill(Rect(cx - 3, cy - 3, 6, 6), th.accent);
+            s.circle(cx, cy, 4, th.primary);
         }
+        if (this.focused) { paint_focus_ring(s, th, Rect(this.bounds.x, by, box, box), box / 2); }
         let tr = Rect(this.bounds.x + box + 6, this.bounds.y,
                       this.bounds.w - box - 6, this.bounds.h);
-        s.text_in(tr, 0, this.label, th.ink);
+        s.set_weight(th.type_body_weight);
+        s.text_in(tr, 0, this.label, th.on_surface);
+        s.set_weight(WEIGHT_REG);
     }
 
     override fn on_click(x: int, y: int): bool {
@@ -828,25 +885,29 @@ export class Switch extends Widget {
         let bx = this.bounds.x;
         let by = this.bounds.y + (this.bounds.h - sh) / 2;
         let br = Rect(bx, by, sw, sh);
-        if (this.on) {
-            s.fill(br, th.accent);
-        } else {
-            s.fill(br, th.muted);
-        }
-        // knob
+        let radius = sh / 2;    // a true pill
+        let track = th.neutral_300;
+        if (this.on) { track = th.primary; }
+        else if (this.hovered) { track = mix(th.neutral_300, th.on_surface, 0.18); }
+        if (this.on && this.pressed) { track = th.primary_press; }
+        s.fill_round(br, radius, track);
+        // knob — a circular thumb inset 2px, AA on the rich tier
         let kw = sh - 4;
-        let kx = bx + 2;
-        if (this.on) { kx = bx + sw - kw - 2; }
-        let ky = by + 2;
-        s.fill(Rect(kx, ky, kw, kw), th.white);
-        if (this.focused) {
-            s.frame(br, th.ink);
-        }
+        let kx = bx + 2 + kw / 2;
+        if (this.on) { kx = bx + sw - 2 - kw / 2; }
+        let ky = by + sh / 2;
+        s.circle(kx, ky, kw / 2, th.surface_raised);
+        // subtle stroke around the knob on the rich tier so it separates from
+        // a same-color track when off
+        s.stroke_circle(kx, ky, kw / 2, 1, th.border);
+        if (this.focused) { paint_focus_ring(s, th, br, radius); }
         // label
         let lbl = "off";
         if (this.on) { lbl = "on"; }
         let lr = Rect(bx + sw + 6, this.bounds.y, this.bounds.w - sw - 6, this.bounds.h);
-        s.text_in(lr, 0, lbl, th.ink);
+        s.set_weight(th.type_body_weight);
+        s.text_in(lr, 0, lbl, th.on_surface);
+        s.set_weight(WEIGHT_REG);
     }
 
     override fn on_click(x: int, y: int): bool {
@@ -907,27 +968,41 @@ export class SegmentedControl extends Widget {
         let sh = this.bounds.h;
         let x0 = this.bounds.x;
         let w = this.bounds.w;
+        let radius = th.radius_md;
+        // backdrop pill: surface_sunken track the segments sit in
+        s.fill_round(this.bounds, radius, th.surface_sunken);
         // Segments split the full control width evenly (integer math avoids
-        // rounding gaps between adjacent cells).
+        // rounding gaps between adjacent cells). The selected segment is a
+        // rounded primary pill; the others are transparent.
+        let seg_in = 2;
         for (let i in 0..n) {
             let sx = x0 + i * w / n;
             let sxn = x0 + (i + 1) * w / n;
-            let sr = Rect(sx, this.bounds.y, sxn - sx, sh);
+            let sr = Rect(sx + seg_in, this.bounds.y + seg_in,
+                          sxn - sx - 2 * seg_in, sh - 2 * seg_in);
             if (i == this.selected) {
-                s.fill(sr, th.accent);
-                s.text_in(sr, 10, this.labels[i], th.white);
+                let top = th.primary;
+                if (this.pressed) { top = th.primary_press; }
+                s.gradient_v(sr, radius, top, th.primary_700);
+                s.set_weight(WEIGHT_BOLD);
+                s.text_in(sr, 0, this.labels[i], th.on_primary);
+                s.set_weight(WEIGHT_REG);
             } else {
-                s.fill(sr, th.white);
-                s.text_in(sr, 10, this.labels[i], th.ink);
-            }
-            if (i < n - 1) {
-                s.line(sr.x + sr.w, sr.y, sr.x + sr.w, sr.y + sr.h, th.muted);
+                let col = th.on_surface_muted;
+                if (this.hovered) {
+                    col = mix(th.on_surface, th.primary, 0.18);
+                }
+                s.text_in(sr, 0, this.labels[i], col);
             }
         }
-        s.frame(this.bounds, th.muted);
-        if (this.focused) {
-            s.frame(this.bounds, th.accent);
-        }
+        if (this.focused) { paint_focus_ring(s, th, this.bounds, radius); }
+    }
+
+    // hit-test a segment index from absolute x — used for per-segment hover.
+    fn hit_test_seg(i: int): bool {
+        let n = this.labels.len;
+        if (n == 0 || this.bounds.w <= 0) { return false; }
+        return this.hovered;
     }
 
     fn pick(i: int) {
@@ -1013,29 +1088,30 @@ export class Stepper extends Widget {
         this.cached_btn_w = this.btn_w(s);
         let bh = s.font_height() + 12;
         let by = this.bounds.y + (this.bounds.h - bh) / 2;
+        let radius = th.radius_md;
         // Three equal columns fill the control width: [ - | value | + ].
         let x0 = this.bounds.x;
         let w = this.bounds.w;
         let t1 = x0 + w / 3;
         let t2 = x0 + 2 * w / 3;
-        // minus
+        // shared surface: a single rounded panel with the value centered
+        s.fill_round(this.bounds, radius, th.surface_raised);
+        s.stroke_round(this.bounds, radius, 1, th.border);
+        // minus / plus buttons read as soft square icons
         let mr = Rect(x0, by, t1 - x0, bh);
-        s.fill(mr, th.white);
-        s.frame(mr, th.muted);
-        s.text_in(mr, 8, "-", th.ink);
+        let pr = Rect(t2, by, x0 + w - t2, bh);
+        let mr_col = th.on_surface;
+        if (this.hovered) { mr_col = mix(th.on_surface, th.primary, 0.20); }
+        s.set_weight(WEIGHT_BOLD);
+        s.text_in(mr, 0, "-", mr_col);
+        s.text_in(pr, 0, "+", mr_col);
+        s.set_weight(WEIGHT_REG);
         // value
         let vr = Rect(t1, by, t2 - t1, bh);
-        s.fill(vr, th.white);
-        s.frame(vr, th.muted);
-        s.text_in(vr, 8, "" + this.value, th.ink);
-        // plus
-        let pr = Rect(t2, by, x0 + w - t2, bh);
-        s.fill(pr, th.white);
-        s.frame(pr, th.muted);
-        s.text_in(pr, 8, "+", th.ink);
-        if (this.focused) {
-            s.frame(this.bounds, th.accent);
-        }
+        s.set_weight(WEIGHT_BOLD);
+        s.text_in(vr, 0, "" + this.value, th.on_surface);
+        s.set_weight(WEIGHT_REG);
+        if (this.focused) { paint_focus_ring(s, th, this.bounds, radius); }
     }
 
     override fn on_click(x: int, y: int): bool {
@@ -1099,20 +1175,30 @@ export class Dropdown extends Widget {
     }
 
     override fn draw(s: Painter, th: Theme) {
-        s.fill(this.bounds, th.white);
-        let border = th.muted;
-        if (this.focused) { border = th.accent; }
-        s.frame(this.bounds, border);
+        let radius = th.radius_md;
+        let bg = th.surface_raised;
+        if (this.hovered) { bg = mix(th.surface_raised, th.on_surface, 0.04); }
+        s.fill_round(this.bounds, radius, bg);
+        let border = th.border;
+        if (this.focused) {
+            border = th.primary;
+            paint_focus_ring(s, th, this.bounds, radius);
+        } else if (this.hovered) {
+            border = mix(th.border, th.on_surface, 0.20);
+        }
+        s.stroke_round(this.bounds, radius, 1, border);
         let label = "";
         if (this.selected >= 0 && this.selected < this.items.len) {
             label = this.items[this.selected];
         }
-        s.text_in(this.bounds, 8, label, th.ink);
-        // arrow
+        s.set_weight(th.type_body_weight);
+        s.text_in(this.bounds, 8, label, th.on_surface);
+        s.set_weight(WEIGHT_REG);
+        // arrow (a small chevron drawn with text)
         let aw = s.text_width("v");
         let ar = Rect(this.bounds.x + this.bounds.w - aw - 8, this.bounds.y,
                       aw + 8, this.bounds.h);
-        s.text_in(ar, 0, "v", th.muted);
+        s.text_in(ar, 0, "v", th.on_surface_muted);
     }
 
     override fn on_click(x: int, y: int): bool {
@@ -1170,13 +1256,22 @@ class DropdownPopup extends Widget {
     }
 
     override fn draw(s: Painter, th: Theme) {
-        s.fill(this.bounds, th.white);
-        s.frame(this.bounds, th.muted);
+        let radius = th.radius_md;
+        // elevated dropdown menu: a soft shadow trails the panel
+        s.shadow(this.bounds, radius, th.elevation2_blur, th.elevation2_dy, th.shadow_color);
+        s.fill_round(this.bounds, radius, th.surface_raised);
+        s.stroke_round(this.bounds, radius, 1, th.border);
         for (let i in 0..this.dd.items.len) {
-            let r = Rect(this.bounds.x + 1, this.bounds.y + 1 + i * this.row_h,
-                         this.bounds.w - 2, this.row_h);
-            if (i == this.sel) { s.fill(r, th.sel); }
-            s.text_in(r, 8, this.dd.items[i], th.ink);
+            let r = Rect(this.bounds.x + 2, this.bounds.y + 1 + i * this.row_h,
+                         this.bounds.w - 4, this.row_h);
+            if (i == this.sel) {
+                s.fill_round(r, th.radius_sm, th.selection);
+                s.set_weight(WEIGHT_BOLD);
+                s.text_in(r, 8, this.dd.items[i], th.primary);
+                s.set_weight(WEIGHT_REG);
+            } else {
+                s.text_in(r, 8, this.dd.items[i], th.on_surface);
+            }
         }
     }
 
@@ -1224,15 +1319,17 @@ export class ProgressBar extends Widget {
     }
 
     override fn draw(s: Painter, th: Theme) {
-        let bg = this.bg;
-        if (bg < 0) { bg = th.muted; }
-        s.fill(this.bounds, bg);
+        let radius = th.radius_md;
+        let track = this.bg;
+        if (track < 0) { track = th.surface_sunken; }
+        s.fill_round(this.bounds, radius, track);
         let fw = (this.bounds.w as float * this.progress) as int;
-        if (fw > 0) {
+        if (fw > 2) {
             let f = this.fill;
-            if (f < 0) { f = th.accent; }
-            s.fill(Rect(this.bounds.x, this.bounds.y, fw, this.bounds.h), f);
+            if (f < 0) { f = th.primary; }
+            // gradient fill for depth (rich tier); the leading edge stays rounded
+            let fr = Rect(this.bounds.x, this.bounds.y, fw, this.bounds.h);
+            s.gradient_v(fr, radius, f, th.primary_700);
         }
-        s.frame(this.bounds, th.muted);
     }
 }

@@ -1,8 +1,9 @@
 // volt/ui/nav — navigation widgets: Tabs/TabView, Accordion/Expander,
 // Toolbar, StatusBar.
 
-import { Widget, Painter, Theme, Size, BoxConstraints, bcLoose } from "volt/ui/core";
-import { Rect, contains, KEY_LEFT, KEY_RIGHT } from "volt/surface";
+import { Widget, Painter, Theme, Size, BoxConstraints, bcLoose,
+         WEIGHT_REG, WEIGHT_BOLD, paint_focus_ring } from "volt/ui/core";
+import { Rect, contains, mix, KEY_LEFT, KEY_RIGHT } from "volt/surface";
 
 // ------------------------------------------------------- Tabs / TabView
 
@@ -121,7 +122,7 @@ export class TabView extends Widget {
 
     override fn draw_chrome(s: Painter, th: Theme) {
         // tab strip background
-        s.fill(Rect(this.bounds.x, this.bounds.y, this.bounds.w, this.tab_h), th.bg);
+        s.fill(Rect(this.bounds.x, this.bounds.y, this.bounds.w, this.tab_h), th.surface);
         let x = this.bounds.x;
         let xs: int[] = [];
         let ws: int[] = [];
@@ -131,18 +132,26 @@ export class TabView extends Widget {
             ws.push(tw);
             let tr = Rect(x, this.bounds.y, tw, this.tab_h);
             if (i == this.active) {
-                s.fill(tr, th.white);
-                s.text_in(tr, 10, this.tab_labels[i], th.accent);
+                s.set_weight(WEIGHT_BOLD);
+                s.text_in(tr, 10, this.tab_labels[i], th.on_surface);
+                s.set_weight(WEIGHT_REG);
+                // active-tab accent underline
+                let uw = tw - 20;
+                if (uw < 0) { uw = tw; }
+                let ux = x + 10;
+                s.fill(Rect(ux, this.bounds.y + this.tab_h - 3, uw, 3), th.primary);
             } else {
-                s.text_in(tr, 10, this.tab_labels[i], th.muted);
+                let col = th.on_surface_muted;
+                if (this.hovered) { col = mix(th.on_surface_muted, th.on_surface, 0.35); }
+                s.text_in(tr, 10, this.tab_labels[i], col);
             }
             x += tw;
         }
         this.tab_x = xs;
         this.tab_w_arr = ws;
-        // separator line
+        // separator hairline under the strip
         s.line(this.bounds.x, this.bounds.y + this.tab_h,
-               this.bounds.x + this.bounds.w, this.bounds.y + this.tab_h, th.muted);
+               this.bounds.x + this.bounds.w, this.bounds.y + this.tab_h, th.divider);
     }
 
     // Only the active panel participates in hit-testing — inactive panels
@@ -284,10 +293,14 @@ export class Accordion extends Widget {
         }
         for (let i in 0..this.titles.len) {
             let hr = Rect(this.bounds.x, y, this.bounds.w, hh);
-            s.fill(hr, th.white);
-            let arrow = "+";
-            if (this.expanded[i]) { arrow = "-"; }
-            s.text_in(hr, 8, arrow + " " + this.titles[i], th.ink);
+            let header_bg = th.surface_raised;
+            if (this.hovered) { header_bg = mix(th.surface_raised, th.on_surface, 0.04); }
+            s.fill(hr, header_bg);
+            let arrow = ">";    // collapsed chevron
+            if (this.expanded[i]) { arrow = "v"; }   // expanded chevron
+            s.set_weight(WEIGHT_BOLD);
+            s.text_in(hr, 8, arrow + "  " + this.titles[i], th.on_surface);
+            s.set_weight(WEIGHT_REG);
             y += hh;
             if (this.expanded[i] && i < this.children.len) {
                 let cs = this.children[i].measure(s, th);
@@ -296,7 +309,7 @@ export class Accordion extends Widget {
                 chs[i] = cs.h;
                 y += cs.h + th.spacing;
             }
-            s.line(this.bounds.x, y, this.bounds.x + this.bounds.w, y, th.muted);
+            s.line(this.bounds.x, y, this.bounds.x + this.bounds.w, y, th.divider);
         }
         this.cached_child_h = chs;
     }
@@ -362,9 +375,9 @@ export class Toolbar extends Widget {
     }
 
     override fn draw(s: Painter, th: Theme) {
-        s.fill(this.bounds, th.bg);
-        s.line(this.bounds.x, this.bounds.y + this.bounds.h - 1,
-               this.bounds.x + this.bounds.w, this.bounds.y + this.bounds.h - 1, th.muted);
+        s.fill(this.bounds, th.surface_raised);
+        s.line(this.bounds.x, this.bounds.y,
+               this.bounds.x + this.bounds.w, this.bounds.y, th.divider);
         for (let c in this.children) { c.draw(s, th); }
     }
 }
@@ -393,13 +406,13 @@ export class StatusBar extends Widget {
     }
 
     override fn draw(s: Painter, th: Theme) {
-        s.fill(this.bounds, th.bg);
+        s.fill(this.bounds, th.surface);
         s.line(this.bounds.x, this.bounds.y,
-               this.bounds.x + this.bounds.w, this.bounds.y, th.muted);
+               this.bounds.x + this.bounds.w, this.bounds.y, th.divider);
         s.text_in(Rect(this.bounds.x + 8, this.bounds.y,
-                       this.bounds.w / 2, this.bounds.h), 0, this.left_text, th.muted);
+                       this.bounds.w / 2, this.bounds.h), 0, this.left_text, th.on_surface_muted);
         let rw = s.text_width(this.right_text);
         s.text_in(Rect(this.bounds.x + this.bounds.w - rw - 8, this.bounds.y,
-                       rw + 8, this.bounds.h), 0, this.right_text, th.muted);
+                       rw + 8, this.bounds.h), 0, this.right_text, th.on_surface_muted);
     }
 }

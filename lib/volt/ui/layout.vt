@@ -668,7 +668,56 @@ export class ClippedPainter extends Painter {
         this.inner.text_in(cr, np, s, color);
     }
 
+    // Widened-vocabulary passes-through: intersect the rounded/circle rects and
+    // forward; the inner painter does its own clipping for what it can.
+    override fn fill_round(r: Rect, radius: int, color: int) {
+        let cr = this.intersect(r);
+        if (cr.w > 0 && cr.h > 0) {
+            // shrink the radius to the smaller clipped dimension if needed
+            let rd = radius;
+            if (cr.w < 2 * rd) { rd = cr.w / 2; }
+            if (cr.h < 2 * rd) { rd = cr.h / 2; }
+            this.inner.fill_round(cr, rd, color);
+        }
+    }
+
+    override fn stroke_round(r: Rect, radius: int, width: int, color: int) {
+        // stroke overflows the rect; only forward when the rect is at least
+        // partially inside (the strokes around the clipped-inset rect leak a
+        // little at the clip edge — acceptable degraded clip on the lean tier).
+        if (this.intersect(r).w > 0) { this.inner.stroke_round(r, radius, width, color); }
+    }
+
+    override fn circle(cx: int, cy: int, radius: int, color: int) {
+        let r = Rect(cx - radius, cy - radius, radius * 2, radius * 2);
+        if (this.intersect(r).w > 0) { this.inner.circle(cx, cy, radius, color); }
+    }
+
+    override fn stroke_circle(cx: int, cy: int, radius: int, width: int, color: int) {
+        let r = Rect(cx - radius, cy - radius, radius * 2, radius * 2);
+        if (this.intersect(r).w > 0) { this.inner.stroke_circle(cx, cy, radius, width, color); }
+    }
+
+    override fn gradient_v(r: Rect, radius: int, top: int, bottom: int) {
+        let cr = this.intersect(r);
+        if (cr.w > 0 && cr.h > 0) { this.inner.gradient_v(cr, radius, top, bottom); }
+    }
+
+    override fn shadow(r: Rect, radius: int, blur: int, dy: int, color: int) {
+        // soft shadow: forward only when its anchor rect intersects the clip
+        if (this.intersect(r).w > 0) { this.inner.shadow(r, radius, blur, dy, color); }
+    }
+
+    // Nested clip: push another rect clip intersected with this painter's clip.
+    override fn clip_push(r: Rect, radius: int) {
+        let cr = this.intersect(r);
+        this.inner.clip_push(cr, radius);
+    }
+
+    override fn clip_pop() { this.inner.clip_pop(); }
+
     // Metrics — pass through unchanged.
+    override fn set_weight(w: int) { this.inner.set_weight(w); }
     override fn text_width(s: string): int { return this.inner.text_width(s); }
     override fn font_ascent(): int { return this.inner.font_ascent(); }
     override fn font_height(): int { return this.inner.font_height(); }
