@@ -249,6 +249,104 @@ void *vt_alloc(size_t size, const VtType *type) {
     return o;
 }
 
+/* ---- auto-zeroing weak references ----
+   A `weak` field stores a raw, non-owning T*. We record the address of every
+   such slot in a side table keyed by the target object; when the target is
+   freed, every slot that pointed at it is nulled. A stale weak read then yields
+   null (a clean crash on use) instead of a dangling pointer into freed memory.
+   Single-threaded: the table is unguarded, matching the current RC model. */
+typedef struct WeakNode {
+    void **slot;
+    struct WeakNode *next;
+} WeakNode;
+
+typedef struct WeakEntry {
+    void *target;
+    WeakNode *slots;
+    struct WeakEntry *next; /* bucket chain */
+} WeakEntry;
+
+#define VT_WEAK_BUCKETS 1024
+static WeakEntry *vt_weak_tab[VT_WEAK_BUCKETS];
+static int64_t vt_weak_live; /* registered slots; 0 => release skips the probe */
+
+static size_t weak_hash(void *p) {
+    uintptr_t x = (uintptr_t)p >> 4; /* drop alignment bits */
+    return (size_t)(x & (VT_WEAK_BUCKETS - 1));
+}
+
+static void weak_detach(void **slot, void *target) {
+    WeakEntry **pe = &vt_weak_tab[weak_hash(target)];
+    for (WeakEntry *e = *pe; e; pe = &e->next, e = e->next) {
+        if (e->target != target) continue;
+        for (WeakNode **pn = &e->slots; *pn; pn = &(*pn)->next) {
+            if ((*pn)->slot == slot) {
+                WeakNode *n = *pn;
+                *pn = n->next;
+                vt_host_free(n);
+                vt_weak_live--;
+                break;
+            }
+        }
+        if (!e->slots) { *pe = e->next; vt_host_free(e); }
+        return;
+    }
+}
+
+static void weak_attach(void **slot, void *target) {
+    size_t h = weak_hash(target);
+    WeakEntry *e = vt_weak_tab[h];
+    for (; e; e = e->next) if (e->target == target) break;
+    if (!e) {
+        e = vt_host_alloc(sizeof *e);
+        if (!e) vt_oom();
+        e->target = target;
+        e->next = vt_weak_tab[h];
+        vt_weak_tab[h] = e;
+    }
+    WeakNode *n = vt_host_alloc(sizeof *n);
+    if (!n) vt_oom();
+    n->slot = slot;
+    n->next = e->slots;
+    e->slots = n;
+    vt_weak_live++;
+}
+
+/* Assign `target` into a weak slot, keeping the registry in step. */
+void vt_weak_set(void **slot, void *target) {
+    void *old = *slot;
+    if (old == target) return;
+    if (old) weak_detach(slot, old);
+    *slot = target;
+    if (target) weak_attach(slot, target);
+}
+
+/* Unregister a weak slot whose owner is being torn down, so the registry never
+   holds the address of freed memory. Called from a class deinit per weak field. */
+void vt_weak_drop(void **slot) {
+    void *old = *slot;
+    if (old) weak_detach(slot, old);
+    *slot = 0;
+}
+
+/* Null every weak slot pointing at `target`; called as `target` is freed. */
+static void vt_weak_on_free(void *target) {
+    WeakEntry **pe = &vt_weak_tab[weak_hash(target)];
+    for (WeakEntry *e = *pe; e; pe = &e->next, e = e->next) {
+        if (e->target != target) continue;
+        for (WeakNode *n = e->slots; n;) {
+            WeakNode *nx = n->next;
+            *n->slot = 0;
+            vt_host_free(n);
+            vt_weak_live--;
+            n = nx;
+        }
+        *pe = e->next;
+        vt_host_free(e);
+        return;
+    }
+}
+
 void vt_release(void *p) {
     if (!p) return;
     VtObj *o = (VtObj *)p;
@@ -258,11 +356,13 @@ void vt_release(void *p) {
        concurrent releaser's writes are visible to the thread that frees. */
     if (__atomic_fetch_sub(&o->rc, 1, __ATOMIC_RELEASE) == 1) {
         __atomic_thread_fence(__ATOMIC_ACQUIRE);
+        if (vt_weak_live) vt_weak_on_free(o);
         if (o->type && o->type->deinit) o->type->deinit(o);
         vt_host_free(o);
     }
 #else
     if (--o->rc == 0) {
+        if (vt_weak_live) vt_weak_on_free(o);
         if (o->type && o->type->deinit) o->type->deinit(o);
         vt_host_free(o);
     }
@@ -323,6 +423,38 @@ static void vt_overflow(const char *file, int line, const char *op) {
     char msg[64];
     vt_snprintf(msg, sizeof msg, "integer overflow in '%s'", op);
     vt_panic_c(file, line, msg);
+}
+
+static void vt_div_zero(const char *file, int line, const char *op) {
+    char msg[64];
+    vt_snprintf(msg, sizeof msg, "division by zero in '%s'", op);
+    vt_panic_c(file, line, msg);
+}
+
+/* Signed divide/modulo: trap zero divisor (would SIGFPE) and the INT_MIN/-1
+   overflow (C UB), then range-check the quotient against the target type. */
+int64_t vt_ck_div(int64_t a, int64_t b, int64_t lo, int64_t hi, const char *file, int line) {
+    if (b == 0) vt_div_zero(file, line, "/");
+    if (b == -1 && a == INT64_MIN) vt_overflow(file, line, "/");
+    int64_t r = a / b;
+    if (r < lo || r > hi) vt_overflow(file, line, "/");
+    return r;
+}
+
+int64_t vt_ck_mod(int64_t a, int64_t b, const char *file, int line) {
+    if (b == 0) vt_div_zero(file, line, "%");
+    if (b == -1) return 0; /* a % -1 is 0; dodge the INT_MIN/-1 UB */
+    return a % b;
+}
+
+uint64_t vt_ck_udiv(uint64_t a, uint64_t b, const char *file, int line) {
+    if (b == 0) vt_div_zero(file, line, "/");
+    return a / b;
+}
+
+uint64_t vt_ck_umod(uint64_t a, uint64_t b, const char *file, int line) {
+    if (b == 0) vt_div_zero(file, line, "%");
+    return a % b;
 }
 
 int64_t vt_ck_add(int64_t a, int64_t b, int64_t lo, int64_t hi, const char *file, int line) {

@@ -959,6 +959,23 @@ static char *ex(Em *em, Expr *e, bool *fresh) {
                                 ex_b(em, e->lhs), ex_b(em, e->rhs), lo, hi,
                                 c_escape(e->loc.file, strlen(e->loc.file)), e->loc.line);
         }
+        /* integer divide/modulo: guard zero divisor (SIGFPE) and INT_MIN/-1 (UB) */
+        if (g_checks && (e->op == T_SLASH || e->op == T_PERCENT) && type_is_int(e->type)) {
+            const char *esc = c_escape(e->loc.file, strlen(e->loc.file));
+            if (type_unsigned_int(e->type)) {
+                const char *fn = e->op == T_SLASH ? "vt_ck_udiv" : "vt_ck_umod";
+                return arena_printf(&g_arena, "((%s)%s(%s, %s, \"%s\", %d))", c_type(e->type), fn,
+                                    ex_b(em, e->lhs), ex_b(em, e->rhs), esc, e->loc.line);
+            }
+            if (e->op == T_PERCENT)
+                return arena_printf(&g_arena, "((%s)vt_ck_mod(%s, %s, \"%s\", %d))", c_type(e->type),
+                                    ex_b(em, e->lhs), ex_b(em, e->rhs), esc, e->loc.line);
+            const char *dlo = "INT64_MIN", *dhi = "INT64_MAX";
+            int_bounds(e->type, &dlo, &dhi);
+            return arena_printf(&g_arena, "((%s)vt_ck_div(%s, %s, %s, %s, \"%s\", %d))",
+                                c_type(e->type), ex_b(em, e->lhs), ex_b(em, e->rhs), dlo, dhi, esc,
+                                e->loc.line);
+        }
         /* shifts: guard the amount (negative / >= width is C UB) */
         if (g_checks && (e->op == T_SHL || e->op == T_SHR) && type_is_int(e->type)) {
             const char *fn = e->op == T_SHL ? "vt_ck_shl"
@@ -1223,7 +1240,7 @@ static void emit_assign(Em *em, Expr *e) {
         }
         if (weak) {
             ind(em);
-            sb_printf(em->out, "%s = %s;\n", slot, ex_v(em, e->rhs, f->type));
+            sb_printf(em->out, "vt_weak_set((void**)&%s, %s);\n", slot, ex_v(em, e->rhs, f->type));
             return;
         }
         const char *tv = newtemp(em, lt, false);
@@ -1561,8 +1578,12 @@ static void emit_class_infra(Em *base, ClassDecl *cd, SBuf *dst) {
     }
     for (int i = 0; i < cd->nfields; i++) {
         Field *f = &cd->fields[i];
-        if (type_is_ref(f->type) && !f->type->weak)
-            sb_printf(dst, "    vt_release(self->f_%s);\n", f->name);
+        if (type_is_ref(f->type)) {
+            if (f->type->weak)
+                sb_printf(dst, "    vt_weak_drop((void**)&self->f_%s);\n", f->name);
+            else
+                sb_printf(dst, "    vt_release(self->f_%s);\n", f->name);
+        }
     }
     if (cd->parent)
         sb_printf(dst, "    %s__deinit(vself);\n", class_cname(cd->parent));

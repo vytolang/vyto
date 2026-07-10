@@ -67,6 +67,12 @@ static inline void *vt_retain(void *p) {
 /* release + null in one expression; x must be an lvalue */
 #define VT_RELEASE(x) (vt_release(x), (x) = 0)
 
+/* Auto-zeroing weak references. vt_weak_set assigns a weak field and registers
+   its slot so the target's free nulls it; vt_weak_drop unregisters a slot when
+   its owning object is torn down. Both take the slot's address. */
+void vt_weak_set(void **slot, void *target);
+void vt_weak_drop(void **slot);
+
 bool vt_isa(const void *p, const VtType *t);
 void *vt_checked_cast(void *p, const VtType *t, const char *file, int line);
 
@@ -85,6 +91,13 @@ int64_t vt_ck_add(int64_t a, int64_t b, int64_t lo, int64_t hi, const char *file
 int64_t vt_ck_sub(int64_t a, int64_t b, int64_t lo, int64_t hi, const char *file, int line);
 int64_t vt_ck_mul(int64_t a, int64_t b, int64_t lo, int64_t hi, const char *file, int line);
 int64_t vt_ck_neg(int64_t a, int64_t lo, int64_t hi, const char *file, int line);
+
+/* Checked divide/modulo: panic on a zero divisor (SIGFPE otherwise) and on the
+   INT_MIN/-1 overflow (C UB). Unsigned variants only guard the zero divisor. */
+int64_t vt_ck_div(int64_t a, int64_t b, int64_t lo, int64_t hi, const char *file, int line);
+int64_t vt_ck_mod(int64_t a, int64_t b, const char *file, int line);
+uint64_t vt_ck_udiv(uint64_t a, uint64_t b, const char *file, int line);
+uint64_t vt_ck_umod(uint64_t a, uint64_t b, const char *file, int line);
 
 /* Checked shifts: panic when the shift amount is negative or >= the operand
    width (C UB otherwise). vt_ck_shr is an arithmetic (signed) shift,
