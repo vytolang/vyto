@@ -30,22 +30,42 @@ fn derive_variant_path(regular: string, tag: string): string {
 export class GfxPainter extends Painter {
     surf: Surface;
     canvas: Canvas;
-    weight: int;    // current active weight (WeIGHT_REG/MED/BOLD)
+    weight: int;      // current active weight (WEIGHT_REG/MED/BOLD)
+    font_path: string; // kept for canvas re-creation on resize
+    font_size: float;
 
     fn init(surf: Surface, fontPath: string, fontSize: float) {
         this.surf = surf;
-        this.canvas = new Canvas(surf.width(), surf.height());
+        this.font_path = fontPath;
+        this.font_size = fontSize;
         this.weight = WEIGHT_REG;
+        this.make_canvas(surf.width(), surf.height());
+    }
+
+    fn make_canvas(w: int, h: int) {
+        this.canvas = new Canvas(w, h);
         // regular weight always loads; medium/bold are best-effort — widgets
         // fall back to regular if a variant TTF isn't on disk.
-        this.canvas.loadFontWeight(fontPath, fontSize, WEIGHT_REG);
-        if (!this.canvas.loadFontWeight(derive_variant_path(fontPath, "-Medium"), fontSize, WEIGHT_MED)) {
+        this.canvas.loadFontWeight(this.font_path, this.font_size, WEIGHT_REG);
+        if (!this.canvas.loadFontWeight(derive_variant_path(this.font_path, "-Medium"),
+                                        this.font_size, WEIGHT_MED)) {
             // reuse regular for medium so set_weight(med) never blanks text
-            this.canvas.loadFontWeight(fontPath, fontSize, WEIGHT_MED);
+            this.canvas.loadFontWeight(this.font_path, this.font_size, WEIGHT_MED);
         }
-        if (!this.canvas.loadFontWeight(derive_variant_path(fontPath, "-Bold"), fontSize, WEIGHT_BOLD)) {
-            this.canvas.loadFontWeight(derive_variant_path(fontPath, "Bold"), fontSize, WEIGHT_BOLD);
+        if (!this.canvas.loadFontWeight(derive_variant_path(this.font_path, "-Bold"),
+                                        this.font_size, WEIGHT_BOLD)) {
+            this.canvas.loadFontWeight(derive_variant_path(this.font_path, "Bold"),
+                                       this.font_size, WEIGHT_BOLD);
         }
+        this.canvas.setWeight(this.weight);
+    }
+
+    // window resized: the canvas is fixed-size, so rebuild it (and its font
+    // slots) at the new size — without this, growing the window paints into
+    // a stale-sized buffer and the new area stays garbage.
+    override fn on_resize(w: int, h: int) {
+        if (w == this.canvas.width() && h == this.canvas.height()) { return; }
+        this.make_canvas(w, h);
     }
 
     override fn fill(r: Rect, color: int) {
@@ -67,6 +87,14 @@ export class GfxPainter extends Painter {
     override fn line(x0: int, y0: int, x1: int, y1: int, color: int) {
         this.canvas.strokeLine(x0 as float, y0 as float, x1 as float, y1 as float, 1.0, color);
     }
+
+    // real anti-aliased stroke width (the base class fakes it with offsets)
+    override fn line_w(x0: int, y0: int, x1: int, y1: int, width: int, color: int) {
+        this.canvas.strokeLine(x0 as float, y0 as float, x1 as float, y1 as float,
+                               width as float, color);
+    }
+
+    override fn can_clip(): bool { return true; }
 
     // -- widened vocabulary (WS2) ------------------------------------------------
     override fn fill_round(r: Rect, radius: int, color: int) {
@@ -185,11 +213,30 @@ export class GfxPainter extends Painter {
     override fn width(): int { return this.canvas.width(); }
     override fn height(): int { return this.canvas.height(); }
 
-    // rasterize the frame and blit it to the window
+    // rasterize the frame and blit it to the window. blitRect is stride-aware
+    // (blend2d may align rows), so arbitrary window widths blit correctly.
     override fn present() {
         this.canvas.flush();
-        this.surf.blitPtr(this.canvas.pixels(), this.canvas.width(), this.canvas.height(),
-                          Rect(0, 0, this.canvas.width(), this.canvas.height()));
+        let w = this.canvas.width();
+        let h = this.canvas.height();
+        this.surf.blitRect(this.canvas.pixels(), this.canvas.stride() / 4, 0, 0, w, h, 0, 0);
         this.surf.present();
+    }
+
+    // dirty-region present: rasterize, then move only the changed rect —
+    // the big per-frame win for hover/caret/animation repaints.
+    override fn present_rect(r: Rect) {
+        this.canvas.flush();
+        let x = r.x;
+        let y = r.y;
+        let w = r.w;
+        let h = r.h;
+        if (x < 0) { w += x; x = 0; }
+        if (y < 0) { h += y; y = 0; }
+        if (x + w > this.canvas.width()) { w = this.canvas.width() - x; }
+        if (y + h > this.canvas.height()) { h = this.canvas.height() - y; }
+        if (w <= 0 || h <= 0) { return; }
+        this.surf.blitRect(this.canvas.pixels(), this.canvas.stride() / 4, x, y, w, h, x, y);
+        this.surf.present_rect(Rect(x, y, w, h));
     }
 }

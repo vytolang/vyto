@@ -5,9 +5,19 @@
 import { Widget, Painter, Theme, Size, BoxConstraints, bcLoose,
          WEIGHT_REG, WEIGHT_BOLD } from "volt/ui/core";
 import { Tween } from "volt/ui/anim";
+import { utf8_prev, utf8_next } from "volt/util/helper";
 import { Rect, rgb, mix,
           KEY_ENTER, KEY_BACKSPACE, KEY_UP, KEY_DOWN, KEY_LEFT,
-          KEY_RIGHT, KEY_DELETE, KEY_HOME, KEY_END } from "volt/surface";
+          KEY_RIGHT, KEY_DELETE, KEY_HOME, KEY_END,
+          MOD_CTRL, MOD_ALT } from "volt/surface";
+
+// insertable text arrived with this key event: the surface layer only sets
+// text for printable input, and Ctrl/Alt chords are shortcuts, not typing
+fn is_text_input(w: Widget, ch: string): bool {
+    if (ch.len == 0) { return false; }
+    if (w.win != null && (w.win.mods & (MOD_CTRL | MOD_ALT)) != 0) { return false; }
+    return true;
+}
 
 export class Label extends Widget {
     text: string;
@@ -81,7 +91,8 @@ export class Button extends Widget {
 export class TextField extends Widget {
     text: string;
     placeholder: string;
-    caret: int;                 // byte index into text
+    caret: int;                 // byte index into text (UTF-8 sequence start)
+    scroll_x: int;              // horizontal pan so the caret stays visible
     onSubmit: fn(string);
 
     fn init(placeholder: string) {
@@ -89,12 +100,14 @@ export class TextField extends Widget {
         this.text = "";
         this.placeholder = placeholder;
         this.caret = 0;
+        this.scroll_x = 0;
         this.focusable = true;
     }
 
     fn set_text(t: string) {
         this.text = t;
         this.caret = t.len;
+        this.scroll_x = 0;
     }
 
     override fn measure(s: Painter, th: Theme): Size {
@@ -103,15 +116,29 @@ export class TextField extends Widget {
 
     override fn draw(s: Painter, th: Theme) {
         this.win.skin.field.paint_box(s, th, this.bounds, this.focused, this.hovered, this.win.skin);
-        let text_col = th.on_surface;
+        let pad = 8;
+        let avail = this.bounds.w - 2 * pad;
+        if (avail < 8) { avail = 8; }
+        // caret-follow horizontal scroll: keep the caret inside the box
+        let caret_off = s.text_width(this.text.slice(0, this.caret));
+        if (caret_off - this.scroll_x > avail) { this.scroll_x = caret_off - avail; }
+        if (caret_off - this.scroll_x < 0) { this.scroll_x = caret_off; }
+        let full_w = s.text_width(this.text);
+        if (full_w - this.scroll_x < avail) { this.scroll_x = full_w - avail; }
+        if (this.scroll_x < 0) { this.scroll_x = 0; }
+        // clip: long content must not paint past the rounded box
+        let inner = Rect(this.bounds.x + pad, this.bounds.y,
+                         this.bounds.w - 2 * pad, this.bounds.h);
+        s.clip_push(inner, 0);
         if (this.text.len == 0 && !this.focused) {
-            s.text_in(this.bounds, 8, this.placeholder, th.on_surface_muted);
+            s.text_in(this.bounds, pad, this.placeholder, th.on_surface_muted);
         } else {
             s.set_weight(WEIGHT_REG);
-            s.text_in(this.bounds, 8, this.text, text_col);
+            s.text_in(this.bounds, pad - this.scroll_x, this.text, th.on_surface);
         }
+        s.clip_pop();
         if (this.focused) {
-            let cx = this.bounds.x + 8 + s.text_width(this.text.slice(0, this.caret));
+            let cx = this.bounds.x + pad + caret_off - this.scroll_x;
             let cy = this.bounds.y + (this.bounds.h - s.font_height()) / 2;
             s.fill(Rect(cx, cy, 1, s.font_height()), th.primary);
         }
@@ -136,25 +163,27 @@ export class TextField extends Widget {
         }
         if (k == KEY_BACKSPACE) {
             if (this.caret > 0) {
-                this.text = this.text.slice(0, this.caret - 1)
+                let p = utf8_prev(this.text, this.caret); // whole sequence
+                this.text = this.text.slice(0, p)
                           + this.text.slice(this.caret, this.text.len);
-                this.caret -= 1;
+                this.caret = p;
             }
             return true;
         }
         if (k == KEY_DELETE) {
             if (this.caret < this.text.len) {
+                let n = utf8_next(this.text, this.caret);
                 this.text = this.text.slice(0, this.caret)
-                          + this.text.slice(this.caret + 1, this.text.len);
+                          + this.text.slice(n, this.text.len);
             }
             return true;
         }
         if (k == KEY_LEFT) {
-            if (this.caret > 0) { this.caret -= 1; }
+            if (this.caret > 0) { this.caret = utf8_prev(this.text, this.caret); }
             return true;
         }
         if (k == KEY_RIGHT) {
-            if (this.caret < this.text.len) { this.caret += 1; }
+            if (this.caret < this.text.len) { this.caret = utf8_next(this.text, this.caret); }
             return true;
         }
         if (k == KEY_HOME) {
@@ -165,10 +194,10 @@ export class TextField extends Widget {
             this.caret = this.text.len;
             return true;
         }
-        if (k >= 32 && k < 127 && ch.len > 0) {
+        if (is_text_input(this, ch)) {
             this.text = this.text.slice(0, this.caret) + ch
                       + this.text.slice(this.caret, this.text.len);
-            this.caret += 1;
+            this.caret += ch.len;
             return true;
         }
         return false;
@@ -299,6 +328,8 @@ export class ListBox extends Widget {
             return;
         }
         let vis = this.visible_rows();
+        // clip: long rows must not paint past the rounded box
+        s.clip_push(Rect(b.x + 1, b.y + 1, b.w - 2, b.h - 2), th.radius_md);
         for (let i in 0..vis) {
             let idx = this.scroll + i;
             if (idx >= this.items.len) { break; }
@@ -316,6 +347,7 @@ export class ListBox extends Widget {
             }
             s.text_in(r, 8, mark + this.items[idx], color);
         }
+        s.clip_pop();
     }
 
     override fn on_click(x: int, y: int): bool {
@@ -380,6 +412,9 @@ export class TextArea extends Widget {
     wrap_map: int[];   // visual_row -> logical_row
     wrap_col: int[];   // visual_row -> starting col within logical row
     wrap_count: int;   // total visual rows
+    rev: int;          // bumped on every edit; keys the wrap cache
+    wrapped_rev: int;  // rev the current wrap was computed at
+    wrap_w: int;       // width the current wrap was computed at
 
     fn init() {
         super.init();
@@ -391,6 +426,9 @@ export class TextArea extends Widget {
         this.wrap_map = [];
         this.wrap_col = [];
         this.wrap_count = 1;
+        this.rev = 1;
+        this.wrapped_rev = 0;
+        this.wrap_w = -1;
     }
 
     fn set_text(s: string) {
@@ -416,6 +454,7 @@ export class TextArea extends Widget {
         this.caret_row = 0;
         this.caret_col = 0;
         this.top = 0;
+        this.rev += 1;
     }
 
     fn text(): string {
@@ -428,6 +467,7 @@ export class TextArea extends Widget {
     }
 
     fn changed() {
+        this.rev += 1; // invalidate the wrap cache
         if (this.onChange != null) { this.onChange(); }
     }
 
@@ -447,10 +487,25 @@ export class TextArea extends Widget {
             }
             let col = 0;
             while (col < line.len) {
-                // try to fit as much as possible from col onward
+                // largest end with slice(col, end) fitting max_w — binary
+                // search instead of a byte-by-byte backward scan (each probe
+                // is a full text-shaping call on the rich tier)
                 let end = line.len;
-                while (end > col && s.text_width(line.slice(col, end)) > max_w) {
-                    end -= 1;
+                if (s.text_width(line.slice(col, end)) > max_w) {
+                    let lo = col + 1;
+                    let hi = line.len - 1;
+                    end = col + 1;
+                    while (lo <= hi) {
+                        let mid = (lo + hi) / 2;
+                        if (s.text_width(line.slice(col, mid)) <= max_w) {
+                            end = mid;
+                            lo = mid + 1;
+                        } else {
+                            hi = mid - 1;
+                        }
+                    }
+                    // never split a UTF-8 sequence at the wrap point
+                    while (end > col + 1 && (line[end] & 0xC0) == 0x80) { end -= 1; }
                 }
                 if (end == col) { end = col + 1; } // at least one char
                 // try to break at a space
@@ -530,9 +585,10 @@ export class TextArea extends Widget {
         }
         if (k == KEY_BACKSPACE) {
             if (this.caret_col > 0) {
-                this.lines[this.caret_row] = line.slice(0, this.caret_col - 1)
+                let p = utf8_prev(line, this.caret_col);
+                this.lines[this.caret_row] = line.slice(0, p)
                                            + line.slice(this.caret_col, line.len);
-                this.caret_col -= 1;
+                this.caret_col = p;
                 this.changed();
             } else if (this.caret_row > 0) {
                 let prev = this.lines[this.caret_row - 1];
@@ -547,8 +603,9 @@ export class TextArea extends Widget {
         }
         if (k == KEY_DELETE) {
             if (this.caret_col < line.len) {
+                let n = utf8_next(line, this.caret_col);
                 this.lines[this.caret_row] = line.slice(0, this.caret_col)
-                                           + line.slice(this.caret_col + 1, line.len);
+                                           + line.slice(n, line.len);
                 this.changed();
             } else if (this.caret_row < this.lines.len - 1) {
                 let next = this.lines[this.caret_row + 1];
@@ -559,7 +616,7 @@ export class TextArea extends Widget {
             return true;
         }
         if (k == KEY_LEFT) {
-            if (this.caret_col > 0) { this.caret_col -= 1; }
+            if (this.caret_col > 0) { this.caret_col = utf8_prev(line, this.caret_col); }
             else if (this.caret_row > 0) {
                 this.caret_row -= 1;
                 this.caret_col = this.lines[this.caret_row].len;
@@ -567,7 +624,7 @@ export class TextArea extends Widget {
             return true;
         }
         if (k == KEY_RIGHT) {
-            if (this.caret_col < line.len) { this.caret_col += 1; }
+            if (this.caret_col < line.len) { this.caret_col = utf8_next(line, this.caret_col); }
             else if (this.caret_row < this.lines.len - 1) {
                 this.caret_row += 1;
                 this.caret_col = 0;
@@ -594,10 +651,10 @@ export class TextArea extends Widget {
         }
         if (k == KEY_HOME) { this.caret_col = 0; return true; }
         if (k == KEY_END) { this.caret_col = line.len; return true; }
-        if (k >= 32 && k < 127 && ch.len > 0) {
+        if (is_text_input(this, ch)) {
             this.lines[this.caret_row] = line.slice(0, this.caret_col) + ch
                                        + line.slice(this.caret_col, line.len);
-            this.caret_col += 1;
+            this.caret_col += ch.len;
             this.changed();
             return true;
         }
@@ -621,8 +678,13 @@ export class TextArea extends Widget {
         this.view_rows = inner_h / this.line_h;
         if (this.view_rows < 1) { this.view_rows = 1; }
 
-        // compute word-wrap at the current width
-        this.compute_wrap(s, inner_w);
+        // word-wrap at the current width — cached; recomputed only when an
+        // edit bumped `rev` or the width changed (was: every draw, O(n²))
+        if (this.wrap_w != inner_w || this.wrapped_rev != this.rev) {
+            this.compute_wrap(s, inner_w);
+            this.wrap_w = inner_w;
+            this.wrapped_rev = this.rev;
+        }
 
         // keep the caret visible
         let caret_vrow = this.visual_row_of(this.caret_row, this.caret_col);
@@ -1118,11 +1180,12 @@ export class Dropdown extends Widget {
         s.set_weight(th.type_body_weight);
         s.text_in(this.bounds, 8, label, th.on_surface);
         s.set_weight(WEIGHT_REG);
-        // arrow (a small chevron drawn with text)
-        let aw = s.text_width("v");
-        let ar = Rect(this.bounds.x + this.bounds.w - aw - 8, this.bounds.y,
-                      aw + 8, this.bounds.h);
-        s.text_in(ar, 0, "v", th.on_surface_muted);
+        // chevron-down glyph (a real stroke, not the letter "v")
+        let cw = 8;
+        let cx = this.bounds.x + this.bounds.w - 12 - cw / 2;
+        let cy = this.bounds.y + this.bounds.h / 2 - 1;
+        s.line_w(cx - cw / 2, cy - 2, cx, cy + 2, 2, th.on_surface_muted);
+        s.line_w(cx, cy + 2, cx + cw / 2, cy - 2, 2, th.on_surface_muted);
     }
 
     override fn on_click(x: int, y: int): bool {
@@ -1223,9 +1286,8 @@ export class ProgressBar extends Widget {
     bg: int;
     fill: int;
     // WS9c: an animated sweep instead of a fixed fill, for "working, unknown
-    // ETA" states. Toggling this back off doesn't stop the underlying Tween
-    // (it just keeps ticking unseen) — acceptable for this scoped consumer;
-    // a real pause/stop would need this to be a setter, not a plain field.
+    // ETA" states. Toggling it off cancels the Tween on the next draw, so the
+    // event loop returns to its blocking wait.
     indeterminate: bool;
     sweep_t: float;
     tween: Tween;
@@ -1256,11 +1318,21 @@ export class ProgressBar extends Widget {
         this.win.skin.track.paint_track(s, th, this.bounds, radius, track);
         let f = this.fill;
         if (f < 0) { f = th.primary; }
+        if (!this.indeterminate && this.tween != null) {
+            // sweep switched off: stop the clock instead of ticking unseen
+            this.tween.cancel();
+            this.tween = null;
+        }
         if (this.indeterminate) {
             if (this.tween == null) {
                 this.tween = new Tween(1200, true);
+                this.tween.track_bounds = true; // dirty-repaint just the bar
+                this.tween.bounds = this.bounds;
                 let pb = this;
-                this.tween.on_tick = (t) => { pb.sweep_t = t; };
+                this.tween.on_tick = (t) => {
+                    pb.sweep_t = t;
+                    if (pb.tween != null) { pb.tween.bounds = pb.bounds; }
+                };
                 this.win.add_animation(this.tween);
             }
             let band_w = this.bounds.w / 3;

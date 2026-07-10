@@ -4,7 +4,7 @@
 
 import { Widget, Painter, Theme, Size, BoxConstraints, bcLoose, bcTight } from "volt/ui/core";
 import { Rect, contains,
-         KEY_UP, KEY_DOWN, KEY_HOME, KEY_END } from "volt/surface";
+         KEY_UP, KEY_DOWN, KEY_HOME, KEY_END, KEY_PAGEUP, KEY_PAGEDOWN } from "volt/surface";
 
 // vertical stack; children stretched to the inner width
 export class Column extends Widget {
@@ -380,7 +380,9 @@ export class Align extends Box {
     }
 }
 
-// Positioned: explicit offset/size for a child inside a Stack.
+// Positioned: offset/size for a child inside a Stack, RELATIVE to the rect
+// the Stack hands it (left/top are offsets from the stack's origin, so a
+// stack composes the same wherever it lands in the layout).
 export class Positioned extends Box {
     left: int;
     top: int;
@@ -404,19 +406,20 @@ export class Positioned extends Box {
     }
 
     override fn arrange(s: Painter, th: Theme, r: Rect) {
-        this.bounds = r;
-        let c = this.child();
-        if (c == null) { return; }
         let cw = this.w;
         let ch = this.h;
-        if (cw < 0) { cw = c.measure(s, th).w; }
-        if (ch < 0) { ch = c.measure(s, th).h; }
-        c.arrange(s, th, Rect(this.left, this.top, cw, ch));
+        let c = this.child();
+        if (cw < 0 && c != null) { cw = c.measure(s, th).w; }
+        if (ch < 0 && c != null) { ch = c.measure(s, th).h; }
+        let pr = Rect(r.x + this.left, r.y + this.top, cw, ch);
+        this.bounds = pr; // cover the child for hit-testing
+        if (c != null) { c.arrange(s, th, pr); }
     }
 }
 
-// Stack: z-layered children drawn in order; each child is arranged at its
-// natural size unless wrapped in Positioned.
+// Stack: z-layered children drawn in order. Un-Positioned children sit at
+// the stack origin at their natural size; Positioned children offset from
+// the stack origin.
 export class Stack extends Widget {
     override fn measure(s: Painter, th: Theme): Size {
         let w = 0;
@@ -432,7 +435,8 @@ export class Stack extends Widget {
     override fn arrange(s: Painter, th: Theme, r: Rect) {
         this.bounds = r;
         for (let c in this.children) {
-            c.arrange(s, th, c.bounds);
+            let cs = c.measure(s, th);
+            c.arrange(s, th, Rect(r.x, r.y, cs.w, cs.h));
         }
     }
 }
@@ -449,30 +453,41 @@ export class Wrap extends Widget {
         for (let k in kids) { this.add(k); }
     }
 
+    // Natural size: everything on one line — measure() has no available
+    // width to wrap against. layout(bc) reports the real wrapped size.
     override fn measure(s: Painter, th: Theme): Size {
         let w = 0;
-        let h = 0;
-        let line_w = 0;
         let line_h = 0;
         let n = this.children.len;
-        for (let i in 0..n) {
-            let c = this.children[i];
+        for (let c in this.children) {
             let cs = c.measure(s, th);
-            if (line_w + cs.w > w && line_w > 0) {
-                // wrap
-                if (line_w > w) { w = line_w; }
-                h += line_h + this.line_spacing;
-                line_w = cs.w;
-                line_h = cs.h;
-            } else {
-                if (line_w > 0) { line_w += this.spacing; }
-                line_w += cs.w;
-                if (cs.h > line_h) { line_h = cs.h; }
-            }
+            w += cs.w;
+            if (cs.h > line_h) { line_h = cs.h; }
         }
-        if (line_w > w) { w = line_w; }
-        h += line_h;
-        return Size(w, h);
+        if (n > 1) { w += this.spacing * (n - 1); }
+        return Size(w, line_h);
+    }
+
+    // Wrapped size at the offered max width — the same flow arrange() runs,
+    // so the height a parent reserves always matches what gets painted.
+    override fn layout(s: Painter, th: Theme, bc: BoxConstraints): Size {
+        let max_w = bc.maxW;
+        let x = 0;
+        let y = 0;
+        let line_h = 0;
+        let used_w = 0;
+        for (let c in this.children) {
+            let cs = c.measure(s, th);
+            if (x + cs.w > max_w && x > 0) {
+                y += line_h + this.line_spacing;
+                x = 0;
+                line_h = 0;
+            }
+            x += cs.w + this.spacing;
+            if (x - this.spacing > used_w) { used_w = x - this.spacing; }
+            if (cs.h > line_h) { line_h = cs.h; }
+        }
+        return bc.constrain(Size(used_w, y + line_h));
     }
 
     override fn arrange(s: Painter, th: Theme, r: Rect) {
@@ -716,6 +731,18 @@ export class ClippedPainter extends Painter {
 
     override fn clip_pop() { this.inner.clip_pop(); }
 
+    override fn line_w(x0: int, y0: int, x1: int, y1: int, width: int, color: int) {
+        let cx0 = this.clip.x;
+        let cy0 = this.clip.y;
+        let cx1 = this.clip.x + this.clip.w;
+        let cy1 = this.clip.y + this.clip.h;
+        if (x0 < cx0 && x1 < cx0) { return; }
+        if (x0 >= cx1 && x1 >= cx1) { return; }
+        if (y0 < cy0 && y1 < cy0) { return; }
+        if (y0 >= cy1 && y1 >= cy1) { return; }
+        this.inner.line_w(x0, y0, x1, y1, width, color);
+    }
+
     // Metrics — pass through unchanged.
     override fn set_weight(w: int) { this.inner.set_weight(w); }
     override fn text_width(s: string): int { return this.inner.text_width(s); }
@@ -724,6 +751,11 @@ export class ClippedPainter extends Painter {
     override fn width(): int { return this.inner.width(); }
     override fn height(): int { return this.inner.height(); }
     override fn present() { this.inner.present(); }
+    override fn present_rect(r: Rect) { this.inner.present_rect(r); }
+    override fn on_resize(w: int, h: int) { this.inner.on_resize(w, h); }
+    // geometric trimming, not a pixel clip — report false so nested users
+    // keep their fallback behavior
+    override fn can_clip(): bool { return false; }
 }
 
 // ------------------------------------------------------- ScrollView
@@ -803,13 +835,21 @@ export class ScrollView extends Box {
         s.fill(this.bounds, th.bg);
         let c = this.child();
         if (c == null) { return; }
-        // draw through a clipped painter so nothing leaks outside the viewport
-        let cp = new ClippedPainter(s, this.bounds);
-        c.draw(cp, th);
+        if (s.can_clip()) {
+            // real pixel clip (both tiers now): partial lines at the viewport
+            // edge crop instead of popping in/out; no wrapper allocation
+            s.clip_push(this.bounds, 0);
+            c.draw(s, th);
+            s.clip_pop();
+        } else {
+            // geometric fallback for painters without a clip (RecordPainter)
+            let cp = new ClippedPainter(s, this.bounds);
+            c.draw(cp, th);
+        }
     }
 
-    // Partial repaint: intersect dirty rect with viewport, fill, then
-    // draw the child through a ClippedPainter scoped to the intersection.
+    // Partial repaint: intersect dirty rect with the viewport, fill, then
+    // draw the child clipped to the intersection.
     override fn draw_within(s: Painter, th: Theme, d: Rect) {
         let b = this.bounds;
         // intersect d with our bounds
@@ -826,8 +866,14 @@ export class ScrollView extends Box {
         s.fill(clip, th.bg);
         let c = this.child();
         if (c == null) { return; }
-        let cp = new ClippedPainter(s, clip);
-        c.draw_within(cp, th, clip);
+        if (s.can_clip()) {
+            s.clip_push(clip, 0);
+            c.draw_within(s, th, clip);
+            s.clip_pop();
+        } else {
+            let cp = new ClippedPainter(s, clip);
+            c.draw_within(cp, th, clip);
+        }
     }
 
     override fn on_key(k: int, ch: string): bool {
@@ -844,6 +890,26 @@ export class ScrollView extends Box {
         if (k == KEY_UP) {
             if (this.scroll_y > 0) {
                 this.scroll_by(-fh);
+                this.rearrange();
+                return true;
+            }
+            return false;
+        }
+        if (k == KEY_PAGEDOWN) {
+            if (this.scroll_y < this.max_scroll()) {
+                let page = this.bounds.h - fh; // one line of overlap for context
+                if (page < fh) { page = fh; }
+                this.scroll_by(page);
+                this.rearrange();
+                return true;
+            }
+            return false;
+        }
+        if (k == KEY_PAGEUP) {
+            if (this.scroll_y > 0) {
+                let page = this.bounds.h - fh;
+                if (page < fh) { page = fh; }
+                this.scroll_by(-page);
                 this.rearrange();
                 return true;
             }

@@ -83,6 +83,14 @@ export fn rect_inset(r: Rect, dx: int): Rect {
     return Rect(r.x - dx, r.y - dx, r.w + 2 * dx, r.h + 2 * dx);
 }
 
+// Scale a px metric by the UI scale factor, rounded, flooring at 1 for
+// nonzero inputs (a 1px hairline must survive downscaling).
+export fn scale_px(v: int, f: float): int {
+    let r = ((v as float) * f + 0.5) as int;
+    if (r < 1 && v > 0) { r = 1; }
+    return r;
+}
+
 // A soft focus glow: a 2px stroke_round just outside the control, painted in
 // the theme's rgba focus_ring color. The lean tier falls back to a 1px frame.
 export fn paint_focus_ring(s: Painter, th: Theme, r: Rect, radius: int) {
@@ -184,6 +192,34 @@ export class Theme {
     type_color_title: int;
     type_color_body: int;
     type_color_caption: int;
+
+    scale_applied: float; // 0.0 = apply_scale not run yet (Window.run applies)
+
+    // Multiply every px-denominated scale by the UI scale factor (HiDPI).
+    // Colors and weights are untouched. Idempotent per theme instance —
+    // Window.run() calls this once with Surface.scale().
+    fn apply_scale(f: float) {
+        if (this.scale_applied > 0.0) { return; }
+        this.scale_applied = f;
+        if (f > 0.99 && f < 1.01) { return; }
+        this.radius_sm = scale_px(this.radius_sm, f);
+        this.radius_md = scale_px(this.radius_md, f);
+        this.radius_lg = scale_px(this.radius_lg, f);
+        this.elevation1_blur = scale_px(this.elevation1_blur, f);
+        this.elevation1_dy = scale_px(this.elevation1_dy, f);
+        this.elevation2_blur = scale_px(this.elevation2_blur, f);
+        this.elevation2_dy = scale_px(this.elevation2_dy, f);
+        this.elevation3_blur = scale_px(this.elevation3_blur, f);
+        this.elevation3_dy = scale_px(this.elevation3_dy, f);
+        this.space_1 = scale_px(this.space_1, f);
+        this.space_2 = scale_px(this.space_2, f);
+        this.space_3 = scale_px(this.space_3, f);
+        this.space_4 = scale_px(this.space_4, f);
+        this.space_5 = scale_px(this.space_5, f);
+        this.space_6 = scale_px(this.space_6, f);
+        this.pad = this.space_3;
+        this.spacing = this.space_2;
+    }
 
     fn init() {
         // Refined light theme (the default).
@@ -345,6 +381,25 @@ export class Painter {
     virtual fn width(): int { return 0; }
     virtual fn height(): int { return 0; }
     virtual fn present() { }
+    // present only the given rect; fallback presents everything. The
+    // dirty-region repaint path calls this instead of present().
+    virtual fn present_rect(r: Rect) { this.present(); }
+    // the window was resized to w x h; painters with their own buffer
+    // (GfxPainter) recreate it here. Called by Window on EV_RESIZE.
+    virtual fn on_resize(w: int, h: int) { }
+    // true when clip_push/clip_pop really clip pixels (the rich tier);
+    // false means callers must clip geometrically (ClippedPainter).
+    virtual fn can_clip(): bool { return false; }
+    // a stroked line with width; the base fakes it with three offset 1px
+    // lines (the historical lean-tier "thick line"), the rich tier draws a
+    // real anti-aliased stroke.
+    virtual fn line_w(x0: int, y0: int, x1: int, y1: int, width: int, color: int) {
+        this.line(x0, y0, x1, y1, color);
+        if (width > 1) {
+            this.line(x0 + 1, y0, x1 + 1, y1, color);
+            this.line(x0, y0 + 1, x1, y1 + 1, color);
+        }
+    }
 
     // -- WS3: weight selection for the next text draws -------------------
     virtual fn set_weight(w: int) { }
@@ -444,10 +499,51 @@ export class Painter {
     }
 }
 
-// Default painter: forwards every call to a volt/surface Surface.
+// Default painter: forwards every call to a volt/surface Surface. Clipping
+// is real on this tier too now (an X11 GC clip / Win32 region), so
+// clip_push/clip_pop crop pixels — the rounded radius degrades to a
+// rectangular scissor, same as the shim documents.
 export class SurfacePainter extends Painter {
     surf: Surface;
-    fn init(surf: Surface) { this.surf = surf; }
+    clips: Rect[]; // clip stack; the top (intersected) rect is active
+
+    fn init(surf: Surface) {
+        this.surf = surf;
+        this.clips = [];
+    }
+
+    override fn can_clip(): bool { return true; }
+
+    override fn clip_push(r: Rect, radius: int) {
+        let top = r;
+        if (this.clips.len > 0) {
+            // intersect with the current clip so nesting only shrinks
+            let c = this.clips[this.clips.len - 1];
+            let x0 = r.x;
+            if (x0 < c.x) { x0 = c.x; }
+            let y0 = r.y;
+            if (y0 < c.y) { y0 = c.y; }
+            let x1 = r.x + r.w;
+            if (x1 > c.x + c.w) { x1 = c.x + c.w; }
+            let y1 = r.y + r.h;
+            if (y1 > c.y + c.h) { y1 = c.y + c.h; }
+            if (x1 < x0) { x1 = x0; }
+            if (y1 < y0) { y1 = y0; }
+            top = Rect(x0, y0, x1 - x0, y1 - y0);
+        }
+        this.clips.push(top);
+        this.surf.clip_set(top);
+    }
+
+    override fn clip_pop() {
+        if (this.clips.len == 0) { return; }
+        this.clips.pop();
+        if (this.clips.len > 0) {
+            this.surf.clip_set(this.clips[this.clips.len - 1]);
+        } else {
+            this.surf.clip_clear();
+        }
+    }
     override fn fill(r: Rect, color: int) { this.surf.fill(r, color); }
     override fn frame(r: Rect, color: int) { this.surf.frame(r, color); }
     override fn line(x0: int, y0: int, x1: int, y1: int, color: int) {
@@ -463,6 +559,7 @@ export class SurfacePainter extends Painter {
     override fn width(): int { return this.surf.width(); }
     override fn height(): int { return this.surf.height(); }
     override fn present() { this.surf.present(); }
+    override fn present_rect(r: Rect) { this.surf.present_rect(r); }
 }
 
 // ------------------------------------------------------------------ Chrome
@@ -845,6 +942,10 @@ export class Window {
     drag_x: int;         // WS9a: last mouse position while press_w holds capture
     drag_y: int;
     animations: Tween[]; // WS9c: active Tweens; run() ticks the wait clock only while non-empty
+    mods: int;           // MOD_* bitmask at the event being dispatched — widgets
+                         // read `this.win.mods` in on_key/on_click/on_scroll
+    scale: float;        // UI scale factor (1.0 = 96dpi); themes are scaled by
+                         // it at run(); pass it to GfxPainter font sizes too
 
     fn init(title: string, w: int, h: int) {
         this.surf = new Surface(title, w, h);
@@ -855,6 +956,7 @@ export class Window {
         this.focusables = [];
         this.focus_i = -1;
         this.close_on_esc = true;
+        this.scale = this.surf.scale();
     }
 
     // Register a Tween to be advanced on the ~60fps clock; call from a
@@ -864,17 +966,31 @@ export class Window {
         this.animations.push(t);
     }
 
-    // Advance every active Tween by dt_ms, drop completed (non-looping)
-    // ones, and redraw once if anything ticked.
+    // Advance every active Tween by dt_ms and drop completed/cancelled ones.
+    // Tweens that track their widget's bounds trigger a dirty-region repaint;
+    // any untracked ticking Tween falls back to one full redraw.
     fn tick(dt_ms: int) {
         let alive: Tween[] = [];
-        let changed = false;
+        let full = false;
+        let partial = false;
         for (let t in this.animations) {
-            if (t.advance(dt_ms)) { changed = true; }
+            if (t.advance(dt_ms)) {
+                if (t.track_bounds) {
+                    this.mark_dirty(t.bounds);
+                    partial = true;
+                } else {
+                    full = true;
+                }
+            }
             if (!t.done) { alive.push(t); }
         }
         this.animations = alive;
-        if (changed) { this.redraw(); }
+        if (full) {
+            this.has_dirty = false; // the full redraw covers everything
+            this.redraw();
+        } else if (partial) {
+            this.repaint();
+        }
     }
 
     // escape hatch: the raw surface underneath
@@ -999,14 +1115,25 @@ export class Window {
     // in the back buffer from the last full frame. Falls back to nothing if no
     // region is dirty. Structural changes (resize, overlays, menus) still use
     // the full redraw() path.
+    // How far widget chrome paints OUTSIDE widget bounds: elevation shadows
+    // (blur growth + vertical offset) and the focus ring (2px outside + 2px
+    // stroke). The dirty region is inflated by this so repainting a widget
+    // also clears and redraws its overhanging chrome.
+    fn chrome_overhang(): int {
+        let o = this.theme.elevation3_blur + this.theme.elevation3_dy;
+        if (o < 6) { o = 6; }
+        return o + 2;
+    }
+
     fn repaint() {
         if (!this.has_dirty) { return; }
         let w = this.surf.width();
         let h = this.surf.height();
-        let x0 = this.dirty.x;
-        let y0 = this.dirty.y;
-        let x1 = this.dirty.x + this.dirty.w;
-        let y1 = this.dirty.y + this.dirty.h;
+        let ov = this.chrome_overhang();
+        let x0 = this.dirty.x - ov;
+        let y0 = this.dirty.y - ov;
+        let x1 = this.dirty.x + this.dirty.w + ov;
+        let y1 = this.dirty.y + this.dirty.h + ov;
         if (x0 < 0) { x0 = 0; }
         if (y0 < 0) { y0 = 0; }
         if (x1 > w) { x1 = w; }
@@ -1014,6 +1141,10 @@ export class Window {
         this.has_dirty = false;
         if (x1 <= x0 || y1 <= y0) { return; }
         let d = Rect(x0, y0, x1 - x0, y1 - y0);
+        // Clip to the region on the rich tier so translucent chrome (shadows)
+        // can't re-composite over last frame's pixels outside the cleared
+        // area — that's what made hovered buttons' shadows darken over time.
+        this.painter.clip_push(d, 0);
         this.painter.fill(d, this.theme.bg);
         if (this.root != null) {
             this.root.draw_within(this.painter, this.theme, d);
@@ -1024,7 +1155,10 @@ export class Window {
         if (this.overlay != null && rect_overlaps(this.overlay.bounds, d)) {
             this.overlay.draw(this.painter, this.theme);
         }
-        this.painter.present();
+        this.painter.clip_pop();
+        // present only the changed rect — full-window blits per hover/caret
+        // repaint were the single biggest frame cost on the rich tier
+        this.painter.present_rect(d);
     }
 
     fn on_key_ev(k: int, ch: string) {
@@ -1188,42 +1322,67 @@ export class Window {
     }
 
     // Mouse wheel: walk from the deepest widget under the cursor up the
-    // parent chain until a widget consumes the scroll (e.g. ScrollView).
-    // A full redraw is cheap and always correct for scroll changes.
+    // parent chain until a widget consumes the scroll (e.g. ScrollView),
+    // then repaint just the consumer's bounds — a scroll only changes
+    // pixels inside the scrolling widget.
     fn on_wheel_ev(x: int, y: int, delta: int) {
         if (this.overlay != null) {
             if (contains(this.overlay.bounds, x, y)) {
-                if (this.overlay.on_scroll_at(x, y, delta)) { this.redraw(); }
+                if (this.overlay.on_scroll_at(x, y, delta)) {
+                    this.mark_dirty(this.overlay.bounds);
+                    this.repaint();
+                }
             }
             return;
         }
         let target: Widget = null;
         if (this.root != null) { target = this.root.hit(x, y); }
-        if (target != null) {
-            if (target.on_scroll_at(x, y, delta)) { this.redraw(); }
+        let w = target;
+        while (w != null) {
+            if (w.on_scroll(delta)) {
+                this.mark_dirty(w.bounds);
+                this.repaint();
+                return;
+            }
+            w = w.parent;
         }
     }
 
     fn run() {
+        // scale the theme's px metrics for HiDPI (idempotent; also covers a
+        // theme the app swapped in after construction)
+        this.theme.apply_scale(this.scale);
         this.layout();
         this.redraw();
         this.running = true;
+        let last_ms = this.surf.now_ms();
         while (this.running) {
             // WS9c: only pay for the timer tick while something is actually
-            // animating — a static app blocks on wait() exactly as before,
-            // zero behavior change (verified: no widget registers a Tween
-            // unless it opts into one, e.g. ProgressBar.indeterminate).
+            // animating — a static app blocks on wait() exactly as before.
+            // While animating, advance by REAL elapsed time on every loop
+            // pass (not a fixed 16ms only on EV_TIMER): input events return
+            // early from wait_timeout, and without this a moving mouse would
+            // starve the timer and freeze every animation; slow frames would
+            // dilate time instead of dropping frames.
             let ev = 0;
             if (this.animations.len > 0) {
                 ev = this.surf.wait_timeout(16);
+                let now = this.surf.now_ms();
+                let dt = now - last_ms;
+                last_ms = now;
+                if (dt > 100) { dt = 100; } // clamp a stall to one long frame
+                if (dt > 0) { this.tick(dt); }
             } else {
                 ev = this.surf.wait();
+                last_ms = this.surf.now_ms(); // idle wait: don't bank the gap
             }
+            this.mods = this.surf.mods();
             if (ev == EV_TIMER) {
-                this.tick(16);
+                // already ticked above; nothing else to dispatch
             } else if (ev == EV_EXPOSE) {
                 this.redraw();
             } else if (ev == EV_RESIZE) {
+                this.painter.on_resize(this.surf.width(), this.surf.height());
                 this.layout();
                 this.redraw();
             } else if (ev == EV_CLOSE) {

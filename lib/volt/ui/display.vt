@@ -25,6 +25,7 @@ export class Text extends Widget {
     cached_lines: string[];
     cached_w: int;
     cached_count: int;
+    cached_text: string; // content the cache was computed from
 
     fn init(text: string) {
         super.init();
@@ -34,11 +35,13 @@ export class Text extends Widget {
         this.cached_lines = [];
         this.cached_w = -1;
         this.cached_count = 0;
+        this.cached_text = "";
     }
 
     fn wrap_lines(s: Painter, max_w: int) {
         this.cached_lines = [];
         this.cached_w = max_w;
+        this.cached_text = this.text;
         if (max_w <= 0) {
             this.cached_count = 0;
             return;
@@ -68,10 +71,10 @@ export class Text extends Widget {
         return Size(w, h);
     }
 
-    // Re-wrap if the bounds width differs from what we cached.
+    // Re-wrap if the width or the text differs from what we cached.
     fn ensure_wrapped(s: Painter) {
         let bw = this.bounds.w;
-        if (this.cached_w != bw || this.cached_count == 0) {
+        if (this.cached_w != bw || this.cached_count == 0 || !(this.cached_text == this.text)) {
             this.wrap_lines(s, bw);
         }
     }
@@ -79,7 +82,12 @@ export class Text extends Widget {
     override fn layout(s: Painter, th: Theme, bc: BoxConstraints): Size {
         let max_w = bc.maxW;
         if (max_w < 0) { max_w = 0; }
-        this.wrap_lines(s, max_w);
+        // cache hit: same width and content — skip the re-wrap entirely
+        // (layout runs 2+ times per frame; wrapping shapes text per word)
+        if (!(this.cached_w == max_w && this.cached_count > 0 &&
+              this.cached_text == this.text)) {
+            this.wrap_lines(s, max_w);
+        }
         let used_w = 0;
         for (let ln in this.cached_lines) {
             let lw = s.text_width(ln);
@@ -417,12 +425,10 @@ export class Icon extends Widget {
     fn fx(u: float): int { return this.bounds.x + (u * (this.bounds.w as float)) as int; }
     fn fy(u: float): int { return this.bounds.y + (u * (this.bounds.h as float)) as int; }
 
-    // Painter.line is 1px; three parallel 1px lines (offset +1 in each axis)
-    // fake a ~2-3px stroke at icon scale, regardless of the line's angle.
+    // ~2px stroke: a real anti-aliased stroke on the rich tier (line_w),
+    // three offset 1px lines on the lean tier (the base fallback).
     fn thick_line(s: Painter, x0: int, y0: int, x1: int, y1: int, color: int) {
-        s.line(x0, y0, x1, y1, color);
-        s.line(x0 + 1, y0, x1 + 1, y1, color);
-        s.line(x0, y0 + 1, x1, y1 + 1, color);
+        s.line_w(x0, y0, x1, y1, 2, color);
     }
 
     override fn draw(s: Painter, th: Theme) {
@@ -580,6 +586,7 @@ export class Avatar extends Widget {
     size: int;
     imagePath: string;   // "" = initials mode
     handle: rawptr;       // lazy-loaded image handle, image mode only
+    load_failed: bool;    // tried and failed: don't refetch every draw
 
     fn init(initials: string, size: int) {
         super.init();
@@ -597,9 +604,12 @@ export class Avatar extends Widget {
     override fn draw(s: Painter, th: Theme) {
         let r = this.size / 2;
         if (this.imagePath.len > 0) {
-            if (this.handle == null) {
+            if (this.handle == null && !this.load_failed) {
+                // load once; a failure must never retry per frame — a URL
+                // fetch is synchronous with a multi-second timeout
                 if (is_http_url(this.imagePath)) { this.handle = s.load_image_url(this.imagePath); }
                 else { this.handle = s.load_image(this.imagePath); }
+                if (this.handle == null) { this.load_failed = true; }
             }
             if (this.handle != null) {
                 s.clip_push(this.bounds, r);

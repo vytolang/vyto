@@ -4,6 +4,8 @@
  *   - headless (VS_HEADLESS=1): no window system at all; events replay from
  *     the $VS_EVENTS script. Shared by every platform, used by the tests.
  */
+#define _POSIX_C_SOURCE 200809L /* clock_gettime */
+
 #include "vsurf.h"
 
 #include <stdint.h>
@@ -11,8 +13,61 @@
 #include <stdlib.h>
 #include <string.h>
 
-static int last_key, last_x, last_y, last_wheel;
+static int headless_on(void);
+static long long headless_ms; /* synthetic clock: +16 per scripted event */
+
+#ifdef _WIN32
+#include <windows.h>
+long long vs_now_ms(void) {
+    if (headless_on()) return headless_ms;
+    return (long long)GetTickCount64();
+}
+#else
+#include <time.h>
+long long vs_now_ms(void) {
+    /* headless: deterministic 16ms-per-event clock so animation tests
+       replay identically regardless of host speed */
+    if (headless_on()) return headless_ms;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+#endif
+
+static int g_scale_pct; /* cached DPI scale (percent), set at vs_open */
+
+/* $VOLT_SCALE (e.g. "1.5" or "150") overrides platform DPI detection */
+static int scale_from_env(void) {
+    const char *e = getenv("VOLT_SCALE");
+    if (!e || !*e) return 0;
+    double f = atof(e);
+    if (f > 8.0) return (int)(f + 0.5); /* given as percent already */
+    if (f >= 0.5) return (int)(f * 100.0 + 0.5);
+    return 0;
+}
+
+static int last_key, last_x, last_y, last_wheel, last_mods;
 static char last_text[32];
+
+/* named-key table shared by the headless script parser; also the single
+   place a new VS_KEY_* needs a script-facing name */
+static const struct { const char *name; int key; } key_names[] = {
+    {"Space", VS_KEY_SPACE},
+    {"Enter", VS_KEY_ENTER}, {"Backspace", VS_KEY_BACKSPACE}, {"Esc", VS_KEY_ESC},
+    {"Up", VS_KEY_UP}, {"Down", VS_KEY_DOWN}, {"Left", VS_KEY_LEFT}, {"Right", VS_KEY_RIGHT},
+    {"Delete", VS_KEY_DELETE}, {"Tab", VS_KEY_TAB}, {"Home", VS_KEY_HOME}, {"End", VS_KEY_END},
+    {"PageUp", VS_KEY_PAGEUP}, {"PageDown", VS_KEY_PAGEDOWN}, {"Insert", VS_KEY_INSERT},
+    {"Shift", VS_KEY_SHIFT}, {"Ctrl", VS_KEY_CTRL}, {"Alt", VS_KEY_ALT}, {"Super", VS_KEY_SUPER},
+    {"F1", VS_KEY_F1}, {"F2", VS_KEY_F2}, {"F3", VS_KEY_F3}, {"F4", VS_KEY_F4},
+    {"F5", VS_KEY_F5}, {"F6", VS_KEY_F6}, {"F7", VS_KEY_F7}, {"F8", VS_KEY_F8},
+    {"F9", VS_KEY_F9}, {"F10", VS_KEY_F10}, {"F11", VS_KEY_F11}, {"F12", VS_KEY_F12},
+};
+
+static int key_by_name(const char *n) {
+    for (size_t i = 0; i < sizeof key_names / sizeof key_names[0]; i++)
+        if (strcmp(key_names[i].name, n) == 0) return key_names[i].key;
+    return 0;
+}
 
 /* ---- headless backend (platform-independent) ---- */
 
@@ -48,20 +103,32 @@ static void headless_open_script(void) {
  *   resize W H
  *   expose
  *   tick             a timer tick (VS_EV_TIMER), for game-loop tests
+ *   mods <spec>      set the modifier state reported by vs_mods() for all
+ *                    following events: "+"-joined ctrl/shift/alt/super, or
+ *                    "none" (e.g. "mods ctrl+shift"). Emits no event itself.
  *   close
  * '#' starts a comment; EOF acts as close. */
 static int headless_wait(int *w, int *h) {
     static int pending_up; /* deliver MOUSE_UP after each click's MOUSE_DOWN */
+    headless_ms += 16;     /* one synthetic frame per delivered event */
     if (pending_up) {
         pending_up = 0;
         return VS_EV_MOUSE_UP;
     }
     for (;;) {
         if (type_p && *type_p) {
-            last_key = (unsigned char)*type_p;
-            last_text[0] = *type_p;
-            last_text[1] = 0;
-            type_p++;
+            /* one key event per UTF-8 sequence; multibyte input has no
+               ASCII key code (key = 0), only insertable text */
+            unsigned char lead = (unsigned char)*type_p;
+            int len = 1;
+            if ((lead & 0xE0) == 0xC0) len = 2;
+            else if ((lead & 0xF0) == 0xE0) len = 3;
+            else if ((lead & 0xF8) == 0xF0) len = 4;
+            last_key = len == 1 ? (int)lead : 0;
+            int i = 0;
+            while (i < len && type_p[i]) { last_text[i] = type_p[i]; i++; }
+            last_text[i] = 0;
+            type_p += i;
             return VS_EV_KEY;
         }
         type_p = NULL;
@@ -77,19 +144,25 @@ static int headless_wait(int *w, int *h) {
             int up = script_line[3] == 'u';
             const char *k = script_line + (up ? 6 : 4);
             last_text[0] = 0;
-            if (strcmp(k, "Enter") == 0) last_key = VS_KEY_ENTER;
-            else if (strcmp(k, "Backspace") == 0) last_key = VS_KEY_BACKSPACE;
-            else if (strcmp(k, "Esc") == 0) last_key = VS_KEY_ESC;
-            else if (strcmp(k, "Up") == 0) last_key = VS_KEY_UP;
-            else if (strcmp(k, "Down") == 0) last_key = VS_KEY_DOWN;
-            else if (strcmp(k, "Left") == 0) last_key = VS_KEY_LEFT;
-            else if (strcmp(k, "Right") == 0) last_key = VS_KEY_RIGHT;
-            else if (strcmp(k, "Delete") == 0) last_key = VS_KEY_DELETE;
-            else if (strcmp(k, "Tab") == 0) last_key = VS_KEY_TAB;
-            else if (strcmp(k, "Home") == 0) last_key = VS_KEY_HOME;
-            else if (strcmp(k, "End") == 0) last_key = VS_KEY_END;
-            else continue;
+            int code = key_by_name(k);
+            if (!code) continue;
+            last_key = code;
+            if (code == VS_KEY_SPACE) { last_text[0] = ' '; last_text[1] = 0; }
             return up ? VS_EV_KEY_UP : VS_EV_KEY;
+        }
+        if (strncmp(script_line, "mods ", 5) == 0) {
+            const char *p = script_line + 5;
+            int m = 0;
+            while (*p) {
+                if (strncmp(p, "ctrl", 4) == 0) { m |= VS_MOD_CTRL; p += 4; }
+                else if (strncmp(p, "shift", 5) == 0) { m |= VS_MOD_SHIFT; p += 5; }
+                else if (strncmp(p, "alt", 3) == 0) { m |= VS_MOD_ALT; p += 3; }
+                else if (strncmp(p, "super", 5) == 0) { m |= VS_MOD_SUPER; p += 5; }
+                else if (strncmp(p, "none", 4) == 0) { m = 0; p += 4; }
+                else p++;
+            }
+            last_mods = m;
+            continue;
         }
         if (sscanf(script_line, "click %d %d", &last_x, &last_y) == 2) {
             pending_up = 1;
@@ -145,6 +218,7 @@ const char *vs_text(void) { return last_text; }
 int vs_x(void) { return last_x; }
 int vs_y(void) { return last_y; }
 int vs_wheel(void) { return last_wheel; }
+int vs_mods(void) { return last_mods; }
 
 #ifdef _WIN32
 /* ================================================================ Win32 */
@@ -162,22 +236,74 @@ typedef struct VSurf {
 
 /* WndProc -> vs_wait event queue (single window; small ring buffer) */
 typedef struct QEv {
-    int type, key, x, y;
+    int type, key, x, y, mods;
     char text[2];
 } QEv;
 static QEv evq[64];
 static int evq_head, evq_len;
 
+/* async modifier state at event time */
+static int win_mods(void) {
+    int m = 0;
+    if (GetKeyState(VK_SHIFT) & 0x8000) m |= VS_MOD_SHIFT;
+    if (GetKeyState(VK_CONTROL) & 0x8000) m |= VS_MOD_CTRL;
+    if (GetKeyState(VK_MENU) & 0x8000) m |= VS_MOD_ALT;
+    if ((GetKeyState(VK_LWIN) | GetKeyState(VK_RWIN)) & 0x8000) m |= VS_MOD_SUPER;
+    return m;
+}
+
 static void q_push(int type, int key, int x, int y, int ch) {
-    if (evq_len == 64) return; /* drop when full; the loop catches up */
+    /* coalesce mouse-move bursts: overwrite a trailing queued move */
+    if (type == VS_EV_MOUSE_MOVE && evq_len > 0) {
+        QEv *tail = &evq[(evq_head + evq_len - 1) % 64];
+        if (tail->type == VS_EV_MOUSE_MOVE) {
+            tail->x = x;
+            tail->y = y;
+            tail->mods = win_mods();
+            return;
+        }
+    }
+    if (evq_len == 64) {
+        /* drop when full — except CLOSE, which must never be lost */
+        if (type != VS_EV_CLOSE) return;
+        evq_len--; /* sacrifice the newest queued event for the CLOSE */
+    }
     QEv *e = &evq[(evq_head + evq_len) % 64];
     e->type = type;
     e->key = key;
     e->x = x;
     e->y = y;
+    e->mods = win_mods();
     e->text[0] = (char)ch;
     e->text[1] = 0;
     evq_len++;
+}
+
+/* shared VK -> VS_KEY_* mapping for WM_KEYDOWN/WM_KEYUP (and SYS variants) */
+static int vk_to_key(WPARAM wp) {
+    switch (wp) {
+    case VK_RETURN: return VS_KEY_ENTER;
+    case VK_BACK: return VS_KEY_BACKSPACE;
+    case VK_ESCAPE: return VS_KEY_ESC;
+    case VK_UP: return VS_KEY_UP;
+    case VK_DOWN: return VS_KEY_DOWN;
+    case VK_LEFT: return VS_KEY_LEFT;
+    case VK_RIGHT: return VS_KEY_RIGHT;
+    case VK_DELETE: return VS_KEY_DELETE;
+    case VK_TAB: return VS_KEY_TAB;
+    case VK_HOME: return VS_KEY_HOME;
+    case VK_END: return VS_KEY_END;
+    case VK_PRIOR: return VS_KEY_PAGEUP;
+    case VK_NEXT: return VS_KEY_PAGEDOWN;
+    case VK_INSERT: return VS_KEY_INSERT;
+    case VK_SHIFT: return VS_KEY_SHIFT;
+    case VK_CONTROL: return VS_KEY_CTRL;
+    case VK_MENU: return VS_KEY_ALT;
+    case VK_LWIN: case VK_RWIN: return VS_KEY_SUPER;
+    default:
+        if (wp >= VK_F1 && wp <= VK_F12) return VS_KEY_F1 + (int)(wp - VK_F1);
+        return 0;
+    }
 }
 
 /* 0xRRGGBB -> COLORREF (0x00BBGGRR) */
@@ -250,48 +376,34 @@ static LRESULT CALLBACK vs_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         q_push(VS_EV_MOUSE_WHEEL, lines, pt.x, pt.y, 0);
         return 0;
     }
-    case WM_KEYDOWN: {
-        int k = 0;
-        switch (wp) {
-        case VK_RETURN: k = VS_KEY_ENTER; break;
-        case VK_BACK: k = VS_KEY_BACKSPACE; break;
-        case VK_ESCAPE: k = VS_KEY_ESC; break;
-        case VK_UP: k = VS_KEY_UP; break;
-        case VK_DOWN: k = VS_KEY_DOWN; break;
-        case VK_LEFT: k = VS_KEY_LEFT; break;
-        case VK_RIGHT: k = VS_KEY_RIGHT; break;
-        case VK_DELETE: k = VS_KEY_DELETE; break;
-        case VK_TAB: k = VS_KEY_TAB; break;
-        case VK_HOME: k = VS_KEY_HOME; break;
-        case VK_END: k = VS_KEY_END; break;
+    case WM_KEYDOWN:
+    case WM_SYSKEYDOWN: { /* SYS variant: Alt itself and Alt-held chords */
+        int k = vk_to_key(wp);
+        if (!k && (GetKeyState(VK_CONTROL) & 0x8000)) {
+            /* Ctrl chords produce control-char WM_CHARs; report the plain
+               key here instead so shortcuts see 'a', not 0x01 (no text) */
+            if (wp >= 'A' && wp <= 'Z') k = (int)wp + 32;
+            else if (wp >= '0' && wp <= '9') k = (int)wp;
+            else if (wp == VK_SPACE) k = VS_KEY_SPACE;
         }
-        if (k) {
-            q_push(VS_EV_KEY, k, 0, 0, 0);
-            return 0;
-        }
-        break; /* DefWindowProc; TranslateMessage yields WM_CHAR */
+        if (k) q_push(VS_EV_KEY, k, 0, 0, 0);
+        /* unhandled keys fall to DefWindowProc (TranslateMessage yields
+           WM_CHAR); SYS messages always fall through so Alt+F4 etc. work */
+        if (k && msg == WM_KEYDOWN) return 0;
+        break;
     }
-    case WM_KEYUP: {
-        int k = 0;
-        switch (wp) {
-        case VK_RETURN: k = VS_KEY_ENTER; break;
-        case VK_BACK: k = VS_KEY_BACKSPACE; break;
-        case VK_ESCAPE: k = VS_KEY_ESC; break;
-        case VK_UP: k = VS_KEY_UP; break;
-        case VK_DOWN: k = VS_KEY_DOWN; break;
-        case VK_LEFT: k = VS_KEY_LEFT; break;
-        case VK_RIGHT: k = VS_KEY_RIGHT; break;
-        case VK_DELETE: k = VS_KEY_DELETE; break;
-        case VK_TAB: k = VS_KEY_TAB; break;
-        case VK_HOME: k = VS_KEY_HOME; break;
-        case VK_END: k = VS_KEY_END; break;
-        default:
+    case WM_KEYUP:
+    case WM_SYSKEYUP: {
+        int k = vk_to_key(wp);
+        if (!k) {
             /* no WM_CHAR on release: report printable letters/digits/space by VK */
-            if ((wp >= 'A' && wp <= 'Z') || (wp >= '0' && wp <= '9')) k = (int)wp;
-            else if (wp == VK_SPACE) k = 32;
+            if (wp >= 'A' && wp <= 'Z') k = (int)wp + 32;
+            else if (wp >= '0' && wp <= '9') k = (int)wp;
+            else if (wp == VK_SPACE) k = VS_KEY_SPACE;
         }
         if (k) q_push(VS_EV_KEY_UP, k, 0, 0, 0);
-        return 0;
+        if (msg == WM_KEYUP) return 0;
+        break;
     }
     case WM_CHAR:
         if (wp >= 32 && wp < 127) q_push(VS_EV_KEY, (int)wp, 0, 0, (int)wp);
@@ -309,6 +421,7 @@ void *vs_open(const char *title, int w, int h) {
     s->h = h;
     if (headless_on()) {
         headless_open_script();
+        g_scale_pct = 100;
         return s;
     }
     static int registered;
@@ -329,6 +442,11 @@ void *vs_open(const char *title, int w, int h) {
                             GetModuleHandle(NULL), NULL);
     if (!s->hwnd) { free(s); return NULL; }
     SetWindowLongPtr(s->hwnd, GWLP_USERDATA, (LONG_PTR)s);
+    {
+        HDC wdc = GetDC(s->hwnd);
+        g_scale_pct = GetDeviceCaps(wdc, LOGPIXELSX) * 100 / 96;
+        ReleaseDC(s->hwnd, wdc);
+    }
     s->font = GetStockObject(ANSI_FIXED_FONT);
     make_backbuffer(s);
     ShowWindow(s->hwnd, SW_SHOW);
@@ -396,10 +514,26 @@ void vs_draw_text(void *vs, int x, int y, const char *str, int rgb) {
     TextOutA(s->memdc, x, y - tm.tmAscent, str, (int)strlen(str));
 }
 
+void vs_clip_set(void *vs, int x, int y, int w, int h) {
+    VSurf *s = vs;
+    if (!s->hwnd) return;
+    HRGN rgn = CreateRectRgn(x, y, x + w, y + h);
+    SelectClipRgn(s->memdc, rgn);
+    DeleteObject(rgn);
+}
+
+void vs_clip_clear(void *vs) {
+    VSurf *s = vs;
+    if (!s->hwnd) return;
+    SelectClipRgn(s->memdc, NULL);
+}
+
 void vs_blit(void *vs, const int *pixels, int srcw, int srch,
              int dstx, int dsty, int dstw, int dsth) {
     VSurf *s = vs;
     if (!s->hwnd || srcw <= 0 || srch <= 0) return;
+    int saved = SaveDC(s->memdc); /* blits are never clipped */
+    SelectClipRgn(s->memdc, NULL);
     BITMAPINFO bmi;
     memset(&bmi, 0, sizeof bmi);
     bmi.bmiHeader.biSize = sizeof bmi.bmiHeader;
@@ -411,6 +545,35 @@ void vs_blit(void *vs, const int *pixels, int srcw, int srch,
     SetStretchBltMode(s->memdc, COLORONCOLOR); /* nearest-neighbor */
     StretchDIBits(s->memdc, dstx, dsty, dstw, dsth, 0, 0, srcw, srch, pixels, &bmi,
                   DIB_RGB_COLORS, SRCCOPY);
+    RestoreDC(s->memdc, saved);
+}
+
+/* unscaled sub-rect copy with explicit source stride (pixels) */
+void vs_blit_rect(void *vs, const int *pixels, int stride_px,
+                  int srcx, int srcy, int w, int h, int dstx, int dsty) {
+    VSurf *s = vs;
+    if (!s->hwnd || w <= 0 || h <= 0 || stride_px <= 0) return;
+    /* repack the sub-rect tightly; SetDIBitsToDevice's source-offset rules
+       for top-down DIBs are error-prone, a copy is simple and correct */
+    int *tmp = malloc((size_t)w * (size_t)h * 4);
+    if (!tmp) return;
+    for (int dy = 0; dy < h; dy++)
+        memcpy(tmp + (size_t)dy * w, pixels + (size_t)(srcy + dy) * stride_px + srcx,
+               (size_t)w * 4);
+    int saved = SaveDC(s->memdc); /* blits are never clipped */
+    SelectClipRgn(s->memdc, NULL);
+    BITMAPINFO bmi;
+    memset(&bmi, 0, sizeof bmi);
+    bmi.bmiHeader.biSize = sizeof bmi.bmiHeader;
+    bmi.bmiHeader.biWidth = w;
+    bmi.bmiHeader.biHeight = -h;
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+    StretchDIBits(s->memdc, dstx, dsty, w, h, 0, 0, w, h, tmp, &bmi,
+                  DIB_RGB_COLORS, SRCCOPY);
+    RestoreDC(s->memdc, saved);
+    free(tmp);
 }
 
 void vs_present(void *vs) {
@@ -419,6 +582,25 @@ void vs_present(void *vs) {
     HDC dc = GetDC(s->hwnd);
     BitBlt(dc, 0, 0, s->w, s->h, s->memdc, 0, 0, SRCCOPY);
     ReleaseDC(s->hwnd, dc);
+}
+
+void vs_present_rect(void *vs, int x, int y, int w, int h) {
+    VSurf *s = vs;
+    if (!s->hwnd) return;
+    if (x < 0) { w += x; x = 0; }
+    if (y < 0) { h += y; y = 0; }
+    if (x + w > s->w) w = s->w - x;
+    if (y + h > s->h) h = s->h - y;
+    if (w <= 0 || h <= 0) return;
+    HDC dc = GetDC(s->hwnd);
+    BitBlt(dc, x, y, w, h, s->memdc, x, y, SRCCOPY);
+    ReleaseDC(s->hwnd, dc);
+}
+
+int vs_scale_pct(void) {
+    int env = scale_from_env();
+    if (env) return env;
+    return g_scale_pct ? g_scale_pct : 100;
 }
 
 int vs_text_width(void *vs, const char *str) {
@@ -452,6 +634,7 @@ static int q_pop(void) {
     last_key = e.key;
     last_x = e.x;
     last_y = e.y;
+    last_mods = e.mods;
     last_wheel = (e.type == VS_EV_MOUSE_WHEEL) ? e.key : 0;
     last_text[0] = e.text[0];
     last_text[1] = 0;
@@ -486,7 +669,11 @@ int vs_wait_timeout(void *vs, int ms) {
     if (!s->hwnd) return headless_wait(&s->w, &s->h);
     for (;;) {
         if (evq_len) return q_pop();
-        DWORD r = MsgWaitForMultipleObjects(0, NULL, FALSE, (DWORD)ms, QS_ALLINPUT);
+        /* MWMO_INPUTAVAILABLE: also wake for input already in the queue that
+           a previous PeekMessage saw — plain MsgWaitForMultipleObjects only
+           signals NEW input and can stall on already-queued messages */
+        DWORD r = MsgWaitForMultipleObjectsEx(0, NULL, (DWORD)ms, QS_ALLINPUT,
+                                              MWMO_INPUTAVAILABLE);
         if (r == WAIT_TIMEOUT) return VS_EV_TIMER;
         MSG msg;
         while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
@@ -508,20 +695,27 @@ void *vs_native_gc(void *vs) { return ((VSurf *)vs)->memdc; }
 
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
+#include <X11/Xresource.h>
 #include <X11/keysym.h>
 #include <X11/XKBlib.h>
+#include <locale.h>
 #include <sys/select.h>
 
 typedef struct VSurf {
     Display *dpy; /* NULL in headless mode */
     Window win;
     Pixmap back;
-    GC gc;
+    GC gc;         /* draw GC — vs_clip_set applies here */
+    GC pgc;        /* blit/present GC — never clipped */
     int w, h;
+    Atom wm_delete;
+    XIM im;        /* input method (UTF-8 text input); may be NULL */
+    XIC ic;
+    XImage *img;   /* cached blit staging image, resized on demand */
+    int img_w, img_h;
 } VSurf;
 
-static XFontStruct *font;
-static Atom wm_delete;
+static XFontStruct *font;       /* one bitmap UI font, shared, never freed */
 
 /* ---- color mapping: 0xRRGGBB -> X pixel ---- */
 
@@ -547,6 +741,26 @@ static unsigned long pixel_of(Display *dpy, int rgb) {
     return c.pixel;
 }
 
+/* Xft.dpi from the X resource database, else the physical screen DPI;
+   returned as a percent of the 96dpi baseline. */
+static int x11_detect_scale(Display *dpy) {
+    const char *rms = XResourceManagerString(dpy);
+    if (rms) {
+        const char *p = strstr(rms, "Xft.dpi:");
+        if (p) {
+            double dpi = atof(p + 8);
+            if (dpi >= 48.0) return (int)(dpi * 100.0 / 96.0 + 0.5);
+        }
+    }
+    int scr = DefaultScreen(dpy);
+    int mm = DisplayWidthMM(dpy, scr);
+    if (mm > 0) {
+        double dpi = (double)DisplayWidth(dpy, scr) * 25.4 / (double)mm;
+        if (dpi >= 48.0 && dpi <= 480.0) return (int)(dpi * 100.0 / 96.0 + 0.5);
+    }
+    return 100;
+}
+
 void *vs_open(const char *title, int w, int h) {
     VSurf *s = calloc(1, sizeof *s);
     if (!s) return NULL;
@@ -554,6 +768,7 @@ void *vs_open(const char *title, int w, int h) {
     s->h = h;
     if (headless_on()) {
         headless_open_script();
+        g_scale_pct = 100;
         return s;
     }
     Display *dpy = XOpenDisplay(NULL);
@@ -564,6 +779,7 @@ void *vs_open(const char *title, int w, int h) {
     truecolor = vis->class == TrueColor && (depth == 24 || depth == 32) &&
                 vis->red_mask == 0xFF0000 && vis->green_mask == 0x00FF00 &&
                 vis->blue_mask == 0x0000FF;
+    g_scale_pct = x11_detect_scale(dpy);
     s->dpy = dpy;
     s->win = XCreateSimpleWindow(dpy, DefaultRootWindow(dpy), 0, 0, (unsigned)w, (unsigned)h, 1,
                                  BlackPixel(dpy, scr), WhitePixel(dpy, scr));
@@ -573,13 +789,23 @@ void *vs_open(const char *title, int w, int h) {
     /* only emit KeyRelease on real release, not auto-repeat — matters for
        held-key game input (EV_KEY / EV_KEY_UP pairing) */
     XkbSetDetectableAutoRepeat(dpy, True, NULL);
-    wm_delete = XInternAtom(dpy, "WM_DELETE_WINDOW", False);
-    XSetWMProtocols(dpy, s->win, &wm_delete, 1);
+    s->wm_delete = XInternAtom(dpy, "WM_DELETE_WINDOW", False);
+    XSetWMProtocols(dpy, s->win, &s->wm_delete, 1);
     s->gc = XCreateGC(dpy, s->win, 0, 0);
+    s->pgc = XCreateGC(dpy, s->win, 0, 0);
     if (!font) font = XLoadQueryFont(dpy, "9x15");
     if (!font) font = XLoadQueryFont(dpy, "fixed");
     if (font) XSetFont(dpy, s->gc, font->fid);
     s->back = XCreatePixmap(dpy, s->win, (unsigned)w, (unsigned)h, (unsigned)depth);
+    /* input method for UTF-8 text; falls back to Latin-1 XLookupString */
+    setlocale(LC_CTYPE, "");
+    XSetLocaleModifiers("");
+    s->im = XOpenIM(dpy, NULL, NULL, NULL);
+    if (s->im) {
+        s->ic = XCreateIC(s->im, XNInputStyle, XIMPreeditNothing | XIMStatusNothing,
+                          XNClientWindow, s->win, XNFocusWindow, s->win, NULL);
+        if (!s->ic) { XCloseIM(s->im); s->im = NULL; }
+    }
     XMapWindow(dpy, s->win);
     return s;
 }
@@ -588,12 +814,33 @@ void vs_close(void *vs) {
     VSurf *s = vs;
     if (!s) return;
     if (s->dpy) {
+        if (s->img) { XDestroyImage(s->img); s->img = NULL; } /* frees its data too */
+        if (s->ic) XDestroyIC(s->ic);
+        if (s->im) XCloseIM(s->im);
         XFreePixmap(s->dpy, s->back);
         XFreeGC(s->dpy, s->gc);
+        XFreeGC(s->dpy, s->pgc);
         XDestroyWindow(s->dpy, s->win);
         XCloseDisplay(s->dpy);
     }
     free(s);
+}
+
+void vs_clip_set(void *vs, int x, int y, int w, int h) {
+    VSurf *s = vs;
+    if (!s->dpy) return;
+    XRectangle r;
+    r.x = (short)x;
+    r.y = (short)y;
+    r.width = (unsigned short)(w > 0 ? w : 0);
+    r.height = (unsigned short)(h > 0 ? h : 0);
+    XSetClipRectangles(s->dpy, s->gc, 0, 0, &r, 1, Unsorted);
+}
+
+void vs_clip_clear(void *vs) {
+    VSurf *s = vs;
+    if (!s->dpy) return;
+    XSetClipMask(s->dpy, s->gc, None);
 }
 
 int vs_width(void *vs) { return ((VSurf *)vs)->w; }
@@ -632,34 +879,39 @@ void vs_draw_text(void *vs, int x, int y, const char *str, int rgb) {
     XDrawString(s->dpy, s->back, s->gc, x, y, str, (int)strlen(str));
 }
 
-/* nearest-neighbor blit of a 0x00RRGGBB pixel buffer into the backbuffer.
-   A dest-sized XImage is cached across calls and reused (single window). */
+/* per-surface staging XImage, (re)sized on demand */
+static XImage *blit_image(VSurf *s, int w, int h) {
+    if (s->img && s->img_w >= w && s->img_h >= h) return s->img;
+    int nw = s->img_w > w ? s->img_w : w;
+    int nh = s->img_h > h ? s->img_h : h;
+    if (s->img) { XDestroyImage(s->img); s->img = NULL; } /* frees the data too */
+    char *buf = malloc((size_t)nw * (size_t)nh * 4);
+    if (!buf) return NULL;
+    int scr = DefaultScreen(s->dpy);
+    s->img = XCreateImage(s->dpy, DefaultVisual(s->dpy, scr),
+                          (unsigned)DefaultDepth(s->dpy, scr), ZPixmap, 0, buf,
+                          (unsigned)nw, (unsigned)nh, 32, 0);
+    if (!s->img) { free(buf); return NULL; }
+    s->img_w = nw;
+    s->img_h = nh;
+    return s->img;
+}
+
+/* nearest-neighbor blit of a 0x00RRGGBB pixel buffer into the backbuffer. */
 void vs_blit(void *vs, const int *pixels, int srcw, int srch,
              int dstx, int dsty, int dstw, int dsth) {
     VSurf *s = vs;
     if (!s->dpy || srcw <= 0 || srch <= 0 || dstw <= 0 || dsth <= 0) return;
-    static XImage *img;
-    static int img_w, img_h;
-    int scr = DefaultScreen(s->dpy);
-    if (!img || img_w != dstw || img_h != dsth) {
-        if (img) XDestroyImage(img); /* frees the malloc'd data too */
-        char *buf = malloc((size_t)dstw * (size_t)dsth * 4);
-        if (!buf) return;
-        img = XCreateImage(s->dpy, DefaultVisual(s->dpy, scr),
-                           (unsigned)DefaultDepth(s->dpy, scr), ZPixmap, 0, buf,
-                           (unsigned)dstw, (unsigned)dsth, 32, 0);
-        if (!img) { free(buf); return; }
-        img_w = dstw;
-        img_h = dsth;
-    }
+    XImage *img = blit_image(s, dstw, dsth);
+    if (!img) return;
     /* Fast path: on a little-endian 32bpp TrueColor visual the image row is a
        plain uint32 array of 0x00RRGGBB — pack directly, skipping 786K XPutPixel
        calls per frame. Falls back to XPutPixel on paletted/odd visuals. */
     if (truecolor && img->bits_per_pixel == 32 && img->byte_order == LSBFirst) {
         for (int dy = 0; dy < dsth; dy++) {
             int sy = dy * srch / dsth;
-            const int *src = pixels + sy * srcw;
-            uint32_t *row = (uint32_t *)(img->data + dy * img->bytes_per_line);
+            const int *src = pixels + (long)sy * srcw;
+            uint32_t *row = (uint32_t *)(img->data + (long)dy * img->bytes_per_line);
             if (srcw == dstw) {
                 for (int dx = 0; dx < dstw; dx++) row[dx] = (uint32_t)(src[dx] & 0xFFFFFF);
             } else {
@@ -671,16 +923,51 @@ void vs_blit(void *vs, const int *pixels, int srcw, int srch,
         for (int dy = 0; dy < dsth; dy++) {
             int sy = dy * srch / dsth;
             for (int dx = 0; dx < dstw; dx++)
-                XPutPixel(img, dx, dy, pixel_of(s->dpy, pixels[sy * srcw + dx * srcw / dstw]));
+                XPutPixel(img, dx, dy, pixel_of(s->dpy, pixels[(long)sy * srcw + dx * srcw / dstw]));
         }
     }
-    XPutImage(s->dpy, s->back, s->gc, img, 0, 0, dstx, dsty, (unsigned)dstw, (unsigned)dsth);
+    XPutImage(s->dpy, s->back, s->pgc, img, 0, 0, dstx, dsty, (unsigned)dstw, (unsigned)dsth);
+}
+
+/* unscaled sub-rect copy with explicit source stride (pixels), for
+   dirty-region presents out of a full-frame canvas */
+void vs_blit_rect(void *vs, const int *pixels, int stride_px,
+                  int srcx, int srcy, int w, int h, int dstx, int dsty) {
+    VSurf *s = vs;
+    if (!s->dpy || w <= 0 || h <= 0 || stride_px <= 0) return;
+    XImage *img = blit_image(s, w, h);
+    if (!img) return;
+    if (truecolor && img->bits_per_pixel == 32 && img->byte_order == LSBFirst) {
+        for (int dy = 0; dy < h; dy++) {
+            const int *src = pixels + (long)(srcy + dy) * stride_px + srcx;
+            uint32_t *row = (uint32_t *)(img->data + (long)dy * img->bytes_per_line);
+            for (int dx = 0; dx < w; dx++) row[dx] = (uint32_t)(src[dx] & 0xFFFFFF);
+        }
+    } else {
+        for (int dy = 0; dy < h; dy++)
+            for (int dx = 0; dx < w; dx++)
+                XPutPixel(img, dx, dy,
+                          pixel_of(s->dpy, pixels[(long)(srcy + dy) * stride_px + srcx + dx]));
+    }
+    XPutImage(s->dpy, s->back, s->pgc, img, 0, 0, dstx, dsty, (unsigned)w, (unsigned)h);
 }
 
 void vs_present(void *vs) {
     VSurf *s = vs;
     if (!s->dpy) return;
-    XCopyArea(s->dpy, s->back, s->win, s->gc, 0, 0, (unsigned)s->w, (unsigned)s->h, 0, 0);
+    XCopyArea(s->dpy, s->back, s->win, s->pgc, 0, 0, (unsigned)s->w, (unsigned)s->h, 0, 0);
+    XFlush(s->dpy);
+}
+
+void vs_present_rect(void *vs, int x, int y, int w, int h) {
+    VSurf *s = vs;
+    if (!s->dpy) return;
+    if (x < 0) { w += x; x = 0; }
+    if (y < 0) { h += y; y = 0; }
+    if (x + w > s->w) w = s->w - x;
+    if (y + h > s->h) h = s->h - y;
+    if (w <= 0 || h <= 0) return;
+    XCopyArea(s->dpy, s->back, s->win, s->pgc, x, y, (unsigned)w, (unsigned)h, x, y);
     XFlush(s->dpy);
 }
 
@@ -702,33 +989,79 @@ int vs_font_height(void *vs) {
     return font->ascent + font->descent;
 }
 
+/* X modifier state -> VS_MOD_* bitmask (Mod1 = Alt, Mod4 = Super on
+   stock X keyboard maps) */
+static int x11_mods_of(unsigned int state) {
+    int m = 0;
+    if (state & ShiftMask) m |= VS_MOD_SHIFT;
+    if (state & ControlMask) m |= VS_MOD_CTRL;
+    if (state & Mod1Mask) m |= VS_MOD_ALT;
+    if (state & Mod4Mask) m |= VS_MOD_SUPER;
+    return m;
+}
+
 /* decode an X key event into last_key/last_text; 1 if a key we deliver, else 0 */
-static int x11_decode_key(XKeyEvent *ke) {
+static int x11_decode_key(VSurf *s, XKeyEvent *ke) {
     char buf[16];
     KeySym ks = 0;
-    int n = XLookupString(ke, buf, sizeof buf - 1, &ks, NULL);
+    int n;
+    if (s->ic && ke->type == KeyPress) {
+        /* UTF-8 text input via the input method (composed chars, dead keys) */
+        Status st = 0;
+        n = Xutf8LookupString(s->ic, ke, buf, sizeof buf - 1, &ks, &st);
+        if (st != XLookupChars && st != XLookupBoth && st != XLookupKeySym) n = 0;
+        if (st == XLookupKeySym) n = 0;
+    } else {
+        n = XLookupString(ke, buf, sizeof buf - 1, &ks, NULL);
+    }
+    buf[n < 0 ? 0 : n] = 0;
     last_text[0] = 0;
     switch (ks) {
     case XK_Return: case XK_KP_Enter: last_key = VS_KEY_ENTER; return 1;
     case XK_BackSpace: last_key = VS_KEY_BACKSPACE; return 1;
     case XK_Escape: last_key = VS_KEY_ESC; return 1;
-    case XK_Up: last_key = VS_KEY_UP; return 1;
-    case XK_Down: last_key = VS_KEY_DOWN; return 1;
-    case XK_Left: last_key = VS_KEY_LEFT; return 1;
-    case XK_Right: last_key = VS_KEY_RIGHT; return 1;
-    case XK_Delete: last_key = VS_KEY_DELETE; return 1;
-    case XK_Tab: last_key = VS_KEY_TAB; return 1;
-    case XK_Home: last_key = VS_KEY_HOME; return 1;
-    case XK_End: last_key = VS_KEY_END; return 1;
+    case XK_Up: case XK_KP_Up: last_key = VS_KEY_UP; return 1;
+    case XK_Down: case XK_KP_Down: last_key = VS_KEY_DOWN; return 1;
+    case XK_Left: case XK_KP_Left: last_key = VS_KEY_LEFT; return 1;
+    case XK_Right: case XK_KP_Right: last_key = VS_KEY_RIGHT; return 1;
+    case XK_Delete: case XK_KP_Delete: last_key = VS_KEY_DELETE; return 1;
+    case XK_Tab: case XK_ISO_Left_Tab: last_key = VS_KEY_TAB; return 1;
+    case XK_Home: case XK_KP_Home: last_key = VS_KEY_HOME; return 1;
+    case XK_End: case XK_KP_End: last_key = VS_KEY_END; return 1;
+    case XK_Page_Up: case XK_KP_Page_Up: last_key = VS_KEY_PAGEUP; return 1;
+    case XK_Page_Down: case XK_KP_Page_Down: last_key = VS_KEY_PAGEDOWN; return 1;
+    case XK_Insert: case XK_KP_Insert: last_key = VS_KEY_INSERT; return 1;
+    case XK_Shift_L: case XK_Shift_R: last_key = VS_KEY_SHIFT; return 1;
+    case XK_Control_L: case XK_Control_R: last_key = VS_KEY_CTRL; return 1;
+    case XK_Alt_L: case XK_Alt_R: case XK_Meta_L: case XK_Meta_R:
+        last_key = VS_KEY_ALT; return 1;
+    case XK_Super_L: case XK_Super_R: last_key = VS_KEY_SUPER; return 1;
     default:
-        if (n == 1 && buf[0] >= 32 && buf[0] < 127) {
-            last_key = buf[0];
-            last_text[0] = buf[0];
-            last_text[1] = 0;
+        if (ks >= XK_F1 && ks <= XK_F12) { /* contiguous keysym block */
+            last_key = VS_KEY_F1 + (int)(ks - XK_F1);
+            return 1;
+        }
+        /* Printable key: prefer the (shift-aware) keysym so Ctrl+A still
+           reads as 'a' — the lookup folds Ctrl into a control byte, which
+           would otherwise swallow the shortcut key entirely. Text is set
+           only from a printable lookup, so Ctrl-chorded keys deliver a key
+           code but no insertable text. */
+        if (ks == XK_space || (ks >= 0x21 && ks <= 0x7e)) {
+            last_key = (int)ks;
+            if (n >= 1 && (unsigned char)buf[0] >= 32 && buf[0] != 127) {
+                if ((size_t)n < sizeof last_text) memcpy(last_text, buf, (size_t)n + 1);
+            }
+            return 1;
+        }
+        /* keypad digits, and any UTF-8 text the input method composed:
+           no ASCII key code (key = 0 for multibyte), only insertable text */
+        if (n >= 1 && (unsigned char)buf[0] >= 32 && buf[0] != 127) {
+            last_key = (n == 1 && (unsigned char)buf[0] < 127) ? buf[0] : 0;
+            if ((size_t)n < sizeof last_text) memcpy(last_text, buf, (size_t)n + 1);
             return 1;
         }
     }
-    return 0; /* modifier or unmapped key */
+    return 0; /* dead key or unmapped */
 }
 
 /* translate one XEvent into a VS_EV_* code, or -1 to ignore and keep waiting */
@@ -750,10 +1083,13 @@ static int x11_translate(VSurf *s, XEvent *e) {
         return -1;
     }
     case KeyPress:
-        return x11_decode_key(&e->xkey) ? VS_EV_KEY : -1;
+        last_mods = x11_mods_of(e->xkey.state);
+        return x11_decode_key(s, &e->xkey) ? VS_EV_KEY : -1;
     case KeyRelease:
-        return x11_decode_key(&e->xkey) ? VS_EV_KEY_UP : -1;
+        last_mods = x11_mods_of(e->xkey.state);
+        return x11_decode_key(s, &e->xkey) ? VS_EV_KEY_UP : -1;
     case ButtonPress:
+        last_mods = x11_mods_of(e->xbutton.state);
         if (e->xbutton.button == Button1) {
             last_x = e->xbutton.x;
             last_y = e->xbutton.y;
@@ -778,6 +1114,7 @@ static int x11_translate(VSurf *s, XEvent *e) {
         }
         return -1;
     case ButtonRelease:
+        last_mods = x11_mods_of(e->xbutton.state);
         if (e->xbutton.button == Button1) {
             last_x = e->xbutton.x;
             last_y = e->xbutton.y;
@@ -785,6 +1122,7 @@ static int x11_translate(VSurf *s, XEvent *e) {
         }
         return -1;
     case MotionNotify:
+        last_mods = x11_mods_of(e->xmotion.state);
         /* hover source — coalesce: only deliver if the cursor actually moved.
            X11 often fires many MotionNotify per pixel; throttle by storing the
            latest and letting vs_wait dedupe via the change check in Window. */
@@ -792,11 +1130,34 @@ static int x11_translate(VSurf *s, XEvent *e) {
         last_y = e->xmotion.y;
         return VS_EV_MOUSE_MOVE;
     case ClientMessage:
-        if ((Atom)e->xclient.data.l[0] == wm_delete) return VS_EV_CLOSE;
+        if ((Atom)e->xclient.data.l[0] == s->wm_delete) return VS_EV_CLOSE;
         return -1;
     default:
         return -1;
     }
+}
+
+/* Coalesce a burst of MotionNotify: after delivering one move, swallow any
+   further queued motion events (keeping the newest coordinates) so a fast
+   mouse produces one hover pass per frame instead of one per pixel. */
+static void x11_coalesce_motion(VSurf *s) {
+    while (XPending(s->dpy)) {
+        XEvent e;
+        XPeekEvent(s->dpy, &e);
+        if (e.type != MotionNotify) return;
+        XNextEvent(s->dpy, &e);
+        last_x = e.xmotion.x;
+        last_y = e.xmotion.y;
+        last_mods = x11_mods_of(e.xmotion.state);
+    }
+}
+
+/* translate + IME filter + motion coalescing for one raw event */
+static int x11_deliver(VSurf *s, XEvent *e) {
+    if (XFilterEvent(e, None)) return -1; /* consumed by the input method */
+    int r = x11_translate(s, e);
+    if (r == VS_EV_MOUSE_MOVE) x11_coalesce_motion(s);
+    return r;
 }
 
 int vs_wait(void *vs) {
@@ -805,7 +1166,7 @@ int vs_wait(void *vs) {
     for (;;) {
         XEvent e;
         XNextEvent(s->dpy, &e);
-        int r = x11_translate(s, &e);
+        int r = x11_deliver(s, &e);
         if (r >= 0) return r;
     }
 }
@@ -819,7 +1180,7 @@ int vs_poll(void *vs) {
     while (XPending(s->dpy)) {
         XEvent e;
         XNextEvent(s->dpy, &e);
-        int r = x11_translate(s, &e);
+        int r = x11_deliver(s, &e);
         if (r >= 0) return r;
     }
     return VS_EV_NONE;
@@ -836,7 +1197,7 @@ int vs_wait_timeout(void *vs, int ms) {
         while (XPending(s->dpy)) {
             XEvent e;
             XNextEvent(s->dpy, &e);
-            int r = x11_translate(s, &e);
+            int r = x11_deliver(s, &e);
             if (r >= 0) return r;
         }
         fd_set rf;
@@ -849,6 +1210,12 @@ int vs_wait_timeout(void *vs, int ms) {
         if (rc <= 0) return VS_EV_TIMER; /* timeout or interrupted: tick */
         /* data ready: loop and drain via XPending */
     }
+}
+
+int vs_scale_pct(void) {
+    int env = scale_from_env();
+    if (env) return env;
+    return g_scale_pct ? g_scale_pct : 100;
 }
 
 void *vs_native_display(void *vs) { return ((VSurf *)vs)->dpy; }

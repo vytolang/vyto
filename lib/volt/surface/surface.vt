@@ -9,6 +9,8 @@ import { vs_open, vs_close, vs_width, vs_height, vs_set_title,
           vs_fill_rect, vs_draw_rect, vs_draw_line, vs_draw_text, vs_blit, vs_present,
           vs_text_width, vs_font_ascent, vs_font_height,
           vs_wait, vs_poll, vs_wait_timeout, vs_key, vs_text, vs_x, vs_y, vs_wheel,
+          vs_mods, vs_now_ms, vs_scale_pct, vs_blit_rect, vs_present_rect,
+          vs_clip_set, vs_clip_clear,
           vs_native_display, vs_native_window, vs_native_gc } from "vsurf";
 
 // Event classes returned by Surface.wait(). Values mirror VS_EV_* in
@@ -27,7 +29,11 @@ export const EV_MOUSE_WHEEL: int = 10; // mouse wheel scrolled; wheel() gives th
 export const EV_MOUSE_RDOWN: int = 11; // right button pressed; mouse_x()/mouse_y() give position
 
 // Key codes from Surface.key(): printable ASCII, or one of these
-// (mirrors VS_KEY_* in vsurf.h).
+// (mirrors VS_KEY_* in vsurf.h). KEY_SPACE is plain ASCII 32, named for
+// readability. Modifier keys also arrive as their own KEY/KEY_UP events
+// (for held-key game input); for "was ctrl held during this event" use
+// Surface.mods() / Window.mods with the MOD_* masks below.
+export const KEY_SPACE: int = 32;
 export const KEY_ENTER: int = 1000;
 export const KEY_BACKSPACE: int = 1001;
 export const KEY_ESC: int = 1002;
@@ -39,6 +45,31 @@ export const KEY_DELETE: int = 1007;
 export const KEY_TAB: int = 1008;
 export const KEY_HOME: int = 1009;
 export const KEY_END: int = 1010;
+export const KEY_PAGEUP: int = 1011;
+export const KEY_PAGEDOWN: int = 1012;
+export const KEY_INSERT: int = 1013;
+export const KEY_SHIFT: int = 1014;
+export const KEY_CTRL: int = 1015;
+export const KEY_ALT: int = 1016;
+export const KEY_SUPER: int = 1017;
+export const KEY_F1: int = 1021;
+export const KEY_F2: int = 1022;
+export const KEY_F3: int = 1023;
+export const KEY_F4: int = 1024;
+export const KEY_F5: int = 1025;
+export const KEY_F6: int = 1026;
+export const KEY_F7: int = 1027;
+export const KEY_F8: int = 1028;
+export const KEY_F9: int = 1029;
+export const KEY_F10: int = 1030;
+export const KEY_F11: int = 1031;
+export const KEY_F12: int = 1032;
+
+// Modifier bitmask from Surface.mods(): state at the last delivered event.
+export const MOD_SHIFT: int = 1;
+export const MOD_CTRL: int = 2;
+export const MOD_ALT: int = 4;
+export const MOD_SUPER: int = 8;
 
 export struct Rect {
     x: int;
@@ -99,10 +130,11 @@ export fn mix(c0: int, c1: int, t: float): int {
     let a1 = alpha_of(c1);
     let r0 = red_of(c0);  let g0 = green_of(c0);  let b0 = blue_of(c0);
     let r1 = red_of(c1);  let g1 = green_of(c1);  let b1 = blue_of(c1);
-    let r = ((r0 as float) + (r1 - r0) as float * t) as int;
-    let g = ((g0 as float) + (g1 - g0) as float * t) as int;
-    let b = ((b0 as float) + (b1 - b0) as float * t) as int;
-    let a = ((a0 as float) + (a1 - a0) as float * t) as int;
+    // rounded, not truncated — truncation dark-biases every gradient/tint
+    let r = ((r0 as float) + (r1 - r0) as float * t + 0.5) as int;
+    let g = ((g0 as float) + (g1 - g0) as float * t + 0.5) as int;
+    let b = ((b0 as float) + (b1 - b0) as float * t + 0.5) as int;
+    let a = ((a0 as float) + (a1 - a0) as float * t + 0.5) as int;
     let aa = a & 0xFF;
     if (aa == 0) { aa = 0xFF; }
     return (aa << 24) | ((r & 0xFF) << 16) | ((g & 0xFF) << 8) | (b & 0xFF);
@@ -152,14 +184,34 @@ export class Surface {
                 dst.x as i32, dst.y as i32, dst.w as i32, dst.h as i32);
     }
     // Blit from a C-owned 0xRRGGBB buffer (e.g. a volt/gfx Canvas). The buffer
-    // must be tightly packed (stride == srcw*4); blend2d aligns stride to the
-    // width, so widths that are a multiple of 4 satisfy this.
+    // must be tightly packed (stride == srcw*4); for stride-aware or partial
+    // blits use blitRect instead.
     fn blitPtr(p: rawptr, srcw: int, srch: int, dst: Rect) {
         vs_blit(this.h, p, srcw as i32, srch as i32,
                 dst.x as i32, dst.y as i32, dst.w as i32, dst.h as i32);
     }
 
+    // Unscaled sub-rect blit with an explicit row stride (in pixels): copies
+    // src (x,y,w,h) out of the buffer to (dstx,dsty). The dirty-region path
+    // out of a full-frame canvas, and the correct call for any stride.
+    fn blitRect(p: rawptr, stridePx: int, srcx: int, srcy: int,
+                w: int, h: int, dstx: int, dsty: int) {
+        vs_blit_rect(this.h, p, stridePx as i32, srcx as i32, srcy as i32,
+                     w as i32, h as i32, dstx as i32, dsty as i32);
+    }
+
     fn present() { vs_present(this.h); }
+    // present only this backbuffer rect — cheaper for dirty-region repaints
+    fn present_rect(r: Rect) {
+        vs_present_rect(this.h, r.x as i32, r.y as i32, r.w as i32, r.h as i32);
+    }
+
+    // Rectangular clip for the draw calls (fill/frame/line/text); replaces
+    // any previous clip. blit/present ignore it. clip_clear removes it.
+    fn clip_set(r: Rect) {
+        vs_clip_set(this.h, r.x as i32, r.y as i32, r.w as i32, r.h as i32);
+    }
+    fn clip_clear() { vs_clip_clear(this.h); }
 
     fn wait(): int { return vs_wait(this.h); }
     // Non-blocking: returns the next event or EV_NONE if none is queued.
@@ -172,6 +224,13 @@ export class Surface {
     fn mouse_x(): int { return vs_x(); }
     fn mouse_y(): int { return vs_y(); }
     fn wheel(): int { return vs_wheel(); }
+    // MOD_* bitmask captured with the last delivered event
+    fn mods(): int { return vs_mods(); }
+    // monotonic milliseconds — the animation/game clock (not wall time)
+    fn now_ms(): int { return vs_now_ms() as int; }
+    // UI scale factor: 1.0 = 96dpi baseline, 2.0 = HiDPI. From $VOLT_SCALE,
+    // else Xft.dpi / the Windows DPI. Headless is always 1.0.
+    fn scale(): float { return (vs_scale_pct() as float) / 100.0; }
 
     // escape hatches: reach the backend for the 5% case
     fn raw_handle(): rawptr { return this.h; }
