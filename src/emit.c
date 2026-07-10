@@ -1262,7 +1262,7 @@ static void emit_class_struct(ClassDecl *cd, SBuf *h, bool *emitted, ClassDecl *
     sb_puts(h, "};\n");
 }
 
-void emit_module(Module *m, bool is_entry, bool checks, SBuf *h, SBuf *c) {
+void emit_module(Module *m, bool is_entry, bool checks, bool freestanding, SBuf *h, SBuf *c) {
     g_checks = checks;
     /* ---------- header ---------- */
     sb_printf(h, "#ifndef VOLT_MOD_%s_H\n#define VOLT_MOD_%s_H\n", m->name, m->name);
@@ -1376,9 +1376,15 @@ void emit_module(Module *m, bool is_entry, bool checks, SBuf *h, SBuf *c) {
     sb_puts(c, aux.data);
     sb_puts(c, "\n");
     sb_puts(c, code.data);
-    if (is_entry)
-        sb_printf(c, "int main(int argc, char **argv) {\n    vt_set_args(argc, argv);\n"
-                     "    v_%s_main();\n    return 0;\n}\n", m->name);
+    if (is_entry) {
+        if (freestanding)
+            /* Bare-metal has no argc/argv and owns its own startup: export an
+               entry the reset handler / RTOS task calls. Args stay empty. */
+            sb_printf(c, "void vt_main(void) {\n    v_%s_main();\n}\n", m->name);
+        else
+            sb_printf(c, "int main(int argc, char **argv) {\n    vt_set_args(argc, argv);\n"
+                         "    v_%s_main();\n    return 0;\n}\n", m->name);
+    }
     sb_free(&aux);
     sb_free(&code);
 }

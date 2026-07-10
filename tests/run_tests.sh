@@ -50,6 +50,36 @@ else
     fail=1
 fi
 
+# --- freestanding runtime profile: -DVT_NO_LIBC path builds, links, runs ---
+# The runtime is compiled with no libc and reaches the host only through the six
+# vt_host_* hooks; host_hooks.c bridges them to libc as a no-cross-toolchain
+# stand-in. Also asserts the runtime object references zero libc symbols.
+./voltc build examples/01_hello.vt --freestanding --cc gcc \
+        -o examples/.volt-cache/libhello_fs.a >/dev/null 2>&1 &&
+    cc -c examples/freestanding/host_hooks.c -o examples/.volt-cache/host_hooks.o 2>/dev/null &&
+    cc examples/.volt-cache/host_hooks.o examples/.volt-cache/libhello_fs.a \
+       -o examples/.volt-cache/hello_fs 2>/dev/null
+if [ "$(examples/.volt-cache/hello_fs 2>/dev/null | head -1)" = "hello, volt" ] &&
+   [ "$(examples/.volt-cache/hello_fs 2>/dev/null | sed -n 5p)" = "x*2 = 5" ]; then
+    echo "PASS freestanding_build_run"
+else
+    echo "FAIL freestanding_build_run"
+    fail=1
+fi
+if nm examples/.volt-cache/volt_rt_gcc_fs.o 2>/dev/null | grep ' U ' | grep -qv 'vt_host_'; then
+    echo "FAIL freestanding_no_libc (runtime object references a libc symbol)"
+    nm examples/.volt-cache/volt_rt_gcc_fs.o | grep ' U ' | grep -v 'vt_host_' | head
+    fail=1
+else
+    echo "PASS freestanding_no_libc"
+fi
+if ./voltc run examples/01_hello.vt --freestanding 2>&1 | grep -q "not a runnable executable"; then
+    echo "PASS freestanding_run_refused"
+else
+    echo "FAIL freestanding_run_refused"
+    fail=1
+fi
+
 # --- stdlib search path: VOLT_HOME lib, stem-collision naming, local shadowing ---
 got=$(VOLT_HOME=tests/fixtures/volthome ./voltc run tests/fixtures/libpath/main.vt 2>&1)
 want="hello from VOLT_HOME lib

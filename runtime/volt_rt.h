@@ -5,7 +5,22 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+
+#ifdef VT_NO_LIBC
+/* Freestanding: no <string.h>. The runtime defines these (see volt_rt.c);
+   declare them here so header-inline helpers and emitted code can call them. */
+void *memcpy(void *dst, const void *src, size_t n);
+void *memset(void *dst, int c, size_t n);
+void *memmove(void *dst, const void *src, size_t n);
+int memcmp(const void *a, const void *b, size_t n);
+size_t strlen(const char *s);
+int strcmp(const char *a, const char *b);
+int strncmp(const char *a, const char *b, size_t n);
+#else
 #include <string.h>
+#endif
+
+#include "volt_host.h"
 
 /* extern "C" declarations are emitted under private identifiers aliased to the
    real symbol with __asm__, so they can never conflict with system headers.
@@ -37,7 +52,14 @@ void vt_free_now(void *p);
 static inline void *vt_retain(void *p) {
     if (p) {
         VtObj *o = (VtObj *)p;
-        if (o->rc >= 0) o->rc++;
+        if (o->rc >= 0)
+#ifdef VT_ATOMIC_RC
+            /* Multicore-forward seam: relaxed is sufficient for a retain — it
+               only guards the count, not the pointee's contents. */
+            __atomic_fetch_add(&o->rc, 1, __ATOMIC_RELAXED);
+#else
+            o->rc++;
+#endif
     }
     return p;
 }

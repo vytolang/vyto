@@ -244,12 +244,18 @@ static void usage(void) {
             "usage:\n"
             "  voltc build <file.vt> [-o out] [--release] [--bundle] [--verbose]\n"
             "              [--target <triple>] [--cc <compiler cmd>]\n"
-            "    --bundle   statically link prebuilt native libs + the C++ runtime\n"
-            "               into one self-contained exe (no shipped .so)\n"
+            "              [--freestanding] [--no-float] [--no-fs]\n"
+            "    --bundle       statically link prebuilt native libs + the C++ runtime\n"
+            "                   into one self-contained exe (no shipped .so)\n"
+            "    --freestanding no libc: route alloc/print/abort through vt_host_* hooks\n"
+            "                   the embedder supplies; output is lib<name>.a, not an exe\n"
+            "    --no-float     stub float-to-string (no soft-float formatter pulled in)\n"
+            "    --no-fs        drop the filesystem layer (File ops become no-ops/panics)\n"
             "  voltc run   <file.vt> [--release] [--verbose] [-- args...]\n"
             "targets: linux-x64 linux-arm64 macos-x64 macos-arm64 windows-x64\n"
             "  --cc (or VOLT_CC) overrides the C compiler; put sysroots/flags inside it,\n"
-            "  e.g. --cc 'zig cc -target aarch64-linux-gnu'\n");
+            "  e.g. --cc 'zig cc -target aarch64-linux-gnu' or (freestanding)\n"
+            "  --cc 'arm-none-eabi-gcc -mcpu=cortex-m4 -ffreestanding'\n");
     exit(2);
 }
 
@@ -278,6 +284,7 @@ int main(int argc, char **argv) {
     const char *cmd = argv[1];
     const char *input = argv[2];
     bool release = false, verbose = false, bundle = false;
+    bool freestanding = false, no_float = false, no_fs = false;
     const char *outpath = NULL, *target = NULL, *cc_override = NULL;
     int prog_argc = 0;
     char **prog_argv = NULL;
@@ -285,6 +292,9 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "--release") == 0) release = true;
         else if (strcmp(argv[i], "--bundle") == 0) bundle = true;
         else if (strcmp(argv[i], "--verbose") == 0) verbose = true;
+        else if (strcmp(argv[i], "--freestanding") == 0) freestanding = true;
+        else if (strcmp(argv[i], "--no-float") == 0) no_float = true;
+        else if (strcmp(argv[i], "--no-fs") == 0) no_fs = true;
         else if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) outpath = argv[++i];
         else if (strcmp(argv[i], "--target") == 0 && i + 1 < argc) target = argv[++i];
         else if (strcmp(argv[i], "--cc") == 0 && i + 1 < argc) cc_override = argv[++i];
@@ -293,6 +303,9 @@ int main(int argc, char **argv) {
     }
     bool do_run = strcmp(cmd, "run") == 0;
     if (!do_run && strcmp(cmd, "build") != 0) usage();
+    if (freestanding && do_run)
+        fatal("freestanding builds produce a library, not a runnable executable — "
+              "link libvolt.a into your firmware and flash it");
     if (!cc_override) cc_override = getenv("VOLT_CC");
     if (target && !known_triple(target))
         fatal("unknown target '%s' (see voltc --help for the list)", target);
@@ -317,6 +330,9 @@ int main(int argc, char **argv) {
     }
 
     const char *rtdir = find_runtime_dir();
+    if (freestanding && !cc_override)
+        fatal("freestanding builds need a bare-metal toolchain — pass one with "
+              "--cc or VOLT_CC (e.g. --cc 'arm-none-eabi-gcc -mcpu=cortex-m4')");
     const char *cc;
     if (cc_override) {
         cc = cc_override;
@@ -332,28 +348,42 @@ int main(int argc, char **argv) {
         cc = have_tcc() && !release ? "tcc" : "cc";
     }
     const char *opt = release ? "-O2" : (strcmp(cc, "tcc") == 0 ? "" : "-O0");
+    /* Freestanding profile: no libc, no libc-recognized builtins (so our own
+       mem/str/formatter routines can't be pattern-matched into self-calls),
+       plus the opt-in sub-profiles. Injected into every runtime+module compile. */
+    const char *fsflags = "";
+    if (freestanding) fsflags = " -ffreestanding -DVT_NO_LIBC -fno-builtin";
+    if (no_float) fsflags = arena_printf(&g_arena, "%s -DVT_NO_FLOAT", fsflags);
+    if (no_fs) fsflags = arena_printf(&g_arena, "%s -DVT_NO_FS", fsflags);
     /* Debug builds also trap overflow at the C level (defense in depth beyond
        the emitter's checked arithmetic), catching overflow in native/FFI code.
-       Native host compilers only; skipped for cross/tcc or if unsupported. */
+       Native host compilers only; skipped for cross/tcc/freestanding (ubsan
+       needs a hosted runtime) or if unsupported. */
     const char *san = "";
-    if (!release && !bundle && !cross && !win_target && strcmp(cc, "tcc") != 0 && cc_supports_san(cc))
+    if (!release && !bundle && !cross && !win_target && !freestanding &&
+        strcmp(cc, "tcc") != 0 && cc_supports_san(cc))
         san = " -fsanitize=signed-integer-overflow -fno-sanitize-recover=all";
     /* Object-cache key for module .o files. A ubsan-instrumented debug object
        cannot be reused for a --bundle/release link (which omits the ubsan
-       runtime), so debug+san and plain builds must not share the same path. */
-    const char *osuf = release ? "_rel" : (san[0] ? "_dbg" : "");
+       runtime), so debug+san and plain builds must not share the same path;
+       the freestanding profile likewise needs its own objects. */
+    const char *prof = arena_printf(&g_arena, "%s%s%s", freestanding ? "_fs" : "",
+                                    no_float ? "_nf" : "", no_fs ? "_nofs" : "");
+    const char *osuf = arena_printf(&g_arena, "%s%s", release ? "_rel" : (san[0] ? "_dbg" : ""),
+                                    prof);
 
     SBuf objs;
     sb_init(&objs);
     bool relink = false;
 
     /* runtime object (cc name sanitized: --cc commands may contain spaces) */
-    const char *rt_o = arena_printf(&g_arena, "%s/volt_rt_%s%s.o", cache, sanitize(cc),
-                                    release ? "_rel" : "");
+    const char *rt_o = arena_printf(&g_arena, "%s/volt_rt_%s%s%s.o", cache, sanitize(cc),
+                                    release ? "_rel" : "", prof);
     const char *rt_c = arena_printf(&g_arena, "%s/volt_rt.c", rtdir);
     if (!file_exists(rt_o) || file_mtime(rt_c) > file_mtime(rt_o) ||
         file_mtime(arena_printf(&g_arena, "%s/volt_rt.h", rtdir)) > file_mtime(rt_o)) {
-        char *c = arena_printf(&g_arena, "%s %s -w -c -o %s %s/volt_rt.c", cc, opt, rt_o, rtdir);
+        char *c = arena_printf(&g_arena, "%s %s%s -w -c -o %s %s/volt_rt.c", cc, opt, fsflags, rt_o,
+                               rtdir);
         if (run_cmd(c, verbose) != 0) fatal("runtime compilation failed");
         relink = true;
     }
@@ -385,11 +415,11 @@ int main(int argc, char **argv) {
             while ((de = readdir(dp))) {
                 if (!has_suffix(de->d_name, ".c")) continue;
                 const char *csrc = arena_printf(&g_arena, "%s/%s", nsrc, de->d_name);
-                const char *obj = arena_printf(&g_arena, "%s/native_%s_%s%s.o", cache, m->name,
-                                               stem_of(de->d_name), release ? "_rel" : "");
+                const char *obj = arena_printf(&g_arena, "%s/native_%s_%s%s%s.o", cache, m->name,
+                                               stem_of(de->d_name), release ? "_rel" : "", prof);
                 if (!file_exists(obj) || file_mtime(csrc) > file_mtime(obj)) {
-                    char *cl = arena_printf(&g_arena, "%s %s -w -I%s -c -o %s %s", cc,
-                                            release ? "-O2" : opt, nsrc, obj, csrc);
+                    char *cl = arena_printf(&g_arena, "%s %s%s -w -I%s -c -o %s %s", cc,
+                                            release ? "-O2" : opt, fsflags, nsrc, obj, csrc);
                     if (run_cmd(cl, verbose) != 0)
                         fatal("native source of package '%s' failed to compile", m->name);
                     relink = true;
@@ -443,7 +473,7 @@ int main(int argc, char **argv) {
         SBuf h, c;
         sb_init(&h);
         sb_init(&c);
-        emit_module(m, m == entry, !release, &h, &c);
+        emit_module(m, m == entry, !release, freestanding, &h, &c);
         const char *hpath = arena_printf(&g_arena, "%s/mod_%s.h", cache, m->name);
         const char *cpath = arena_printf(&g_arena, "%s/mod_%s.c", cache, m->name);
         bool hchanged = false, cchanged = false;
@@ -476,11 +506,30 @@ int main(int argc, char **argv) {
         const char *opath = arena_printf(&g_arena, "%s/mod_%s%s.o", cache, m->name, osuf);
         if (m->src_hash || any_h_changed || !file_exists(opath) ||
             file_mtime(cpath) > file_mtime(opath) || latest_h > file_mtime(opath)) {
-            char *cmdline = arena_printf(&g_arena, "%s %s%s -w -I%s -I%s -c -o %s %s", cc, opt,
-                                         san, rtdir, cache, opath, cpath);
+            char *cmdline = arena_printf(&g_arena, "%s %s%s%s -w -I%s -I%s -c -o %s %s", cc, opt,
+                                         san, fsflags, rtdir, cache, opath, cpath);
             if (run_cmd(cmdline, verbose) != 0) fatal("C compilation of module '%s' failed", m->name);
             relink = true;
         }
+    }
+
+    /* ---- freestanding: archive, don't link ----
+       Bare-metal has no hosted crt0/main and often no linker at this stage —
+       the embedder links libvolt.a with their vt_host_* hooks, startup, and
+       linker script. ar just bundles objects, so the host ar handles cross
+       objects fine. No -lm, no rpath, no exe. */
+    if (freestanding) {
+        const char *lib = outpath ? outpath
+                                  : arena_printf(&g_arena, "%s/lib%s.a", cache, stem_of(input));
+        if (relink || !file_exists(lib)) {
+            char *cmdline = arena_printf(&g_arena, "rm -f %s && ar rcs %s%s", lib, lib, objs.data);
+            if (run_cmd(cmdline, verbose) != 0) fatal("archive failed");
+        }
+        if (verbose) fprintf(stderr, "wrote %s\n", lib);
+        sb_free(&objs);
+        sb_free(&shlibs);
+        sb_free(&bundle_deps);
+        return 0;
     }
 
     /* ---- link ---- */
