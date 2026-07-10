@@ -71,11 +71,70 @@ export const MOD_CTRL: int = 2;
 export const MOD_ALT: int = 4;
 export const MOD_SUPER: int = 8;
 
+fn imin2(a: int, b: int): int { if (a < b) { return a; } return b; }
+fn imax2(a: int, b: int): int { if (a > b) { return a; } return b; }
+
 export struct Rect {
     x: int;
     y: int;
     w: int;
     h: int;
+
+    // --- edges & center (read-only queries) ---
+    fn right(): int { return this.x + this.w; }
+    fn bottom(): int { return this.y + this.h; }
+    fn cx(): int { return this.x + this.w / 2; }
+    fn cy(): int { return this.y + this.h / 2; }
+    fn is_empty(): bool { return this.w <= 0 || this.h <= 0; }
+    fn has(px: int, py: int): bool {
+        return px >= this.x && px < this.x + this.w && py >= this.y && py < this.y + this.h;
+    }
+
+    // --- transforms (return a new Rect; `this` is by value) ---
+    fn inset(d: int): Rect { return Rect(this.x + d, this.y + d, this.w - 2 * d, this.h - 2 * d); }
+    fn inset_xy(dx: int, dy: int): Rect {
+        return Rect(this.x + dx, this.y + dy, this.w - 2 * dx, this.h - 2 * dy);
+    }
+    fn outset(d: int): Rect { return Rect(this.x - d, this.y - d, this.w + 2 * d, this.h + 2 * d); }
+    fn offset(dx: int, dy: int): Rect { return Rect(this.x + dx, this.y + dy, this.w, this.h); }
+    fn move_to(nx: int, ny: int): Rect { return Rect(nx, ny, this.w, this.h); }
+    fn resize(nw: int, nh: int): Rect { return Rect(this.x, this.y, nw, nh); }
+
+    // --- slicing: take a band off one edge, leaving `this` conceptually shrunk ---
+    fn take_top(n: int): Rect { return Rect(this.x, this.y, this.w, n); }
+    fn take_bottom(n: int): Rect { return Rect(this.x, this.y + this.h - n, this.w, n); }
+    fn take_left(n: int): Rect { return Rect(this.x, this.y, n, this.h); }
+    fn take_right(n: int): Rect { return Rect(this.x + this.w - n, this.y, n, this.h); }
+    fn drop_top(n: int): Rect { return Rect(this.x, this.y + n, this.w, this.h - n); }
+    fn drop_bottom(n: int): Rect { return Rect(this.x, this.y, this.w, this.h - n); }
+    fn drop_left(n: int): Rect { return Rect(this.x + n, this.y, this.w - n, this.h); }
+    fn drop_right(n: int): Rect { return Rect(this.x, this.y, this.w - n, this.h); }
+
+    // --- centering a w×h box inside this rect ---
+    fn center_box(bw: int, bh: int): Rect {
+        return Rect(this.x + (this.w - bw) / 2, this.y + (this.h - bh) / 2, bw, bh);
+    }
+
+    // --- set ops ---
+    fn union(o: Rect): Rect {
+        let nx = imin2(this.x, o.x);
+        let ny = imin2(this.y, o.y);
+        let rr = imax2(this.x + this.w, o.x + o.w);
+        let bb = imax2(this.y + this.h, o.y + o.h);
+        return Rect(nx, ny, rr - nx, bb - ny);
+    }
+    fn intersect(o: Rect): Rect {
+        let nx = imax2(this.x, o.x);
+        let ny = imax2(this.y, o.y);
+        let rr = imin2(this.x + this.w, o.x + o.w);
+        let bb = imin2(this.y + this.h, o.y + o.h);
+        if (rr <= nx || bb <= ny) { return Rect(0, 0, 0, 0); }
+        return Rect(nx, ny, rr - nx, bb - ny);
+    }
+    fn overlaps(o: Rect): bool {
+        return this.x < o.x + o.w && o.x < this.x + this.w &&
+               this.y < o.y + o.h && o.y < this.y + this.h;
+    }
 }
 
 export fn contains(r: Rect, px: int, py: int): bool {

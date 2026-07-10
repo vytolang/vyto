@@ -97,6 +97,7 @@ struct Expr {
     Expr *lhs, *rhs;
     Expr **args;
     int nargs;
+    const char **arg_names; /* per-arg label for named arguments; NULL if none used */
     int64_t ival;
     double fval;
     const char *sval;   /* string literal bytes */
@@ -167,6 +168,7 @@ typedef struct Param {
     const char *name;
     Type *type;
     Loc loc;
+    Expr *def;    /* default argument: literal-only, NULL if none */
     Local *local; /* set by checker */
 } Param;
 
@@ -184,8 +186,9 @@ struct FnDecl {
     Type *ret;              /* TY_VOID default */
     Stmt **body;
     int nbody;
-    bool is_virtual, is_override, is_extern;
+    bool is_virtual, is_override, is_extern, is_builder;
     ClassDecl *owner;       /* method owner, NULL for free fn */
+    StructDecl *sowner;     /* struct method owner, NULL otherwise */
     Module *module;
     int vslot;              /* vtable slot if virtual, else -1 */
     /* checker outputs */
@@ -210,6 +213,8 @@ struct StructDecl {
     Loc loc;
     Field *fields;
     int nfields;
+    FnDecl **methods;       /* value-receiver methods */
+    int nmethods;
     Module *module;
     bool is_extern;         /* extern "C" struct: emit verbatim name */
     bool checked;
@@ -246,6 +251,7 @@ struct Decl {
     ClassDecl *cd;          /* D_CLASS */
     Type *const_type;       /* D_CONST */
     Expr *const_init;
+    int fold_state;         /* D_CONST folding: 0 none, 1 in-progress, 2 done */
     /* import */
     const char **import_names;
     int nimport_names;

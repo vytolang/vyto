@@ -200,8 +200,24 @@ static void resolve_type(Type *t, Module *m) {
         fatal_at(t->loc, "'weak' applies only to class types");
 }
 
+static bool is_literal_default(const Expr *e) {
+    switch (e->kind) {
+    case EX_INT: case EX_FLOAT: case EX_BOOL: case EX_NULL: case EX_STR:
+        return true;
+    case EX_UN:
+        return e->op == T_MINUS && (e->lhs->kind == EX_INT || e->lhs->kind == EX_FLOAT);
+    default:
+        return false;
+    }
+}
+
 static void resolve_fn_sig(FnDecl *fd, Module *m) {
-    for (int i = 0; i < fd->nparams; i++) resolve_type(fd->params[i].type, m);
+    for (int i = 0; i < fd->nparams; i++) {
+        resolve_type(fd->params[i].type, m);
+        if (fd->params[i].def && !is_literal_default(fd->params[i].def))
+            fatal_at(fd->params[i].def->loc,
+                     "default argument must be a literal (or negated literal)");
+    }
     resolve_type(fd->ret, m);
 }
 
@@ -241,6 +257,16 @@ static void resolve_module_sigs(Module *m) {
                              "struct fields must be value types in v0.1 (use a class for '%s')",
                              sd->fields[f].name);
                 }
+            }
+            for (int mi = 0; mi < sd->nmethods; mi++) {
+                resolve_fn_sig(sd->methods[mi], m);
+                for (int j = 0; j < mi; j++)
+                    if (sd->methods[j]->name == sd->methods[mi]->name)
+                        fatal_at(sd->methods[mi]->loc, "duplicate method '%s'", sd->methods[mi]->name);
+                for (int f = 0; f < sd->nfields; f++)
+                    if (sd->fields[f].name == sd->methods[mi]->name)
+                        fatal_at(sd->methods[mi]->loc,
+                                 "method '%s' collides with a field", sd->methods[mi]->name);
             }
             break;
         }
@@ -305,6 +331,11 @@ static void layout_class(ClassDecl *cd) {
         } else {
             if (inherited) fatal_at(m->loc, "'%s' hides inherited method", m->name);
         }
+        if (m->is_virtual || m->is_override)
+            for (int k = 0; k < m->nparams; k++)
+                if (m->params[k].def)
+                    fatal_at(m->params[k].def->loc,
+                             "virtual/override methods cannot have default arguments");
         /* duplicate names within the class */
         for (int j = 0; j < i; j++)
             if (cd->methods[j]->name == m->name) fatal_at(m->loc, "duplicate method '%s'", m->name);
@@ -464,6 +495,42 @@ static void want(Ctx *c, Expr *e, Type *dst, const char *what) {
 }
 
 static void check_args_against(Ctx *c, Expr *e, Param *params, int nparams, const char *name) {
+    /* Resolve named arguments into positional slots and fill trailing defaults.
+       Rewrites e->args to a full positional array of length nparams. */
+    if (e->arg_names || e->nargs < nparams) {
+        Expr **slots = arena_alloc(&g_arena, sizeof(Expr *) * (size_t)(nparams ? nparams : 1));
+        for (int i = 0; i < nparams; i++) slots[i] = NULL;
+        bool seen_named = false;
+        for (int i = 0; i < e->nargs; i++) {
+            const char *label = e->arg_names ? e->arg_names[i] : NULL;
+            if (label) {
+                seen_named = true;
+                int idx = -1;
+                for (int j = 0; j < nparams; j++)
+                    if (params[j].name == label) { idx = j; break; }
+                if (idx < 0)
+                    fatal_at(e->args[i]->loc, "'%s' has no parameter named '%s'", name, label);
+                if (slots[idx])
+                    fatal_at(e->args[i]->loc, "duplicate argument '%s'", label);
+                slots[idx] = e->args[i];
+            } else {
+                if (seen_named)
+                    fatal_at(e->args[i]->loc, "positional argument follows a named argument");
+                if (i >= nparams)
+                    fatal_at(e->loc, "'%s' expects %d argument(s), got %d", name, nparams, e->nargs);
+                slots[i] = e->args[i];
+            }
+        }
+        for (int i = 0; i < nparams; i++) {
+            if (slots[i]) continue;
+            if (!params[i].def)
+                fatal_at(e->loc, "'%s' missing argument for '%s'", name, params[i].name);
+            slots[i] = params[i].def;
+        }
+        e->args = slots;
+        e->nargs = nparams;
+        e->arg_names = NULL;
+    }
     if (e->nargs != nparams)
         fatal_at(e->loc, "'%s' expects %d argument(s), got %d", name, nparams, e->nargs);
     for (int i = 0; i < nparams; i++) {
@@ -512,6 +579,8 @@ static Local *lookup_value(Ctx *c, Expr *e, const char *name) {
 }
 
 static void check_closure_call(Ctx *c, Expr *e, Type *fnty) {
+    if (e->arg_names)
+        fatal_at(e->loc, "named arguments are not supported on closure calls");
     if (e->nargs != fnty->nparams)
         fatal_at(e->loc, "closure expects %d argument(s), got %d", fnty->nparams, e->nargs);
     for (int i = 0; i < fnty->nparams; i++) {
@@ -657,6 +726,8 @@ static Type *check_call(Ctx *c, Expr *e) {
             return e->type = d->fn->ret;
         case D_STRUCT: {
             StructDecl *sd = d->sd;
+            if (e->arg_names)
+                fatal_at(e->loc, "named arguments are not supported on struct construction");
             if (e->nargs != 0 && e->nargs != sd->nfields)
                 fatal_at(e->loc, "struct %s takes 0 or %d arguments", n, sd->nfields);
             for (int i = 0; i < e->nargs; i++) {
@@ -740,7 +811,9 @@ static Type *check_call(Ctx *c, Expr *e) {
                 e->method = m;
                 e->cls = m->owner;
                 check_args_against(c, e, m->params, m->nparams, n);
-                return e->type = m->ret;
+                /* a builder returns the receiver, so the call has the receiver's
+                   static type, not the declaring class's type */
+                return e->type = m->is_builder ? recv : m->ret;
             }
             Field *f;
             ClassDecl *owner = class_find_field(recv->cdecl, n, &f);
@@ -752,6 +825,18 @@ static Type *check_call(Ctx *c, Expr *e) {
                 return e->type;
             }
             fatal_at(e->loc, "class %s has no method '%s'", recv->cdecl->name, n);
+        }
+        if (recv->kind == TY_STRUCT) {
+            StructDecl *sd = recv->sdecl;
+            for (int i = 0; i < sd->nmethods; i++) {
+                if (sd->methods[i]->name != n) continue;
+                FnDecl *m = sd->methods[i];
+                e->ref = REF_METHOD;
+                e->method = m;
+                check_args_against(c, e, m->params, m->nparams, n);
+                return e->type = m->ret;
+            }
+            fatal_at(e->loc, "struct %s has no method '%s'", sd->name, n);
         }
         fatal_at(e->loc, "%s has no methods", type_str(recv));
     }
@@ -852,7 +937,8 @@ static Type *check_expr(Ctx *c, Expr *e, Type *expected) {
         e->type = mk_type(TY_NULL);
         return e->type;
     case EX_THIS: {
-        if (!c->cls) fatal_at(e->loc, "'this' outside a class method");
+        if (!c->cls && !(c->fn && c->fn->sowner))
+            fatal_at(e->loc, "'this' outside a method");
         Local *l = scope_find(c->scope, intern("this"));
         e->ref = REF_PARAM;
         e->local = l;
@@ -990,6 +1076,13 @@ static Type *check_expr(Ctx *c, Expr *e, Type *expected) {
         } else if (lhs->kind == EX_MEMBER) {
             lt = check_member(c, lhs);
             if (lhs->ref != REF_FIELD) fatal_at(lhs->loc, "not assignable");
+            if (c->fn && c->fn->sowner) {
+                Expr *base = lhs->lhs;
+                while (base->kind == EX_MEMBER) base = base->lhs;
+                if (base->kind == EX_THIS)
+                    fatal_at(lhs->loc, "struct methods receive 'this' by value; "
+                                       "assigning to a field has no effect (return a new struct)");
+            }
         } else if (lhs->kind == EX_INDEX) {
             Type *at = check_expr(c, lhs->lhs, NULL);
             if (at->kind != TY_ARRAY) fatal_at(lhs->loc, "only array elements are assignable");
@@ -1163,6 +1256,12 @@ static void check_stmt(Ctx *c, Stmt *s) {
         return;
     }
     case ST_RETURN:
+        if (c->fn->is_builder) {
+            if (!s->expr || s->expr->kind != EX_THIS)
+                fatal_at(s->loc, "a builder method may only 'return this;'");
+            check_expr(c, s->expr, c->fn->ret);
+            return;
+        }
         if (s->expr) {
             if (c->fn->ret->kind == TY_VOID) fatal_at(s->loc, "void function returns a value");
             check_expr(c, s->expr, c->fn->ret);
@@ -1254,6 +1353,12 @@ static void check_fn_body(Module *m, FnDecl *fd, ClassDecl *cls) {
         Local *self = define_local(&c, intern("this"), t, true, fd->loc);
         self->cname = "self";
         self->is_this = true;
+    } else if (fd->sowner) {
+        Type *t = mk_type(TY_STRUCT);
+        t->sdecl = fd->sowner;
+        Local *self = define_local(&c, intern("this"), t, true, fd->loc);
+        self->cname = "self";
+        self->is_this = true;
     }
     for (int i = 0; i < fd->nparams; i++)
         fd->params[i].local =
@@ -1263,12 +1368,118 @@ static void check_fn_body(Module *m, FnDecl *fd, ClassDecl *cls) {
     require_returns(fd);
 }
 
+/* Compile-time constant value: kind 0=int, 1=float, 2=bool. */
+typedef struct { int kind; int64_t i; double f; bool b; } CVal;
+
+static CVal fold_const_decl(Decl *d);
+
+static CVal fold_const_expr(Module *m, Expr *e) {
+    switch (e->kind) {
+    case EX_INT:   return (CVal){0, e->ival, 0, false};
+    case EX_FLOAT: return (CVal){1, 0, e->fval, false};
+    case EX_BOOL:  return (CVal){2, 0, 0, e->ival != 0};
+    case EX_IDENT: {
+        Decl *d = mod_lookup(m, e->name);
+        if (!d || d->kind != D_CONST)
+            fatal_at(e->loc, "const initializer may only reference other constants");
+        return fold_const_decl(d);
+    }
+    case EX_UN: {
+        CVal v = fold_const_expr(m, e->lhs);
+        if (e->op == T_MINUS) {
+            if (v.kind == 1) return (CVal){1, 0, -v.f, false};
+            if (v.kind == 0) return (CVal){0, (int64_t)(-(uint64_t)v.i), 0, false};
+            fatal_at(e->loc, "cannot negate a boolean constant");
+        }
+        if (e->op == T_TILDE) {
+            if (v.kind != 0) fatal_at(e->loc, "'~' requires an integer constant");
+            return (CVal){0, ~v.i, 0, false};
+        }
+        if (e->op == T_NOT) {
+            if (v.kind != 2) fatal_at(e->loc, "'!' requires a boolean constant");
+            return (CVal){2, 0, 0, !v.b};
+        }
+        fatal_at(e->loc, "unsupported operator in constant expression");
+    }
+    case EX_BIN: {
+        CVal a = fold_const_expr(m, e->lhs);
+        CVal b = fold_const_expr(m, e->rhs);
+        int op = e->op;
+        if (op == T_AMP || op == T_PIPE || op == T_CARET || op == T_SHL ||
+            op == T_SHR || op == T_PERCENT) {
+            if (a.kind != 0 || b.kind != 0)
+                fatal_at(e->loc, "this operator requires integer constants");
+            int64_t x = a.i, y = b.i, r = 0;
+            switch (op) {
+            case T_AMP: r = x & y; break;
+            case T_PIPE: r = x | y; break;
+            case T_CARET: r = x ^ y; break;
+            case T_PERCENT:
+                if (y == 0) fatal_at(e->loc, "modulo by zero in constant expression");
+                r = x % y; break;
+            case T_SHL: case T_SHR:
+                if (y < 0 || y >= 64) fatal_at(e->loc, "shift amount out of range in constant");
+                r = op == T_SHL ? (int64_t)((uint64_t)x << y) : (x >> y);
+                break;
+            }
+            return (CVal){0, r, 0, false};
+        }
+        if (a.kind == 2 || b.kind == 2)
+            fatal_at(e->loc, "arithmetic on a boolean constant");
+        if (a.kind == 1 || b.kind == 1) {
+            double x = a.kind == 1 ? a.f : (double)a.i;
+            double y = b.kind == 1 ? b.f : (double)b.i;
+            double r = 0;
+            switch (op) {
+            case T_PLUS: r = x + y; break;
+            case T_MINUS: r = x - y; break;
+            case T_STAR: r = x * y; break;
+            case T_SLASH:
+                if (y == 0) fatal_at(e->loc, "division by zero in constant expression");
+                r = x / y; break;
+            default: fatal_at(e->loc, "unsupported operator in constant expression");
+            }
+            return (CVal){1, 0, r, false};
+        }
+        int64_t x = a.i, y = b.i, r = 0;
+        switch (op) {
+        case T_PLUS: r = (int64_t)((uint64_t)x + (uint64_t)y); break;
+        case T_MINUS: r = (int64_t)((uint64_t)x - (uint64_t)y); break;
+        case T_STAR: r = (int64_t)((uint64_t)x * (uint64_t)y); break;
+        case T_SLASH:
+            if (y == 0) fatal_at(e->loc, "division by zero in constant expression");
+            r = x / y; break;
+        default: fatal_at(e->loc, "unsupported operator in constant expression");
+        }
+        return (CVal){0, r, 0, false};
+    }
+    default:
+        fatal_at(e->loc, "const initializer must be a constant expression");
+    }
+}
+
+/* Fold d's initializer to a value and rewrite it in place to a bare literal, so
+   the type check and the emitter (which switch on literal kinds) are unchanged. */
+static CVal fold_const_decl(Decl *d) {
+    Expr *e = d->const_init;
+    if (d->fold_state == 2) return fold_const_expr(d->module, e); /* now a literal */
+    if (d->fold_state == 1)
+        fatal_at(e->loc, "constant '%s' has a cyclic definition", d->name);
+    d->fold_state = 1;
+    CVal v = fold_const_expr(d->module, e);
+    if (v.kind == 0) { e->kind = EX_INT; e->ival = v.i; }
+    else if (v.kind == 1) { e->kind = EX_FLOAT; e->fval = v.f; }
+    else { e->kind = EX_BOOL; e->ival = v.b ? 1 : 0; }
+    e->lhs = e->rhs = NULL;
+    d->fold_state = 2;
+    return v;
+}
+
 static void check_const(Module *m, Decl *d) {
     Expr *e = d->const_init;
-    if (e->kind != EX_INT && e->kind != EX_FLOAT && e->kind != EX_BOOL && e->kind != EX_NULL &&
-        !(e->kind == EX_UN && e->op == T_MINUS &&
-          (e->lhs->kind == EX_INT || e->lhs->kind == EX_FLOAT)))
-        fatal_at(e->loc, "const initializer must be a literal or null");
+    /* null stays as-is (rawptr/cstring consts); everything else folds to a literal. */
+    if (e->kind != EX_NULL) fold_const_decl(d);
+    e = d->const_init;
     Ctx c = {0};
     c.mod = m;
     FnDecl dummy = {0};
@@ -1304,6 +1515,10 @@ void check_all(Module *mods, Module *entry) {
             switch (d->kind) {
             case D_CONST: check_const(m, d); break;
             case D_FN: check_fn_body(m, d->fn, NULL); break;
+            case D_STRUCT:
+                for (int mi = 0; mi < d->sd->nmethods; mi++)
+                    check_fn_body(m, d->sd->methods[mi], NULL);
+                break;
             case D_CLASS: {
                 ClassDecl *cd = d->cd;
                 for (int mi = 0; mi < cd->nmethods; mi++)

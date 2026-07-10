@@ -81,6 +81,8 @@ static const char *fn_cname(FnDecl *fd) {
     if (fd->is_extern) return arena_printf(&g_arena, "vx_%s", fd->name);
     if (fd->owner)
         return arena_printf(&g_arena, "v_%s_%s_%s", fd->module->name, fd->owner->name, fd->name);
+    if (fd->sowner)
+        return arena_printf(&g_arena, "v_%s_%s_%s", fd->module->name, fd->sowner->name, fd->name);
     return arena_printf(&g_arena, "v_%s_%s", fd->module->name, fd->name);
 }
 
@@ -424,6 +426,13 @@ static char *emit_call(Em *em, Expr *e, bool *fresh) {
     if (e->ref == REF_METHOD) {
         FnDecl *m = e->method;
         Expr *recv = e->lhs->lhs;
+        if (m->sowner) {
+            /* struct method: receiver passed by value, no vtable, no retain */
+            char *rv = ex_v(em, recv, recv->type);
+            char *args = args_list(em, e->args, e->nargs, m->params, NULL);
+            return arena_printf(&g_arena, "%s(%s%s%s)", fn_cname(m), rv,
+                                e->nargs ? ", " : "", args);
+        }
         const char *owner_ct = arena_printf(&g_arena, "%s*", class_cname(m->owner));
         if (m->vslot >= 0) {
             const char *tr = newtemp(em, recv->type, false);
@@ -435,8 +444,13 @@ static char *emit_call(Em *em, Expr *e, bool *fresh) {
                                 sig, tr, m->vslot, owner_ct, tr, e->nargs ? ", " : "", args);
         }
         char *rv = ex_b(em, recv);
-        return arena_printf(&g_arena, "%s((%s)%s%s%s)", fn_cname(m), owner_ct, rv,
-                            e->nargs ? ", " : "", args_list(em, e->args, e->nargs, m->params, NULL));
+        char *call = arena_printf(&g_arena, "%s((%s)%s%s%s)", fn_cname(m), owner_ct, rv,
+                                  e->nargs ? ", " : "", args_list(em, e->args, e->nargs, m->params, NULL));
+        /* a builder returns the declaring class's pointer; re-cast to the
+           receiver's static type so a chained call keeps its concrete type */
+        if (m->is_builder)
+            return arena_printf(&g_arena, "((%s)%s)", c_type(e->type), call);
+        return call;
     }
 
     if (e->sd) { /* struct constructor */
@@ -1106,6 +1120,9 @@ static char *fn_proto(FnDecl *fd, bool with_names) {
     if (fd->owner) {
         sb_printf(&sb, "%s* self", class_cname(fd->owner));
         first = false;
+    } else if (fd->sowner) {
+        sb_printf(&sb, "%s self", struct_cname(fd->sowner));
+        first = false;
     }
     for (int i = 0; i < fd->nparams; i++) {
         if (!first) sb_puts(&sb, ", ");
@@ -1333,6 +1350,10 @@ void emit_module(Module *m, bool is_entry, bool checks, bool freestanding, SBuf 
                 sb_printf(h, "%s;\n", fn_proto(cd->methods[mi], false));
             break;
         }
+        case D_STRUCT:
+            for (int mi = 0; mi < d->sd->nmethods; mi++)
+                sb_printf(h, "%s;\n", fn_proto(d->sd->methods[mi], false));
+            break;
         case D_CONST: {
             Expr *e = d->const_init;
             const char *v;
@@ -1363,6 +1384,10 @@ void emit_module(Module *m, bool is_entry, bool checks, bool freestanding, SBuf 
     for (int i = 0; i < m->ndecls; i++) {
         Decl *d = m->decls[i];
         if (d->kind == D_FN) emit_fn(&base, d->fn, NULL, &code);
+        else if (d->kind == D_STRUCT) {
+            for (int mi = 0; mi < d->sd->nmethods; mi++)
+                emit_fn(&base, d->sd->methods[mi], NULL, &code);
+        }
         else if (d->kind == D_CLASS) {
             ClassDecl *cd = d->cd;
             if (cd->ctor) emit_fn(&base, cd->ctor, cd, &code);

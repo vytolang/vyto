@@ -378,6 +378,19 @@ export class Painter {
     virtual fn text_width(s: string): int { return 0; }
     virtual fn font_ascent(): int { return 0; }
     virtual fn font_height(): int { return 0; }
+
+    // Horizontally-centred / right-aligned text within a rect, vertically
+    // centred. Concrete helpers over the metrics above, so a custom draw()
+    // never open-codes the centering arithmetic.
+    fn baseline_in(r: Rect): int {
+        return r.y + (r.h - this.font_height()) / 2 + this.font_ascent();
+    }
+    fn text_center(r: Rect, s: string, color: int) {
+        this.text(r.x + (r.w - this.text_width(s)) / 2, this.baseline_in(r), s, color);
+    }
+    fn text_right(r: Rect, pad: int, s: string, color: int) {
+        this.text(r.x + r.w - pad - this.text_width(s), this.baseline_in(r), s, color);
+    }
     virtual fn width(): int { return 0; }
     virtual fn height(): int { return 0; }
     virtual fn present() { }
@@ -779,9 +792,20 @@ export class Widget {
         this.children = [];
     }
 
-    fn add(child: Widget) {
+    builder fn add(child: Widget) {
         child.parent = this;
         this.children.push(child);
+        return this;
+    }
+
+    // Fluent configuration setters. Declared on Widget so every widget and
+    // container returns its own concrete type from a chain.
+    builder fn flex(n: int) { this.grow = n; return this; }
+
+    // Request a full-window repaint of just this widget's bounds. Relies on
+    // Window.layout() having propagated `win` to the whole tree.
+    fn invalidate() {
+        if (this.win != null) { this.win.mark_dirty(this.bounds); }
     }
 
     // natural size, bottom-up
@@ -1099,15 +1123,7 @@ export class Window {
             this.has_dirty = true;
             return;
         }
-        let ax = this.dirty.x;
-        let ay = this.dirty.y;
-        let ar = ax + this.dirty.w;
-        let ab = ay + this.dirty.h;
-        if (r.x < ax) { ax = r.x; }
-        if (r.y < ay) { ay = r.y; }
-        if (r.x + r.w > ar) { ar = r.x + r.w; }
-        if (r.y + r.h > ab) { ab = r.y + r.h; }
-        this.dirty = Rect(ax, ay, ar - ax, ab - ay);
+        this.dirty = this.dirty.union(r);
     }
 
     // Repaint only the accumulated dirty region: clear its background, redraw

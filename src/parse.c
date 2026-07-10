@@ -152,16 +152,41 @@ static Type *parse_type(Parser *p) {
 static Expr *parse_expr(Parser *p);
 static Stmt **parse_block(Parser *p, int *count);
 
-static Expr **parse_args(Parser *p, int *nargs) {
+/* at "ident :" (a named-argument label), not "ident" alone? */
+static bool at_arg_label(Parser *p) {
+    if (cur(p) != T_IDENT) return false;
+    Lexer save = p->lx; /* lexer is a value type; safe to snapshot */
+    advance(p);
+    bool is_label = cur(p) == T_COLON;
+    p->lx = save;
+    return is_label;
+}
+
+static Expr **parse_args_named(Parser *p, int *nargs, const char ***arg_names) {
     expect(p, T_LPAREN);
-    PtrVec args = {0};
+    PtrVec args = {0}, names = {0};
+    bool any_named = false;
     while (cur(p) != T_RPAREN) {
+        const char *label = NULL;
+        if (at_arg_label(p)) {
+            label = p->lx.tok.ident;
+            advance(p);       /* ident */
+            advance(p);       /* ':'   */
+            any_named = true;
+        }
+        pv_push(&names, (void *)label);
         pv_push(&args, parse_expr(p));
         if (!accept(p, T_COMMA)) break;
     }
     expect(p, T_RPAREN);
     *nargs = args.len;
+    *arg_names = any_named ? (const char **)names.items : NULL;
     return (Expr **)args.items;
+}
+
+static Expr **parse_args(Parser *p, int *nargs) {
+    const char **names = NULL;
+    return parse_args_named(p, nargs, &names);
 }
 
 /* speculative check: are we at "(id, id, ...) =>" ? */
@@ -280,7 +305,7 @@ static Expr *parse_primary(Parser *p) {
             return e;
         }
         e->name = expect_ident(p);
-        e->args = parse_args(p, &e->nargs);
+        e->args = parse_args_named(p, &e->nargs, &e->arg_names);
         return e;
     }
     case T_IDENT:
@@ -319,7 +344,7 @@ static Expr *parse_postfix(Parser *p) {
         if (cur(p) == T_LPAREN) {
             Expr *call = new_expr(p, EX_CALL);
             call->lhs = e;
-            call->args = parse_args(p, &call->nargs);
+            call->args = parse_args_named(p, &call->nargs, &call->arg_names);
             e = call;
         } else if (accept(p, T_LBRACKET)) {
             Expr *ix = new_expr(p, EX_INDEX);
@@ -513,12 +538,19 @@ static Stmt *parse_stmt(Parser *p) {
 static Param *parse_params(Parser *p, int *nparams) {
     expect(p, T_LPAREN);
     PtrVec params = {0};
+    bool seen_default = false;
     while (cur(p) != T_RPAREN) {
         Param *pa = NEW(Param);
         pa->loc = ploc(p);
         pa->name = expect_ident(p);
         expect(p, T_COLON);
         pa->type = parse_type(p);
+        if (accept(p, T_ASSIGN)) {
+            pa->def = parse_expr(p);
+            seen_default = true;
+        } else if (seen_default) {
+            fatal_at(pa->loc, "non-default parameter '%s' follows a default parameter", pa->name);
+        }
         pv_push(&params, pa);
         if (!accept(p, T_COMMA)) break;
     }
@@ -540,6 +572,9 @@ static FnDecl *parse_fn(Parser *p, bool is_extern) {
     fd->ret = accept(p, T_COLON) ? parse_type(p) : type_new(TY_VOID);
     if (is_extern) {
         fd->is_extern = true;
+        for (int i = 0; i < fd->nparams; i++)
+            if (fd->params[i].def)
+                fatal_at(fd->params[i].loc, "extern functions cannot have default arguments");
         expect(p, T_SEMI);
     } else {
         fd->body = parse_block(p, &fd->nbody);
@@ -555,8 +590,26 @@ static StructDecl *parse_struct(Parser *p, bool is_extern) {
     expect(p, T_STRUCT);
     sd->name = expect_ident(p);
     expect(p, T_LBRACE);
-    PtrVec fields = {0};
+    PtrVec fields = {0}, methods = {0};
     while (cur(p) != T_RBRACE) {
+        if (cur(p) == T_BUILDER || cur(p) == T_VIRTUAL || cur(p) == T_OVERRIDE)
+            fatal_at(ploc(p), "struct methods cannot be virtual/override/builder");
+        if (cur(p) == T_DEINIT) fatal_at(ploc(p), "structs cannot have deinit");
+        if (cur(p) == T_FN) {
+            FnDecl *m = NEW(FnDecl);
+            m->loc = ploc(p);
+            m->module = p->mod;
+            m->sowner = sd;
+            m->vslot = -1;
+            advance(p);
+            if (cur(p) == T_INIT) fatal_at(ploc(p), "structs have no init; construct with S(...)");
+            m->name = expect_ident(p);
+            m->params = parse_params(p, &m->nparams);
+            m->ret = accept(p, T_COLON) ? parse_type(p) : type_new(TY_VOID);
+            m->body = parse_block(p, &m->nbody);
+            pv_push(&methods, m);
+            continue;
+        }
         Field *f = NEW(Field);
         f->loc = ploc(p);
         f->name = expect_ident(p);
@@ -569,6 +622,8 @@ static StructDecl *parse_struct(Parser *p, bool is_extern) {
     sd->nfields = fields.len;
     sd->fields = arena_alloc(&g_arena, sizeof(Field) * (size_t)(fields.len ? fields.len : 1));
     for (int i = 0; i < fields.len; i++) sd->fields[i] = *(Field *)fields.items[i];
+    sd->nmethods = methods.len;
+    sd->methods = (FnDecl **)methods.items;
     return sd;
 }
 
@@ -582,9 +637,13 @@ static ClassDecl *parse_class(Parser *p) {
     expect(p, T_LBRACE);
     PtrVec fields = {0}, methods = {0};
     while (cur(p) != T_RBRACE) {
+        bool is_builder = accept(p, T_BUILDER);
         bool is_virtual = accept(p, T_VIRTUAL);
         bool is_override = !is_virtual && accept(p, T_OVERRIDE);
+        if (is_builder && (is_virtual || is_override))
+            fatal_at(ploc(p), "builder methods cannot be virtual/override");
         if (cur(p) == T_DEINIT) {
+            if (is_builder) fatal_at(ploc(p), "deinit cannot be a builder");
             if (is_virtual || is_override) fatal_at(ploc(p), "deinit cannot be virtual/override");
             if (cd->deinit_body) fatal_at(ploc(p), "duplicate deinit");
             advance(p);
@@ -599,8 +658,10 @@ static ClassDecl *parse_class(Parser *p) {
             m->vslot = -1;
             m->is_virtual = is_virtual;
             m->is_override = is_override;
+            m->is_builder = is_builder;
             advance(p);
             if (cur(p) == T_INIT) {
+                if (is_builder) fatal_at(ploc(p), "init cannot be a builder");
                 if (is_virtual || is_override) fatal_at(ploc(p), "init cannot be virtual/override");
                 advance(p);
                 m->name = intern("init");
@@ -613,7 +674,16 @@ static ClassDecl *parse_class(Parser *p) {
             }
             m->name = expect_ident(p);
             m->params = parse_params(p, &m->nparams);
-            m->ret = accept(p, T_COLON) ? parse_type(p) : type_new(TY_VOID);
+            if (is_builder) {
+                if (cur(p) == T_COLON)
+                    fatal_at(ploc(p), "builder methods cannot declare a return type (they return the receiver)");
+                Type *rt = type_new(TY_NAMED);
+                rt->name = cd->name;
+                rt->loc = m->loc;
+                m->ret = rt;
+            } else {
+                m->ret = accept(p, T_COLON) ? parse_type(p) : type_new(TY_VOID);
+            }
             m->body = parse_block(p, &m->nbody);
             pv_push(&methods, m);
             continue;

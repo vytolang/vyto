@@ -121,6 +121,24 @@ for src in examples/[0-9]*.vt; do
     fi
 done
 
+# --- compile-error golden tests: each .vt must fail to build with its message ---
+for src in tests/errors/*.vt; do
+    [ -f "$src" ] || continue
+    name=$(basename "$src" .vt)
+    expected="tests/errors/$name.expected-error"
+    [ -f "$expected" ] || continue
+    # first diagnostic line, with the file:line prefix stripped for portability
+    got=$(./voltc build "$src" 2>&1 | sed -n '1p' | sed 's/^[^ ]*: error:/error:/')
+    if [ "$got" = "$(cat "$expected")" ]; then
+        echo "PASS err_$name"
+    else
+        echo "FAIL err_$name"
+        echo "  expected: $(cat "$expected")"
+        echo "  got:      $got"
+        fail=1
+    fi
+done
+
 # --- integer overflow: checked (traps) in debug, wraps in --release ---
 got=$(./voltc run tests/fixtures/overflow_trap.vt 2>&1)
 if echo "$got" | grep -q "integer overflow in '+'"; then
