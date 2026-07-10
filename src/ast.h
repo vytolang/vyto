@@ -134,6 +134,27 @@ typedef enum BuiltinKind {
     B_APPENDFILE,   /* appendfile(path, data): bool */
     B_BYTES,        /* bytes(n): byte[] — zeroed, sized buffer for FFI */
     B_ARGS,         /* args(): string[] — command-line arguments (excl. program name) */
+    /* int methods */
+    B_INT_ABS, B_INT_MIN, B_INT_MAX, B_INT_CLAMP, B_INT_SIGN, B_INT_POW, B_INT_GCD,
+    B_INT_TO_FLOAT, B_INT_TO_STRING,
+    /* float methods */
+    B_FLT_ABS, B_FLT_MIN, B_FLT_MAX, B_FLT_CLAMP, B_FLT_FLOOR, B_FLT_CEIL, B_FLT_ROUND,
+    B_FLT_TRUNC, B_FLT_SQRT, B_FLT_POW, B_FLT_TO_INT, B_FLT_IS_NAN,
+    /* string methods */
+    B_STR_IS_EMPTY, B_STR_CONTAINS, B_STR_STARTS_WITH, B_STR_ENDS_WITH,
+    B_STR_INDEX_OF, B_STR_LAST_INDEX_OF, B_STR_COUNT, B_STR_CHAR_AT,
+    B_STR_TO_UPPER, B_STR_TO_LOWER, B_STR_TRIM, B_STR_TRIM_START, B_STR_TRIM_END,
+    B_STR_REPEAT, B_STR_PAD_START, B_STR_PAD_END, B_STR_REPLACE, B_STR_REVERSE,
+    B_STR_SPLIT, B_STR_LINES, B_STR_TO_INT, B_STR_TO_FLOAT,
+    /* array methods */
+    B_ARR_FIRST, B_ARR_LAST, B_ARR_NTH, B_ARR_IS_EMPTY, B_ARR_CONTAINS, B_ARR_INDEX_OF,
+    B_ARR_REVERSE, B_ARR_CLEAR, B_ARR_INSERT, B_ARR_REMOVE_AT, B_ARR_EXTEND,
+    B_ARR_CONCAT, B_ARR_SLICE, B_ARR_FILL, B_ARR_JOIN,
+    /* array higher-order methods (closure args) */
+    B_ARR_MAP, B_ARR_FILTER, B_ARR_REDUCE, B_ARR_EACH, B_ARR_FIND_INDEX,
+    B_ARR_ANY, B_ARR_ALL, B_ARR_SORT,
+    /* map methods */
+    B_MAP_KEYS, B_MAP_VALUES, B_MAP_GET_OR, B_MAP_IS_EMPTY, B_MAP_CLEAR, B_MAP_MERGE,
 } BuiltinKind;
 
 /* ---------------- statements ---------------- */

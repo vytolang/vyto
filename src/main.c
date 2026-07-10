@@ -380,8 +380,18 @@ int main(int argc, char **argv) {
     const char *rt_o = arena_printf(&g_arena, "%s/volt_rt_%s%s%s.o", cache, sanitize(cc),
                                     release ? "_rel" : "", prof);
     const char *rt_c = arena_printf(&g_arena, "%s/volt_rt.c", rtdir);
-    if (!file_exists(rt_o) || file_mtime(rt_c) > file_mtime(rt_o) ||
-        file_mtime(arena_printf(&g_arena, "%s/volt_rt.h", rtdir)) > file_mtime(rt_o)) {
+    /* builtin-method helpers are amalgamated into volt_rt.c via #include, so the
+       compile unit is still volt_rt.c; track their mtimes so edits rebuild it. */
+    static const char *rt_amalg[] = {"volt_rt_num.c", "volt_rt_str.c",
+                                     "volt_rt_arr.c", "volt_rt_map.c"};
+    long rt_newest = file_mtime(rt_c);
+    long rt_h_mt = file_mtime(arena_printf(&g_arena, "%s/volt_rt.h", rtdir));
+    if (rt_h_mt > rt_newest) rt_newest = rt_h_mt;
+    for (size_t i = 0; i < sizeof rt_amalg / sizeof *rt_amalg; i++) {
+        long t = file_mtime(arena_printf(&g_arena, "%s/%s", rtdir, rt_amalg[i]));
+        if (t > rt_newest) rt_newest = t;
+    }
+    if (!file_exists(rt_o) || rt_newest > file_mtime(rt_o)) {
         char *c = arena_printf(&g_arena, "%s %s%s -w -c -o %s %s/volt_rt.c", cc, opt, fsflags, rt_o,
                                rtdir);
         if (run_cmd(c, verbose) != 0) fatal("runtime compilation failed");

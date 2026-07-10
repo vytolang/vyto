@@ -292,6 +292,128 @@ static char *strconv_frag(Em *em, Expr *inner) {
     return arena_printf(&g_arena, "vt_str_from_int((int64_t)(%s))", v);
 }
 
+/* Higher-order array methods: emit a monomorphized static helper into em->aux
+   (one per call site, types T/U baked in) that loops and applies the closure,
+   then return a call to it. Mirrors the cthunk aux pattern. */
+static char *emit_hof(Em *em, Expr *e, Expr *recv, bool *fresh) {
+    Expr **a = e->args;
+    Type *et = recv->type->elem;
+    const char *T = c_type(et);
+    int id = ++em->mod->arrow_counter;
+    SBuf *ax = em->aux;
+    const char *esc = c_escape(e->loc.file, strlen(e->loc.file));
+    int line = e->loc.line;
+    Expr *fn = e->builtin == B_ARR_REDUCE ? a[1] : a[0];
+    Type *ft = fn->type;
+    char *sig = fnptr_sig(ft->ret, "VtObj*", ft->params, ft->nparams, NULL);
+    /* the emitted loops deref src->len, so null-check the receiver at the call
+       site (panics with a source location, like push/pop) */
+    char *rv = arena_printf(&g_arena, "vt_arr_nn(%s, \"%s\", %d)", ex_b(em, recv), esc, line);
+
+    switch ((BuiltinKind)e->builtin) {
+    case B_ARR_MAP: {
+        const char *U = c_type(ft->ret);
+        bool uref = type_is_ref(ft->ret);
+        sb_printf(ax,
+            "static VtArray* __vt_hof%d(VtArray* src, VtClosure* f) {\n"
+            "    VtArray* dst = vt_arr_new((int32_t)sizeof(%s), %s);\n"
+            "    for (int64_t i = 0; i < src->len; i++) {\n"
+            "        %s e = *(%s*)vt_arr_at(src, i, \"%s\", %d);\n"
+            "        %s r = ((%s)f->fn)(f->env, e);\n"
+            "        vt_arr_push(dst, &r);\n%s"
+            "    }\n    return dst;\n}\n",
+            id, U, uref ? "true" : "false", T, T, esc, line, U, sig,
+            uref ? "        vt_release(r);\n" : "");
+        *fresh = true;
+        return arena_printf(&g_arena, "__vt_hof%d(%s, %s)", id, rv, ex_b(em, fn));
+    }
+    case B_ARR_FILTER: {
+        bool tref = type_is_ref(et);
+        sb_printf(ax,
+            "static VtArray* __vt_hof%d(VtArray* src, VtClosure* f) {\n"
+            "    VtArray* dst = vt_arr_new((int32_t)sizeof(%s), %s);\n"
+            "    for (int64_t i = 0; i < src->len; i++) {\n"
+            "        %s e = *(%s*)vt_arr_at(src, i, \"%s\", %d);\n"
+            "        if (((%s)f->fn)(f->env, e)) vt_arr_push(dst, &e);\n"
+            "    }\n    return dst;\n}\n",
+            id, T, tref ? "true" : "false", T, T, esc, line, sig);
+        *fresh = true;
+        return arena_printf(&g_arena, "__vt_hof%d(%s, %s)", id, rv, ex_b(em, fn));
+    }
+    case B_ARR_REDUCE: {
+        const char *U = c_type(ft->ret);
+        bool uref = type_is_ref(ft->ret);
+        sb_printf(ax,
+            "static %s __vt_hof%d(VtArray* src, %s acc, VtClosure* f) {\n%s"
+            "    for (int64_t i = 0; i < src->len; i++) {\n"
+            "        %s e = *(%s*)vt_arr_at(src, i, \"%s\", %d);\n"
+            "        %s nv = ((%s)f->fn)(f->env, acc, e);\n%s"
+            "        acc = nv;\n"
+            "    }\n    return acc;\n}\n",
+            U, id, U, uref ? arena_printf(&g_arena, "    acc = (%s)vt_retain(acc);\n", U) : "",
+            T, T, esc, line, U, sig, uref ? "        vt_release(acc);\n" : "");
+        *fresh = uref;
+        return arena_printf(&g_arena, "__vt_hof%d(%s, %s, %s)", id, rv,
+                            ex_v(em, a[0], ft->ret), ex_b(em, fn));
+    }
+    case B_ARR_EACH:
+        sb_printf(ax,
+            "static void __vt_hof%d(VtArray* src, VtClosure* f) {\n"
+            "    for (int64_t i = 0; i < src->len; i++) {\n"
+            "        %s e = *(%s*)vt_arr_at(src, i, \"%s\", %d);\n"
+            "        ((%s)f->fn)(f->env, e);\n"
+            "    }\n}\n",
+            id, T, T, esc, line, sig);
+        *fresh = false;
+        return arena_printf(&g_arena, "__vt_hof%d(%s, %s)", id, rv, ex_b(em, fn));
+    case B_ARR_FIND_INDEX:
+    case B_ARR_ANY:
+    case B_ARR_ALL: {
+        const char *ret_t = e->builtin == B_ARR_FIND_INDEX ? "int64_t" : "bool";
+        const char *test = e->builtin == B_ARR_FIND_INDEX ? "if (((%s)f->fn)(f->env, e)) return i;\n"
+                           : e->builtin == B_ARR_ANY ? "if (((%s)f->fn)(f->env, e)) return true;\n"
+                           : "if (!((%s)f->fn)(f->env, e)) return false;\n";
+        const char *dflt = e->builtin == B_ARR_FIND_INDEX ? "    return -1;\n"
+                           : e->builtin == B_ARR_ANY ? "    return false;\n" : "    return true;\n";
+        char *testln = arena_printf(&g_arena, test, sig);
+        sb_printf(ax,
+            "static %s __vt_hof%d(VtArray* src, VtClosure* f) {\n"
+            "    for (int64_t i = 0; i < src->len; i++) {\n"
+            "        %s e = *(%s*)vt_arr_at(src, i, \"%s\", %d);\n"
+            "        %s"
+            "    }\n%s}\n",
+            ret_t, id, T, T, esc, line, testln, dflt);
+        *fresh = false;
+        return arena_printf(&g_arena, "__vt_hof%d(%s, %s)", id, rv, ex_b(em, fn));
+    }
+    case B_ARR_SORT:
+        /* stable insertion sort: O(n^2) worst case, chosen over shell/qsort so
+           equal-comparing elements keep their order; fine at UI-scale lengths */
+        sb_printf(ax,
+            "static void __vt_hof%d(VtArray* src, VtClosure* f) {\n"
+            "    int32_t es = src->elem_size;\n"
+            "    for (int64_t i = 1; i < src->len; i++) {\n"
+            "        char tmp[es];\n"
+            "        memcpy(tmp, src->data + i*es, (size_t)es);\n"
+            "        %s key = *(%s*)tmp;\n"
+            "        int64_t j = i - 1;\n"
+            "        while (j >= 0) {\n"
+            "            %s ej = *(%s*)(src->data + j*es);\n"
+            "            if (((%s)f->fn)(f->env, ej, key) <= 0) break;\n"
+            "            memcpy(src->data + (j+1)*es, src->data + j*es, (size_t)es);\n"
+            "            j--;\n"
+            "        }\n"
+            "        memcpy(src->data + (j+1)*es, tmp, (size_t)es);\n"
+            "    }\n}\n",
+            id, T, T, T, T, sig);
+        *fresh = false;
+        return arena_printf(&g_arena, "__vt_hof%d(%s, %s)", id, rv, ex_b(em, fn));
+    default:
+        fatal_at(e->loc, "internal: bad hof builtin");
+        return NULL;
+    }
+}
+
 static char *emit_call(Em *em, Expr *e, bool *fresh) {
     *fresh = type_is_ref(e->type);
 
@@ -412,6 +534,234 @@ static char *emit_call(Em *em, Expr *e, bool *fresh) {
         case B_BYTES:
             *fresh = true;
             return arena_printf(&g_arena, "vt_arr_bytes(%s)", ex_b(em, a[0]));
+        /* ---- int methods ---- */
+        case B_INT_ABS:
+            return arena_printf(&g_arena, "vt_int_abs(%s, \"%s\", %d)", ex_b(em, recv),
+                                c_escape(e->loc.file, strlen(e->loc.file)), e->loc.line);
+        case B_INT_SIGN:
+            return arena_printf(&g_arena, "vt_int_sign(%s)", ex_b(em, recv));
+        case B_INT_MIN:
+            return arena_printf(&g_arena, "vt_int_min(%s, %s)", ex_b(em, recv), ex_b(em, a[0]));
+        case B_INT_MAX:
+            return arena_printf(&g_arena, "vt_int_max(%s, %s)", ex_b(em, recv), ex_b(em, a[0]));
+        case B_INT_POW:
+            return arena_printf(&g_arena, "vt_int_pow(%s, %s, \"%s\", %d)", ex_b(em, recv),
+                                ex_b(em, a[0]), c_escape(e->loc.file, strlen(e->loc.file)),
+                                e->loc.line);
+        case B_INT_GCD:
+            return arena_printf(&g_arena, "vt_int_gcd(%s, %s, \"%s\", %d)", ex_b(em, recv),
+                                ex_b(em, a[0]), c_escape(e->loc.file, strlen(e->loc.file)),
+                                e->loc.line);
+        case B_INT_CLAMP:
+            return arena_printf(&g_arena, "vt_int_clamp(%s, %s, %s)", ex_b(em, recv),
+                                ex_b(em, a[0]), ex_b(em, a[1]));
+        case B_INT_TO_FLOAT:
+            return arena_printf(&g_arena, "((double)(%s))", ex_b(em, recv));
+        case B_INT_TO_STRING:
+            *fresh = true;
+            return arena_printf(&g_arena, "vt_str_from_int(%s)", ex_b(em, recv));
+        /* ---- float methods ---- */
+        case B_FLT_ABS:
+            return arena_printf(&g_arena, "vt_flt_abs(%s)", ex_b(em, recv));
+        case B_FLT_FLOOR:
+            return arena_printf(&g_arena, "vt_flt_floor(%s)", ex_b(em, recv));
+        case B_FLT_CEIL:
+            return arena_printf(&g_arena, "vt_flt_ceil(%s)", ex_b(em, recv));
+        case B_FLT_ROUND:
+            return arena_printf(&g_arena, "vt_flt_round(%s)", ex_b(em, recv));
+        case B_FLT_TRUNC:
+            return arena_printf(&g_arena, "vt_flt_trunc(%s)", ex_b(em, recv));
+        case B_FLT_SQRT:
+            return arena_printf(&g_arena, "vt_flt_sqrt(%s)", ex_b(em, recv));
+        case B_FLT_MIN:
+            return arena_printf(&g_arena, "vt_flt_min(%s, %s)", ex_b(em, recv), ex_b(em, a[0]));
+        case B_FLT_MAX:
+            return arena_printf(&g_arena, "vt_flt_max(%s, %s)", ex_b(em, recv), ex_b(em, a[0]));
+        case B_FLT_POW:
+            return arena_printf(&g_arena, "vt_flt_pow(%s, %s)", ex_b(em, recv), ex_b(em, a[0]));
+        case B_FLT_CLAMP:
+            return arena_printf(&g_arena, "vt_flt_clamp(%s, %s, %s)", ex_b(em, recv),
+                                ex_b(em, a[0]), ex_b(em, a[1]));
+        case B_FLT_TO_INT:
+            return arena_printf(&g_arena, "((int64_t)(%s))", ex_b(em, recv));
+        case B_FLT_IS_NAN:
+            return arena_printf(&g_arena, "vt_flt_is_nan(%s)", ex_b(em, recv));
+        /* ---- string methods ---- */
+        case B_STR_IS_EMPTY:
+            return arena_printf(&g_arena, "(vt_len(%s, \"%s\", %d) == 0)", ex_b(em, recv),
+                                c_escape(e->loc.file, strlen(e->loc.file)), e->loc.line);
+        case B_STR_CONTAINS:
+            return arena_printf(&g_arena, "vt_str_contains(%s, %s)", ex_b(em, recv), ex_b(em, a[0]));
+        case B_STR_STARTS_WITH:
+            return arena_printf(&g_arena, "vt_str_starts_with(%s, %s)", ex_b(em, recv), ex_b(em, a[0]));
+        case B_STR_ENDS_WITH:
+            return arena_printf(&g_arena, "vt_str_ends_with(%s, %s)", ex_b(em, recv), ex_b(em, a[0]));
+        case B_STR_INDEX_OF:
+            return arena_printf(&g_arena, "vt_str_index_of(%s, %s)", ex_b(em, recv), ex_b(em, a[0]));
+        case B_STR_LAST_INDEX_OF:
+            return arena_printf(&g_arena, "vt_str_last_index_of(%s, %s)", ex_b(em, recv), ex_b(em, a[0]));
+        case B_STR_COUNT:
+            return arena_printf(&g_arena, "vt_str_count(%s, %s)", ex_b(em, recv), ex_b(em, a[0]));
+        case B_STR_CHAR_AT:
+            return arena_printf(&g_arena, "vt_str_char_at(%s, %s, \"%s\", %d)", ex_b(em, recv),
+                                ex_b(em, a[0]), c_escape(e->loc.file, strlen(e->loc.file)), e->loc.line);
+        case B_STR_TO_UPPER:
+            return arena_printf(&g_arena, "vt_str_to_upper(%s)", ex_b(em, recv));
+        case B_STR_TO_LOWER:
+            return arena_printf(&g_arena, "vt_str_to_lower(%s)", ex_b(em, recv));
+        case B_STR_TRIM:
+            return arena_printf(&g_arena, "vt_str_trim(%s)", ex_b(em, recv));
+        case B_STR_TRIM_START:
+            return arena_printf(&g_arena, "vt_str_trim_start(%s)", ex_b(em, recv));
+        case B_STR_TRIM_END:
+            return arena_printf(&g_arena, "vt_str_trim_end(%s)", ex_b(em, recv));
+        case B_STR_REVERSE:
+            return arena_printf(&g_arena, "vt_str_reverse(%s)", ex_b(em, recv));
+        case B_STR_REPEAT:
+            return arena_printf(&g_arena, "vt_str_repeat(%s, %s, \"%s\", %d)", ex_b(em, recv),
+                                ex_b(em, a[0]), c_escape(e->loc.file, strlen(e->loc.file)),
+                                e->loc.line);
+        case B_STR_PAD_START:
+            return arena_printf(&g_arena, "vt_str_pad_start(%s, %s, %s)", ex_b(em, recv),
+                                ex_b(em, a[0]), ex_b(em, a[1]));
+        case B_STR_PAD_END:
+            return arena_printf(&g_arena, "vt_str_pad_end(%s, %s, %s)", ex_b(em, recv),
+                                ex_b(em, a[0]), ex_b(em, a[1]));
+        case B_STR_REPLACE:
+            return arena_printf(&g_arena, "vt_str_replace(%s, %s, %s)", ex_b(em, recv),
+                                ex_b(em, a[0]), ex_b(em, a[1]));
+        case B_STR_SPLIT:
+            return arena_printf(&g_arena, "vt_str_split(%s, %s)", ex_b(em, recv), ex_b(em, a[0]));
+        case B_STR_LINES:
+            return arena_printf(&g_arena, "vt_str_lines(%s)", ex_b(em, recv));
+        case B_STR_TO_INT:
+            return arena_printf(&g_arena, "vt_str_to_int(%s, \"%s\", %d)", ex_b(em, recv),
+                                c_escape(e->loc.file, strlen(e->loc.file)), e->loc.line);
+        case B_STR_TO_FLOAT:
+            return arena_printf(&g_arena, "vt_str_to_float(%s, \"%s\", %d)", ex_b(em, recv),
+                                c_escape(e->loc.file, strlen(e->loc.file)), e->loc.line);
+        /* ---- array methods ---- */
+        case B_ARR_FIRST:
+        case B_ARR_LAST:
+        case B_ARR_NTH: {
+            Type *et = recv->type->elem;
+            char *idx = e->builtin == B_ARR_FIRST ? "0"
+                        : e->builtin == B_ARR_LAST ? "-1" : ex_b(em, a[0]);
+            *fresh = false; /* borrowed element, like a[i] and map.get */
+            return arena_printf(&g_arena, "(*(%s*)vt_arr_nth(%s, %s, \"%s\", %d))", c_type(et),
+                                ex_b(em, recv), idx, c_escape(e->loc.file, strlen(e->loc.file)),
+                                e->loc.line);
+        }
+        case B_ARR_IS_EMPTY:
+            return arena_printf(&g_arena, "(vt_len(%s, \"%s\", %d) == 0)", ex_b(em, recv),
+                                c_escape(e->loc.file, strlen(e->loc.file)), e->loc.line);
+        case B_ARR_CONTAINS:
+        case B_ARR_INDEX_OF: {
+            Type *et = recv->type->elem;
+            const char *tv = newtemp(em, et, false);
+            const char *eq = et->kind == TY_STRING ? "VT_EQ_STR"
+                             : (et->kind == TY_FLOAT || et->kind == TY_F64) ? "VT_EQ_F64"
+                             : et->kind == TY_F32 ? "VT_EQ_F32" : "VT_EQ_BITS";
+            const char *fn = e->builtin == B_ARR_CONTAINS ? "vt_arr_contains" : "vt_arr_index_of";
+            *fresh = false;
+            return arena_printf(&g_arena, "(%s = %s, %s(%s, &%s, %s, \"%s\", %d))", tv,
+                                ex_v(em, a[0], et), fn, ex_b(em, recv), tv, eq,
+                                c_escape(e->loc.file, strlen(e->loc.file)), e->loc.line);
+        }
+        case B_ARR_REVERSE:
+            *fresh = false;
+            return arena_printf(&g_arena, "vt_arr_reverse(%s, \"%s\", %d)", ex_b(em, recv),
+                                c_escape(e->loc.file, strlen(e->loc.file)), e->loc.line);
+        case B_ARR_CLEAR:
+            *fresh = false;
+            return arena_printf(&g_arena, "vt_arr_clear(%s, \"%s\", %d)", ex_b(em, recv),
+                                c_escape(e->loc.file, strlen(e->loc.file)), e->loc.line);
+        case B_ARR_INSERT: {
+            Type *et = recv->type->elem;
+            const char *tv = newtemp(em, et, false); /* borrowed; insert retains internally */
+            *fresh = false;
+            return arena_printf(&g_arena, "(%s = %s, vt_arr_insert(%s, %s, &%s, \"%s\", %d))", tv,
+                                ex_v(em, a[1], et), ex_b(em, recv), ex_b(em, a[0]), tv,
+                                c_escape(e->loc.file, strlen(e->loc.file)), e->loc.line);
+        }
+        case B_ARR_REMOVE_AT: {
+            Type *et = recv->type->elem;
+            const char *tv = newtemp(em, et, false); /* ownership transfers to consumer */
+            *fresh = type_is_ref(et);
+            return arena_printf(&g_arena, "(vt_arr_remove_at(%s, %s, &%s, \"%s\", %d), %s)",
+                                ex_b(em, recv), ex_b(em, a[0]), tv,
+                                c_escape(e->loc.file, strlen(e->loc.file)), e->loc.line, tv);
+        }
+        case B_ARR_EXTEND:
+            *fresh = false;
+            return arena_printf(&g_arena, "vt_arr_extend(%s, %s, \"%s\", %d)", ex_b(em, recv),
+                                ex_b(em, a[0]), c_escape(e->loc.file, strlen(e->loc.file)),
+                                e->loc.line);
+        case B_ARR_CONCAT:
+            *fresh = true;
+            return arena_printf(&g_arena, "vt_arr_concat(%s, %s, \"%s\", %d)", ex_b(em, recv),
+                                ex_b(em, a[0]), c_escape(e->loc.file, strlen(e->loc.file)),
+                                e->loc.line);
+        case B_ARR_SLICE:
+            *fresh = true;
+            return arena_printf(&g_arena, "vt_arr_slice(%s, %s, %s, \"%s\", %d)", ex_b(em, recv),
+                                ex_b(em, a[0]), ex_b(em, a[1]),
+                                c_escape(e->loc.file, strlen(e->loc.file)), e->loc.line);
+        case B_ARR_FILL: {
+            Type *et = recv->type->elem;
+            const char *tv = newtemp(em, et, false); /* borrowed; fill retains internally */
+            *fresh = false;
+            return arena_printf(&g_arena, "(%s = %s, vt_arr_fill(%s, &%s, \"%s\", %d))", tv,
+                                ex_v(em, a[0], et), ex_b(em, recv), tv,
+                                c_escape(e->loc.file, strlen(e->loc.file)), e->loc.line);
+        }
+        case B_ARR_JOIN:
+            *fresh = true;
+            return arena_printf(&g_arena, "vt_arr_join(%s, %s, \"%s\", %d)", ex_b(em, recv),
+                                ex_b(em, a[0]), c_escape(e->loc.file, strlen(e->loc.file)),
+                                e->loc.line);
+        /* ---- map methods ---- */
+        case B_MAP_KEYS:
+            *fresh = true;
+            return arena_printf(&g_arena, "vt_map_keys(%s, \"%s\", %d)", ex_b(em, recv),
+                                c_escape(e->loc.file, strlen(e->loc.file)), e->loc.line);
+        case B_MAP_VALUES: {
+            Type *et = recv->type->elem;
+            *fresh = true;
+            return arena_printf(&g_arena, "vt_map_values(%s, sizeof(%s), %s, \"%s\", %d)",
+                                ex_b(em, recv), c_type(et), type_is_ref(et) ? "true" : "false",
+                                c_escape(e->loc.file, strlen(e->loc.file)), e->loc.line);
+        }
+        case B_MAP_GET_OR: {
+            Type *et = recv->type->elem;
+            *fresh = false; /* borrowed, like map.get */
+            return unbits(arena_printf(&g_arena, "vt_map_get_or(%s, %s, %s, \"%s\", %d)",
+                                       ex_b(em, recv), ex_b(em, a[0]), bits_of(em, a[1], et),
+                                       c_escape(e->loc.file, strlen(e->loc.file)), e->loc.line),
+                          et);
+        }
+        case B_MAP_IS_EMPTY:
+            return arena_printf(&g_arena, "(vt_len(%s, \"%s\", %d) == 0)", ex_b(em, recv),
+                                c_escape(e->loc.file, strlen(e->loc.file)), e->loc.line);
+        case B_MAP_CLEAR:
+            *fresh = false;
+            return arena_printf(&g_arena, "vt_map_clear(%s, \"%s\", %d)", ex_b(em, recv),
+                                c_escape(e->loc.file, strlen(e->loc.file)), e->loc.line);
+        case B_MAP_MERGE:
+            *fresh = false;
+            return arena_printf(&g_arena, "vt_map_merge(%s, %s, \"%s\", %d)", ex_b(em, recv),
+                                ex_b(em, a[0]), c_escape(e->loc.file, strlen(e->loc.file)),
+                                e->loc.line);
+        /* ---- array higher-order methods ---- */
+        case B_ARR_MAP:
+        case B_ARR_FILTER:
+        case B_ARR_REDUCE:
+        case B_ARR_EACH:
+        case B_ARR_FIND_INDEX:
+        case B_ARR_ANY:
+        case B_ARR_ALL:
+        case B_ARR_SORT:
+            return emit_hof(em, e, recv, fresh);
         default: break;
         }
         fatal_at(e->loc, "internal: bad builtin");

@@ -189,4 +189,77 @@ typedef struct VtClosure {
 
 VtClosure *vt_closure_new(void *fn, VtObj *env); /* takes ownership of env */
 
+/* ---- int / float builtin-method helpers (runtime/volt_rt_num.c) ---- */
+int64_t vt_int_abs(int64_t x, const char *file, int line); /* traps INT64_MIN */
+int64_t vt_int_min(int64_t a, int64_t b);
+int64_t vt_int_max(int64_t a, int64_t b);
+int64_t vt_int_clamp(int64_t x, int64_t lo, int64_t hi);
+int64_t vt_int_sign(int64_t x);
+int64_t vt_int_pow(int64_t base, int64_t exp, const char *file, int line); /* traps overflow */
+int64_t vt_int_gcd(int64_t a, int64_t b, const char *file, int line);
+
+double vt_flt_abs(double x);
+double vt_flt_min(double a, double b);
+double vt_flt_max(double a, double b);
+double vt_flt_clamp(double x, double lo, double hi);
+double vt_flt_floor(double x);
+double vt_flt_ceil(double x);
+double vt_flt_round(double x);
+double vt_flt_trunc(double x);
+double vt_flt_sqrt(double x);
+double vt_flt_pow(double b, double e);
+bool vt_flt_is_nan(double x);
+
+/* ---- string builtin-method helpers (runtime/volt_rt_str.c) ---- */
+bool vt_str_starts_with(VtString *s, VtString *p);
+bool vt_str_ends_with(VtString *s, VtString *p);
+bool vt_str_contains(VtString *s, VtString *sub);
+int64_t vt_str_index_of(VtString *s, VtString *sub);
+int64_t vt_str_last_index_of(VtString *s, VtString *sub);
+int64_t vt_str_count(VtString *s, VtString *sub);
+VtString *vt_str_char_at(VtString *s, int64_t i, const char *file, int line);
+VtString *vt_str_to_upper(VtString *s);
+VtString *vt_str_to_lower(VtString *s);
+VtString *vt_str_trim(VtString *s);
+VtString *vt_str_trim_start(VtString *s);
+VtString *vt_str_trim_end(VtString *s);
+VtString *vt_str_repeat(VtString *s, int64_t n, const char *file, int line);
+VtString *vt_str_pad_start(VtString *s, int64_t w, VtString *ch);
+VtString *vt_str_pad_end(VtString *s, int64_t w, VtString *ch);
+VtString *vt_str_replace(VtString *s, VtString *old, VtString *neu);
+VtString *vt_str_reverse(VtString *s);
+VtArray *vt_str_split(VtString *s, VtString *sep);
+VtArray *vt_str_lines(VtString *s);
+int64_t vt_str_to_int(VtString *s, const char *file, int line);
+double vt_str_to_float(VtString *s, const char *file, int line);
+
+/* ---- array builtin-method helpers (runtime/volt_rt_arr.c) ---- */
+/* element-equality kind, set by the checker (floats compare by value so
+   -0.0 == 0.0 and NaN never matches, same as `==`) */
+enum { VT_EQ_BITS = 0, VT_EQ_STR = 1, VT_EQ_F64 = 2, VT_EQ_F32 = 3 };
+/* null-check pass-through: emitted higher-order loops receive a checked array */
+static inline VtArray *vt_arr_nn(VtArray *a, const char *file, int line) {
+    if (!a) vt_panic_c(file, line, "method call on null array");
+    return a;
+}
+void *vt_arr_nth(VtArray *a, int64_t i, const char *file, int line);
+int64_t vt_arr_index_of(VtArray *a, const void *elem, int eq, const char *file, int line);
+bool vt_arr_contains(VtArray *a, const void *elem, int eq, const char *file, int line);
+void vt_arr_reverse(VtArray *a, const char *file, int line);
+void vt_arr_clear(VtArray *a, const char *file, int line);
+void vt_arr_insert(VtArray *a, int64_t i, const void *elem, const char *file, int line);
+void vt_arr_remove_at(VtArray *a, int64_t i, void *out, const char *file, int line);
+void vt_arr_extend(VtArray *a, VtArray *o, const char *file, int line);
+VtArray *vt_arr_concat(VtArray *a, VtArray *o, const char *file, int line);
+VtArray *vt_arr_slice(VtArray *a, int64_t lo, int64_t hi, const char *file, int line);
+void vt_arr_fill(VtArray *a, const void *elem, const char *file, int line);
+VtString *vt_arr_join(VtArray *a, VtString *sep, const char *file, int line);
+
+/* ---- map builtin-method helpers (runtime/volt_rt_map.c) ---- */
+VtArray *vt_map_keys(VtMap *m, const char *file, int line);
+VtArray *vt_map_values(VtMap *m, int32_t elem_size, bool elem_ref, const char *file, int line);
+uint64_t vt_map_get_or(VtMap *m, VtString *key, uint64_t defbits, const char *file, int line);
+void vt_map_clear(VtMap *m, const char *file, int line);
+void vt_map_merge(VtMap *m, VtMap *o, const char *file, int line);
+
 #endif

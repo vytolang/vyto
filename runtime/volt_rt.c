@@ -840,3 +840,12 @@ VtClosure *vt_closure_new(void *fn, VtObj *env) {
     c->env = env; /* ownership transferred */
     return c;
 }
+
+/* ---- builtin-method helper units (amalgamated) ----
+ * Included here so they share every static host hook / helper above and compile
+ * into the single volt_rt translation unit. Each file's mtime is tracked by the
+ * driver (src/main.c) so edits trigger a runtime rebuild. */
+#include "volt_rt_num.c"
+#include "volt_rt_str.c"
+#include "volt_rt_arr.c"
+#include "volt_rt_map.c"

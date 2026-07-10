@@ -525,6 +525,10 @@ static void check_args_against(Ctx *c, Expr *e, Param *params, int nparams, cons
             if (slots[i]) continue;
             if (!params[i].def)
                 fatal_at(e->loc, "'%s' missing argument for '%s'", name, params[i].name);
+            /* NOTE: this shares ONE Expr node across every call site that uses
+               the default. Safe only while defaults are literal-only (enforced
+               by is_literal_default) and each site types it against the same
+               param type. Revisit before allowing non-literal defaults. */
             slots[i] = params[i].def;
         }
         e->args = slots;
@@ -545,6 +549,19 @@ static Type *fn_type_of(FnDecl *fd) {
     t->params = arena_alloc(&g_arena, sizeof(Type *) * (size_t)(fd->nparams ? fd->nparams : 1));
     for (int i = 0; i < fd->nparams; i++) t->params[i] = fd->params[i].type;
     t->ret = fd->ret;
+    return t;
+}
+
+/* build a fn-type hint (0/1/2 params) so arrow closures passed to higher-order
+   array methods can infer their parameter and return types inline. */
+static Type *mk_fn_hint(Type *p0, Type *p1, Type *ret) {
+    Type *t = mk_type(TY_FN);
+    int np = p1 ? 2 : (p0 ? 1 : 0);
+    t->nparams = np;
+    t->params = arena_alloc(&g_arena, sizeof(Type *) * (size_t)(np ? np : 1));
+    if (np >= 1) t->params[0] = p0;
+    if (np >= 2) t->params[1] = p1;
+    t->ret = ret;
     return t;
 }
 
@@ -610,6 +627,17 @@ static Type *check_call(Ctx *c, Expr *e) {
 
     if (callee->kind == EX_IDENT) {
         const char *n = callee->name;
+        /* builtin free functions are positional-only; without this guard a
+           label would be silently ignored. Keep in sync with the chain below
+           (user fns resolved via mod_lookup DO support named arguments). */
+        if (e->arg_names) {
+            static const char *positional_builtins[] = {
+                "print", "panic", "str", "cthunk", "cthunk_last", "readfile", "readlines",
+                "listdir", "isdir", "writefile", "appendfile", "bytes", "args", NULL};
+            for (int i = 0; positional_builtins[i]; i++)
+                if (n == intern(positional_builtins[i]))
+                    fatal_at(e->loc, "named arguments are not supported on builtin calls");
+        }
         if (n == intern("print") || n == intern("panic")) {
             if (e->nargs != 1) fatal_at(e->loc, "%s takes 1 argument", n);
             check_expr(c, e->args[0], ty_string());
@@ -749,6 +777,12 @@ static Type *check_call(Ctx *c, Expr *e) {
     if (callee->kind == EX_MEMBER) {
         Type *recv = check_expr(c, callee->lhs, NULL);
         const char *n = callee->name;
+        /* builtin methods are positional-only; class/struct methods below keep
+           named-argument support via check_args_against */
+        if (e->arg_names &&
+            (recv->kind == TY_ARRAY || recv->kind == TY_MAP || recv->kind == TY_STRING ||
+             recv->kind == TY_INT || recv->kind == TY_FLOAT))
+            fatal_at(e->loc, "named arguments are not supported on builtin methods");
         if (recv->kind == TY_ARRAY) {
             if (n == intern("push")) {
                 if (e->nargs != 1) fatal_at(e->loc, "push takes 1 argument");
@@ -761,6 +795,145 @@ static Type *check_call(Ctx *c, Expr *e) {
                 if (e->nargs != 0) fatal_at(e->loc, "pop takes no arguments");
                 e->ref = REF_BUILTIN; e->builtin = B_POP;
                 return e->type = recv->elem;
+            }
+            if (n == intern("first") || n == intern("last")) {
+                if (e->nargs != 0) fatal_at(e->loc, "%s takes no arguments", n);
+                e->ref = REF_BUILTIN;
+                e->builtin = n == intern("first") ? B_ARR_FIRST : B_ARR_LAST;
+                return e->type = recv->elem;
+            }
+            if (n == intern("nth")) {
+                if (e->nargs != 1) fatal_at(e->loc, "nth takes 1 argument");
+                check_expr(c, e->args[0], ty_int());
+                want(c, e->args[0], ty_int(), "nth index");
+                e->ref = REF_BUILTIN; e->builtin = B_ARR_NTH;
+                return e->type = recv->elem;
+            }
+            if (n == intern("is_empty")) {
+                if (e->nargs != 0) fatal_at(e->loc, "is_empty takes no arguments");
+                e->ref = REF_BUILTIN; e->builtin = B_ARR_IS_EMPTY;
+                return e->type = ty_bool();
+            }
+            if (n == intern("contains") || n == intern("index_of")) {
+                /* struct padding bytes make a byte-wise compare unreliable */
+                if (recv->elem->kind == TY_STRUCT)
+                    fatal_at(e->loc, "%s is not supported on struct-element arrays", n);
+                if (e->nargs != 1) fatal_at(e->loc, "%s takes 1 argument", n);
+                check_expr(c, e->args[0], recv->elem);
+                want(c, e->args[0], recv->elem, "array element");
+                e->ref = REF_BUILTIN;
+                e->builtin = n == intern("contains") ? B_ARR_CONTAINS : B_ARR_INDEX_OF;
+                return e->type = n == intern("contains") ? ty_bool() : ty_int();
+            }
+            if (n == intern("reverse") || n == intern("clear")) {
+                if (e->nargs != 0) fatal_at(e->loc, "%s takes no arguments", n);
+                e->ref = REF_BUILTIN;
+                e->builtin = n == intern("reverse") ? B_ARR_REVERSE : B_ARR_CLEAR;
+                return e->type = ty_void();
+            }
+            if (n == intern("insert")) {
+                if (e->nargs != 2) fatal_at(e->loc, "insert takes 2 arguments");
+                check_expr(c, e->args[0], ty_int());
+                want(c, e->args[0], ty_int(), "insert index");
+                check_expr(c, e->args[1], recv->elem);
+                want(c, e->args[1], recv->elem, "insert element");
+                e->ref = REF_BUILTIN; e->builtin = B_ARR_INSERT;
+                return e->type = ty_void();
+            }
+            if (n == intern("remove_at")) {
+                if (e->nargs != 1) fatal_at(e->loc, "remove_at takes 1 argument");
+                check_expr(c, e->args[0], ty_int());
+                want(c, e->args[0], ty_int(), "remove_at index");
+                e->ref = REF_BUILTIN; e->builtin = B_ARR_REMOVE_AT;
+                return e->type = recv->elem;
+            }
+            if (n == intern("extend") || n == intern("concat")) {
+                if (e->nargs != 1) fatal_at(e->loc, "%s takes 1 argument", n);
+                check_expr(c, e->args[0], recv);
+                want(c, e->args[0], recv, "array");
+                e->ref = REF_BUILTIN;
+                if (n == intern("extend")) { e->builtin = B_ARR_EXTEND; return e->type = ty_void(); }
+                e->builtin = B_ARR_CONCAT;
+                return e->type = recv;
+            }
+            if (n == intern("slice")) {
+                if (e->nargs != 2) fatal_at(e->loc, "slice takes 2 arguments");
+                for (int i = 0; i < 2; i++) {
+                    check_expr(c, e->args[i], ty_int());
+                    want(c, e->args[i], ty_int(), "slice bound");
+                }
+                e->ref = REF_BUILTIN; e->builtin = B_ARR_SLICE;
+                return e->type = recv;
+            }
+            if (n == intern("fill")) {
+                if (e->nargs != 1) fatal_at(e->loc, "fill takes 1 argument");
+                check_expr(c, e->args[0], recv->elem);
+                want(c, e->args[0], recv->elem, "fill element");
+                e->ref = REF_BUILTIN; e->builtin = B_ARR_FILL;
+                return e->type = ty_void();
+            }
+            if (n == intern("join")) {
+                if (recv->elem->kind != TY_STRING)
+                    fatal_at(e->loc, "join requires a string[] (got %s[])", type_str(recv->elem));
+                if (e->nargs != 1) fatal_at(e->loc, "join takes 1 argument");
+                check_expr(c, e->args[0], ty_string());
+                want(c, e->args[0], ty_string(), "join separator");
+                e->ref = REF_BUILTIN; e->builtin = B_ARR_JOIN;
+                return e->type = ty_string();
+            }
+            /* ---- higher-order (closure) methods ---- */
+            if (n == intern("map")) {
+                if (e->nargs != 1) fatal_at(e->loc, "map takes 1 argument");
+                Type *ft = check_expr(c, e->args[0], NULL);
+                if (ft->kind != TY_FN || ft->nparams != 1 ||
+                    !type_identical(ft->params[0], recv->elem) || ft->ret->kind == TY_VOID)
+                    fatal_at(e->loc, "map expects fn(%s): U with a non-void result "
+                             "(assign an arrow to a typed value first)", type_str(recv->elem));
+                e->ref = REF_BUILTIN; e->builtin = B_ARR_MAP;
+                Type *t = mk_type(TY_ARRAY); t->elem = ft->ret;
+                return e->type = t;
+            }
+            if (n == intern("filter") || n == intern("each") ||
+                n == intern("find_index") || n == intern("any") || n == intern("all")) {
+                if (e->nargs != 1) fatal_at(e->loc, "%s takes 1 argument", n);
+                bool is_each = n == intern("each");
+                Type *want_ret = is_each ? ty_void() : ty_bool();
+                check_expr(c, e->args[0], mk_fn_hint(recv->elem, NULL, want_ret));
+                Type *ft = e->args[0]->type;
+                if (ft->kind != TY_FN || ft->nparams != 1 ||
+                    !type_identical(ft->params[0], recv->elem) ||
+                    !type_identical(ft->ret, want_ret))
+                    fatal_at(e->loc, "%s expects fn(%s): %s", n, type_str(recv->elem),
+                             type_str(want_ret));
+                e->ref = REF_BUILTIN;
+                if (n == intern("filter")) { e->builtin = B_ARR_FILTER; return e->type = recv; }
+                if (is_each) { e->builtin = B_ARR_EACH; return e->type = ty_void(); }
+                if (n == intern("find_index")) { e->builtin = B_ARR_FIND_INDEX; return e->type = ty_int(); }
+                e->builtin = n == intern("any") ? B_ARR_ANY : B_ARR_ALL;
+                return e->type = ty_bool();
+            }
+            if (n == intern("reduce")) {
+                if (e->nargs != 2) fatal_at(e->loc, "reduce takes 2 arguments (init, fn)");
+                Type *ut = check_expr(c, e->args[0], NULL);
+                check_expr(c, e->args[1], mk_fn_hint(ut, recv->elem, ut));
+                Type *ft = e->args[1]->type;
+                if (ft->kind != TY_FN || ft->nparams != 2 || !type_identical(ft->params[0], ut) ||
+                    !type_identical(ft->params[1], recv->elem) || !type_identical(ft->ret, ut))
+                    fatal_at(e->loc, "reduce expects fn(acc, %s): acc", type_str(recv->elem));
+                e->ref = REF_BUILTIN; e->builtin = B_ARR_REDUCE;
+                return e->type = ut;
+            }
+            if (n == intern("sort")) {
+                if (e->nargs != 1) fatal_at(e->loc, "sort takes 1 argument (comparator)");
+                check_expr(c, e->args[0], mk_fn_hint(recv->elem, recv->elem, ty_int()));
+                Type *ft = e->args[0]->type;
+                if (ft->kind != TY_FN || ft->nparams != 2 ||
+                    !type_identical(ft->params[0], recv->elem) ||
+                    !type_identical(ft->params[1], recv->elem) || ft->ret->kind != TY_INT)
+                    fatal_at(e->loc, "sort expects fn(%s, %s): int", type_str(recv->elem),
+                             type_str(recv->elem));
+                e->ref = REF_BUILTIN; e->builtin = B_ARR_SORT;
+                return e->type = ty_void();
             }
             fatal_at(e->loc, "arrays have no method '%s'", n);
         }
@@ -784,6 +957,44 @@ static Type *check_call(Ctx *c, Expr *e) {
                 e->builtin = B_MAP_REMOVE;
                 return e->type = ty_void();
             }
+            if (n == intern("keys")) {
+                if (e->nargs != 0) fatal_at(e->loc, "keys takes no arguments");
+                e->ref = REF_BUILTIN; e->builtin = B_MAP_KEYS;
+                Type *t = mk_type(TY_ARRAY); t->elem = ty_string();
+                return e->type = t;
+            }
+            if (n == intern("values")) {
+                if (e->nargs != 0) fatal_at(e->loc, "values takes no arguments");
+                e->ref = REF_BUILTIN; e->builtin = B_MAP_VALUES;
+                Type *t = mk_type(TY_ARRAY); t->elem = recv->elem;
+                return e->type = t;
+            }
+            if (n == intern("get_or")) {
+                if (e->nargs != 2) fatal_at(e->loc, "get_or takes 2 arguments");
+                check_expr(c, e->args[0], ty_string());
+                want(c, e->args[0], ty_string(), "map key");
+                check_expr(c, e->args[1], recv->elem);
+                want(c, e->args[1], recv->elem, "map default value");
+                e->ref = REF_BUILTIN; e->builtin = B_MAP_GET_OR;
+                return e->type = recv->elem;
+            }
+            if (n == intern("is_empty")) {
+                if (e->nargs != 0) fatal_at(e->loc, "is_empty takes no arguments");
+                e->ref = REF_BUILTIN; e->builtin = B_MAP_IS_EMPTY;
+                return e->type = ty_bool();
+            }
+            if (n == intern("clear")) {
+                if (e->nargs != 0) fatal_at(e->loc, "clear takes no arguments");
+                e->ref = REF_BUILTIN; e->builtin = B_MAP_CLEAR;
+                return e->type = ty_void();
+            }
+            if (n == intern("merge")) {
+                if (e->nargs != 1) fatal_at(e->loc, "merge takes 1 argument");
+                check_expr(c, e->args[0], recv);
+                want(c, e->args[0], recv, "map");
+                e->ref = REF_BUILTIN; e->builtin = B_MAP_MERGE;
+                return e->type = ty_void();
+            }
             fatal_at(e->loc, "maps have no method '%s'", n);
         }
         if (recv->kind == TY_STRING) {
@@ -801,7 +1012,166 @@ static Type *check_call(Ctx *c, Expr *e) {
                 e->ref = REF_BUILTIN; e->builtin = B_SLICE;
                 return e->type = ty_string();
             }
+            /* no-arg -> string */
+            if (n == intern("to_upper") || n == intern("to_lower") || n == intern("trim") ||
+                n == intern("trim_start") || n == intern("trim_end") || n == intern("reverse")) {
+                if (e->nargs != 0) fatal_at(e->loc, "%s takes no arguments", n);
+                e->ref = REF_BUILTIN;
+                e->builtin = n == intern("to_upper") ? B_STR_TO_UPPER
+                             : n == intern("to_lower") ? B_STR_TO_LOWER
+                             : n == intern("trim") ? B_STR_TRIM
+                             : n == intern("trim_start") ? B_STR_TRIM_START
+                             : n == intern("trim_end") ? B_STR_TRIM_END : B_STR_REVERSE;
+                return e->type = ty_string();
+            }
+            if (n == intern("is_empty")) {
+                if (e->nargs != 0) fatal_at(e->loc, "is_empty takes no arguments");
+                e->ref = REF_BUILTIN; e->builtin = B_STR_IS_EMPTY;
+                return e->type = ty_bool();
+            }
+            if (n == intern("to_int")) {
+                if (e->nargs != 0) fatal_at(e->loc, "to_int takes no arguments");
+                e->ref = REF_BUILTIN; e->builtin = B_STR_TO_INT;
+                return e->type = ty_int();
+            }
+            if (n == intern("to_float")) {
+                if (e->nargs != 0) fatal_at(e->loc, "to_float takes no arguments");
+                e->ref = REF_BUILTIN; e->builtin = B_STR_TO_FLOAT;
+                return e->type = ty_float();
+            }
+            if (n == intern("lines")) {
+                if (e->nargs != 0) fatal_at(e->loc, "lines takes no arguments");
+                e->ref = REF_BUILTIN; e->builtin = B_STR_LINES;
+                Type *t = mk_type(TY_ARRAY); t->elem = ty_string();
+                return e->type = t;
+            }
+            /* 1 string arg -> bool / int / string[] */
+            if (n == intern("contains") || n == intern("starts_with") ||
+                n == intern("ends_with") || n == intern("index_of") ||
+                n == intern("last_index_of") || n == intern("count") || n == intern("split")) {
+                if (e->nargs != 1) fatal_at(e->loc, "%s takes 1 argument", n);
+                check_expr(c, e->args[0], ty_string());
+                want(c, e->args[0], ty_string(), "string method argument");
+                e->ref = REF_BUILTIN;
+                if (n == intern("contains")) { e->builtin = B_STR_CONTAINS; return e->type = ty_bool(); }
+                if (n == intern("starts_with")) { e->builtin = B_STR_STARTS_WITH; return e->type = ty_bool(); }
+                if (n == intern("ends_with")) { e->builtin = B_STR_ENDS_WITH; return e->type = ty_bool(); }
+                if (n == intern("index_of")) { e->builtin = B_STR_INDEX_OF; return e->type = ty_int(); }
+                if (n == intern("last_index_of")) { e->builtin = B_STR_LAST_INDEX_OF; return e->type = ty_int(); }
+                if (n == intern("count")) { e->builtin = B_STR_COUNT; return e->type = ty_int(); }
+                e->builtin = B_STR_SPLIT;
+                Type *t = mk_type(TY_ARRAY); t->elem = ty_string();
+                return e->type = t;
+            }
+            /* 1 int arg -> string */
+            if (n == intern("char_at") || n == intern("repeat")) {
+                if (e->nargs != 1) fatal_at(e->loc, "%s takes 1 argument", n);
+                check_expr(c, e->args[0], ty_int());
+                want(c, e->args[0], ty_int(), "string method argument");
+                e->ref = REF_BUILTIN;
+                e->builtin = n == intern("char_at") ? B_STR_CHAR_AT : B_STR_REPEAT;
+                return e->type = ty_string();
+            }
+            /* (int width, string fill) -> string */
+            if (n == intern("pad_start") || n == intern("pad_end")) {
+                if (e->nargs != 2) fatal_at(e->loc, "%s takes 2 arguments", n);
+                check_expr(c, e->args[0], ty_int());
+                want(c, e->args[0], ty_int(), "pad width");
+                check_expr(c, e->args[1], ty_string());
+                want(c, e->args[1], ty_string(), "pad fill");
+                e->ref = REF_BUILTIN;
+                e->builtin = n == intern("pad_start") ? B_STR_PAD_START : B_STR_PAD_END;
+                return e->type = ty_string();
+            }
+            /* (string old, string new) -> string */
+            if (n == intern("replace")) {
+                if (e->nargs != 2) fatal_at(e->loc, "replace takes 2 arguments");
+                for (int i = 0; i < 2; i++) {
+                    check_expr(c, e->args[i], ty_string());
+                    want(c, e->args[i], ty_string(), "replace argument");
+                }
+                e->ref = REF_BUILTIN; e->builtin = B_STR_REPLACE;
+                return e->type = ty_string();
+            }
             fatal_at(e->loc, "strings have no method '%s'", n);
+        }
+        if (recv->kind == TY_INT) {
+            if (n == intern("abs") || n == intern("sign")) {
+                if (e->nargs != 0) fatal_at(e->loc, "%s takes no arguments", n);
+                e->ref = REF_BUILTIN;
+                e->builtin = n == intern("abs") ? B_INT_ABS : B_INT_SIGN;
+                return e->type = ty_int();
+            }
+            if (n == intern("min") || n == intern("max") ||
+                n == intern("pow") || n == intern("gcd")) {
+                if (e->nargs != 1) fatal_at(e->loc, "%s takes 1 argument", n);
+                check_expr(c, e->args[0], ty_int());
+                want(c, e->args[0], ty_int(), "int method argument");
+                e->ref = REF_BUILTIN;
+                e->builtin = n == intern("min") ? B_INT_MIN : n == intern("max") ? B_INT_MAX
+                             : n == intern("pow") ? B_INT_POW : B_INT_GCD;
+                return e->type = ty_int();
+            }
+            if (n == intern("clamp")) {
+                if (e->nargs != 2) fatal_at(e->loc, "clamp takes 2 arguments");
+                for (int i = 0; i < 2; i++) {
+                    check_expr(c, e->args[i], ty_int());
+                    want(c, e->args[i], ty_int(), "clamp bound");
+                }
+                e->ref = REF_BUILTIN; e->builtin = B_INT_CLAMP;
+                return e->type = ty_int();
+            }
+            if (n == intern("to_float")) {
+                if (e->nargs != 0) fatal_at(e->loc, "to_float takes no arguments");
+                e->ref = REF_BUILTIN; e->builtin = B_INT_TO_FLOAT;
+                return e->type = ty_float();
+            }
+            if (n == intern("to_string")) {
+                if (e->nargs != 0) fatal_at(e->loc, "to_string takes no arguments");
+                e->ref = REF_BUILTIN; e->builtin = B_INT_TO_STRING;
+                return e->type = ty_string();
+            }
+            fatal_at(e->loc, "int has no method '%s'", n);
+        }
+        if (recv->kind == TY_FLOAT) {
+            if (n == intern("abs") || n == intern("floor") || n == intern("ceil") ||
+                n == intern("round") || n == intern("trunc") || n == intern("sqrt")) {
+                if (e->nargs != 0) fatal_at(e->loc, "%s takes no arguments", n);
+                e->ref = REF_BUILTIN;
+                e->builtin = n == intern("abs") ? B_FLT_ABS : n == intern("floor") ? B_FLT_FLOOR
+                             : n == intern("ceil") ? B_FLT_CEIL : n == intern("round") ? B_FLT_ROUND
+                             : n == intern("trunc") ? B_FLT_TRUNC : B_FLT_SQRT;
+                return e->type = ty_float();
+            }
+            if (n == intern("min") || n == intern("max") || n == intern("pow")) {
+                if (e->nargs != 1) fatal_at(e->loc, "%s takes 1 argument", n);
+                check_expr(c, e->args[0], ty_float());
+                want(c, e->args[0], ty_float(), "float method argument");
+                e->ref = REF_BUILTIN;
+                e->builtin = n == intern("min") ? B_FLT_MIN : n == intern("max") ? B_FLT_MAX
+                             : B_FLT_POW;
+                return e->type = ty_float();
+            }
+            if (n == intern("clamp")) {
+                if (e->nargs != 2) fatal_at(e->loc, "clamp takes 2 arguments");
+                for (int i = 0; i < 2; i++) {
+                    check_expr(c, e->args[i], ty_float());
+                    want(c, e->args[i], ty_float(), "clamp bound");
+                }
+                e->ref = REF_BUILTIN; e->builtin = B_FLT_CLAMP;
+                return e->type = ty_float();
+            }
+            if (n == intern("to_int")) {
+                if (e->nargs != 0) fatal_at(e->loc, "to_int takes no arguments");
+                e->ref = REF_BUILTIN; e->builtin = B_FLT_TO_INT;
+                return e->type = ty_int();
+            }
+            if (n == intern("is_nan")) {
+                if (e->nargs != 0) fatal_at(e->loc, "is_nan takes no arguments");
+                e->ref = REF_BUILTIN; e->builtin = B_FLT_IS_NAN;
+                return e->type = ty_bool();
+            }
+            fatal_at(e->loc, "float has no method '%s'", n);
         }
         if (recv->kind == TY_CLASS) {
             if (n == intern("init")) fatal_at(e->loc, "init is called via 'new' or 'super.init'");
@@ -1416,6 +1786,8 @@ static CVal fold_const_expr(Module *m, Expr *e) {
             case T_CARET: r = x ^ y; break;
             case T_PERCENT:
                 if (y == 0) fatal_at(e->loc, "modulo by zero in constant expression");
+                if (x == INT64_MIN && y == -1) /* the one x%y that traps in C */
+                    fatal_at(e->loc, "integer overflow in constant expression");
                 r = x % y; break;
             case T_SHL: case T_SHR:
                 if (y < 0 || y >= 64) fatal_at(e->loc, "shift amount out of range in constant");
@@ -1448,6 +1820,8 @@ static CVal fold_const_expr(Module *m, Expr *e) {
         case T_STAR: r = (int64_t)((uint64_t)x * (uint64_t)y); break;
         case T_SLASH:
             if (y == 0) fatal_at(e->loc, "division by zero in constant expression");
+            if (x == INT64_MIN && y == -1) /* the one x/y that traps in C */
+                fatal_at(e->loc, "integer overflow in constant expression");
             r = x / y; break;
         default: fatal_at(e->loc, "unsupported operator in constant expression");
         }
