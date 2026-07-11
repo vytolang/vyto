@@ -1,0 +1,355 @@
+// volt/gfx motion gallery — 13 independent animations in a tiled grid, each a
+// pure consumer of the rich tier (transforms, vector paths, linear + radial
+// gradients, clip, AA text) and volt/anim easings, on a raw Surface loop.
+// Every tile auto-loops; hovering rings a tile; clicking the "trace" and
+// "pop" tiles fires a one-shot. No Window/widgets — just Canvas + a clock.
+import { Surface, Rect, EV_CLOSE, EV_MOUSE_MOVE, EV_MOUSE_DOWN,
+         mix, with_alpha, rgb } from "volt/surface";
+import { Canvas } from "volt/gfx";
+import { Path } from "volt/geom/path";
+import { Anim, ease_linear, ease_in_out_quad, ease_out_cubic, ease_in_out_cubic,
+         ease_out_back, ease_out_bounce, ease_in_out_sine } from "volt/anim";
+import { sin, cos, fmod, PI } from "volt/math";
+
+const K_RACE: i64 = 0;
+const K_BALL: i64 = 1;
+const K_COUNT: i64 = 2;
+const K_SPIN: i64 = 3;
+const K_ORB: i64 = 4;
+const K_ORBIT: i64 = 5;
+const K_WAVE: i64 = 6;
+const K_GRAD: i64 = 7;
+const K_FADE: i64 = 8;
+const K_MORPH: i64 = 9;
+const K_TRACE: i64 = 10;
+const K_BARS: i64 = 11;
+const K_POP: i64 = 12;
+
+const ACCENT: i64 = 0x3CA0E0;
+const PANEL: i64 = 0x1E2330;
+const INK: i64 = 0xE6EAF2;
+const MUTED: i64 = 0x8792A6;
+
+// ---- small helpers ----
+fn loop01(t: int, period: int): float {
+    return fmod(t as float, period as float) / (period as float);
+}
+fn tri(p: float): float {           // 0->1->0
+    if (p < 0.5) { return p * 2.0; }
+    return 2.0 - p * 2.0;
+}
+fn lerp(a: float, b: float, t: float): float { return a + (b - a) * t; }
+
+// the six easings shown side by side in the race tile
+fn ease_by(i: int, p: float): float {
+    if (i == 0) { return ease_linear(p); }
+    if (i == 1) { return ease_in_out_quad(p); }
+    if (i == 2) { return ease_out_cubic(p); }
+    if (i == 3) { return ease_out_back(p); }
+    if (i == 4) { return ease_out_bounce(p); }
+    return ease_in_out_sine(p);
+}
+
+// build a 5-point star Path centered at (cx,cy); inner/outer radii given
+fn star_path(cx: float, cy: float, inner: float, outer: float): Path {
+    let p = new Path();
+    let i = 0;
+    while (i < 10) {
+        let r = outer;
+        if (i % 2 == 1) { r = inner; }
+        let a = (-PI / 2.0) + (i as float) * (PI / 5.0);
+        let x = cx + r * cos(a);
+        let y = cy + r * sin(a);
+        if (i == 0) { p.moveTo(x, y); } else { p.lineTo(x, y); }
+        i += 1;
+    }
+    p.close();
+    return p;
+}
+
+class Tile {
+    kind: int;
+    x: int;
+    y: int;
+    w: int;
+    h: int;
+    label: string;
+    pop: Anim;      // one-shot for click-driven tiles; null otherwise
+
+    fn init(kind: int, label: string) {
+        this.kind = kind;
+        this.label = label;
+    }
+    fn hit(mx: int, my: int): bool {
+        return mx >= this.x && mx <= this.x + this.w
+            && my >= this.y && my <= this.y + this.h;
+    }
+}
+
+// ---- per-tile animations, drawn inside the tile's content rect ----
+fn draw_anim(cv: Canvas, tl: Tile, t: int) {
+    let ix = (tl.x + 12) as float;
+    let iy = (tl.y + 30) as float;
+    let iw = (tl.w - 24) as float;
+    let ih = (tl.h - 42) as float;
+    let cx = ix + iw / 2.0;
+    let cy = iy + ih / 2.0;
+    let k = tl.kind;
+
+    if (k == K_RACE) {
+        let names: string[] = ["lin", "quad", "cub", "back", "bnc", "sin"];
+        let p = loop01(t, 1700);
+        for (let j in 0..6) {
+            let ty = iy + 8.0 + (j as float) * (ih - 12.0) / 5.0;
+            cv.text(ix, ty + 5.0, names[j], MUTED);
+            let x0 = ix + 40.0;
+            let x1 = ix + iw - 10.0;
+            let e = ease_by(j, tri(p));
+            let dx = lerp(x0, x1, e);
+            cv.fillCircle(dx, ty, 5.0, mix(ACCENT, 0xF06060, (j as float) / 5.0));
+        }
+    } else if (k == K_BALL) {
+        let floor_y = iy + ih - 8.0;
+        let p = loop01(t, 1400);
+        let v = ease_out_bounce(p);
+        let by = lerp(iy + 10.0, floor_y, v);
+        let sq = v * v;                       // squash hardest near the floor
+        cv.save();
+        cv.translate(cx, by);
+        cv.scale(1.0 + 0.28 * sq, 1.0 - 0.28 * sq);
+        cv.fillCircle(0.0, 0.0, 14.0, 0xFFC24B);
+        cv.restore();
+        cv.fillRect(ix, floor_y + 6.0, iw, 2.0, 0x39404F);
+    } else if (k == K_COUNT) {
+        let n = (ease_out_cubic(loop01(t, 2200)) * 9999.0) as int;
+        cv.text(cx - 34.0, cy + 6.0, "" + n, INK);
+        cv.text(ix, iy + ih - 2.0, "ease_out_cubic", MUTED);
+    } else if (k == K_SPIN) {
+        let ang = fmod(t as float, 1400.0) / 1400.0 * 360.0;
+        let r = iw;
+        if (ih < r) { r = ih; }
+        r = r / 2.0 - 8.0;
+        cv.save();
+        cv.translate(cx, cy);
+        cv.rotate(ang);
+        cv.fillPath(star_path(0.0, 0.0, r * 0.45, r), 0x7C5CFF);
+        cv.restore();
+    } else if (k == K_ORB) {
+        let base = 0.62;
+        if (ih < iw) { base = ih / iw * 0.62; }
+        let rr = iw;
+        if (ih < rr) { rr = ih; }
+        let r = rr / 2.0 * (0.55 + 0.35 * (0.5 + 0.5 * sin((t as float) * 0.004)));
+        let cols: i32[] = [0xFFE27A as i32, 0x20242E as i32];
+        let pos: float[] = [0.0, 1.0];
+        cv.radialGradientRectN(cx - r, cy - r, r * 2.0, r * 2.0, cx, cy, r, cols, pos);
+    } else if (k == K_ORBIT) {
+        let rr = iw;
+        if (ih < rr) { rr = ih; }
+        let orbit = rr / 2.0 - 14.0;
+        cv.fillCircle(cx, cy, 6.0, MUTED);
+        for (let g in 0..4) {
+            let a = (t as float) * 0.005 - (g as float) * 0.28;
+            let gx = cx + orbit * cos(a);
+            let gy = cy + orbit * sin(a);
+            cv.fillCircle(gx, gy, 8.0 - (g as float) * 1.5,
+                          with_alpha(ACCENT, 230 - g * 60));
+        }
+    } else if (k == K_WAVE) {
+        let n = 9;
+        for (let i in 0..n) {
+            let x = ix + 10.0 + (i as float) * (iw - 20.0) / ((n - 1) as float);
+            let y = cy + (ih / 3.0) * sin((t as float) * 0.005 + (i as float) * 0.6);
+            cv.fillCircle(x, y, 6.0, mix(0x3CA0E0, 0x30C0A0, (i as float) / ((n - 1) as float)));
+        }
+    } else if (k == K_GRAD) {
+        let m = tri(loop01(t, 3200));
+        let ca = mix(0x2A4CC8, 0xE0407C, m);
+        let cb = mix(0x30C0A0, 0xF0B050, m);
+        cv.linearGradientRect(ix, iy, iw, ih, ix, iy, ix + iw, iy + ih, ca, cb);
+    } else if (k == K_FADE) {
+        let a = 0.5 + 0.5 * sin((t as float) * 0.003);
+        let bw = iw * 0.5;
+        let bh = ih * 0.7;
+        cv.fillRoundRect(cx - bw / 2.0 - 12.0, cy - bh / 2.0, bw, bh, 14.0,
+                         with_alpha(0xF06060, ((1.0 - a) * 255.0) as int));
+        cv.fillRoundRect(cx - bw / 2.0 + 12.0, cy - bh / 2.0, bw, bh, 14.0,
+                         with_alpha(0x3CA0E0, (a * 255.0) as int));
+    } else if (k == K_MORPH) {
+        let p = ease_in_out_cubic(tri(loop01(t, 2600)));
+        let rr = iw;
+        if (ih < rr) { rr = ih; }
+        let outer = rr / 2.0 - 8.0;
+        let inner = lerp(outer * 0.92, outer * 0.4, p);   // circle-ish -> star
+        cv.fillPath(star_path(cx, cy, inner, outer), 0x59C36A);
+    } else if (k == K_TRACE) {
+        // checkmark polyline revealed by progress (click replays, else loops)
+        let xs: float[] = [ix + 16.0, cx - 8.0, ix + iw - 14.0];
+        let ys: float[] = [cy + 4.0, cy + ih / 3.0, cy - ih / 3.0];
+        let prog = loop01(t, 3000) * 1.5;
+        if (prog > 1.0) { prog = 1.0; }
+        if (tl.pop != null && !tl.pop.finished()) { prog = tl.pop.value(); }
+        draw_trace(cv, xs, ys, prog, 4.0, 0xFFFFFF);
+    } else if (k == K_BARS) {
+        let n = 7;
+        let bw = (iw - 12.0) / (n as float) * 0.62;
+        let gap = (iw - (n as float) * bw) / ((n + 1) as float);
+        let baseY = iy + ih - 4.0;
+        for (let i in 0..n) {
+            let bx = ix + gap + (i as float) * (bw + gap);
+            let hh = (ih - 8.0) * (0.2 + 0.8 * (0.5 + 0.5 * sin((t as float) * 0.006 + (i as float) * 0.5)));
+            cv.fillRoundRect(bx, baseY - hh, bw, hh, 3.0,
+                             mix(0x3C5AC8, 0x30C0A0, (i as float) / ((n - 1) as float)));
+        }
+    } else if (k == K_POP) {
+        let s = 1.0;
+        if (tl.pop != null && !tl.pop.finished()) {
+            s = 1.0 + 0.3 * sin(PI * tl.pop.value());   // 1 -> 1.3 -> 1 bump
+        }
+        let bw = iw * 0.5;
+        let bh = ih * 0.5;
+        cv.save();
+        cv.translate(cx, cy);
+        cv.scale(s, s);
+        cv.shadowRound(-bw / 2.0, -bh / 2.0, bw, bh, 14.0, 12.0, 4.0, with_alpha(0x000000, 90));
+        cv.fillRoundRect(-bw / 2.0, -bh / 2.0, bw, bh, 14.0, 0xE0605C);
+        cv.restore();
+        cv.text(ix, iy + ih - 2.0, "click me", MUTED);
+    }
+}
+
+// reveal a polyline up to `prog` (0..1) of its total length as a stroked Path
+fn draw_trace(cv: Canvas, xs: float[], ys: float[], prog: float, width: float, col: int) {
+    if (xs.len < 2) { return; }
+    let total = 0.0;
+    for (let i in 1..xs.len) {
+        let dx = xs[i] - xs[i - 1];
+        let dy = ys[i] - ys[i - 1];
+        total += sqrt_f(dx * dx + dy * dy);
+    }
+    let target = total * prog;
+    let p = new Path();
+    p.moveTo(xs[0], ys[0]);
+    let acc = 0.0;
+    let i = 1;
+    while (i < xs.len) {
+        let dx = xs[i] - xs[i - 1];
+        let dy = ys[i] - ys[i - 1];
+        let seg = sqrt_f(dx * dx + dy * dy);
+        if (acc + seg <= target) {
+            p.lineTo(xs[i], ys[i]);
+            acc += seg;
+        } else {
+            let rem = target - acc;
+            let f = 0.0;
+            if (seg > 0.0) { f = rem / seg; }
+            p.lineTo(xs[i - 1] + dx * f, ys[i - 1] + dy * f);
+            i = xs.len;   // stop
+        }
+        i += 1;
+    }
+    cv.strokePath(p, width, col);
+}
+
+fn sqrt_f(x: float): float {
+    // local Newton sqrt to avoid another import; x >= 0 here
+    if (x <= 0.0) { return 0.0; }
+    let g = x;
+    for (let i in 0..20) { g = (g + x / g) / 2.0; }
+    return g;
+}
+
+fn draw_tile(cv: Canvas, tl: Tile, t: int, hovered: bool) {
+    cv.fillRoundRect(tl.x as float, tl.y as float, tl.w as float, tl.h as float, 12.0, PANEL);
+    cv.text((tl.x + 12) as float, (tl.y + 20) as float, tl.label, INK);
+    cv.clipPush(tl.x as float, tl.y as float, tl.w as float, tl.h as float, 12.0);
+    draw_anim(cv, tl, t);
+    cv.clipPop();
+    if (hovered) {
+        cv.strokeRoundRect(tl.x as float, tl.y as float, tl.w as float, tl.h as float, 12.0, 2.0, ACCENT);
+    }
+}
+
+fn build_tiles(): Tile[] {
+    let labels: string[] = ["Easing race", "Bouncing ball", "Count up", "Spinner",
+                            "Breathing orb", "Orbit", "Sine wave", "Gradient shift",
+                            "Crossfade", "Shape morph", "Draw-on (click)", "Equalizer",
+                            "Pop (click)"];
+    let tiles: Tile[] = [];
+    let cols = 4;
+    let top = 64;
+    let colw = 256;
+    let rowh = (768 - top) / 4;
+    let pad = 12;
+    for (let i in 0..13) {
+        let tl = new Tile(i, labels[i]);
+        let c = i % cols;
+        let rrow = i / cols;
+        tl.x = c * colw + pad;
+        tl.y = top + rrow * rowh + pad;
+        tl.w = colw - 2 * pad;
+        tl.h = rowh - 2 * pad;
+        tiles.push(tl);
+    }
+    return tiles;
+}
+
+fn main() {
+    let W = 1024;
+    let H = 768;
+    let s = new Surface("volt/gfx — motion gallery", W, H);
+    let cv = new Canvas(W, H);
+    cv.loadFont("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 14.0);
+
+    let tiles = build_tiles();
+    let start = s.now_ms();
+    let last = start;
+    let hover = -1;
+
+    print("motion gallery ready, tiles=" + tiles.len);
+
+    let running = true;
+    while (running) {
+        let ev = s.wait_timeout(16);
+        if (ev == EV_CLOSE) {
+            running = false;
+        } else {
+            if (ev == EV_MOUSE_MOVE) {
+                hover = -1;
+                for (let i in 0..tiles.len) {
+                    if (tiles[i].hit(s.mouse_x(), s.mouse_y())) { hover = i; }
+                }
+            } else if (ev == EV_MOUSE_DOWN) {
+                for (let i in 0..tiles.len) {
+                    if (tiles[i].hit(s.mouse_x(), s.mouse_y())) {
+                        if (tiles[i].kind == K_TRACE) {
+                            tiles[i].pop = new Anim(0.0, 1.0, 900, ease_out_cubic);
+                        } else if (tiles[i].kind == K_POP) {
+                            tiles[i].pop = new Anim(0.0, 1.0, 380, ease_out_cubic);
+                        }
+                    }
+                }
+            }
+            let now = s.now_ms();
+            let dt = now - last;
+            last = now;
+            if (dt > 100) { dt = 100; }
+            for (let i in 0..tiles.len) {
+                if (tiles[i].pop != null && !tiles[i].pop.finished()) {
+                    tiles[i].pop.advance(dt);
+                }
+            }
+            let t = now - start;
+
+            cv.linearGradientRect(0.0, 0.0, W as float, H as float,
+                                  0.0, 0.0, 0.0, H as float, 0x0F1218, 0x171B24);
+            cv.text(20.0, 40.0, "volt/gfx — motion gallery", INK);
+            for (let i in 0..tiles.len) {
+                draw_tile(cv, tiles[i], t, i == hover);
+            }
+            cv.flush();
+            s.blitPtr(cv.pixels(), W, H, Rect(0, 0, W, H));
+            s.present();
+        }
+    }
+}

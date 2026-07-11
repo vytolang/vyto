@@ -164,6 +164,18 @@ else
     fail=1
 fi
 
+# --- volt/anim + volt/geom/path: pure-Volt animation clock & path flatten
+#     (no blend2d — always runs) ---
+got=$(./voltc run tests/fixtures/anim_clock.vt 2>&1)
+if [ "$got" = "$(cat tests/fixtures/anim_clock.expected)" ]; then
+    echo "PASS anim_clock"
+else
+    echo "FAIL anim_clock"
+    echo "--- expected ---"; cat tests/fixtures/anim_clock.expected
+    echo "--- got ---"; printf '%s\n' "$got"
+    fail=1
+fi
+
 # --- volt/gfx: blend2d Canvas -> blitPtr (gated on the prebuilt lib) ---
 if [ -f lib/volt/gfx/native/linux-x64/libblend2d.so ]; then
     gfx_bin=apps/gfxdemo/.volt-cache/gfxdemo_test
@@ -192,6 +204,21 @@ if [ -f lib/volt/gfx/native/linux-x64/libblend2d.so ]; then
         fi
     else
         echo "FAIL gfx_ui_painter (build failed)"
+        fail=1
+    fi
+    # motion gallery: 13 animation tiles exercising transforms/paths/gradients/
+    # anim on a raw Surface loop (scripted events end in close so it exits)
+    motion_bin=apps/motiondemo/.volt-cache/motiondemo_test
+    if ./voltc build apps/motiondemo/motiondemo.vt -o "$motion_bin" >/dev/null 2>&1; then
+        got=$(VS_HEADLESS=1 VS_EVENTS=apps/motiondemo/motiondemo.events "$motion_bin" 2>&1)
+        if echo "$got" | grep -q "motion gallery ready"; then
+            echo "PASS motion_demo"
+        else
+            echo "FAIL motion_demo (got: $got)"
+            fail=1
+        fi
+    else
+        echo "FAIL motion_demo (build failed)"
         fail=1
     fi
     # --bundle: one self-contained exe, no libblend2d.so/libstdc++ alongside
