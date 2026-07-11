@@ -5,7 +5,9 @@
 
 import { Widget, Painter, Theme, Size, BoxConstraints, bcLoose,
          WEIGHT_REG, WEIGHT_BOLD } from "volt/ui/core";
-import { Rect, mix } from "volt/surface";
+import { Rect, mix, MOD_CTRL } from "volt/surface";
+import { SelectionModel, SelectionAction, col_at_x, select_word,
+         open_selection_toolbar } from "volt/ui/selection";
 import { sin, cos, PI } from "volt/math";
 import { is_http_url } from "volt/util/helper";
 import { Path } from "volt/geom/path";
@@ -27,6 +29,12 @@ export class Text extends Widget {
     cached_w: int;
     cached_count: int;
     cached_text: string; // content the cache was computed from
+    // Text selection (drag / double-click / long-press) + copy. Selection
+    // offsets index the *display text* — the wrapped visual lines joined by
+    // "\n" (display_text) — so a copy yields exactly what the user sees.
+    selectable: bool;
+    sel: SelectionModel;
+    selectionActions: SelectionAction[]; // app-supplied extra toolbar buttons
 
     fn init(text: string) {
         super.init();
@@ -37,6 +45,65 @@ export class Text extends Widget {
         this.cached_w = -1;
         this.cached_count = 0;
         this.cached_text = "";
+        this.selectable = true;
+        this.focusable = true;   // so Ctrl+C / Ctrl+A reach a focused paragraph
+        this.sel = new SelectionModel(this);
+        let self = this;
+        this.sel.text_fn = () => { return self.display_text(); };
+        this.selectionActions = [];
+    }
+
+    // The wrapped visual lines joined by "\n": the selectable/copyable text.
+    fn display_text(): string {
+        let out = "";
+        for (let i in 0..this.cached_count) {
+            if (i > 0) { out = out + "\n"; }
+            out = out + this.cached_lines[i];
+        }
+        return out;
+    }
+
+    // Visual-line index containing display-text byte offset `off`.
+    fn line_of_offset(off: int): int {
+        let base = 0;
+        for (let i in 0..this.cached_count) {
+            let end = base + this.cached_lines[i].len;
+            if (off <= end) { return i; }
+            base = end + 1;
+        }
+        if (this.cached_count > 0) { return this.cached_count - 1; }
+        return 0;
+    }
+
+    // Map an absolute pointer (x,y) to a display-text byte offset, replicating
+    // draw()'s per-line geometry. Uses win.surf for metrics (event handlers
+    // have no Painter). Assumes the lean tier's surf metrics match the painter.
+    fn offset_at(x: int, y: int): int {
+        if (this.cached_count == 0 || this.win == null) { return 0; }
+        let surf = this.win.surf;
+        let lh = surf.font_height();
+        let adv = lh + 2;
+        let li = 0;
+        if (adv > 0) { li = (y - this.bounds.y) / adv; }
+        if (li < 0) { li = 0; }
+        if (li >= this.cached_count) { li = this.cached_count - 1; }
+        let ln = this.cached_lines[li];
+        let tw = surf.text_width(ln);
+        let ox = this.bounds.x;
+        if (this.align == ALIGN_CENTER) { ox = this.bounds.x + (this.bounds.w - tw) / 2; }
+        else if (this.align == ALIGN_RIGHT) { ox = this.bounds.x + this.bounds.w - tw; }
+        let col = col_at_x(surf, ln, x - ox);
+        let base = 0;
+        for (let i in 0..li) { base += this.cached_lines[i].len + 1; }
+        return base + col;
+    }
+
+    fn show_toolbar(px: int) {
+        if (this.win == null || this.sel.empty()) { return; }
+        let li = this.line_of_offset(this.sel.lo());
+        let lh = this.win.surf.font_height();
+        let ytop = this.bounds.y + li * (lh + 2);
+        open_selection_toolbar(this, this.sel, px, ytop, this.selectionActions);
     }
 
     fn wrap_lines(s: Painter, max_w: int) {
@@ -108,7 +175,13 @@ export class Text extends Widget {
         if (c < 0) { c = th.ink; }
         let lh = s.font_height();
         let asc = s.font_ascent();
+        let sel_on = this.selectable && this.sel != null && !this.sel.empty();
+        let lo = 0;
+        let hi = 0;
+        if (sel_on) { lo = this.sel.lo(); hi = this.sel.hi(); }
+        let base = 0;
         let y = this.bounds.y + asc;
+        let top = this.bounds.y;
         for (let i in 0..this.cached_count) {
             let ln = this.cached_lines[i];
             let tw = s.text_width(ln);
@@ -118,9 +191,88 @@ export class Text extends Widget {
             } else if (this.align == ALIGN_RIGHT) {
                 x = this.bounds.x + this.bounds.w - tw;
             }
+            if (sel_on) {
+                // this visual line spans display offsets [base, base+len)
+                let ll = lo - base;
+                let lr = hi - base;
+                if (ll < 0) { ll = 0; }
+                if (lr > ln.len) { lr = ln.len; }
+                if (lr > ll) {
+                    let pre = s.text_width(ln.slice(0, ll));
+                    let selw = s.text_width(ln.slice(0, lr)) - pre;
+                    s.fill(Rect(x + pre, top, selw, lh), th.selection);
+                }
+            }
             s.text(x, y, ln, c);
+            base += ln.len + 1;
             y += lh + 2;
+            top += lh + 2;
         }
+    }
+
+    override fn on_click(x: int, y: int): bool {
+        if (!this.selectable) { return false; }
+        let off = this.offset_at(x, y);
+        this.sel.set(off, off);   // collapse: a plain click clears the selection
+        return true;
+    }
+
+    override fn on_drag_start(x: int, y: int): bool {
+        if (!this.selectable) { return false; }
+        // anchor was set at the press point by on_click; extend from there.
+        return true;
+    }
+
+    override fn on_drag(dx: int, dy: int): bool {
+        if (!this.selectable || this.win == null) { return false; }
+        this.sel.focus = this.offset_at(this.win.drag_x, this.win.drag_y);
+        this.sel.active = true;
+        this.invalidate();
+        return true;
+    }
+
+    override fn on_drag_end(x: int, y: int): bool {
+        if (!this.selectable) { return false; }
+        if (!this.sel.empty()) { this.show_toolbar(x); }
+        return true;
+    }
+
+    override fn on_double_click(x: int, y: int): bool {
+        if (!this.selectable) { return false; }
+        select_word(this.sel, this.offset_at(x, y));
+        this.invalidate();
+        this.show_toolbar(x);
+        return true;
+    }
+
+    override fn on_long_press(x: int, y: int): bool {
+        if (!this.selectable) { return false; }
+        select_word(this.sel, this.offset_at(x, y));
+        this.invalidate();
+        this.show_toolbar(x);
+        return true;
+    }
+
+    override fn on_key(k: int, ch: string): bool {
+        if (!this.selectable || this.win == null) { return false; }
+        if ((this.win.mods & MOD_CTRL) != 0) {
+            if (k == 99) { // Ctrl+C — copy selection, or the whole text if none
+                let t = this.sel.selected_text();
+                if (t.len == 0) { t = this.text; }
+                this.win.surf.set_clipboard(t);
+                return true;
+            }
+            if (k == 97) { // Ctrl+A — select all
+                this.sel.select_all();
+                this.invalidate();
+                return true;
+            }
+        }
+        return false;
+    }
+
+    override fn drop_handlers() {
+        if (this.sel != null) { this.sel.drop(); }
     }
 }
 

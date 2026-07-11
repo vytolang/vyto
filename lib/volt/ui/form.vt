@@ -5,6 +5,8 @@
 import { Widget, Painter, Theme, Size, BoxConstraints, bcLoose,
          WEIGHT_REG, WEIGHT_BOLD, EASE_LINEAR, EASE_OUT_CUBIC } from "volt/ui/core";
 import { Tween } from "volt/ui/anim";
+import { SelectionModel, SelectionAction, col_at_x, select_word,
+         open_selection_toolbar } from "volt/ui/selection";
 import { utf8_prev, utf8_next } from "volt/util/helper";
 import { Rect, rgb, mix,
           KEY_ENTER, KEY_BACKSPACE, KEY_UP, KEY_DOWN, KEY_LEFT,
@@ -114,6 +116,9 @@ export class TextField extends Widget {
     caret: int;                 // byte index into text (UTF-8 sequence start)
     scroll_x: int;              // horizontal pan so the caret stays visible
     onSubmit: fn(string);
+    // Selection: anchor is the fixed end, caret tracks the moving end (focus).
+    sel: SelectionModel;
+    selectionActions: SelectionAction[]; // app-supplied extra toolbar buttons
 
     fn init(placeholder: string) {
         super.init();
@@ -122,12 +127,54 @@ export class TextField extends Widget {
         this.caret = 0;
         this.scroll_x = 0;
         this.focusable = true;
+        this.sel = new SelectionModel(this);
+        let self = this;
+        this.sel.text_fn = () => { return self.text; };
+        this.selectionActions = [];
     }
 
     fn set_text(t: string) {
         this.text = t;
         this.caret = t.len;
         this.scroll_x = 0;
+        this.sel.clear();
+    }
+
+    // Map an absolute x to a byte offset in text (metrics via win.surf).
+    fn offset_at(x: int): int {
+        if (this.win == null) { return this.caret; }
+        return col_at_x(this.win.surf, this.text, x - this.bounds.x - 8 + this.scroll_x);
+    }
+
+    // Move the caret; extend keeps the selection anchor (shift+move / drag),
+    // otherwise the selection collapses.
+    fn set_caret(c: int, extend: bool) {
+        if (extend) {
+            if (!this.sel.active) { this.sel.anchor = this.caret; }
+            this.caret = c;
+            this.sel.focus = c;
+            this.sel.active = true;
+        } else {
+            this.caret = c;
+            this.sel.clear();
+        }
+    }
+
+    // Remove the selected range (if any); returns true when it deleted text.
+    fn delete_selection(): bool {
+        if (this.sel.empty()) { return false; }
+        let a = this.sel.lo();
+        let b = this.sel.hi();
+        if (b > this.text.len) { b = this.text.len; }
+        this.text = this.text.slice(0, a) + this.text.slice(b, this.text.len);
+        this.caret = a;
+        this.sel.clear();
+        return true;
+    }
+
+    fn show_toolbar(px: int) {
+        if (this.win == null || this.sel.empty()) { return; }
+        open_selection_toolbar(this, this.sel, px, this.bounds.y, this.selectionActions);
     }
 
     override fn measure(s: Painter, th: Theme): Size {
@@ -150,6 +197,17 @@ export class TextField extends Widget {
         let inner = Rect(this.bounds.x + pad, this.bounds.y,
                          this.bounds.w - 2 * pad, this.bounds.h);
         s.clip_push(inner, 0);
+        // selection highlight sits behind the glyphs
+        if (!this.sel.empty()) {
+            let a = this.sel.lo();
+            let b = this.sel.hi();
+            if (b > this.text.len) { b = this.text.len; }
+            let ax = s.text_width(this.text.slice(0, a));
+            let selw = s.text_width(this.text.slice(0, b)) - ax;
+            let sy = this.bounds.y + (this.bounds.h - s.font_height()) / 2;
+            s.fill(Rect(this.bounds.x + pad + ax - this.scroll_x, sy,
+                        selw, s.font_height()), th.selection);
+        }
         if (this.text.len == 0 && !this.focused) {
             s.text_in(this.bounds, pad, this.placeholder, th.on_surface_muted);
         } else {
@@ -165,34 +223,77 @@ export class TextField extends Widget {
     }
 
     override fn on_click(x: int, y: int): bool {
-        // on_click has no Surface, so no text metrics here: the caret goes
-        // to the end. (Precise caret placement needs a metrics-aware hook.)
-        this.caret = this.text.len;
+        // precise caret placement: metrics via win.surf (see offset_at)
+        let off = this.offset_at(x);
+        this.caret = off;
+        this.sel.set(off, off);
         return true;
     }
 
+    override fn on_drag_start(x: int, y: int): bool {
+        // anchor stays at the press-point caret set by on_click
+        return true;
+    }
+
+    override fn on_drag(dx: int, dy: int): bool {
+        if (this.win == null) { return false; }
+        this.set_caret(this.offset_at(this.win.drag_x), true);
+        this.invalidate();
+        return true;
+    }
+
+    override fn on_drag_end(x: int, y: int): bool {
+        if (!this.sel.empty()) { this.show_toolbar(x); }
+        return true;
+    }
+
+    override fn on_double_click(x: int, y: int): bool {
+        select_word(this.sel, this.offset_at(x));
+        this.caret = this.sel.hi();
+        this.invalidate();
+        this.show_toolbar(x);
+        return true;
+    }
+
+    override fn on_long_press(x: int, y: int): bool {
+        return this.on_double_click(x, y);
+    }
+
     override fn on_key(k: int, ch: string): bool {
-        // clipboard shortcuts: no selection model yet, so copy/cut act on
-        // the whole field and paste inserts at the caret
+        let shift = this.win != null && (this.win.mods & MOD_SHIFT) != 0;
+        // clipboard shortcuts: act on the selection when there is one, else
+        // fall back to the whole field (the historical behaviour)
         if (this.win != null && (this.win.mods & MOD_CTRL) != 0) {
             if (k == 99) { // Ctrl+C
-                this.win.surf.set_clipboard(this.text);
+                if (!this.sel.empty()) { this.win.surf.set_clipboard(this.sel.selected_text()); }
+                else { this.win.surf.set_clipboard(this.text); }
                 return true;
             }
             if (k == 120) { // Ctrl+X
-                this.win.surf.set_clipboard(this.text);
-                this.text = "";
-                this.caret = 0;
+                if (!this.sel.empty()) {
+                    this.win.surf.set_clipboard(this.sel.selected_text());
+                    this.delete_selection();
+                } else {
+                    this.win.surf.set_clipboard(this.text);
+                    this.text = "";
+                    this.caret = 0;
+                }
                 return true;
             }
             if (k == 118) { // Ctrl+V
                 // single-line field: newlines flatten to spaces
                 let t = this.win.surf.clipboard().replace("\r", "").replace("\n", " ");
+                this.delete_selection();
                 if (t.len > 0) {
                     this.text = this.text.slice(0, this.caret) + t
                               + this.text.slice(this.caret, this.text.len);
                     this.caret += t.len;
                 }
+                return true;
+            }
+            if (k == 97) { // Ctrl+A — select all
+                this.sel.set(0, this.text.len);
+                this.caret = this.text.len;
                 return true;
             }
         }
@@ -201,11 +302,13 @@ export class TextField extends Widget {
                 let t = this.text;
                 this.text = "";
                 this.caret = 0;
+                this.sel.clear();
                 this.onSubmit(t);
             }
             return true;
         }
         if (k == KEY_BACKSPACE) {
+            if (this.delete_selection()) { return true; }
             if (this.caret > 0) {
                 let p = utf8_prev(this.text, this.caret); // whole sequence
                 this.text = this.text.slice(0, p)
@@ -215,6 +318,7 @@ export class TextField extends Widget {
             return true;
         }
         if (k == KEY_DELETE) {
+            if (this.delete_selection()) { return true; }
             if (this.caret < this.text.len) {
                 let n = utf8_next(this.text, this.caret);
                 this.text = this.text.slice(0, this.caret)
@@ -223,22 +327,25 @@ export class TextField extends Widget {
             return true;
         }
         if (k == KEY_LEFT) {
-            if (this.caret > 0) { this.caret = utf8_prev(this.text, this.caret); }
+            if (this.caret > 0) { this.set_caret(utf8_prev(this.text, this.caret), shift); }
+            else if (!shift) { this.sel.clear(); }
             return true;
         }
         if (k == KEY_RIGHT) {
-            if (this.caret < this.text.len) { this.caret = utf8_next(this.text, this.caret); }
+            if (this.caret < this.text.len) { this.set_caret(utf8_next(this.text, this.caret), shift); }
+            else if (!shift) { this.sel.clear(); }
             return true;
         }
         if (k == KEY_HOME) {
-            this.caret = 0;
+            this.set_caret(0, shift);
             return true;
         }
         if (k == KEY_END) {
-            this.caret = this.text.len;
+            this.set_caret(this.text.len, shift);
             return true;
         }
         if (is_text_input(this, ch)) {
+            this.delete_selection();
             this.text = this.text.slice(0, this.caret) + ch
                       + this.text.slice(this.caret, this.text.len);
             this.caret += ch.len;
@@ -249,6 +356,7 @@ export class TextField extends Widget {
 
     override fn drop_handlers() {
         this.onSubmit = null;
+        if (this.sel != null) { this.sel.drop(); }
     }
 }
 
@@ -459,6 +567,10 @@ export class TextArea extends Widget {
     rev: int;          // bumped on every edit; keys the wrap cache
     wrapped_rev: int;  // rev the current wrap was computed at
     wrap_w: int;       // width the current wrap was computed at
+    // Selection: offsets index the joined text() (logical lines + "\n"); the
+    // (caret_row, caret_col) pair is the moving end (== sel.focus).
+    sel: SelectionModel;
+    selectionActions: SelectionAction[];
 
     fn init() {
         super.init();
@@ -473,6 +585,81 @@ export class TextArea extends Widget {
         this.rev = 1;
         this.wrapped_rev = 0;
         this.wrap_w = -1;
+        this.sel = new SelectionModel(this);
+        let self = this;
+        this.sel.text_fn = () => { return self.text(); };
+        this.selectionActions = [];
+    }
+
+    // --- selection offset <-> (row,col) conversions over the joined text ---
+    fn caret_offset(): int { return this.ta_offset(this.caret_row, this.caret_col); }
+
+    fn ta_offset(row: int, col: int): int {
+        let o = 0;
+        for (let i in 0..row) { o += this.lines[i].len + 1; }
+        return o + col;
+    }
+
+    fn set_caret_offset(off: int) {
+        let o = off;
+        if (o < 0) { o = 0; }
+        for (let i in 0..this.lines.len) {
+            let ll = this.lines[i].len;
+            if (o <= ll) { this.caret_row = i; this.caret_col = o; return; }
+            o -= ll + 1;
+        }
+        this.caret_row = this.lines.len - 1;
+        this.caret_col = this.lines[this.caret_row].len;
+    }
+
+    // Move the caret to display offset `off`; extend keeps the anchor (drag /
+    // shift+move), otherwise the selection collapses.
+    fn move_caret(off: int, extend: bool) {
+        if (extend) {
+            if (!this.sel.active) { this.sel.anchor = this.caret_offset(); }
+            this.set_caret_offset(off);
+            this.sel.focus = off;
+            this.sel.active = true;
+        } else {
+            this.set_caret_offset(off);
+            this.sel.clear();
+        }
+    }
+
+    fn delete_selection(): bool {
+        if (this.sel.empty()) { return false; }
+        let full = this.text();
+        let a = this.sel.lo();
+        let b = this.sel.hi();
+        if (b > full.len) { b = full.len; }
+        this.set_text(full.slice(0, a) + full.slice(b, full.len));
+        this.set_caret_offset(a);
+        this.sel.clear();
+        this.changed();
+        return true;
+    }
+
+    fn offset_at(x: int, y: int): int {
+        if (this.win == null || this.wrap_count == 0) { return this.caret_offset(); }
+        let surf = this.win.surf;
+        let vrow = this.top + (y - this.bounds.y - TA_PAD) / this.line_h;
+        if (vrow < 0) { vrow = 0; }
+        if (vrow >= this.wrap_count) { vrow = this.wrap_count - 1; }
+        let li = this.wrap_map[vrow];
+        let cstart = this.wrap_col[vrow];
+        let line = this.lines[li];
+        // end column of this visual row (start of the next wrapped row, if any)
+        let end = line.len;
+        let nv = vrow + 1;
+        if (nv < this.wrap_count && this.wrap_map[nv] == li) { end = this.wrap_col[nv]; }
+        let piece = line.slice(cstart, end);
+        let local = col_at_x(surf, piece, x - (this.bounds.x + TA_PAD));
+        return this.ta_offset(li, cstart + local);
+    }
+
+    fn show_toolbar(px: int) {
+        if (this.win == null || this.sel.empty()) { return; }
+        open_selection_toolbar(this, this.sel, px, this.bounds.y, this.selectionActions);
     }
 
     fn set_text(s: string) {
@@ -499,6 +686,7 @@ export class TextArea extends Widget {
         this.caret_col = 0;
         this.top = 0;
         this.rev += 1;
+        if (this.sel != null) { this.sel.clear(); }
     }
 
     fn text(): string {
@@ -611,16 +799,28 @@ export class TextArea extends Widget {
     }
 
     override fn on_key(k: int, ch: string): bool {
-        let line = this.lines[this.caret_row];
-        // clipboard shortcuts: no selection model yet, so copy/cut act on
-        // the caret line and paste splices (multi-line) text at the caret
+        let shift = this.win != null && (this.win.mods & MOD_SHIFT) != 0;
+        // clipboard shortcuts: act on the selection when there is one, else
+        // fall back to the caret line (the historical behaviour)
         if (this.win != null && (this.win.mods & MOD_CTRL) != 0) {
             if (k == 99) { // Ctrl+C
-                this.win.surf.set_clipboard(line);
+                if (!this.sel.empty()) { this.win.surf.set_clipboard(this.sel.selected_text()); }
+                else { this.win.surf.set_clipboard(this.lines[this.caret_row]); }
+                return true;
+            }
+            if (k == 97) { // Ctrl+A — select all
+                this.sel.set(0, this.text().len);
+                this.set_caret_offset(this.text().len);
+                this.sel.focus = this.sel.hi();
                 return true;
             }
             if (k == 120) { // Ctrl+X
-                this.win.surf.set_clipboard(line);
+                if (!this.sel.empty()) {
+                    this.win.surf.set_clipboard(this.sel.selected_text());
+                    this.delete_selection();
+                    return true;
+                }
+                this.win.surf.set_clipboard(this.lines[this.caret_row]);
                 this.remove_row(this.caret_row);
                 if (this.caret_row >= this.lines.len) {
                     this.caret_row = this.lines.len - 1;
@@ -630,6 +830,8 @@ export class TextArea extends Widget {
                 return true;
             }
             if (k == 118) { // Ctrl+V
+                this.delete_selection();
+                let line = this.lines[this.caret_row];
                 let t = this.win.surf.clipboard().replace("\r", "");
                 if (t.len > 0) {
                     let ls = t.split("\n");
@@ -659,6 +861,8 @@ export class TextArea extends Widget {
             }
         }
         if (k == KEY_ENTER) {
+            this.delete_selection();
+            let line = this.lines[this.caret_row];
             let before = line.slice(0, this.caret_col);
             let after = line.slice(this.caret_col, line.len);
             this.lines[this.caret_row] = before;
@@ -674,6 +878,8 @@ export class TextArea extends Widget {
             return true;
         }
         if (k == KEY_BACKSPACE) {
+            if (this.delete_selection()) { return true; }
+            let line = this.lines[this.caret_row];
             if (this.caret_col > 0) {
                 let p = utf8_prev(line, this.caret_col);
                 this.lines[this.caret_row] = line.slice(0, p)
@@ -692,6 +898,8 @@ export class TextArea extends Widget {
             return true;
         }
         if (k == KEY_DELETE) {
+            if (this.delete_selection()) { return true; }
+            let line = this.lines[this.caret_row];
             if (this.caret_col < line.len) {
                 let n = utf8_next(line, this.caret_col);
                 this.lines[this.caret_row] = line.slice(0, this.caret_col)
@@ -706,42 +914,46 @@ export class TextArea extends Widget {
             return true;
         }
         if (k == KEY_LEFT) {
-            if (this.caret_col > 0) { this.caret_col = utf8_prev(line, this.caret_col); }
-            else if (this.caret_row > 0) {
-                this.caret_row -= 1;
-                this.caret_col = this.lines[this.caret_row].len;
-            }
+            let line = this.lines[this.caret_row];
+            let t = this.caret_offset();
+            if (this.caret_col > 0) { t = this.ta_offset(this.caret_row, utf8_prev(line, this.caret_col)); }
+            else if (this.caret_row > 0) { t = this.ta_offset(this.caret_row - 1, this.lines[this.caret_row - 1].len); }
+            this.move_caret(t, shift);
             return true;
         }
         if (k == KEY_RIGHT) {
-            if (this.caret_col < line.len) { this.caret_col = utf8_next(line, this.caret_col); }
-            else if (this.caret_row < this.lines.len - 1) {
-                this.caret_row += 1;
-                this.caret_col = 0;
-            }
+            let line = this.lines[this.caret_row];
+            let t = this.caret_offset();
+            if (this.caret_col < line.len) { t = this.ta_offset(this.caret_row, utf8_next(line, this.caret_col)); }
+            else if (this.caret_row < this.lines.len - 1) { t = this.ta_offset(this.caret_row + 1, 0); }
+            this.move_caret(t, shift);
             return true;
         }
         if (k == KEY_UP) {
+            let t = this.caret_offset();
             if (this.caret_row > 0) {
-                this.caret_row -= 1;
-                if (this.caret_col > this.lines[this.caret_row].len) {
-                    this.caret_col = this.lines[this.caret_row].len;
-                }
+                let nc = this.caret_col;
+                if (nc > this.lines[this.caret_row - 1].len) { nc = this.lines[this.caret_row - 1].len; }
+                t = this.ta_offset(this.caret_row - 1, nc);
             }
+            this.move_caret(t, shift);
             return true;
         }
         if (k == KEY_DOWN) {
+            let t = this.caret_offset();
             if (this.caret_row < this.lines.len - 1) {
-                this.caret_row += 1;
-                if (this.caret_col > this.lines[this.caret_row].len) {
-                    this.caret_col = this.lines[this.caret_row].len;
-                }
+                let nc = this.caret_col;
+                if (nc > this.lines[this.caret_row + 1].len) { nc = this.lines[this.caret_row + 1].len; }
+                t = this.ta_offset(this.caret_row + 1, nc);
             }
+            this.move_caret(t, shift);
             return true;
         }
-        if (k == KEY_HOME) { this.caret_col = 0; return true; }
-        if (k == KEY_END) { this.caret_col = line.len; return true; }
+        if (k == KEY_HOME) { this.move_caret(this.ta_offset(this.caret_row, 0), shift); return true; }
+        if (k == KEY_END) { this.move_caret(this.ta_offset(this.caret_row, this.lines[this.caret_row].len), shift); return true; }
         if (is_text_input(this, ch)) {
+            this.delete_selection();
+            let line = this.lines[this.caret_row];
             this.lines[this.caret_row] = line.slice(0, this.caret_col) + ch
                                        + line.slice(this.caret_col, line.len);
             this.caret_col += ch.len;
@@ -752,13 +964,39 @@ export class TextArea extends Widget {
     }
 
     override fn on_click(x: int, y: int): bool {
-        let vrow = this.top + (y - this.bounds.y - TA_PAD) / this.line_h;
-        if (vrow < 0) { vrow = 0; }
-        if (vrow >= this.wrap_count) { vrow = this.wrap_count - 1; }
-        this.caret_row = this.wrap_map[vrow];
-        // snap caret to end of the visual row's logical line
-        this.caret_col = this.lines[this.caret_row].len;
+        // precise caret placement (x->col via win.surf metrics), collapse sel
+        let off = this.offset_at(x, y);
+        this.set_caret_offset(off);
+        this.sel.set(off, off);
         return true;
+    }
+
+    override fn on_drag_start(x: int, y: int): bool { return true; }
+
+    override fn on_drag(dx: int, dy: int): bool {
+        if (this.win == null) { return false; }
+        this.move_caret(this.offset_at(this.win.drag_x, this.win.drag_y), true);
+        this.invalidate();
+        return true;
+    }
+
+    override fn on_drag_end(x: int, y: int): bool {
+        if (!this.sel.empty()) { this.show_toolbar(x); }
+        return true;
+    }
+
+    override fn on_double_click(x: int, y: int): bool {
+        select_word(this.sel, this.offset_at(x, y));
+        this.set_caret_offset(this.sel.hi());
+        this.sel.focus = this.sel.hi();
+        this.sel.active = true;
+        this.invalidate();
+        this.show_toolbar(x);
+        return true;
+    }
+
+    override fn on_long_press(x: int, y: int): bool {
+        return this.on_double_click(x, y);
     }
 
     override fn draw(s: Painter, th: Theme) {
@@ -794,6 +1032,9 @@ export class TextArea extends Widget {
 
         let ox = this.bounds.x + TA_PAD;
         let asc = s.font_ascent();
+        let sel_on = !this.sel.empty();
+        let sel_lo = this.sel.lo();
+        let sel_hi = this.sel.hi();
         for (let i in 0..this.view_rows) {
             let vrow = this.top + i;
             if (vrow >= this.wrap_count) { break; }
@@ -810,6 +1051,22 @@ export class TextArea extends Widget {
             }
             let piece = line.slice(col, end);
             let ty = this.bounds.y + TA_PAD + i * this.line_h + asc;
+            // selection highlight: intersect [sel_lo,sel_hi) with this row's
+            // display-offset span [row_start, row_start + (end-col))
+            if (sel_on) {
+                let row_start = this.ta_offset(li, col);
+                let a = sel_lo - row_start;
+                let b = sel_hi - row_start;
+                let plen = end - col;
+                if (a < 0) { a = 0; }
+                if (b > plen) { b = plen; }
+                if (b > a) {
+                    let px0 = ox + s.text_width(piece.slice(0, a));
+                    let selw = s.text_width(piece.slice(0, b)) - s.text_width(piece.slice(0, a));
+                    s.fill(Rect(px0, this.bounds.y + TA_PAD + i * this.line_h,
+                                selw, this.line_h), th.selection);
+                }
+            }
             s.text(ox, ty, piece, th.ink);
         }
         // caret
@@ -828,6 +1085,7 @@ export class TextArea extends Widget {
 
     override fn drop_handlers() {
         this.onChange = null;
+        if (this.sel != null) { this.sel.drop(); }
     }
 }
 

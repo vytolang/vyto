@@ -21,6 +21,7 @@ import { Window, Column, Row, Spacer, Label, Button, TextField, Checkbox,
          TabView, Accordion, StatusBar,
          Menu, MenuBar,
          FilePicker, MessageDialog, ConfirmDialog, InputDialog, Popover,
+         SelectionAction, SelectionToolbar, SelectionModel,
          Widget, Painter, Theme, Size, theme_light, theme_dark,
          JUSTIFY_START, JUSTIFY_CENTER, JUSTIFY_BETWEEN,
          JUSTIFY_EVENLY, CROSS_START, CROSS_CENTER, CROSS_END,
@@ -59,6 +60,22 @@ class GState {
     fn action(m: string) {
         this.sb.right_text = m;
         print("action: " + m);
+    }
+}
+
+// A restyled selection toolbar: same behaviour (it IS a Widget), but a
+// primary-tinted bar with on_primary labels instead of the default panel.
+// Wired to a Text via sel.toolbar_factory — the whole point of the toolbar
+// being an ordinary, subclassable Widget.
+class TintToolbar extends SelectionToolbar {
+    fn init(ax: int, ay: int, actions: SelectionAction[], sel: SelectionModel) {
+        super.init(ax, ay, actions, sel);
+    }
+    override fn draw(s: Painter, th: Theme) {
+        this.win.skin.panel.paint(s, th, this.bounds, th.radius_lg, th.primary, th.primary, 3);
+        for (let i in 0..this.actions.len) {
+            s.text_center(this.btn_rect(i), this.actions[i].label, th.on_primary);
+        }
     }
 }
 
@@ -356,6 +373,27 @@ fn build_display_tab(st: GState): Widget {
     let tL = new Text(lorem); tL.align = ALIGN_LEFT;
     let tC = new Text(lorem); tC.align = ALIGN_CENTER;
 
+    // Selectable text: drag to select, double-click a word, or long-press.
+    // A floating toolbar (Copy / Select All) pops above the selection. The app
+    // extends it with a custom "Reverse" action and restyles the bar itself.
+    let selText = new Text("Select this paragraph: drag across it, double-click "
+              + "a word, or press and hold. A toolbar offers Copy and Select All, "
+              + "plus a custom Reverse action wired by the app.");
+    let revAction = new SelectionAction("Reverse", (sel) => {
+        let t = sel.selected_text();
+        let out = "";
+        for (let i in 0..t.len) { out = t.slice(i, i + 1) + out; }
+        let host = sel.host;
+        if (host != null && host.win != null) { host.win.surf.set_clipboard(out); }
+        st.action("reversed & copied: " + out);
+    });
+    selText.selectionActions = [revAction];
+    selText.sel.toolbar_factory = (ax, ay, acts, sel) => {
+        return new TintToolbar(ax, ay, acts, sel);
+    };
+    let selField = new TextField("select & copy me too");
+    selField.set_text("drag to select, then Copy");
+
     // Badges over placeholder boxes
     let badge1 = new Badge("5", rgb(0xDC, 0x3C, 0x3C), rgb(255, 255, 255), mk_box(40, 40, rgb(200, 200, 200)));
     let badge2 = new Badge("NEW", rgb(0x2E, 0xA0, 0x43), rgb(255, 255, 255), mk_box(40, 40, rgb(200, 200, 200)));
@@ -379,6 +417,8 @@ fn build_display_tab(st: GState): Widget {
     return new Column([
         new Card(8, -1, -1, "Text — ALIGN_LEFT", tL),
         new Card(8, -1, -1, "Text — ALIGN_CENTER", tC),
+        new Card(8, -1, -1, "Selectable text (drag / double-click / long-press)",
+                 new Column([selText, selField]).gap(8)),
         new Card(8, -1, -1, "Badges", new Row([badge1, badge2]).gap(18).align(CROSS_CENTER)),
         new Card(8, -1, -1, "Chips (click x to delete)",
                  new Row([chip1, chip2]).gap(8).align(CROSS_CENTER)),
@@ -609,7 +649,7 @@ fn build_dashboard_screen(st: GState): Widget {
         new Label("Overview"),
         stats,
         new Row([
-            new Expanded(new Card(10, -1, -1, "Weekly traffic", chart)),
+            new Expanded(new Card(10, -1, 1, "Weekly traffic", chart)),
             new Expanded(new Card(10, -1, -1, "Trend", new Column([
                 spark, new SizedBox(0, 6, null), new Label("Server load"), load,
             ]).gap(4))),
