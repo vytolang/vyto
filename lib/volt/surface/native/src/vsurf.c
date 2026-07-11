@@ -49,6 +49,18 @@ static int scale_from_env(void) {
 static int last_key, last_x, last_y, last_wheel, last_mods;
 static char last_text[32];
 
+/* process-local clipboard buffer: the whole story for headless and fbdev,
+   and the "we own the selection" copy on X11 */
+static char *clip_local;
+
+static void clip_store(char **slot, const char *text) {
+    size_t n = strlen(text);
+    char *p = realloc(*slot, n + 1);
+    if (!p) return;
+    memcpy(p, text, n + 1);
+    *slot = p;
+}
+
 /* named-key table shared by the headless script parser; also the single
    place a new VS_KEY_* needs a script-facing name */
 static const struct { const char *name; int key; } key_names[] = {
@@ -106,6 +118,8 @@ static void headless_open_script(void) {
  *   mods <spec>      set the modifier state reported by vs_mods() for all
  *                    following events: "+"-joined ctrl/shift/alt/super, or
  *                    "none" (e.g. "mods ctrl+shift"). Emits no event itself.
+ *   clip <text>      seed the process-local clipboard (what vs_clipboard_get
+ *                    returns) — the paste-test hook. Emits no event itself.
  *   close
  * '#' starts a comment; EOF acts as close. */
 static int headless_wait(int *w, int *h) {
@@ -149,6 +163,10 @@ static int headless_wait(int *w, int *h) {
             last_key = code;
             if (code == VS_KEY_SPACE) { last_text[0] = ' '; last_text[1] = 0; }
             return up ? VS_EV_KEY_UP : VS_EV_KEY;
+        }
+        if (strncmp(script_line, "clip ", 5) == 0) {
+            clip_store(&clip_local, script_line + 5);
+            continue;
         }
         if (strncmp(script_line, "mods ", 5) == 0) {
             const char *p = script_line + 5;
@@ -690,19 +708,79 @@ void *vs_native_display(void *vs) {
 unsigned long vs_native_window(void *vs) { return (unsigned long)(uintptr_t)((VSurf *)vs)->hwnd; }
 void *vs_native_gc(void *vs) { return ((VSurf *)vs)->memdc; }
 
+void vs_clipboard_set(void *vs, const char *text) {
+    VSurf *s = vs;
+    if (!text) text = "";
+    if (!s->hwnd) { clip_store(&clip_local, text); return; }
+    int wn = MultiByteToWideChar(CP_UTF8, 0, text, -1, NULL, 0);
+    if (wn <= 0) return;
+    HGLOBAL hg = GlobalAlloc(GMEM_MOVEABLE, (SIZE_T)wn * sizeof(WCHAR));
+    if (!hg) return;
+    MultiByteToWideChar(CP_UTF8, 0, text, -1, GlobalLock(hg), wn);
+    GlobalUnlock(hg);
+    if (OpenClipboard(s->hwnd)) {
+        EmptyClipboard();
+        SetClipboardData(CF_UNICODETEXT, hg); /* the system owns hg now */
+        CloseClipboard();
+    } else {
+        GlobalFree(hg);
+    }
+}
+
+const char *vs_clipboard_get(void *vs) {
+    VSurf *s = vs;
+    if (!s->hwnd) return clip_local ? clip_local : "";
+    static char *buf; /* grows; valid until the next call */
+    const char *ret = "";
+    if (!OpenClipboard(s->hwnd)) return "";
+    HANDLE h = GetClipboardData(CF_UNICODETEXT);
+    if (h) {
+        const WCHAR *w = GlobalLock(h);
+        if (w) {
+            int n = WideCharToMultiByte(CP_UTF8, 0, w, -1, NULL, 0, NULL, NULL);
+            if (n > 0) {
+                char *nb = realloc(buf, (size_t)n);
+                if (nb) {
+                    buf = nb;
+                    WideCharToMultiByte(CP_UTF8, 0, w, -1, buf, n, NULL, NULL);
+                    ret = buf;
+                }
+            }
+            GlobalUnlock(h);
+        }
+    }
+    CloseClipboard();
+    return ret;
+}
+
 #else
 /* ================================================================== X11 */
 
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
 #include <X11/Xresource.h>
+#include <X11/Xatom.h>
 #include <X11/keysym.h>
 #include <X11/XKBlib.h>
 #include <locale.h>
 #include <sys/select.h>
 
+#ifdef __linux__ /* fbdev sub-backend (VS_FBDEV=/dev/fb0) */
+#include <fcntl.h>
+#include <unistd.h>
+#include <dirent.h>
+#include <signal.h>
+#include <termios.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <linux/fb.h>
+#include <linux/input.h>
+#include <linux/kd.h>
+#endif
+
 typedef struct VSurf {
-    Display *dpy; /* NULL in headless mode */
+    Display *dpy; /* NULL in headless and fbdev modes */
     Window win;
     Pixmap back;
     GC gc;         /* draw GC — vs_clip_set applies here */
@@ -713,6 +791,20 @@ typedef struct VSurf {
     XIC ic;
     XImage *img;   /* cached blit staging image, resized on demand */
     int img_w, img_h;
+    /* clipboard (CLIPBOARD selection) */
+    Atom a_clipboard, a_utf8, a_targets, a_incr, a_clip_prop;
+    char *clip_got; /* last text fetched from another owner */
+    /* fbdev mode: fb_on != 0, everything above except w/h unused */
+    int fb_on;
+    int fb_fd;
+    uint8_t *fb_mem;   /* mmapped framebuffer (or file) */
+    long fb_maplen;
+    long fb_stride;    /* bytes per row */
+    int fb_bpp;        /* 16 or 32 */
+    int fb_ro, fb_rl, fb_go, fb_gl, fb_bo, fb_bl; /* channel offset/length */
+    uint32_t *bb;      /* software backbuffer, w*h of 0x00RRGGBB */
+    int fb_clip_on, fb_cx0, fb_cy0, fb_cx1, fb_cy1;
+    int fb_expose;     /* deliver one EV_EXPOSE on the first wait */
 } VSurf;
 
 static XFontStruct *font;       /* one bitmap UI font, shared, never freed */
@@ -761,6 +853,628 @@ static int x11_detect_scale(Display *dpy) {
     return 100;
 }
 
+/* =================================================== fbdev sub-backend
+ * Selected at runtime by VS_FBDEV=<path> (usually /dev/fb0). No display
+ * server: drawing runs a software rasterizer into a 0x00RRGGBB backbuffer,
+ * vs_present converts rows into the mmapped framebuffer (32bpp or 16bpp,
+ * channel offsets honored), input comes from evdev. When the path is a
+ * regular file (ioctl fails) it becomes a render-to-file target sized by
+ * VS_FB_W/VS_FB_H — the test path, with no console or input plumbing. */
+#ifdef __linux__
+
+/* 8x8 bitmap font, printable ASCII 0x20-0x7E; row per byte, bit0 = leftmost
+   pixel (the public-domain "font8x8" glyphs) */
+static const uint8_t fb_font[95][8] = {
+    {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00}, /* ' ' */
+    {0x18,0x3C,0x3C,0x18,0x18,0x00,0x18,0x00}, /* ! */
+    {0x36,0x36,0x00,0x00,0x00,0x00,0x00,0x00}, /* " */
+    {0x36,0x36,0x7F,0x36,0x7F,0x36,0x36,0x00}, /* # */
+    {0x0C,0x3E,0x03,0x1E,0x30,0x1F,0x0C,0x00}, /* $ */
+    {0x00,0x63,0x33,0x18,0x0C,0x66,0x63,0x00}, /* % */
+    {0x1C,0x36,0x1C,0x6E,0x3B,0x33,0x6E,0x00}, /* & */
+    {0x06,0x06,0x03,0x00,0x00,0x00,0x00,0x00}, /* ' */
+    {0x18,0x0C,0x06,0x06,0x06,0x0C,0x18,0x00}, /* ( */
+    {0x06,0x0C,0x18,0x18,0x18,0x0C,0x06,0x00}, /* ) */
+    {0x00,0x66,0x3C,0xFF,0x3C,0x66,0x00,0x00}, /* * */
+    {0x00,0x0C,0x0C,0x3F,0x0C,0x0C,0x00,0x00}, /* + */
+    {0x00,0x00,0x00,0x00,0x00,0x0C,0x0C,0x06}, /* , */
+    {0x00,0x00,0x00,0x3F,0x00,0x00,0x00,0x00}, /* - */
+    {0x00,0x00,0x00,0x00,0x00,0x0C,0x0C,0x00}, /* . */
+    {0x60,0x30,0x18,0x0C,0x06,0x03,0x01,0x00}, /* / */
+    {0x3E,0x63,0x73,0x7B,0x6F,0x67,0x3E,0x00}, /* 0 */
+    {0x0C,0x0E,0x0C,0x0C,0x0C,0x0C,0x3F,0x00}, /* 1 */
+    {0x1E,0x33,0x30,0x1C,0x06,0x33,0x3F,0x00}, /* 2 */
+    {0x1E,0x33,0x30,0x1C,0x30,0x33,0x1E,0x00}, /* 3 */
+    {0x38,0x3C,0x36,0x33,0x7F,0x30,0x78,0x00}, /* 4 */
+    {0x3F,0x03,0x1F,0x30,0x30,0x33,0x1E,0x00}, /* 5 */
+    {0x1C,0x06,0x03,0x1F,0x33,0x33,0x1E,0x00}, /* 6 */
+    {0x3F,0x33,0x30,0x18,0x0C,0x0C,0x0C,0x00}, /* 7 */
+    {0x1E,0x33,0x33,0x1E,0x33,0x33,0x1E,0x00}, /* 8 */
+    {0x1E,0x33,0x33,0x3E,0x30,0x18,0x0E,0x00}, /* 9 */
+    {0x00,0x0C,0x0C,0x00,0x00,0x0C,0x0C,0x00}, /* : */
+    {0x00,0x0C,0x0C,0x00,0x00,0x0C,0x0C,0x06}, /* ; */
+    {0x18,0x0C,0x06,0x03,0x06,0x0C,0x18,0x00}, /* < */
+    {0x00,0x00,0x3F,0x00,0x00,0x3F,0x00,0x00}, /* = */
+    {0x06,0x0C,0x18,0x30,0x18,0x0C,0x06,0x00}, /* > */
+    {0x1E,0x33,0x30,0x18,0x0C,0x00,0x0C,0x00}, /* ? */
+    {0x3E,0x63,0x7B,0x7B,0x7B,0x03,0x1E,0x00}, /* @ */
+    {0x0C,0x1E,0x33,0x33,0x3F,0x33,0x33,0x00}, /* A */
+    {0x3F,0x66,0x66,0x3E,0x66,0x66,0x3F,0x00}, /* B */
+    {0x3C,0x66,0x03,0x03,0x03,0x66,0x3C,0x00}, /* C */
+    {0x1F,0x36,0x66,0x66,0x66,0x36,0x1F,0x00}, /* D */
+    {0x7F,0x46,0x16,0x1E,0x16,0x46,0x7F,0x00}, /* E */
+    {0x7F,0x46,0x16,0x1E,0x16,0x06,0x0F,0x00}, /* F */
+    {0x3C,0x66,0x03,0x03,0x73,0x66,0x7C,0x00}, /* G */
+    {0x33,0x33,0x33,0x3F,0x33,0x33,0x33,0x00}, /* H */
+    {0x1E,0x0C,0x0C,0x0C,0x0C,0x0C,0x1E,0x00}, /* I */
+    {0x78,0x30,0x30,0x30,0x33,0x33,0x1E,0x00}, /* J */
+    {0x67,0x66,0x36,0x1E,0x36,0x66,0x67,0x00}, /* K */
+    {0x0F,0x06,0x06,0x06,0x46,0x66,0x7F,0x00}, /* L */
+    {0x63,0x77,0x7F,0x7F,0x6B,0x63,0x63,0x00}, /* M */
+    {0x63,0x67,0x6F,0x7B,0x73,0x63,0x63,0x00}, /* N */
+    {0x1C,0x36,0x63,0x63,0x63,0x36,0x1C,0x00}, /* O */
+    {0x3F,0x66,0x66,0x3E,0x06,0x06,0x0F,0x00}, /* P */
+    {0x1E,0x33,0x33,0x33,0x3B,0x1E,0x38,0x00}, /* Q */
+    {0x3F,0x66,0x66,0x3E,0x36,0x66,0x67,0x00}, /* R */
+    {0x1E,0x33,0x07,0x0E,0x38,0x33,0x1E,0x00}, /* S */
+    {0x3F,0x2D,0x0C,0x0C,0x0C,0x0C,0x1E,0x00}, /* T */
+    {0x33,0x33,0x33,0x33,0x33,0x33,0x3F,0x00}, /* U */
+    {0x33,0x33,0x33,0x33,0x33,0x1E,0x0C,0x00}, /* V */
+    {0x63,0x63,0x63,0x6B,0x7F,0x77,0x63,0x00}, /* W */
+    {0x63,0x63,0x36,0x1C,0x1C,0x36,0x63,0x00}, /* X */
+    {0x33,0x33,0x33,0x1E,0x0C,0x0C,0x1E,0x00}, /* Y */
+    {0x7F,0x63,0x31,0x18,0x4C,0x66,0x7F,0x00}, /* Z */
+    {0x1E,0x06,0x06,0x06,0x06,0x06,0x1E,0x00}, /* [ */
+    {0x03,0x06,0x0C,0x18,0x30,0x60,0x40,0x00}, /* \ */
+    {0x1E,0x18,0x18,0x18,0x18,0x18,0x1E,0x00}, /* ] */
+    {0x08,0x1C,0x36,0x63,0x00,0x00,0x00,0x00}, /* ^ */
+    {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0xFF}, /* _ */
+    {0x0C,0x0C,0x18,0x00,0x00,0x00,0x00,0x00}, /* ` */
+    {0x00,0x00,0x1E,0x30,0x3E,0x33,0x6E,0x00}, /* a */
+    {0x07,0x06,0x06,0x3E,0x66,0x66,0x3B,0x00}, /* b */
+    {0x00,0x00,0x1E,0x33,0x03,0x33,0x1E,0x00}, /* c */
+    {0x38,0x30,0x30,0x3E,0x33,0x33,0x6E,0x00}, /* d */
+    {0x00,0x00,0x1E,0x33,0x3F,0x03,0x1E,0x00}, /* e */
+    {0x1C,0x36,0x06,0x0F,0x06,0x06,0x0F,0x00}, /* f */
+    {0x00,0x00,0x6E,0x33,0x33,0x3E,0x30,0x1F}, /* g */
+    {0x07,0x06,0x36,0x6E,0x66,0x66,0x67,0x00}, /* h */
+    {0x0C,0x00,0x0E,0x0C,0x0C,0x0C,0x1E,0x00}, /* i */
+    {0x30,0x00,0x30,0x30,0x30,0x33,0x33,0x1E}, /* j */
+    {0x07,0x06,0x66,0x36,0x1E,0x36,0x67,0x00}, /* k */
+    {0x0E,0x0C,0x0C,0x0C,0x0C,0x0C,0x1E,0x00}, /* l */
+    {0x00,0x00,0x33,0x7F,0x7F,0x6B,0x63,0x00}, /* m */
+    {0x00,0x00,0x1F,0x33,0x33,0x33,0x33,0x00}, /* n */
+    {0x00,0x00,0x1E,0x33,0x33,0x33,0x1E,0x00}, /* o */
+    {0x00,0x00,0x3B,0x66,0x66,0x3E,0x06,0x0F}, /* p */
+    {0x00,0x00,0x6E,0x33,0x33,0x3E,0x30,0x78}, /* q */
+    {0x00,0x00,0x3B,0x6E,0x66,0x06,0x0F,0x00}, /* r */
+    {0x00,0x00,0x3E,0x03,0x1E,0x30,0x1F,0x00}, /* s */
+    {0x08,0x0C,0x3E,0x0C,0x0C,0x2C,0x18,0x00}, /* t */
+    {0x00,0x00,0x33,0x33,0x33,0x33,0x6E,0x00}, /* u */
+    {0x00,0x00,0x33,0x33,0x33,0x1E,0x0C,0x00}, /* v */
+    {0x00,0x00,0x63,0x6B,0x7F,0x7F,0x36,0x00}, /* w */
+    {0x00,0x00,0x63,0x36,0x1C,0x36,0x63,0x00}, /* x */
+    {0x00,0x00,0x33,0x33,0x33,0x3E,0x30,0x1F}, /* y */
+    {0x00,0x00,0x3F,0x19,0x0C,0x26,0x3F,0x00}, /* z */
+    {0x38,0x0C,0x0C,0x07,0x0C,0x0C,0x38,0x00}, /* { */
+    {0x18,0x18,0x18,0x00,0x18,0x18,0x18,0x00}, /* | */
+    {0x07,0x0C,0x0C,0x38,0x0C,0x0C,0x07,0x00}, /* } */
+    {0x6E,0x3B,0x00,0x00,0x00,0x00,0x00,0x00}, /* ~ */
+};
+
+#define FB_FONT_W 8
+#define FB_FONT_ASCENT 6 /* baseline sits above the two descender rows */
+#define FB_FONT_H 9      /* 8 glyph rows + 1 of leading */
+
+/* US-layout scancode -> char maps for the classic PC codes 0..57
+   (KEY_ESC=1 .. KEY_SPACE=57); special keys are handled by code first */
+static const char fb_km[58] =
+    "\0\0331234567890-=\10\11qwertyuiop[]\n\0asdfghjkl;'`\0\\zxcvbnm,./\0*\0 ";
+static const char fb_km_sh[58] =
+    "\0\033!@#$%^&*()_+\10\11QWERTYUIOP{}\n\0ASDFGHJKL:\"~\0|ZXCVBNM<>?\0*\0 ";
+
+/* evdev input state (single window, like the other backends' statics) */
+static int fb_in[16];
+static int fb_nin;
+static int fb_mx, fb_my;    /* pointer position, backend-tracked */
+static int fb_mods_state;
+static volatile sig_atomic_t fb_close_req;
+
+static void fb_on_sig(int sig) {
+    (void)sig;
+    fb_close_req = 1;
+}
+
+/* event ring, mirroring the Win32 queue shape */
+typedef struct FbEv {
+    int type, key, x, y, wheel, mods;
+    char text[8];
+} FbEv;
+static FbEv fbq[64];
+static int fbq_head, fbq_len;
+
+static void fbq_push(int type, int key, int wheel, const char *text) {
+    if (type == VS_EV_MOUSE_MOVE && fbq_len > 0) {
+        FbEv *tail = &fbq[(fbq_head + fbq_len - 1) % 64];
+        if (tail->type == VS_EV_MOUSE_MOVE) { /* coalesce move bursts */
+            tail->x = fb_mx;
+            tail->y = fb_my;
+            tail->mods = fb_mods_state;
+            return;
+        }
+    }
+    if (fbq_len == 64) return;
+    FbEv *e = &fbq[(fbq_head + fbq_len) % 64];
+    e->type = type;
+    e->key = key;
+    e->x = fb_mx;
+    e->y = fb_my;
+    e->wheel = wheel;
+    e->mods = fb_mods_state;
+    snprintf(e->text, sizeof e->text, "%s", text ? text : "");
+    fbq_len++;
+}
+
+static int fbq_pop(void) {
+    FbEv e = fbq[fbq_head];
+    fbq_head = (fbq_head + 1) % 64;
+    fbq_len--;
+    last_key = e.key;
+    last_x = e.x;
+    last_y = e.y;
+    last_wheel = e.wheel;
+    last_mods = e.mods;
+    snprintf(last_text, sizeof last_text, "%s", e.text);
+    return e.type;
+}
+
+static void fb_handle(VSurf *s, const struct input_event *ev) {
+    if (ev->type == EV_REL) {
+        if (ev->code == REL_X || ev->code == REL_Y) {
+            if (ev->code == REL_X) fb_mx += ev->value;
+            else fb_my += ev->value;
+            if (fb_mx < 0) fb_mx = 0;
+            if (fb_my < 0) fb_my = 0;
+            if (fb_mx >= s->w) fb_mx = s->w - 1;
+            if (fb_my >= s->h) fb_my = s->h - 1;
+            fbq_push(VS_EV_MOUSE_MOVE, 0, 0, "");
+        } else if (ev->code == REL_WHEEL && ev->value != 0) {
+            /* evdev: +1 notch = wheel up; match X11's up = -3 lines */
+            fbq_push(VS_EV_MOUSE_WHEEL, 0, -3 * ev->value, "");
+        }
+        return;
+    }
+    if (ev->type != EV_KEY) return;
+    int code = ev->code, val = ev->value; /* 0 = up, 1 = down, 2 = repeat */
+    if (code == BTN_LEFT) {
+        if (val == 1) fbq_push(VS_EV_MOUSE_DOWN, 0, 0, "");
+        else if (val == 0) fbq_push(VS_EV_MOUSE_UP, 0, 0, "");
+        return;
+    }
+    if (code == BTN_RIGHT) {
+        if (val == 1) fbq_push(VS_EV_MOUSE_RDOWN, 0, 0, "");
+        return;
+    }
+    if (code >= BTN_MISC) return; /* other buttons/axes */
+    int mod = 0, vk = 0;
+    switch (code) {
+    case KEY_LEFTSHIFT: case KEY_RIGHTSHIFT: mod = VS_MOD_SHIFT; vk = VS_KEY_SHIFT; break;
+    case KEY_LEFTCTRL: case KEY_RIGHTCTRL: mod = VS_MOD_CTRL; vk = VS_KEY_CTRL; break;
+    case KEY_LEFTALT: case KEY_RIGHTALT: mod = VS_MOD_ALT; vk = VS_KEY_ALT; break;
+    case KEY_LEFTMETA: case KEY_RIGHTMETA: mod = VS_MOD_SUPER; vk = VS_KEY_SUPER; break;
+    default: break;
+    }
+    if (mod) { /* modifiers: track state and deliver as their own events */
+        if (val == 1) fb_mods_state |= mod;
+        else if (val == 0) fb_mods_state &= ~mod;
+        if (val != 2) fbq_push(val ? VS_EV_KEY : VS_EV_KEY_UP, vk, 0, "");
+        return;
+    }
+    char text[2] = "";
+    switch (code) {
+    case KEY_ENTER: case KEY_KPENTER: vk = VS_KEY_ENTER; break;
+    case KEY_BACKSPACE: vk = VS_KEY_BACKSPACE; break;
+    case KEY_ESC: vk = VS_KEY_ESC; break;
+    case KEY_UP: vk = VS_KEY_UP; break;
+    case KEY_DOWN: vk = VS_KEY_DOWN; break;
+    case KEY_LEFT: vk = VS_KEY_LEFT; break;
+    case KEY_RIGHT: vk = VS_KEY_RIGHT; break;
+    case KEY_DELETE: vk = VS_KEY_DELETE; break;
+    case KEY_TAB: vk = VS_KEY_TAB; break;
+    case KEY_HOME: vk = VS_KEY_HOME; break;
+    case KEY_END: vk = VS_KEY_END; break;
+    case KEY_PAGEUP: vk = VS_KEY_PAGEUP; break;
+    case KEY_PAGEDOWN: vk = VS_KEY_PAGEDOWN; break;
+    case KEY_INSERT: vk = VS_KEY_INSERT; break;
+    case KEY_F11: vk = VS_KEY_F11; break;
+    case KEY_F12: vk = VS_KEY_F12; break;
+    default:
+        if (code >= KEY_F1 && code <= KEY_F10) vk = VS_KEY_F1 + (code - KEY_F1);
+        break;
+    }
+    if (!vk && code > 0 && code < 58) {
+        char ch = (fb_mods_state & VS_MOD_SHIFT) ? fb_km_sh[code] : fb_km[code];
+        if ((unsigned char)ch >= 32) {
+            vk = (unsigned char)ch;
+            /* Ctrl/Alt chords deliver the key but no insertable text,
+               matching the X11 and Win32 backends */
+            if (!(fb_mods_state & (VS_MOD_CTRL | VS_MOD_ALT))) {
+                text[0] = ch;
+                text[1] = 0;
+            }
+        }
+    }
+    if (!vk) return;
+    if (val != 0) fbq_push(VS_EV_KEY, vk, 0, text);
+    else fbq_push(VS_EV_KEY_UP, vk, 0, "");
+}
+
+static void fb_pump(VSurf *s) {
+    struct input_event ev[64];
+    for (int i = 0; i < fb_nin; i++) {
+        for (;;) {
+            ssize_t n = read(fb_in[i], ev, sizeof ev);
+            if (n < (ssize_t)sizeof ev[0]) break;
+            int cnt = (int)(n / (ssize_t)sizeof ev[0]);
+            for (int j = 0; j < cnt; j++) fb_handle(s, &ev[j]);
+        }
+    }
+}
+
+/* block <= ms for the next event (ms < 0: forever; block == 0: poll).
+   Returns VS_EV_NONE on an empty poll, VS_EV_TIMER on timeout. */
+static int fb_next(VSurf *s, int block, int ms) {
+    if (s->fb_expose) { /* the "window is up" event X11 apps expect */
+        s->fb_expose = 0;
+        return VS_EV_EXPOSE;
+    }
+    for (;;) {
+        if (fb_close_req) return VS_EV_CLOSE;
+        if (fbq_len) return fbq_pop();
+        fd_set rf;
+        FD_ZERO(&rf);
+        int maxfd = -1;
+        for (int i = 0; i < fb_nin; i++) {
+            FD_SET(fb_in[i], &rf);
+            if (fb_in[i] > maxfd) maxfd = fb_in[i];
+        }
+        struct timeval tv, *ptv = NULL;
+        if (!block) {
+            tv.tv_sec = 0;
+            tv.tv_usec = 0;
+            ptv = &tv;
+        } else if (ms >= 0) {
+            tv.tv_sec = ms / 1000;
+            tv.tv_usec = (ms % 1000) * 1000;
+            ptv = &tv;
+        } else if (maxfd < 0) {
+            /* no input devices and asked to block forever: nap in slices so
+               a SIGINT-driven close request still gets noticed */
+            tv.tv_sec = 0;
+            tv.tv_usec = 100 * 1000;
+            ptv = &tv;
+        }
+        int rc = select(maxfd + 1, maxfd >= 0 ? &rf : NULL, NULL, NULL, ptv);
+        if (rc < 0) continue; /* EINTR: re-check fb_close_req */
+        if (rc == 0) {
+            if (!block) return VS_EV_NONE;
+            if (ms >= 0) return VS_EV_TIMER;
+            continue;
+        }
+        fb_pump(s);
+    }
+}
+
+static void fb_scan_input(void) {
+    DIR *d = opendir("/dev/input");
+    if (!d) return;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL && fb_nin < 16) {
+        if (strncmp(de->d_name, "event", 5) != 0) continue;
+        char path[300];
+        snprintf(path, sizeof path, "/dev/input/%s", de->d_name);
+        int fd = open(path, O_RDONLY | O_NONBLOCK);
+        if (fd < 0) continue;
+        unsigned long evbits = 0;
+        if (ioctl(fd, EVIOCGBIT(0, sizeof evbits), &evbits) < 0 ||
+            !(evbits & ((1UL << EV_KEY) | (1UL << EV_REL)))) {
+            close(fd);
+            continue;
+        }
+        fb_in[fb_nin++] = fd;
+    }
+    closedir(d);
+}
+
+/* best-effort console takeover: raw keyboard-less tty (no echo, no canonical
+   mode; ISIG stays on so Ctrl+C still requests a close) and KD_GRAPHICS so
+   the console cursor/printk stop scribbling over the framebuffer */
+static struct termios fb_tio_saved;
+static int fb_tio_on;
+static int fb_kd_saved = -1;
+
+static void fb_tty_setup(void) {
+    if (isatty(STDIN_FILENO) && tcgetattr(STDIN_FILENO, &fb_tio_saved) == 0) {
+        struct termios t = fb_tio_saved;
+        t.c_lflag &= ~(tcflag_t)(ICANON | ECHO);
+        if (tcsetattr(STDIN_FILENO, TCSANOW, &t) == 0) fb_tio_on = 1;
+        int mode = 0;
+        if (ioctl(STDIN_FILENO, KDGETMODE, &mode) == 0) {
+            fb_kd_saved = mode;
+            ioctl(STDIN_FILENO, KDSETMODE, KD_GRAPHICS);
+        }
+    }
+}
+
+static void fb_tty_restore(void) {
+    if (fb_kd_saved >= 0) {
+        ioctl(STDIN_FILENO, KDSETMODE, fb_kd_saved);
+        fb_kd_saved = -1;
+    }
+    if (fb_tio_on) {
+        tcsetattr(STDIN_FILENO, TCSANOW, &fb_tio_saved);
+        fb_tio_on = 0;
+    }
+}
+
+static int fb_env_int(const char *name, int def) {
+    const char *e = getenv(name);
+    int v = (e && *e) ? atoi(e) : 0;
+    return v > 0 ? v : def;
+}
+
+static int fb_setup(VSurf *s, const char *path) {
+    s->fb_fd = open(path, O_RDWR | O_CREAT, 0666);
+    if (s->fb_fd < 0) return 0;
+    struct fb_var_screeninfo vi;
+    struct fb_fix_screeninfo fi;
+    int real_fb = ioctl(s->fb_fd, FBIOGET_VSCREENINFO, &vi) == 0 &&
+                  ioctl(s->fb_fd, FBIOGET_FSCREENINFO, &fi) == 0;
+    if (real_fb) {
+        s->w = (int)vi.xres;
+        s->h = (int)vi.yres;
+        s->fb_stride = (long)fi.line_length;
+        s->fb_bpp = (int)vi.bits_per_pixel;
+        s->fb_ro = (int)vi.red.offset;
+        s->fb_rl = (int)vi.red.length;
+        s->fb_go = (int)vi.green.offset;
+        s->fb_gl = (int)vi.green.length;
+        s->fb_bo = (int)vi.blue.offset;
+        s->fb_bl = (int)vi.blue.length;
+        s->fb_maplen = (long)fi.smem_len;
+    } else {
+        /* regular-file target: VS_FB_W/VS_FB_H, 32bpp XRGB, tight stride */
+        s->w = fb_env_int("VS_FB_W", 640);
+        s->h = fb_env_int("VS_FB_H", 480);
+        s->fb_stride = (long)s->w * 4;
+        s->fb_bpp = 32;
+        s->fb_ro = 16;
+        s->fb_go = 8;
+        s->fb_bo = 0;
+        s->fb_rl = s->fb_gl = s->fb_bl = 8;
+        s->fb_maplen = s->fb_stride * s->h;
+        if (ftruncate(s->fb_fd, (off_t)s->fb_maplen) != 0) {
+            close(s->fb_fd);
+            return 0;
+        }
+    }
+    if ((s->fb_bpp != 16 && s->fb_bpp != 32) || s->fb_rl < 1 || s->fb_rl > 8 ||
+        s->fb_gl < 1 || s->fb_gl > 8 || s->fb_bl < 1 || s->fb_bl > 8 ||
+        s->w < 1 || s->h < 1 || s->fb_maplen < s->fb_stride * s->h) {
+        close(s->fb_fd);
+        return 0; /* exotic layouts (planar, palette, >8-bit channels): no */
+    }
+    s->fb_mem = mmap(NULL, (size_t)s->fb_maplen, PROT_READ | PROT_WRITE,
+                     MAP_SHARED, s->fb_fd, 0);
+    if (s->fb_mem == MAP_FAILED) {
+        s->fb_mem = NULL;
+        close(s->fb_fd);
+        return 0;
+    }
+    s->bb = calloc((size_t)s->w * (size_t)s->h, 4);
+    if (!s->bb) {
+        munmap(s->fb_mem, (size_t)s->fb_maplen);
+        s->fb_mem = NULL;
+        close(s->fb_fd);
+        return 0;
+    }
+    if (real_fb) { /* console + input plumbing only on a real framebuffer */
+        fb_scan_input();
+        fb_tty_setup();
+        signal(SIGINT, fb_on_sig);
+        signal(SIGTERM, fb_on_sig);
+    }
+    fb_mx = s->w / 2;
+    fb_my = s->h / 2;
+    s->fb_expose = 1;
+    s->fb_on = 1;
+    return 1;
+}
+
+static void fb_close(VSurf *s) {
+    fb_tty_restore();
+    for (int i = 0; i < fb_nin; i++) close(fb_in[i]);
+    fb_nin = 0;
+    if (s->fb_mem) munmap(s->fb_mem, (size_t)s->fb_maplen);
+    if (s->fb_fd >= 0) close(s->fb_fd);
+    free(s->bb);
+    s->bb = NULL;
+    s->fb_on = 0;
+}
+
+/* ---- software rasterizer into the 0x00RRGGBB backbuffer ---- */
+
+static void fb_px(VSurf *s, int x, int y, uint32_t c) {
+    if (x < 0 || y < 0 || x >= s->w || y >= s->h) return;
+    if (s->fb_clip_on &&
+        (x < s->fb_cx0 || y < s->fb_cy0 || x >= s->fb_cx1 || y >= s->fb_cy1))
+        return;
+    s->bb[(long)y * s->w + x] = c;
+}
+
+static void fb_fill(VSurf *s, int x, int y, int w, int h, int rgb) {
+    int x0 = x, y0 = y, x1 = x + w, y1 = y + h;
+    if (s->fb_clip_on) {
+        if (x0 < s->fb_cx0) x0 = s->fb_cx0;
+        if (y0 < s->fb_cy0) y0 = s->fb_cy0;
+        if (x1 > s->fb_cx1) x1 = s->fb_cx1;
+        if (y1 > s->fb_cy1) y1 = s->fb_cy1;
+    }
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 > s->w) x1 = s->w;
+    if (y1 > s->h) y1 = s->h;
+    uint32_t c = (uint32_t)(rgb & 0xFFFFFF);
+    for (int yy = y0; yy < y1; yy++) {
+        uint32_t *row = s->bb + (long)yy * s->w;
+        for (int xx = x0; xx < x1; xx++) row[xx] = c;
+    }
+}
+
+static void fb_rect(VSurf *s, int x, int y, int w, int h, int rgb) {
+    if (w <= 0 || h <= 0) return;
+    fb_fill(s, x, y, w, 1, rgb);
+    fb_fill(s, x, y + h - 1, w, 1, rgb);
+    fb_fill(s, x, y, 1, h, rgb);
+    fb_fill(s, x + w - 1, y, 1, h, rgb);
+}
+
+static void fb_line(VSurf *s, int x0, int y0, int x1, int y1, int rgb) {
+    uint32_t c = (uint32_t)(rgb & 0xFFFFFF);
+    int dx = x1 > x0 ? x1 - x0 : x0 - x1;
+    int dy = y1 > y0 ? y1 - y0 : y0 - y1;
+    int sx = x0 < x1 ? 1 : -1, sy = y0 < y1 ? 1 : -1;
+    int err = dx - dy;
+    for (;;) {
+        fb_px(s, x0, y0, c);
+        if (x0 == x1 && y0 == y1) break;
+        int e2 = 2 * err;
+        if (e2 > -dy) { err -= dy; x0 += sx; }
+        if (e2 < dx) { err += dx; y0 += sy; }
+    }
+}
+
+static void fb_text(VSurf *s, int x, int y, const char *str, int rgb) {
+    uint32_t c = (uint32_t)(rgb & 0xFFFFFF);
+    int top = y - FB_FONT_ASCENT; /* y is the baseline (X11 convention) */
+    for (; *str; str++, x += FB_FONT_W) {
+        unsigned ch = (unsigned char)*str;
+        if (ch >= 0x80) {
+            if ((ch & 0xC0) == 0x80) { /* UTF-8 continuation: no cell */
+                x -= FB_FONT_W;
+                continue;
+            }
+            ch = '?'; /* non-ASCII leads render as a placeholder cell */
+        } else if (ch < 0x20 || ch > 0x7E) {
+            continue;
+        }
+        const uint8_t *g = fb_font[ch - 0x20];
+        for (int ry = 0; ry < 8; ry++) {
+            uint8_t bits = g[ry];
+            for (int rx = 0; bits; rx++, bits >>= 1)
+                if (bits & 1) fb_px(s, x + rx, top + ry, c);
+        }
+    }
+}
+
+/* blits are never clipped (matches the X11/GDI arms) */
+static void fb_blit(VSurf *s, const int *pixels, int srcw, int srch,
+                    int dstx, int dsty, int dstw, int dsth) {
+    for (int dy = 0; dy < dsth; dy++) {
+        int ty = dsty + dy;
+        if (ty < 0 || ty >= s->h) continue;
+        const int *src = pixels + (long)(dy * srch / dsth) * srcw;
+        uint32_t *row = s->bb + (long)ty * s->w;
+        for (int dx = 0; dx < dstw; dx++) {
+            int tx = dstx + dx;
+            if (tx < 0 || tx >= s->w) continue;
+            int sx = srcw == dstw ? dx : dx * srcw / dstw;
+            row[tx] = (uint32_t)(src[sx] & 0xFFFFFF);
+        }
+    }
+}
+
+static void fb_blit_sub(VSurf *s, const int *pixels, int stride_px, int srcx,
+                        int srcy, int w, int h, int dstx, int dsty) {
+    for (int dy = 0; dy < h; dy++) {
+        int ty = dsty + dy;
+        if (ty < 0 || ty >= s->h) continue;
+        const int *src = pixels + (long)(srcy + dy) * stride_px + srcx;
+        uint32_t *row = s->bb + (long)ty * s->w;
+        for (int dx = 0; dx < w; dx++) {
+            int tx = dstx + dx;
+            if (tx < 0 || tx >= s->w) continue;
+            row[tx] = (uint32_t)(src[dx] & 0xFFFFFF);
+        }
+    }
+}
+
+/* copy backbuffer rows into the mmapped framebuffer, honoring the fb's
+   stride and channel layout; the vs_present of this backend */
+static void fb_flush(VSurf *s, int x, int y, int w, int h) {
+    if (x < 0) { w += x; x = 0; }
+    if (y < 0) { h += y; y = 0; }
+    if (x + w > s->w) w = s->w - x;
+    if (y + h > s->h) h = s->h - y;
+    if (w <= 0 || h <= 0 || !s->fb_mem) return;
+    int bytes = s->fb_bpp / 8;
+    int direct = s->fb_bpp == 32 && s->fb_ro == 16 && s->fb_go == 8 &&
+                 s->fb_bo == 0; /* XRGB8888: rows match the backbuffer */
+    for (int dy = 0; dy < h; dy++) {
+        const uint32_t *src = s->bb + (long)(y + dy) * s->w + x;
+        uint8_t *dst = s->fb_mem + (long)(y + dy) * s->fb_stride + (long)x * bytes;
+        if (direct) {
+            memcpy(dst, src, (size_t)w * 4);
+            continue;
+        }
+        for (int dx = 0; dx < w; dx++) {
+            uint32_t c = src[dx];
+            uint32_t v = ((((c >> 16) & 0xFF) >> (8 - s->fb_rl)) << s->fb_ro) |
+                         ((((c >> 8) & 0xFF) >> (8 - s->fb_gl)) << s->fb_go) |
+                         (((c & 0xFF) >> (8 - s->fb_bl)) << s->fb_bo);
+            if (bytes == 4) ((uint32_t *)(void *)dst)[dx] = v;
+            else ((uint16_t *)(void *)dst)[dx] = (uint16_t)v;
+        }
+    }
+}
+
+#else /* !__linux__: X11-only platforms never enter fbdev mode */
+
+static int fb_setup(VSurf *s, const char *path) { (void)s; (void)path; return 0; }
+static void fb_close(VSurf *s) { (void)s; }
+static void fb_fill(VSurf *s, int x, int y, int w, int h, int rgb) {
+    (void)s; (void)x; (void)y; (void)w; (void)h; (void)rgb;
+}
+static void fb_rect(VSurf *s, int x, int y, int w, int h, int rgb) {
+    (void)s; (void)x; (void)y; (void)w; (void)h; (void)rgb;
+}
+static void fb_line(VSurf *s, int x0, int y0, int x1, int y1, int rgb) {
+    (void)s; (void)x0; (void)y0; (void)x1; (void)y1; (void)rgb;
+}
+static void fb_text(VSurf *s, int x, int y, const char *str, int rgb) {
+    (void)s; (void)x; (void)y; (void)str; (void)rgb;
+}
+static void fb_blit(VSurf *s, const int *p, int sw, int sh, int dx, int dy,
+                    int dw, int dh) {
+    (void)s; (void)p; (void)sw; (void)sh; (void)dx; (void)dy; (void)dw; (void)dh;
+}
+static void fb_blit_sub(VSurf *s, const int *p, int st, int sx, int sy, int w,
+                        int h, int dx, int dy) {
+    (void)s; (void)p; (void)st; (void)sx; (void)sy; (void)w; (void)h; (void)dx; (void)dy;
+}
+static void fb_flush(VSurf *s, int x, int y, int w, int h) {
+    (void)s; (void)x; (void)y; (void)w; (void)h;
+}
+static int fb_next(VSurf *s, int block, int ms) {
+    (void)s; (void)block; (void)ms;
+    return VS_EV_CLOSE;
+}
+#define FB_FONT_W 8
+#define FB_FONT_ASCENT 6
+#define FB_FONT_H 9
+
+#endif /* __linux__ */
+
 void *vs_open(const char *title, int w, int h) {
     VSurf *s = calloc(1, sizeof *s);
     if (!s) return NULL;
@@ -769,6 +1483,15 @@ void *vs_open(const char *title, int w, int h) {
     if (headless_on()) {
         headless_open_script();
         g_scale_pct = 100;
+        return s;
+    }
+    const char *fbdev = getenv("VS_FBDEV");
+    if (fbdev && *fbdev) { /* framebuffer mode: no display server */
+        if (!fb_setup(s, fbdev)) {
+            free(s);
+            return NULL;
+        }
+        g_scale_pct = 100; /* $VOLT_SCALE still overrides via scale_from_env */
         return s;
     }
     Display *dpy = XOpenDisplay(NULL);
@@ -791,6 +1514,11 @@ void *vs_open(const char *title, int w, int h) {
     XkbSetDetectableAutoRepeat(dpy, True, NULL);
     s->wm_delete = XInternAtom(dpy, "WM_DELETE_WINDOW", False);
     XSetWMProtocols(dpy, s->win, &s->wm_delete, 1);
+    s->a_clipboard = XInternAtom(dpy, "CLIPBOARD", False);
+    s->a_utf8 = XInternAtom(dpy, "UTF8_STRING", False);
+    s->a_targets = XInternAtom(dpy, "TARGETS", False);
+    s->a_incr = XInternAtom(dpy, "INCR", False);
+    s->a_clip_prop = XInternAtom(dpy, "VS_CLIP", False);
     s->gc = XCreateGC(dpy, s->win, 0, 0);
     s->pgc = XCreateGC(dpy, s->win, 0, 0);
     if (!font) font = XLoadQueryFont(dpy, "9x15");
@@ -810,9 +1538,13 @@ void *vs_open(const char *title, int w, int h) {
     return s;
 }
 
+static void fb_close(VSurf *s);
+
 void vs_close(void *vs) {
     VSurf *s = vs;
     if (!s) return;
+    if (s->fb_on) fb_close(s);
+    free(s->clip_got);
     if (s->dpy) {
         if (s->img) { XDestroyImage(s->img); s->img = NULL; } /* frees its data too */
         if (s->ic) XDestroyIC(s->ic);
@@ -828,6 +1560,14 @@ void vs_close(void *vs) {
 
 void vs_clip_set(void *vs, int x, int y, int w, int h) {
     VSurf *s = vs;
+    if (s->fb_on) {
+        s->fb_clip_on = 1;
+        s->fb_cx0 = x;
+        s->fb_cy0 = y;
+        s->fb_cx1 = x + (w > 0 ? w : 0);
+        s->fb_cy1 = y + (h > 0 ? h : 0);
+        return;
+    }
     if (!s->dpy) return;
     XRectangle r;
     r.x = (short)x;
@@ -839,6 +1579,10 @@ void vs_clip_set(void *vs, int x, int y, int w, int h) {
 
 void vs_clip_clear(void *vs) {
     VSurf *s = vs;
+    if (s->fb_on) {
+        s->fb_clip_on = 0;
+        return;
+    }
     if (!s->dpy) return;
     XSetClipMask(s->dpy, s->gc, None);
 }
@@ -853,6 +1597,10 @@ void vs_set_title(void *vs, const char *t) {
 
 void vs_fill_rect(void *vs, int x, int y, int w, int h, int rgb) {
     VSurf *s = vs;
+    if (s->fb_on) {
+        fb_fill(s, x, y, w, h, rgb);
+        return;
+    }
     if (!s->dpy) return;
     XSetForeground(s->dpy, s->gc, pixel_of(s->dpy, rgb));
     XFillRectangle(s->dpy, s->back, s->gc, x, y, (unsigned)w, (unsigned)h);
@@ -860,6 +1608,10 @@ void vs_fill_rect(void *vs, int x, int y, int w, int h, int rgb) {
 
 void vs_draw_rect(void *vs, int x, int y, int w, int h, int rgb) {
     VSurf *s = vs;
+    if (s->fb_on) {
+        fb_rect(s, x, y, w, h, rgb);
+        return;
+    }
     if (!s->dpy) return;
     XSetForeground(s->dpy, s->gc, pixel_of(s->dpy, rgb));
     XDrawRectangle(s->dpy, s->back, s->gc, x, y, (unsigned)(w - 1), (unsigned)(h - 1));
@@ -867,6 +1619,10 @@ void vs_draw_rect(void *vs, int x, int y, int w, int h, int rgb) {
 
 void vs_draw_line(void *vs, int x0, int y0, int x1, int y1, int rgb) {
     VSurf *s = vs;
+    if (s->fb_on) {
+        fb_line(s, x0, y0, x1, y1, rgb);
+        return;
+    }
     if (!s->dpy) return;
     XSetForeground(s->dpy, s->gc, pixel_of(s->dpy, rgb));
     XDrawLine(s->dpy, s->back, s->gc, x0, y0, x1, y1);
@@ -874,6 +1630,10 @@ void vs_draw_line(void *vs, int x0, int y0, int x1, int y1, int rgb) {
 
 void vs_draw_text(void *vs, int x, int y, const char *str, int rgb) {
     VSurf *s = vs;
+    if (s->fb_on) {
+        fb_text(s, x, y, str, rgb);
+        return;
+    }
     if (!s->dpy) return;
     XSetForeground(s->dpy, s->gc, pixel_of(s->dpy, rgb));
     XDrawString(s->dpy, s->back, s->gc, x, y, str, (int)strlen(str));
@@ -901,7 +1661,12 @@ static XImage *blit_image(VSurf *s, int w, int h) {
 void vs_blit(void *vs, const int *pixels, int srcw, int srch,
              int dstx, int dsty, int dstw, int dsth) {
     VSurf *s = vs;
-    if (!s->dpy || srcw <= 0 || srch <= 0 || dstw <= 0 || dsth <= 0) return;
+    if (srcw <= 0 || srch <= 0 || dstw <= 0 || dsth <= 0) return;
+    if (s->fb_on) {
+        fb_blit(s, pixels, srcw, srch, dstx, dsty, dstw, dsth);
+        return;
+    }
+    if (!s->dpy) return;
     XImage *img = blit_image(s, dstw, dsth);
     if (!img) return;
     /* Fast path: on a little-endian 32bpp TrueColor visual the image row is a
@@ -934,7 +1699,12 @@ void vs_blit(void *vs, const int *pixels, int srcw, int srch,
 void vs_blit_rect(void *vs, const int *pixels, int stride_px,
                   int srcx, int srcy, int w, int h, int dstx, int dsty) {
     VSurf *s = vs;
-    if (!s->dpy || w <= 0 || h <= 0 || stride_px <= 0) return;
+    if (w <= 0 || h <= 0 || stride_px <= 0) return;
+    if (s->fb_on) {
+        fb_blit_sub(s, pixels, stride_px, srcx, srcy, w, h, dstx, dsty);
+        return;
+    }
+    if (!s->dpy) return;
     XImage *img = blit_image(s, w, h);
     if (!img) return;
     if (truecolor && img->bits_per_pixel == 32 && img->byte_order == LSBFirst) {
@@ -954,6 +1724,10 @@ void vs_blit_rect(void *vs, const int *pixels, int stride_px,
 
 void vs_present(void *vs) {
     VSurf *s = vs;
+    if (s->fb_on) {
+        fb_flush(s, 0, 0, s->w, s->h);
+        return;
+    }
     if (!s->dpy) return;
     XCopyArea(s->dpy, s->back, s->win, s->pgc, 0, 0, (unsigned)s->w, (unsigned)s->h, 0, 0);
     XFlush(s->dpy);
@@ -961,6 +1735,10 @@ void vs_present(void *vs) {
 
 void vs_present_rect(void *vs, int x, int y, int w, int h) {
     VSurf *s = vs;
+    if (s->fb_on) {
+        fb_flush(s, x, y, w, h);
+        return;
+    }
     if (!s->dpy) return;
     if (x < 0) { w += x; x = 0; }
     if (y < 0) { h += y; y = 0; }
@@ -973,18 +1751,21 @@ void vs_present_rect(void *vs, int x, int y, int w, int h) {
 
 int vs_text_width(void *vs, const char *str) {
     VSurf *s = vs;
+    if (s->fb_on) return FB_FONT_W * (int)strlen(str);
     if (!s->dpy || !font) return 9 * (int)strlen(str);
     return XTextWidth(font, str, (int)strlen(str));
 }
 
 int vs_font_ascent(void *vs) {
     VSurf *s = vs;
+    if (s->fb_on) return FB_FONT_ASCENT;
     if (!s->dpy || !font) return 11;
     return font->ascent;
 }
 
 int vs_font_height(void *vs) {
     VSurf *s = vs;
+    if (s->fb_on) return FB_FONT_H;
     if (!s->dpy || !font) return 15;
     return font->ascent + font->descent;
 }
@@ -998,6 +1779,113 @@ static int x11_mods_of(unsigned int state) {
     if (state & Mod1Mask) m |= VS_MOD_ALT;
     if (state & Mod4Mask) m |= VS_MOD_SUPER;
     return m;
+}
+
+/* answer another client's paste request out of clip_local (we own CLIPBOARD) */
+static void clip_serve_request(VSurf *s, XSelectionRequestEvent *rq) {
+    XSelectionEvent n;
+    memset(&n, 0, sizeof n);
+    n.type = SelectionNotify;
+    n.display = rq->display;
+    n.requestor = rq->requestor;
+    n.selection = rq->selection;
+    n.target = rq->target;
+    n.time = rq->time;
+    n.property = None; /* refused unless a branch below accepts */
+    if (clip_local) {
+        Atom prop = rq->property != None ? rq->property : rq->target;
+        if (rq->target == s->a_targets) {
+            Atom types[2];
+            types[0] = s->a_utf8;
+            types[1] = XA_STRING;
+            XChangeProperty(rq->display, rq->requestor, prop, XA_ATOM, 32,
+                            PropModeReplace, (unsigned char *)types, 2);
+            n.property = prop;
+        } else if (rq->target == s->a_utf8 || rq->target == XA_STRING) {
+            XChangeProperty(rq->display, rq->requestor, prop, rq->target, 8,
+                            PropModeReplace, (unsigned char *)clip_local,
+                            (int)strlen(clip_local));
+            n.property = prop;
+        }
+    }
+    XSendEvent(rq->display, rq->requestor, False, 0, (XEvent *)&n);
+    XFlush(rq->display);
+}
+
+/* read the converted selection out of our VS_CLIP property into clip_got */
+static const char *clip_read_property(VSurf *s) {
+    Atom type = None;
+    int fmt = 0;
+    unsigned long len = 0, left = 0;
+    unsigned char *data = NULL;
+    /* 1 MiB cap — clipboard text, not a file transfer */
+    if (XGetWindowProperty(s->dpy, s->win, s->a_clip_prop, 0, 1 << 18, True,
+                           AnyPropertyType, &type, &fmt, &len, &left,
+                           &data) != Success)
+        return "";
+    if (!data) return "";
+    if (type == s->a_incr || fmt != 8) {
+        /* INCR (incremental transfer) unsupported: too big, treat as empty */
+        XFree(data);
+        return "";
+    }
+    char *p = realloc(s->clip_got, len + 1);
+    if (!p) { XFree(data); return ""; }
+    memcpy(p, data, len);
+    p[len] = 0;
+    s->clip_got = p;
+    XFree(data);
+    return s->clip_got;
+}
+
+void vs_clipboard_set(void *vs, const char *text) {
+    VSurf *s = vs;
+    if (!text) text = "";
+    clip_store(&clip_local, text); /* also the "we own it" backing store */
+    if (!s->dpy) return;
+    XSetSelectionOwner(s->dpy, s->a_clipboard, s->win, CurrentTime);
+    XFlush(s->dpy);
+}
+
+const char *vs_clipboard_get(void *vs) {
+    VSurf *s = vs;
+    if (!s->dpy) return clip_local ? clip_local : "";
+    if (XGetSelectionOwner(s->dpy, s->a_clipboard) == s->win)
+        return clip_local ? clip_local : "";
+    /* ask the owner for UTF-8, falling back to STRING; pump selection
+       traffic only (other events stay queued for vs_wait), give up after
+       ~300ms so a dead owner can't hang the app */
+    Atom target = s->a_utf8;
+    XDeleteProperty(s->dpy, s->win, s->a_clip_prop);
+    XConvertSelection(s->dpy, s->a_clipboard, target, s->a_clip_prop, s->win,
+                      CurrentTime);
+    XFlush(s->dpy);
+    int fd = ConnectionNumber(s->dpy);
+    for (int waited = 0; waited <= 300;) {
+        XEvent e;
+        while (XCheckTypedWindowEvent(s->dpy, s->win, SelectionNotify, &e)) {
+            if (e.xselection.selection != s->a_clipboard) continue;
+            if (e.xselection.property != None) return clip_read_property(s);
+            if (target == s->a_utf8) { /* owner refused UTF-8: retry STRING */
+                target = XA_STRING;
+                XConvertSelection(s->dpy, s->a_clipboard, target, s->a_clip_prop,
+                                  s->win, CurrentTime);
+                XFlush(s->dpy);
+                continue;
+            }
+            return "";
+        }
+        while (XCheckTypedWindowEvent(s->dpy, s->win, SelectionRequest, &e))
+            clip_serve_request(s, &e.xselectionrequest);
+        fd_set rf;
+        FD_ZERO(&rf);
+        FD_SET(fd, &rf);
+        struct timeval tv;
+        tv.tv_sec = 0;
+        tv.tv_usec = 20 * 1000;
+        if (select(fd + 1, &rf, NULL, NULL, &tv) <= 0) waited += 20;
+    }
+    return "";
 }
 
 /* decode an X key event into last_key/last_text; 1 if a key we deliver, else 0 */
@@ -1132,6 +2020,11 @@ static int x11_translate(VSurf *s, XEvent *e) {
     case ClientMessage:
         if ((Atom)e->xclient.data.l[0] == s->wm_delete) return VS_EV_CLOSE;
         return -1;
+    case SelectionRequest: /* another client pasting what we copied */
+        clip_serve_request(s, &e->xselectionrequest);
+        return -1;
+    case SelectionClear: /* someone else copied; nothing to do */
+        return -1;
     default:
         return -1;
     }
@@ -1162,6 +2055,7 @@ static int x11_deliver(VSurf *s, XEvent *e) {
 
 int vs_wait(void *vs) {
     VSurf *s = vs;
+    if (s->fb_on) return fb_next(s, 1, -1);
     if (!s->dpy) return headless_wait(&s->w, &s->h);
     for (;;) {
         XEvent e;
@@ -1175,6 +2069,7 @@ int vs_wait(void *vs) {
    Flushes output first so this frame's drawing is on screen. */
 int vs_poll(void *vs) {
     VSurf *s = vs;
+    if (s->fb_on) return fb_next(s, 0, -1);
     if (!s->dpy) return headless_wait(&s->w, &s->h);
     XFlush(s->dpy);
     while (XPending(s->dpy)) {
@@ -1190,6 +2085,7 @@ int vs_poll(void *vs) {
    none. The tick source for game loops. */
 int vs_wait_timeout(void *vs, int ms) {
     VSurf *s = vs;
+    if (s->fb_on) return fb_next(s, 1, ms >= 0 ? ms : 0);
     if (!s->dpy) return headless_wait(&s->w, &s->h);
     int fd = ConnectionNumber(s->dpy);
     for (;;) {

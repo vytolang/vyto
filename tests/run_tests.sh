@@ -283,6 +283,23 @@ for name in textarea menu gallery; do
     fi
 done
 
+# --- framebuffer backend, file target: render a known pattern into a raw
+#     XRGB8888 file and verify it byte-for-byte (no display or fb device) ---
+mkdir -p tests/tmp
+rm -f tests/tmp/fb.raw
+render=$(VS_FBDEV=tests/tmp/fb.raw VS_FB_W=4 VS_FB_H=4 \
+         ./voltc run tests/ui/fb_render.vt 2>&1)
+got=$(od -An -tx1 -w16 tests/tmp/fb.raw 2>/dev/null)
+if [ "$render" = "rendered 4x4" ] && [ "$got" = "$(cat tests/ui/fb_render.expected)" ]; then
+    echo "PASS fbdev_render"
+else
+    echo "FAIL fbdev_render"
+    echo "--- render stdout ---"; printf '%s\n' "$render"
+    echo "--- expected ---"; cat tests/ui/fb_render.expected
+    echo "--- got ---"; printf '%s\n' "$got"
+    fail=1
+fi
+
 # --- listdir / isdir builtins + FilePicker over a seeded directory ---
 mkdir -p tests/tmp/pickdir/sub
 printf 'aaa\n' > tests/tmp/pickdir/a.txt

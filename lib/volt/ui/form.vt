@@ -152,6 +152,30 @@ export class TextField extends Widget {
     }
 
     override fn on_key(k: int, ch: string): bool {
+        // clipboard shortcuts: no selection model yet, so copy/cut act on
+        // the whole field and paste inserts at the caret
+        if (this.win != null && (this.win.mods & MOD_CTRL) != 0) {
+            if (k == 99) { // Ctrl+C
+                this.win.surf.set_clipboard(this.text);
+                return true;
+            }
+            if (k == 120) { // Ctrl+X
+                this.win.surf.set_clipboard(this.text);
+                this.text = "";
+                this.caret = 0;
+                return true;
+            }
+            if (k == 118) { // Ctrl+V
+                // single-line field: newlines flatten to spaces
+                let t = this.win.surf.clipboard().replace("\r", "").replace("\n", " ");
+                if (t.len > 0) {
+                    this.text = this.text.slice(0, this.caret) + t
+                              + this.text.slice(this.caret, this.text.len);
+                    this.caret += t.len;
+                }
+                return true;
+            }
+        }
         if (k == KEY_ENTER) {
             if (this.onSubmit != null && this.text.len > 0) {
                 let t = this.text;
@@ -568,6 +592,52 @@ export class TextArea extends Widget {
 
     override fn on_key(k: int, ch: string): bool {
         let line = this.lines[this.caret_row];
+        // clipboard shortcuts: no selection model yet, so copy/cut act on
+        // the caret line and paste splices (multi-line) text at the caret
+        if (this.win != null && (this.win.mods & MOD_CTRL) != 0) {
+            if (k == 99) { // Ctrl+C
+                this.win.surf.set_clipboard(line);
+                return true;
+            }
+            if (k == 120) { // Ctrl+X
+                this.win.surf.set_clipboard(line);
+                this.remove_row(this.caret_row);
+                if (this.caret_row >= this.lines.len) {
+                    this.caret_row = this.lines.len - 1;
+                }
+                this.caret_col = 0;
+                this.changed();
+                return true;
+            }
+            if (k == 118) { // Ctrl+V
+                let t = this.win.surf.clipboard().replace("\r", "");
+                if (t.len > 0) {
+                    let ls = t.split("\n");
+                    let before = line.slice(0, this.caret_col);
+                    let after = line.slice(this.caret_col, line.len);
+                    if (ls.len == 1) {
+                        this.lines[this.caret_row] = before + ls[0] + after;
+                        this.caret_col = before.len + ls[0].len;
+                    } else {
+                        let out: string[] = [];
+                        for (let i in 0..this.lines.len) {
+                            if (i == this.caret_row) {
+                                out.push(before + ls[0]);
+                                for (let j in 1..ls.len - 1) { out.push(ls[j]); }
+                                out.push(ls[ls.len - 1] + after);
+                            } else {
+                                out.push(this.lines[i]);
+                            }
+                        }
+                        this.lines = out;
+                        this.caret_row += ls.len - 1;
+                        this.caret_col = ls[ls.len - 1].len;
+                    }
+                    this.changed();
+                }
+                return true;
+            }
+        }
         if (k == KEY_ENTER) {
             let before = line.slice(0, this.caret_col);
             let after = line.slice(this.caret_col, line.len);

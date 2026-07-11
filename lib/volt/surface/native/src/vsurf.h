@@ -4,7 +4,14 @@
  *
  * Headless test backend: with VS_HEADLESS=1 in the environment, vs_open
  * connects to nothing, drawing is a no-op, metrics are fixed (9x15-like),
- * and vs_wait replays events scripted in the file named by VS_EVENTS. */
+ * and vs_wait replays events scripted in the file named by VS_EVENTS.
+ *
+ * Linux framebuffer backend: with VS_FBDEV=/dev/fb0 in the environment,
+ * vs_open maps the framebuffer instead of opening a display: drawing runs
+ * a small software rasterizer (built-in 8x8 font), input comes from evdev
+ * (/dev/input/event*), and the window size is the screen size. Pointing
+ * VS_FBDEV at a regular file (with VS_FB_W/VS_FB_H) renders into that file
+ * — the test path, and the embedded-bringup path. */
 #ifndef VSURF_H
 #define VSURF_H
 
@@ -122,6 +129,15 @@ int vs_scale_pct(void);
 int vs_x(void);
 int vs_y(void);
 int vs_wheel(void);       /* last VS_EV_MOUSE_WHEEL delta (positive = down) */
+
+/* Clipboard, UTF-8 text. set copies the text out; get returns "" when the
+   clipboard is empty or unavailable, and the returned pointer stays valid
+   until the next clipboard call. X11 speaks the CLIPBOARD selection (get
+   waits up to ~300ms for the owner); Win32 uses CF_UNICODETEXT; headless
+   and framebuffer keep a process-local buffer, seedable from the event
+   script with "clip <text>". */
+void vs_clipboard_set(void *s, const char *text);
+const char *vs_clipboard_get(void *s);
 
 /* escape hatches: native handles for the "drop one layer" case */
 void *vs_native_display(void *s);
