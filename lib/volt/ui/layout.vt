@@ -6,15 +6,67 @@ import { Widget, Painter, Theme, Size, BoxConstraints, bcLoose, bcTight } from "
 import { Rect, contains,
          KEY_UP, KEY_DOWN, KEY_HOME, KEY_END, KEY_PAGEUP, KEY_PAGEDOWN } from "volt/surface";
 
+// main-axis distribution (CSS justify-content). Only bites when no child has a
+// grow factor — a growing child eats the free space first, leaving none to
+// distribute.
+export const JUSTIFY_START: int = 0;    // pack at the start (default)
+export const JUSTIFY_CENTER: int = 1;   // pack the block centered
+export const JUSTIFY_END: int = 2;      // pack at the end
+export const JUSTIFY_BETWEEN: int = 3;  // first/last flush to edges, gaps equal
+export const JUSTIFY_AROUND: int = 4;   // equal gaps, half-gaps at the edges
+export const JUSTIFY_EVENLY: int = 5;   // equal gaps including both edges
+
+// cross-axis alignment (CSS align-items / align-self, see Widget.selfAlign).
+export const CROSS_STRETCH: int = 0;    // fill the cross axis (default)
+export const CROSS_START: int = 1;      // hug the leading edge, natural size
+export const CROSS_CENTER: int = 2;     // center on the cross axis
+export const CROSS_END: int = 3;        // hug the trailing edge
+
+// [startOffset, extraGap] added to a Column/Row's main-axis packing to realize
+// a JUSTIFY_* mode across `free` leftover pixels among `n` children.
+fn dist_offsets(mode: int, free: int, n: int): int[] {
+    if (free <= 0 || n <= 0) { return [0, 0]; }
+    if (mode == JUSTIFY_CENTER) { return [free / 2, 0]; }
+    if (mode == JUSTIFY_END) { return [free, 0]; }
+    if (mode == JUSTIFY_BETWEEN) {
+        if (n == 1) { return [free / 2, 0]; }   // one child: center it
+        return [0, free / (n - 1)];
+    }
+    if (mode == JUSTIFY_AROUND) {
+        let g = free / n;
+        return [g / 2, g];
+    }
+    if (mode == JUSTIFY_EVENLY) {
+        let g = free / (n + 1);
+        return [g, g];
+    }
+    return [0, 0];  // JUSTIFY_START
+}
+
+// [offset, size] for one child on the cross axis: how to place a `natural`-sized
+// child within `avail` cross pixels under a CROSS_* mode.
+fn cross_place(mode: int, avail: int, natural: int): int[] {
+    if (mode == CROSS_STRETCH) { return [0, avail]; }
+    let sz = natural;
+    if (sz > avail) { sz = avail; }
+    if (mode == CROSS_CENTER) { return [(avail - sz) / 2, sz]; }
+    if (mode == CROSS_END) { return [avail - sz, sz]; }
+    return [0, sz];  // CROSS_START
+}
+
 // vertical stack; children stretched to the inner width
 export class Column extends Widget {
-    padding: int;   // -1 = theme default
-    spacing: int;   // -1 = theme default
+    padding: int;    // -1 = theme default
+    spacing: int;    // -1 = theme default
+    mainAlign: int;  // JUSTIFY_* — vertical distribution of free space
+    crossAlign: int; // CROSS_* — horizontal alignment of children
 
     fn init(kids: Widget[]) {
         super.init();
         this.padding = -1;
         this.spacing = -1;
+        this.mainAlign = JUSTIFY_START;
+        this.crossAlign = CROSS_STRETCH;
         for (let k in kids) {
             this.add(k);
         }
@@ -31,6 +83,8 @@ export class Column extends Widget {
 
     builder fn gap(n: int) { this.spacing = n; return this; }
     builder fn pad(n: int) { this.padding = n; return this; }
+    builder fn justify(n: int) { this.mainAlign = n; return this; }
+    builder fn align(n: int) { this.crossAlign = n; return this; }
 
     override fn measure(s: Painter, th: Theme): Size {
         let pad = this.pad_of(th);
@@ -58,26 +112,33 @@ export class Column extends Widget {
         let n = this.children.len;
         if (n == 0) { return; }
         // Use layout() at the actual inner width so height-dependent-on-width
-        // children get the correct wrapped height.
+        // children get the correct wrapped height. Record natural width too, for
+        // cross-axis (horizontal) alignment when not stretching.
         let naturals: int[] = [];
+        let widths: int[] = [];
         let fixed = 0;
         let total_grow = 0;
         for (let c in this.children) {
             let bc = new BoxConstraints(0, inner.w, 0, 100000);
             let cs = c.layout(s, th, bc);
             naturals.push(cs.h);
+            widths.push(cs.w);
             fixed += cs.h;
             total_grow += c.grow;
         }
         let leftover = inner.h - fixed - gap * (n - 1);
         if (leftover < 0) { leftover = 0; }
+        // Free space grow children didn't claim is distributed by mainAlign.
+        let free = leftover;
+        if (total_grow > 0) { free = 0; }
+        let od = dist_offsets(this.mainAlign, free, n);
         let given = 0;
         let flex_seen = 0;
         let flex_total = 0;
         for (let c in this.children) {
             if (c.grow > 0) { flex_total += 1; }
         }
-        let y = inner.y;
+        let y = inner.y + od[0];
         for (let i in 0..n) {
             let c = this.children[i];
             let ch = naturals[i];
@@ -88,8 +149,11 @@ export class Column extends Widget {
                 given += share;
                 ch += share;
             }
-            c.arrange(s, th, Rect(inner.x, y, inner.w, ch));
-            y += ch + gap;
+            let ca = c.alignSelf;
+            if (ca < 0) { ca = this.crossAlign; }
+            let cp = cross_place(ca, inner.w, widths[i]);
+            c.arrange(s, th, Rect(inner.x + cp[0], y, cp[1], ch));
+            y += ch + gap + od[1];
         }
     }
 }
@@ -98,11 +162,15 @@ export class Column extends Widget {
 export class Row extends Widget {
     padding: int;
     spacing: int;
+    mainAlign: int;  // JUSTIFY_* — horizontal distribution of free space
+    crossAlign: int; // CROSS_* — vertical alignment of children
 
     fn init(kids: Widget[]) {
         super.init();
         this.padding = -1;
         this.spacing = -1;
+        this.mainAlign = JUSTIFY_START;
+        this.crossAlign = CROSS_STRETCH;
         for (let k in kids) {
             this.add(k);
         }
@@ -119,6 +187,8 @@ export class Row extends Widget {
 
     builder fn gap(n: int) { this.spacing = n; return this; }
     builder fn pad(n: int) { this.padding = n; return this; }
+    builder fn justify(n: int) { this.mainAlign = n; return this; }
+    builder fn align(n: int) { this.crossAlign = n; return this; }
 
     override fn measure(s: Painter, th: Theme): Size {
         let pad = this.pad_of(th);
@@ -142,24 +212,32 @@ export class Row extends Widget {
         let inner = Rect(r.x + pad, r.y + pad, r.w - 2 * pad, r.h - 2 * pad);
         let n = this.children.len;
         if (n == 0) { return; }
+        // Record natural height too, for cross-axis (vertical) alignment when
+        // not stretching.
         let naturals: int[] = [];
+        let heights: int[] = [];
         let fixed = 0;
         let total_grow = 0;
         for (let c in this.children) {
             let cs = c.measure(s, th);
             naturals.push(cs.w);
+            heights.push(cs.h);
             fixed += cs.w;
             total_grow += c.grow;
         }
         let leftover = inner.w - fixed - gap * (n - 1);
         if (leftover < 0) { leftover = 0; }
+        // Free space grow children didn't claim is distributed by mainAlign.
+        let free = leftover;
+        if (total_grow > 0) { free = 0; }
+        let od = dist_offsets(this.mainAlign, free, n);
         let given = 0;
         let flex_seen = 0;
         let flex_total = 0;
         for (let c in this.children) {
             if (c.grow > 0) { flex_total += 1; }
         }
-        let x = inner.x;
+        let x = inner.x + od[0];
         for (let i in 0..n) {
             let c = this.children[i];
             let cw = naturals[i];
@@ -170,8 +248,11 @@ export class Row extends Widget {
                 given += share;
                 cw += share;
             }
-            c.arrange(s, th, Rect(x, inner.y, cw, inner.h));
-            x += cw + gap;
+            let ca = c.alignSelf;
+            if (ca < 0) { ca = this.crossAlign; }
+            let cp = cross_place(ca, inner.h, heights[i]);
+            c.arrange(s, th, Rect(x, inner.y + cp[0], cw, cp[1]));
+            x += cw + gap + od[1];
         }
     }
 }
