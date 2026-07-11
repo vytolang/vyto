@@ -1,0 +1,676 @@
+// VoltGallery II — the full volt/ui showcase. Covers the whole widget catalog,
+// several custom widgets, the features added after the original gallery.vt (full
+// flexbox alignment, Slider, widget self-animation, the expanded event set), and
+// three composed demo screens: Login, Profile, Dashboard.
+//
+// Rendering tiers:
+//   Rich (blend2d, AA):  ./voltc run apps/gallery/gallery2.vt
+//   Lean (vector):       ./voltc run apps/gallery/gallery2.vt -- --surface
+//   Bundle:              ./voltc build apps/gallery/gallery2.vt --release --bundle -o gallery2
+//
+// Framed: MenuBar + a TabView (Inputs / Display / Layout / Overlays / Animation /
+// Events / Login / Profile / Dashboard) over a StatusBar. Every control updates
+// the StatusBar and prints to stdout.
+
+import { Window, Column, Row, Spacer, Label, Button, TextField, Checkbox,
+         ListBox, TextArea, RadioGroup, Switch, SegmentedControl, Stepper,
+         Dropdown, ProgressBar, Slider,
+         Text, Card, Badge, Chip, Icon, Avatar,
+         Divider, SizedBox, Container, Center, Stack,
+         Positioned, Wrap, Grid, Expanded, ScrollView,
+         TabView, Accordion, StatusBar,
+         Menu, MenuBar,
+         FilePicker, MessageDialog, ConfirmDialog, InputDialog, Popover,
+         Widget, Painter, Theme, Size, theme_light, theme_dark,
+         JUSTIFY_START, JUSTIFY_CENTER, JUSTIFY_BETWEEN,
+         JUSTIFY_EVENLY, CROSS_START, CROSS_CENTER, CROSS_END,
+         EASE_OUT_CUBIC, EASE_OUT_BACK, EASE_IN_OUT_SINE,
+         ALIGN_LEFT, ALIGN_CENTER,
+         ICON_PERSON, ICON_BELL, ICON_GEAR, ICON_HEART, ICON_STAR,
+         ICON_MAIL, ICON_HOME, ICON_SEARCH } from "volt/ui";
+import { GfxPainter } from "volt/gfx/painter";
+import { Rect, rgb, mix } from "volt/surface";
+
+fn font_path(): string {
+    return "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf";
+}
+
+fn pct(v: float): int { return (v * 100.0) as int; }
+
+// A small muted caption stacked above a widget.
+fn titled(caption: string, w: Widget): Widget {
+    let lbl = new Label(caption);
+    lbl.strong = false;
+    return new Column([lbl, w]).gap(2);
+}
+
+fn mk_box(w: int, h: int, color: int): Widget {
+    return new Container(w, h, 0, color, null);
+}
+
+// Shared app state: routes every action to the status bar + stdout.
+class GState {
+    sb: StatusBar;
+    count: int;
+    fn init(sb: StatusBar) {
+        this.sb = sb;
+        this.count = 0;
+    }
+    fn action(m: string) {
+        this.sb.right_text = m;
+        print("action: " + m);
+    }
+}
+
+// ============================================================ custom widgets
+
+// Self-animating pulse: a ping-pong tween declared in init (auto-registered, no
+// Window wiring). The Window only runs the frame clock while a tween is live.
+class PulseBox extends Widget {
+    t: float;
+    tint: int;
+    fn init(tint: int) {
+        super.init();
+        this.t = 0.0;
+        this.tint = tint;
+        let p = this;
+        this.animate_value(0.0, 1.0, 900, true, EASE_IN_OUT_SINE, (v) => { p.t = v; });
+    }
+    override fn measure(s: Painter, th: Theme): Size { return Size(110, 110); }
+    override fn draw(s: Painter, th: Theme) {
+        let cx = this.bounds.x + this.bounds.w / 2;
+        let cy = this.bounds.y + this.bounds.h / 2;
+        let r = 16 + (this.t * 32.0) as int;
+        s.fill_round(Rect(cx - r, cy - r, 2 * r, 2 * r), r,
+                     mix(th.surface, this.tint, 0.3 + this.t * 0.5));
+    }
+}
+
+// One-shot click-triggered animation with an overshoot pop.
+class PopBar extends Widget {
+    v: float;
+    fn init() {
+        super.init();
+        this.v = 0.0;
+        this.focusable = true;
+    }
+    override fn measure(s: Painter, th: Theme): Size { return Size(240, 24); }
+    override fn draw(s: Painter, th: Theme) {
+        s.fill_round(this.bounds, th.radius_md, th.surface_sunken);
+        let w = (this.v * this.bounds.w as float) as int;
+        if (w > 2) {
+            s.fill_round(Rect(this.bounds.x, this.bounds.y, w, this.bounds.h),
+                         th.radius_md, th.primary);
+        }
+    }
+    override fn on_click(x: int, y: int): bool {
+        let p = this;
+        let target = 0.4 + (this.bounds.x % 5) as float * 0.11;
+        this.animate_value(0.0, target, 500, false, EASE_OUT_BACK, (val) => { p.v = val; });
+        return true;
+    }
+}
+
+// Logs every expanded interaction hook via an onEvent sink.
+class InteractiveCard extends Widget {
+    title: string;
+    last: string;
+    onEvent: fn(string);
+    fn init(title: string) {
+        super.init();
+        this.title = title;
+        this.last = "hover / click / double-click / long-press / drag me";
+        this.focusable = true;
+    }
+    fn emit(e: string): bool {
+        this.last = e;
+        if (this.onEvent != null) { this.onEvent(e); }
+        return true;
+    }
+    override fn measure(s: Painter, th: Theme): Size { return Size(380, 92); }
+    override fn draw(s: Painter, th: Theme) {
+        let bg = th.surface_raised;
+        if (this.hovered) { bg = mix(th.surface_raised, th.primary, 0.12); }
+        if (this.pressed) { bg = mix(th.surface_raised, th.primary, 0.24); }
+        s.fill_round(this.bounds, th.radius_md, bg);
+        let bw = 1;
+        let border = th.border;
+        if (this.focused) { bw = 2; border = th.primary; }
+        s.stroke_round(this.bounds, th.radius_md, bw, border);
+        let fh = s.font_height();
+        s.text_in(Rect(this.bounds.x + 12, this.bounds.y + 10, this.bounds.w - 24, fh + 4),
+                  0, this.title, th.on_surface);
+        s.text_in(Rect(this.bounds.x + 12, this.bounds.y + 42, this.bounds.w - 24, fh + 4),
+                  0, "last: " + this.last, th.on_surface_muted);
+    }
+    override fn on_click(x: int, y: int): bool { return this.emit("click"); }
+    override fn on_release(x: int, y: int): bool { return this.emit("release"); }
+    override fn on_double_click(x: int, y: int): bool { return this.emit("double-click"); }
+    override fn on_long_press(x: int, y: int): bool { return this.emit("long-press"); }
+    override fn on_key_up(k: int): bool { return this.emit("key-up " + k); }
+    override fn on_hover_enter(): bool { return this.emit("hover-enter"); }
+    override fn on_hover_leave(): bool { return this.emit("hover-leave"); }
+    override fn on_focus(): bool { return this.emit("focus"); }
+    override fn on_blur(): bool { return this.emit("blur"); }
+    override fn on_drag_start(x: int, y: int): bool { return this.emit("drag-start"); }
+    override fn on_drag(dx: int, dy: int): bool { return this.emit("drag " + dx); }
+    override fn on_drag_end(x: int, y: int): bool { return this.emit("drag-end"); }
+    override fn drop_handlers() { this.onEvent = null; }
+}
+
+// Dashboard tile with a count-up animation on the big number.
+class StatCard extends Widget {
+    title: string;
+    target: int;
+    suffix: string;
+    tint: int;
+    shown: float;
+    fn init(title: string, target: int, suffix: string, tint: int) {
+        super.init();
+        this.title = title;
+        this.target = target;
+        this.suffix = suffix;
+        this.tint = tint;
+        this.shown = 0.0;
+        let c = this;
+        this.animate_value(0.0, target as float, 800, false, EASE_OUT_CUBIC,
+                           (v) => { c.shown = v; });
+    }
+    override fn measure(s: Painter, th: Theme): Size { return Size(150, 84); }
+    override fn draw(s: Painter, th: Theme) {
+        s.fill_round(this.bounds, th.radius_md, th.surface_raised);
+        s.stroke_round(this.bounds, th.radius_md, 1, th.border);
+        // accent bar
+        s.fill_round(Rect(this.bounds.x, this.bounds.y, 4, this.bounds.h), 2, this.tint);
+        let fh = s.font_height();
+        s.text_in(Rect(this.bounds.x + 14, this.bounds.y + 10, this.bounds.w - 20, fh + 2),
+                  0, this.title, th.on_surface_muted);
+        s.set_weight(th.type_title_weight);
+        s.text_in(Rect(this.bounds.x + 14, this.bounds.y + 36, this.bounds.w - 20, fh + 8),
+                  0, (this.shown as int) + this.suffix, th.on_surface);
+        s.set_weight(th.type_body_weight);
+    }
+}
+
+// Bars grow from zero on mount (one-shot tween). Values are 0..1 heights.
+class BarChart extends Widget {
+    values: float[];
+    tint: int;
+    prog: float;
+    fn init(values: float[], tint: int) {
+        super.init();
+        this.values = values;
+        this.tint = tint;
+        this.prog = 0.0;
+        let c = this;
+        this.animate_value(0.0, 1.0, 900, false, EASE_OUT_CUBIC, (v) => { c.prog = v; });
+    }
+    override fn measure(s: Painter, th: Theme): Size { return Size(260, 120); }
+    override fn draw(s: Painter, th: Theme) {
+        let n = this.values.len;
+        if (n == 0) { return; }
+        let gap = 8;
+        let bw = (this.bounds.w - gap * (n - 1)) / n;
+        let base = this.bounds.y + this.bounds.h;
+        for (let i in 0..n) {
+            let full = (this.values[i] * this.bounds.h as float) as int;
+            let h = (full as float * this.prog) as int;
+            let x = this.bounds.x + i * (bw + gap);
+            let bar = Rect(x, base - h, bw, h);
+            s.fill_round(bar, th.radius_sm, mix(this.tint, th.on_surface, 0.0));
+        }
+    }
+}
+
+// Tiny line chart: connects normalized points with strokes.
+class Sparkline extends Widget {
+    points: float[];
+    tint: int;
+    fn init(points: float[], tint: int) {
+        super.init();
+        this.points = points;
+        this.tint = tint;
+    }
+    override fn measure(s: Painter, th: Theme): Size { return Size(260, 60); }
+    override fn draw(s: Painter, th: Theme) {
+        let n = this.points.len;
+        if (n < 2) { return; }
+        let step = this.bounds.w / (n - 1);
+        let prev_x = this.bounds.x;
+        let prev_y = this.bounds.y + this.bounds.h
+                     - (this.points[0] * this.bounds.h as float) as int;
+        for (let i in 1..n) {
+            let x = this.bounds.x + i * step;
+            let y = this.bounds.y + this.bounds.h
+                    - (this.points[i] * this.bounds.h as float) as int;
+            s.line(prev_x, prev_y, x, y, this.tint);
+            prev_x = x;
+            prev_y = y;
+        }
+    }
+}
+
+// Clickable 5-star rating (custom hit + paint). Fires onRate.
+class RatingStars extends Widget {
+    rating: int;
+    onRate: fn(int);
+    fn init(rating: int) {
+        super.init();
+        this.rating = rating;
+        this.focusable = true;
+    }
+    fn cell(): int { return 30; }
+    override fn measure(s: Painter, th: Theme): Size { return Size(5 * this.cell(), this.cell()); }
+    override fn draw(s: Painter, th: Theme) {
+        let c = this.cell();
+        let gold = rgb(0xF5, 0xB3, 0x41);
+        for (let i in 0..5) {
+            let on = i < this.rating;
+            let col = th.surface_sunken;
+            if (on) { col = gold; }
+            let pad = 4;
+            let r = Rect(this.bounds.x + i * c + pad, this.bounds.y + pad,
+                         c - 2 * pad, c - 2 * pad);
+            s.fill_round(r, (c - 2 * pad) / 2, col);
+        }
+    }
+    override fn on_click(x: int, y: int): bool {
+        let idx = (x - this.bounds.x) / this.cell();
+        if (idx < 0) { idx = 0; }
+        if (idx > 4) { idx = 4; }
+        this.rating = idx + 1;
+        if (this.onRate != null) { this.onRate(this.rating); }
+        return true;
+    }
+    override fn drop_handlers() { this.onRate = null; }
+}
+
+// ============================================================ catalog tabs
+
+fn build_inputs_tab(st: GState): Widget {
+    let counter_btn = new Button("Bump counter");
+    let counter_lbl = new Label("count: 0");
+    counter_btn.onClick = (w) => {
+        st.count += 1;
+        counter_lbl.text = "count: " + st.count;
+        st.action("bumped to " + st.count);
+    };
+
+    let tf = new TextField("type here, then press Enter");
+    tf.onSubmit = (t) => st.action("submitted: " + t);
+
+    let cb = new Checkbox("Enable feature");
+    cb.onToggle = (on) => st.action("checkbox: " + on);
+    let sw = new Switch(false);
+    sw.onToggle = (on) => st.action("switch: " + on);
+
+    let rg = new RadioGroup(["Small", "Medium", "Large"], [1, 2, 3]);
+    rg.onChange = (v) => st.action("radio: " + v);
+
+    let sc = new SegmentedControl(["Day", "Week", "Month"]);
+    sc.onSelect = (i) => st.action("segment: " + i);
+
+    let stepper = new Stepper(50, 0, 100);
+    let pb = new ProgressBar(0.5, -1, -1);
+    stepper.onChange = (v) => {
+        pb.set_progress(v as float / 100.0);
+        st.action("stepper: " + v);
+    };
+
+    let dd = new Dropdown(["Red", "Green", "Blue"]);
+    dd.onSelect = (i) => st.action("dropdown: " + i);
+
+    let lb = new ListBox();
+    let items: string[] = ["alpha", "beta", "gamma", "delta"];
+    let checks: bool[] = [false, true, false, false];
+    lb.set_items(items, checks);
+    lb.onToggle = (i) => st.action("listbox: " + items[i]);
+
+    let ta = new TextArea();
+    ta.set_text("multi-line editor —\ntype freely");
+
+    let slider = new Slider(0.3);
+    let sval = new Label("30%");
+    slider.onChange = (v) => { sval.text = pct(v) + "%"; st.action("slider: " + pct(v) + "%"); };
+
+    return new Column([
+        new Row([counter_btn, counter_lbl]).gap(10).align(CROSS_CENTER),
+        tf,
+        new Row([cb, new SizedBox(20, 0, null), new Label("Switch:"), sw]).gap(4).align(CROSS_CENTER),
+        new Label("RadioGroup — pick a size:"), rg,
+        new Label("SegmentedControl — pick a view:"), sc,
+        new Label("Stepper drives ProgressBar:"),
+        new Row([new Label("Value:"), stepper, new Expanded(pb)]).gap(8).align(CROSS_CENTER),
+        new Label("Dropdown — pick a color:"), dd,
+        new Label("Slider — drag or arrow-key (Shift = fine):"),
+        new Row([new Expanded(slider), sval]).gap(10).align(CROSS_CENTER),
+        new Label("ListBox — click a row to toggle:"), new SizedBox(-1, 90, lb),
+        new Label("TextArea:"), new SizedBox(-1, 90, ta),
+    ]).gap(8).pad(12);
+}
+
+fn build_display_tab(st: GState): Widget {
+    let lorem = "The quick brown fox jumps over the lazy dog. "
+              + "Pack my box with five dozen liquor jugs.";
+
+    let tL = new Text(lorem); tL.align = ALIGN_LEFT;
+    let tC = new Text(lorem); tC.align = ALIGN_CENTER;
+
+    // Badges over placeholder boxes
+    let badge1 = new Badge("5", rgb(0xDC, 0x3C, 0x3C), rgb(255, 255, 255), mk_box(40, 40, rgb(200, 200, 200)));
+    let badge2 = new Badge("NEW", rgb(0x2E, 0xA0, 0x43), rgb(255, 255, 255), mk_box(40, 40, rgb(200, 200, 200)));
+
+    // Chips (deletable)
+    let chip1 = new Chip("tag", false, -1);
+    let chip2 = new Chip("deletable", true, -1);
+    chip2.onDelete = (c) => { st.action("chip deleted"); c.bounds = Rect(0, 0, 0, 0); };
+
+    // Icons + Avatars
+    let icons = new Row([
+        new Icon(ICON_HOME, 24), new Icon(ICON_SEARCH, 24), new Icon(ICON_BELL, 24),
+        new Icon(ICON_MAIL, 24), new Icon(ICON_HEART, 24), new Icon(ICON_STAR, 24),
+        new Icon(ICON_GEAR, 24), new Icon(ICON_PERSON, 24),
+    ]).gap(12).align(CROSS_CENTER);
+
+    let avatars = new Row([
+        new Avatar("AB", 44), new Avatar("CD", 44), new Avatar("EF", 44),
+    ]).gap(10).align(CROSS_CENTER);
+
+    return new Column([
+        new Card(8, -1, -1, "Text — ALIGN_LEFT", tL),
+        new Card(8, -1, -1, "Text — ALIGN_CENTER", tC),
+        new Card(8, -1, -1, "Badges", new Row([badge1, badge2]).gap(18).align(CROSS_CENTER)),
+        new Card(8, -1, -1, "Chips (click x to delete)",
+                 new Row([chip1, chip2]).gap(8).align(CROSS_CENTER)),
+        new Card(8, -1, -1, "Icons", icons),
+        new Card(8, -1, -1, "Avatars", avatars),
+        new Card(8, -1, -1, "Divider below", new Column([
+            new Label("above"), new Divider(false), new Label("below"),
+        ]).gap(6)),
+    ]).gap(10).pad(12);
+}
+
+fn build_layout_tab(): Widget {
+    // Grid (3 cols)
+    let grid = new Grid(3, 8, [
+        mk_box(0, 40, rgb(0x8C, 0xA8, 0xFF)), mk_box(0, 40, rgb(0x8C, 0xC8, 0xB8)),
+        mk_box(0, 40, rgb(0xFF, 0xB8, 0x8C)), mk_box(0, 40, rgb(0xC8, 0x8C, 0xFF)),
+        mk_box(0, 40, rgb(0xFF, 0x8C, 0xA8)), mk_box(0, 40, rgb(0x8C, 0xD8, 0xFF)),
+    ]);
+
+    // Wrap (flows chips to the next line)
+    let wrap = new Wrap(6, 6, [
+        new Chip("layout", false, -1), new Chip("flexbox", false, -1),
+        new Chip("wrap", false, -1), new Chip("grid", false, -1),
+        new Chip("stack", false, -1), new Chip("responsive", false, -1),
+        new Chip("constraints", false, -1),
+    ]);
+
+    // Stack + Positioned (overlapping)
+    let stack = new Stack();
+    stack.add(new Positioned(0, 0, 120, 80, mk_box(120, 80, rgb(0x8C, 0xA8, 0xFF))));
+    stack.add(new Positioned(40, 24, 120, 80, mk_box(120, 80, rgb(0xFF, 0xB8, 0x8C))));
+    stack.add(new Positioned(80, 48, 120, 80, mk_box(120, 80, rgb(0x8C, 0xC8, 0xB8))));
+
+    // justify + align demos
+    let jrow = fn_justify_rows();
+    let arow = fn_cross_rows();
+
+    return new Column([
+        new Label("Grid — fixed 3 columns"), grid,
+        new Divider(false),
+        new Label("Wrap — flows to the next line"), wrap,
+        new Divider(false),
+        new Label("Stack + Positioned — z-layered overlap"),
+        new SizedBox(-1, 130, stack),
+        new Divider(false),
+        new Label("Row.justify — main-axis distribution"), jrow,
+        new Divider(false),
+        new Label("Row.align — cross-axis alignment (60px band)"), arow,
+    ]).gap(10).pad(12);
+}
+
+fn fn_justify_rows(): Widget {
+    return new Column([
+        titled("START", new Row([new Button("A"), new Button("B"), new Button("C")]).justify(JUSTIFY_START)),
+        titled("CENTER", new Row([new Button("A"), new Button("B"), new Button("C")]).justify(JUSTIFY_CENTER)),
+        titled("BETWEEN", new Row([new Button("A"), new Button("B"), new Button("C")]).justify(JUSTIFY_BETWEEN)),
+        titled("EVENLY", new Row([new Button("A"), new Button("B"), new Button("C")]).justify(JUSTIFY_EVENLY)),
+    ]).gap(8);
+}
+
+fn fn_cross_rows(): Widget {
+    let over = new Label("selfAlign=END");
+    over.selfAlign(CROSS_END);
+    return new Column([
+        titled("START", new Row([new Container(40, 60, 0, rgb(0x6C, 0x8C, 0xFF), null), new Label("a"), new Label("bb")]).align(CROSS_START)),
+        titled("CENTER", new Row([new Container(40, 60, 0, rgb(0x6C, 0x8C, 0xFF), null), new Label("a"), new Label("bb")]).align(CROSS_CENTER)),
+        titled("END", new Row([new Container(40, 60, 0, rgb(0x6C, 0x8C, 0xFF), null), new Label("a"), new Label("bb")]).align(CROSS_END)),
+        titled("CENTER + one selfAlign=END", new Row([new Container(40, 60, 0, rgb(0x9C, 0x6C, 0xFF), null), new Label("center"), over]).align(CROSS_CENTER)),
+    ]).gap(8);
+}
+
+fn build_overlays_tab(st: GState, win: Window): Widget {
+    let confirm_dlg = new ConfirmDialog("Confirm Action", "Proceed with this action?");
+    let input_dlg = new InputDialog("Enter Name", "Please enter your name:", "");
+    let msg_dlg = new MessageDialog("About", "VoltGallery II\nEvery volt/ui widget, live.");
+    let file_dlg = new FilePicker(".", false);
+    confirm_dlg.onConfirm = () => st.action("confirmed");
+    confirm_dlg.onCancel = () => st.action("cancelled");
+    input_dlg.onAccept = (t) => st.action("typed: " + t);
+    file_dlg.onAccept = (p) => st.action("picked: " + p);
+
+    let b_confirm = new Button("ConfirmDialog");
+    b_confirm.onClick = (w) => win.open_overlay(confirm_dlg);
+    let b_input = new Button("InputDialog");
+    b_input.onClick = (w) => win.open_overlay(input_dlg);
+    let b_msg = new Button("MessageDialog");
+    b_msg.onClick = (w) => win.open_overlay(msg_dlg);
+    let b_file = new Button("FilePicker");
+    b_file.onClick = (w) => win.open_overlay(file_dlg);
+    let b_pop = new Button("Popover");
+    b_pop.onClick = (w) => {
+        let pop = new Popover(b_pop.bounds.x, b_pop.bounds.y + b_pop.bounds.h);
+        pop.add(new Label("Hello from a Popover!"));
+        win.open_overlay(pop);
+        st.action("popover opened");
+    };
+
+    let acc = new Accordion(["Section 1: Layout", "Section 2: Input", "Section 3: Display"]);
+    acc.add_section(new Label("Two-pass measure/arrange with BoxConstraints."));
+    acc.add_section(new Label("Focus, keyboard, and the expanded mouse events."));
+    acc.add_section(new Label("Read-only: Text, Card, Badge, Chip, Icon, Avatar."));
+
+    return new Column([
+        new Label("Overlays — click to launch:"),
+        new Row([b_confirm, b_input, b_msg]).gap(8),
+        new Row([b_file, b_pop]).gap(8),
+        new Divider(false),
+        new Label("Accordion — click a header to expand:"), acc,
+    ]).gap(10).pad(12);
+}
+
+// ============================================================ animation + events
+
+fn build_animation_tab(): Widget {
+    let pulses = new Row([
+        new PulseBox(rgb(0x4C, 0x8C, 0xFF)), new PulseBox(rgb(0xFF, 0x6C, 0x8C)),
+        new PulseBox(rgb(0x4C, 0xCC, 0x8C)),
+    ]).gap(16).justify(JUSTIFY_CENTER);
+
+    return new Column([
+        new Label("Widget self-animation — this.animate_value(), auto-registered"),
+        new Text("The circles loop forever via a ping-pong tween declared in the "
+               + "widget's init — no Window plumbing. Buttons self-animate a "
+               + "hover-lift; the bar pops on click."),
+        pulses,
+        new Divider(false),
+        new Row([new Button("Hover me"), new Button("And me")]).gap(12),
+        new PopBar(),
+    ]).gap(12).pad(12);
+}
+
+fn build_events_tab(st: GState): Widget {
+    let card1 = new InteractiveCard("Card 1");
+    let card2 = new InteractiveCard("Card 2 (Tab / Shift+Tab to focus)");
+    card1.onEvent = (e) => st.action("card1: " + e);
+    card2.onEvent = (e) => st.action("card2: " + e);
+    return new Column([
+        new Label("Expanded interactions — every hook logs to the status bar"),
+        new Text("Hover, click, double-click, long-press (hold ~0.5s), and drag "
+               + "each card. Tab / Shift+Tab move focus; a key release over a "
+               + "focused card fires key-up."),
+        card1, card2,
+    ]).gap(12).pad(12);
+}
+
+// ============================================================ demo screens
+
+fn build_login_screen(st: GState): Widget {
+    let user = new TextField("username");
+    let pass = new TextField("password");
+    let remember = new Checkbox("Remember me");
+    let signin = new Button("Sign In");
+    signin.onClick = (w) => st.action("sign in: " + user.text);
+    let forgot = new Label("Forgot password?");
+    forgot.strong = false;
+
+    let form = new Column([
+        new Label("Welcome back"),
+        new Text("Sign in to your VoltGallery account."),
+        new SizedBox(0, 4, null),
+        titled("Username", user),
+        titled("Password", pass),
+        new Row([remember, new Spacer(), forgot]).align(CROSS_CENTER),
+        new SizedBox(0, 4, null),
+        signin,
+    ]).gap(10);
+
+    let card = new Card(20, -1, -1, "", form);
+    return new Center(new SizedBox(360, 360, card));
+}
+
+fn build_profile_screen(st: GState): Widget {
+    let header = new Row([
+        new Avatar("JD", 64),
+        new Column([
+            new Label("Jane Doe"),
+            new Text("Senior Volt Engineer · San Francisco"),
+        ]).gap(2),
+    ]).gap(14).align(CROSS_CENTER);
+
+    let skills = new Wrap(6, 6, [
+        new Chip("volt", false, -1), new Chip("ui", false, -1),
+        new Chip("gfx", false, -1), new Chip("runtime", false, -1),
+        new Chip("compilers", false, -1),
+    ]);
+
+    let stars = new RatingStars(4);
+    stars.onRate = (r) => st.action("rated " + r + " stars");
+
+    let notif = new Switch(true);
+    notif.onToggle = (on) => st.action("notifications: " + on);
+    let theme_seg = new SegmentedControl(["Light", "Dark", "Auto"]);
+    theme_seg.onSelect = (i) => st.action("theme pref: " + i);
+
+    return new Column([
+        header,
+        new Divider(false),
+        new Label("Skills"), skills,
+        new Label("Rating"), stars,
+        new Divider(false),
+        new Row([new Icon(ICON_BELL, 20), new Label("Notifications"), new Spacer(), notif]).gap(8).align(CROSS_CENTER),
+        new Label("Theme preference"), theme_seg,
+    ]).gap(10).pad(14);
+}
+
+fn build_dashboard_screen(st: GState): Widget {
+    let stats = new Row([
+        new StatCard("Users", 1284, "", rgb(0x4C, 0x8C, 0xFF)),
+        new StatCard("Revenue", 92, "k", rgb(0x2E, 0xA0, 0x43)),
+        new StatCard("Errors", 7, "", rgb(0xDC, 0x3C, 0x3C)),
+    ]).gap(12).justify(JUSTIFY_BETWEEN);
+
+    let bars: float[] = [0.4, 0.7, 0.55, 0.9, 0.65, 0.8, 0.5];
+    let chart = new BarChart(bars, rgb(0x4C, 0x8C, 0xFF));
+
+    let spark_pts: float[] = [0.2, 0.5, 0.35, 0.7, 0.6, 0.85, 0.5, 0.9];
+    let spark = new Sparkline(spark_pts, rgb(0x2E, 0xA0, 0x43));
+
+    let load = new ProgressBar(0.72, -1, -1);
+
+    let recent = new ListBox();
+    let ritems: string[] = ["Deploy #482 succeeded", "New signup: alice",
+                            "Alert: latency spike", "Backup completed"];
+    let rchecks: bool[] = [false, false, false, false];
+    recent.set_items(ritems, rchecks);
+
+    return new Column([
+        new Label("Overview"),
+        stats,
+        new Row([
+            new Expanded(new Card(10, -1, -1, "Weekly traffic", chart)),
+            new Expanded(new Card(10, -1, -1, "Trend", new Column([
+                spark, new SizedBox(0, 6, null), new Label("Server load"), load,
+            ]).gap(4))),
+        ]).gap(12),
+        new Card(10, -1, -1, "Recent activity", new SizedBox(-1, 100, recent)),
+    ]).gap(12).pad(12);
+}
+
+// ============================================================ main
+
+fn build_menubar(st: GState, win: Window): MenuBar {
+    let bar = new MenuBar();
+    let file_menu = bar.add_menu(new Menu("File"));
+    file_menu.add("Exit").onSelect = () => win.close();
+    let view_menu = bar.add_menu(new Menu("View"));
+    view_menu.add("Light theme").onSelect = () => {
+        win.theme = theme_light(); st.action("light theme"); win.layout(); win.redraw();
+    };
+    view_menu.add("Dark theme").onSelect = () => {
+        win.theme = theme_dark(); st.action("dark theme"); win.layout(); win.redraw();
+    };
+    let help_menu = bar.add_menu(new Menu("Help"));
+    let about = new MessageDialog("About VoltGallery II",
+        "The complete volt/ui showcase.\nWidgets · custom widgets · demo screens.");
+    help_menu.add("About").onSelect = () => win.open_overlay(about);
+    return bar;
+}
+
+fn main() {
+    let use_surface = false;
+    let a = args();
+    for (let i in 0..a.len) {
+        if (a[i] == "--surface") { use_surface = true; }
+    }
+
+    let win = new Window("VoltGallery II", 1000, 700);
+    if (!use_surface) {
+        win.use_painter(new GfxPainter(win.surface(), font_path(), 15.0));
+    }
+
+    let sb = new StatusBar("VoltGallery II — the full widget showcase", "Ready");
+    let st = new GState(sb);
+
+    win.menubar = build_menubar(st, win);
+
+    let tv = new TabView(["Inputs", "Display", "Layout", "Overlays",
+                          "Animation", "Events", "Login", "Profile", "Dashboard"]);
+    tv.grow = 1;
+    tv.onSwitch = (i) => { sb.right_text = "tab " + i; };
+    tv.add_panel(new ScrollView(build_inputs_tab(st)));
+    tv.add_panel(new ScrollView(build_display_tab(st)));
+    tv.add_panel(new ScrollView(build_layout_tab()));
+    tv.add_panel(new ScrollView(build_overlays_tab(st, win)));
+    tv.add_panel(new ScrollView(build_animation_tab()));
+    tv.add_panel(new ScrollView(build_events_tab(st)));
+    tv.add_panel(new ScrollView(build_login_screen(st)));
+    tv.add_panel(new ScrollView(build_profile_screen(st)));
+    tv.add_panel(new ScrollView(build_dashboard_screen(st)));
+
+    win.root = new Column([tv, sb]);
+    print("gallery2 ready");
+    win.run();
+    print("bye");
+}

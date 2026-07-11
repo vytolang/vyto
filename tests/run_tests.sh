@@ -417,6 +417,12 @@ if [ -f /usr/include/X11/Xlib.h ]; then
         echo "FAIL app_uidemo_builds"
         fail=1
     fi
+    if ./voltc build apps/gallery/gallery2.vt >/dev/null; then
+        echo "PASS app_gallery2_builds"
+    else
+        echo "FAIL app_gallery2_builds"
+        fail=1
+    fi
     if ./voltc build apps/notepad/notepad.vt >/dev/null; then
         echo "PASS app_notepad_builds"
     else

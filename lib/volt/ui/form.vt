@@ -3,13 +3,13 @@
 // SegmentedControl, Stepper, Dropdown, ProgressBar.
 
 import { Widget, Painter, Theme, Size, BoxConstraints, bcLoose,
-         WEIGHT_REG, WEIGHT_BOLD } from "volt/ui/core";
+         WEIGHT_REG, WEIGHT_BOLD, EASE_LINEAR, EASE_OUT_CUBIC } from "volt/ui/core";
 import { Tween } from "volt/ui/anim";
 import { utf8_prev, utf8_next } from "volt/util/helper";
 import { Rect, rgb, mix,
           KEY_ENTER, KEY_BACKSPACE, KEY_UP, KEY_DOWN, KEY_LEFT,
           KEY_RIGHT, KEY_DELETE, KEY_HOME, KEY_END,
-          MOD_CTRL, MOD_ALT } from "volt/surface";
+          MOD_CTRL, MOD_ALT, MOD_SHIFT } from "volt/surface";
 
 // insertable text arrived with this key event: the surface layer only sets
 // text for printable input, and Ctrl/Alt chords are shortcuts, not typing
@@ -46,11 +46,14 @@ export class Label extends Widget {
 export class Button extends Widget {
     label: string;
     onClick: fn(Button);
+    lift: float;        // 0..1 hover-lift amount, animated on enter/leave
+    lift_tw: Tween;     // in-flight lift animation (cancelled on re-trigger)
 
     fn init(label: string) {
         super.init();
         this.label = label;
         this.focusable = true;
+        this.lift = 0.0;
     }
 
     fn fire() {
@@ -66,9 +69,26 @@ export class Button extends Widget {
     }
 
     override fn draw(s: Painter, th: Theme) {
-        this.win.skin.button.paint(s, th, this.bounds, this.label,
+        // subtle hover-lift: raise the chrome up to 3px while hovered. Hit
+        // bounds are unchanged — this is purely visual.
+        let dy = (this.lift * 3.0) as int;
+        let r = this.bounds;
+        if (dy > 0) { r = Rect(r.x, r.y - dy, r.w, r.h); }
+        this.win.skin.button.paint(s, th, r, this.label,
                                    this.hovered, this.pressed, this.focused, this.win.skin);
     }
+
+    // Self-animate the lift toward `target` (0 or 1), interrupting any
+    // in-flight lift tween so hover in/out stays smooth.
+    fn animate_lift(target: float) {
+        let b = this;
+        if (this.lift_tw != null) { this.lift_tw.cancel(); }
+        this.lift_tw = this.animate_value(this.lift, target, 150, false,
+                                          EASE_OUT_CUBIC, (v) => { b.lift = v; });
+    }
+
+    override fn on_hover_enter(): bool { this.animate_lift(1.0); return true; }
+    override fn on_hover_leave(): bool { this.animate_lift(0.0); return true; }
 
     override fn on_click(x: int, y: int): bool {
         this.fire();
@@ -1395,15 +1415,13 @@ export class ProgressBar extends Widget {
         }
         if (this.indeterminate) {
             if (this.tween == null) {
-                this.tween = new Tween(1200, true);
-                this.tween.track_bounds = true; // dirty-repaint just the bar
-                this.tween.bounds = this.bounds;
+                // Self-animate the sweep on the frame clock — the helper builds
+                // the Tween, marks it bounds-tracked, and auto-registers it; no
+                // manual add_animation. sweep_t reads raw 0..1 (linear).
                 let pb = this;
-                this.tween.on_tick = (t) => {
+                this.tween = this.animate(1200, true, EASE_LINEAR, (t) => {
                     pb.sweep_t = t;
-                    if (pb.tween != null) { pb.tween.bounds = pb.bounds; }
-                };
-                this.win.add_animation(this.tween);
+                });
             }
             let band_w = this.bounds.w / 3;
             if (band_w < 8) { band_w = 8; }
@@ -1419,5 +1437,130 @@ export class ProgressBar extends Widget {
             let fr = Rect(this.bounds.x, this.bounds.y, fw, this.bounds.h);
             this.win.skin.track.paint_fill(s, th, fr, radius, f, th.primary_700);
         }
+    }
+}
+
+// Slider — pick a value in [0,1] by clicking or dragging a thumb along a track.
+// The first real consumer of the drag hooks (on_drag/on_drag_start/on_drag_end)
+// and of this.mods() (Shift = fine step). Arrow keys nudge; onChange fires on
+// every change.
+export class Slider extends Widget {
+    value: float;        // current value, clamped to [0,1]
+    step: float;         // keyboard/coarse increment (default 0.05)
+    fine: float;         // Shift-held increment (default 0.01)
+    dragging: bool;      // thumb held (larger thumb while true)
+    onChange: fn(float);
+
+    fn init(value: float) {
+        super.init();
+        this.value = this.clamp01(value);
+        this.step = 0.05;
+        this.fine = 0.01;
+        this.focusable = true;
+    }
+
+    fn clamp01(v: float): float {
+        if (v < 0.0) { return 0.0; }
+        if (v > 1.0) { return 1.0; }
+        return v;
+    }
+
+    fn set_value(v: float) {
+        let c = this.clamp01(v);
+        if (c != this.value) {
+            this.value = c;
+            if (this.onChange != null) { this.onChange(c); }
+        }
+    }
+
+    // horizontal travel available to the thumb centre (track minus thumb radius
+    // on each end).
+    fn thumb_r(): int {
+        let r = this.bounds.h / 2;
+        if (r < 6) { r = 6; }
+        return r;
+    }
+    fn travel(): int {
+        let t = this.bounds.w - 2 * this.thumb_r();
+        if (t < 1) { t = 1; }
+        return t;
+    }
+
+    override fn measure(s: Painter, th: Theme): Size {
+        return Size(160, s.font_height() + 8);
+    }
+
+    // map an absolute x to a value along the track.
+    fn value_at(x: int): float {
+        let rel = x - this.bounds.x - this.thumb_r();
+        return this.clamp01(rel as float / this.travel() as float);
+    }
+
+    override fn draw(s: Painter, th: Theme) {
+        let r = this.thumb_r();
+        let cy = this.bounds.y + this.bounds.h / 2;
+        // groove: a thin rounded track centred vertically
+        let gh = 4;
+        let groove = Rect(this.bounds.x + r, cy - gh / 2, this.travel(), gh);
+        this.win.skin.track.paint_track(s, th, groove, gh / 2, th.surface_sunken);
+        // filled portion up to the thumb
+        let fx = (this.value * this.travel() as float) as int;
+        if (fx > 0) {
+            let fr = Rect(groove.x, groove.y, fx, gh);
+            this.win.skin.track.paint_fill(s, th, fr, gh / 2, th.primary, th.primary_700);
+        }
+        // thumb
+        let tr = r;
+        if (this.dragging) { tr = r + 1; }
+        let cx = this.bounds.x + r + fx;
+        let tb = Rect(cx - tr, cy - tr, 2 * tr, 2 * tr);
+        let ink = th.primary;
+        if (this.focused || this.dragging) { ink = th.primary_700; }
+        s.fill_round(tb, tr, ink);
+        s.stroke_round(tb, tr, 1, th.surface_raised);
+    }
+
+    override fn on_click(x: int, y: int): bool {
+        this.set_value(this.value_at(x));
+        return true;
+    }
+
+    override fn on_drag_start(x: int, y: int): bool {
+        this.dragging = true;
+        return true;
+    }
+
+    override fn on_drag(dx: int, dy: int): bool {
+        // move proportionally to the horizontal delta; Shift = fine control.
+        let span = this.travel() as float;
+        let d = dx as float / span;
+        if ((this.mods() & MOD_SHIFT) != 0) { d = d / 4.0; }
+        this.set_value(this.value + d);
+        return true;
+    }
+
+    override fn on_drag_end(x: int, y: int): bool {
+        this.dragging = false;
+        return true;
+    }
+
+    override fn on_key(k: int, ch: string): bool {
+        let inc = this.step;
+        if ((this.mods() & MOD_SHIFT) != 0) { inc = this.fine; }
+        if (k == KEY_LEFT || k == KEY_DOWN) {
+            this.set_value(this.value - inc);
+            return true;
+        }
+        if (k == KEY_RIGHT || k == KEY_UP) {
+            this.set_value(this.value + inc);
+            return true;
+        }
+        if (k == KEY_HOME) { this.set_value(0.0); return true; }
+        if (k == KEY_END) { this.set_value(1.0); return true; }
+        return false;
+    }
+
+    override fn drop_handlers() {
+        this.onChange = null;
     }
 }

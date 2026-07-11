@@ -9,10 +9,13 @@
 // (release_all/drop_handlers), so apps never need a manual teardown.
 
 import { Surface, Rect, contains, rgb, rgba, with_alpha, alpha_of, mix,
-          EV_EXPOSE, EV_KEY, EV_MOUSE_DOWN, EV_MOUSE_UP, EV_MOUSE_MOVE, EV_MOUSE_WHEEL, EV_MOUSE_RDOWN,
-          EV_RESIZE, EV_CLOSE, EV_TIMER,
+          EV_EXPOSE, EV_KEY, EV_KEY_UP, EV_MOUSE_DOWN, EV_MOUSE_UP, EV_MOUSE_MOVE, EV_MOUSE_WHEEL, EV_MOUSE_RDOWN,
+          EV_RESIZE, EV_CLOSE, EV_TIMER, MOD_SHIFT,
           KEY_ESC, KEY_TAB } from "volt/surface";
 import { Tween } from "volt/ui/anim";
+import { ease_linear, ease_in_quad, ease_out_quad, ease_in_out_quad,
+         ease_in_cubic, ease_out_cubic, ease_in_out_cubic,
+         ease_out_back, ease_out_bounce, ease_in_out_sine } from "volt/anim";
 import { Path } from "volt/geom/path";
 
 export struct Size {
@@ -82,6 +85,43 @@ export fn bcLoose(w: int, h: int): BoxConstraints {
 // Inset/expand a rect by `dx` on every side (dx<0 expands outward).
 export fn rect_inset(r: Rect, dx: int): Rect {
     return Rect(r.x - dx, r.y - dx, r.w + 2 * dx, r.h + 2 * dx);
+}
+
+// Absolute value of an int (used by gesture slop checks).
+fn abs_i(v: int): int {
+    if (v < 0) { return -v; }
+    return v;
+}
+
+// Easing selectors for the self-animation helpers (Widget.animate*). An int id
+// is used rather than a `fn(float):float` parameter because a bare volt/anim
+// easing function can't be passed by value across the module boundary from user
+// code (the closure thunk isn't declared in the consumer) — ease_apply() below
+// resolves the id to a direct call instead, which works from anywhere. Values
+// mirror the volt/anim easing set; custom easing drops to a raw Tween.
+export const EASE_LINEAR: int = 0;
+export const EASE_IN_QUAD: int = 1;
+export const EASE_OUT_QUAD: int = 2;
+export const EASE_IN_OUT_QUAD: int = 3;
+export const EASE_IN_CUBIC: int = 4;
+export const EASE_OUT_CUBIC: int = 5;
+export const EASE_IN_OUT_CUBIC: int = 6;
+export const EASE_OUT_BACK: int = 7;
+export const EASE_OUT_BOUNCE: int = 8;
+export const EASE_IN_OUT_SINE: int = 9;
+
+// Apply an EASE_* curve to raw progress t in [0,1]. Direct calls into volt/anim.
+export fn ease_apply(id: int, t: float): float {
+    if (id == EASE_IN_QUAD) { return ease_in_quad(t); }
+    if (id == EASE_OUT_QUAD) { return ease_out_quad(t); }
+    if (id == EASE_IN_OUT_QUAD) { return ease_in_out_quad(t); }
+    if (id == EASE_IN_CUBIC) { return ease_in_cubic(t); }
+    if (id == EASE_OUT_CUBIC) { return ease_out_cubic(t); }
+    if (id == EASE_IN_OUT_CUBIC) { return ease_in_out_cubic(t); }
+    if (id == EASE_OUT_BACK) { return ease_out_back(t); }
+    if (id == EASE_OUT_BOUNCE) { return ease_out_bounce(t); }
+    if (id == EASE_IN_OUT_SINE) { return ease_in_out_sine(t); }
+    return ease_linear(t); // EASE_LINEAR
 }
 
 // Scale a px metric by the UI scale factor, rounded, flooring at 1 for
@@ -827,6 +867,10 @@ export class Widget {
     alignSelf: int;     // cross-axis override inside Column/Row; -1 = inherit
     modal: bool;        // overlay traps events; outside clicks don't dismiss
     win: weak Window;   // set on overlays/menubar so they can drive the Window
+    // Animations declared via this.animate(...) before the widget is attached
+    // to a Window (e.g. in init) are stashed here and flushed into the Window's
+    // clock by propagate_win once `win` is known. Null until first used.
+    pending_anims: Tween[];
 
     fn init() {
         this.children = [];
@@ -852,6 +896,57 @@ export class Widget {
     // Window.layout() having propagated `win` to the whole tree.
     fn invalidate() {
         if (this.win != null) { this.win.mark_dirty(this.bounds); }
+    }
+
+    // The active modifier chord (MOD_* bits) at the current event. Window
+    // refreshes Window.mods each loop pass before dispatch, so a handler
+    // (on_click/on_key/on_drag/...) reads the live state through here.
+    fn mods(): int {
+        if (this.win != null) { return this.win.mods; }
+        return 0;
+    }
+
+    // --------------------------------------------------------- self-animation
+    // Register a Tween with the frame clock. If the widget is already mounted
+    // (win set) it goes straight onto the Window's animation list; otherwise it
+    // is stashed and flushed by propagate_win when the widget is attached.
+    fn register_anim(tw: Tween) {
+        if (this.win != null) {
+            this.win.add_animation(tw);
+        } else {
+            if (this.pending_anims == null) { this.pending_anims = []; }
+            this.pending_anims.push(tw);
+        }
+    }
+
+    // Declarative self-animation: run `apply(ease(t))` every frame for dur_ms
+    // (ping-ponging forever when loop). `ease_id` is an EASE_* selector. The
+    // widget never touches the Window's animation list — this auto-registers and
+    // returns the Tween so the caller can cancel() it. track_bounds is set so
+    // only this widget's rect repaints; the closure refreshes the tween bounds
+    // each tick in case the widget was relaid out. See animate_value for the
+    // common from->to case.
+    fn animate(dur_ms: int, loop: bool, ease_id: int, apply: fn(float)): Tween {
+        let tw = new Tween(dur_ms, loop);
+        tw.track_bounds = true;
+        tw.bounds = this.bounds;
+        let w = this;
+        tw.on_tick = (t) => {
+            apply(ease_apply(ease_id, t));
+            tw.bounds = w.bounds;
+        };
+        this.register_anim(tw);
+        return tw;
+    }
+
+    // Ergonomic wrapper over animate(): tween a value from v0 to v1, handing the
+    // eased interpolated value to `apply` each frame. The primary "animate this
+    // property from A to B" call.
+    fn animate_value(v0: float, v1: float, dur_ms: int, loop: bool,
+                     ease_id: int, apply: fn(float)): Tween {
+        return this.animate(dur_ms, loop, ease_id, (e) => {
+            apply(v0 + (v1 - v0) * e);
+        });
     }
 
     // natural size, bottom-up
@@ -916,9 +1011,19 @@ export class Widget {
     // Fired on every mouse move while this widget holds the press capture
     // (Window.press_w), with the delta since the last move/press. dx/dy are
     // in the same coordinate space as on_click. Return true when consumed /
-    // state changed (needs redraw). No built-in widget uses this yet — it's
-    // the hook a future Slider/splitter drags against.
+    // state changed (needs redraw). Bracketed by on_drag_start / on_drag_end;
+    // Slider is the first consumer.
     virtual fn on_drag(dx: int, dy: int): bool {
+        return false;
+    }
+
+    // Fired once when a press begins moving past the drag slop, before the
+    // first on_drag. x/y are absolute. The companion on_drag_end fires on
+    // release after a drag. Return true when consumed / state changed.
+    virtual fn on_drag_start(x: int, y: int): bool {
+        return false;
+    }
+    virtual fn on_drag_end(x: int, y: int): bool {
         return false;
     }
 
@@ -937,6 +1042,50 @@ export class Widget {
     // mouse wheel scrolled while the cursor is over this widget; delta is
     // positive for down, negative for up. Return true when consumed.
     virtual fn on_scroll(delta: int): bool {
+        return false;
+    }
+
+    // Left button released over this widget (it held the press capture and the
+    // cursor is still inside its bounds) — the click-completion companion to
+    // on_click (which still fires on press-down). Absolute coords.
+    virtual fn on_release(x: int, y: int): bool {
+        return false;
+    }
+
+    // A key was released while this widget holds focus (wires EV_KEY_UP, which
+    // the loop otherwise drops). `k` is the KEY_* / ASCII code; no text.
+    virtual fn on_key_up(k: int): bool {
+        return false;
+    }
+
+    // Second click on this same widget within Window.DOUBLE_CLICK_MS and inside
+    // the drag slop. on_click still fires for each individual press.
+    virtual fn on_double_click(x: int, y: int): bool {
+        return false;
+    }
+
+    // Press held on this widget past Window.LONG_PRESS_MS without moving past
+    // the drag slop. Fires once per press.
+    virtual fn on_long_press(x: int, y: int): bool {
+        return false;
+    }
+
+    // Cursor entered / left this widget's bounds — the callback companions to
+    // the passively-maintained `hovered` flag. Return true when consumed /
+    // state changed (needs redraw).
+    virtual fn on_hover_enter(): bool {
+        return false;
+    }
+    virtual fn on_hover_leave(): bool {
+        return false;
+    }
+
+    // This widget gained / lost keyboard focus — callback companions to the
+    // `focused` flag. Return true when consumed / state changed.
+    virtual fn on_focus(): bool {
+        return false;
+    }
+    virtual fn on_blur(): bool {
         return false;
     }
 
@@ -966,6 +1115,14 @@ export class Widget {
     // like Dropdown can reach the Window to open overlays.
     fn propagate_win(w: weak Window) {
         this.win = w;
+        // Flush animations declared before this widget was mounted onto the
+        // now-known Window clock (see animate()/register_anim()).
+        if (this.pending_anims != null && w != null) {
+            for (let t in this.pending_anims) {
+                w.add_animation(t);
+            }
+            this.pending_anims = [];
+        }
         for (let c in this.children) {
             c.propagate_win(w);
         }
@@ -993,6 +1150,13 @@ export class Widget {
 
 // ---------------------------------------------------------------- Window
 
+// Gesture thresholds (ms / px). A second press within DOUBLE_CLICK_MS on the
+// same widget is a double-click; a press held LONG_PRESS_MS without moving past
+// DRAG_SLOP is a long-press; a press moving past DRAG_SLOP begins a drag.
+export const DOUBLE_CLICK_MS: int = 400;
+export const LONG_PRESS_MS: int = 500;
+export const DRAG_SLOP: int = 4;
+
 export class Window {
     surf: Surface;
     painter: Painter;   // widgets draw through this; default = SurfacePainter
@@ -1011,9 +1175,22 @@ export class Window {
     skin: Skin;          // pluggable widget shape; defaults to today's look
     drag_x: int;         // WS9a: last mouse position while press_w holds capture
     drag_y: int;
+    // Gesture tracking. press_ms/press_x/press_y anchor the current press for
+    // long-press + drag-slop; dragging is set once the press moves past the
+    // slop; long_press_fired guards a one-shot. last_click_* remember the prior
+    // click for double-click detection.
+    press_ms: int;
+    press_x: int;
+    press_y: int;
+    dragging: bool;
+    long_press_fired: bool;
+    last_click_ms: int;
+    last_click_x: int;
+    last_click_y: int;
+    last_click_w: weak Widget;
     animations: Tween[]; // WS9c: active Tweens; run() ticks the wait clock only while non-empty
     mods: int;           // MOD_* bitmask at the event being dispatched — widgets
-                         // read `this.win.mods` in on_key/on_click/on_scroll
+                         // read it via Widget.mods() in on_key/on_click/on_drag
     scale: float;        // UI scale factor (1.0 = 96dpi); themes are scaled by
                          // it at run(); pass it to GfxPainter font sizes too
 
@@ -1089,11 +1266,13 @@ export class Window {
     }
 
     fn set_focus(i: int) {
+        // re-focusing the current widget is a no-op (don't fire blur/focus).
+        if (i == this.focus_i) { return; }
         let old = this.focused_widget();
-        if (old != null) { old.focused = false; }
+        if (old != null) { old.focused = false; old.on_blur(); }
         this.focus_i = i;
         let now = this.focused_widget();
-        if (now != null) { now.focused = true; }
+        if (now != null) { now.focused = true; now.on_focus(); }
     }
 
     fn focus_next() {
@@ -1101,6 +1280,14 @@ export class Window {
         if (n == 0) { return; }
         let i = this.focus_i + 1;
         if (i >= n) { i = 0; }
+        this.set_focus(i);
+    }
+
+    fn focus_prev() {
+        let n = this.focusables.len;
+        if (n == 0) { return; }
+        let i = this.focus_i - 1;
+        if (i < 0) { i = n - 1; }
         this.set_focus(i);
     }
 
@@ -1223,6 +1410,20 @@ export class Window {
         this.painter.present_rect(d);
     }
 
+    // Key release (EV_KEY_UP, previously dropped): route to the focused widget
+    // or the open overlay's focus. No text, just the key code.
+    fn on_key_up_ev(k: int) {
+        if (this.overlay != null) {
+            if (this.overlay.on_key_up(k)) { this.redraw(); }
+            return;
+        }
+        let f = this.focused_widget();
+        if (f != null && f.on_key_up(k)) {
+            this.mark_dirty(f.bounds);
+            this.repaint();
+        }
+    }
+
     fn on_key_ev(k: int, ch: string) {
         if (this.overlay != null) {
             if (k == KEY_ESC) {
@@ -1235,7 +1436,9 @@ export class Window {
         }
         if (k == KEY_TAB) {
             let old = this.focused_widget();
-            this.focus_next();
+            // Shift+Tab walks focus backwards.
+            if ((this.mods & MOD_SHIFT) != 0) { this.focus_prev(); }
+            else { this.focus_next(); }
             let now = this.focused_widget();
             // only the two widgets whose focus border changed need repainting
             if (old != null) { this.mark_dirty(old.bounds); }
@@ -1273,15 +1476,35 @@ export class Window {
         let target: Widget = null;
         if (this.root != null) { target = this.root.hit(x, y); }
         if (target != null) {
-            let old = this.focused_widget();
             this.set_hover(target);
             this.set_press(target);
+            // anchor the press for long-press + drag-slop tracking
+            this.press_ms = this.surf.now_ms();
+            this.press_x = x;
+            this.press_y = y;
+            this.dragging = false;
+            this.long_press_fired = false;
             let changed = false;
             if (target.focusable) {
                 this.focus_widget(target);
                 changed = true;
             }
             if (target.on_click(x, y)) { changed = true; }
+            // double-click: a second press on the same widget within the time
+            // window and inside the slop.
+            let now = this.surf.now_ms();
+            if (this.last_click_w == target
+                && now - this.last_click_ms <= DOUBLE_CLICK_MS
+                && abs_i(x - this.last_click_x) <= DRAG_SLOP
+                && abs_i(y - this.last_click_y) <= DRAG_SLOP) {
+                if (target.on_double_click(x, y)) { changed = true; }
+                this.last_click_w = null; // consume — a triple click isn't two doubles
+            } else {
+                this.last_click_w = target;
+                this.last_click_ms = now;
+                this.last_click_x = x;
+                this.last_click_y = y;
+            }
             if (changed) {
                 // A click handler may change state visible elsewhere in the
                 // tree (Label text, StatusBar, ProgressBar …), so do a full
@@ -1328,6 +1551,14 @@ export class Window {
             let dy = y - this.drag_y;
             this.drag_x = x;
             this.drag_y = y;
+            // once the press moves past the slop, begin a drag (fires
+            // on_drag_start once) — this also cancels a pending long-press.
+            if (!this.dragging
+                && (abs_i(x - this.press_x) > DRAG_SLOP
+                    || abs_i(y - this.press_y) > DRAG_SLOP)) {
+                this.dragging = true;
+                if (this.press_w.on_drag_start(x, y)) { this.redraw(); }
+            }
             if (this.press_w.on_drag(dx, dy)) { this.redraw(); }
         }
         let target: Widget = null;
@@ -1352,11 +1583,25 @@ export class Window {
         // release the press capture; repaint the affected widget so it drops
         // its pressed overlay.
         let pw = this.press_w;
+        let was_dragging = this.dragging;
         this.press_w = null;
+        this.dragging = false;
+        this.long_press_fired = false;
         if (pw != null) {
             pw.pressed = false;
-            this.mark_dirty(pw.bounds);
-            this.repaint();
+            let changed = false;
+            if (was_dragging) {
+                // a drag just ended
+                if (pw.on_drag_end(x, y)) { changed = true; }
+            } else if (contains(pw.bounds, x, y)) {
+                // click-completion: released inside the pressed widget
+                if (pw.on_release(x, y)) { changed = true; }
+            }
+            if (changed) { this.redraw(); }
+            else {
+                this.mark_dirty(pw.bounds);
+                this.repaint();
+            }
         }
     }
 
@@ -1368,10 +1613,12 @@ export class Window {
         this.hover_w = w;
         if (old != null) {
             old.hovered = false;
+            old.on_hover_leave();
             this.mark_dirty(old.bounds);
         }
         if (w != null) {
             w.hovered = true;
+            w.on_hover_enter();
             this.mark_dirty(w.bounds);
         }
         this.repaint();
@@ -1426,6 +1673,10 @@ export class Window {
             // early from wait_timeout, and without this a moving mouse would
             // starve the timer and freeze every animation; slow frames would
             // dilate time instead of dropping frames.
+            // A held press (not yet a drag) also needs a timed wake so an
+            // idle long-press fires without further input.
+            let pressing = this.press_w != null && !this.dragging
+                           && !this.long_press_fired;
             let ev = 0;
             if (this.animations.len > 0) {
                 ev = this.surf.wait_timeout(16);
@@ -1434,11 +1685,24 @@ export class Window {
                 last_ms = now;
                 if (dt > 100) { dt = 100; } // clamp a stall to one long frame
                 if (dt > 0) { this.tick(dt); }
+            } else if (pressing) {
+                let rem = LONG_PRESS_MS - (this.surf.now_ms() - this.press_ms);
+                if (rem < 1) { rem = 1; }
+                ev = this.surf.wait_timeout(rem);
+                last_ms = this.surf.now_ms();
             } else {
                 ev = this.surf.wait();
                 last_ms = this.surf.now_ms(); // idle wait: don't bank the gap
             }
             this.mods = this.surf.mods();
+            // long-press: press still held, unmoved, past the threshold.
+            if (this.press_w != null && !this.dragging && !this.long_press_fired
+                && this.surf.now_ms() - this.press_ms >= LONG_PRESS_MS) {
+                this.long_press_fired = true;
+                if (this.press_w.on_long_press(this.drag_x, this.drag_y)) {
+                    this.redraw();
+                }
+            }
             if (ev == EV_TIMER) {
                 // already ticked above; nothing else to dispatch
             } else if (ev == EV_EXPOSE) {
@@ -1451,6 +1715,8 @@ export class Window {
                 this.running = false;
             } else if (ev == EV_KEY) {
                 this.on_key_ev(this.surf.key(), this.surf.text_ev());
+            } else if (ev == EV_KEY_UP) {
+                this.on_key_up_ev(this.surf.key());
             } else if (ev == EV_MOUSE_DOWN) {
                 this.on_mouse_ev(this.surf.mouse_x(), this.surf.mouse_y());
             } else if (ev == EV_MOUSE_UP) {
