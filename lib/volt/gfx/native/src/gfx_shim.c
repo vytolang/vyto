@@ -231,6 +231,99 @@ void gfx_clip_pop(GfxCanvas *c) {
     bl_context_restore(&c->ctx, NULL);
 }
 
+/* ---- affine transforms -------------------------------------------------- *
+ * blend2d's user transform is mutated in place by apply_transform_op and is
+ * saved/restored by bl_context_save/restore — the SAME state stack gfx_clip_
+ * push/pop use. So gfx_save/gfx_restore nest with clip pushes on one stack:
+ * every save (or clip_push) must be balanced by a restore (or clip_pop). */
+void gfx_save(GfxCanvas *c) { bl_context_save(&c->ctx, NULL); }
+void gfx_restore(GfxCanvas *c) { bl_context_restore(&c->ctx, NULL); }
+
+void gfx_translate(GfxCanvas *c, double dx, double dy) {
+    double v[2] = { dx, dy };
+    bl_context_apply_transform_op(&c->ctx, BL_TRANSFORM_OP_TRANSLATE, v);
+}
+void gfx_scale(GfxCanvas *c, double sx, double sy) {
+    double v[2] = { sx, sy };
+    bl_context_apply_transform_op(&c->ctx, BL_TRANSFORM_OP_SCALE, v);
+}
+void gfx_rotate(GfxCanvas *c, double deg) {
+    /* degrees at the Volt-facing edge, like gfx_stroke_arc */
+    double rad = deg * (3.14159265358979323846 / 180.0);
+    bl_context_apply_transform_op(&c->ctx, BL_TRANSFORM_OP_ROTATE, &rad);
+}
+void gfx_reset_transform(GfxCanvas *c) {
+    bl_context_apply_transform_op(&c->ctx, BL_TRANSFORM_OP_RESET, NULL);
+}
+
+/* ---- radial gradient ---------------------------------------------------- *
+ * Centered radial (focal = center, inner radius 0), filling the given rect —
+ * the radial twin of gfx_linear_gradient_rect_n. */
+void gfx_radial_gradient_rect_n(GfxCanvas *c, double x, double y, double w, double h,
+                                double cx, double cy, double radius,
+                                const int *colors, const double *positions, int n) {
+    if (n <= 0 || radius <= 0.0) return;
+    BLGradientCore g;
+    /* (x0,y0,r0) = the outer circle (center + radius); (x1,y1,r1) = the focal
+       circle, here coincident with the center at radius 0 for a plain radial */
+    BLRadialGradientValues rv = { cx, cy, cx, cy, radius, 0.0 };
+    bl_gradient_init_as(&g, BL_GRADIENT_TYPE_RADIAL, &rv, BL_EXTEND_MODE_PAD, NULL, 0, NULL);
+    for (int i = 0; i < n; i++) {
+        bl_gradient_add_stop_rgba32(&g, positions[i], rgba32_of(colors[i]));
+    }
+    BLRect r = { x, y, w, h };
+    bl_context_fill_geometry_ext(&c->ctx, BL_GEOMETRY_TYPE_RECTD, &r, (const BLUnknown *)&g);
+    bl_gradient_destroy(&g);
+}
+
+/* ---- vector path -------------------------------------------------------- *
+ * A path arrives as a flat command stream (`cmds`: 0=move 1=line 2=quad
+ * 3=cubic 4=close) plus a parallel `coords` array holding each command's
+ * operands in order. Rebuild a transient BLPath and fill/stroke it. This
+ * mirrors the volt/geom/path.vt Path exactly so one builder serves both the
+ * rich tier (here) and the lean tier (Path.flatten → polygon). */
+static int gfx_build_path(BLPathCore *p, const int *cmds, int nc,
+                          const double *coords, int ncoord) {
+    bl_path_init(p);
+    int ci = 0;
+    for (int k = 0; k < nc; k++) {
+        switch (cmds[k]) {
+        case 0: if (ci + 2 > ncoord) return 0;
+            bl_path_move_to(p, coords[ci], coords[ci + 1]); ci += 2; break;
+        case 1: if (ci + 2 > ncoord) return 0;
+            bl_path_line_to(p, coords[ci], coords[ci + 1]); ci += 2; break;
+        case 2: if (ci + 4 > ncoord) return 0;
+            bl_path_quad_to(p, coords[ci], coords[ci + 1], coords[ci + 2], coords[ci + 3]);
+            ci += 4; break;
+        case 3: if (ci + 6 > ncoord) return 0;
+            bl_path_cubic_to(p, coords[ci], coords[ci + 1], coords[ci + 2],
+                             coords[ci + 3], coords[ci + 4], coords[ci + 5]);
+            ci += 6; break;
+        case 4: bl_path_close(p); break;
+        default: break;
+        }
+    }
+    return 1;
+}
+
+void gfx_fill_path(GfxCanvas *c, const int *cmds, int nc,
+                   const double *coords, int ncoord, int color) {
+    BLPathCore p;
+    if (!gfx_build_path(&p, cmds, nc, coords, ncoord)) { bl_path_destroy(&p); return; }
+    bl_context_set_fill_style_rgba32(&c->ctx, rgba32_of(color));
+    bl_context_fill_geometry(&c->ctx, BL_GEOMETRY_TYPE_PATH, &p);
+    bl_path_destroy(&p);
+}
+
+void gfx_stroke_path(GfxCanvas *c, const int *cmds, int nc,
+                     const double *coords, int ncoord, double width, int color) {
+    BLPathCore p;
+    if (!gfx_build_path(&p, cmds, nc, coords, ncoord)) { bl_path_destroy(&p); return; }
+    bl_context_set_stroke_width(&c->ctx, width);
+    bl_context_stroke_geometry_rgba32(&c->ctx, BL_GEOMETRY_TYPE_PATH, &p, rgba32_of(color));
+    bl_path_destroy(&p);
+}
+
 int gfx_load_font(GfxCanvas *c, const char *ttf_path, double size) {
     return gfx_load_font_weight(c, ttf_path, size, 0);
 }

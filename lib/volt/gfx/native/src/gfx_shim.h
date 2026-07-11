@@ -72,6 +72,30 @@ void gfx_stroke_arc(GfxCanvas *c, double cx, double cy, double rx, double ry,
 void gfx_clip_push(GfxCanvas *c, double x, double y, double w, double h, double r);
 void gfx_clip_pop(GfxCanvas *c);
 
+/* affine transforms — mutate the user transform, saved/restored on the SAME
+   state stack as gfx_clip_push/pop (one shared blend2d stack; keep every
+   save/clip_push balanced by a restore/clip_pop). rotate is in degrees. */
+void gfx_save(GfxCanvas *c);
+void gfx_restore(GfxCanvas *c);
+void gfx_translate(GfxCanvas *c, double dx, double dy);
+void gfx_scale(GfxCanvas *c, double sx, double sy);
+void gfx_rotate(GfxCanvas *c, double deg);
+void gfx_reset_transform(GfxCanvas *c);
+
+/* centered radial gradient (focal = center, inner radius 0) filling a rect —
+   the radial twin of gfx_linear_gradient_rect_n. colors/positions parallel. */
+void gfx_radial_gradient_rect_n(GfxCanvas *c, double x, double y, double w, double h,
+                                double cx, double cy, double radius,
+                                const int *colors, const double *positions, int n);
+
+/* vector path — a flat command stream (0=move 1=line 2=quad 3=cubic 4=close)
+   with a parallel coords array of each command's operands. Mirrors
+   volt/geom/path.vt so one builder feeds both tiers. */
+void gfx_fill_path(GfxCanvas *c, const int *cmds, int nc,
+                   const double *coords, int ncoord, int color);
+void gfx_stroke_path(GfxCanvas *c, const int *cmds, int nc,
+                     const double *coords, int ncoord, double width, int color);
+
 /* text — load up to three weights (0=regular, 1=medium/semi, 2=bold), then
    draw at a baseline origin with the active weight (defaults to 0). */
 int gfx_load_font(GfxCanvas *c, const char *ttf_path, double size);              /* regular slot, 1 ok */

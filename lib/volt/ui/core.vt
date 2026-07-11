@@ -13,6 +13,7 @@ import { Surface, Rect, contains, rgb, rgba, with_alpha, alpha_of, mix,
           EV_RESIZE, EV_CLOSE, EV_TIMER,
           KEY_ESC, KEY_TAB } from "volt/surface";
 import { Tween } from "volt/ui/anim";
+import { Path } from "volt/geom/path";
 
 export struct Size {
     w: int;
@@ -481,6 +482,44 @@ export class Painter {
     virtual fn stroke_arc(cx: int, cy: int, rx: int, ry: int,
                           start_deg: int, sweep_deg: int, width: int, color: int) {
         this.stroke_circle(cx, cy, (rx + ry) / 2, width, color);
+    }
+
+    // Affine transforms — a rich-tier capability. save()/restore() bracket a
+    // transform change; translate/scale/rotate compose onto the current one.
+    // The base/lean tier CANNOT transform its axis-aligned primitives, so it
+    // no-ops them: callers that need rotation/scale must check can_transform()
+    // (or accept that content draws untransformed on the lean tier). rotate is
+    // in degrees. This matches every other WS2 primitive's degrade contract.
+    virtual fn save() { }
+    virtual fn restore() { }
+    virtual fn translate(dx: float, dy: float) { }
+    virtual fn scale(sx: float, sy: float) { }
+    virtual fn rotate(deg: float) { }
+    virtual fn can_transform(): bool { return false; }
+
+    // Centered radial gradient filling a rect (colors/positions parallel,
+    // positions ascending in [0,1]). Base fallback: mix of first/last stop,
+    // like gradient_n — plain but never blank.
+    virtual fn radial_gradient(r: Rect, cx: int, cy: int, radius: int,
+                               colors: i32[], positions: float[]) {
+        if (colors.len == 0) { return; }
+        this.fill_round(r, 0, mix(colors[0] as int, colors[colors.len - 1] as int, 0.5));
+    }
+
+    // Fill/stroke an arbitrary vector Path. Base fallback: flatten the curves
+    // to a polygon (volt/geom/path.vt) and hand it to polygon()/line_w — the
+    // lean tier gets straight-segment approximations of the curves. The rich
+    // tier overrides these to draw crisp anti-aliased paths.
+    virtual fn fill_path(p: Path, color: int) {
+        let fp = p.flatten();
+        this.polygon(fp.xs, fp.ys, color);
+    }
+    virtual fn stroke_path(p: Path, width: int, color: int) {
+        let fp = p.flatten();
+        for (let i in 1..fp.xs.len) {
+            this.line_w(fp.xs[i - 1] as int, fp.ys[i - 1] as int,
+                        fp.xs[i] as int, fp.ys[i] as int, width, color);
+        }
     }
 
     // Decoded-image loading is a rich-tier-only capability (needs blend2d);

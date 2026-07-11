@@ -1,0 +1,182 @@
+// volt/anim — a standalone animation clock: value tweens on a monotonic
+// millisecond timeline, independent of volt/ui's Window/Widget stack. A gfx
+// app (or any raw Surface loop — snake, chip8, a Canvas demo) drives a Clock
+// off Surface.now_ms() and reads Anim.value() each frame; no widgets required.
+//
+// volt/ui/anim.vt keeps its Window-integrated Tween (dirty-region bounds,
+// EV_TIMER loop) and re-uses the easing functions defined here.
+
+import { cos, PI } from "volt/math";
+
+// ---- easing: t in [0,1] -> eased [0,1] ------------------------------------
+
+export fn ease_linear(t: float): float { return t; }
+
+export fn ease_in_quad(t: float): float { return t * t; }
+export fn ease_out_quad(t: float): float { return 1.0 - (1.0 - t) * (1.0 - t); }
+export fn ease_in_out_quad(t: float): float {
+    if (t < 0.5) { return 2.0 * t * t; }
+    let u = -2.0 * t + 2.0;
+    return 1.0 - u * u / 2.0;
+}
+
+export fn ease_in_cubic(t: float): float { return t * t * t; }
+export fn ease_out_cubic(t: float): float {
+    let inv = 1.0 - t;
+    return 1.0 - inv * inv * inv;
+}
+export fn ease_in_out_cubic(t: float): float {
+    if (t < 0.5) { return 4.0 * t * t * t; }
+    let u = -2.0 * t + 2.0;
+    return 1.0 - u * u * u / 2.0;
+}
+
+// overshoots past 1.0 then settles — a snappy "pop" for entrances
+export fn ease_out_back(t: float): float {
+    let c1 = 1.70158;
+    let c3 = c1 + 1.0;
+    let u = t - 1.0;
+    return 1.0 + c3 * u * u * u + c1 * u * u;
+}
+
+// decaying bounce toward 1.0 — playful landings
+export fn ease_out_bounce(t: float): float {
+    let n1 = 7.5625;
+    let d1 = 2.75;
+    if (t < 1.0 / d1) {
+        return n1 * t * t;
+    } else if (t < 2.0 / d1) {
+        let u = t - 1.5 / d1;
+        return n1 * u * u + 0.75;
+    } else if (t < 2.5 / d1) {
+        let u = t - 2.25 / d1;
+        return n1 * u * u + 0.9375;
+    }
+    let u = t - 2.625 / d1;
+    return n1 * u * u + 0.984375;
+}
+
+// gentle sinusoidal ease-in-out — smooth, natural motion
+export fn ease_in_out_sine(t: float): float {
+    return -(cos(PI * t) - 1.0) / 2.0;
+}
+
+// ---- Anim: a from->to value tween on a millisecond timeline ----------------
+
+export class Anim {
+    v0: float;           // start value ("from" is a reserved word)
+    v1: float;           // end value
+    dur_ms: int;
+    elapsed_ms: int;
+    ease: fn(float): float;
+    loop: bool;          // ping-pong v0->v1->v0 forever instead of stopping
+    done: bool;
+
+    fn init(v0: float, v1: float, dur_ms: int, ease: fn(float): float) {
+        this.v0 = v0;
+        this.v1 = v1;
+        this.dur_ms = dur_ms;
+        if (this.dur_ms < 1) { this.dur_ms = 1; }
+        this.ease = ease;
+        this.elapsed_ms = 0;
+        this.loop = false;
+        this.done = false;
+    }
+
+    // fluent: mark this tween as looping (ping-pong). Returns self.
+    fn looping(): Anim {
+        this.loop = true;
+        return this;
+    }
+
+    // raw progress in [0,1] (ping-ponging when looping); mirrors the Tween in
+    // volt/ui/anim.vt so both systems read identically.
+    fn progress(): float {
+        if (this.loop) {
+            let cycle = this.dur_ms * 2;
+            let phase = this.elapsed_ms % cycle;
+            if (phase < this.dur_ms) {
+                return phase as float / this.dur_ms as float;
+            }
+            return 1.0 - (phase - this.dur_ms) as float / this.dur_ms as float;
+        }
+        let t = this.elapsed_ms as float / this.dur_ms as float;
+        if (t > 1.0) { return 1.0; }
+        return t;
+    }
+
+    // eased interpolated value at the current time
+    fn value(): float {
+        let t = this.ease(this.progress());
+        return this.v0 + (this.v1 - this.v0) * t;
+    }
+
+    // advance the timeline; returns true while still animating (always true for
+    // looping tweens until cancelled). Non-looping tweens set done at t>=1.
+    fn advance(dt_ms: int): bool {
+        if (this.done) { return false; }
+        this.elapsed_ms += dt_ms;
+        if (!this.loop && this.elapsed_ms >= this.dur_ms) {
+            this.done = true;
+        }
+        return true;
+    }
+
+    fn restart() {
+        this.elapsed_ms = 0;
+        this.done = false;
+    }
+    fn cancel() { this.done = true; }
+    fn finished(): bool { return this.done; }
+}
+
+// ---- Clock: advances a set of Anims off a monotonic ms source --------------
+
+export class Clock {
+    anims: Anim[];
+    last_ms: int;
+    has_last: bool;
+
+    fn init() {
+        this.anims = [];
+        this.has_last = false;
+        this.last_ms = 0;
+    }
+
+    // register a tween and return it (so callers can keep the handle):
+    //   let a = clk.add(new Anim(0.0, 360.0, 800, ease_out_cubic));
+    fn add(a: Anim): Anim {
+        this.anims.push(a);
+        return a;
+    }
+
+    // step every tween by dt_ms and drop finished (non-looping) ones
+    fn advance(dt_ms: int) {
+        let alive: Anim[] = [];
+        for (let i in 0..this.anims.len) {
+            let a = this.anims[i];
+            a.advance(dt_ms);
+            if (!a.finished()) { alive.push(a); }
+        }
+        this.anims = alive;
+    }
+
+    // convenience: derive dt from an absolute monotonic ms reading (e.g.
+    // Surface.now_ms()), clamping a long stall to one 100ms frame so a paused
+    // process doesn't fast-forward every tween on resume.
+    fn sync(now_ms: int) {
+        if (!this.has_last) {
+            this.last_ms = now_ms;
+            this.has_last = true;
+            return;
+        }
+        let dt = now_ms - this.last_ms;
+        this.last_ms = now_ms;
+        if (dt > 100) { dt = 100; }
+        if (dt > 0) { this.advance(dt); }
+    }
+
+    // true while any tween is still running — the raw-loop equivalent of the
+    // Window.run() "switch to wait_timeout while animating" test.
+    fn active(): bool { return this.anims.len > 0; }
+}

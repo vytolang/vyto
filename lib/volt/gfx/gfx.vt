@@ -9,6 +9,8 @@
 //   cv.flush();
 //   surface.blitPtr(cv.pixels(), w, h, Rect(0, 0, w, h));
 
+import { Path } from "volt/geom/path";
+
 extern "C" {
     fn gfx_canvas_new(w: i32, h: i32): rawptr;
     fn gfx_canvas_free(c: rawptr);
@@ -51,6 +53,18 @@ extern "C" {
     fn gfx_image_width(img: rawptr): i32;
     fn gfx_image_height(img: rawptr): i32;
     fn gfx_draw_image(c: rawptr, img: rawptr, x: f64, y: f64, w: f64, h: f64);
+    fn gfx_save(c: rawptr);
+    fn gfx_restore(c: rawptr);
+    fn gfx_translate(c: rawptr, dx: f64, dy: f64);
+    fn gfx_scale(c: rawptr, sx: f64, sy: f64);
+    fn gfx_rotate(c: rawptr, deg: f64);
+    fn gfx_reset_transform(c: rawptr);
+    fn gfx_radial_gradient_rect_n(c: rawptr, x: f64, y: f64, w: f64, h: f64,
+                                  cx: f64, cy: f64, radius: f64,
+                                  colors: rawptr, positions: rawptr, n: i32);
+    fn gfx_fill_path(c: rawptr, cmds: rawptr, nc: i32, coords: rawptr, ncoord: i32, rgb: i32);
+    fn gfx_stroke_path(c: rawptr, cmds: rawptr, nc: i32, coords: rawptr, ncoord: i32,
+                       width: f64, rgb: i32);
 }
 
 // A drawable canvas. Colors are packed 0xAARRGGBB (alpha byte 0 = opaque for
@@ -129,6 +143,37 @@ export class Canvas {
     fn strokeArc(cx: float, cy: float, rx: float, ry: float,
                 startDeg: float, sweepDeg: float, width: float, rgb: int) {
         gfx_stroke_arc(this.handle, cx, cy, rx, ry, startDeg, sweepDeg, width, rgb as i32);
+    }
+
+    // Affine transforms. save()/restore() bracket a transform change; they
+    // nest on the SAME blend2d state stack as clipPush/clipPop, so every
+    // save (or clipPush) must be balanced by a restore (or clipPop). rotate
+    // is in degrees, matching strokeArc.
+    fn save() { gfx_save(this.handle); }
+    fn restore() { gfx_restore(this.handle); }
+    fn translate(dx: float, dy: float) { gfx_translate(this.handle, dx, dy); }
+    fn scale(sx: float, sy: float) { gfx_scale(this.handle, sx, sy); }
+    fn rotate(deg: float) { gfx_rotate(this.handle, deg); }
+    fn resetTransform() { gfx_reset_transform(this.handle); }
+
+    // Centered radial gradient (focal = center) filling a rect. colors is
+    // i32[] to match the C int32_t*, same as linearGradientRectN.
+    fn radialGradientRectN(x: float, y: float, w: float, h: float,
+                           cx: float, cy: float, radius: float,
+                           colors: i32[], positions: float[]) {
+        gfx_radial_gradient_rect_n(this.handle, x, y, w, h, cx, cy, radius,
+                                   colors as rawptr, positions as rawptr, colors.len as i32);
+    }
+
+    // Fill/stroke a vector Path (crisp AA curves). The lean tier flattens the
+    // same Path to a polygon instead — see volt/geom/path.vt.
+    fn fillPath(p: Path, rgb: int) {
+        gfx_fill_path(this.handle, p.cmds as rawptr, p.cmds.len as i32,
+                      p.coords as rawptr, p.coords.len as i32, rgb as i32);
+    }
+    fn strokePath(p: Path, width: float, rgb: int) {
+        gfx_stroke_path(this.handle, p.cmds as rawptr, p.cmds.len as i32,
+                        p.coords as rawptr, p.coords.len as i32, width, rgb as i32);
     }
 
     fn loadFont(path: string, size: float): bool {

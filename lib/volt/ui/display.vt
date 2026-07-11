@@ -8,6 +8,7 @@ import { Widget, Painter, Theme, Size, BoxConstraints, bcLoose,
 import { Rect, mix } from "volt/surface";
 import { sin, cos, PI } from "volt/math";
 import { is_http_url } from "volt/util/helper";
+import { Path } from "volt/geom/path";
 
 // Alignment constants for Text
 const ALIGN_LEFT: int = 0;
@@ -424,6 +425,22 @@ export class Icon extends Widget {
     // unit-square (0..1) -> pixel coordinates within this.bounds
     fn fx(u: float): int { return this.bounds.x + (u * (this.bounds.w as float)) as int; }
     fn fy(u: float): int { return this.bounds.y + (u * (this.bounds.h as float)) as int; }
+    // float versions for sub-pixel vector Paths (curved glyphs)
+    fn fxf(u: float): float { return (this.bounds.x as float) + u * (this.bounds.w as float); }
+    fn fyf(u: float): float { return (this.bounds.y as float) + u * (this.bounds.h as float); }
+
+    // build a closed polygon Path from parallel pixel-point arrays — lets the
+    // straight-edged glyphs render through the vector path pipeline (crisp on
+    // the rich tier, flattened to a polygon on the lean tier) instead of the
+    // old s.polygon call.
+    fn poly_path(xs: i32[], ys: i32[]): Path {
+        let p = new Path();
+        if (xs.len == 0) { return p; }
+        p.moveTo(xs[0] as float, ys[0] as float);
+        for (let i in 1..xs.len) { p.lineTo(xs[i] as float, ys[i] as float); }
+        p.close();
+        return p;
+    }
 
     // ~2px stroke: a real anti-aliased stroke on the rich tier (line_w),
     // three offset 1px lines on the lean tier (the base fallback).
@@ -481,7 +498,7 @@ export class Icon extends Widget {
             // roof and walls close in width (real overhang, not an arrow shaft)
             let xs: i32[] = [this.fx(0.5) as i32, this.fx(0.82) as i32, this.fx(0.18) as i32];
             let ys: i32[] = [this.fy(0.15) as i32, this.fy(0.46) as i32, this.fy(0.46) as i32];
-            s.polygon(xs, ys, color);
+            s.fill_path(this.poly_path(xs, ys), color);
             s.fill(Rect(this.fx(0.22), this.fy(0.44), this.fx(0.78) - this.fx(0.22), this.fy(0.85) - this.fy(0.44)), color);
         } else if (this.icon == ICON_BELL) {
             // clapper centered on the body's bottom edge so it reads as one
@@ -527,14 +544,14 @@ export class Icon extends Widget {
                         (0.14 * sz) as int, color);
             let xs: i32[] = [this.fx(0.30) as i32, this.fx(0.42) as i32, this.fx(0.24) as i32];
             let ys: i32[] = [this.fy(0.65) as i32, this.fy(0.65) as i32, this.fy(0.85) as i32];
-            s.polygon(xs, ys, color);
+            s.fill_path(this.poly_path(xs, ys), color);
         } else if (this.icon == ICON_PHOTO) {
             s.stroke_round(Rect(this.fx(0.10), this.fy(0.18), this.fx(0.90) - this.fx(0.10), this.fy(0.82) - this.fy(0.18)),
                           (0.06 * sz) as int, 2, color);
             s.circle(this.fx(0.32), this.fy(0.35), (0.08 * sz) as int, color);
             let xs: i32[] = [this.fx(0.15) as i32, this.fx(0.40) as i32, this.fx(0.60) as i32, this.fx(0.75) as i32, this.fx(0.88) as i32];
             let ys: i32[] = [this.fy(0.75) as i32, this.fy(0.45) as i32, this.fy(0.65) as i32, this.fy(0.50) as i32, this.fy(0.75) as i32];
-            s.polygon(xs, ys, color);
+            s.fill_path(this.poly_path(xs, ys), color);
         } else if (this.icon == ICON_STAR) {
             let cx = this.fx(0.5); let cy = this.fy(0.5);
             let outer = 0.42 * sz; let inner = 0.18 * sz;
@@ -549,24 +566,40 @@ export class Icon extends Widget {
                 ys.push((cy as float + r * sin(a)) as i32);
                 i += 1;
             }
-            s.polygon(xs, ys, color);
+            s.fill_path(this.poly_path(xs, ys), color);
         } else if (this.icon == ICON_HEART) {
-            s.circle(this.fx(0.32), this.fy(0.38), (0.18 * sz) as int, color);
-            s.circle(this.fx(0.68), this.fy(0.38), (0.18 * sz) as int, color);
-            let xs: i32[] = [this.fx(0.14) as i32, this.fx(0.86) as i32, this.fx(0.5) as i32];
-            let ys: i32[] = [this.fy(0.42) as i32, this.fy(0.42) as i32, this.fy(0.88) as i32];
-            s.polygon(xs, ys, color);
+            // a real two-lobe cubic heart (replaces the old two-circles + a
+            // triangle approximation): smooth curves on the rich tier, a
+            // flattened polygon on the lean tier.
+            let hp = new Path();
+            hp.moveTo(this.fxf(0.5), this.fyf(0.32));
+            hp.cubicTo(this.fxf(0.50), this.fyf(0.12), this.fxf(0.10), this.fyf(0.08),
+                       this.fxf(0.10), this.fyf(0.40));
+            hp.cubicTo(this.fxf(0.10), this.fyf(0.60), this.fxf(0.36), this.fyf(0.74),
+                       this.fxf(0.5), this.fyf(0.88));
+            hp.cubicTo(this.fxf(0.64), this.fyf(0.74), this.fxf(0.90), this.fyf(0.60),
+                       this.fxf(0.90), this.fyf(0.40));
+            hp.cubicTo(this.fxf(0.90), this.fyf(0.08), this.fxf(0.50), this.fyf(0.12),
+                       this.fxf(0.5), this.fyf(0.32));
+            hp.close();
+            s.fill_path(hp, color);
         } else if (this.icon == ICON_MAP_PIN) {
-            s.circle(this.fx(0.5), this.fy(0.35), (0.22 * sz) as int, color);
-            let xs: i32[] = [this.fx(0.32) as i32, this.fx(0.68) as i32, this.fx(0.5) as i32];
-            let ys: i32[] = [this.fy(0.48) as i32, this.fy(0.48) as i32, this.fy(0.85) as i32];
-            s.polygon(xs, ys, color);
+            // a teardrop pin: round head tapering to a point at the bottom
+            // (replaces circle + triangle), with a punched-out center dot.
+            let pp = new Path();
+            pp.moveTo(this.fxf(0.5), this.fyf(0.88));
+            pp.cubicTo(this.fxf(0.10), this.fyf(0.52), this.fxf(0.12), this.fyf(0.10),
+                       this.fxf(0.5), this.fyf(0.10));
+            pp.cubicTo(this.fxf(0.88), this.fyf(0.10), this.fxf(0.90), this.fyf(0.52),
+                       this.fxf(0.5), this.fyf(0.88));
+            pp.close();
+            s.fill_path(pp, color);
         } else if (this.icon == ICON_MUSIC) {
             s.circle(this.fx(0.28), this.fy(0.72), (0.10 * sz) as int, color);
             this.thick_line(s, this.fx(0.36), this.fy(0.72), this.fx(0.36), this.fy(0.22), color);
             let xs: i32[] = [this.fx(0.36) as i32, this.fx(0.62) as i32, this.fx(0.36) as i32];
             let ys: i32[] = [this.fy(0.22) as i32, this.fy(0.30) as i32, this.fy(0.38) as i32];
-            s.polygon(xs, ys, color);
+            s.fill_path(this.poly_path(xs, ys), color);
         }
     }
 }

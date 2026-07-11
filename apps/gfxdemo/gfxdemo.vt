@@ -1,5 +1,108 @@
-import { Surface, Rect } from "volt/surface";
+// volt/gfx showcase: a radial-gradient orb, a vector-path heart, and a
+// transformed square — each bounces (scales up with an ease_out_back
+// overshoot) while hovered and settles back when the cursor leaves. Ties
+// together the rich tier's transforms + paths + radial gradients and the
+// volt/anim clock, driven by a raw Surface loop (no Window/widget stack).
+import { Surface, Rect, EV_CLOSE, EV_MOUSE_MOVE } from "volt/surface";
 import { Canvas } from "volt/gfx";
+import { Path } from "volt/geom/path";
+import { Clock, Anim, ease_out_back, ease_out_cubic } from "volt/anim";
+
+const K_ORB: i64 = 0;
+const K_HEART: i64 = 1;
+const K_SQUARE: i64 = 2;
+
+// A hover-scalable drawing: a pivot (its center), an axis-aligned hit box,
+// the current scale, and the active scale tween (null when settled).
+class Hover {
+    kind: int;
+    cx: float;
+    cy: float;
+    hw: float;      // half hit-box width
+    hh: float;      // half hit-box height
+    scale: float;
+    hovered: bool;
+    anim: Anim;     // null until first hover
+
+    fn init(kind: int, cx: float, cy: float, hw: float, hh: float) {
+        this.kind = kind;
+        this.cx = cx;
+        this.cy = cy;
+        this.hw = hw;
+        this.hh = hh;
+        this.scale = 1.0;
+        this.hovered = false;
+    }
+
+    fn hit(mx: float, my: float): bool {
+        return mx >= this.cx - this.hw && mx <= this.cx + this.hw
+            && my >= this.cy - this.hh && my <= this.cy + this.hh;
+    }
+}
+
+// Enter/leave detection: on enter, a bouncy grow (ease_out_back overshoots
+// past the target then settles); on leave, a smooth shrink back to 1.0. Each
+// new tween starts from the current scale, so mid-flight reversals are smooth.
+fn update_hover(shapes: Hover[], mx: float, my: float, clk: Clock) {
+    for (let i in 0..shapes.len) {
+        let h = shapes[i];
+        let over = h.hit(mx, my);
+        if (over && !h.hovered) {
+            h.hovered = true;
+            h.anim = clk.add(new Anim(h.scale, 1.18, 260, ease_out_back));
+        } else if (!over && h.hovered) {
+            h.hovered = false;
+            h.anim = clk.add(new Anim(h.scale, 1.0, 220, ease_out_cubic));
+        }
+    }
+}
+
+fn draw_shape(cv: Canvas, h: Hover) {
+    // scale about the pivot: translate to it, scale, translate back
+    cv.save();
+    cv.translate(h.cx, h.cy);
+    cv.scale(h.scale, h.scale);
+    cv.translate(-h.cx, -h.cy);
+    if (h.kind == K_ORB) {
+        let ocols: i32[] = [0xFFDD66, 0x20242E];
+        let opos: float[] = [0.0, 1.0];
+        cv.radialGradientRectN(h.cx - 100.0, h.cy - 100.0, 200.0, 200.0,
+                               h.cx, h.cy, 100.0, ocols, opos);
+    } else if (h.kind == K_HEART) {
+        let p = new Path();
+        p.moveTo(h.cx, h.cy - 20.0);
+        p.cubicTo(h.cx, h.cy - 60.0, h.cx - 80.0, h.cy - 68.0, h.cx - 80.0, h.cy);
+        p.cubicTo(h.cx - 80.0, h.cy + 40.0, h.cx - 28.0, h.cy + 54.0, h.cx, h.cy + 76.0);
+        p.cubicTo(h.cx + 28.0, h.cy + 54.0, h.cx + 80.0, h.cy + 40.0, h.cx + 80.0, h.cy);
+        p.cubicTo(h.cx + 80.0, h.cy - 68.0, h.cx, h.cy - 60.0, h.cx, h.cy - 20.0);
+        p.close();
+        cv.fillPath(p, 0x3CA0E0);
+        cv.strokePath(p, 3.0, 0xFFFFFF);
+    } else {
+        cv.save();
+        cv.translate(h.cx, h.cy);
+        cv.rotate(30.0);
+        cv.fillRect(-45.0, -45.0, 90.0, 90.0, 0xE0605C);
+        cv.restore();
+    }
+    cv.restore();
+}
+
+fn render_frame(cv: Canvas, shapes: Hover[], w: int, h: int) {
+    cv.linearGradientRect(0.0, 0.0, w as float, h as float,
+                          0.0, 0.0, 0.0, h as float, 0x141821, 0x20242E);
+    for (let cy in 0..3) {
+        for (let cx in 0..10) {
+            let x = 20.0 + (cx as float) * 100.0;
+            let y = 20.0 + (cy as float) * 120.0;
+            cv.fillRoundRect(x, y, 80.0, 90.0, 12.0, 0x3C5AC8);
+            cv.text(x + 8.0, y + 30.0, "Widget", 0xECECEC);
+        }
+    }
+    cv.text(60.0, 430.0, "Hover a shape below — it bounces (ease_out_back).", 0xB8C0D0);
+    for (let i in 0..shapes.len) { draw_shape(cv, shapes[i]); }
+    cv.flush();
+}
 
 fn main() {
     let W = 1024;
@@ -8,18 +111,38 @@ fn main() {
     let cv = new Canvas(W, H);
     cv.loadFont("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 15.0);
 
-    cv.linearGradientRect(0.0, 0.0, W as float, H as float,
-                          0.0, 0.0, 0.0, H as float, 0x141821, 0x20242E);
-    for (let cy in 0..6) {
-        for (let cx in 0..10) {
-            let x = 20.0 + (cx as float) * 100.0;
-            let y = 20.0 + (cy as float) * 120.0;
-            cv.fillRoundRect(x, y, 80.0, 90.0, 12.0, 0x3C5AC8);
-            cv.text(x + 8.0, y + 30.0, "Widget", 0xECECEC);
-        }
-    }
-    cv.flush();
+    let shapes: Hover[] = [
+        new Hover(K_ORB, 160.0, 600.0, 100.0, 100.0),
+        new Hover(K_HEART, 460.0, 600.0, 84.0, 78.0),
+        new Hover(K_SQUARE, 760.0, 600.0, 64.0, 64.0),
+    ];
+    let clk = new Clock();
+
+    render_frame(cv, shapes, W, H);
     s.blitPtr(cv.pixels(), W, H, Rect(0, 0, W, H));
     s.present();
     print("gfx demo painted, canvas stride=" + cv.stride());
+
+    // Event loop: block on wait() when idle, ~60fps wait_timeout() while a
+    // hover tween is running. Headless (VS_EVENTS empty) returns EV_CLOSE from
+    // either call, so the test still paints one frame and exits immediately.
+    let running = true;
+    while (running) {
+        let ev = 0;
+        if (clk.active()) { ev = s.wait_timeout(16); } else { ev = s.wait(); }
+        if (ev == EV_CLOSE) {
+            running = false;
+        } else {
+            if (ev == EV_MOUSE_MOVE) {
+                update_hover(shapes, s.mouse_x() as float, s.mouse_y() as float, clk);
+            }
+            clk.sync(s.now_ms());
+            for (let i in 0..shapes.len) {
+                if (shapes[i].anim != null) { shapes[i].scale = shapes[i].anim.value(); }
+            }
+            render_frame(cv, shapes, W, H);
+            s.blitPtr(cv.pixels(), W, H, Rect(0, 0, W, H));
+            s.present();
+        }
+    }
 }
