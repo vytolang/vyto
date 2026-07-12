@@ -1,0 +1,105 @@
+// volt/hw/usb — enumerate connected USB devices, the Volt-way (docs/HARDWARE.md):
+// a thin sysfs shim, an opaque native snapshot owned and freed here, fields
+// copied out into plain Volt objects. Read-only and root-free; no external
+// library, no #link. Linux today (macOS returns an empty list until an IOKit
+// backend lands).
+//
+//     for (let d in usb_devices()) {
+//         print(d.id() + "  " + d.name());   // "1d6b:0003  Linux Foundation 3.0 root hub"
+//     }
+//
+// Bulk/interrupt transfers (opening a device and moving bytes) are the next
+// step on this same pattern — an opaque per-device handle with a byte[] transfer
+// call and a deinit that closes it, exactly like Socket.
+
+extern "C" {
+    fn usb_enumerate(): rawptr;
+    fn usb_count(h: rawptr): i32;
+    fn usb_vid(h: rawptr, i: i32): i32;
+    fn usb_pid(h: rawptr, i: i32): i32;
+    fn usb_bus(h: rawptr, i: i32): i32;
+    fn usb_addr(h: rawptr, i: i32): i32;
+    fn usb_class(h: rawptr, i: i32): i32;
+    fn usb_mfr(h: rawptr, i: i32): cstring;
+    fn usb_product(h: rawptr, i: i32): cstring;
+    fn usb_serial(h: rawptr, i: i32): cstring;
+    fn usb_speed(h: rawptr, i: i32): cstring;
+    fn usb_free(h: rawptr);
+}
+
+// A connected USB device (a snapshot; fields are copied, nothing aliases the
+// native buffer once usb_devices returns).
+export class UsbDevice {
+    vid: int;           // vendor id
+    pid: int;           // product id
+    bus: int;           // bus number
+    addr: int;          // device address on the bus
+    cls: int;           // bDeviceClass
+    manufacturer: string;
+    product: string;
+    serial: string;
+    speed: string;      // negotiated speed in Mbit/s, e.g. "480", "5000"
+
+    fn init(vid: int, pid: int, bus: int, addr: int, cls: int,
+            manufacturer: string, product: string, serial: string, speed: string) {
+        this.vid = vid;
+        this.pid = pid;
+        this.bus = bus;
+        this.addr = addr;
+        this.cls = cls;
+        this.manufacturer = manufacturer;
+        this.product = product;
+        this.serial = serial;
+        this.speed = speed;
+    }
+
+    // "vvvv:pppp" — the canonical vendor:product identifier (lowercase hex).
+    fn id(): string { return hex4(this.vid) + ":" + hex4(this.pid); }
+
+    // A human label: manufacturer + product when known, else the id.
+    fn name(): string {
+        if (this.product != "") {
+            if (this.manufacturer != "") { return this.manufacturer + " " + this.product; }
+            return this.product;
+        }
+        return this.id();
+    }
+}
+
+// Snapshot every connected USB device. Empty (never null) when there is no USB
+// subsystem or none are attached.
+export fn usb_devices(): UsbDevice[] {
+    let out: UsbDevice[] = [];
+    let h = usb_enumerate();
+    if (h == null) { return out; }
+    let n = usb_count(h) as int;
+    let i = 0;
+    while (i < n) {
+        out.push(new UsbDevice(
+            usb_vid(h, i as i32) as int,
+            usb_pid(h, i as i32) as int,
+            usb_bus(h, i as i32) as int,
+            usb_addr(h, i as i32) as int,
+            usb_class(h, i as i32) as int,
+            str(usb_mfr(h, i as i32)),
+            str(usb_product(h, i as i32)),
+            str(usb_serial(h, i as i32)),
+            str(usb_speed(h, i as i32))));
+        i += 1;
+    }
+    usb_free(h);
+    return out;
+}
+
+// Lowercase 4-digit hex (USB ids are 16-bit).
+fn hex4(v: int): string {
+    let digits = "0123456789abcdef";
+    let out = "";
+    let shift = 12;
+    while (shift >= 0) {
+        let nib = (v >> shift) & 0xF;
+        out = out + digits.slice(nib, nib + 1);
+        shift -= 4;
+    }
+    return out;
+}
