@@ -1,0 +1,100 @@
+// httpd — a minimal single-threaded HTTP/1.1 server in pure Volt, on
+// volt/net/socket. Volt has no threads, so it serves one connection to
+// completion before accepting the next (Connection: close per request). Fine
+// for tools, local dashboards, webhooks; not a load-bearing web server.
+//
+//   voltc run apps/httpd/httpd.vt            # listens on :8080
+//   voltc run apps/httpd/httpd.vt -- 9000    # custom port
+//
+// Routes: GET /  -> html   GET /api/time -> json   anything else -> 404.
+
+import { socket_listen, Socket } from "volt/net/socket";
+import { unixSec } from "volt/util/time";
+import { jobj, jint, jstr, json_encode } from "volt/util/json";
+
+fn main() {
+    let port = 8080;
+    let av = args();
+    if (av.len > 0) { port = av[0].to_int(); }
+
+    let srv = socket_listen(port);
+    if (srv == null) {
+        print("cannot bind port " + port + " (in use?)");
+        return;
+    }
+    print("httpd listening on http://127.0.0.1:" + port + "  (Ctrl-C to stop)");
+
+    while (true) {
+        let conn = srv.accept();
+        if (conn == null) { continue; }
+        conn.setTimeoutMs(5000);
+        handle(conn);
+        conn.close();
+    }
+}
+
+fn handle(conn: Socket) {
+    let req = readRequest(conn);
+    if (req == "") { return; }
+
+    // request line: "METHOD /path HTTP/1.1"
+    let eol = req.index_of("\r\n");
+    let line = req;
+    if (eol >= 0) { line = req.slice(0, eol); }
+    let sp1 = line.index_of(" ");
+    let method = "";
+    let target = "/";
+    if (sp1 >= 0) {
+        method = line.slice(0, sp1);
+        let after = line.slice(sp1 + 1, line.len);
+        let sp2 = after.index_of(" ");
+        if (sp2 >= 0) { target = after.slice(0, sp2); } else { target = after; }
+    }
+    let path = target;
+    let q = target.index_of("?");
+    if (q >= 0) { path = target.slice(0, q); }
+
+    print(method + " " + target);
+
+    if (path == "/") {
+        send(conn, 200, "text/html; charset=utf-8",
+             "<!doctype html><meta charset=utf-8><h1>volt httpd</h1>"
+             + "<p>Pure-Volt HTTP server on volt/net/socket.</p>"
+             + "<p><a href=/api/time>/api/time</a></p>");
+    } else if (path == "/api/time") {
+        let o = jobj();
+        o.set("service", jstr("volt-httpd"));
+        o.set("unix", jint(unixSec() as int));
+        send(conn, 200, "application/json", json_encode(o));
+    } else {
+        send(conn, 404, "text/plain", "404 not found: " + path + "\n");
+    }
+}
+
+// Read request bytes up to the end of the header block.
+fn readRequest(conn: Socket): string {
+    let acc = "";
+    while (acc.len < 65536) {
+        let chunk = conn.recvText(4096);
+        if (chunk.len == 0) { break; }
+        acc = acc + chunk;
+        if (acc.index_of("\r\n\r\n") >= 0) { break; }
+    }
+    return acc;
+}
+
+fn statusText(code: int): string {
+    if (code == 200) { return "OK"; }
+    if (code == 404) { return "Not Found"; }
+    return "OK";
+}
+
+// Write a complete HTTP/1.1 response and signal connection close.
+fn send(conn: Socket, code: int, ctype: string, body: string) {
+    let head = "HTTP/1.1 " + code + " " + statusText(code) + "\r\n"
+             + "Content-Type: " + ctype + "\r\n"
+             + "Content-Length: " + body.len + "\r\n"
+             + "Connection: close\r\n"
+             + "Server: volt-httpd/0.1\r\n\r\n";
+    conn.sendText(head + body);
+}

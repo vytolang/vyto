@@ -1,0 +1,61 @@
+// volt/net/socket — self-contained TCP loopback (no external network).
+// A single thread works: socket_connect() to a listening socket completes via the
+// kernel's accept backlog, so accept() returns without a second thread.
+import { socket_listen, socket_connect, socket_udp_bind } from "volt/net/socket";
+
+fn main() {
+    let srv = socket_listen(0);
+    print("listening=" + srv.isValid());
+    let port = srv.localPort();
+
+    let cli = socket_connect("127.0.0.1", port);
+    print("connected=" + cli.isValid());
+    cli.setTimeoutMs(2000);
+
+    let conn = srv.accept();
+    conn.setTimeoutMs(2000);
+
+    // client -> server
+    cli.sendText("ping");
+    print("server_recv=[" + conn.recvText(64) + "]");
+
+    // server -> client
+    conn.sendText("pong");
+    print("client_recv=[" + cli.recvText(64) + "]");
+
+    // a larger binary payload round-trips intact
+    let n = 5000;
+    let big = bytes(n);
+    let i = 0;
+    while (i < n) { big[i] = (i & 0xFF) as byte; i += 1; }
+    cli.send(big);
+    let got = 0;
+    let ok = true;
+    while (got < n) {
+        let chunk = conn.recv(n - got);
+        if (chunk.len == 0) { ok = false; break; }
+        let j = 0;
+        while (j < chunk.len) {
+            if ((chunk[j] as int) != ((got + j) & 0xFF)) { ok = false; }
+            j += 1;
+        }
+        got += chunk.len;
+    }
+    print("binary_bytes=" + got + " intact=" + ok);
+
+    cli.close();
+    conn.close();
+    srv.close();
+
+    // UDP loopback
+    let u = socket_udp_bind(0);
+    let uport = u.localPort();
+    let c2 = socket_udp_bind(0);
+    let msg = bytes(3);
+    msg[0] = 65 as byte; msg[1] = 66 as byte; msg[2] = 67 as byte;
+    c2.sendTo("127.0.0.1", uport, msg);
+    u.setTimeoutMs(2000);
+    print("udp_recv=[" + str(u.recvFrom(16) as cstring) + "]");
+    u.close();
+    c2.close();
+}

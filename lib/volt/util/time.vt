@@ -1,0 +1,65 @@
+// volt/util/time — clocks, sleep, durations, and a stopwatch.
+//
+// Two clocks, kept distinct because they answer different questions:
+//   * monoNs / monoMs  — a monotonic counter that never jumps backward; the
+//     right tool for measuring elapsed time, timeouts, and frame pacing.
+//   * nowNs  / unixMs  — wall-clock time (Unix epoch); the right tool for
+//     timestamps, but subject to NTP steps and DST.
+//
+//     let t = new Timer();
+//     do_work();
+//     print("took " + t.elapsedMs() + " ms");
+//
+// All native calls are single clock reads with no allocation — the low-latency
+// path. Sleep restarts across signal interrupts so the full interval elapses.
+
+extern "C" {
+    fn vtime_mono_ns(): i64;
+    fn vtime_real_ns(): i64;
+    fn vtime_sleep_ns(ns: i64);
+}
+
+// ---- monotonic clock (for measuring elapsed time) -----------------------
+export fn monoNs(): i64 { return vtime_mono_ns(); }
+export fn monoUs(): i64 { return vtime_mono_ns() / 1000; }
+export fn monoMs(): i64 { return vtime_mono_ns() / 1000000; }
+
+// ---- wall clock (for timestamps) ----------------------------------------
+export fn nowNs(): i64 { return vtime_real_ns(); }
+export fn nowUs(): i64 { return vtime_real_ns() / 1000; }
+export fn nowMs(): i64 { return vtime_real_ns() / 1000000; }
+export fn unixSec(): i64 { return vtime_real_ns() / 1000000000; }
+export fn unixMs(): i64 { return vtime_real_ns() / 1000000; }
+
+// ---- sleep --------------------------------------------------------------
+export fn sleepNs(ns: i64) { vtime_sleep_ns(ns); }
+export fn sleepUs(us: int) { vtime_sleep_ns((us as i64) * 1000); }
+export fn sleepMs(ms: int) { vtime_sleep_ns((ms as i64) * 1000000); }
+
+// ---- Duration (value type) ----------------------------------------------
+// A span of nanoseconds. Construct via the helpers; read it in whatever unit
+// you need. `this` arrives by value, so the accessors return numbers.
+export struct Duration {
+    ns: i64;
+}
+export fn dur_ms(v: float): Duration { return Duration((v * 1000000.0) as i64); }
+export fn dur_secs(v: float): Duration { return Duration((v * 1000000000.0) as i64); }
+export fn dur_micros(v: int): Duration { return Duration((v as i64) * 1000); }
+export fn dur_nanos(v: i64): Duration { return Duration(v); }
+
+// Duration accessors.
+export fn dur_as_ms(d: Duration): float { return (d.ns as float) / 1000000.0; }
+export fn dur_as_secs(d: Duration): float { return (d.ns as float) / 1000000000.0; }
+
+// ---- Timer (monotonic stopwatch) ----------------------------------------
+export class Timer {
+    startNs: i64;
+
+    fn init() { this.startNs = vtime_mono_ns(); }
+    fn reset() { this.startNs = vtime_mono_ns(); }
+
+    fn elapsedNs(): i64 { return vtime_mono_ns() - this.startNs; }
+    fn elapsedUs(): float { return (this.elapsedNs() as float) / 1000.0; }
+    fn elapsedMs(): float { return (this.elapsedNs() as float) / 1000000.0; }
+    fn elapsedSecs(): float { return (this.elapsedNs() as float) / 1000000000.0; }
+}

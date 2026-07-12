@@ -1,0 +1,93 @@
+// volt/net/websocket — self-contained: two WebSocket endpoints over a socket
+// pair talk to each other (each masks its frames; recv unmasks), so the RFC
+// 6455 framing is exercised end-to-end with no external server. Random masks
+// don't affect output because recv unmasks. A live ws_connect() runs only under
+// VOLT_WS_LIVE.
+import { socket_listen, socket_connect } from "volt/net/socket";
+import { WebSocket, base64_encode, ws_connect } from "volt/net/websocket";
+import { getenv } from "volt/os/os";
+
+fn strToBytes(s: string): byte[] {
+    let b = bytes(s.len);
+    let i = 0;
+    while (i < s.len) { b[i] = s[i] as byte; i += 1; }
+    return b;
+}
+
+fn main() {
+    // base64_encode vectors (RFC 4648)
+    print("b64.Man=" + base64_encode(strToBytes("Man")));
+    print("b64.Ma=" + base64_encode(strToBytes("Ma")));
+    print("b64.M=" + base64_encode(strToBytes("M")));
+
+    // socket pair
+    let srv = socket_listen(0);
+    let port = srv.localPort();
+    let cli = socket_connect("127.0.0.1", port);
+    cli.setTimeoutMs(2000);
+    let conn = srv.accept();
+    conn.setTimeoutMs(2000);
+
+    let a = new WebSocket(cli);
+    let b = new WebSocket(conn);
+
+    // text frame
+    a.sendText("hello websocket");
+    let m1 = b.recv();
+    print("text=[" + m1.text() + "] isText=" + m1.isText());
+
+    // binary frame
+    let payload = bytes(4);
+    payload[0] = 1 as byte; payload[1] = 2 as byte; payload[2] = 254 as byte; payload[3] = 255 as byte;
+    a.sendBinary(payload);
+    let m2 = b.recv();
+    print("binary.len=" + m2.data.len + " isBinary=" + m2.isBinary()
+          + " last=" + (m2.data[3] as int));
+
+    // medium frame (>125 -> 16-bit length path)
+    let big = bytes(1000);
+    let i = 0;
+    while (i < 1000) { big[i] = (i & 0xFF) as byte; i += 1; }
+    a.sendBinary(big);
+    let m3 = b.recv();
+    let intact = m3.data.len == 1000;
+    let k = 0;
+    while (k < m3.data.len) {
+        if ((m3.data[k] as int) != (k & 0xFF)) { intact = false; }
+        k += 1;
+    }
+    print("medium.len=" + m3.data.len + " intact=" + intact);
+
+    // large frame (>65535 -> 64-bit length path)
+    let huge = bytes(70000);
+    a.sendBinary(huge);
+    let m4 = b.recv();
+    print("large.len=" + m4.data.len);
+
+    // ping/pong: a sends ping then text (same direction). b.recv reads the
+    // ping, auto-replies pong, and returns the text; a then reads the pong.
+    a.ping();
+    a.sendText("after-ping");
+    let m6 = b.recv();
+    print("after=[" + m6.text() + "]");
+    let m5 = a.recv();
+    print("pong.opcode=" + m5.opcode);
+
+    a.close(1000);
+    b.close(1000);
+    srv.close();
+
+    if (getenv("VOLT_WS_LIVE") != "") {
+        let ws = ws_connect("ws://echo.websocket.events/");
+        if (ws != null) {
+            ws.sendText("volt");
+            let mm = ws.recv();
+            print("live.first=[" + mm.text() + "]");
+            ws.close(1000);
+        } else {
+            print("live=socket_connect-failed");
+        }
+    } else {
+        print("live=skipped");
+    }
+}

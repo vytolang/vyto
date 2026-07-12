@@ -1,0 +1,105 @@
+// volt/os — operating-system helpers: environment, working directory, process
+// and host info, and subprocess execution.
+//
+//     os.getenv("HOME")                 // "/home/ada"
+//     os.setenv("MODE", "fast")
+//     os.cwd()                          // "/home/ada/project"
+//     let r = os.capture("uname -sm");  // r.out() -> "Linux x86_64\n"
+//     os.run("make")                    // -> child exit code
+//
+// Runtime failures are soft (missing env var -> "", failed chdir -> false).
+// `capture` returns a ProcResult whose native buffer is freed deterministically
+// by its deinit — no manual cleanup. Linux + macOS.
+
+extern "C" {
+    fn os_getenv(k: cstring): cstring;
+    fn os_setenv(k: cstring, v: cstring): i32;
+    fn os_unsetenv(k: cstring): i32;
+    fn os_chdir(p: cstring): i32;
+    fn os_getcwd(buf: cstring, cap: i32): i32;
+    fn os_pid(): i32;
+    fn os_gethostname(buf: cstring, cap: i32): i32;
+    fn os_username(): cstring;
+    fn os_homedir(): cstring;
+    fn os_cpucount(): i32;
+    fn os_exit(code: i32);
+    fn os_platform(): cstring;
+    fn os_arch(buf: cstring, cap: i32): i32;
+    fn os_run(cmd: cstring): i32;
+    fn os_capture(cmd: cstring): rawptr;
+    fn os_capture_data(h: rawptr): cstring;
+    fn os_capture_len(h: rawptr): i64;
+    fn os_capture_code(h: rawptr): i32;
+    fn os_capture_free(h: rawptr);
+}
+
+// ---- environment --------------------------------------------------------
+export fn getenv(k: string): string { return str(os_getenv(k.cstr())); }
+export fn hasEnv(k: string): bool { return os_getenv(k.cstr()) != null; }
+export fn setenv(k: string, v: string): bool { return os_setenv(k.cstr(), v.cstr()) as int == 0; }
+export fn unsetenv(k: string): bool { return os_unsetenv(k.cstr()) as int == 0; }
+// Like getenv, but returns `fallback` when the variable is unset.
+export fn getenvOr(k: string, fallback: string): string {
+    let p = os_getenv(k.cstr());
+    if (p == null) { return fallback; }
+    return str(p);
+}
+
+// ---- working directory & process ----------------------------------------
+export fn cwd(): string {
+    let b = bytes(4096);
+    os_getcwd(b as cstring, 4096 as i32);
+    return str(b as cstring);
+}
+export fn chdir(p: string): bool { return os_chdir(p.cstr()) as int == 0; }
+export fn pid(): int { return os_pid() as int; }
+export fn exit(code: int) { os_exit(code as i32); }
+
+// ---- host / user --------------------------------------------------------
+export fn hostname(): string {
+    let b = bytes(256);
+    os_gethostname(b as cstring, 256 as i32);
+    return str(b as cstring);
+}
+export fn username(): string { return str(os_username()); }
+export fn homeDir(): string { return str(os_homedir()); }
+export fn tempDir(): string {
+    let t = getenv("TMPDIR");
+    if (t != "") { return t; }
+    return "/tmp";
+}
+export fn platform(): string { return str(os_platform()); }
+export fn arch(): string {
+    let b = bytes(64);
+    os_arch(b as cstring, 64 as i32);
+    return str(b as cstring);
+}
+export fn cpuCount(): int { return os_cpucount() as int; }
+
+// ---- subprocess ---------------------------------------------------------
+// Run `cmd` through the shell, inheriting stdio; returns the child's exit code
+// (-1 if it could not run).
+export fn run(cmd: string): int { return os_run(cmd.cstr()) as int; }
+
+// The captured result of a subprocess. The native output buffer is owned here
+// and freed on teardown.
+export class ProcResult {
+    h: rawptr;
+    fn init(h: rawptr) { this.h = h; }
+
+    fn code(): int { return os_capture_code(this.h) as int; }
+    fn out(): string { return str(os_capture_data(this.h)); }
+    fn ok(): bool { return this.code() == 0; }
+
+    deinit {
+        if (this.h != null) { os_capture_free(this.h); this.h = null; }
+    }
+}
+
+// Run `cmd` through the shell and capture its stdout. Null only if the process
+// could not be spawned.
+export fn capture(cmd: string): ProcResult {
+    let h = os_capture(cmd.cstr());
+    if (h == null) { return null; }
+    return new ProcResult(h);
+}
