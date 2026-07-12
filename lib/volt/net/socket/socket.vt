@@ -24,6 +24,40 @@ extern "C" {
     fn vsock_udp_bind(host: cstring, port: i32): i32;
     fn vsock_sendto(fd: i32, host: cstring, port: i32, buf: cstring, n: i64): i64;
     fn vsock_recvfrom(fd: i32, buf: cstring, cap: i64): i64;
+
+    // non-blocking (async)
+    fn vsock_set_nonblocking(fd: i32, on: i32): i32;
+    fn vsock_try_recv(fd: i32, buf: cstring, cap: i64): i64;
+    fn vsock_try_send(fd: i32, buf: cstring, n: i64): i64;
+    fn vsock_try_accept(fd: i32): i32;
+    fn vsock_connect_async(host: cstring, port: i32): i32;
+    fn vsock_conn_result(fd: i32): i32;
+
+    // poll set (event loop)
+    fn vpoll_new(): rawptr;
+    fn vpoll_add(h: rawptr, fd: i32, events: i32): i32;
+    fn vpoll_mod(h: rawptr, fd: i32, events: i32): i32;
+    fn vpoll_del(h: rawptr, fd: i32): i32;
+    fn vpoll_wait(h: rawptr, timeout_ms: i32): i32;
+    fn vpoll_ready_fd(h: rawptr, i: i32): i32;
+    fn vpoll_ready_events(h: rawptr, i: i32): i32;
+    fn vpoll_free(h: rawptr);
+}
+
+// Event bits for PollSet (match the native VP_* contract).
+export const POLL_READ:  int = 1;
+export const POLL_WRITE: int = 2;
+export const POLL_ERR:   int = 4;
+
+// Result of a non-blocking read. `status`: >0 = bytes in `data`, 0 = peer
+// closed (EOF), -1 = would-block (retry later), -2 = error. `data` is populated
+// (and right-sized) only when status > 0.
+export class RecvResult {
+    status: int;
+    data: byte[];
+    fn init(status: int, data: byte[]) { this.status = status; this.data = data; }
+    fn wouldBlock(): bool { return this.status == -1; }
+    fn eof(): bool { return this.status == 0; }
 }
 
 // Copy the first `n` bytes of `buf` into a right-sized array.
@@ -95,15 +129,95 @@ export class Socket {
         return take(buf, got);
     }
 
+    // ---- non-blocking (async) ----
+    // Switch the socket between blocking and non-blocking mode.
+    fn setNonBlocking(on: bool): bool {
+        this.ensure();
+        let v = 0;
+        if (on) { v = 1; }
+        return vsock_set_nonblocking(this.fd, v as i32) as int == 0;
+    }
+    // Non-blocking read of up to `n` bytes. Inspect the RecvResult's status to
+    // tell bytes / EOF / would-block / error apart.
+    fn tryRecv(n: int): RecvResult {
+        this.ensure();
+        if (n <= 0) { return new RecvResult(0, bytes(0)); }
+        let buf = bytes(n);
+        let r = vsock_try_recv(this.fd, buf as cstring, n as i64) as int;
+        if (r > 0) { return new RecvResult(r, take(buf, r)); }
+        return new RecvResult(r, bytes(0));
+    }
+    // Non-blocking write. Returns bytes sent (>=0), -1 would-block, -2 error.
+    fn trySend(data: byte[]): int {
+        this.ensure();
+        return vsock_try_send(this.fd, data as cstring, data.len as i64) as int;
+    }
+    // Non-blocking accept. Null when nothing is pending (or on error); the
+    // accepted socket is itself non-blocking.
+    fn tryAccept(): Socket {
+        this.ensure();
+        let c = vsock_try_accept(this.fd) as int;
+        if (c < 0) { return null; }
+        return new Socket(c as i32);
+    }
+    // For a socket from socket_connect_async: once it is POLL_WRITE-ready,
+    // 0 = connected, >0 = errno (failed), -1 = getsockopt error.
+    fn connResult(): int { this.ensure(); return vsock_conn_result(this.fd) as int; }
+
     fn close() {
         if ((this.fd as int) >= 0) { vsock_close(this.fd); this.fd = -1 as i32; }
     }
     deinit { this.close(); }
 }
 
+// A set of sockets watched for readiness — the honest single-thread concurrency
+// primitive (nginx-style). epoll on Linux, poll(2) elsewhere; identical bits
+// either way. Register fds with events (POLL_READ | POLL_WRITE), block in
+// `wait`, then walk the ready list. `readyFd` returns a raw fd, so keep your own
+// Map<int, Socket> of live connections.
+//
+//     let ps = new PollSet();
+//     ps.add(listener, POLL_READ);
+//     while (true) {
+//         let n = ps.wait(-1);
+//         let i = 0;
+//         while (i < n) {
+//             let fd = ps.readyFd(i);
+//             ... dispatch on fd ...
+//             i += 1;
+//         }
+//     }
+export class PollSet {
+    h: rawptr;
+    fn init() { this.h = vpoll_new(); }
+
+    fn add(s: Socket, events: int): bool { return vpoll_add(this.h, s.fd, events as i32) as int == 0; }
+    fn addFd(fd: int, events: int): bool { return vpoll_add(this.h, fd as i32, events as i32) as int == 0; }
+    fn modify(s: Socket, events: int): bool { return vpoll_mod(this.h, s.fd, events as i32) as int == 0; }
+    fn remove(s: Socket): bool { return vpoll_del(this.h, s.fd) as int == 0; }
+    fn removeFd(fd: int): bool { return vpoll_del(this.h, fd as i32) as int == 0; }
+
+    // Block up to timeoutMs (-1 = forever, 0 = poll now). Returns the number of
+    // ready fds (0 on timeout), -1 on error.
+    fn wait(timeoutMs: int): int { return vpoll_wait(this.h, timeoutMs as i32) as int; }
+    fn readyFd(i: int): int { return vpoll_ready_fd(this.h, i as i32) as int; }
+    fn readyEvents(i: int): int { return vpoll_ready_events(this.h, i as i32) as int; }
+
+    deinit { if (this.h != null) { vpoll_free(this.h); this.h = null; } }
+}
+
 // Connect a TCP socket to host:port (IPv4 or IPv6). Null on failure.
 export fn socket_connect(host: string, port: int): Socket {
     let fd = vsock_connect(host.cstr(), port as i32) as int;
+    if (fd < 0) { return null; }
+    return new Socket(fd as i32);
+}
+
+// Start a non-blocking TCP connect (returns before the handshake completes).
+// Null on setup failure. Poll the socket for POLL_WRITE, then check connResult()
+// == 0 before using it.
+export fn socket_connect_async(host: string, port: int): Socket {
+    let fd = vsock_connect_async(host.cstr(), port as i32) as int;
     if (fd < 0) { return null; }
     return new Socket(fd as i32);
 }

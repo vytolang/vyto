@@ -1,0 +1,67 @@
+// Single-thread concurrency with a poll set — no threads. A non-blocking
+// listener and two client connections are all driven from one PollSet.wait
+// loop: the loop accepts both connections and echoes each client's data back,
+// serving them concurrently on one thread (the property a blocking
+// accept-then-serve server like apps/httpd lacks).
+
+import { socket_listen, socket_connect, Socket, PollSet,
+         POLL_READ } from "volt/net/socket";
+
+fn main() {
+    // Non-blocking listener on an ephemeral port.
+    let srv = socket_listen(0);
+    if (srv == null) { print("bind failed"); return; }
+    srv.setNonBlocking(true);
+    let port = srv.localPort();
+    let srvFd = srv.fd as int;
+
+    let ps = new PollSet();
+    ps.add(srv, POLL_READ);
+
+    // Two clients connect and send (blocking connect/send is fine here — the
+    // data sits in the kernel until the event loop drains it).
+    let c1 = socket_connect("127.0.0.1", port);
+    let c2 = socket_connect("127.0.0.1", port);
+    c1.sendText("hello-1");
+    c2.sendText("hello-2");
+
+    // Event loop: one wait() call surfaces every ready fd. Accept new
+    // connections on the listener; echo + retire client connections. Stop once
+    // both clients have been served.
+    let conns: Socket[] = [];
+    let served = 0;
+    while (served < 2) {
+        let n = ps.wait(1000);
+        if (n <= 0) { break; } // timeout guard so the example can't hang
+        let i = 0;
+        while (i < n) {
+            let fd = ps.readyFd(i);
+            if (fd == srvFd) {
+                let conn = srv.tryAccept();
+                if (conn != null) { ps.add(conn, POLL_READ); conns.push(conn); }
+            } else {
+                let conn = findConn(conns, fd);
+                if (conn != null) {
+                    let rr = conn.tryRecv(256);
+                    if (rr.status > 0) {
+                        conn.trySend(rr.data); // echo
+                        ps.remove(conn);
+                        served += 1;
+                    }
+                }
+            }
+            i += 1;
+        }
+    }
+
+    // Clients read their echoes back.
+    print("served=" + served);
+    print("c1=" + c1.recvText(256));
+    print("c2=" + c2.recvText(256));
+}
+
+// Find the connection with the given fd (linear scan — Map keys are strings).
+fn findConn(conns: Socket[], fd: int): Socket {
+    for (let c in conns) { if ((c.fd as int) == fd) { return c; } }
+    return null;
+}

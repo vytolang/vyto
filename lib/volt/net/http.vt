@@ -32,6 +32,12 @@ extern "C" {
                    body: cstring, body_len: i64, timeout_ms: i64,
                    sink: rawptr, sink_ud: rawptr): i64;
     fn http_chunk_copy(src: cstring, dst: cstring, len: i32);
+    fn http_multi_new(): rawptr;
+    fn http_multi_add(h: rawptr, method: cstring, url: cstring, header_lines: cstring,
+                      body: cstring, body_len: i64, timeout_ms: i64): rawptr;
+    fn http_multi_perform(h: rawptr, timeout_ms: i32): i32;
+    fn http_multi_next_done(h: rawptr): rawptr;
+    fn http_multi_free(h: rawptr);
 }
 
 // A completed HTTP response. Owns the native buffer; freed on teardown.
@@ -145,6 +151,64 @@ export class Request {
         if (this.hasBody) { s = s + "body: " + this.payload; }
         return s;
     }
+}
+
+// ---- concurrent client (curl_multi) -------------------------------------
+//
+// Run many requests at once on a single thread (Volt has no threads). Queue
+// built Requests with `add`, then `runAll` drives them all concurrently and
+// returns the Responses as they complete. Wall-clock is ~the slowest request,
+// not the sum.
+//
+//     let pool = new HttpPool();
+//     pool.add(http_get("https://a/1"));
+//     pool.add(http_get("https://a/2"));
+//     for (let r in pool.runAll(30000)) { print(r.status()); }
+//
+// Each Response owns its native buffer (freed on teardown), exactly like a
+// Response from Request.send.
+export class HttpPool {
+    h: rawptr;
+    pending: int;
+    fn init() { this.h = http_multi_new(); this.pending = 0; }
+
+    // Queue a built request. Its per-request timeout (timeoutMs) still applies.
+    fn add(req: Request) {
+        let blen = 0;
+        if (req.hasBody) { blen = req.payload.len; }
+        http_multi_add(this.h, req.method.cstr(), req.url.cstr(), req.hdrs.cstr(),
+                       req.payload.cstr(), blen as i64, req.timeout as i64);
+        this.pending += 1;
+    }
+
+    // Drive one round: block up to timeoutMs waiting on activity, then return
+    // every Response that finished this round (empty if none yet). For building
+    // your own event loop; most callers want runAll.
+    fn poll(timeoutMs: int): Response[] {
+        let done: Response[] = [];
+        if (this.pending <= 0) { return done; }
+        http_multi_perform(this.h, timeoutMs as i32);
+        while (true) {
+            let r = http_multi_next_done(this.h);
+            if (r == null) { break; }
+            done.push(new Response(r));
+            this.pending -= 1;
+        }
+        return done;
+    }
+
+    // Block, driving all queued transfers concurrently, until every one
+    // finishes; return the Responses in completion order.
+    fn runAll(timeoutMs: int): Response[] {
+        let out: Response[] = [];
+        while (this.pending > 0) {
+            let batch = this.poll(timeoutMs);
+            for (let r in batch) { out.push(r); }
+        }
+        return out;
+    }
+
+    deinit { if (this.h != null) { http_multi_free(this.h); this.h = null; } }
 }
 
 // ---- streaming ----------------------------------------------------------

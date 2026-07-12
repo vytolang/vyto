@@ -1,0 +1,46 @@
+// Real CPU parallelism with no threads: a WorkerPool forks 4 children and runs
+// a heavy pure job across them. Each job crunches an arithmetic loop keyed by
+// its one input byte and returns the result as text. map() fans the inputs out
+// and gathers the outputs in order — the work runs on 4 cores at once, yet the
+// language stays single-threaded and lock-free (workers share nothing but bytes).
+
+import { WorkerPool } from "volt/os/worker";
+
+fn main() {
+    // 4 workers, each running the same pure byte[] -> byte[] job.
+    let pool = new WorkerPool(4, (input) => heavy(input));
+    print("workers=" + pool.size());
+
+    // One job per input; input is a single seed byte.
+    let inputs: byte[][] = [];
+    let k = 1;
+    while (k <= 6) {
+        let b = bytes(1);
+        b[0] = k as byte;
+        inputs.push(b);
+        k += 1;
+    }
+
+    let outs = pool.map(inputs);
+    for (let o in outs) { print("out=" + str(o as cstring)); }
+}
+
+// CPU-bound, deterministic per seed: sum of (i * seed) mod P over a big range.
+fn heavy(input: byte[]): byte[] {
+    let seed = 0;
+    if (input.len > 0) { seed = input[0] as int; }
+    let acc = 0;
+    let i = 0;
+    while (i < 2000000) {
+        acc = (acc + i * seed) % 1000000007;
+        i += 1;
+    }
+    return strBytes("" + acc);
+}
+
+fn strBytes(s: string): byte[] {
+    let b = bytes(s.len);
+    let i = 0;
+    while (i < s.len) { b[i] = s[i] as byte; i += 1; }
+    return b;
+}
