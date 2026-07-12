@@ -206,6 +206,12 @@ export class Theme {
     focus_ring: int;      // rgba primary, ~0.55 alpha
     shadow_color: int;    // rgba neutral, soft-drop shadow tint
     selection: int;       // list row highlight
+    // status/severity roles — Alert, Toast, Banner (info/success/warning/error)
+    info: int;
+    success: int;
+    warning: int;
+    danger: int;
+    on_status: int;       // text/icon color on a filled status color
 
     // --- scales ---
     radius_sm: int;
@@ -280,6 +286,11 @@ export class Theme {
         this.divider         = rgb(228, 231, 238);
         this.selection       = mix(this.surface, this.primary, 0.16);
         this.shadow_color    = rgba(35, 40, 60, 55);
+        this.info            = rgb(46, 98, 210);
+        this.success         = rgb(34, 152, 84);
+        this.warning         = rgb(214, 152, 24);
+        this.danger          = rgb(210, 60, 60);
+        this.on_status       = rgb(255, 255, 255);
 
         // ramps
         this.primary_500     = this.primary;
@@ -362,6 +373,11 @@ export fn theme_dark(): Theme {
     th.divider           = rgb(44, 44, 54);
     th.selection         = mix(th.surface, th.primary, 0.30);
     th.shadow_color      = rgba(0, 0, 0, 150);
+    th.info              = rgb(96, 148, 238);
+    th.success           = rgb(64, 190, 120);
+    th.warning           = rgb(232, 176, 64);
+    th.danger            = rgb(232, 96, 96);
+    th.on_status         = rgb(16, 18, 26);
 
     th.primary_500       = th.primary;
     th.primary_300       = mix(th.primary, th.on_primary, 0.45);
@@ -1163,6 +1179,8 @@ export class Window {
     root: Widget;
     menubar: Widget;    // optional MenuBar; drawn in a top strip above root
     overlay: Widget;    // optional; popup or modal dialog on top of everything
+    toasts: Widget[];   // transient top-most notifications; coexist with overlay,
+                        // never capture input like a modal, self-dismiss on a tween
     theme: Theme;
     focusables: Widget[];
     focus_i: int;
@@ -1200,6 +1218,7 @@ export class Window {
         this.theme = new Theme();
         this.skin = new Skin();
         this.animations = [];
+        this.toasts = [];
         this.focusables = [];
         this.focus_i = -1;
         this.close_on_esc = true;
@@ -1260,6 +1279,29 @@ export class Window {
         this.layout();
     }
 
+    // Transient notifications (Toast/Snackbar). They live in a separate top-most
+    // layer from `overlay`, so a toast can appear over a dialog and never blocks
+    // input. A toast self-dismisses by calling remove_toast(this) from its own
+    // fade tween. propagate_win flushes the toast's pending fade animation into
+    // the clock (which keeps run() ticking until it settles).
+    fn show_toast(t: Widget) {
+        t.propagate_win(this);
+        this.toasts.push(t);
+        this.layout();
+        this.redraw();
+    }
+
+    fn remove_toast(t: Widget) {
+        let keep: Widget[] = [];
+        for (let x in this.toasts) {
+            if (x != t) { keep.push(x); }
+        }
+        this.toasts = keep;
+        t.release_all();
+        this.layout();
+        this.redraw();
+    }
+
     fn focused_widget(): Widget {
         if (this.focus_i < 0 || this.focus_i >= this.focusables.len) { return null; }
         return this.focusables[this.focus_i];
@@ -1318,6 +1360,11 @@ export class Window {
         if (this.overlay != null) {
             this.overlay.place(this.painter, this.theme);
         }
+        // toasts self-position (bottom-stacked); place() reads this.toasts order
+        for (let t in this.toasts) {
+            t.win = this;
+            t.place(this.painter, this.theme);
+        }
         // focus ring covers the root tree; overlays manage their own focus
         let old = this.focused_widget();
         let fresh: Widget[] = [];
@@ -1345,6 +1392,9 @@ export class Window {
         }
         if (this.overlay != null) {
             this.overlay.draw(this.painter, this.theme);
+        }
+        for (let t in this.toasts) {
+            t.draw(this.painter, this.theme);
         }
         this.painter.present();
     }
@@ -1404,6 +1454,9 @@ export class Window {
         if (this.overlay != null && rect_overlaps(this.overlay.bounds, d)) {
             this.overlay.draw(this.painter, this.theme);
         }
+        for (let t in this.toasts) {
+            if (rect_overlaps(t.bounds, d)) { t.draw(this.painter, this.theme); }
+        }
         this.painter.clip_pop();
         // present only the changed rect — full-window blits per hover/caret
         // repaint were the single biggest frame cost on the rich tier
@@ -1458,6 +1511,15 @@ export class Window {
     fn on_mouse_ev(x: int, y: int) {
         this.drag_x = x;
         this.drag_y = y;
+        // toasts sit above everything and get first crack at a click (a Snackbar
+        // action button) — but a miss falls through so they never block input.
+        let n = this.toasts.len;
+        for (let i in 0..n) {
+            let t = this.toasts[n - 1 - i];
+            if (contains(t.bounds, x, y)) {
+                if (t.on_click(x, y)) { this.redraw(); return; }
+            }
+        }
         if (this.overlay != null) {
             if (!contains(this.overlay.bounds, x, y) && !this.overlay.modal) {
                 this.dismiss_overlay();
@@ -1735,6 +1797,8 @@ export class Window {
         if (this.root != null) { this.root.release_all(); }
         if (this.menubar != null) { this.menubar.release_all(); }
         if (this.overlay != null) { this.overlay.release_all(); }
+        for (let t in this.toasts) { t.release_all(); }
+        this.toasts = [];
         this.root = null;
         this.menubar = null;
         this.overlay = null;

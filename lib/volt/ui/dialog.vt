@@ -2,8 +2,10 @@
 // listing + filename field + OK/Cancel), and a MessageDialog notice.
 
 import { Widget, Painter, Theme, Window, BoxConstraints } from "volt/ui/core";
-import { Button, TextField, ListBox } from "volt/ui/form";
+import { Button, TextField, ListBox, ProgressBar } from "volt/ui/form";
 import { Text } from "volt/ui/display";
+import { severity_color, draw_severity_glyph,
+         SEV_NONE, SEV_INFO, SEV_SUCCESS, SEV_WARNING, SEV_ERROR } from "volt/ui/feedback";
 import { Rect, contains, KEY_ENTER, KEY_TAB } from "volt/surface";
 
 // Modal panel base: centered, dims nothing (no alpha) but traps events via
@@ -219,5 +221,176 @@ export class MessageDialog extends Dialog {
     override fn on_click(x: int, y: int): bool {
         if (contains(this.ok.bounds, x, y)) { this.dismiss(); return true; }
         return true; // swallow clicks inside the modal (Esc / OK dismiss)
+    }
+}
+
+// ------------------------------------------------------- AlertDialog
+
+// A modal alert with a severity glyph and one or more action buttons. Default
+// action is a single "OK"; call set_actions(["Cancel","Delete"]) for choices.
+// onAction fires with the clicked button index after dismissal.
+export class AlertDialog extends Dialog {
+    severity: int;
+    message: string;
+    actions: string[];
+    onAction: fn(int);
+    msg_text: Text;
+    btns: Button[];
+
+    fn init(title: string, message: string, severity: int) {
+        super.init(title);
+        this.severity = severity;
+        this.message = message;
+        this.actions = ["OK"];
+        this.msg_text = new Text(message);
+        this.add(this.msg_text);
+        this.btns = [];
+    }
+
+    fn set_actions(labels: string[]) { this.actions = labels; }
+
+    fn ensure_btns() {
+        if (this.btns.len == this.actions.len) { return; }
+        this.btns = [];
+        for (let i in 0..this.actions.len) {
+            let b = new Button(this.actions[i]);
+            this.add(b);
+            // built lazily in place() — after the tree's propagate_win ran — so
+            // give the new button the Window ref it needs to draw.
+            if (this.win != null) { b.propagate_win(this.win); }
+            this.btns.push(b);
+        }
+    }
+
+    override fn place(s: Painter, th: Theme) {
+        this.ensure_btns();
+        let dw = 360;
+        let fh = s.font_height();
+        let titleh = fh + 10;
+        let ctrl = fh + 12;
+        let textx = 60;   // room for the severity glyph on the left
+        this.msg_text.layout(s, th, new BoxConstraints(0, dw - textx - 16, 0, 400));
+        let msg_h = this.msg_text.cached_count * (fh + 2);
+        if (msg_h < fh + 10) { msg_h = fh + 10; }
+        let dh = titleh + 16 + msg_h + 16 + ctrl + 12;
+        let x = (s.width() - dw) / 2;
+        let y = (s.height() - dh) / 2;
+        this.bounds = Rect(x, y, dw, dh);
+        this.msg_text.bounds = Rect(x + textx, y + titleh + 16, dw - textx - 16, msg_h);
+        let bx = x + dw - 12;
+        let by = y + dh - 12 - ctrl;
+        for (let i in 0..this.btns.len) {
+            let bi = this.btns.len - 1 - i;   // right-to-left
+            let bw = s.text_width(this.actions[bi]) + 28;
+            bx -= bw;
+            this.btns[bi].bounds = Rect(bx, by, bw, ctrl);
+            bx -= 8;
+        }
+    }
+
+    override fn draw(s: Painter, th: Theme) {
+        this.win.skin.panel.paint_titled(s, th, this.bounds, th.radius_lg,
+                                         th.surface_raised, th.border, 3, this.title);
+        let c = severity_color(th, this.severity);
+        let gy = this.msg_text.bounds.y + 8;
+        draw_severity_glyph(s, this.bounds.x + 32, gy, 11, c, th.on_status, this.severity);
+        this.msg_text.draw(s, th);
+        for (let b in this.btns) { b.draw(s, th); }
+    }
+
+    fn fire(i: int) {
+        let cb = this.onAction;
+        this.dismiss();
+        if (cb != null) { cb(i); }
+    }
+
+    override fn on_click(x: int, y: int): bool {
+        for (let i in 0..this.btns.len) {
+            if (contains(this.btns[i].bounds, x, y)) { this.fire(i); return true; }
+        }
+        return true;
+    }
+
+    override fn on_key(k: int, ch: string): bool {
+        if (k == KEY_ENTER) { this.fire(this.btns.len - 1); return true; }
+        return false;
+    }
+
+    override fn drop_handlers() {
+        this.onAction = null;
+    }
+}
+
+// ------------------------------------------------------- ProgressDialog
+
+// A modal progress panel: title + message + a ProgressBar. Determinate via
+// set_progress(0..1) or indeterminate via set_indeterminate(true). Optional
+// Cancel button (onCancel).
+export class ProgressDialog extends Dialog {
+    message: string;
+    msg_text: Text;
+    bar: ProgressBar;
+    cancel_btn: Button;
+    show_cancel: bool;
+    onCancel: fn();
+
+    fn init(title: string, message: string) {
+        super.init(title);
+        this.message = message;
+        this.msg_text = new Text(message);
+        this.bar = new ProgressBar(0.0, -1, -1);
+        this.cancel_btn = new Button("Cancel");
+        this.add(this.msg_text);
+        this.add(this.bar);
+        // must be a child: propagate_win sets its `win`, else Button.draw
+        // dereferences a null skin when show_cancel is on (segfault).
+        this.add(this.cancel_btn);
+        this.show_cancel = false;
+    }
+
+    fn set_progress(p: float) { this.bar.set_progress(p); }
+    fn set_indeterminate(v: bool) { this.bar.indeterminate = v; }
+
+    override fn place(s: Painter, th: Theme) {
+        let dw = 340;
+        let fh = s.font_height();
+        let titleh = fh + 10;
+        let ctrl = fh + 12;
+        this.msg_text.layout(s, th, new BoxConstraints(0, dw - 32, 0, 400));
+        let msg_h = this.msg_text.cached_count * (fh + 2);
+        if (msg_h < fh + 4) { msg_h = fh + 4; }
+        let barh = 8;
+        let dh = titleh + 16 + msg_h + 12 + barh + 16;
+        if (this.show_cancel) { dh += ctrl + 12; }
+        let x = (s.width() - dw) / 2;
+        let y = (s.height() - dh) / 2;
+        this.bounds = Rect(x, y, dw, dh);
+        this.msg_text.bounds = Rect(x + 16, y + titleh + 16, dw - 32, msg_h);
+        this.bar.bounds = Rect(x + 16, this.msg_text.bounds.y + msg_h + 12, dw - 32, barh);
+        if (this.show_cancel) {
+            this.cancel_btn.bounds = Rect(x + dw - 12 - 90, y + dh - 12 - ctrl, 90, ctrl);
+        }
+    }
+
+    override fn draw(s: Painter, th: Theme) {
+        this.win.skin.panel.paint_titled(s, th, this.bounds, th.radius_lg,
+                                         th.surface_raised, th.border, 3, this.title);
+        this.msg_text.draw(s, th);
+        this.bar.draw(s, th);
+        if (this.show_cancel) { this.cancel_btn.draw(s, th); }
+    }
+
+    override fn on_click(x: int, y: int): bool {
+        if (this.show_cancel && contains(this.cancel_btn.bounds, x, y)) {
+            let cb = this.onCancel;
+            this.dismiss();
+            if (cb != null) { cb(); }
+            return true;
+        }
+        return true;
+    }
+
+    override fn drop_handlers() {
+        this.onCancel = null;
     }
 }

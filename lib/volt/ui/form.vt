@@ -119,6 +119,10 @@ export class TextField extends Widget {
     // Selection: anchor is the fixed end, caret tracks the moving end (focus).
     sel: SelectionModel;
     selectionActions: SelectionAction[]; // app-supplied extra toolbar buttons
+    // horizontal padding of the text area — subclasses (SearchField) widen these
+    // to inset leading/trailing icons. Default 8 on both sides.
+    pad_l: int;
+    pad_r: int;
 
     fn init(placeholder: string) {
         super.init();
@@ -127,6 +131,8 @@ export class TextField extends Widget {
         this.caret = 0;
         this.scroll_x = 0;
         this.focusable = true;
+        this.pad_l = 8;
+        this.pad_r = 8;
         this.sel = new SelectionModel(this);
         let self = this;
         this.sel.text_fn = () => { return self.text; };
@@ -143,7 +149,7 @@ export class TextField extends Widget {
     // Map an absolute x to a byte offset in text (metrics via win.surf).
     fn offset_at(x: int): int {
         if (this.win == null) { return this.caret; }
-        return col_at_x(this.win.surf, this.text, x - this.bounds.x - 8 + this.scroll_x);
+        return col_at_x(this.win.surf, this.text, x - this.bounds.x - this.pad_l + this.scroll_x);
     }
 
     // Move the caret; extend keeps the selection anchor (shift+move / drag),
@@ -182,9 +188,15 @@ export class TextField extends Widget {
     }
 
     override fn draw(s: Painter, th: Theme) {
+        this.draw_field(s, th);
+    }
+
+    // The field box + text + selection + caret. Split out so subclasses
+    // (SearchField) can reuse it and overlay their own chrome (super.draw isn't
+    // callable in Volt). Uses pad_l/pad_r so leading/trailing icons get room.
+    fn draw_field(s: Painter, th: Theme) {
         this.win.skin.field.paint_box(s, th, this.bounds, this.focused, this.hovered, this.win.skin);
-        let pad = 8;
-        let avail = this.bounds.w - 2 * pad;
+        let avail = this.bounds.w - this.pad_l - this.pad_r;
         if (avail < 8) { avail = 8; }
         // caret-follow horizontal scroll: keep the caret inside the box
         let caret_off = s.text_width(this.text.slice(0, this.caret));
@@ -194,8 +206,8 @@ export class TextField extends Widget {
         if (full_w - this.scroll_x < avail) { this.scroll_x = full_w - avail; }
         if (this.scroll_x < 0) { this.scroll_x = 0; }
         // clip: long content must not paint past the rounded box
-        let inner = Rect(this.bounds.x + pad, this.bounds.y,
-                         this.bounds.w - 2 * pad, this.bounds.h);
+        let inner = Rect(this.bounds.x + this.pad_l, this.bounds.y,
+                         this.bounds.w - this.pad_l - this.pad_r, this.bounds.h);
         s.clip_push(inner, 0);
         // selection highlight sits behind the glyphs
         if (!this.sel.empty()) {
@@ -205,18 +217,18 @@ export class TextField extends Widget {
             let ax = s.text_width(this.text.slice(0, a));
             let selw = s.text_width(this.text.slice(0, b)) - ax;
             let sy = this.bounds.y + (this.bounds.h - s.font_height()) / 2;
-            s.fill(Rect(this.bounds.x + pad + ax - this.scroll_x, sy,
+            s.fill(Rect(this.bounds.x + this.pad_l + ax - this.scroll_x, sy,
                         selw, s.font_height()), th.selection);
         }
         if (this.text.len == 0 && !this.focused) {
-            s.text_in(this.bounds, pad, this.placeholder, th.on_surface_muted);
+            s.text_in(this.bounds, this.pad_l, this.placeholder, th.on_surface_muted);
         } else {
             s.set_weight(WEIGHT_REG);
-            s.text_in(this.bounds, pad - this.scroll_x, this.text, th.on_surface);
+            s.text_in(this.bounds, this.pad_l - this.scroll_x, this.text, th.on_surface);
         }
         s.clip_pop();
         if (this.focused) {
-            let cx = this.bounds.x + pad + caret_off - this.scroll_x;
+            let cx = this.bounds.x + this.pad_l + caret_off - this.scroll_x;
             let cy = this.bounds.y + (this.bounds.h - s.font_height()) / 2;
             s.fill(Rect(cx, cy, 1, s.font_height()), th.primary);
         }
@@ -260,6 +272,12 @@ export class TextField extends Widget {
     }
 
     override fn on_key(k: int, ch: string): bool {
+        return this.handle_key(k, ch);
+    }
+
+    // The full key-handling body, as a plain method so SearchField can wrap it
+    // to fire onChange (super.on_key isn't callable in Volt).
+    fn handle_key(k: int, ch: string): bool {
         let shift = this.win != null && (this.win.mods & MOD_SHIFT) != 0;
         // clipboard shortcuts: act on the selection when there is one, else
         // fall back to the whole field (the historical behaviour)
@@ -356,6 +374,67 @@ export class TextField extends Widget {
 
     override fn drop_handlers() {
         this.onSubmit = null;
+        if (this.sel != null) { this.sel.drop(); }
+    }
+}
+
+// A TextField with a leading magnifier, a trailing clear ✕, and an onChange
+// callback fired on every edit (for live/incremental search). Inherits all of
+// TextField's caret + selection machinery; only insets the text (pad_l/pad_r)
+// and overlays the two glyphs.
+export class SearchField extends TextField {
+    onChange: fn(string);
+
+    fn init(placeholder: string) {
+        super.init(placeholder);
+        this.pad_l = 28;   // room for the magnifier
+        this.pad_r = 26;   // room for the clear ✕
+    }
+
+    fn fire_change() {
+        if (this.onChange != null) { this.onChange(this.text); }
+    }
+
+    override fn draw(s: Painter, th: Theme) {
+        this.draw_field(s, th);
+        let cy = this.bounds.y + this.bounds.h / 2;
+        // leading magnifier
+        let gx = this.bounds.x + 13;
+        s.stroke_circle(gx, cy - 1, 5, 2, th.on_surface_muted);
+        s.line_w(gx + 4, cy + 3, gx + 9, cy + 8, 2, th.on_surface_muted);
+        // trailing clear ✕ (only when there's text)
+        if (this.text.len > 0) {
+            let xx = this.bounds.x + this.bounds.w - 14;
+            s.line_w(xx - 4, cy - 4, xx + 4, cy + 4, 2, th.on_surface_muted);
+            s.line_w(xx + 4, cy - 4, xx - 4, cy + 4, 2, th.on_surface_muted);
+        }
+    }
+
+    override fn on_click(x: int, y: int): bool {
+        // click in the trailing pad clears the query
+        if (this.text.len > 0 && x >= this.bounds.x + this.bounds.w - this.pad_r) {
+            this.text = "";
+            this.caret = 0;
+            this.sel.clear();
+            this.fire_change();
+            return true;
+        }
+        let off = this.offset_at(x);
+        this.caret = off;
+        this.sel.set(off, off);
+        return true;
+    }
+
+    override fn on_key(k: int, ch: string): bool {
+        let before = this.text;
+        let r = this.handle_key(k, ch);
+        if (!(this.text == before)) { this.fire_change(); }
+        return r;
+    }
+
+    override fn drop_handlers() {
+        this.onSubmit = null;
+        this.onChange = null;
         if (this.sel != null) { this.sel.drop(); }
     }
 }

@@ -22,6 +22,12 @@ import { Window, Column, Row, Spacer, Label, Button, TextField, Checkbox,
          Menu, MenuBar,
          FilePicker, MessageDialog, ConfirmDialog, InputDialog, Popover,
          SelectionAction, SelectionToolbar, SelectionModel,
+         SearchField, Spinner, Breadcrumb, NavRail,
+         AlertBanner, AlertDialog, ProgressDialog, ContextMenu,
+         show_toast_msg, show_snackbar,
+         SEV_INFO, SEV_SUCCESS, SEV_WARNING, SEV_ERROR,
+         TreeNode, TreeView, TableColumn, Table,
+         ImageGallery, open_gallery_viewer,
          Widget, Painter, Theme, Size, theme_light, theme_dark,
          JUSTIFY_START, JUSTIFY_CENTER, JUSTIFY_BETWEEN,
          JUSTIFY_EVENLY, CROSS_START, CROSS_CENTER, CROSS_END,
@@ -678,6 +684,109 @@ fn build_menubar(st: GState, win: Window): MenuBar {
     return bar;
 }
 
+// ---- Data tab: TreeView + Table (search / sort / paginate / select / action)
+fn build_data_tab(st: GState): Widget {
+    let tv = new TreeView();
+    let src = new TreeNode("project"); src.expanded = true;
+    let lib = new TreeNode("lib"); lib.expanded = true;
+    lib.add(new TreeNode("core.vt"));
+    lib.add(new TreeNode("form.vt"));
+    lib.add(new TreeNode("data.vt"));
+    src.add(lib);
+    let apps = new TreeNode("apps");
+    apps.add(new TreeNode("gallery2.vt"));
+    src.add(apps);
+    src.add(new TreeNode("README.md"));
+    tv.add_root(src);
+    tv.view_h = 220;
+    tv.onSelect = (n) => { st.action("tree: " + n.label); };
+
+    let cols = [new TableColumn("Name", 150), new TableColumn("Role", 130),
+                new TableColumn("Age", 60)];
+    cols[2].align = 2;
+    let tbl = new Table(cols);
+    tbl.set_rows([
+        ["Alice", "Engineer", "31"], ["Bob", "Designer", "27"],
+        ["Carol", "Product", "44"], ["Dave", "Engineer", "39"],
+        ["Eve", "Sales", "22"], ["Frank", "Support", "35"],
+        ["Grace", "Engineer", "29"], ["Heidi", "Legal", "51"],
+        ["Ivan", "Sales", "41"], ["Judy", "Design", "33"],
+        ["Mallory", "Security", "38"], ["Niaj", "Finance", "47"],
+    ]);
+    tbl.set_actions(["Edit", "Del"]);
+    tbl.onSelect = (i) => { st.action("row " + i + " selected"); };
+    tbl.onAction = (r, a) => { st.action("row " + r + " action " + a); };
+
+    return new Column([
+        new Card(8, -1, -1, "TreeView (click chevrons; arrows navigate)", tv),
+        new Card(8, -1, -1, "Table — search, sort headers, paginate, actions", tbl),
+    ]).gap(10).pad(12);
+}
+
+// ---- Media tab: Fresco-style thumbnail grid opening a zoom viewer
+fn build_media_tab(st: GState, win: Window): Widget {
+    // paths are illustrative; a missing/undecoded image renders as a placeholder
+    let paths = ["photo1.png", "photo2.png", "photo3.png", "photo4.png",
+                 "photo5.png", "photo6.png", "photo7.png", "photo8.png"];
+    let g = new ImageGallery(paths, 4, 110);
+    g.onOpen = (i) => { st.action("open image " + i); open_gallery_viewer(win, paths, i); };
+    return new Column([
+        new Card(8, -1, -1, "ImageGallery — click a thumbnail to open the viewer "
+                          + "(wheel/±: zoom, ←/→: prev/next, Esc: close)", g),
+    ]).gap(10).pad(12);
+}
+
+// snackbar UNDO handler (top-level: Volt forbids closures nested in closures)
+fn snackbar_undo() { print("snackbar: undo"); }
+
+// ---- More tab: the remaining new widgets
+fn build_more_tab(st: GState, win: Window): Widget {
+    let search = new SearchField("Filter the list…");
+    search.onChange = (q) => { st.action("search: " + q); };
+
+    let crumbs = new Breadcrumb(["Home", "Library", "UI", "Widgets"]);
+    crumbs.onSelect = (i) => { st.action("crumb " + i); };
+
+    let rail = new NavRail(["Inbox", "Starred", "Sent", "Drafts", "Trash"]);
+    rail.onSelect = (i) => { st.action("nav " + i); };
+
+    // dialogs are built once and reused (no build-and-wire inside a handler)
+    let alert = new AlertDialog("Delete file?", "This action cannot be undone.", SEV_ERROR);
+    alert.set_actions(["Cancel", "Delete"]);
+    alert.onAction = (i) => { st.action("alert action " + i); };
+    let prog = new ProgressDialog("Working", "Crunching numbers…");
+    prog.set_indeterminate(true);
+    prog.show_cancel = true;
+    prog.onCancel = () => { st.action("progress cancelled"); };
+
+    let undo: fn() = () => { snackbar_undo(); };
+
+    let bToast = new Button("Toast");
+    bToast.onClick = (b) => { show_toast_msg(win, "Settings saved", SEV_SUCCESS); };
+    let bSnack = new Button("Snackbar");
+    bSnack.onClick = (b) => { show_snackbar(win, "Message archived", "UNDO", undo); };
+    let bAlert = new Button("Alert dialog");
+    bAlert.onClick = (b) => { win.open_overlay(alert); };
+    let bProg = new Button("Progress dialog");
+    bProg.onClick = (b) => { win.open_overlay(prog); };
+
+    return new Column([
+        new Card(8, -1, -1, "SearchField (live onChange)", search),
+        new Card(8, -1, -1, "Breadcrumb", crumbs),
+        new Card(8, -1, -1, "NavRail", rail),
+        new Card(8, -1, -1, "Spinner", new Row([new Spinner(28), new Spinner(20),
+                 new Label("loading…")]).gap(12).align(CROSS_CENTER)),
+        new Card(8, -1, -1, "AlertBanner (severities)", new Column([
+            new AlertBanner(SEV_INFO, "A new version is available."),
+            new AlertBanner(SEV_SUCCESS, "Your changes were published."),
+            new AlertBanner(SEV_WARNING, "Storage is almost full."),
+            new AlertBanner(SEV_ERROR, "Failed to reach the server."),
+        ]).gap(6)),
+        new Card(8, -1, -1, "Overlays & notifications",
+                 new Row([bToast, bSnack, bAlert, bProg]).gap(8)),
+    ]).gap(10).pad(12);
+}
+
 fn main() {
     let use_surface = false;
     let a = args();
@@ -695,12 +804,16 @@ fn main() {
 
     win.menubar = build_menubar(st, win);
 
-    let tv = new TabView(["Inputs", "Display", "Layout", "Overlays",
-                          "Animation", "Events", "Login", "Profile", "Dashboard"]);
+    let tv = new TabView(["Inputs", "Display", "Data", "Media", "More",
+                          "Layout", "Overlays", "Animation", "Events",
+                          "Login", "Profile", "Dashboard"]);
     tv.grow = 1;
     tv.onSwitch = (i) => { sb.right_text = "tab " + i; };
     tv.add_panel(new ScrollView(build_inputs_tab(st)));
     tv.add_panel(new ScrollView(build_display_tab(st)));
+    tv.add_panel(new ScrollView(build_data_tab(st)));
+    tv.add_panel(new ScrollView(build_media_tab(st, win)));
+    tv.add_panel(new ScrollView(build_more_tab(st, win)));
     tv.add_panel(new ScrollView(build_layout_tab()));
     tv.add_panel(new ScrollView(build_overlays_tab(st, win)));
     tv.add_panel(new ScrollView(build_animation_tab()));
