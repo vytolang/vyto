@@ -1,0 +1,32 @@
+// Read a serial port through a PollSet — the Volt-way streaming hardware shape
+// (docs/HARDWARE.md). The port's fd joins the same wait() loop everything else
+// uses, so this is exactly how a socket or window would be driven.
+//
+//   voltc run examples/52_serial.vt -- /dev/ttyUSB0 115200
+//
+// (Needs a real port, so no golden .expected — the runner SKIPs it.) Prints each
+// chunk as it arrives; exits after 5s of silence.
+
+import { PollSet, POLL_READ } from "volt/net/socket";
+import { serial_open } from "volt/hw/serial";
+
+fn main() {
+    let av = args();
+    if (av.len < 1) { print("usage: 52_serial <port> [baud]"); return; }
+    let baud = 115200;
+    if (av.len >= 2) { baud = av[1].to_int(); }
+
+    let port = serial_open(av[0], baud);
+    if (port == null) { print("cannot open " + av[0]); return; }
+    print("reading " + av[0] + " @ " + baud + " (5s idle to quit)");
+
+    let ps = new PollSet();
+    ps.addFd(port.pollFd(), POLL_READ);
+
+    while (true) {
+        let n = ps.wait(5000);
+        if (n <= 0) { print("[idle]"); return; } // timeout or error
+        let chunk = port.readText(512);
+        if (chunk.len > 0) { print("rx: " + chunk); }
+    }
+}

@@ -1,0 +1,95 @@
+// volt/hw/serial — serial / TTY ports, the Volt-way (docs/HARDWARE.md). A port
+// is a non-blocking fd, so it folds into a PollSet event loop alongside sockets,
+// windows, and workers — one wait() covers the network AND the wire. Raw 8N1 at
+// a configurable baud; bytes in, bytes out, no line discipline.
+//
+//     let port = serial_open("/dev/ttyUSB0", 115200);
+//     if (port == null) { print("no port"); return; }
+//     let ps = new PollSet();
+//     ps.addFd(port.pollFd(), POLL_READ);   // drive it from the shared loop
+//     port.writeText("AT\r\n");
+//     while (true) {
+//         if (ps.wait(-1) > 0) { print(port.readText(256)); }
+//     }
+//
+// Reads are non-blocking: readText/read return whatever is buffered (empty when
+// nothing is ready yet), so only read after the PollSet reports the fd readable.
+// The fd lives in Serial and is closed by deinit. POSIX today (Linux + macOS);
+// Windows COM ports are a later backend.
+
+extern "C" {
+    fn ser_open(path: cstring, baud: i32): i32;
+    fn ser_configure(fd: i32, baud: i32): i32;
+    fn ser_read(fd: i32, buf: cstring, cap: i64): i64;
+    fn ser_write(fd: i32, buf: cstring, n: i64): i64;
+    fn ser_drain(fd: i32): i32;
+    fn ser_flush(fd: i32): i32;
+    fn ser_close(fd: i32);
+}
+
+// Copy the first `n` bytes of `buf` into a right-sized array.
+fn take(buf: byte[], n: int): byte[] {
+    if (n <= 0) { return bytes(0); }
+    if (n == buf.len) { return buf; }
+    let out = bytes(n);
+    let i = 0;
+    while (i < n) { out[i] = buf[i]; i += 1; }
+    return out;
+}
+
+export class Serial {
+    fd: i32;
+
+    fn init(fd: i32) { this.fd = fd; }
+
+    fn ensure() { if ((this.fd as int) < 0) { panic("volt/hw/serial: operation on a closed port"); } }
+    fn isValid(): bool { return (this.fd as int) >= 0; }
+
+    // The fd to register in a PollSet (POLL_READ). The whole point of the
+    // streaming shape: the wire joins the same wait() as everything else.
+    fn pollFd(): int { return this.fd as int; }
+
+    // Non-blocking read of up to `n` bytes; result length is what was actually
+    // available (empty when nothing is ready). Read after PollSet reports the fd
+    // readable.
+    fn read(n: int): byte[] {
+        this.ensure();
+        if (n <= 0) { return bytes(0); }
+        let buf = bytes(n);
+        let got = ser_read(this.fd, buf as cstring, n as i64) as int;
+        if (got <= 0) { return bytes(0); } // would-block, EOF, or error
+        return take(buf, got);
+    }
+    fn readText(n: int): string { return str(this.read(n) as cstring); }
+
+    // Write bytes; returns the count written (>=0), or a negative encoded status
+    // (-1 would-block, -2 error). On a fast local port a short write is rare.
+    fn write(data: byte[]): int {
+        this.ensure();
+        return ser_write(this.fd, data as cstring, data.len as i64) as int;
+    }
+    fn writeText(s: string): int {
+        this.ensure();
+        return ser_write(this.fd, s.cstr(), s.len as i64) as int;
+    }
+
+    // Change the line speed on the fly (raw 8N1 at the new baud). True on success.
+    fn setBaud(baud: int): bool { this.ensure(); return ser_configure(this.fd, baud as i32) as int == 0; }
+    // Block until queued output has physically transmitted.
+    fn drain(): bool { this.ensure(); return ser_drain(this.fd) as int == 0; }
+    // Discard buffered input and unsent output.
+    fn flush(): bool { this.ensure(); return ser_flush(this.fd) as int == 0; }
+
+    fn close() {
+        if ((this.fd as int) >= 0) { ser_close(this.fd); this.fd = -1 as i32; }
+    }
+    deinit { this.close(); }
+}
+
+// Open a serial port (e.g. "/dev/ttyUSB0", "/dev/ttyACM0") at `baud`, raw 8N1.
+// Null on failure (missing device, unsupported baud, no permission).
+export fn serial_open(path: string, baud: int): Serial {
+    let fd = ser_open(path.cstr(), baud as i32) as int;
+    if (fd < 0) { return null; }
+    return new Serial(fd as i32);
+}
