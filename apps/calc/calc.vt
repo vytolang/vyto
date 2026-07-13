@@ -1,0 +1,996 @@
+// VytoCalc — a four-mode calculator built on vyto/ui.
+//
+//   Basic       — standard arithmetic with shunting-yard evaluator
+//   Scientific  — trig, log, pow, constants (PI, E)
+//   Programmer  — hex/dec/bin/oct, bitwise ops, 64-bit flip grid
+//   Converter   — unit conversion across length, weight, temperature, etc.
+//
+//   ./vytoc run apps/calc/calc.vt
+
+import { Window, Column, Row, Spacer, Label, Button, TextField,
+         TabView, Grid, Text, Dropdown, SegmentedControl, ScrollView, Widget,
+         Container } from "vyto/ui";
+import { sqrt, pow, sin, cos, tan, asin, acos, atan, log, log10, exp, floor, ceil, fabs, PI, E } from "vyto/math";
+
+extern "C" {
+    fn atof(s: cstring): float;
+    fn strtod(s: cstring, endptr: rawptr): float;
+    fn getenv(name: cstring): cstring;
+}
+
+fn str2float(s: string): float {
+    return atof(s.cstr());
+}
+
+// ---- shunting-yard expression evaluator ----
+
+const TOK_NUM: int = 0;
+const TOK_OP: int = 1;
+const TOK_FN: int = 2;
+const TOK_LPAREN: int = 3;
+const TOK_RPAREN: int = 4;
+
+class Token {
+    kind: int;
+    num: float;
+    op: string;
+
+    fn init_num(v: float) {
+        this.kind = TOK_NUM;
+        this.num = v;
+    }
+
+    fn init_op(s: string) {
+        this.kind = TOK_OP;
+        this.op = s;
+    }
+
+    fn init_fn(s: string) {
+        this.kind = TOK_FN;
+        this.op = s;
+    }
+
+    fn init_lparen() {
+        this.kind = TOK_LPAREN;
+    }
+
+    fn init_rparen() {
+        this.kind = TOK_RPAREN;
+    }
+}
+
+fn is_op_char(ch: string): bool {
+    return ch == "+" || ch == "-" || ch == "*" || ch == "/" || ch == "%" || ch == "^";
+}
+
+fn op_prec(op: string): int {
+    if (op == "+" || op == "-") { return 1; }
+    if (op == "*" || op == "/" || op == "%") { return 2; }
+    if (op == "^") { return 3; }
+    return 0;
+}
+
+fn op_left_assoc(op: string): bool {
+    return op != "^";
+}
+
+fn tokenize(expr: string): Token[] {
+    let tokens: Token[] = [];
+    let i = 0;
+    let n = expr.len;
+    while (i < n) {
+        let ch = expr[i];
+        // skip whitespace
+        if (ch == 32 || ch == 9) { i += 1; continue; } // space or tab
+        // number (including decimal point)
+        if ((ch >= 48 && ch <= 57) || ch == 46) { // '0'-'9' or '.'
+            let start = i;
+            while (i < n && ((expr[i] >= 48 && expr[i] <= 57) || expr[i] == 46)) { i += 1; }
+            let s = expr.slice(start, i);
+            let t = new Token();
+            t.init_num(str2float(s));
+            tokens.push(t);
+            continue;
+        }
+        // letters (functions, constants, 'E' in scientific notation handled above)
+        if ((ch >= 65 && ch <= 90) || (ch >= 97 && ch <= 122)) { // A-Z a-z
+            let start = i;
+            while (i < n && ((expr[i] >= 65 && expr[i] <= 90) || (expr[i] >= 97 && expr[i] <= 122))) { i += 1; }
+            let s = expr.slice(start, i);
+            let t = new Token();
+            if (s == "pi" || s == "PI") {
+                t.init_num(PI);
+            } else if (s == "e" || s == "E") {
+                t.init_num(E);
+            } else {
+                t.init_fn(s);
+            }
+            tokens.push(t);
+            continue;
+        }
+        // operators (slice the 1-char substring — str(ch) would stringify
+        // the char CODE, e.g. "43" instead of "+")
+        let ops = expr.slice(i, i + 1);
+        if (is_op_char(ops)) {
+            let t = new Token();
+            t.init_op(ops);
+            tokens.push(t);
+            i += 1;
+            continue;
+        }
+        // parentheses
+        if (ch == 40) { // '('
+            let t = new Token();
+            t.init_lparen();
+            tokens.push(t);
+            i += 1;
+            continue;
+        }
+        if (ch == 41) { // ')'
+            let t = new Token();
+            t.init_rparen();
+            tokens.push(t);
+            i += 1;
+            continue;
+        }
+        // unknown character, skip
+        i += 1;
+    }
+    return tokens;
+}
+
+fn apply_op(a: float, b: float, op: string): float {
+    if (op == "+") { return a + b; }
+    if (op == "-") { return a - b; }
+    if (op == "*") { return a * b; }
+    if (op == "/") { return a / b; }
+    if (op == "%") { return a - floor(a / b) * b; }
+    if (op == "^") { return pow(a, b); }
+    return 0;
+}
+
+fn apply_fn(name: string, x: float): float {
+    if (name == "sin") { return sin(x); }
+    if (name == "cos") { return cos(x); }
+    if (name == "tan") { return tan(x); }
+    if (name == "asin") { return asin(x); }
+    if (name == "acos") { return acos(x); }
+    if (name == "atan") { return atan(x); }
+    if (name == "sqrt") { return sqrt(x); }
+    if (name == "log") { return log(x); }
+    if (name == "log10") { return log10(x); }
+    if (name == "exp") { return exp(x); }
+    if (name == "abs") { return fabs(x); }
+    if (name == "floor") { return floor(x); }
+    if (name == "ceil") { return ceil(x); }
+    if (name == "neg") { return -x; }
+    return 0;
+}
+
+fn eval_tokens(tokens: Token[]): float {
+    let output: Token[] = [];
+    let ops: Token[] = [];
+
+    let i = 0;
+    while (i < tokens.len) {
+        let t = tokens[i];
+        if (t.kind == TOK_NUM) {
+            output.push(t);
+        } else if (t.kind == TOK_FN) {
+            ops.push(t);
+        } else if (t.kind == TOK_OP) {
+            // handle unary minus: at start, after '(', or after another op
+            // unary minus: insert a leading 0 so "-x" becomes "0 - x",
+            // then fall through to push the '-' operator itself.
+            if (t.op == "-" && (output.len == 0 || (ops.len > 0 && ops[ops.len - 1].kind == TOK_LPAREN))) {
+                let zero = new Token();
+                zero.init_num(0);
+                output.push(zero);
+            }
+            while (ops.len > 0) {
+                let top = ops[ops.len - 1];
+                if (top.kind == TOK_LPAREN) { break; }
+                if (top.kind == TOK_OP) {
+                    let tp = op_prec(top.op);
+                    let cp = op_prec(t.op);
+                    // pop while top >= current (left-assoc); stop only when top
+                    // is strictly lower, or equal-and-current-is-right-assoc.
+                    if (cp > tp || (cp == tp && !op_left_assoc(t.op))) { break; }
+                    let op = ops.pop();
+                    let b = output.pop();
+                    let a = output.pop();
+                    let r = new Token();
+                    r.init_num(apply_op(a.num, b.num, op.op));
+                    output.push(r);
+                } else {
+                    break;
+                }
+            }
+            ops.push(t);
+        } else if (t.kind == TOK_LPAREN) {
+            ops.push(t);
+        } else if (t.kind == TOK_RPAREN) {
+            while (ops.len > 0 && ops[ops.len - 1].kind != TOK_LPAREN) {
+                let op = ops.pop();
+                if (op.kind == TOK_FN) {
+                    let a = output.pop();
+                    let r = new Token();
+                    r.init_num(apply_fn(op.op, a.num));
+                    output.push(r);
+                } else if (op.kind == TOK_OP) {
+                    let b = output.pop();
+                    let a = output.pop();
+                    let r = new Token();
+                    r.init_num(apply_op(a.num, b.num, op.op));
+                    output.push(r);
+                }
+            }
+            if (ops.len > 0) { ops.pop(); } // pop '('
+            // if there's a function on top of ops, apply it
+            if (ops.len > 0 && ops[ops.len - 1].kind == TOK_FN) {
+                let fn_t = ops.pop();
+                let a = output.pop();
+                let r = new Token();
+                r.init_num(apply_fn(fn_t.op, a.num));
+                output.push(r);
+            }
+        }
+        i += 1;
+    }
+    while (ops.len > 0) {
+        let op = ops.pop();
+        if (op.kind == TOK_FN) {
+            let a = output.pop();
+            let r = new Token();
+            r.init_num(apply_fn(op.op, a.num));
+            output.push(r);
+        } else if (op.kind == TOK_OP) {
+            let b = output.pop();
+            let a = output.pop();
+            let r = new Token();
+            r.init_num(apply_op(a.num, b.num, op.op));
+            output.push(r);
+        }
+    }
+    if (output.len > 0) {
+        return output[0].num;
+    }
+    return 0;
+}
+
+fn evaluate(expr: string): float {
+    let tokens = tokenize(expr);
+    return eval_tokens(tokens);
+}
+
+fn format_result(v: float): string {
+    // if it's effectively an integer, show without decimals
+    if (v == floor(v) && fabs(v) < 1e15) {
+        return str(v as int);
+    }
+    let s = str(v);
+    return s;
+}
+
+// ---- bitwise eval for programmer mode ----
+
+fn eval_bitwise(expr: string): int {
+    let tokens = tokenize(expr);
+    let output: Token[] = [];
+    let ops: Token[] = [];
+
+    let i = 0;
+    while (i < tokens.len) {
+        let t = tokens[i];
+        if (t.kind == TOK_NUM) {
+            output.push(t);
+        } else if (t.kind == TOK_OP) {
+            while (ops.len > 0 && ops[ops.len - 1].kind == TOK_OP) {
+                let top = ops[ops.len - 1];
+                if (op_prec(top.op) >= op_prec(t.op)) {
+                    let op = ops.pop();
+                    let b = output.pop();
+                    let a = output.pop();
+                    let r = new Token();
+                    let ai = a.num as int;
+                    let bi = b.num as int;
+                    let ri: int = 0;
+                    if (op.op == "&") { ri = ai & bi; }
+                    else if (op.op == "|") { ri = ai | bi; }
+                    else if (op.op == "^") { ri = ai ^ bi; }
+                    else if (op.op == "<<") { ri = ai << bi; }
+                    else if (op.op == ">>") { ri = ai >> bi; }
+                    else { ri = apply_op(a.num, b.num, op.op) as int; }
+                    r.init_num(ri as float);
+                    output.push(r);
+                } else {
+                    break;
+                }
+            }
+            ops.push(t);
+        } else if (t.kind == TOK_LPAREN) {
+            ops.push(t);
+        } else if (t.kind == TOK_RPAREN) {
+            while (ops.len > 0 && ops[ops.len - 1].kind != TOK_LPAREN) {
+                let op = ops.pop();
+                let b = output.pop();
+                let a = output.pop();
+                let r = new Token();
+                let ai = a.num as int;
+                let bi = b.num as int;
+                let ri: int = 0;
+                if (op.op == "&") { ri = ai & bi; }
+                else if (op.op == "|") { ri = ai | bi; }
+                else if (op.op == "^") { ri = ai ^ bi; }
+                else if (op.op == "<<") { ri = ai << bi; }
+                else if (op.op == ">>") { ri = ai >> bi; }
+                else { ri = apply_op(a.num, b.num, op.op) as int; }
+                r.init_num(ri as float);
+                output.push(r);
+            }
+            if (ops.len > 0) { ops.pop(); }
+        }
+        i += 1;
+    }
+    while (ops.len > 0) {
+        let op = ops.pop();
+        let b = output.pop();
+        let a = output.pop();
+        let r = new Token();
+        let ai = a.num as int;
+        let bi = b.num as int;
+        let ri: int = 0;
+        if (op.op == "&") { ri = ai & bi; }
+        else if (op.op == "|") { ri = ai | bi; }
+        else if (op.op == "^") { ri = ai ^ bi; }
+        else if (op.op == "<<") { ri = ai << bi; }
+        else if (op.op == ">>") { ri = ai >> bi; }
+        else { ri = apply_op(a.num, b.num, op.op) as int; }
+        r.init_num(ri as float);
+        output.push(r);
+    }
+    if (output.len > 0) {
+        return output[0].num as int;
+    }
+    return 0;
+}
+
+fn int_to_base(v: int, base: int): string {
+    if (v == 0) { return "0"; }
+    let digits = "0123456789ABCDEF";
+    let neg = v < 0;
+    let uv: int = v;
+    if (neg) { uv = -uv; }
+    let out = "";
+    while (uv > 0) {
+        out = digits[uv % base] + out;
+        uv = uv / base;
+    }
+    if (neg) { out = "-" + out; }
+    return out;
+}
+
+// ---- Unit conversion ----
+
+const DIM_LENGTH: int = 0;
+const DIM_WEIGHT: int = 1;
+const DIM_TEMP: int = 2;
+const DIM_AREA: int = 3;
+const DIM_VOLUME: int = 4;
+const DIM_SPEED: int = 5;
+const DIM_TIME: int = 6;
+const DIM_DATA: int = 7;
+
+fn dim_names(): string[] {
+    return ["Length", "Weight", "Temperature", "Area", "Volume", "Speed", "Time", "Data"];
+}
+
+fn dim_units(dim: int): string[] {
+    if (dim == DIM_LENGTH) { return ["mm", "cm", "m", "km", "in", "ft", "yd", "mi"]; }
+    if (dim == DIM_WEIGHT) { return ["mg", "g", "kg", "oz", "lb", "ton"]; }
+    if (dim == DIM_TEMP) { return ["°C", "°F", "K"]; }
+    if (dim == DIM_AREA) { return ["mm²", "cm²", "m²", "km²", "in²", "ft²", "ac", "ha"]; }
+    if (dim == DIM_VOLUME) { return ["mL", "L", "gal", "qt", "pt", "cup", "fl oz", "tbsp", "tsp"]; }
+    if (dim == DIM_SPEED) { return ["m/s", "km/h", "mph", "kn"]; }
+    if (dim == DIM_TIME) { return ["ms", "s", "min", "hr", "day", "wk"]; }
+    if (dim == DIM_DATA) { return ["B", "KB", "MB", "GB", "TB"]; }
+    return [];
+}
+
+// factors to convert TO base unit (mm, g, °C, m², L, m/s, s, B)
+fn dim_factors(dim: int): float[] {
+    if (dim == DIM_LENGTH) { return [1, 10, 1000, 1e6, 25.4, 304.8, 914.4, 1.609344e6]; }
+    if (dim == DIM_WEIGHT) { return [0.001, 1, 1000, 28.349523125, 453.59237, 907184.74]; }
+    if (dim == DIM_AREA) { return [1, 100, 1e6, 1e12, 645.16, 92903.04, 4.0468564224e9, 1e10]; }
+    if (dim == DIM_VOLUME) { return [1, 1000, 3785.411784, 946.352946, 473.176473, 236.5882365, 29.5735295625, 14.78676478125, 4.92892159375]; }
+    if (dim == DIM_SPEED) { return [1, 0.277778, 0.44704, 0.514444]; }
+    if (dim == DIM_TIME) { return [0.001, 1, 60, 3600, 86400, 604800]; }
+    if (dim == DIM_DATA) { return [1, 1024, 1048576, 1073741824, 1099511627776]; }
+    return [];
+}
+
+fn convert_temp(value: float, from_unit: string, to_unit: string): float {
+    // to Celsius first
+    let c: float = 0;
+    if (from_unit == "°C") { c = value; }
+    else if (from_unit == "°F") { c = (value - 32) * 5 / 9; }
+    else if (from_unit == "K") { c = value - 273.15; }
+    // from Celsius to target
+    if (to_unit == "°C") { return c; }
+    if (to_unit == "°F") { return c * 9 / 5 + 32; }
+    if (to_unit == "K") { return c + 273.15; }
+    return value;
+}
+
+fn convert_unit(dim: int, value: float, from_i: int, to_i: int): float {
+    if (dim == DIM_TEMP) {
+        let units = dim_units(dim);
+        return convert_temp(value, units[from_i], units[to_i]);
+    }
+    let factors = dim_factors(dim);
+    let base = value * factors[from_i];
+    return base / factors[to_i];
+}
+
+// ---- Calculator App ----
+
+class Calc {
+    // shared
+    display_text: string;
+    result_text: string;
+    expr: string;
+    error: string;
+
+    // basic / scientific (separate widgets so panels don't overwrite each other)
+    basic_disp: Label;
+    basic_result: Label;
+    sci_disp: Label;
+    sci_result: Label;
+
+    // programmer
+    disp_prog: Label;
+    result_hex: Label;
+    result_dec: Label;
+    result_oct: Label;
+    result_bin: Label;
+    bit_labels: Widget[];
+    bit_label_arr: Label[];
+    base_idx: int; // 0=HEX, 1=DEC, 2=OCT, 3=BIN
+    prog_expr: string;
+    prog_result: int;
+
+    // converter
+    conv_dim_idx: int;
+    conv_from_idx: int;
+    conv_to_idx: int;
+    conv_input: TextField;
+    conv_output: Label;
+    conv_from_dd: Dropdown;
+    conv_to_dd: Dropdown;
+    conv_dim_dd: Dropdown;
+
+    fn init() {
+        this.display_text = "0";
+        this.result_text = "";
+        this.expr = "";
+        this.error = "";
+        this.base_idx = 1;
+        this.prog_expr = "";
+        this.prog_result = 0;
+        this.bit_labels = [];
+        this.conv_dim_idx = 0;
+        this.conv_from_idx = 0;
+        this.conv_to_idx = 1;
+    }
+
+    // ---- Basic / Scientific ----
+
+    fn basic_press(token: string) {
+        print(token);
+        if (token == "C") {
+            this.expr = "";
+            this.result_text = "";
+            this.error = "";
+            this.update_basic_display();
+            return;
+        }
+        if (token == "⌫") {
+            if (this.expr.len > 0) {
+                this.expr = this.expr.slice(0, this.expr.len - 1);
+            }
+            this.update_basic_display();
+            return;
+        }
+        if (token == "=") {
+            this.basic_eval();
+            this.update_basic_display_full();
+            return;
+        }
+        if (token == "±") {
+            // negate: wrap current expression
+            if (this.expr.len > 0) {
+                this.expr = "neg(" + this.expr + ")";
+            }
+            this.update_basic_display();
+            return;
+        }
+        if (token == ".") {
+            // only add if last token isn't already a dot
+            if (this.expr.len > 0 && this.expr[this.expr.len - 1] == 46) { return; }
+        }
+        this.expr = this.expr + token;
+        this.update_basic_display();
+    }
+
+    fn update_basic_display() {
+        if (this.basic_disp != null) {
+            if (this.expr.len == 0) {
+                this.basic_disp.text = "0";
+            } else {
+                this.basic_disp.text = this.expr;
+            }
+        }
+        if (this.basic_result != null) {
+            this.basic_result.text = this.result_text;
+        }
+        if (this.sci_disp != null) {
+            if (this.expr.len == 0) {
+                this.sci_disp.text = "0";
+            } else {
+                this.sci_disp.text = this.expr;
+            }
+        }
+        if (this.sci_result != null) {
+            this.sci_result.text = this.result_text;
+        }
+    }
+
+    fn update_basic_display_full() {
+        // show "expr = result" in the main display
+        if (this.basic_disp != null) {
+            if (this.result_text.len > 0) {
+                this.basic_disp.text = this.expr + " = " + this.result_text;
+            } else if (this.expr.len == 0) {
+                this.basic_disp.text = "0";
+            } else {
+                this.basic_disp.text = this.expr;
+            }
+        }
+        if (this.basic_result != null) {
+            this.basic_result.text = this.result_text;
+        }
+        if (this.sci_disp != null) {
+            if (this.result_text.len > 0) {
+                this.sci_disp.text = this.expr + " = " + this.result_text;
+            } else if (this.expr.len == 0) {
+                this.sci_disp.text = "0";
+            } else {
+                this.sci_disp.text = this.expr;
+            }
+        }
+        if (this.sci_result != null) {
+            this.sci_result.text = this.result_text;
+        }
+    }
+
+    fn basic_eval() {
+        if (this.expr.len == 0) { return; }
+        let v = evaluate(this.expr);
+        this.result_text = format_result(v);
+        // after evaluation, replace expression with result so next press continues from result
+        this.expr = this.result_text;
+    }
+
+    fn sci_press(token: string) {
+        print(token);
+        if (token == "C") {
+            this.expr = "";
+            this.result_text = "";
+            this.error = "";
+            this.update_basic_display();
+            return;
+        }
+        if (token == "⌫") {
+            if (this.expr.len > 0) {
+                this.expr = this.expr.slice(0, this.expr.len - 1);
+            }
+            this.update_basic_display();
+            return;
+        }
+        if (token == "=") {
+            this.basic_eval();
+            this.update_basic_display_full();
+            return;
+        }
+        if (token == "±") {
+            if (this.expr.len > 0) {
+                this.expr = "neg(" + this.expr + ")";
+            }
+            this.update_basic_display();
+            return;
+        }
+        // function buttons add "fn("
+        if (token == "sin" || token == "cos" || token == "tan" ||
+            token == "asin" || token == "acos" || token == "atan" ||
+            token == "sqrt" || token == "log" || token == "log10" ||
+            token == "exp" || token == "abs") {
+            this.expr = this.expr + token + "(";
+            this.update_basic_display();
+            return;
+        }
+        // constants
+        if (token == "π") { this.expr = this.expr + "pi"; this.update_basic_display(); return; }
+        if (token == "e") { this.expr = this.expr + "e"; this.update_basic_display(); return; }
+        // power
+        if (token == "x²") { this.expr = this.expr + "^2"; this.update_basic_display(); return; }
+        if (token == "xʸ") { this.expr = this.expr + "^"; this.update_basic_display(); return; }
+        if (token == "1/x") { this.expr = "1/(" + this.expr + ")"; this.update_basic_display(); return; }
+        if (token == "!") {
+            // factorial approximation via gamma — skip for now, just add !
+            return;
+        }
+        this.expr = this.expr + token;
+        this.update_basic_display();
+    }
+
+    // ---- Programmer ----
+
+    fn prog_press(token: string) {
+        if (token == "C") {
+            this.prog_expr = "";
+            this.prog_result = 0;
+            this.update_prog_display();
+            return;
+        }
+        if (token == "⌫") {
+            if (this.prog_expr.len > 0) {
+                this.prog_expr = this.prog_expr.slice(0, this.prog_expr.len - 1);
+            }
+            this.update_prog_display();
+            return;
+        }
+        if (token == "=") {
+            this.prog_result = eval_bitwise(this.prog_expr);
+            this.update_prog_display();
+            return;
+        }
+        // validate digit for current base
+        if (token.len == 1) {
+            let ch = token[0];
+            if ((ch >= 48 && ch <= 57) || (ch >= 65 && ch <= 70) || (ch >= 97 && ch <= 102)) {
+                // check valid for base
+                let val: int = 0;
+                if (ch >= 48 && ch <= 57) { val = ch - 48; }
+                else if (ch >= 65 && ch <= 70) { val = ch - 55; }
+                else if (ch >= 97 && ch <= 102) { val = ch - 87; }
+                let max_digit: int = 0;
+                if (this.base_idx == 0) { max_digit = 16; }       // HEX
+                else if (this.base_idx == 1) { max_digit = 10; }  // DEC
+                else if (this.base_idx == 2) { max_digit = 8; }   // OCT
+                else if (this.base_idx == 3) { max_digit = 2; }   // BIN
+                if (val >= max_digit) { return; }
+            }
+        }
+        this.prog_expr = this.prog_expr + token;
+        this.update_prog_display();
+    }
+
+    fn update_prog_display() {
+        if (this.disp_prog != null) {
+            if (this.prog_expr.len == 0) {
+                this.disp_prog.text = "0";
+            } else {
+                this.disp_prog.text = this.prog_expr;
+            }
+        }
+        let hex_s = int_to_base(this.prog_result, 16);
+        let dec_s = int_to_base(this.prog_result, 10);
+        let oct_s = int_to_base(this.prog_result, 8);
+        let bin_s = int_to_base(this.prog_result, 2);
+        if (this.result_hex != null) { this.result_hex.text = "HEX: " + hex_s; }
+        if (this.result_dec != null) { this.result_dec.text = "DEC: " + dec_s; }
+        if (this.result_oct != null) { this.result_oct.text = "OCT: " + oct_s; }
+        if (this.result_bin != null) { this.result_bin.text = "BIN: " + bin_s; }
+        // update bit labels
+        for (let b in 0..64) {
+            if (b < this.bit_label_arr.len) {
+                let lbl = this.bit_label_arr[b];
+                let bit_val = (this.prog_result >> b) & 1;
+                if (bit_val != 0) {
+                    lbl.text = "1";
+                } else {
+                    lbl.text = "0";
+                }
+            }
+        }
+    }
+
+    fn prog_bit_flip(bit: int) {
+        let mask = 1 << bit;
+        let has_bit = (this.prog_result & mask);
+        if (has_bit != 0) {
+            this.prog_result = this.prog_result & (~mask);
+        } else {
+            this.prog_result = this.prog_result | mask;
+        }
+        this.prog_expr = int_to_base(this.prog_result, 10);
+        this.update_prog_display();
+    }
+
+    fn set_base(i: int) {
+        this.base_idx = i;
+    }
+
+    // ---- Converter ----
+
+    fn do_convert() {
+        let val = str2float(this.conv_input.text);
+        let result = convert_unit(this.conv_dim_idx, val, this.conv_from_idx, this.conv_to_idx);
+        this.conv_output.text = format_result(result);
+    }
+
+    fn on_dim_change(i: int) {
+        this.conv_dim_idx = i;
+        this.conv_from_idx = 0;
+        this.conv_to_idx = 1;
+        // update dropdown items
+        let units = dim_units(i);
+        if (this.conv_from_dd != null) {
+            this.conv_from_dd.items = units;
+            this.conv_from_dd.selected = 0;
+        }
+        if (this.conv_to_dd != null) {
+            this.conv_to_dd.items = units;
+            this.conv_to_dd.selected = 1;
+        }
+        this.do_convert();
+    }
+
+    fn on_from_change(i: int) {
+        this.conv_from_idx = i;
+        this.do_convert();
+    }
+
+    fn on_to_change(i: int) {
+        this.conv_to_idx = i;
+        this.do_convert();
+    }
+
+    fn update_conv_units() {
+        // rebuild dropdowns when dimension changes
+        // caller handles this by recreating the panel
+    }
+}
+
+// ---- Build UI ----
+
+// Action token vs display label. vsurf.c now decodes UTF-8 and draws via
+// XDrawString16 against an iso10646-1 font, so BMP glyphs (⌫ ± π …) render.
+// Only "xʸ" needs remapping: U+02B8 (modifier letter small y) is a superscript
+// that many fixed Unicode fonts lack, so show ASCII "x^y" instead.
+fn btn_display(tok: string): string {
+    if (tok == "xʸ") { return "x^y"; }
+    return tok;
+}
+
+fn calc_btn(tok: string, calc: Calc, mode: int): Button {
+    // mode 0 = basic, 1 = scientific, 2 = programmer. `tok` is the action
+    // token; the button shows btn_display(tok) but the handler fires on `tok`.
+    let btn = new Button(btn_display(tok));
+    if (mode == 0) {
+        btn.onClick = (b) => calc.basic_press(tok);
+    } else if (mode == 1) {
+        btn.onClick = (b) => calc.sci_press(tok);
+    } else {
+        btn.onClick = (b) => calc.prog_press(tok);
+    }
+    return btn;
+}
+
+fn build_basic_panel(calc: Calc): Widget {
+    calc.basic_disp = new Label("0");
+    calc.basic_result = new Label("");
+    calc.basic_result.strong = false;
+
+    let display_col = new Column([
+        calc.basic_disp,
+        calc.basic_result,
+    ]);
+    display_col.gap(4);
+    display_col.pad(12);
+
+    let display_bg = new Container(-1, -1, 0, 0xF0F0F0, display_col);
+
+    let buttons = [
+        "C", "⌫", "%", "/",
+        "7", "8", "9", "*",
+        "4", "5", "6", "-",
+        "1", "2", "3", "+",
+        "±", "0", ".", "=",
+    ];
+
+    let kids: Widget[] = [];
+    for (let lbl in buttons) {
+        let btn = calc_btn(lbl, calc, 0);
+        kids.push(btn);
+    }
+
+    let grid = new Grid(4, 6, kids);
+
+    return new Column([
+        display_bg,
+        new Spacer(),
+        grid,
+    ]);
+}
+
+fn build_sci_panel(calc: Calc): Widget {
+    calc.sci_disp = new Label("0");
+    calc.sci_result = new Label("");
+    calc.sci_result.strong = false;
+
+    let display_col = new Column([
+        calc.sci_disp,
+        calc.sci_result,
+    ]);
+    display_col.gap(4);
+    display_col.pad(12);
+
+    let display_bg = new Container(-1, -1, 0, 0xF0F0F0, display_col);
+
+    let sci_row1 = [
+        "sin", "cos", "tan", "(",
+        "asin", "acos", "atan", ")",
+        "sqrt", "log", "log10", "π",
+        "exp", "abs", "x²", "xʸ",
+        "C", "⌫", "±", "=",
+        "7", "8", "9", "/",
+        "4", "5", "6", "*",
+        "1", "2", "3", "-",
+        "0", ".", "+", "e",
+    ];
+
+    let kids: Widget[] = [];
+    for (let lbl in sci_row1) {
+        let btn = calc_btn(lbl, calc, 1);
+        kids.push(btn);
+    }
+
+    let grid = new Grid(4, 4, kids);
+
+    return new Column([
+        display_bg,
+        new Spacer(),
+        grid,
+    ]);
+}
+
+fn build_prog_panel(calc: Calc): Widget {
+    calc.disp_prog = new Label("0");
+    calc.result_hex = new Label("HEX: 0");
+    calc.result_hex.strong = false;
+    calc.result_dec = new Label("DEC: 0");
+    calc.result_dec.strong = false;
+    calc.result_oct = new Label("OCT: 0");
+    calc.result_oct.strong = false;
+    calc.result_bin = new Label("BIN: 0");
+    calc.result_bin.strong = false;
+
+    // base selector
+    let base_ctrl = new SegmentedControl(["HEX", "DEC", "OCT", "BIN"]);
+    base_ctrl.onSelect = (i) => calc.set_base(i);
+
+    let info_col = new Column([
+        calc.disp_prog,
+        calc.result_hex,
+        calc.result_dec,
+        calc.result_oct,
+        calc.result_bin,
+    ]);
+    info_col.gap(2);
+    info_col.pad(12);
+
+    let info_bg = new Container(-1, -1, 0, 0xF0F0F0, info_col);
+
+    let prog_buttons = [
+        "C", "⌫", "(", ")",
+        "A", "B", "C", "D",
+        "E", "F", "&", "|",
+        "^", "<<", ">>", "~",
+        "7", "8", "9", "/",
+        "4", "5", "6", "*",
+        "1", "2", "3", "-",
+        "0", "=", "+", "%",
+    ];
+
+    let kids: Widget[] = [];
+    for (let lbl in prog_buttons) {
+        let btn = calc_btn(lbl, calc, 2);
+        kids.push(btn);
+    }
+
+    let grid = new Grid(4, 4, kids);
+
+    // bit flip grid (64 bits in 8 rows of 8)
+    let bit_labels: Widget[] = [];
+    let bit_label_arr: Label[] = [];
+    let bit_kids: Widget[] = [];
+    for (let b in 0..64) {
+        let lbl = new Label("0");
+        lbl.strong = false;
+        bit_labels.push(lbl);
+        bit_label_arr.push(lbl);
+        bit_kids.push(lbl);
+    }
+    calc.bit_labels = bit_labels;
+    calc.bit_label_arr = bit_label_arr;
+    let bit_grid = new Grid(8, 2, bit_kids);
+
+    let bit_col = new Column([
+        new Label("64-bit view (click to flip)"),
+        bit_grid,
+    ]);
+    bit_col.gap(4);
+
+    return new Column([
+        base_ctrl,
+        info_bg,
+        new Spacer(),
+        grid,
+        bit_col,
+    ]);
+}
+
+fn build_conv_panel(calc: Calc): Widget {
+    calc.conv_dim_dd = new Dropdown(dim_names());
+    calc.conv_dim_dd.onSelect = (i) => calc.on_dim_change(i);
+
+    calc.conv_from_dd = new Dropdown(dim_units(0));
+    calc.conv_from_dd.onSelect = (i) => calc.on_from_change(i);
+
+    calc.conv_to_dd = new Dropdown(dim_units(0));
+    calc.conv_to_dd.onSelect = (i) => calc.on_to_change(i);
+
+    calc.conv_input = new TextField("0");
+    calc.conv_input.onSubmit = (t) => calc.do_convert();
+
+    calc.conv_output = new Label("0");
+
+    let convert_btn = new Button("Convert");
+    convert_btn.onClick = (b) => calc.do_convert();
+
+    let row1 = new Row([calc.conv_from_dd, calc.conv_to_dd]);
+    row1.gap(8);
+
+    let row2 = new Row([calc.conv_input, convert_btn]);
+    row2.gap(8);
+
+    return new Column([
+        new Label("Dimension"),
+        calc.conv_dim_dd,
+        new Label("From"),
+        calc.conv_from_dd,
+        new Label("To"),
+        calc.conv_to_dd,
+        row2,
+        new Label("Result"),
+        calc.conv_output,
+    ]);
+}
+
+fn main() {
+    let win = new Window("VytoCalc", 380, 560);
+    let calc = new Calc();
+
+    let tv = new TabView(["Basic", "Scientific", "Programmer", "Converter"]);
+    tv.add_panel(build_basic_panel(calc));
+    tv.add_panel(build_sci_panel(calc));
+    tv.add_panel(build_prog_panel(calc));
+    tv.add_panel(build_conv_panel(calc));
+
+    win.root = new Column([
+        tv,
+    ]);
+
+    win.run();
+}
