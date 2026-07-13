@@ -20,7 +20,7 @@ int strncmp(const char *a, const char *b, size_t n);
 #include <string.h>
 #endif
 
-#include "volt_host.h"
+#include "vyto_host.h"
 
 /* extern "C" declarations are emitted under private identifiers aliased to the
    real symbol with __asm__, so they can never conflict with system headers.

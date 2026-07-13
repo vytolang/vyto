@@ -1,5 +1,5 @@
 #include "vyto_rt.h"
-#include "volt_host.h"
+#include "vyto_host.h"
 
 #include <stdarg.h> /* vt_snprintf; part of freestanding C */
 
@@ -9,7 +9,7 @@
 #define VT_NO_FS
 #endif
 
-/* Hosted host hooks: thin wrappers over libc, kept here (not in volt_host.h)
+/* Hosted host hooks: thin wrappers over libc, kept here (not in vyto_host.h)
    so no stdio/stdlib type leaks into the module headers that include vyto_rt.h.
    Static, so the compiler inlines them and the hosted path stays zero-overhead
    and byte-for-byte the same as the old direct libc calls. */
