@@ -1,0 +1,60 @@
+// Generic classes on the real vyto/ui stack: a typed dropdown wrapper that
+// eliminates the classic "int index round-trip". The widget hands back the
+// actual value T on selection, not a bare index into a parallel array.
+
+import { Dropdown, Widget } from "vyto/ui";
+
+class TypedDropdown<T> {
+    dd: Dropdown;
+    values: T[];
+    onPick: fn(T);
+
+    fn init(labels: string[], values: T[]) {
+        this.values = values;
+        this.dd = new Dropdown(labels);
+        let self = this;
+        // the one place the index lives — mapped to a typed value right here,
+        // so callers never see it.
+        this.dd.onSelect = (i) => {
+            if (self.onPick != null) { self.onPick(self.values[i]); }
+        };
+    }
+
+    fn widget(): Dropdown { return this.dd; }
+    fn selected(): T { return this.values[this.dd.selected]; }
+}
+
+// A unit for a length converter — the typed payload the dropdown carries.
+class Unit {
+    name: string;
+    to_mm: float;
+    fn init(name: string, to_mm: float) { this.name = name; this.to_mm = to_mm; }
+}
+
+fn main() {
+    let units: Unit[] = [
+        new Unit("mm", 1.0),
+        new Unit("cm", 10.0),
+        new Unit("m", 1000.0),
+    ];
+    let labels: string[] = [];
+    for (let u in units) { labels.push(u.name); }
+
+    let from_dd = new TypedDropdown<Unit>(labels, units);
+    let to_dd = new TypedDropdown<Unit>(labels, units);
+
+    // typed callbacks: no conv_from_idx / conv_to_idx shadow fields, no
+    // dim_units(dim)[i] re-lookup — the Unit arrives directly.
+    from_dd.onPick = (u) => print("from -> " + u.name);
+    to_dd.onPick = (u) => print("to -> " + u.name);
+
+    // simulate the user choosing cm (index 1) then m (index 2)
+    from_dd.widget().pick(1);
+    to_dd.widget().pick(2);
+
+    // convert 5 of the selected 'from' unit into the 'to' unit, typed end-to-end
+    let f = from_dd.selected();
+    let t = to_dd.selected();
+    let mm = 5.0 * f.to_mm;
+    print(f.name + " -> " + t.name + ": " + str(mm / t.to_mm));
+}
