@@ -119,3 +119,20 @@ lib/volt/  bundled stdlib modules: math (libm), surface, ui
 examples/  01_hello … 12_math + golden .expected outputs
 docs/      SPEC.md
 ```
+
+## Native dependencies
+
+The compiler itself (`make`) needs only a C99 toolchain — zero third-party
+deps. Some stdlib packages bind native libraries and need a one-time setup
+before use (a bare clone builds `voltc` and runs the core/stdlib examples
+without them):
+
+- **`volt/gfx`** (blend2d) — run `lib/volt/gfx/native/build-blend2d.sh`
+  (needs cmake + ninja + a C++ compiler). Not vendored in git.
+- **`volt/intl`** (ICU) — links the system ICU by default; install
+  `libicu-dev` (Debian/Ubuntu) or `libicu-devel` (Fedora). For `--bundle` or
+  targets without a system ICU, run `lib/volt/intl/native/build-icu.sh`.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
