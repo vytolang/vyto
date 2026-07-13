@@ -29,6 +29,7 @@ bool type_identical(const Type *a, const Type *b) {
     switch (a->kind) {
     case TY_STRUCT: return a->sdecl == b->sdecl;
     case TY_CLASS: return a->cdecl == b->cdecl;
+    case TY_TYPARAM: return a->name == b->name;
     case TY_ARRAY: case TY_MAP: return type_identical(a->elem, b->elem);
     case TY_FN: {
         if (a->nparams != b->nparams) return false;
@@ -56,6 +57,7 @@ static const char *type_str(const Type *t) {
     case TY_MAP: return arena_printf(&g_arena, "Map<string, %s>", type_str(t->elem));
     case TY_FN: return "fn(...)";
     case TY_NAMED: return t->name;
+    case TY_TYPARAM: return t->name;
     }
     return "?";
 }
@@ -176,14 +178,39 @@ static Decl *mod_lookup(Module *m, const char *name) {
 
 /* ---------------- type resolution ---------------- */
 
+static StructDecl *instantiate_struct(StructDecl *g, Type **args, int nargs, Loc use);
+static ClassDecl *instantiate_class(ClassDecl *g, Type **args, int nargs, Loc use);
+
 static void resolve_type(Type *t, Module *m) {
     if (!t) return;
     switch (t->kind) {
     case TY_NAMED: {
         Decl *d = mod_lookup(m, t->name);
         if (!d) fatal_at(t->loc, "unknown type '%s'", t->name);
-        if (d->kind == D_STRUCT) { t->kind = TY_STRUCT; t->sdecl = d->sd; }
-        else if (d->kind == D_CLASS) { t->kind = TY_CLASS; t->cdecl = d->cd; }
+        if (d->kind == D_STRUCT) {
+            if (t->nparams > 0 || d->sd->ntyparams > 0) {
+                if (d->sd->ntyparams == 0)
+                    fatal_at(t->loc, "'%s' is not a generic type", t->name);
+                if (t->nparams != d->sd->ntyparams)
+                    fatal_at(t->loc, "generic type '%s' takes %d type argument(s), got %d",
+                             t->name, d->sd->ntyparams, t->nparams);
+                for (int i = 0; i < t->nparams; i++) resolve_type(t->params[i], m);
+                StructDecl *inst = instantiate_struct(d->sd, t->params, t->nparams, t->loc);
+                t->kind = TY_STRUCT; t->sdecl = inst;
+            } else { t->kind = TY_STRUCT; t->sdecl = d->sd; }
+        }
+        else if (d->kind == D_CLASS) {
+            if (t->nparams > 0 || d->cd->ntyparams > 0) {
+                if (d->cd->ntyparams == 0)
+                    fatal_at(t->loc, "'%s' is not a generic type", t->name);
+                if (t->nparams != d->cd->ntyparams)
+                    fatal_at(t->loc, "generic type '%s' takes %d type argument(s), got %d",
+                             t->name, d->cd->ntyparams, t->nparams);
+                for (int i = 0; i < t->nparams; i++) resolve_type(t->params[i], m);
+                ClassDecl *inst = instantiate_class(d->cd, t->params, t->nparams, t->loc);
+                t->kind = TY_CLASS; t->cdecl = inst;
+            } else { t->kind = TY_CLASS; t->cdecl = d->cd; }
+        }
         else fatal_at(t->loc, "'%s' is not a type", t->name);
         break;
     }
@@ -239,6 +266,7 @@ static void resolve_module_sigs(Module *m) {
         Decl *d = m->decls[i];
         switch (d->kind) {
         case D_FN: case D_EXTERN_FN:
+            if (d->fn->ntyparams > 0) break; /* template sig resolved at instantiation */
             resolve_fn_sig(d->fn, m);
             break;
         case D_CONST:
@@ -246,6 +274,7 @@ static void resolve_module_sigs(Module *m) {
             break;
         case D_STRUCT: {
             StructDecl *sd = d->sd;
+            if (sd->ntyparams > 0) break; /* template sig resolved at instantiation */
             for (int f = 0; f < sd->nfields; f++) {
                 resolve_type(sd->fields[f].type, m);
                 Type *ft = sd->fields[f].type;
@@ -272,6 +301,7 @@ static void resolve_module_sigs(Module *m) {
         }
         case D_CLASS: {
             ClassDecl *cd = d->cd;
+            if (cd->ntyparams > 0) break; /* template sig resolved at instantiation */
             if (cd->parent_name) {
                 Decl *pd = mod_lookup(m, cd->parent_name);
                 if (!pd || pd->kind != D_CLASS)
@@ -565,6 +595,485 @@ static Type *mk_fn_hint(Type *p0, Type *p1, Type *ret) {
     return t;
 }
 
+/* ================= generics: monomorphization ================= */
+
+static void check_fn_body(Module *m, FnDecl *fd, ClassDecl *cls);
+
+/* Substitution: typaram name -> concrete type. args[i] may be NULL for a
+   not-yet-inferred parameter (subst then leaves that typaram in place). */
+typedef struct { const char **names; Type **args; int n; } Subst;
+
+static Type *subst_type(Type *t, Subst *s) {
+    if (!t) return NULL;
+    switch (t->kind) {
+    case TY_TYPARAM:
+        for (int i = 0; i < s->n; i++)
+            if (t->name == s->names[i]) {
+                if (!s->args[i]) return t; /* unbound: leave the typaram */
+                if (t->weak && s->args[i]->kind == TY_CLASS) {
+                    Type *w = mk_type(TY_CLASS); *w = *s->args[i]; w->weak = true; return w;
+                }
+                return s->args[i];
+            }
+        return t;
+    case TY_ARRAY: { Type *n = mk_type(TY_ARRAY); n->elem = subst_type(t->elem, s); n->weak = t->weak; n->loc = t->loc; return n; }
+    case TY_MAP:   { Type *n = mk_type(TY_MAP);   n->elem = subst_type(t->elem, s); n->loc = t->loc; return n; }
+    case TY_FN: {
+        Type *n = mk_type(TY_FN);
+        n->nparams = t->nparams;
+        n->params = arena_alloc(&g_arena, sizeof(Type *) * (size_t)(t->nparams ? t->nparams : 1));
+        for (int i = 0; i < t->nparams; i++) n->params[i] = subst_type(t->params[i], s);
+        n->ret = subst_type(t->ret, s);
+        n->loc = t->loc;
+        return n;
+    }
+    case TY_NAMED:
+        if (t->nparams > 0) { /* generic instantiation reference: substitute its args */
+            Type *n = mk_type(TY_NAMED);
+            n->name = t->name; n->nparams = t->nparams; n->loc = t->loc; n->weak = t->weak;
+            n->params = arena_alloc(&g_arena, sizeof(Type *) * (size_t)t->nparams);
+            for (int i = 0; i < t->nparams; i++) n->params[i] = subst_type(t->params[i], s);
+            return n;
+        }
+        return t;
+    default: return t; /* concrete types are shared */
+    }
+}
+
+/* Does a (possibly substituted) type still mention any type parameter? */
+static bool type_has_typaram(Type *t) {
+    if (!t) return false;
+    switch (t->kind) {
+    case TY_TYPARAM: return true;
+    case TY_ARRAY: case TY_MAP: return type_has_typaram(t->elem);
+    case TY_FN:
+        for (int i = 0; i < t->nparams; i++) if (type_has_typaram(t->params[i])) return true;
+        return type_has_typaram(t->ret);
+    case TY_NAMED:
+        for (int i = 0; i < t->nparams; i++) if (type_has_typaram(t->params[i])) return true;
+        return false;
+    default: return false;
+    }
+}
+
+/* ---- deep clone of a pristine (unchecked) template body, applying subst ---- */
+
+static Expr *clone_expr(Expr *e, Subst *s, Module *mod);
+static Stmt *clone_stmt(Stmt *st, Subst *s, Module *mod);
+
+static Expr **clone_expr_list(Expr **a, int n, Subst *s, Module *mod) {
+    if (n == 0) return NULL;
+    Expr **out = arena_alloc(&g_arena, sizeof(Expr *) * (size_t)n);
+    for (int i = 0; i < n; i++) out[i] = clone_expr(a[i], s, mod);
+    return out;
+}
+
+static FnDecl *clone_fn_into(FnDecl *fd, Subst *s, Module *mod,
+                             ClassDecl *owner, StructDecl *sowner) {
+    FnDecl *n = NEW(FnDecl);
+    *n = *fd;                       /* copy scalars + flags; then override */
+    n->owner = owner;
+    n->sowner = sowner;
+    n->module = mod;
+    n->locals = NULL; n->ntemps = 0; n->captures = NULL; n->ncaptures = 0;
+    n->typarams = NULL; n->ntyparams = 0;
+    n->generic_origin = NULL; n->type_args = NULL; n->next_inst = NULL;
+    n->inst_decl = NULL; n->sig_resolved = false; n->cname = NULL;
+    if (fd->name == NULL) n->arrow_id = ++mod->arrow_counter; /* fresh arrow */
+    n->params = arena_alloc(&g_arena, sizeof(Param) * (size_t)(fd->nparams ? fd->nparams : 1));
+    for (int i = 0; i < fd->nparams; i++) {
+        n->params[i] = fd->params[i];
+        n->params[i].local = NULL;
+        n->params[i].type = subst_type(fd->params[i].type, s);
+        n->params[i].def = fd->params[i].def ? clone_expr(fd->params[i].def, s, mod) : NULL;
+    }
+    n->ret = subst_type(fd->ret, s);
+    n->body = NULL; n->nbody = 0;
+    if (fd->nbody) {
+        n->body = arena_alloc(&g_arena, sizeof(Stmt *) * (size_t)fd->nbody);
+        for (int i = 0; i < fd->nbody; i++) n->body[i] = clone_stmt(fd->body[i], s, mod);
+        n->nbody = fd->nbody;
+    }
+    return n;
+}
+
+static Expr *clone_expr(Expr *e, Subst *s, Module *mod) {
+    if (!e) return NULL;
+    Expr *n = NEW(Expr);
+    *n = *e;                        /* copy literals/op/name/loc; reset checker fields */
+    n->type = NULL; n->ref = REF_NONE; n->local = NULL; n->decl = NULL;
+    n->cls = NULL; n->sd = NULL; n->method = NULL; n->builtin = 0;
+    n->lhs = clone_expr(e->lhs, s, mod);
+    n->rhs = clone_expr(e->rhs, s, mod);
+    n->args = clone_expr_list(e->args, e->nargs, s, mod);
+    n->cast_type = e->cast_type ? subst_type(e->cast_type, s) : NULL;
+    n->fn_lit = e->fn_lit ? clone_fn_into(e->fn_lit, s, mod, NULL, NULL) : NULL;
+    if (e->ntype_args) {
+        n->type_args = arena_alloc(&g_arena, sizeof(Type *) * (size_t)e->ntype_args);
+        for (int i = 0; i < e->ntype_args; i++) n->type_args[i] = subst_type(e->type_args[i], s);
+    }
+    return n;
+}
+
+static Stmt **clone_stmt_list(Stmt **a, int n, Subst *s, Module *mod) {
+    if (n == 0) return NULL;
+    Stmt **out = arena_alloc(&g_arena, sizeof(Stmt *) * (size_t)n);
+    for (int i = 0; i < n; i++) out[i] = clone_stmt(a[i], s, mod);
+    return out;
+}
+
+static Stmt *clone_stmt(Stmt *st, Subst *s, Module *mod) {
+    if (!st) return NULL;
+    Stmt *n = NEW(Stmt);
+    *n = *st;
+    n->local = NULL;
+    n->decl_type = st->decl_type ? subst_type(st->decl_type, s) : NULL;
+    n->init = clone_expr(st->init, s, mod);
+    n->expr = clone_expr(st->expr, s, mod);
+    n->range_lo = clone_expr(st->range_lo, s, mod);
+    n->range_hi = clone_expr(st->range_hi, s, mod);
+    n->iter = clone_expr(st->iter, s, mod);
+    n->body = clone_stmt_list(st->body, st->nbody, s, mod);
+    n->els = clone_stmt_list(st->els, st->nels, s, mod);
+    return n;
+}
+
+/* ---- instantiation worklist + depth guard ---- */
+
+#define GENERIC_DEPTH_MAX 64
+static int g_generic_depth;
+
+typedef struct Pending { FnDecl *fd; ClassDecl *cls; Module *mod; struct Pending *next; } Pending;
+static Pending *g_pending;
+
+static void enqueue_body(FnDecl *fd, ClassDecl *cls, Module *mod) {
+    Pending *p = NEW(Pending);
+    p->fd = fd; p->cls = cls; p->mod = mod; p->next = g_pending;
+    g_pending = p;
+}
+
+static void drain_pending(void) {
+    while (g_pending) {
+        Pending *p = g_pending;
+        g_pending = p->next;
+        check_fn_body(p->mod, p->fd, p->cls);
+    }
+}
+
+static FnDecl *instantiate_fn(FnDecl *g, Type **args, int nargs, Loc use) {
+    for (FnDecl *it = g->next_inst; it; it = it->next_inst) {
+        bool same = true;
+        for (int i = 0; i < nargs; i++)
+            if (!type_identical(it->type_args[i], args[i])) { same = false; break; }
+        if (same) return it;
+    }
+    if (++g_generic_depth > GENERIC_DEPTH_MAX)
+        fatal_at(use, "generic instantiation nested too deeply (is '%s' self-referential?)", g->name);
+    Subst s = { g->typarams, args, nargs };
+    FnDecl *inst = clone_fn_into(g, &s, g->module, NULL, NULL);
+    inst->generic_origin = g;
+    inst->type_args = arena_alloc(&g_arena, sizeof(Type *) * (size_t)(nargs ? nargs : 1));
+    for (int i = 0; i < nargs; i++) inst->type_args[i] = args[i];
+    inst->first_use = use;
+    inst->next_inst = g->next_inst;
+    g->next_inst = inst;
+    resolve_fn_sig(inst, g->module);
+    Decl *d = NEW(Decl);
+    d->kind = D_FN; d->loc = g->loc; d->name = g->name; d->module = g->module; d->fn = inst;
+    inst->inst_decl = d;
+    enqueue_body(inst, NULL, g->module);
+    g_generic_depth--;
+    return inst;
+}
+
+static const char *pretty_inst_name(const char *base, Type **args, int n);
+
+static StructDecl *instantiate_struct(StructDecl *g, Type **args, int nargs, Loc use) {
+    for (StructDecl *it = g->next_inst; it; it = it->next_inst) {
+        bool same = true;
+        for (int i = 0; i < nargs; i++)
+            if (!type_identical(it->type_args[i], args[i])) { same = false; break; }
+        if (same) return it;
+    }
+    if (++g_generic_depth > GENERIC_DEPTH_MAX)
+        fatal_at(use, "generic instantiation nested too deeply (is '%s' self-referential?)", g->name);
+    Subst s = { g->typarams, args, nargs };
+    StructDecl *inst = NEW(StructDecl);
+    *inst = *g;
+    inst->typarams = NULL; inst->ntyparams = 0;
+    inst->generic_origin = g;
+    inst->sig_resolved = false; inst->checked = false; inst->cname = NULL;
+    inst->name = pretty_inst_name(g->name, args, nargs);
+    inst->type_args = arena_alloc(&g_arena, sizeof(Type *) * (size_t)(nargs ? nargs : 1));
+    for (int i = 0; i < nargs; i++) inst->type_args[i] = args[i];
+    inst->fields = arena_alloc(&g_arena, sizeof(Field) * (size_t)(g->nfields ? g->nfields : 1));
+    for (int f = 0; f < g->nfields; f++) {
+        inst->fields[f] = g->fields[f];
+        inst->fields[f].owner_class = NULL;
+        inst->fields[f].type = subst_type(g->fields[f].type, &s);
+    }
+    inst->methods = arena_alloc(&g_arena, sizeof(FnDecl *) * (size_t)(g->nmethods ? g->nmethods : 1));
+    for (int mi = 0; mi < g->nmethods; mi++)
+        inst->methods[mi] = clone_fn_into(g->methods[mi], &s, g->module, NULL, inst);
+    /* link into cache before resolving fields (self-reference safe) */
+    inst->next_inst = g->next_inst;
+    g->next_inst = inst;
+    /* resolve substituted field types + apply the value-type field rule honestly */
+    for (int f = 0; f < inst->nfields; f++) {
+        resolve_type(inst->fields[f].type, g->module);
+        Type *ft = inst->fields[f].type;
+        if (type_is_ref(ft) || ft->kind == TY_VOID)
+            fatal_at(use, "field '%s' of '%s' is a reference type; struct fields must be "
+                          "value types (use a class)", inst->fields[f].name, inst->name);
+    }
+    for (int mi = 0; mi < inst->nmethods; mi++) {
+        resolve_fn_sig(inst->methods[mi], g->module);
+        enqueue_body(inst->methods[mi], NULL, g->module);
+    }
+    g_generic_depth--;
+    return inst;
+}
+
+static ClassDecl *instantiate_class(ClassDecl *g, Type **args, int nargs, Loc use) {
+    for (ClassDecl *it = g->next_inst; it; it = it->next_inst) {
+        bool same = true;
+        for (int i = 0; i < nargs; i++)
+            if (!type_identical(it->type_args[i], args[i])) { same = false; break; }
+        if (same) return it;
+    }
+    if (++g_generic_depth > GENERIC_DEPTH_MAX)
+        fatal_at(use, "generic instantiation nested too deeply (is '%s' self-referential?)", g->name);
+    Subst s = { g->typarams, args, nargs };
+    ClassDecl *inst = NEW(ClassDecl);
+    *inst = *g;
+    inst->typarams = NULL; inst->ntyparams = 0;
+    inst->generic_origin = g;
+    inst->sig_resolved = false; inst->checked = false; inst->cname = NULL;
+    inst->nvslots = 0;
+    inst->name = pretty_inst_name(g->name, args, nargs);
+    inst->type_args = arena_alloc(&g_arena, sizeof(Type *) * (size_t)(nargs ? nargs : 1));
+    for (int i = 0; i < nargs; i++) inst->type_args[i] = args[i];
+    /* base class (non-generic, per the v1 restriction) */
+    if (g->parent_name) {
+        Decl *pd = mod_lookup(g->module, g->parent_name);
+        if (!pd || pd->kind != D_CLASS)
+            fatal_at(g->loc, "unknown base class '%s'", g->parent_name);
+        if (pd->cd->ntyparams > 0)
+            fatal_at(g->loc, "generic base classes are not supported yet");
+        inst->parent = pd->cd;
+    }
+    inst->fields = arena_alloc(&g_arena, sizeof(Field) * (size_t)(g->nfields ? g->nfields : 1));
+    for (int f = 0; f < g->nfields; f++) {
+        inst->fields[f] = g->fields[f];
+        inst->fields[f].type = subst_type(g->fields[f].type, &s);
+        inst->fields[f].owner_class = inst;
+    }
+    inst->methods = arena_alloc(&g_arena, sizeof(FnDecl *) * (size_t)(g->nmethods ? g->nmethods : 1));
+    for (int mi = 0; mi < g->nmethods; mi++)
+        inst->methods[mi] = clone_fn_into(g->methods[mi], &s, g->module, inst, NULL);
+    inst->ctor = g->ctor ? clone_fn_into(g->ctor, &s, g->module, inst, NULL) : NULL;
+    if (g->deinit_body) {
+        inst->deinit_body = arena_alloc(&g_arena, sizeof(Stmt *) * (size_t)g->ndeinit);
+        for (int i = 0; i < g->ndeinit; i++) inst->deinit_body[i] = clone_stmt(g->deinit_body[i], &s, g->module);
+    }
+    inst->next_inst = g->next_inst;
+    g->next_inst = inst;
+    /* resolve substituted field/method sigs (classes allow ref fields) */
+    for (int f = 0; f < inst->nfields; f++) {
+        resolve_type(inst->fields[f].type, g->module);
+        if (inst->fields[f].type->kind == TY_VOID)
+            fatal_at(inst->fields[f].loc, "field cannot be void");
+    }
+    for (int mi = 0; mi < inst->nmethods; mi++) resolve_fn_sig(inst->methods[mi], g->module);
+    if (inst->ctor) resolve_fn_sig(inst->ctor, g->module);
+    layout_class(inst);
+    /* enqueue instance bodies (methods, ctor, synthetic deinit) */
+    for (int mi = 0; mi < inst->nmethods; mi++) enqueue_body(inst->methods[mi], inst, g->module);
+    if (inst->ctor) enqueue_body(inst->ctor, inst, g->module);
+    if (inst->deinit_body) {
+        FnDecl *dd = NEW(FnDecl);
+        dd->name = intern("deinit");
+        dd->loc = inst->loc; dd->module = g->module; dd->owner = inst;
+        dd->ret = ty_void(); dd->vslot = -1;
+        dd->body = inst->deinit_body; dd->nbody = inst->ndeinit;
+        enqueue_body(dd, inst, g->module);
+    }
+    g_generic_depth--;
+    return inst;
+}
+
+/* pretty "Name<int, string>" for diagnostics/emit-name base */
+static const char *pretty_inst_name(const char *base, Type **args, int n) {
+    SBuf sb; sb_init(&sb);
+    sb_printf(&sb, "%s<", base);
+    for (int i = 0; i < n; i++) sb_printf(&sb, "%s%s", i ? ", " : "", type_str(args[i]));
+    sb_printf(&sb, ">");
+    return arena_strdup(&g_arena, sb.data);
+}
+
+/* ---- call-site inference (unification-lite) ---- */
+
+static int typaram_index(const char **names, int nn, const char *name) {
+    for (int i = 0; i < nn; i++) if (names[i] == name) return i;
+    return -1;
+}
+
+/* Bind type parameters by matching a template param type against a concrete
+   argument type. `arg` is fully concrete; `param` may mention typarams. */
+static void unify(const char **names, int nn, Type *param, Type *arg, Type **bind, Loc loc) {
+    if (!param || !arg) return;
+    if (param->kind == TY_TYPARAM) {
+        int idx = typaram_index(names, nn, param->name);
+        if (idx < 0) return;
+        if (bind[idx]) {
+            if (!type_identical(bind[idx], arg))
+                fatal_at(loc, "conflicting types for '%s': %s vs %s",
+                         param->name, type_str(bind[idx]), type_str(arg));
+        } else bind[idx] = arg;
+        return;
+    }
+    switch (param->kind) {
+    case TY_ARRAY: if (arg->kind == TY_ARRAY) unify(names, nn, param->elem, arg->elem, bind, loc); return;
+    case TY_MAP:   if (arg->kind == TY_MAP)   unify(names, nn, param->elem, arg->elem, bind, loc); return;
+    case TY_FN:
+        if (arg->kind == TY_FN && arg->nparams == param->nparams) {
+            for (int i = 0; i < param->nparams; i++) unify(names, nn, param->params[i], arg->params[i], bind, loc);
+            unify(names, nn, param->ret, arg->ret, bind, loc);
+        }
+        return;
+    case TY_NAMED: /* generic struct/class reference Foo<...> vs a concrete instance */
+        if (arg->kind == TY_STRUCT && arg->sdecl->generic_origin &&
+            arg->sdecl->generic_origin->name == param->name &&
+            param->nparams == arg->sdecl->generic_origin->ntyparams) {
+            for (int i = 0; i < param->nparams; i++)
+                unify(names, nn, param->params[i], arg->sdecl->type_args[i], bind, loc);
+        } else if (arg->kind == TY_CLASS && arg->cdecl->generic_origin &&
+                   arg->cdecl->generic_origin->name == param->name &&
+                   param->nparams == arg->cdecl->generic_origin->ntyparams) {
+            for (int i = 0; i < param->nparams; i++)
+                unify(names, nn, param->params[i], arg->cdecl->type_args[i], bind, loc);
+        }
+        return;
+    default: return;
+    }
+}
+
+/* Resolve a generic function call: bind type args (explicit or inferred),
+   instantiate, and return the concrete instance. */
+static FnDecl *infer_generic_fn(Ctx *c, Expr *e, FnDecl *g, Type *expected) {
+    int ntp = g->ntyparams;
+    Type **bind = arena_alloc(&g_arena, sizeof(Type *) * (size_t)ntp);
+    for (int i = 0; i < ntp; i++) bind[i] = NULL;
+    if (e->ntype_args) {
+        if (e->ntype_args != ntp)
+            fatal_at(e->loc, "generic function '%s' takes %d type argument(s), got %d",
+                     g->name, ntp, e->ntype_args);
+        for (int i = 0; i < ntp; i++) { resolve_type(e->type_args[i], c->mod); bind[i] = e->type_args[i]; }
+    } else {
+        if (expected && type_has_typaram(g->ret)) unify(g->typarams, g->ntyparams, g->ret, expected, bind, e->loc);
+        if (e->arg_names) {
+            bool all = true;
+            for (int i = 0; i < ntp; i++) if (!bind[i]) all = false;
+            if (!all)
+                fatal_at(e->loc, "cannot infer type arguments of '%s' with named arguments; "
+                                 "pass them explicitly as %s<...>(...)", g->name, g->name);
+        } else {
+            Subst partial = { g->typarams, bind, ntp };
+            for (int i = 0; i < g->nparams && i < e->nargs; i++) {
+                bool done = true;
+                for (int j = 0; j < ntp; j++) if (!bind[j]) done = false;
+                if (done) break;
+                Type *pt = subst_type(g->params[i].type, &partial);
+                if (!type_has_typaram(pt)) continue; /* not helpful for inference */
+                if (e->args[i]->kind == EX_ARROW)
+                    fatal_at(e->args[i]->loc,
+                             "cannot infer a type parameter from a closure literal; "
+                             "pass type arguments explicitly");
+                check_expr(c, e->args[i], NULL);
+                unify(g->typarams, g->ntyparams, g->params[i].type, e->args[i]->type, bind, e->loc);
+            }
+        }
+        for (int i = 0; i < ntp; i++)
+            if (!bind[i])
+                fatal_at(e->loc, "cannot infer type parameter '%s' of '%s'; use %s<...>(...)",
+                         g->typarams[i], g->name, g->name);
+    }
+    return instantiate_fn(g, bind, ntp, e->loc);
+}
+
+/* Resolve a generic struct construction Name(...) / Name<...>(...): bind type
+   args (explicit or inferred from field args), and return the instance. */
+static StructDecl *infer_generic_struct(Ctx *c, Expr *e, StructDecl *g) {
+    int ntp = g->ntyparams;
+    Type **bind = arena_alloc(&g_arena, sizeof(Type *) * (size_t)ntp);
+    for (int i = 0; i < ntp; i++) bind[i] = NULL;
+    if (e->ntype_args) {
+        if (e->ntype_args != ntp)
+            fatal_at(e->loc, "generic struct '%s' takes %d type argument(s), got %d",
+                     g->name, ntp, e->ntype_args);
+        for (int i = 0; i < ntp; i++) { resolve_type(e->type_args[i], c->mod); bind[i] = e->type_args[i]; }
+    } else {
+        if (e->nargs == 0)
+            fatal_at(e->loc, "cannot infer type arguments for '%s'; use %s<...>(...)", g->name, g->name);
+        if (e->nargs != g->nfields)
+            fatal_at(e->loc, "struct %s takes 0 or %d arguments", g->name, g->nfields);
+        Subst partial = { g->typarams, bind, ntp };
+        for (int i = 0; i < g->nfields; i++) {
+            bool done = true;
+            for (int j = 0; j < ntp; j++) if (!bind[j]) done = false;
+            if (done) break;
+            Type *ft = subst_type(g->fields[i].type, &partial);
+            if (!type_has_typaram(ft)) continue;
+            if (e->args[i]->kind == EX_ARROW)
+                fatal_at(e->args[i]->loc, "cannot infer a type parameter from a closure literal; "
+                                          "pass type arguments explicitly");
+            check_expr(c, e->args[i], NULL);
+            unify(g->typarams, g->ntyparams, g->fields[i].type, e->args[i]->type, bind, e->loc);
+        }
+        for (int i = 0; i < ntp; i++)
+            if (!bind[i])
+                fatal_at(e->loc, "cannot infer type parameter '%s' of '%s'; use %s<...>(...)",
+                         g->typarams[i], g->name, g->name);
+    }
+    return instantiate_struct(g, bind, ntp, e->loc);
+}
+
+/* Resolve `new Name(...)` / `new Name<...>(...)` for a generic class: bind type
+   args (explicit or inferred from ctor arguments), return the instance. */
+static ClassDecl *infer_generic_class(Ctx *c, Expr *e, ClassDecl *g) {
+    int ntp = g->ntyparams;
+    Type **bind = arena_alloc(&g_arena, sizeof(Type *) * (size_t)ntp);
+    for (int i = 0; i < ntp; i++) bind[i] = NULL;
+    if (e->ntype_args) {
+        if (e->ntype_args != ntp)
+            fatal_at(e->loc, "generic class '%s' takes %d type argument(s), got %d",
+                     g->name, ntp, e->ntype_args);
+        for (int i = 0; i < ntp; i++) { resolve_type(e->type_args[i], c->mod); bind[i] = e->type_args[i]; }
+    } else {
+        FnDecl *ctor = g->ctor;
+        if (!ctor || e->arg_names)
+            fatal_at(e->loc, "cannot infer type arguments for '%s'; use new %s<...>(...)", g->name, g->name);
+        Subst partial = { g->typarams, bind, ntp };
+        for (int i = 0; i < ctor->nparams && i < e->nargs; i++) {
+            bool done = true;
+            for (int j = 0; j < ntp; j++) if (!bind[j]) done = false;
+            if (done) break;
+            Type *pt = subst_type(ctor->params[i].type, &partial);
+            if (!type_has_typaram(pt)) continue;
+            if (e->args[i]->kind == EX_ARROW)
+                fatal_at(e->args[i]->loc, "cannot infer a type parameter from a closure literal; "
+                                          "pass type arguments explicitly");
+            check_expr(c, e->args[i], NULL);
+            unify(g->typarams, g->ntyparams, ctor->params[i].type, e->args[i]->type, bind, e->loc);
+        }
+        for (int i = 0; i < ntp; i++)
+            if (!bind[i])
+                fatal_at(e->loc, "cannot infer type parameter '%s' of '%s'; use new %s<...>(...)",
+                         g->typarams[i], g->name, g->name);
+    }
+    return instantiate_class(g, bind, ntp, e->loc);
+}
+
 static Local *lookup_value(Ctx *c, Expr *e, const char *name) {
     Local *l = scope_find(c->scope, name);
     if (l) {
@@ -608,7 +1117,7 @@ static void check_closure_call(Ctx *c, Expr *e, Type *fnty) {
     e->type = fnty->ret;
 }
 
-static Type *check_call(Ctx *c, Expr *e) {
+static Type *check_call(Ctx *c, Expr *e, Type *expected) {
     if (e->is_super_call) {
         if (!c->cls || !c->fn || c->fn != c->cls->ctor)
             fatal_at(e->loc, "super.init() is only allowed inside init");
@@ -743,6 +1252,13 @@ static Type *check_call(Ctx *c, Expr *e) {
         if (!d) fatal_at(e->loc, "unknown function '%s'", n);
         switch (d->kind) {
         case D_FN:
+            if (d->fn->ntyparams > 0) {
+                FnDecl *inst = infer_generic_fn(c, e, d->fn, expected);
+                e->ref = REF_GLOBAL_FN;
+                e->decl = inst->inst_decl;
+                check_args_against(c, e, inst->params, inst->nparams, n);
+                return e->type = inst->ret;
+            }
             e->ref = REF_GLOBAL_FN;
             e->decl = d;
             check_args_against(c, e, d->fn->params, d->fn->nparams, n);
@@ -756,6 +1272,7 @@ static Type *check_call(Ctx *c, Expr *e) {
             StructDecl *sd = d->sd;
             if (e->arg_names)
                 fatal_at(e->loc, "named arguments are not supported on struct construction");
+            if (sd->ntyparams > 0) sd = infer_generic_struct(c, e, sd);
             if (e->nargs != 0 && e->nargs != sd->nfields)
                 fatal_at(e->loc, "struct %s takes 0 or %d arguments", n, sd->nfields);
             for (int i = 0; i < e->nargs; i++) {
@@ -1325,6 +1842,9 @@ static Type *check_expr(Ctx *c, Expr *e, Type *expected) {
             return e->type = d->const_type;
         }
         if (d->kind == D_FN) { /* function used as a closure value */
+            if (d->fn->ntyparams > 0)
+                fatal_at(e->loc, "cannot use generic function '%s' as a value; "
+                                 "call it, or wrap it in a closure", e->name);
             e->ref = REF_GLOBAL_FN;
             e->decl = d;
             return e->type = fn_type_of(d->fn);
@@ -1482,7 +2002,7 @@ static Type *check_expr(Ctx *c, Expr *e, Type *expected) {
         }
         return e->type = ty_void();
     }
-    case EX_CALL: return check_call(c, e);
+    case EX_CALL: return check_call(c, e, expected);
     case EX_INDEX: {
         Type *t = check_expr(c, e->lhs, NULL);
         check_expr(c, e->rhs, NULL);
@@ -1503,6 +2023,7 @@ static Type *check_expr(Ctx *c, Expr *e, Type *expected) {
         Decl *d = mod_lookup(c->mod, e->name);
         if (!d || d->kind != D_CLASS) fatal_at(e->loc, "unknown class '%s'", e->name);
         ClassDecl *cd = d->cd;
+        if (cd->ntyparams > 0) cd = infer_generic_class(c, e, cd);
         e->cls = cd;
         FnDecl *ctor = NULL;
         for (ClassDecl *k = cd; k && !ctor; k = k->parent) ctor = k->ctor;
@@ -1882,19 +2403,25 @@ void check_all(Module *mods, Module *entry) {
     for (Module *m = mods; m; m = m->next) resolve_module_sigs(m);
     for (Module *m = mods; m; m = m->next)
         for (int i = 0; i < m->ndecls; i++)
-            if (m->decls[i]->kind == D_CLASS) layout_class(m->decls[i]->cd);
+            if (m->decls[i]->kind == D_CLASS && m->decls[i]->cd->ntyparams == 0)
+                layout_class(m->decls[i]->cd);
     for (Module *m = mods; m; m = m->next) {
         for (int i = 0; i < m->ndecls; i++) {
             Decl *d = m->decls[i];
             switch (d->kind) {
             case D_CONST: check_const(m, d); break;
-            case D_FN: check_fn_body(m, d->fn, NULL); break;
+            case D_FN:
+                if (d->fn->ntyparams > 0) break; /* templates checked as instances */
+                check_fn_body(m, d->fn, NULL);
+                break;
             case D_STRUCT:
+                if (d->sd->ntyparams > 0) break; /* templates checked as instances */
                 for (int mi = 0; mi < d->sd->nmethods; mi++)
                     check_fn_body(m, d->sd->methods[mi], NULL);
                 break;
             case D_CLASS: {
                 ClassDecl *cd = d->cd;
+                if (cd->ntyparams > 0) break; /* templates checked as instances */
                 for (int mi = 0; mi < cd->nmethods; mi++)
                     check_fn_body(m, cd->methods[mi], cd);
                 if (cd->ctor) check_fn_body(m, cd->ctor, cd);
@@ -1916,9 +2443,12 @@ void check_all(Module *mods, Module *entry) {
             }
         }
     }
+    drain_pending(); /* check all generic instance bodies (may enqueue more) */
     Decl *maind = mod_lookup_own(entry, intern("main"));
     if (!maind || maind->kind != D_FN)
         fatal("entry module '%s' must define fn main()", entry->name);
+    if (maind->fn->ntyparams > 0)
+        fatal_at(maind->loc, "fn main cannot be generic");
     if (maind->fn->nparams != 0 || maind->fn->ret->kind != TY_VOID)
         fatal_at(maind->loc, "fn main must take no parameters and return nothing");
 }

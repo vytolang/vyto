@@ -19,6 +19,7 @@ typedef enum TypeKind {
     TY_I8, TY_I16, TY_I32, TY_I64, TY_U8, TY_U16, TY_U32, TY_U64, TY_F32, TY_F64,
     TY_CLONG, TY_CULONG,  /* C long / unsigned long: target-width, emit as raw C `long` */
     TY_STRING, TY_CSTRING, TY_RAWPTR, TY_NULL,
+    TY_TYPARAM, /* reference to an in-scope generic type parameter; ->name */
     TY_NAMED,   /* unresolved identifier, resolved by checker */
     TY_STRUCT,  /* ->sdecl */
     TY_CLASS,   /* ->cdecl; ->weak flag on reference site */
@@ -115,6 +116,8 @@ struct Expr {
     int builtin;            /* BuiltinKind for REF_BUILTIN */
     bool is_super_call;     /* super.init(...) */
     FnDecl *fn_lit;         /* EX_ARROW body as a synthetic FnDecl */
+    Type **type_args;       /* explicit f<T,...>(...) / New<T>(...) type args */
+    int ntype_args;
 };
 
 typedef enum BuiltinKind {
@@ -220,6 +223,16 @@ struct FnDecl {
     int ncaptures;
     int arrow_id;           /* unique id for arrows within module */
     struct FnDecl *parent_fn; /* lexically enclosing fn, for arrows */
+    /* generics: template if ntyparams > 0; instance if generic_origin != NULL */
+    const char **typarams;
+    int ntyparams;
+    struct FnDecl *generic_origin;  /* template this instance was cloned from */
+    Type **type_args;               /* instance's concrete type arguments */
+    struct FnDecl *next_inst;       /* instantiation-cache list, hung off the origin */
+    Decl *inst_decl;                /* synthetic Decl wrapping a fn instance */
+    Loc first_use;                  /* first instantiating call site (diagnostics) */
+    bool sig_resolved;              /* template sig resolved on demand (idempotent) */
+    const char *cname;              /* memoized mangled name (instances) */
 };
 
 typedef struct Field {
@@ -239,6 +252,15 @@ struct StructDecl {
     Module *module;
     bool is_extern;         /* extern "C" struct: emit verbatim name */
     bool checked;
+    /* generics (mirror of FnDecl's set) */
+    const char **typarams;
+    int ntyparams;
+    struct StructDecl *generic_origin;
+    Type **type_args;
+    struct StructDecl *next_inst;
+    Loc first_use;
+    bool sig_resolved;
+    const char *cname;      /* memoized mangled name */
 };
 
 struct ClassDecl {
@@ -256,6 +278,15 @@ struct ClassDecl {
     Module *module;
     int nvslots;            /* total vtable slots incl. inherited */
     bool checked;
+    /* generics (mirror of FnDecl's set) */
+    const char **typarams;
+    int ntyparams;
+    struct ClassDecl *generic_origin;
+    Type **type_args;
+    struct ClassDecl *next_inst;
+    Loc first_use;
+    bool sig_resolved;
+    const char *cname;      /* memoized mangled name */
 };
 
 typedef enum DeclKind {

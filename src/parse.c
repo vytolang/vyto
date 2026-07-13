@@ -4,6 +4,8 @@
 typedef struct Parser {
     Lexer lx;
     Module *mod;
+    const char **typarams;  /* in-scope generic type parameters (current decl) */
+    int ntyparams;
 } Parser;
 
 /* ---- helpers ---- */
@@ -38,6 +40,13 @@ static const char *expect_ident(Parser *p) {
     return s;
 }
 
+/* is `name` one of the current decl's in-scope generic type parameters? */
+static bool is_typaram(Parser *p, const char *name) {
+    for (int i = 0; i < p->ntyparams; i++)
+        if (p->typarams[i] == name) return true;
+    return false;
+}
+
 /* growable pointer-array helper (arena-backed, geometric growth) */
 typedef struct PtrVec { void **items; int len, cap; } PtrVec;
 static void pv_push(PtrVec *v, void *item) {
@@ -49,6 +58,49 @@ static void pv_push(PtrVec *v, void *item) {
         v->cap = ncap;
     }
     v->items[v->len++] = item;
+}
+
+/* Parse a type-parameter list `<T, U, ...>` after a declaration name and set
+   p->typarams/ntyparams. No-op if the next token isn't `<`. The caller
+   saves/restores the previous typaram scope. Rejects bounds, empty lists,
+   duplicates, and primitive-name shadowing. */
+static void parse_typarams(Parser *p) {
+    if (cur(p) != T_LT) { p->typarams = NULL; p->ntyparams = 0; return; }
+    advance(p); /* '<' */
+    PtrVec names = {0};
+    if (cur(p) == T_GT) fatal_at(ploc(p), "empty type parameter list '<>'");
+    for (;;) {
+        Loc nloc = ploc(p);
+        const char *n = expect_ident(p);
+        if (cur(p) == T_COLON)
+            fatal_at(ploc(p), "type parameter bounds are not supported");
+        static const char *prims[] = {
+            "int","float","bool","byte","string","cstring","rawptr","void",
+            "i8","i16","i32","i64","u8","u16","u32","u64","f32","f64","clong","culong",
+        };
+        for (size_t i = 0; i < sizeof prims / sizeof prims[0]; i++)
+            if (n == intern(prims[i]))
+                fatal_at(nloc, "type parameter '%s' shadows a primitive type", n);
+        for (int i = 0; i < names.len; i++)
+            if ((const char *)names.items[i] == n)
+                fatal_at(nloc, "duplicate type parameter '%s'", n);
+        pv_push(&names, (void *)n);
+        if (!accept(p, T_COMMA)) break;
+    }
+    expect_gt(p);
+    p->typarams = (const char **)names.items;
+    p->ntyparams = names.len;
+}
+
+/* Parse an explicit type-argument list `<T, U, ...>` in type or call position. */
+static Type *parse_type(Parser *p);
+static void parse_type_args(Parser *p, Type ***out, int *nout) {
+    expect(p, T_LT);
+    PtrVec ts = {0};
+    do { pv_push(&ts, parse_type(p)); } while (accept(p, T_COMMA));
+    expect_gt(p);
+    *out = (Type **)ts.items;
+    *nout = ts.len;
 }
 
 static Expr *new_expr(Parser *p, ExprKind k) {
@@ -128,9 +180,18 @@ static Type *parse_base_type(Parser *p) {
             return t;
         }
     }
+    if (is_typaram(p, name)) {
+        t = type_new(TY_TYPARAM);
+        t->name = name;
+        t->loc = loc;
+        return t;
+    }
     t = type_new(TY_NAMED);
     t->name = name;
     t->loc = loc;
+    if (cur(p) == T_LT) {  /* generic instantiation in type position: Name<...> */
+        parse_type_args(p, &t->params, &t->nparams);
+    }
     return t;
 }
 
@@ -212,6 +273,33 @@ static bool looks_like_arrow(Parser *p) {
     }
     p->lx = save;
     return result;
+}
+
+/* Speculative, non-fatal, purely structural scan: is the `<` at the cursor the
+   start of an explicit type-argument list that closes and is followed by `(`?
+   (C#-style rule — the trailing `(` requirement keeps `a < b` a comparison.)
+   Restores the lexer either way. */
+static bool looks_like_type_args(Parser *p) {
+    if (cur(p) != T_LT) return false;
+    Lexer save = p->lx;
+    advance(p); /* '<' */
+    int angle = 1;
+    bool ok = false;
+    for (int guard = 0; guard < 4096; guard++) {
+        TokKind k = cur(p);
+        if (k == T_EOF) break;
+        if (k == T_LT) angle++;
+        else if (k == T_GT) angle--;
+        else if (k == T_SHR || k == T_SHREQ) angle -= 2; /* '>>' closes two levels */
+        else if (k == T_IDENT || k == T_COMMA || k == T_LBRACKET || k == T_RBRACKET ||
+                 k == T_MAP || k == T_FN || k == T_WEAK || k == T_COLON ||
+                 k == T_LPAREN || k == T_RPAREN) { /* allowed inside a type */ }
+        else break; /* any other token can't be part of a type-arg list */
+        advance(p);
+        if (angle <= 0) { ok = (angle == 0) && (cur(p) == T_LPAREN); break; }
+    }
+    p->lx = save;
+    return ok;
 }
 
 static Expr *parse_arrow(Parser *p) {
@@ -305,6 +393,8 @@ static Expr *parse_primary(Parser *p) {
             return e;
         }
         e->name = expect_ident(p);
+        if (cur(p) == T_LT)  /* new Name<T,...>(...) */
+            parse_type_args(p, &e->type_args, &e->ntype_args);
         e->args = parse_args_named(p, &e->nargs, &e->arg_names);
         return e;
     }
@@ -341,7 +431,14 @@ static Expr *parse_primary(Parser *p) {
 static Expr *parse_postfix(Parser *p) {
     Expr *e = parse_primary(p);
     for (;;) {
-        if (cur(p) == T_LPAREN) {
+        if (e->kind == EX_IDENT && cur(p) == T_LT && looks_like_type_args(p)) {
+            /* explicit type args at a call site: ident<T,...>(...) */
+            Expr *call = new_expr(p, EX_CALL);
+            call->lhs = e;
+            parse_type_args(p, &call->type_args, &call->ntype_args);
+            call->args = parse_args_named(p, &call->nargs, &call->arg_names);
+            e = call;
+        } else if (cur(p) == T_LPAREN) {
             Expr *call = new_expr(p, EX_CALL);
             call->lhs = e;
             call->args = parse_args_named(p, &call->nargs, &call->arg_names);
@@ -568,6 +665,12 @@ static FnDecl *parse_fn(Parser *p, bool is_extern) {
     fd->vslot = -1;
     expect(p, T_FN);
     fd->name = expect_ident(p);
+    const char **save_tp = p->typarams; int save_ntp = p->ntyparams;
+    parse_typarams(p);
+    if (is_extern && p->ntyparams > 0)
+        fatal_at(fd->loc, "extern functions cannot be generic");
+    fd->typarams = p->typarams;
+    fd->ntyparams = p->ntyparams;
     fd->params = parse_params(p, &fd->nparams);
     fd->ret = accept(p, T_COLON) ? parse_type(p) : type_new(TY_VOID);
     if (is_extern) {
@@ -579,6 +682,7 @@ static FnDecl *parse_fn(Parser *p, bool is_extern) {
     } else {
         fd->body = parse_block(p, &fd->nbody);
     }
+    p->typarams = save_tp; p->ntyparams = save_ntp;
     return fd;
 }
 
@@ -589,6 +693,12 @@ static StructDecl *parse_struct(Parser *p, bool is_extern) {
     sd->is_extern = is_extern;
     expect(p, T_STRUCT);
     sd->name = expect_ident(p);
+    const char **save_tp = p->typarams; int save_ntp = p->ntyparams;
+    if (!is_extern) {
+        parse_typarams(p);
+        sd->typarams = p->typarams;
+        sd->ntyparams = p->ntyparams;
+    }
     expect(p, T_LBRACE);
     PtrVec fields = {0}, methods = {0};
     while (cur(p) != T_RBRACE) {
@@ -624,6 +734,7 @@ static StructDecl *parse_struct(Parser *p, bool is_extern) {
     for (int i = 0; i < fields.len; i++) sd->fields[i] = *(Field *)fields.items[i];
     sd->nmethods = methods.len;
     sd->methods = (FnDecl **)methods.items;
+    p->typarams = save_tp; p->ntyparams = save_ntp;
     return sd;
 }
 
@@ -633,7 +744,15 @@ static ClassDecl *parse_class(Parser *p) {
     cd->module = p->mod;
     expect(p, T_CLASS);
     cd->name = expect_ident(p);
-    if (accept(p, T_EXTENDS)) cd->parent_name = expect_ident(p);
+    const char **save_tp = p->typarams; int save_ntp = p->ntyparams;
+    parse_typarams(p);
+    cd->typarams = p->typarams;
+    cd->ntyparams = p->ntyparams;
+    if (accept(p, T_EXTENDS)) {
+        cd->parent_name = expect_ident(p);
+        if (cur(p) == T_LT)
+            fatal_at(ploc(p), "generic base classes are not supported yet");
+    }
     expect(p, T_LBRACE);
     PtrVec fields = {0}, methods = {0};
     while (cur(p) != T_RBRACE) {
@@ -704,6 +823,7 @@ static ClassDecl *parse_class(Parser *p) {
     for (int i = 0; i < fields.len; i++) cd->fields[i] = *(Field *)fields.items[i];
     cd->nmethods = methods.len;
     cd->methods = (FnDecl **)methods.items;
+    p->typarams = save_tp; p->ntyparams = save_ntp;
     return cd;
 }
 

@@ -36,12 +36,84 @@ static bool type_unsigned_int(const Type *t) {
     }
 }
 
+/* Injective, C-safe mangling of a concrete type, for generic-instance names. */
+static void mangle_into(SBuf *sb, Type *t) {
+    switch (t->kind) {
+    case TY_VOID: sb_printf(sb, "void"); return;
+    case TY_INT: case TY_I64: sb_printf(sb, "int"); return;
+    case TY_FLOAT: case TY_F64: sb_printf(sb, "flt"); return;
+    case TY_BOOL: sb_printf(sb, "bool"); return;
+    case TY_BYTE: case TY_U8: sb_printf(sb, "byte"); return;
+    case TY_I8: sb_printf(sb, "i8"); return;
+    case TY_I16: sb_printf(sb, "i16"); return;
+    case TY_I32: sb_printf(sb, "i32"); return;
+    case TY_U16: sb_printf(sb, "u16"); return;
+    case TY_U32: sb_printf(sb, "u32"); return;
+    case TY_U64: sb_printf(sb, "u64"); return;
+    case TY_CLONG: sb_printf(sb, "cl"); return;
+    case TY_CULONG: sb_printf(sb, "cul"); return;
+    case TY_F32: sb_printf(sb, "f32"); return;
+    case TY_STRING: sb_printf(sb, "str"); return;
+    case TY_CSTRING: sb_printf(sb, "cstr"); return;
+    case TY_RAWPTR: case TY_NULL: sb_printf(sb, "ptr"); return;
+    case TY_ARRAY: sb_printf(sb, "arr_"); mangle_into(sb, t->elem); sb_printf(sb, "_E"); return;
+    case TY_MAP: sb_printf(sb, "map_"); mangle_into(sb, t->elem); sb_printf(sb, "_E"); return;
+    case TY_FN:
+        sb_printf(sb, "fn%d", t->nparams);
+        for (int i = 0; i < t->nparams; i++) { sb_printf(sb, "_"); mangle_into(sb, t->params[i]); }
+        sb_printf(sb, "_r_"); mangle_into(sb, t->ret); sb_printf(sb, "_E");
+        return;
+    case TY_STRUCT: {
+        StructDecl *sd = t->sdecl;
+        if (sd->generic_origin) {
+            sb_printf(sb, "%s_%s_I", sd->generic_origin->module->name, sd->generic_origin->name);
+            for (int i = 0; i < sd->generic_origin->ntyparams; i++) { sb_printf(sb, "_"); mangle_into(sb, sd->type_args[i]); }
+            sb_printf(sb, "_E");
+        } else sb_printf(sb, "%s_%s", sd->module->name, sd->name);
+        return;
+    }
+    case TY_CLASS: {
+        ClassDecl *cd = t->cdecl;
+        if (cd->generic_origin) {
+            sb_printf(sb, "%s_%s_I", cd->generic_origin->module->name, cd->generic_origin->name);
+            for (int i = 0; i < cd->generic_origin->ntyparams; i++) { sb_printf(sb, "_"); mangle_into(sb, cd->type_args[i]); }
+            sb_printf(sb, "_E");
+        } else sb_printf(sb, "%s_%s", cd->module->name, cd->name);
+        return;
+    }
+    case TY_NAMED: case TY_TYPARAM: break;
+    }
+    fatal("internal: cannot mangle unresolved type");
+}
+
+/* "__<argmangle>_<argmangle>..." suffix for a generic instance. */
+static const char *inst_suffix(Type **args, int n) {
+    SBuf sb; sb_init(&sb);
+    sb_printf(&sb, "__");
+    for (int i = 0; i < n; i++) { if (i) sb_printf(&sb, "_"); mangle_into(&sb, args[i]); }
+    return arena_strdup(&g_arena, sb.data);
+}
+
 static const char *struct_cname(StructDecl *sd) {
     if (sd->is_extern) return sd->name;
+    if (sd->generic_origin) {
+        if (!sd->cname)
+            sd->cname = arena_printf(&g_arena, "v_%s_%s%s", sd->generic_origin->module->name,
+                                     sd->generic_origin->name,
+                                     inst_suffix(sd->type_args, sd->generic_origin->ntyparams));
+        return sd->cname;
+    }
     return arena_printf(&g_arena, "v_%s_%s", sd->module->name, sd->name);
 }
 
 static const char *class_cname(ClassDecl *cd) {
+    if (cd->generic_origin) {
+        if (!cd->cname)
+            cd->cname = arena_printf(&g_arena, "v_%s_%s%s", cd->generic_origin->module->name,
+                                     cd->generic_origin->name,
+                                     inst_suffix(cd->type_args, cd->generic_origin->ntyparams));
+        return cd->cname;
+    }
     return arena_printf(&g_arena, "v_%s_%s", cd->module->name, cd->name);
 }
 
@@ -69,7 +141,7 @@ static const char *c_type(Type *t) {
     case TY_FN: return "VtClosure*";
     case TY_STRUCT: return struct_cname(t->sdecl);
     case TY_CLASS: return arena_printf(&g_arena, "%s*", class_cname(t->cdecl));
-    case TY_NAMED: break;
+    case TY_NAMED: case TY_TYPARAM: break;
     }
     fatal("internal: unresolved type in emitter");
     return NULL;
@@ -79,10 +151,16 @@ static const char *fn_cname(FnDecl *fd) {
     /* extern fns get a private C identifier aliased to the real symbol via
        __asm__, so system headers can never clash with our declaration */
     if (fd->is_extern) return arena_printf(&g_arena, "vx_%s", fd->name);
+    /* Use the owner's cname (instance-aware) so methods of a generic instance
+       get its unique mangled prefix; identical output for non-generic owners. */
     if (fd->owner)
-        return arena_printf(&g_arena, "v_%s_%s_%s", fd->module->name, fd->owner->name, fd->name);
+        return arena_printf(&g_arena, "%s_%s", class_cname(fd->owner), fd->name);
     if (fd->sowner)
-        return arena_printf(&g_arena, "v_%s_%s_%s", fd->module->name, fd->sowner->name, fd->name);
+        return arena_printf(&g_arena, "%s_%s", struct_cname(fd->sowner), fd->name);
+    if (fd->generic_origin)
+        return arena_printf(&g_arena, "v_%s_%s%s", fd->generic_origin->module->name,
+                            fd->generic_origin->name,
+                            inst_suffix(fd->type_args, fd->generic_origin->ntyparams));
     return arena_printf(&g_arena, "v_%s_%s", fd->module->name, fd->name);
 }
 
@@ -1650,6 +1728,32 @@ static void emit_class_struct(ClassDecl *cd, SBuf *h, bool *emitted, ClassDecl *
     sb_puts(h, "};\n");
 }
 
+static bool sd_seen(StructDecl **arr, int n, StructDecl *sd) {
+    for (int i = 0; i < n; i++) if (arr[i] == sd) return true;
+    return false;
+}
+
+/* Emit a struct's typedef+body, emitting any same-module/instance struct-typed
+   field dependencies first (by-value members need a complete type). */
+static void emit_one_struct(StructDecl *sd, Module *m, SBuf *h, StructDecl **done, int *ndone) {
+    if (sd_seen(done, *ndone, sd)) return;
+    for (int f = 0; f < sd->nfields; f++) {
+        Type *ft = sd->fields[f].type;
+        if (ft->kind == TY_STRUCT && !ft->sdecl->is_extern &&
+            (ft->sdecl->module == m || ft->sdecl->generic_origin))
+            emit_one_struct(ft->sdecl, m, h, done, ndone);
+    }
+    if (sd_seen(done, *ndone, sd)) return;
+    done[(*ndone)++] = sd;
+    const char *sn = struct_cname(sd);
+    sb_printf(h, "typedef struct %s %s;\n", sn, sn);
+    sb_printf(h, "struct %s {\n", sn);
+    for (int f = 0; f < sd->nfields; f++)
+        sb_printf(h, "    %s %s%s;\n", c_type(sd->fields[f].type), sd->is_extern ? "" : "f_",
+                  sd->fields[f].name);
+    sb_puts(h, "};\n");
+}
+
 void emit_module(Module *m, bool is_entry, bool checks, bool freestanding, SBuf *h, SBuf *c) {
     g_checks = checks;
     /* ---------- header ---------- */
@@ -1660,28 +1764,44 @@ void emit_module(Module *m, bool is_entry, bool checks, bool freestanding, SBuf 
             sb_printf(h, "#include \"mod_%s.h\"\n", m->decls[i]->import_module->name);
     sb_puts(h, "\n");
 
-    /* struct typedefs + bodies */
+    /* struct typedefs + bodies (deps-first; generic templates -> instances) */
+    int nsd = 0;
+    for (int i = 0; i < m->ndecls; i++)
+        if (m->decls[i]->kind == D_STRUCT) {
+            if (m->decls[i]->sd->ntyparams > 0)
+                for (StructDecl *it = m->decls[i]->sd->next_inst; it; it = it->next_inst) nsd++;
+            else nsd++;
+        }
+    StructDecl **sdone = arena_alloc(&g_arena, sizeof(StructDecl *) * (size_t)(nsd ? nsd : 1));
+    int nsdone = 0;
     for (int i = 0; i < m->ndecls; i++) {
         if (m->decls[i]->kind != D_STRUCT) continue;
         StructDecl *sd = m->decls[i]->sd;
-        const char *sn = struct_cname(sd);
-        sb_printf(h, "typedef struct %s %s;\n", sn, sn);
-        sb_printf(h, "struct %s {\n", sn);
-        for (int f = 0; f < sd->nfields; f++)
-            sb_printf(h, "    %s %s%s;\n", c_type(sd->fields[f].type), sd->is_extern ? "" : "f_",
-                      sd->fields[f].name);
-        sb_puts(h, "};\n");
+        if (sd->ntyparams > 0) {
+            for (StructDecl *it = sd->next_inst; it; it = it->next_inst)
+                emit_one_struct(it, m, h, sdone, &nsdone);
+        } else {
+            emit_one_struct(sd, m, h, sdone, &nsdone);
+        }
     }
 
-    /* class forward typedefs */
+    /* class forward typedefs (generic templates -> their instances) */
     int nclasses = 0;
     for (int i = 0; i < m->ndecls; i++)
-        if (m->decls[i]->kind == D_CLASS) nclasses++;
+        if (m->decls[i]->kind == D_CLASS) {
+            if (m->decls[i]->cd->ntyparams > 0)
+                for (ClassDecl *it = m->decls[i]->cd->next_inst; it; it = it->next_inst) nclasses++;
+            else nclasses++;
+        }
     ClassDecl **classes = arena_alloc(&g_arena, sizeof(ClassDecl *) * (size_t)(nclasses ? nclasses : 1));
     bool *emitted = arena_alloc(&g_arena, sizeof(bool) * (size_t)(nclasses ? nclasses : 1));
     int ci = 0;
     for (int i = 0; i < m->ndecls; i++)
-        if (m->decls[i]->kind == D_CLASS) classes[ci++] = m->decls[i]->cd;
+        if (m->decls[i]->kind == D_CLASS) {
+            if (m->decls[i]->cd->ntyparams > 0) {
+                for (ClassDecl *it = m->decls[i]->cd->next_inst; it; it = it->next_inst) classes[ci++] = it;
+            } else classes[ci++] = m->decls[i]->cd;
+        }
     for (int i = 0; i < nclasses; i++) {
         const char *cn = class_cname(classes[i]);
         sb_printf(h, "typedef struct %s %s;\n", cn, cn);
@@ -1712,18 +1832,36 @@ void emit_module(Module *m, bool is_entry, bool checks, bool freestanding, SBuf 
                       d->fn->name);
             break;
         case D_FN:
-            sb_printf(h, "%s;\n", fn_proto(d->fn, false));
+            if (d->fn->ntyparams > 0) {
+                for (FnDecl *it = d->fn->next_inst; it; it = it->next_inst)
+                    sb_printf(h, "%s;\n", fn_proto(it, false));
+            } else {
+                sb_printf(h, "%s;\n", fn_proto(d->fn, false));
+            }
             break;
-        case D_CLASS: {
-            ClassDecl *cd = d->cd;
-            if (cd->ctor) sb_printf(h, "%s;\n", fn_proto(cd->ctor, false));
-            for (int mi = 0; mi < cd->nmethods; mi++)
-                sb_printf(h, "%s;\n", fn_proto(cd->methods[mi], false));
+        case D_CLASS:
+            if (d->cd->ntyparams > 0) {
+                for (ClassDecl *cd = d->cd->next_inst; cd; cd = cd->next_inst) {
+                    if (cd->ctor) sb_printf(h, "%s;\n", fn_proto(cd->ctor, false));
+                    for (int mi = 0; mi < cd->nmethods; mi++)
+                        sb_printf(h, "%s;\n", fn_proto(cd->methods[mi], false));
+                }
+            } else {
+                ClassDecl *cd = d->cd;
+                if (cd->ctor) sb_printf(h, "%s;\n", fn_proto(cd->ctor, false));
+                for (int mi = 0; mi < cd->nmethods; mi++)
+                    sb_printf(h, "%s;\n", fn_proto(cd->methods[mi], false));
+            }
             break;
-        }
         case D_STRUCT:
-            for (int mi = 0; mi < d->sd->nmethods; mi++)
-                sb_printf(h, "%s;\n", fn_proto(d->sd->methods[mi], false));
+            if (d->sd->ntyparams > 0) {
+                for (StructDecl *it = d->sd->next_inst; it; it = it->next_inst)
+                    for (int mi = 0; mi < it->nmethods; mi++)
+                        sb_printf(h, "%s;\n", fn_proto(it->methods[mi], false));
+            } else {
+                for (int mi = 0; mi < d->sd->nmethods; mi++)
+                    sb_printf(h, "%s;\n", fn_proto(d->sd->methods[mi], false));
+            }
             break;
         case D_CONST: {
             Expr *e = d->const_init;
@@ -1754,17 +1892,37 @@ void emit_module(Module *m, bool is_entry, bool checks, bool freestanding, SBuf 
 
     for (int i = 0; i < m->ndecls; i++) {
         Decl *d = m->decls[i];
-        if (d->kind == D_FN) emit_fn(&base, d->fn, NULL, &code);
+        if (d->kind == D_FN) {
+            if (d->fn->ntyparams > 0) {
+                for (FnDecl *it = d->fn->next_inst; it; it = it->next_inst)
+                    emit_fn(&base, it, NULL, &code);
+            } else emit_fn(&base, d->fn, NULL, &code);
+        }
         else if (d->kind == D_STRUCT) {
-            for (int mi = 0; mi < d->sd->nmethods; mi++)
-                emit_fn(&base, d->sd->methods[mi], NULL, &code);
+            if (d->sd->ntyparams > 0) {
+                for (StructDecl *it = d->sd->next_inst; it; it = it->next_inst)
+                    for (int mi = 0; mi < it->nmethods; mi++)
+                        emit_fn(&base, it->methods[mi], NULL, &code);
+            } else {
+                for (int mi = 0; mi < d->sd->nmethods; mi++)
+                    emit_fn(&base, d->sd->methods[mi], NULL, &code);
+            }
         }
         else if (d->kind == D_CLASS) {
-            ClassDecl *cd = d->cd;
-            if (cd->ctor) emit_fn(&base, cd->ctor, cd, &code);
-            for (int mi = 0; mi < cd->nmethods; mi++) emit_fn(&base, cd->methods[mi], cd, &code);
-            emit_class_infra(&base, cd, &code);
-            emit_class_new(&base, cd, &code);
+            if (d->cd->ntyparams > 0) {
+                for (ClassDecl *cd = d->cd->next_inst; cd; cd = cd->next_inst) {
+                    if (cd->ctor) emit_fn(&base, cd->ctor, cd, &code);
+                    for (int mi = 0; mi < cd->nmethods; mi++) emit_fn(&base, cd->methods[mi], cd, &code);
+                    emit_class_infra(&base, cd, &code);
+                    emit_class_new(&base, cd, &code);
+                }
+            } else {
+                ClassDecl *cd = d->cd;
+                if (cd->ctor) emit_fn(&base, cd->ctor, cd, &code);
+                for (int mi = 0; mi < cd->nmethods; mi++) emit_fn(&base, cd->methods[mi], cd, &code);
+                emit_class_infra(&base, cd, &code);
+                emit_class_new(&base, cd, &code);
+            }
         }
     }
 
