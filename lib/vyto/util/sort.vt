@@ -1,0 +1,70 @@
+// Generic sorting and searching over arbitrary element types, using an
+// explicit comparator (v1 generics have no type-parameter bounds, so ordering
+// is supplied by the caller rather than inferred from a trait).
+//
+// ── SCOPE CAVEAT ─────────────────────────────────────────────────────────────
+// These are generic functions monomorphized into THIS module. A generic
+// instantiation is emitted in the generic's defining module (here), which can
+// only see types that module can see. So:
+//
+//   • Element type = a primitive (int, float, bool, byte, string, …):
+//       works everywhere, including from other modules.  ✅
+//   • Element type = a struct/class defined in the SAME module as the call:
+//       only works if that type is also visible here — i.e. it does NOT work
+//       for a user type defined in another module (a header cycle).  ⚠
+//
+// In practice: use these for primitive arrays freely. To sort/search arrays of
+// YOUR OWN struct/class types, prefer an app-local generic helper defined in
+// the same module as those types (the app-local generic pattern), or project
+// to a primitive key first. See docs/SPEC.md §12b "Cross-module limitation".
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Return a new array sorted by `cmp` — cmp(a, b) < 0 when a should come before
+// b, 0 when equal, > 0 when after. Stable insertion sort: simple and correct,
+// well-suited to the small/medium arrays typical of app and UI code.
+export fn sort_by<T>(arr: T[], cmp: fn(T, T): int): T[] {
+    let out: T[] = [];
+    for (let x in arr) { out.push(x); }
+    let i = 1;
+    while (i < out.len) {
+        let key = out[i];
+        let j = i - 1;
+        while (j >= 0 && cmp(out[j], key) > 0) {
+            out[j + 1] = out[j];
+            j -= 1;
+        }
+        out[j + 1] = key;
+        i += 1;
+    }
+    return out;
+}
+
+// Index of the first element satisfying `pred`, or -1.
+export fn index_of_by<T>(arr: T[], pred: fn(T): bool): int {
+    let i = 0;
+    while (i < arr.len) {
+        if (pred(arr[i])) { return i; }
+        i += 1;
+    }
+    return -1;
+}
+
+// Does any element satisfy `pred`?
+export fn contains_by<T>(arr: T[], pred: fn(T): bool): bool {
+    return index_of_by(arr, pred) >= 0;
+}
+
+// Binary search a `cmp`-sorted array for `key`; returns an index i with
+// cmp(arr[i], key) == 0, or -1. cmp(elem, key) < 0 when elem precedes key.
+export fn binary_search<T>(arr: T[], key: T, cmp: fn(T, T): int): int {
+    let lo = 0;
+    let hi = arr.len - 1;
+    while (lo <= hi) {
+        let mid = (lo + hi) / 2;
+        let c = cmp(arr[mid], key);
+        if (c == 0) { return mid; }
+        if (c < 0) { lo = mid + 1; }
+        else { hi = mid - 1; }
+    }
+    return -1;
+}
