@@ -1,4 +1,4 @@
-# Vyto
+# Vyto [Experimental]
 
 A small, statically typed language with JavaScript-like syntax and Turbo
 Pascal's soul: units with separate compilation, records and classes with
@@ -106,6 +106,233 @@ it then depends only on base system libraries (libc, libX11):
 
 See `examples/` (`01_hello` … `50_worker_pool`) for a tour of the language
 and stdlib.
+
+## In four snippets
+
+### Canvas drawing — `vyto/gfx`
+
+A 2D canvas over blend2d: gradients, shapes, vector paths, text. From
+[apps/gfxdemo](apps/gfxdemo/gfxdemo.vt) (trimmed).
+
+```js
+import { Surface, Rect } from "vyto/surface";
+import { Canvas } from "vyto/gfx";
+import { Path } from "vyto/geom/path";
+
+fn main() {
+    let w = 480;
+    let h = 320;
+    let s = new Surface("canvas demo", w, h);
+    let cv = new Canvas(w, h);
+    cv.loadFont("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 15.0);
+
+    // background gradient
+    cv.linearGradientRect(0.0, 0.0, w as float, h as float,
+                          0.0, 0.0, 0.0, h as float, 0x141821, 0x20242E);
+
+    // filled + stroked shapes
+    cv.fillRoundRect(24.0, 24.0, 140.0, 90.0, 12.0, 0x3C5AC8);
+    cv.strokeCircle(280.0, 70.0, 40.0, 3.0, 0xE0605C);
+
+    // a radial-gradient orb
+    let cols: i32[] = [0xFFDD66, 0x20242E];
+    let pos: float[] = [0.0, 1.0];
+    cv.radialGradientRectN(360.0, 24.0, 90.0, 90.0, 405.0, 69.0, 45.0, cols, pos);
+
+    // a filled vector path (heart)
+    let p = new Path();
+    p.moveTo(120.0, 200.0);
+    p.cubicTo(120.0, 175.0, 60.0, 168.0, 60.0, 200.0);
+    p.cubicTo(60.0, 230.0, 100.0, 245.0, 120.0, 265.0);
+    p.cubicTo(140.0, 245.0, 180.0, 230.0, 180.0, 200.0);
+    p.cubicTo(180.0, 168.0, 120.0, 175.0, 120.0, 200.0);
+    p.close();
+    cv.fillPath(p, 0x3CA0E0);
+    cv.strokePath(p, 3.0, 0xFFFFFF);
+
+    cv.text(24.0, 150.0, "vyto/gfx canvas", 0xECECEC);
+    cv.flush();
+
+    s.blitPtr(cv.pixels(), w, h, Rect(0, 0, w, h));
+    s.present();
+    print("painted " + w + "x" + h + " canvas, stride=" + cv.stride());
+}
+```
+
+### Widgets — `vyto/ui`
+
+The whole widget set in one screen: layout containers, a text field, a
+checkbox, a live-updating list. From [apps/uidemo](apps/uidemo/uidemo.vt).
+
+```js
+import { Window, Column, Row, Label, Button, TextField, Checkbox, ListBox } from "vyto/ui";
+
+class Demo {
+    list: ListBox;
+    status: Label;
+    items: string[];
+    checked: bool[];
+
+    fn init() {
+        this.list = new ListBox();
+        this.status = new Label("0 items");
+        this.items = [];
+        this.checked = [];
+    }
+
+    fn add(text: string) {
+        this.items.push(text);
+        this.checked.push(false);
+        this.refresh();
+    }
+
+    fn toggle(i: int) {
+        this.checked[i] = !this.checked[i];
+        this.refresh();
+    }
+
+    fn refresh() {
+        this.list.set_items(this.items, this.checked);
+        this.status.text = this.items.len + " items";
+    }
+}
+
+fn main() {
+    let win = new Window("UIDemo", 420, 480);
+    let demo = new Demo();
+    let input = new TextField("type and press Enter");
+    let add = new Button("Add");
+    let dark = new Checkbox("extra padding");
+    input.grow = 1;
+    demo.list.grow = 1;
+
+    input.onSubmit = (t) => demo.add(t);
+    add.onClick = (b) => demo.add("clicked!");
+    dark.onToggle = (v) => demo.status.text = "padding=" + v;
+    demo.list.onToggle = (i) => demo.toggle(i);
+
+    win.root = new Column([
+        new Label("vyto/ui demo"),
+        new Row([input, add]),
+        dark,
+        demo.list,
+        demo.status,
+    ]);
+    win.run();
+    print("demo closed cleanly");
+}
+```
+
+### CLI + JSON — `vyto/net/http`, `vyto/util/json`
+
+Fetch a JSON array from a REST endpoint and print it. From
+[apps/posts](apps/posts/posts.vt).
+
+```js
+import { http_get } from "vyto/net/http";
+import { json_parse } from "vyto/util/json";
+
+fn main() {
+    let url = "https://jsonplaceholder.typicode.com/posts";
+
+    let limit = 10;
+    let av = args();
+    if (av.len > 0) {
+        if (av[0] == "all") { limit = -1; } else { limit = av[0].to_int(); }
+    }
+
+    print("GET " + url);
+    let resp = http_get(url).timeoutMs(10000).send();
+    if (!resp.ok()) {
+        print("request failed (status " + resp.status() + ")");
+        return;
+    }
+
+    let posts = json_parse(resp.text());
+    let total = posts.len();
+    let show = total;
+    if (limit >= 0 && limit < total) { show = limit; }
+    print("fetched " + total + " posts, showing " + show);
+
+    let i = 0;
+    while (i < show) {
+        let p = posts.at(i);
+        let title = p.get("title").asString();
+        print("#" + p.get("id").asInt() + " (user " + p.get("userId").asInt() + ")  " + title);
+        i += 1;
+    }
+}
+```
+
+### Networking — `vyto/net/socket`
+
+A minimal HTTP/1.1 server. Vyto has no threads, so it serves one connection
+to completion before accepting the next. From
+[apps/httpd](apps/httpd/httpd.vt) (trimmed).
+
+```js
+import { socket_listen, Socket } from "vyto/net/socket";
+import { unixSec } from "vyto/util/time";
+import { jobj, jint, jstr, json_encode } from "vyto/util/json";
+
+fn main() {
+    let srv = socket_listen(8080);
+    if (srv == null) { print("cannot bind :8080"); return; }
+    print("listening on http://127.0.0.1:8080");
+
+    while (true) {
+        let conn = srv.accept();
+        if (conn == null) { continue; }
+        conn.setTimeoutMs(5000);
+        handle(conn);
+        conn.close();
+    }
+}
+
+fn handle(conn: Socket) {
+    let req = readRequest(conn);
+    if (req == "") { return; }
+
+    let eol = req.index_of("\r\n");
+    let line = req;
+    if (eol >= 0) { line = req.slice(0, eol); }
+    let sp = line.index_of(" ");
+    let method = line.slice(0, sp);
+    let rest = line.slice(sp + 1, line.len);
+    let path = rest.slice(0, rest.index_of(" "));
+
+    print(method + " " + path);
+
+    if (path == "/") {
+        send(conn, 200, "text/html", "<h1>vyto httpd</h1><a href=/api/time>/api/time</a>");
+    } else if (path == "/api/time") {
+        let o = jobj();
+        o.set("service", jstr("vyto-httpd"));
+        o.set("unix", jint(unixSec() as int));
+        send(conn, 200, "application/json", json_encode(o));
+    } else {
+        send(conn, 404, "text/plain", "404 not found: " + path + "\n");
+    }
+}
+
+// Read request bytes up to the end of the header block.
+fn readRequest(conn: Socket): string {
+    let acc = "";
+    while (acc.len < 65536) {
+        let chunk = conn.recvText(4096);
+        if (chunk.len == 0) { break; }
+        acc = acc + chunk;
+        if (acc.index_of("\r\n\r\n") >= 0) { break; }
+    }
+    return acc;
+}
+
+fn send(conn: Socket, code: int, ctype: string, body: string) {
+    let head = "HTTP/1.1 " + code + " OK\r\nContent-Type: " + ctype
+             + "\r\nContent-Length: " + body.len + "\r\nConnection: close\r\n\r\n";
+    conn.sendText(head + body);
+}
+```
 
 ## Standard library
 
