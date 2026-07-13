@@ -1,0 +1,59 @@
+// volt/intl demo — Unicode text ops, locale formatting, and MessageFormat.
+// Run: ./voltc run examples/intl_demo.vt   (needs system ICU: libicu-dev)
+
+import { locale, defaultLocale, NFC, NFD,
+         DT_FULL, DT_LONG, DT_MEDIUM, DT_SHORT, DT_NONE, PLURAL_CARDINAL } from "volt/intl";
+import { decode, charCount, encode, normalize, toUpper, toLower, foldCase,
+         graphemes, words, collator } from "volt/intl/unicode";
+import { formatNumber, formatCurrency, formatPercent, NumberFormat } from "volt/intl/number";
+import { NUM_DECIMAL } from "volt/intl";
+import { formatDate } from "volt/intl/datefmt";
+import { message, argSet, catalogFromJson, pluralRules } from "volt/intl/message";
+import { date_from_unix } from "volt/util/date";
+
+fn main() {
+    print("== Unicode text ==");
+    let s = "héllo🎉";
+    print("  \"" + s + "\": " + str(s.len) + " bytes, " + str(charCount(s)) + " codepoints");
+    print("  NFD e+́ -> NFC bytes: " + str(normalize("e" + encode([0x0301]), NFC).len));
+    print("  toUpper(straße, de): " + toUpper("straße", locale("de")));
+    print("  toLower(İSTANBUL, tr): " + toLower("İSTANBUL", locale("tr")));
+    print("  foldCase(HÉLLO): " + foldCase("HÉLLO"));
+    let fam = encode([0x1F468, 0x200D, 0x1F469, 0x200D, 0x1F467]);
+    print("  graphemes(family emoji): " + str(graphemes(fam).len));
+    let sv = collator(locale("sv"));
+    print("  sv compare(z, ö): " + str(sv.compare("z", "ö")) + "  (z before ö)");
+
+    print("== Numbers & currency ==");
+    let de = locale("de-DE");
+    print("  1234567.5 de: " + formatNumber(1234567.5, de));
+    print("  1234567.5 hi: " + formatNumber(1234567.5, locale("hi-IN")));
+    print("  9.90 EUR de:  " + formatCurrency(9.9, "EUR", de));
+    print("  1234 JPY ja:  " + formatCurrency(1234.0, "JPY", locale("ja")));
+    print("  0.25 pct de:  " + formatPercent(0.25, de));
+
+    print("== Dates ==");
+    let d = date_from_unix(1700000000);   // 2023-11-14T22:13:20Z
+    print("  en full: " + formatDate(d, locale("en-US"), DT_FULL, DT_NONE));
+    print("  ja med:  " + formatDate(d, locale("ja-JP"), DT_MEDIUM, DT_SHORT));
+    print("  ar long: " + formatDate(d, locale("ar"), DT_LONG, DT_NONE));
+
+    print("== Messages & plurals ==");
+    let en = locale("en");
+    let p = "{n, plural, =0{no items} one{# item} other{# items}}";
+    print("  en 0: " + message(p, en, argSet().whole("n", 0)));
+    print("  en 1: " + message(p, en, argSet().whole("n", 1)));
+    print("  en 5: " + message(p, en, argSet().whole("n", 5)));
+    let pl = "{n, plural, one{# plik} few{# pliki} many{# plików} other{# pliku}}";
+    print("  pl 3: " + message(pl, locale("pl"), argSet().whole("n", 3)));
+    let sel = "{who} updated {g, select, male{his} female{her} other{their}} profile";
+    print("  sel:  " + message(sel, en, argSet().text("who", "Ada").text("g", "female")));
+
+    let cat = catalogFromJson(de,
+        "{\"greeting\": \"Hallo, {name}!\", \"cart\": \"{n, plural, one{# Artikel} other{# Artikel}} im Korb\"}");
+    print("  cat greeting: " + cat.msg("greeting", argSet().text("name", "Welt")));
+    print("  cat cart 3:   " + cat.msg("cart", argSet().whole("n", 3)));
+
+    print("== Environment ==");
+    print("  default locale: " + defaultLocale().id);
+}

@@ -1,0 +1,213 @@
+// volt/intl/unicode — Unicode text operations that the byte-level `string`
+// primitives can't do correctly: codepoint decode/encode, normalization,
+// locale-aware case mapping, grapheme/word/line segmentation, and collation.
+//
+//     decode("héllo🎉").len            // 6 codepoints (not 8 bytes)
+//     normalize(nfd_e_acute, NFC)      // recompose to a single "é"
+//     toUpper("straße", locale("de"))  // "STRASSE"
+//     graphemes("👨‍👩‍👧").len            // 1 grapheme cluster
+//     collator(locale("sv")).compare("z", "ö")   // -1: Swedish sorts z before ö
+//
+// decode/encode are pure Volt (UTF-8 is simple); everything genuinely hard
+// (normalization tables, case folding, CLDR segmentation & collation) is ICU
+// via native/src/intl_shim.c. Output buffers grow-and-retry: the shim returns
+// the full byte length it needs, so a first generous guess almost always fits.
+
+import { Locale } from "volt/intl";
+
+extern "C" {
+    fn intl_normalize(s: cstring, mode: i32, out: cstring, cap: i32): i32;
+    fn intl_case(s: cstring, locale: cstring, op: i32, out: cstring, cap: i32): i32;
+    fn intl_brk_open(kind: i32, locale: cstring, s: cstring): rawptr;
+    fn intl_brk_next(h: rawptr): i32;
+    fn intl_brk_close(h: rawptr);
+    fn intl_col_open(locale: cstring): rawptr;
+    fn intl_col_compare(h: rawptr, a: cstring, b: cstring): i32;
+    fn intl_col_sortkey(h: rawptr, s: cstring, out: cstring, cap: i32): i32;
+    fn intl_col_close(h: rawptr);
+}
+
+// ---- codepoints (pure Volt) ---------------------------------------------
+
+// UTF-8 -> array of Unicode scalar values. Malformed bytes are decoded
+// leniently (each lead byte consumes its expected continuation bytes).
+export fn decode(s: string): int[] {
+    let out: int[] = [];
+    let i = 0;
+    let n = s.len;
+    while (i < n) {
+        let b0 = s[i];
+        let cp = 0;
+        let len = 1;
+        if (b0 < 0x80) { cp = b0; len = 1; }
+        else if ((b0 & 0xE0) == 0xC0) { cp = b0 & 0x1F; len = 2; }
+        else if ((b0 & 0xF0) == 0xE0) { cp = b0 & 0x0F; len = 3; }
+        else { cp = b0 & 0x07; len = 4; }
+        let j = 1;
+        while (j < len && i + j < n) { cp = (cp << 6) | (s[i + j] & 0x3F); j += 1; }
+        out.push(cp);
+        i += len;
+    }
+    return out;
+}
+
+// Number of Unicode codepoints (contrast `s.len`, which is bytes).
+export fn charCount(s: string): int { return decode(s).len; }
+
+fn encode_cp(cp: int): string {
+    if (cp < 0x80) {
+        let b = bytes(2);
+        b[0] = cp as byte;
+        return str(b as cstring);
+    }
+    if (cp < 0x800) {
+        let b = bytes(3);
+        b[0] = (0xC0 | (cp >> 6)) as byte;
+        b[1] = (0x80 | (cp & 0x3F)) as byte;
+        return str(b as cstring);
+    }
+    if (cp < 0x10000) {
+        let b = bytes(4);
+        b[0] = (0xE0 | (cp >> 12)) as byte;
+        b[1] = (0x80 | ((cp >> 6) & 0x3F)) as byte;
+        b[2] = (0x80 | (cp & 0x3F)) as byte;
+        return str(b as cstring);
+    }
+    let b = bytes(5);
+    b[0] = (0xF0 | (cp >> 18)) as byte;
+    b[1] = (0x80 | ((cp >> 12) & 0x3F)) as byte;
+    b[2] = (0x80 | ((cp >> 6) & 0x3F)) as byte;
+    b[3] = (0x80 | (cp & 0x3F)) as byte;
+    return str(b as cstring);
+}
+
+// Codepoints -> UTF-8 string.
+export fn encode(cps: int[]): string {
+    let out = "";
+    let i = 0;
+    while (i < cps.len) { out = out + encode_cp(cps[i]); i += 1; }
+    return out;
+}
+
+// ---- normalization & case (ICU) -----------------------------------------
+
+// Grow-and-retry wrapper around a `(s, arg, out, cap) -> needed` shim call.
+fn run_norm(s: string, mode: int): string {
+    let cap = s.len * 3 + 64;
+    let buf = bytes(cap);
+    let n = intl_normalize(s.cstr(), mode as i32, buf as cstring, cap as i32) as int;
+    if (n < 0) { panic("volt/intl: normalize failed"); }
+    if (n >= cap) {
+        cap = n + 1;
+        buf = bytes(cap);
+        n = intl_normalize(s.cstr(), mode as i32, buf as cstring, cap as i32) as int;
+    }
+    return str(buf as cstring);
+}
+fn run_case(s: string, loc: string, op: int): string {
+    let cap = s.len * 3 + 64;
+    let buf = bytes(cap);
+    let n = intl_case(s.cstr(), loc.cstr(), op as i32, buf as cstring, cap as i32) as int;
+    if (n < 0) { panic("volt/intl: case mapping failed"); }
+    if (n >= cap) {
+        cap = n + 1;
+        buf = bytes(cap);
+        n = intl_case(s.cstr(), loc.cstr(), op as i32, buf as cstring, cap as i32) as int;
+    }
+    return str(buf as cstring);
+}
+
+// Normalize `s` to NFC / NFD / NFKC / NFKD (the const from volt/intl).
+export fn normalize(s: string, form: int): string { return run_norm(s, form); }
+
+// Locale-aware full case mapping (may change length, e.g. "ß" -> "SS").
+export fn toUpper(s: string, loc: Locale): string { return run_case(s, loc.id, 0); }
+export fn toLower(s: string, loc: Locale): string { return run_case(s, loc.id, 1); }
+// Case folding for caseless comparison (locale-independent).
+export fn foldCase(s: string): string { return run_case(s, "", 2); }
+
+// ---- segmentation (ICU break iterators) ---------------------------------
+
+// Slice `s` at every boundary of `kind` (0=grapheme 1=word 2=line 3=sentence).
+fn segments(s: string, kind: int, loc: string): string[] {
+    let out: string[] = [];
+    if (s.len == 0) { return out; }
+    let h = intl_brk_open(kind as i32, loc.cstr(), s.cstr());
+    if (h == null) { panic("volt/intl: break iterator open failed"); }
+    let prev = 0;
+    while (true) {
+        let b = intl_brk_next(h) as int;
+        if (b < 0) { break; }
+        if (b > prev) { out.push(s.slice(prev, b)); prev = b; }
+    }
+    intl_brk_close(h);
+    return out;
+}
+
+// User-perceived characters (grapheme clusters): emoji ZWJ sequences, combining
+// marks, and regional-indicator flags each count as one.
+export fn graphemes(s: string): string[] { return segments(s, 0, ""); }
+// Word segmentation (root locale). Includes inter-word whitespace as segments.
+export fn words(s: string): string[] { return segments(s, 1, ""); }
+// Word segmentation with an explicit locale (matters for e.g. Thai/Japanese).
+export fn wordsIn(s: string, loc: Locale): string[] { return segments(s, 1, loc.id); }
+
+// Byte offsets at which a line break is permitted (line-break opportunities).
+export fn lineBreaks(s: string): int[] {
+    let out: int[] = [];
+    if (s.len == 0) { return out; }
+    let h = intl_brk_open(2 as i32, "".cstr(), s.cstr());
+    if (h == null) { panic("volt/intl: line break iterator open failed"); }
+    while (true) {
+        let b = intl_brk_next(h) as int;
+        if (b < 0) { break; }
+        out.push(b);
+    }
+    intl_brk_close(h);
+    return out;
+}
+
+// ---- collation (ICU) ----------------------------------------------------
+
+fn take(buf: byte[], n: int): byte[] {
+    if (n <= 0) { return bytes(0); }
+    if (n == buf.len) { return buf; }
+    let out = bytes(n);
+    let i = 0;
+    while (i < n) { out[i] = buf[i]; i += 1; }
+    return out;
+}
+
+// Locale-aware string ordering. Build once and reuse for sorting; the ICU
+// collator carries the locale's tailored rules (accents, digraphs, case order).
+export class Collator {
+    handle: rawptr;
+
+    fn init(loc: Locale) {
+        this.handle = intl_col_open(loc.id.cstr());
+        if (this.handle == null) { panic("volt/intl: collator open failed for '" + loc.id + "'"); }
+    }
+    deinit { intl_col_close(this.handle); }
+
+    // -1 if a < b, 0 if equal, 1 if a > b under this locale's collation.
+    fn compare(a: string, b: string): int {
+        return intl_col_compare(this.handle, a.cstr(), b.cstr()) as int;
+    }
+
+    // Opaque binary sort key; byte-comparing two keys reproduces `compare`.
+    // Cheaper than re-collating when sorting large lists.
+    fn sortKey(s: string): byte[] {
+        let cap = s.len * 4 + 64;
+        let buf = bytes(cap);
+        let n = intl_col_sortkey(this.handle, s.cstr(), buf as cstring, cap as i32) as int;
+        if (n < 0) { panic("volt/intl: sortKey failed"); }
+        if (n >= cap) {
+            cap = n + 1;
+            buf = bytes(cap);
+            n = intl_col_sortkey(this.handle, s.cstr(), buf as cstring, cap as i32) as int;
+        }
+        return take(buf, n);
+    }
+}
+
+export fn collator(loc: Locale): Collator { return new Collator(loc); }

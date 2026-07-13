@@ -1,0 +1,87 @@
+// volt/intl — internationalization & localization, backed by ICU.
+//
+//     import { locale, defaultLocale } from "volt/intl";
+//     import { normalize, graphemes, Collator } from "volt/intl/unicode";
+//     import { formatNumber, formatCurrency } from "volt/intl/number";
+//     import { formatDate } from "volt/intl/datefmt";
+//     import { Catalog } from "volt/intl/message";
+//
+//     let de = locale("de-DE");
+//     formatNumber(1234567.5, de)          // "1.234.567,5"
+//
+// This entry module owns the `Locale` value, locale detection, and the shared
+// enum vocabulary (as int consts) used across the sibling modules. The ICU
+// engine is the *system* ICU by default (linked below); run native/build-icu.sh
+// to vendor static ICU for `voltc build --bundle` or Windows — see README.md.
+//
+// Locale detection reads the POSIX environment; the sibling modules only ever
+// see a `Locale`, so a Volt program never touches an ICU id string by hand.
+
+import { getenv } from "volt/os";
+
+// System ICU. macOS/Windows have no public system ICU headers — those targets
+// require the vendored path (native/build-icu.sh); see README.md.
+#link "icuuc" if "linux"
+#link "icui18n" if "linux"
+
+// ---- shared enums (int consts) ------------------------------------------
+
+// Normalization forms — normalize(s, form) in volt/intl/unicode.
+export const NFC:  int = 0;
+export const NFD:  int = 1;
+export const NFKC: int = 2;
+export const NFKD: int = 3;
+
+// Number styles — NumberFormat in volt/intl/number.
+export const NUM_DECIMAL:    int = 0;
+export const NUM_CURRENCY:   int = 1;
+export const NUM_PERCENT:    int = 2;
+export const NUM_SCIENTIFIC: int = 3;
+
+// Date/time styles — formatDate in volt/intl/datefmt.
+export const DT_FULL:   int = 0;
+export const DT_LONG:   int = 1;
+export const DT_MEDIUM: int = 2;
+export const DT_SHORT:  int = 3;
+export const DT_NONE:   int = 4;
+
+// Plural rule kinds — PluralRules in volt/intl/message.
+export const PLURAL_CARDINAL: int = 0;
+export const PLURAL_ORDINAL:  int = 1;
+
+// A resolved locale. `id` is an ICU locale id ("de_DE", "fr", "ja_JP"); build
+// one with `locale(...)` rather than by hand so the id is normalized.
+export class Locale {
+    id: string;
+    fn init(id: string) { this.id = id; }
+}
+
+// Normalize a user-supplied tag ("de-DE", "de_DE", "de_DE.UTF-8") to an ICU id
+// ("de_DE"): drop a ".<charset>" suffix and map '-' to '_'. A trailing
+// "@keywords" modifier (rare) is dropped with the charset in this v1.
+fn normalize_id(s: string): string {
+    let out = "";
+    let i = 0;
+    while (i < s.len) {
+        let c = s[i];
+        if (c == 46) { break; }               // '.' begins the charset
+        if (c == 45) { out = out + "_"; }      // '-' -> '_'
+        else { out = out + s.slice(i, i + 1); }
+        i += 1;
+    }
+    return out;
+}
+
+// Build a Locale from a BCP-47-ish or POSIX tag.
+export fn locale(tag: string): Locale { return new Locale(normalize_id(tag)); }
+
+// The process locale, from $LC_ALL / $LC_MESSAGES / $LANG (in that order).
+// Falls back to "en_US"; the POSIX "C"/"POSIX" locale maps to "en_US_POSIX".
+export fn defaultLocale(): Locale {
+    let v = getenv("LC_ALL");
+    if (v.len == 0) { v = getenv("LC_MESSAGES"); }
+    if (v.len == 0) { v = getenv("LANG"); }
+    if (v.len == 0) { return new Locale("en_US"); }
+    if (v == "C" || v == "POSIX") { return new Locale("en_US_POSIX"); }
+    return new Locale(normalize_id(v));
+}

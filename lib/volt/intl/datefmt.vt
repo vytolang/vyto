@@ -1,0 +1,63 @@
+// volt/intl/datefmt — locale-aware date & time formatting via ICU (CLDR).
+//
+//     let dt = date_utc_now();
+//     formatDate(dt, locale("ja-JP"), DT_MEDIUM, DT_SHORT)   // "2026/07/13 12:30"
+//     formatDate(dt, locale("en-US"), DT_FULL,   DT_NONE)
+//
+// Unlike volt/util/date's strftime path (one global C locale, fixed field
+// order), each call here carries its own Locale and ICU picks the culturally
+// correct field order, month/day names, era and numbering system.
+//
+// A `DateTime` is interpreted as a UTC wall-clock time (matching date_to_unix)
+// and formatted in UTC, so the rendered fields match the struct's fields in the
+// target language. Use a DateFormat with an explicit tz for zoned rendering.
+
+import { Locale, DT_FULL, DT_LONG, DT_MEDIUM, DT_SHORT, DT_NONE } from "volt/intl";
+import { DateTime, date_to_unix } from "volt/util/date";
+
+extern "C" {
+    fn intl_dat_open(locale: cstring, dateStyle: i32, timeStyle: i32, tz: cstring): rawptr;
+    fn intl_dat_close(h: rawptr);
+    fn intl_dat_fmt(h: rawptr, unix_ms: i64, out: cstring, cap: i32): i32;
+}
+
+// A reusable date/time formatter: one locale, date/time styles (DT_* consts),
+// and a time zone ("" = default zone, or an IANA id like "Asia/Tokyo").
+export class DateFormat {
+    handle: rawptr;
+
+    fn init(loc: Locale, dateStyle: int, timeStyle: int, tz: string) {
+        this.handle = intl_dat_open(loc.id.cstr(), dateStyle as i32, timeStyle as i32, tz.cstr());
+        if (this.handle == null) {
+            panic("volt/intl: date formatter open failed for '" + loc.id + "'");
+        }
+    }
+    deinit { intl_dat_close(this.handle); }
+
+    // Format an instant given as Unix milliseconds.
+    fn formatMillis(ms: i64): string {
+        let cap = 256;
+        let buf = bytes(cap);
+        let n = intl_dat_fmt(this.handle, ms, buf as cstring, cap as i32) as int;
+        if (n < 0) { panic("volt/intl: date format failed"); }
+        if (n >= cap) {
+            cap = n + 1; buf = bytes(cap);
+            n = intl_dat_fmt(this.handle, ms, buf as cstring, cap as i32) as int;
+        }
+        return str(buf as cstring);
+    }
+
+    // Format a DateTime (its fields read as UTC, per date_to_unix).
+    fn format(dt: DateTime): string {
+        return this.formatMillis(date_to_unix(dt) * 1000);
+    }
+}
+
+// ---- one-shot convenience ------------------------------------------------
+
+// Format `dt` for `loc` at the given date/time styles (DT_* from volt/intl;
+// use DT_NONE to omit the date or time part). Rendered in UTC.
+export fn formatDate(dt: DateTime, loc: Locale, dateStyle: int, timeStyle: int): string {
+    let f = new DateFormat(loc, dateStyle, timeStyle, "UTC");
+    return f.format(dt);
+}
