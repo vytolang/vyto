@@ -422,14 +422,48 @@ fn convert_temp(value: float, from_unit: string, to_unit: string): float {
     return value;
 }
 
-fn convert_unit(dim: int, value: float, from_i: int, to_i: int): float {
+// A selectable unit: its display name and factor to the dimension's base unit
+// (unused for temperature, which is affine and handled by convert_temp).
+class Unit {
+    name: string;
+    factor: float;
+    fn init(name: string, factor: float) { this.name = name; this.factor = factor; }
+}
+
+// Zip a dimension's unit names with their base-unit factors into Unit objects,
+// so the dropdown can carry the actual Unit rather than a bare index.
+fn dim_unit_objs(dim: int): Unit[] {
+    let names = dim_units(dim);
+    let out: Unit[] = [];
     if (dim == DIM_TEMP) {
-        let units = dim_units(dim);
-        return convert_temp(value, units[from_i], units[to_i]);
+        for (let nm in names) { out.push(new Unit(nm, 0.0)); }
+        return out;
     }
-    let factors = dim_factors(dim);
-    let base = value * factors[from_i];
-    return base / factors[to_i];
+    let facs = dim_factors(dim);
+    let i = 0;
+    while (i < names.len) { out.push(new Unit(names[i], facs[i])); i += 1; }
+    return out;
+}
+
+// A dropdown that carries typed values: onPick hands back the selected T, not
+// an int index into a parallel array. The index lives in exactly one place —
+// the internal onSelect closure below.
+class TypedDropdown<T> {
+    dd: Dropdown;
+    values: T[];
+    onPick: fn(T);
+    fn init(labels: string[], values: T[]) {
+        this.values = values;
+        this.dd = new Dropdown(labels);
+        let self = this;
+        this.dd.onSelect = (i) => { if (self.onPick != null) { self.onPick(self.values[i]); } };
+    }
+    fn selected(): T { return this.values[this.dd.selected]; }
+    fn set_options(labels: string[], values: T[], sel: int) {
+        this.values = values;
+        this.dd.items = labels;
+        this.dd.selected = sel;
+    }
 }
 
 // ---- Calculator App ----
@@ -461,12 +495,10 @@ class Calc {
 
     // converter
     conv_dim_idx: int;
-    conv_from_idx: int;
-    conv_to_idx: int;
     conv_input: TextField;
     conv_output: Label;
-    conv_from_dd: Dropdown;
-    conv_to_dd: Dropdown;
+    conv_from: TypedDropdown<Unit>;
+    conv_to: TypedDropdown<Unit>;
     conv_dim_dd: Dropdown;
 
     fn init() {
@@ -479,8 +511,6 @@ class Calc {
         this.prog_result = 0;
         this.bit_labels = [];
         this.conv_dim_idx = 0;
-        this.conv_from_idx = 0;
-        this.conv_to_idx = 1;
     }
 
     // ---- Basic / Scientific ----
@@ -725,40 +755,26 @@ class Calc {
 
     fn do_convert() {
         let val = str2float(this.conv_input.text);
-        let result = convert_unit(this.conv_dim_idx, val, this.conv_from_idx, this.conv_to_idx);
+        // the dropdowns hand back the actual Unit — no index round-trip, no
+        // dim_units(dim)[i] re-lookup.
+        let f = this.conv_from.selected();
+        let t = this.conv_to.selected();
+        let result: float = 0.0;
+        if (this.conv_dim_idx == DIM_TEMP) {
+            result = convert_temp(val, f.name, t.name);
+        } else {
+            result = val * f.factor / t.factor;
+        }
         this.conv_output.text = format_result(result);
     }
 
     fn on_dim_change(i: int) {
         this.conv_dim_idx = i;
-        this.conv_from_idx = 0;
-        this.conv_to_idx = 1;
-        // update dropdown items
-        let units = dim_units(i);
-        if (this.conv_from_dd != null) {
-            this.conv_from_dd.items = units;
-            this.conv_from_dd.selected = 0;
-        }
-        if (this.conv_to_dd != null) {
-            this.conv_to_dd.items = units;
-            this.conv_to_dd.selected = 1;
-        }
+        let labels = dim_units(i);
+        let units = dim_unit_objs(i);
+        if (this.conv_from != null) { this.conv_from.set_options(labels, units, 0); }
+        if (this.conv_to != null) { this.conv_to.set_options(labels, units, 1); }
         this.do_convert();
-    }
-
-    fn on_from_change(i: int) {
-        this.conv_from_idx = i;
-        this.do_convert();
-    }
-
-    fn on_to_change(i: int) {
-        this.conv_to_idx = i;
-        this.do_convert();
-    }
-
-    fn update_conv_units() {
-        // rebuild dropdowns when dimension changes
-        // caller handles this by recreating the panel
     }
 }
 
@@ -945,11 +961,12 @@ fn build_conv_panel(calc: Calc): Widget {
     calc.conv_dim_dd = new Dropdown(dim_names());
     calc.conv_dim_dd.onSelect = (i) => calc.on_dim_change(i);
 
-    calc.conv_from_dd = new Dropdown(dim_units(0));
-    calc.conv_from_dd.onSelect = (i) => calc.on_from_change(i);
+    calc.conv_from = new TypedDropdown<Unit>(dim_units(0), dim_unit_objs(0));
+    calc.conv_from.onPick = (u) => calc.do_convert();
 
-    calc.conv_to_dd = new Dropdown(dim_units(0));
-    calc.conv_to_dd.onSelect = (i) => calc.on_to_change(i);
+    calc.conv_to = new TypedDropdown<Unit>(dim_units(0), dim_unit_objs(0));
+    calc.conv_to.onPick = (u) => calc.do_convert();
+    calc.conv_to.dd.selected = 1;
 
     calc.conv_input = new TextField("0");
     calc.conv_input.onSubmit = (t) => calc.do_convert();
@@ -959,9 +976,6 @@ fn build_conv_panel(calc: Calc): Widget {
     let convert_btn = new Button("Convert");
     convert_btn.onClick = (b) => calc.do_convert();
 
-    let row1 = new Row([calc.conv_from_dd, calc.conv_to_dd]);
-    row1.gap(8);
-
     let row2 = new Row([calc.conv_input, convert_btn]);
     row2.gap(8);
 
@@ -969,9 +983,9 @@ fn build_conv_panel(calc: Calc): Widget {
         new Label("Dimension"),
         calc.conv_dim_dd,
         new Label("From"),
-        calc.conv_from_dd,
+        calc.conv_from.dd,
         new Label("To"),
-        calc.conv_to_dd,
+        calc.conv_to.dd,
         row2,
         new Label("Result"),
         calc.conv_output,
