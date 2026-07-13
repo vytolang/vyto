@@ -1,0 +1,1810 @@
+// vyto/ui/core — the layout/paint/event spine: Size, Theme, the Painter
+// abstraction, the Widget base class, and the Window that owns the event loop.
+// The widget catalog (layout, form, menu, dialog) builds on these; apps import
+// everything through the vyto/ui barrel.
+//
+// Reference cycles: handler closures (onClick, onSubmit, ...) usually capture
+// the object that owns the widget tree. Window.run() breaks those cycles on
+// exit by walking the tree and nulling every handler field
+// (release_all/drop_handlers), so apps never need a manual teardown.
+
+import { Surface, Rect, contains, rgb, rgba, with_alpha, alpha_of, mix,
+          EV_EXPOSE, EV_KEY, EV_KEY_UP, EV_MOUSE_DOWN, EV_MOUSE_UP, EV_MOUSE_MOVE, EV_MOUSE_WHEEL, EV_MOUSE_RDOWN,
+          EV_RESIZE, EV_CLOSE, EV_TIMER, MOD_SHIFT,
+          KEY_ESC, KEY_TAB } from "vyto/surface";
+import { Tween } from "vyto/ui/anim";
+import { ease_linear, ease_in_quad, ease_out_quad, ease_in_out_quad,
+         ease_in_cubic, ease_out_cubic, ease_in_out_cubic,
+         ease_out_back, ease_out_bounce, ease_in_out_sine } from "vyto/anim";
+import { Path } from "vyto/geom/path";
+
+export struct Size {
+    w: int;
+    h: int;
+}
+
+// ------------------------------------------------------------ constraints
+
+// Flutter-style box constraints: the min/max width and height a parent offers
+// a child. The child picks a size within them (layout()); the parent then
+// positions it (arrange()). "Constraints go down, sizes come up, the parent
+// sets position."
+export class BoxConstraints {
+    minW: int;
+    maxW: int;
+    minH: int;
+    maxH: int;
+
+    fn init(minW: int, maxW: int, minH: int, maxH: int) {
+        this.minW = minW;
+        this.maxW = maxW;
+        this.minH = minH;
+        this.maxH = maxH;
+    }
+
+    // clamp a natural size into this box
+    fn constrain(sz: Size): Size {
+        let w = sz.w;
+        let h = sz.h;
+        if (w < this.minW) { w = this.minW; }
+        if (w > this.maxW) { w = this.maxW; }
+        if (h < this.minH) { h = this.minH; }
+        if (h > this.maxH) { h = this.maxH; }
+        return Size(w, h);
+    }
+
+    // shrink the max box by (dw, dh) (e.g. for padding), flooring at the min
+    fn deflate(dw: int, dh: int): BoxConstraints {
+        let maxw = this.maxW - dw;
+        let maxh = this.maxH - dh;
+        if (maxw < 0) { maxw = 0; }
+        if (maxh < 0) { maxh = 0; }
+        let minw = this.minW;
+        let minh = this.minH;
+        if (minw > maxw) { minw = maxw; }
+        if (minh > maxh) { minh = maxh; }
+        return new BoxConstraints(minw, maxw, minh, maxh);
+    }
+}
+
+// a box forced to exactly w x h
+export fn bcTight(w: int, h: int): BoxConstraints {
+    return new BoxConstraints(w, w, h, h);
+}
+
+// a box free to be anything up to w x h (min 0)
+export fn bcLoose(w: int, h: int): BoxConstraints {
+    return new BoxConstraints(0, w, 0, h);
+}
+
+// --------------------------------------------------------------- paint helpers
+// Small reusable chrome routines shared by the widget draws so every control
+// composites the same way: rounded surface, elevation shadow, focus glow.
+// These work on any Painter — the lean tier falls back to plain fill/frame.
+
+// Inset/expand a rect by `dx` on every side (dx<0 expands outward).
+export fn rect_inset(r: Rect, dx: int): Rect {
+    return Rect(r.x - dx, r.y - dx, r.w + 2 * dx, r.h + 2 * dx);
+}
+
+// Absolute value of an int (used by gesture slop checks).
+fn abs_i(v: int): int {
+    if (v < 0) { return -v; }
+    return v;
+}
+
+// Easing selectors for the self-animation helpers (Widget.animate*). An int id
+// is used rather than a `fn(float):float` parameter because a bare vyto/anim
+// easing function can't be passed by value across the module boundary from user
+// code (the closure thunk isn't declared in the consumer) — ease_apply() below
+// resolves the id to a direct call instead, which works from anywhere. Values
+// mirror the vyto/anim easing set; custom easing drops to a raw Tween.
+export const EASE_LINEAR: int = 0;
+export const EASE_IN_QUAD: int = 1;
+export const EASE_OUT_QUAD: int = 2;
+export const EASE_IN_OUT_QUAD: int = 3;
+export const EASE_IN_CUBIC: int = 4;
+export const EASE_OUT_CUBIC: int = 5;
+export const EASE_IN_OUT_CUBIC: int = 6;
+export const EASE_OUT_BACK: int = 7;
+export const EASE_OUT_BOUNCE: int = 8;
+export const EASE_IN_OUT_SINE: int = 9;
+
+// Apply an EASE_* curve to raw progress t in [0,1]. Direct calls into vyto/anim.
+export fn ease_apply(id: int, t: float): float {
+    if (id == EASE_IN_QUAD) { return ease_in_quad(t); }
+    if (id == EASE_OUT_QUAD) { return ease_out_quad(t); }
+    if (id == EASE_IN_OUT_QUAD) { return ease_in_out_quad(t); }
+    if (id == EASE_IN_CUBIC) { return ease_in_cubic(t); }
+    if (id == EASE_OUT_CUBIC) { return ease_out_cubic(t); }
+    if (id == EASE_IN_OUT_CUBIC) { return ease_in_out_cubic(t); }
+    if (id == EASE_OUT_BACK) { return ease_out_back(t); }
+    if (id == EASE_OUT_BOUNCE) { return ease_out_bounce(t); }
+    if (id == EASE_IN_OUT_SINE) { return ease_in_out_sine(t); }
+    return ease_linear(t); // EASE_LINEAR
+}
+
+// Scale a px metric by the UI scale factor, rounded, flooring at 1 for
+// nonzero inputs (a 1px hairline must survive downscaling).
+export fn scale_px(v: int, f: float): int {
+    let r = ((v as float) * f + 0.5) as int;
+    if (r < 1 && v > 0) { r = 1; }
+    return r;
+}
+
+// A soft focus glow: a 2px stroke_round just outside the control, painted in
+// the theme's rgba focus_ring color. The lean tier falls back to a 1px frame.
+export fn paint_focus_ring(s: Painter, th: Theme, r: Rect, radius: int) {
+    let ring = rect_inset(r, -2);
+    s.stroke_round(ring, radius + 2, 2, th.focus_ring);
+}
+
+// Resolve the visible fill of a control given its hover/press state. Uses
+// opaque mix() so the lean tier (no alpha) renders the same tint as the rich
+// tier — alpha compositing is reserved for true overlays the widget code may
+// add on top. `base` is the resting fill; hover/press are opaque tint colors.
+export fn resolve_state_fill(base: int, hovered: bool, pressed: bool,
+                             hover_tint: int, press_tint: int): int {
+    if (pressed) { return mix(base, press_tint, 0.5); }
+    if (hovered) { return mix(base, hover_tint, 0.5); }
+    return base;
+}
+
+// ----------------------------------------------------------------- Theme
+//
+// A themeable design system: color ramps, semantic roles, scales, and type
+// roles. The legacy field names (bg, ink, accent, muted, sel, white, pad,
+// spacing) are kept as computed aliases over the semantic roles so existing
+// apps and the existing widget draws keep compiling — only the NEW widget
+// draws use the semantic roles directly. Two polished built-in themes ship:
+//   `new Theme()`         — refined light   (also `theme_light()`)
+//   `theme_dark()`        — true dark, deeper than the gallery's old dark
+
+export class Theme {
+    // --- legacy aliases (kept for backward compatibility; mirrors of the
+    //     semantic roles) ---
+    bg: int;       // = surface
+    ink: int;      // = on_surface
+    accent: int;   // = primary
+    muted: int;    // = on_surface_muted
+    sel: int;      // = secondary
+    white: int;    // = surface_raised
+    pad: int;      // = space_3 (12)
+    spacing: int;  // = space_2 (8)
+
+    // --- color ramps ---
+    primary_300: int;
+    primary_500: int;
+    primary_700: int;
+    neutral_100: int;
+    neutral_200: int;
+    neutral_300: int;
+    neutral_400: int;
+    neutral_500: int;
+    neutral_700: int;
+    neutral_900: int;
+
+    // --- semantic roles (rgba-packed when alpha matters) ---
+    surface: int;          // page background
+    surface_raised: int;   // cards, popups, inputs
+    surface_sunken: int;   // wells, track of progress bar
+    on_surface: int;       // primary text
+    on_surface_muted: int; // secondary text / captions
+    on_surface_subtle: int;
+    primary: int;
+    on_primary: int;
+    primary_hover: int;   // computed: mix(primary -> on_primary, 0.10)
+    primary_press: int;   // computed: mix(primary -> darker)
+    secondary: int;       // subtle filled surface
+    on_secondary: int;
+    hover_overlay: int;    // rgba white, low alpha — composited over a control
+    press_overlay: int;    // rgba black, low alpha
+    disabled: int;
+    disabled_fg: int;
+    border: int;
+    divider: int;
+    focus_ring: int;      // rgba primary, ~0.55 alpha
+    shadow_color: int;    // rgba neutral, soft-drop shadow tint
+    selection: int;       // list row highlight
+    // status/severity roles — Alert, Toast, Banner (info/success/warning/error)
+    info: int;
+    success: int;
+    warning: int;
+    danger: int;
+    on_status: int;       // text/icon color on a filled status color
+
+    // --- scales ---
+    radius_sm: int;
+    radius_md: int;
+    radius_lg: int;
+    elevation1_blur: int;
+    elevation1_dy: int;
+    elevation2_blur: int;
+    elevation2_dy: int;
+    elevation3_blur: int;
+    elevation3_dy: int;
+    space_1: int;
+    space_2: int;
+    space_3: int;
+    space_4: int;
+    space_5: int;
+    space_6: int;
+
+    // --- type roles: weight + color per role (size stays at the painter's
+    //     loaded font size; weight is the headline hierarchy lever) ---
+    type_title_weight: int;
+    type_body_weight: int;
+    type_label_weight: int;
+    type_caption_weight: int;
+    type_color_title: int;
+    type_color_body: int;
+    type_color_caption: int;
+
+    scale_applied: float; // 0.0 = apply_scale not run yet (Window.run applies)
+
+    // Multiply every px-denominated scale by the UI scale factor (HiDPI).
+    // Colors and weights are untouched. Idempotent per theme instance —
+    // Window.run() calls this once with Surface.scale().
+    fn apply_scale(f: float) {
+        if (this.scale_applied > 0.0) { return; }
+        this.scale_applied = f;
+        if (f > 0.99 && f < 1.01) { return; }
+        this.radius_sm = scale_px(this.radius_sm, f);
+        this.radius_md = scale_px(this.radius_md, f);
+        this.radius_lg = scale_px(this.radius_lg, f);
+        this.elevation1_blur = scale_px(this.elevation1_blur, f);
+        this.elevation1_dy = scale_px(this.elevation1_dy, f);
+        this.elevation2_blur = scale_px(this.elevation2_blur, f);
+        this.elevation2_dy = scale_px(this.elevation2_dy, f);
+        this.elevation3_blur = scale_px(this.elevation3_blur, f);
+        this.elevation3_dy = scale_px(this.elevation3_dy, f);
+        this.space_1 = scale_px(this.space_1, f);
+        this.space_2 = scale_px(this.space_2, f);
+        this.space_3 = scale_px(this.space_3, f);
+        this.space_4 = scale_px(this.space_4, f);
+        this.space_5 = scale_px(this.space_5, f);
+        this.space_6 = scale_px(this.space_6, f);
+        this.pad = this.space_3;
+        this.spacing = this.space_2;
+    }
+
+    fn init() {
+        // Refined light theme (the default).
+        this.surface         = rgb(247, 247, 249);
+        this.surface_raised  = rgb(255, 255, 255);
+        this.surface_sunken  = rgb(238, 239, 242);
+        this.on_surface      = rgb(28, 28, 34);
+        this.on_surface_muted= rgb(108, 112, 124);
+        this.on_surface_subtle = rgb(150, 154, 165);
+        this.primary         = rgb(46, 98, 210);
+        this.on_primary      = rgb(255, 255, 255);
+        this.secondary       = rgb(232, 236, 246);
+        this.on_secondary    = rgb(40, 44, 58);
+        this.disabled        = rgb(214, 216, 224);
+        this.disabled_fg     = rgb(150, 152, 162);
+        this.border          = rgb(214, 218, 226);
+        this.divider         = rgb(228, 231, 238);
+        this.selection       = mix(this.surface, this.primary, 0.16);
+        this.shadow_color    = rgba(35, 40, 60, 55);
+        this.info            = rgb(46, 98, 210);
+        this.success         = rgb(34, 152, 84);
+        this.warning         = rgb(214, 152, 24);
+        this.danger          = rgb(210, 60, 60);
+        this.on_status       = rgb(255, 255, 255);
+
+        // ramps
+        this.primary_500     = this.primary;
+        this.primary_300     = mix(this.primary, this.surface_raised, 0.5);
+        this.primary_700     = mix(this.primary, rgb(18, 22, 36), 0.28);
+        this.neutral_100     = rgb(248, 248, 250);
+        this.neutral_200     = rgb(236, 237, 240);
+        this.neutral_300     = rgb(220, 222, 228);
+        this.neutral_400     = rgb(198, 200, 208);
+        this.neutral_500     = rgb(160, 162, 172);
+        this.neutral_700     = rgb(96, 98, 108);
+        this.neutral_900     = rgb(28, 28, 34);
+
+        // interaction overlays (alpha-packed; rich tier composites them)
+        this.hover_overlay   = rgba(255, 255, 255, 36);
+        this.press_overlay   = rgba(0, 0, 0, 24);
+        this.focus_ring      = with_alpha(this.primary, 150);
+
+        // primary button depth
+        this.primary_hover   = mix(this.primary, this.on_primary, 0.10);
+        this.primary_press   = mix(this.primary, this.primary_700, 0.35);
+
+        // scales (8pt grid)
+        this.radius_sm = 4;
+        this.radius_md = 8;
+        this.radius_lg = 14;
+        this.elevation1_blur = 6;  this.elevation1_dy = 2;
+        this.elevation2_blur = 12; this.elevation2_dy = 4;
+        this.elevation3_blur = 20; this.elevation3_dy = 8;
+        this.space_1 = 4;
+        this.space_2 = 8;
+        this.space_3 = 12;
+        this.space_4 = 16;
+        this.space_5 = 24;
+        this.space_6 = 32;
+
+        // type roles
+        this.type_title_weight   = WEIGHT_BOLD;
+        this.type_body_weight    = WEIGHT_REG;
+        this.type_label_weight   = WEIGHT_MED;
+        this.type_caption_weight = WEIGHT_REG;
+        this.type_color_title    = this.on_surface;
+        this.type_color_body     = this.on_surface;
+        this.type_color_caption  = this.on_surface_muted;
+
+        // legacy aliases
+        this.bg      = this.surface;
+        this.ink     = this.on_surface;
+        this.accent  = this.primary;
+        this.muted   = this.on_surface_muted;
+        this.sel     = this.secondary;
+        this.white   = this.surface_raised;
+        this.pad     = this.space_3;
+        this.spacing = this.space_2;
+    }
+}
+
+// Refined light theme (identical to `new Theme()`; provided for symmetry with
+// `theme_dark()` so apps can name what they ship).
+export fn theme_light(): Theme { return new Theme(); }
+
+// A genuinely attractive true-dark theme: deep neutral surfaces, a brighter
+// primary, stronger shadows on dark. The semantic roles are fully populated
+// so every widget draws consistently — this is the theme people screenshot.
+export fn theme_dark(): Theme {
+    let th = new Theme();
+    th.surface           = rgb(24, 24, 28);
+    th.surface_raised    = rgb(34, 34, 40);
+    th.surface_sunken    = rgb(18, 18, 22);
+    th.on_surface        = rgb(226, 227, 233);
+    th.on_surface_muted  = rgb(150, 153, 165);
+    th.on_surface_subtle = rgb(108, 112, 124);
+    th.primary           = rgb(96, 148, 238);
+    th.on_primary        = rgb(16, 18, 26);
+    th.secondary         = rgb(48, 48, 56);
+    th.on_secondary      = rgb(220, 222, 232);
+    th.disabled          = rgb(60, 62, 70);
+    th.disabled_fg       = rgb(96, 98, 108);
+    th.border            = rgb(56, 56, 66);
+    th.divider           = rgb(44, 44, 54);
+    th.selection         = mix(th.surface, th.primary, 0.30);
+    th.shadow_color      = rgba(0, 0, 0, 150);
+    th.info              = rgb(96, 148, 238);
+    th.success           = rgb(64, 190, 120);
+    th.warning           = rgb(232, 176, 64);
+    th.danger            = rgb(232, 96, 96);
+    th.on_status         = rgb(16, 18, 26);
+
+    th.primary_500       = th.primary;
+    th.primary_300       = mix(th.primary, th.on_primary, 0.45);
+    th.primary_700       = mix(th.primary, rgb(0, 0, 0), 0.30);
+    th.neutral_100      = rgb(56, 56, 64);
+    th.neutral_200      = rgb(44, 44, 52);
+    th.neutral_300      = rgb(38, 38, 46);
+    th.neutral_400      = rgb(80, 80, 90);
+    th.neutral_500      = rgb(120, 120, 130);
+    th.neutral_700      = rgb(170, 170, 180);
+    th.neutral_900      = rgb(232, 232, 238);
+
+    th.hover_overlay     = rgba(255, 255, 255, 20);
+    th.press_overlay     = rgba(0, 0, 0, 42);
+    th.focus_ring        = with_alpha(th.primary, 175);
+
+    th.primary_hover     = mix(th.primary, th.on_primary, 0.16);
+    th.primary_press     = mix(th.primary, th.primary_700, 0.40);
+
+    th.type_color_title  = th.on_surface;
+    th.type_color_body   = th.on_surface;
+    th.type_color_caption = th.on_surface_muted;
+
+    // refresh legacy aliases
+    th.bg      = th.surface;
+    th.ink     = th.on_surface;
+    th.accent  = th.primary;
+    th.muted   = th.on_surface_muted;
+    th.sel     = th.secondary;
+    th.white   = th.surface_raised;
+    return th;
+}
+
+// --------------------------------------------------------------- Painter
+
+// The drawing target widgets render through. The default SurfacePainter draws
+// straight to the vyto/surface vector API (the lean tier — no blend2d). A
+// GfxPainter in vyto/gfx draws through a blend2d Canvas (the rich tier). Widgets
+// only ever see a Painter, so vyto/ui itself never depends on blend2d: apps that
+// want AA rendering pass a GfxPainter, everyone else pays nothing.
+// Font weights the painter can select for a draw call. 0 = regular,
+// 1 = medium/semi, 2 = bold. The lean tier ignores weight (its bitmap font is
+// a single weight); the rich tier maps it to blend2d font slots. Widgets pull
+// the weight of a `type_*` role from the Theme.
+export const WEIGHT_REG: int = 0;
+export const WEIGHT_MED: int = 1;
+export const WEIGHT_BOLD: int = 2;
+
+export class Painter {
+    virtual fn fill(r: Rect, color: int) { }
+    virtual fn frame(r: Rect, color: int) { }
+    virtual fn line(x0: int, y0: int, x1: int, y1: int, color: int) { }
+    virtual fn text(x: int, y: int, s: string, color: int) { }
+    virtual fn text_in(r: Rect, pad: int, s: string, color: int) { }
+    virtual fn text_width(s: string): int { return 0; }
+    virtual fn font_ascent(): int { return 0; }
+    virtual fn font_height(): int { return 0; }
+
+    // Horizontally-centred / right-aligned text within a rect, vertically
+    // centred. Concrete helpers over the metrics above, so a custom draw()
+    // never open-codes the centering arithmetic.
+    fn baseline_in(r: Rect): int {
+        return r.y + (r.h - this.font_height()) / 2 + this.font_ascent();
+    }
+    fn text_center(r: Rect, s: string, color: int) {
+        this.text(r.x + (r.w - this.text_width(s)) / 2, this.baseline_in(r), s, color);
+    }
+    fn text_right(r: Rect, pad: int, s: string, color: int) {
+        this.text(r.x + r.w - pad - this.text_width(s), this.baseline_in(r), s, color);
+    }
+    virtual fn width(): int { return 0; }
+    virtual fn height(): int { return 0; }
+    virtual fn present() { }
+    // present only the given rect; fallback presents everything. The
+    // dirty-region repaint path calls this instead of present().
+    virtual fn present_rect(r: Rect) { this.present(); }
+    // the window was resized to w x h; painters with their own buffer
+    // (GfxPainter) recreate it here. Called by Window on EV_RESIZE.
+    virtual fn on_resize(w: int, h: int) { }
+    // true when clip_push/clip_pop really clip pixels (the rich tier);
+    // false means callers must clip geometrically (ClippedPainter).
+    virtual fn can_clip(): bool { return false; }
+    // a stroked line with width; the base fakes it with three offset 1px
+    // lines (the historical lean-tier "thick line"), the rich tier draws a
+    // real anti-aliased stroke.
+    virtual fn line_w(x0: int, y0: int, x1: int, y1: int, width: int, color: int) {
+        this.line(x0, y0, x1, y1, color);
+        if (width > 1) {
+            this.line(x0 + 1, y0, x1 + 1, y1, color);
+            this.line(x0, y0 + 1, x1, y1 + 1, color);
+        }
+    }
+
+    // -- WS3: weight selection for the next text draws -------------------
+    virtual fn set_weight(w: int) { }
+
+    // -- WS2: widened paint vocabulary ----------------------------------
+    // Rounded fill/stroke; circle fill; vertical gradient (top→bottom);
+    // soft drop shadow; clip stack. The base class falls back to the plain
+    // primitives so any Painter (incl. a test RecordPainter or the lean
+    // SurfacePainter, which overrides the ones it can do) keeps rendering
+    // correctly, just plainer. Packed colors (0xAARRGGBB) are honored by the
+    // rich tier; the base/lean tiers treat alpha 0 as opaque.
+    virtual fn fill_round(r: Rect, radius: int, color: int) { this.fill(r, color); }
+    virtual fn stroke_round(r: Rect, radius: int, width: int, color: int) { this.frame(r, color); }
+    virtual fn circle(cx: int, cy: int, radius: int, color: int) {
+        this.fill(Rect(cx - radius, cy - radius, radius * 2, radius * 2), color);
+    }
+    virtual fn stroke_circle(cx: int, cy: int, radius: int, width: int, color: int) {
+        this.frame(Rect(cx - radius, cy - radius, radius * 2, radius * 2), color);
+    }
+    virtual fn gradient_v(r: Rect, radius: int, top: int, bottom: int) {
+        // base fallback: the mid color (alpha-aware mix against itself)
+        this.fill_round(r, radius, mix(top, bottom, 0.5));
+    }
+    virtual fn shadow(r: Rect, radius: int, blur: int, dy: int, color: int) { }
+    virtual fn clip_push(r: Rect, radius: int) { }
+    virtual fn clip_pop() { }
+
+    // Multi-stop gradient (colors/positions parallel arrays, positions
+    // ascending in [0,1]) — for skins needing more than gradient_v's 2-color
+    // ramp (e.g. a glossy highlight band). Base fallback: mix of the first
+    // and last stop, ignoring intermediate ones — plain but never blank.
+    virtual fn gradient_n(r: Rect, radius: int, colors: i32[], positions: float[]) {
+        if (colors.len == 0) { return; }
+        this.fill_round(r, radius, mix(colors[0] as int, colors[colors.len - 1] as int, 0.5));
+    }
+
+    // Bevel border: a raised (light top/left, dark bottom/right) or sunken
+    // (swapped) 3D edge, for retro OS skins (Windows Luna/Aero). Base
+    // fallback: a plain single-tone stroke (no bevel on the lean tier).
+    virtual fn bevel(r: Rect, radius: int, width: int, light: int, dark: int, raised: bool) {
+        let color = dark;
+        if (raised) { color = light; }
+        this.stroke_round(r, radius, width, color);
+    }
+
+    // Arbitrary filled polygon (xs/ys parallel arrays, same point at index
+    // i) — for icon glyphs a rect/round-rect/circle can't express: stars,
+    // hearts, roofs, speech-bubble tails. Base fallback: the bounding box of
+    // the points, filled flat — a rough but honest stand-in on the lean tier.
+    virtual fn polygon(xs: i32[], ys: i32[], color: int) {
+        if (xs.len == 0) { return; }
+        let minx = xs[0]; let maxx = xs[0];
+        let miny = ys[0]; let maxy = ys[0];
+        for (let i in 0..xs.len) {
+            if (xs[i] < minx) { minx = xs[i]; }
+            if (xs[i] > maxx) { maxx = xs[i]; }
+            if (ys[i] < miny) { miny = ys[i]; }
+            if (ys[i] > maxy) { maxy = ys[i]; }
+        }
+        this.fill(Rect(minx as int, miny as int, (maxx - minx) as int, (maxy - miny) as int), color);
+    }
+
+    // Partial ring stroke (e.g. a wifi/signal glyph). Degrees, 0 = +x axis,
+    // clockwise. Base fallback: a full circle instead of a partial arc —
+    // plainer, still visibly the right shape family.
+    virtual fn stroke_arc(cx: int, cy: int, rx: int, ry: int,
+                          start_deg: int, sweep_deg: int, width: int, color: int) {
+        this.stroke_circle(cx, cy, (rx + ry) / 2, width, color);
+    }
+
+    // Affine transforms — a rich-tier capability. save()/restore() bracket a
+    // transform change; translate/scale/rotate compose onto the current one.
+    // The base/lean tier CANNOT transform its axis-aligned primitives, so it
+    // no-ops them: callers that need rotation/scale must check can_transform()
+    // (or accept that content draws untransformed on the lean tier). rotate is
+    // in degrees. This matches every other WS2 primitive's degrade contract.
+    virtual fn save() { }
+    virtual fn restore() { }
+    virtual fn translate(dx: float, dy: float) { }
+    virtual fn scale(sx: float, sy: float) { }
+    virtual fn rotate(deg: float) { }
+    virtual fn can_transform(): bool { return false; }
+
+    // Centered radial gradient filling a rect (colors/positions parallel,
+    // positions ascending in [0,1]). Base fallback: mix of first/last stop,
+    // like gradient_n — plain but never blank.
+    virtual fn radial_gradient(r: Rect, cx: int, cy: int, radius: int,
+                               colors: i32[], positions: float[]) {
+        if (colors.len == 0) { return; }
+        this.fill_round(r, 0, mix(colors[0] as int, colors[colors.len - 1] as int, 0.5));
+    }
+
+    // Fill/stroke an arbitrary vector Path. Base fallback: flatten the curves
+    // to a polygon (vyto/geom/path.vt) and hand it to polygon()/line_w — the
+    // lean tier gets straight-segment approximations of the curves. The rich
+    // tier overrides these to draw crisp anti-aliased paths.
+    virtual fn fill_path(p: Path, color: int) {
+        let fp = p.flatten();
+        this.polygon(fp.xs, fp.ys, color);
+    }
+    virtual fn stroke_path(p: Path, width: int, color: int) {
+        let fp = p.flatten();
+        for (let i in 1..fp.xs.len) {
+            this.line_w(fp.xs[i - 1] as int, fp.ys[i - 1] as int,
+                        fp.xs[i] as int, fp.ys[i] as int, width, color);
+        }
+    }
+
+    // Decoded-image loading is a rich-tier-only capability (needs blend2d);
+    // the base/lean tier can never decode a file, so it returns null rather
+    // than pretending. Widgets that call this must handle a null handle.
+    virtual fn load_image(path: string): rawptr {
+        return null;
+    }
+    // Base fallback: a flat neutral placeholder — visibly "there's an image
+    // here" rather than a blank hole, matching every other WS2 primitive's
+    // graceful-degrade contract. No Theme is available at this layer, so the
+    // color is a fixed neutral gray, not theme-derived.
+    virtual fn draw_image(handle: rawptr, r: Rect) {
+        this.fill(r, rgb(200, 200, 200));
+    }
+    // Release a handle from load_image. Widgets that hold an image call this
+    // from their own `deinit` via `this.win.painter.free_image(...)` — never
+    // straight to vyto/gfx, so display.vt keeps the "vyto/ui doesn't depend
+    // on blend2d" boundary painter.vt exists to enforce. Base: no-op (the
+    // base/lean tier's load_image never returns a real handle to free).
+    virtual fn free_image(handle: rawptr) { }
+
+    // URL-based loading is a rich-tier-only capability (needs vyto/net +
+    // blend2d); the base/lean tier has no network client, so it returns null
+    // — same graceful-degrade contract as load_image. Widgets must handle a
+    // null handle exactly as they already do for load_image's failures.
+    virtual fn load_image_url(url: string): rawptr {
+        return null;
+    }
+}
+
+// Default painter: forwards every call to a vyto/surface Surface. Clipping
+// is real on this tier too now (an X11 GC clip / Win32 region), so
+// clip_push/clip_pop crop pixels — the rounded radius degrades to a
+// rectangular scissor, same as the shim documents.
+export class SurfacePainter extends Painter {
+    surf: Surface;
+    clips: Rect[]; // clip stack; the top (intersected) rect is active
+
+    fn init(surf: Surface) {
+        this.surf = surf;
+        this.clips = [];
+    }
+
+    override fn can_clip(): bool { return true; }
+
+    override fn clip_push(r: Rect, radius: int) {
+        let top = r;
+        if (this.clips.len > 0) {
+            // intersect with the current clip so nesting only shrinks
+            let c = this.clips[this.clips.len - 1];
+            let x0 = r.x;
+            if (x0 < c.x) { x0 = c.x; }
+            let y0 = r.y;
+            if (y0 < c.y) { y0 = c.y; }
+            let x1 = r.x + r.w;
+            if (x1 > c.x + c.w) { x1 = c.x + c.w; }
+            let y1 = r.y + r.h;
+            if (y1 > c.y + c.h) { y1 = c.y + c.h; }
+            if (x1 < x0) { x1 = x0; }
+            if (y1 < y0) { y1 = y0; }
+            top = Rect(x0, y0, x1 - x0, y1 - y0);
+        }
+        this.clips.push(top);
+        this.surf.clip_set(top);
+    }
+
+    override fn clip_pop() {
+        if (this.clips.len == 0) { return; }
+        this.clips.pop();
+        if (this.clips.len > 0) {
+            this.surf.clip_set(this.clips[this.clips.len - 1]);
+        } else {
+            this.surf.clip_clear();
+        }
+    }
+    override fn fill(r: Rect, color: int) { this.surf.fill(r, color); }
+    override fn frame(r: Rect, color: int) { this.surf.frame(r, color); }
+    override fn line(x0: int, y0: int, x1: int, y1: int, color: int) {
+        this.surf.line(x0, y0, x1, y1, color);
+    }
+    override fn text(x: int, y: int, s: string, color: int) { this.surf.text(x, y, s, color); }
+    override fn text_in(r: Rect, pad: int, s: string, color: int) {
+        this.surf.text_in(r, pad, s, color);
+    }
+    override fn text_width(s: string): int { return this.surf.text_width(s); }
+    override fn font_ascent(): int { return this.surf.font_ascent(); }
+    override fn font_height(): int { return this.surf.font_height(); }
+    override fn width(): int { return this.surf.width(); }
+    override fn height(): int { return this.surf.height(); }
+    override fn present() { this.surf.present(); }
+    override fn present_rect(r: Rect) { this.surf.present_rect(r); }
+}
+
+// ------------------------------------------------------------------ Chrome
+//
+// Pluggable widget *shape*. Every widget's draw() delegates its shape
+// painting (background, border, shadow, gradient — never layout, focus,
+// keyboard, or event logic) to one of these six families via `this.win.skin`.
+// A skin subclasses only the families it needs to reskin; the rest inherit
+// this default look (today's exact rendering, moved here verbatim).
+//
+// Lives in core.vt, not a separate module: Window needs the Skin type for
+// its `skin` field, and Skin needs Painter/Theme/Rect from this file — a
+// two-module cycle compiles at the Vyto language level but fails C codegen
+// (forward-declaration ordering across generated headers), so the type has
+// to live where Window does. Same-file forward references (Skin used before
+// fully defined, Chrome classes referencing Skin) are fine — this file
+// already has that shape (e.g. RadioButton/RadioGroup below).
+//
+// Some paint methods take a trailing `skin: Skin` even though they only use
+// `skin.focus`: several widgets interleave their focus ring between other
+// paint calls rather than drawing it last (e.g. TextField's ring sits
+// between its fill and border stroke), so the ring has to be paintable from
+// inside the Chrome method to preserve that ordering, not bolted on
+// afterward by the widget.
+
+export class ButtonChrome {
+    virtual fn paint(s: Painter, th: Theme, r: Rect, label: string,
+                     hovered: bool, pressed: bool, focused: bool, skin: Skin) {
+        let radius = th.radius_md;
+        s.shadow(r, radius, th.elevation1_blur, th.elevation1_dy, th.shadow_color);
+        let top = th.primary;
+        if (hovered) { top = th.primary_hover; }
+        if (pressed) { top = th.primary_press; }
+        s.gradient_v(r, radius, top, th.primary_700);
+        if (focused) { skin.focus.paint(s, th, r, radius); }
+        s.set_weight(WEIGHT_BOLD);
+        let tw = s.text_width(label);
+        let pad = (r.w - tw) / 2;
+        s.text_in(r, pad, label, th.on_primary);
+        s.set_weight(WEIGHT_REG);
+    }
+}
+
+// Bordered/rounded input-box shape shared by TextField, TextArea, Dropdown
+// (closed state), and Stepper. `hovered` should be passed as `false` by
+// callers that don't have their own hover concept (TextArea, Stepper) to
+// reproduce their current unconditional look exactly.
+export class FieldChrome {
+    virtual fn radius(th: Theme): int { return th.radius_md; }
+
+    virtual fn paint_box(s: Painter, th: Theme, r: Rect, focused: bool, hovered: bool, skin: Skin) {
+        let radius = this.radius(th);
+        let bg = th.surface_raised;
+        if (hovered && !focused) { bg = mix(th.surface_raised, th.on_surface, 0.04); }
+        s.fill_round(r, radius, bg);
+        let border = th.border;
+        if (focused) {
+            border = th.primary;
+        } else if (hovered) {
+            border = mix(th.border, th.on_surface, 0.20);
+        }
+        s.stroke_round(r, radius, 1, border);
+        if (focused) { skin.focus.paint(s, th, r, radius); }
+    }
+}
+
+// Checkbox/RadioButton/Switch — bundled as one family since real skins
+// always restyle these three together as a set.
+export class ToggleChrome {
+    virtual fn paint_checkbox(s: Painter, th: Theme, r: Rect, checked: bool,
+                              hovered: bool, focused: bool, skin: Skin) {
+        let radius = th.radius_sm;
+        let bg = th.surface_raised;
+        if (checked) { bg = th.primary; }
+        else if (hovered) { bg = mix(th.surface_raised, th.on_surface, 0.05); }
+        s.fill_round(r, radius, bg);
+        let border = th.border;
+        if (checked) { border = th.primary; }
+        else if (hovered) { border = mix(th.border, th.on_surface, 0.20); }
+        s.stroke_round(r, radius, 1, border);
+        if (checked) {
+            // filled check mark (a small rounded inner square approximating a tick)
+            s.fill_round(Rect(r.x + 4, r.y + 4, r.w - 8, r.h - 8), radius, th.on_primary);
+        }
+        if (focused) { skin.focus.paint(s, th, r, radius); }
+    }
+
+    virtual fn paint_radio(s: Painter, th: Theme, r: Rect, selected: bool,
+                           hovered: bool, focused: bool, skin: Skin) {
+        let cx = r.x + r.w / 2;
+        let cy = r.y + r.h / 2;
+        let radius = r.w / 2;
+        let ring_col = th.border;
+        if (selected) { ring_col = th.primary; }
+        else if (hovered) { ring_col = mix(th.border, th.on_surface, 0.20); }
+        s.stroke_circle(cx, cy, radius - 1, 2, ring_col);
+        if (selected) { s.circle(cx, cy, 4, th.primary); }
+        if (focused) { skin.focus.paint(s, th, r, radius); }
+    }
+
+    virtual fn paint_switch(s: Painter, th: Theme, r: Rect, on: bool,
+                            hovered: bool, pressed: bool, focused: bool, skin: Skin) {
+        let radius = r.h / 2;   // a true pill
+        let track = th.neutral_300;
+        if (on) { track = th.primary; }
+        else if (hovered) { track = mix(th.neutral_300, th.on_surface, 0.18); }
+        if (on && pressed) { track = th.primary_press; }
+        s.fill_round(r, radius, track);
+        let kw = r.h - 4;
+        let kx = r.x + 2 + kw / 2;
+        if (on) { kx = r.x + r.w - 2 - kw / 2; }
+        let ky = r.y + r.h / 2;
+        s.circle(kx, ky, kw / 2, th.surface_raised);
+        s.stroke_circle(kx, ky, kw / 2, 1, th.border);
+        if (focused) { skin.focus.paint(s, th, r, radius); }
+    }
+}
+
+// Elevated rounded surface shared by every floating/modal panel: Card,
+// Dialog and its titled-modal siblings (MessageDialog/ConfirmDialog/
+// InputDialog), MenuPopup, DropdownPopup, Popover. Absorbs and extends the
+// old `paint_panel` free function (shadow+fill only) with the border stroke
+// every one of those call sites already added by hand.
+export class PanelChrome {
+    virtual fn paint(s: Painter, th: Theme, r: Rect, radius: int, fill: int, border: int, elevation: int) {
+        if (elevation > 0) {
+            let blur = th.elevation1_blur;
+            let dy = th.elevation1_dy;
+            if (elevation >= 2) { blur = th.elevation2_blur; dy = th.elevation2_dy; }
+            if (elevation >= 3) { blur = th.elevation3_blur; dy = th.elevation3_dy; }
+            s.shadow(r, radius, blur, dy, th.shadow_color);
+        }
+        s.fill_round(r, radius, fill);
+        s.stroke_round(r, radius, 1, border);
+    }
+
+    // Panel + a title bar (bold text, left-padded) + a hairline divider under
+    // it. Returns the title-bar height so a caller that needs to lay out
+    // content below it can. Confirmed byte-identical across Dialog/
+    // MessageDialog/ConfirmDialog/InputDialog before this consolidation.
+    virtual fn paint_titled(s: Painter, th: Theme, r: Rect, radius: int, fill: int, border: int,
+                            elevation: int, title: string): int {
+        this.paint(s, th, r, radius, fill, border, elevation);
+        let tb_h = s.font_height() + 10;
+        let tb = Rect(r.x, r.y, r.w, tb_h);
+        s.set_weight(WEIGHT_BOLD);
+        s.text_in(tb, 12, title, th.on_surface);
+        s.set_weight(WEIGHT_REG);
+        s.line(r.x + 12, r.y + tb_h, r.x + r.w - 12, r.y + tb_h, th.divider);
+        return tb_h;
+    }
+}
+
+// Linear value/fill indicator shared by ProgressBar and SegmentedControl's
+// selected-segment paint.
+export class TrackChrome {
+    virtual fn paint_track(s: Painter, th: Theme, r: Rect, radius: int, bg: int) {
+        s.fill_round(r, radius, bg);
+    }
+    virtual fn paint_fill(s: Painter, th: Theme, r: Rect, radius: int, top: int, bottom: int) {
+        s.gradient_v(r, radius, top, bottom);
+    }
+}
+
+// Focus indication — its own family since skins vary this independently of
+// everything else (XP's dotted rect, GTK's dashed outline, macOS's halo).
+export class FocusChrome {
+    virtual fn paint(s: Painter, th: Theme, r: Rect, radius: int) {
+        paint_focus_ring(s, th, r, radius);
+    }
+}
+
+// The bag every Window carries. Defaults to today's exact look — landing
+// this architecture is a pure refactor, zero visual change, by construction.
+export class Skin {
+    button: ButtonChrome;
+    field: FieldChrome;
+    toggle: ToggleChrome;
+    panel: PanelChrome;
+    track: TrackChrome;
+    focus: FocusChrome;
+
+    fn init() {
+        this.button = new ButtonChrome();
+        this.field  = new FieldChrome();
+        this.toggle = new ToggleChrome();
+        this.panel  = new PanelChrome();
+        this.track  = new TrackChrome();
+        this.focus  = new FocusChrome();
+    }
+}
+
+// true when two rects share any area (touching edges don't count)
+fn rect_overlaps(a: Rect, b: Rect): bool {
+    if (a.x + a.w <= b.x) { return false; }
+    if (b.x + b.w <= a.x) { return false; }
+    if (a.y + a.h <= b.y) { return false; }
+    if (b.y + b.h <= a.y) { return false; }
+    return true;
+}
+
+// ---------------------------------------------------------------- Widget
+
+export class Widget {
+    bounds: Rect;
+    parent: weak Widget;
+    children: Widget[];
+    focusable: bool;
+    focused: bool;
+    hovered: bool;     // WS6: cursor is over this widget
+    pressed: bool;     // WS6: a button is held down over this widget
+    grow: int;          // flex factor inside Column/Row; 0 = natural size
+    alignSelf: int;     // cross-axis override inside Column/Row; -1 = inherit
+    modal: bool;        // overlay traps events; outside clicks don't dismiss
+    win: weak Window;   // set on overlays/menubar so they can drive the Window
+    // Animations declared via this.animate(...) before the widget is attached
+    // to a Window (e.g. in init) are stashed here and flushed into the Window's
+    // clock by propagate_win once `win` is known. Null until first used.
+    pending_anims: Tween[];
+
+    fn init() {
+        this.children = [];
+        this.alignSelf = -1;
+    }
+
+    builder fn add(child: Widget) {
+        child.parent = this;
+        this.children.push(child);
+        return this;
+    }
+
+    // Fluent configuration setters. Declared on Widget so every widget and
+    // container returns its own concrete type from a chain.
+    builder fn flex(n: int) { this.grow = n; return this; }
+
+    // Override the parent Column/Row's cross-axis alignment for just this child
+    // (CSS align-self). Pass a CROSS_* constant from vyto/ui/layout; -1 resets
+    // to inherit the container's `align`.
+    builder fn selfAlign(n: int) { this.alignSelf = n; return this; }
+
+    // Request a full-window repaint of just this widget's bounds. Relies on
+    // Window.layout() having propagated `win` to the whole tree.
+    fn invalidate() {
+        if (this.win != null) { this.win.mark_dirty(this.bounds); }
+    }
+
+    // The active modifier chord (MOD_* bits) at the current event. Window
+    // refreshes Window.mods each loop pass before dispatch, so a handler
+    // (on_click/on_key/on_drag/...) reads the live state through here.
+    fn mods(): int {
+        if (this.win != null) { return this.win.mods; }
+        return 0;
+    }
+
+    // --------------------------------------------------------- self-animation
+    // Register a Tween with the frame clock. If the widget is already mounted
+    // (win set) it goes straight onto the Window's animation list; otherwise it
+    // is stashed and flushed by propagate_win when the widget is attached.
+    fn register_anim(tw: Tween) {
+        if (this.win != null) {
+            this.win.add_animation(tw);
+        } else {
+            if (this.pending_anims == null) { this.pending_anims = []; }
+            this.pending_anims.push(tw);
+        }
+    }
+
+    // Declarative self-animation: run `apply(ease(t))` every frame for dur_ms
+    // (ping-ponging forever when loop). `ease_id` is an EASE_* selector. The
+    // widget never touches the Window's animation list — this auto-registers and
+    // returns the Tween so the caller can cancel() it. track_bounds is set so
+    // only this widget's rect repaints; the closure refreshes the tween bounds
+    // each tick in case the widget was relaid out. See animate_value for the
+    // common from->to case.
+    fn animate(dur_ms: int, loop: bool, ease_id: int, apply: fn(float)): Tween {
+        let tw = new Tween(dur_ms, loop);
+        tw.track_bounds = true;
+        tw.bounds = this.bounds;
+        let w = this;
+        tw.on_tick = (t) => {
+            apply(ease_apply(ease_id, t));
+            tw.bounds = w.bounds;
+        };
+        this.register_anim(tw);
+        return tw;
+    }
+
+    // Ergonomic wrapper over animate(): tween a value from v0 to v1, handing the
+    // eased interpolated value to `apply` each frame. The primary "animate this
+    // property from A to B" call.
+    fn animate_value(v0: float, v1: float, dur_ms: int, loop: bool,
+                     ease_id: int, apply: fn(float)): Tween {
+        return this.animate(dur_ms, loop, ease_id, (e) => {
+            apply(v0 + (v1 - v0) * e);
+        });
+    }
+
+    // natural size, bottom-up
+    virtual fn measure(s: Painter, th: Theme): Size {
+        return Size(this.bounds.w, this.bounds.h);
+    }
+
+    // size within constraints, bottom-up. The default clamps the natural size
+    // (measure) into the box, so existing widgets get constraint behavior for
+    // free; constraint-driven containers (Center, Padding, …) override this to
+    // pass derived constraints to their children.
+    virtual fn layout(s: Painter, th: Theme, bc: BoxConstraints): Size {
+        return bc.constrain(this.measure(s, th));
+    }
+
+    // assign absolute bounds, top-down. The base class keeps children at
+    // their manually set bounds — the absolute-placement escape hatch.
+    virtual fn arrange(s: Painter, th: Theme, r: Rect) {
+        this.bounds = r;
+        for (let c in this.children) {
+            c.arrange(s, th, c.bounds);
+        }
+    }
+
+    // overlays (popups, dialogs) self-position against the whole surface;
+    // normal widgets are placed by their parent's arrange() instead.
+    virtual fn place(s: Painter, th: Theme) { }
+
+    virtual fn draw(s: Painter, th: Theme) {
+        for (let c in this.children) {
+            c.draw(s, th);
+        }
+    }
+
+    // A container's own painting (background, borders) — separate from its
+    // children so a partial repaint can redraw the container chrome without
+    // wholesale-redrawing every child. Leaf widgets paint in draw() instead.
+    virtual fn draw_chrome(s: Painter, th: Theme) { }
+
+    // Partial-repaint walk: draw only the widgets that intersect the dirty
+    // rect `d`, pruning whole subtrees that fall outside it. A leaf paints
+    // itself; a container paints its chrome and recurses per child (each child
+    // re-tests against d). The persistent back buffer keeps everything outside
+    // d from the previous frame, so only the changed region is repainted.
+    virtual fn draw_within(s: Painter, th: Theme, d: Rect) {
+        if (!rect_overlaps(this.bounds, d)) { return; }
+        if (this.children.len == 0) {
+            this.draw(s, th);
+        } else {
+            this.draw_chrome(s, th);
+            for (let c in this.children) {
+                c.draw_within(s, th, d);
+            }
+        }
+    }
+
+    // absolute coordinates; return true when state changed (needs redraw)
+    virtual fn on_click(x: int, y: int): bool {
+        return false;
+    }
+
+    // Fired on every mouse move while this widget holds the press capture
+    // (Window.press_w), with the delta since the last move/press. dx/dy are
+    // in the same coordinate space as on_click. Return true when consumed /
+    // state changed (needs redraw). Bracketed by on_drag_start / on_drag_end;
+    // Slider is the first consumer.
+    virtual fn on_drag(dx: int, dy: int): bool {
+        return false;
+    }
+
+    // Fired once when a press begins moving past the drag slop, before the
+    // first on_drag. x/y are absolute. The companion on_drag_end fires on
+    // release after a drag. Return true when consumed / state changed.
+    virtual fn on_drag_start(x: int, y: int): bool {
+        return false;
+    }
+    virtual fn on_drag_end(x: int, y: int): bool {
+        return false;
+    }
+
+    // Right-button press at absolute coordinates. Return true when consumed
+    // / state changed (needs redraw). No built-in widget uses this yet —
+    // it's the hook a future context-menu widget dispatches from.
+    virtual fn on_context(x: int, y: int): bool {
+        return false;
+    }
+
+    // return true when consumed / state changed
+    virtual fn on_key(k: int, ch: string): bool {
+        return false;
+    }
+
+    // mouse wheel scrolled while the cursor is over this widget; delta is
+    // positive for down, negative for up. Return true when consumed.
+    virtual fn on_scroll(delta: int): bool {
+        return false;
+    }
+
+    // Left button released over this widget (it held the press capture and the
+    // cursor is still inside its bounds) — the click-completion companion to
+    // on_click (which still fires on press-down). Absolute coords.
+    virtual fn on_release(x: int, y: int): bool {
+        return false;
+    }
+
+    // A key was released while this widget holds focus (wires EV_KEY_UP, which
+    // the loop otherwise drops). `k` is the KEY_* / ASCII code; no text.
+    virtual fn on_key_up(k: int): bool {
+        return false;
+    }
+
+    // Second click on this same widget within Window.DOUBLE_CLICK_MS and inside
+    // the drag slop. on_click still fires for each individual press.
+    virtual fn on_double_click(x: int, y: int): bool {
+        return false;
+    }
+
+    // Press held on this widget past Window.LONG_PRESS_MS without moving past
+    // the drag slop. Fires once per press.
+    virtual fn on_long_press(x: int, y: int): bool {
+        return false;
+    }
+
+    // Cursor entered / left this widget's bounds — the callback companions to
+    // the passively-maintained `hovered` flag. Return true when consumed /
+    // state changed (needs redraw).
+    virtual fn on_hover_enter(): bool {
+        return false;
+    }
+    virtual fn on_hover_leave(): bool {
+        return false;
+    }
+
+    // This widget gained / lost keyboard focus — callback companions to the
+    // `focused` flag. Return true when consumed / state changed.
+    virtual fn on_focus(): bool {
+        return false;
+    }
+    virtual fn on_blur(): bool {
+        return false;
+    }
+
+    // Walk from this widget up the parent chain calling on_scroll until one
+    // consumes it. Used by Window.on_wheel_ev.
+    fn on_scroll_at(x: int, y: int, delta: int): bool {
+        let w: Widget = this;
+        while (w != null) {
+            if (w.on_scroll(delta)) { return true; }
+            w = w.parent;
+        }
+        return false;
+    }
+
+    // subclasses null their own closure fields here (leaf hook only —
+    // release_all() does the tree walk; overrides never recurse)
+    virtual fn drop_handlers() { }
+
+    fn release_all() {
+        this.drop_handlers();
+        for (let c in this.children) {
+            c.release_all();
+        }
+    }
+
+    // set the Window weak-ref on this widget and all descendants so widgets
+    // like Dropdown can reach the Window to open overlays.
+    fn propagate_win(w: weak Window) {
+        this.win = w;
+        // Flush animations declared before this widget was mounted onto the
+        // now-known Window clock (see animate()/register_anim()).
+        if (this.pending_anims != null && w != null) {
+            for (let t in this.pending_anims) {
+                w.add_animation(t);
+            }
+            this.pending_anims = [];
+        }
+        for (let c in this.children) {
+            c.propagate_win(w);
+        }
+    }
+
+    // deepest widget under the point; later siblings win (drawn on top)
+    virtual fn hit(px: int, py: int): Widget {
+        let n = this.children.len;
+        for (let i in 0..n) {
+            let c = this.children[n - 1 - i];
+            let found = c.hit(px, py);
+            if (found != null) { return found; }
+        }
+        if (contains(this.bounds, px, py)) { return this; }
+        return null;
+    }
+
+    virtual fn collect_focus(out: Widget[]) {
+        if (this.focusable) { out.push(this); }
+        for (let c in this.children) {
+            c.collect_focus(out);
+        }
+    }
+}
+
+// ---------------------------------------------------------------- Window
+
+// Gesture thresholds (ms / px). A second press within DOUBLE_CLICK_MS on the
+// same widget is a double-click; a press held LONG_PRESS_MS without moving past
+// DRAG_SLOP is a long-press; a press moving past DRAG_SLOP begins a drag.
+export const DOUBLE_CLICK_MS: int = 400;
+export const LONG_PRESS_MS: int = 500;
+export const DRAG_SLOP: int = 4;
+
+export class Window {
+    surf: Surface;
+    painter: Painter;   // widgets draw through this; default = SurfacePainter
+    root: Widget;
+    menubar: Widget;    // optional MenuBar; drawn in a top strip above root
+    overlay: Widget;    // optional; popup or modal dialog on top of everything
+    toasts: Widget[];   // transient top-most notifications; coexist with overlay,
+                        // never capture input like a modal, self-dismiss on a tween
+    theme: Theme;
+    focusables: Widget[];
+    focus_i: int;
+    running: bool;
+    close_on_esc: bool;
+    dirty: Rect;        // accumulated repaint region (valid when has_dirty)
+    has_dirty: bool;
+    hover_w: Widget;     // WS6: widget currently under the cursor (draws hover state)
+    press_w: Widget;    // WS6: widget capturing the current mouse press
+    skin: Skin;          // pluggable widget shape; defaults to today's look
+    drag_x: int;         // WS9a: last mouse position while press_w holds capture
+    drag_y: int;
+    // Gesture tracking. press_ms/press_x/press_y anchor the current press for
+    // long-press + drag-slop; dragging is set once the press moves past the
+    // slop; long_press_fired guards a one-shot. last_click_* remember the prior
+    // click for double-click detection.
+    press_ms: int;
+    press_x: int;
+    press_y: int;
+    dragging: bool;
+    long_press_fired: bool;
+    last_click_ms: int;
+    last_click_x: int;
+    last_click_y: int;
+    last_click_w: weak Widget;
+    animations: Tween[]; // WS9c: active Tweens; run() ticks the wait clock only while non-empty
+    mods: int;           // MOD_* bitmask at the event being dispatched — widgets
+                         // read it via Widget.mods() in on_key/on_click/on_drag
+    scale: float;        // UI scale factor (1.0 = 96dpi); themes are scaled by
+                         // it at run(); pass it to GfxPainter font sizes too
+
+    fn init(title: string, w: int, h: int) {
+        this.surf = new Surface(title, w, h);
+        this.painter = new SurfacePainter(this.surf);
+        this.theme = new Theme();
+        this.skin = new Skin();
+        this.animations = [];
+        this.toasts = [];
+        this.focusables = [];
+        this.focus_i = -1;
+        this.close_on_esc = true;
+        this.scale = this.surf.scale();
+    }
+
+    // Register a Tween to be advanced on the ~60fps clock; call from a
+    // widget's own draw() the first time it needs animating (this.win is
+    // guaranteed non-null there, unlike at construction time).
+    fn add_animation(t: Tween) {
+        this.animations.push(t);
+    }
+
+    // Advance every active Tween by dt_ms and drop completed/cancelled ones.
+    // Tweens that track their widget's bounds trigger a dirty-region repaint;
+    // any untracked ticking Tween falls back to one full redraw.
+    fn tick(dt_ms: int) {
+        let alive: Tween[] = [];
+        let full = false;
+        let partial = false;
+        for (let t in this.animations) {
+            if (t.advance(dt_ms)) {
+                if (t.track_bounds) {
+                    this.mark_dirty(t.bounds);
+                    partial = true;
+                } else {
+                    full = true;
+                }
+            }
+            if (!t.done) { alive.push(t); }
+        }
+        this.animations = alive;
+        if (full) {
+            this.has_dirty = false; // the full redraw covers everything
+            this.redraw();
+        } else if (partial) {
+            this.repaint();
+        }
+    }
+
+    // escape hatch: the raw surface underneath
+    fn surface(): Surface { return this.surf; }
+
+    // opt into a custom painter (e.g. vyto/gfx GfxPainter for AA rendering).
+    // Call before run(); the painter draws and presents each frame.
+    fn use_painter(p: Painter) { this.painter = p; }
+
+    fn close() { this.running = false; }
+
+    fn open_overlay(o: Widget) {
+        o.propagate_win(this);
+        this.overlay = o;
+        this.layout();
+    }
+
+    fn dismiss_overlay() {
+        this.overlay = null;
+        this.layout();
+    }
+
+    // Transient notifications (Toast/Snackbar). They live in a separate top-most
+    // layer from `overlay`, so a toast can appear over a dialog and never blocks
+    // input. A toast self-dismisses by calling remove_toast(this) from its own
+    // fade tween. propagate_win flushes the toast's pending fade animation into
+    // the clock (which keeps run() ticking until it settles).
+    fn show_toast(t: Widget) {
+        t.propagate_win(this);
+        this.toasts.push(t);
+        this.layout();
+        this.redraw();
+    }
+
+    fn remove_toast(t: Widget) {
+        let keep: Widget[] = [];
+        for (let x in this.toasts) {
+            if (x != t) { keep.push(x); }
+        }
+        this.toasts = keep;
+        t.release_all();
+        this.layout();
+        this.redraw();
+    }
+
+    fn focused_widget(): Widget {
+        if (this.focus_i < 0 || this.focus_i >= this.focusables.len) { return null; }
+        return this.focusables[this.focus_i];
+    }
+
+    fn set_focus(i: int) {
+        // re-focusing the current widget is a no-op (don't fire blur/focus).
+        if (i == this.focus_i) { return; }
+        let old = this.focused_widget();
+        if (old != null) { old.focused = false; old.on_blur(); }
+        this.focus_i = i;
+        let now = this.focused_widget();
+        if (now != null) { now.focused = true; now.on_focus(); }
+    }
+
+    fn focus_next() {
+        let n = this.focusables.len;
+        if (n == 0) { return; }
+        let i = this.focus_i + 1;
+        if (i >= n) { i = 0; }
+        this.set_focus(i);
+    }
+
+    fn focus_prev() {
+        let n = this.focusables.len;
+        if (n == 0) { return; }
+        let i = this.focus_i - 1;
+        if (i < 0) { i = n - 1; }
+        this.set_focus(i);
+    }
+
+    fn focus_widget(w: Widget) {
+        for (let i in 0..this.focusables.len) {
+            if (this.focusables[i] == w) {
+                this.set_focus(i);
+                return;
+            }
+        }
+    }
+
+    fn layout() {
+        let w = this.surf.width();
+        let h = this.surf.height();
+        let top = 0;
+        if (this.menubar != null) {
+            let sh = this.painter.font_height() + 8;
+            this.menubar.win = this;
+            this.menubar.arrange(this.painter, this.theme, Rect(0, 0, w, sh));
+            top = sh;
+        }
+        if (this.root != null) {
+            this.root.measure(this.painter, this.theme);
+            this.root.arrange(this.painter, this.theme, Rect(0, top, w, h - top));
+            this.root.propagate_win(this);
+        }
+        if (this.overlay != null) {
+            this.overlay.place(this.painter, this.theme);
+        }
+        // toasts self-position (bottom-stacked); place() reads this.toasts order
+        for (let t in this.toasts) {
+            t.win = this;
+            t.place(this.painter, this.theme);
+        }
+        // focus ring covers the root tree; overlays manage their own focus
+        let old = this.focused_widget();
+        let fresh: Widget[] = [];
+        if (this.root != null) { this.root.collect_focus(fresh); }
+        this.focusables = fresh;
+        this.focus_i = -1;
+        if (old != null) {
+            for (let i in 0..fresh.len) {
+                if (fresh[i] == old) { this.focus_i = i; }
+            }
+            if (this.focus_i < 0) { old.focused = false; }
+        }
+        if (this.focus_i < 0 && fresh.len > 0) {
+            this.set_focus(0);
+        }
+    }
+
+    fn redraw() {
+        this.painter.fill(Rect(0, 0, this.surf.width(), this.surf.height()), this.theme.bg);
+        if (this.root != null) {
+            this.root.draw(this.painter, this.theme);
+        }
+        if (this.menubar != null) {
+            this.menubar.draw(this.painter, this.theme);
+        }
+        if (this.overlay != null) {
+            this.overlay.draw(this.painter, this.theme);
+        }
+        for (let t in this.toasts) {
+            t.draw(this.painter, this.theme);
+        }
+        this.painter.present();
+    }
+
+    // Union a rect into the pending dirty region for the next repaint().
+    fn mark_dirty(r: Rect) {
+        if (!this.has_dirty) {
+            this.dirty = r;
+            this.has_dirty = true;
+            return;
+        }
+        this.dirty = this.dirty.union(r);
+    }
+
+    // Repaint only the accumulated dirty region: clear its background, redraw
+    // the widgets that intersect it, and present. Everything outside survives
+    // in the back buffer from the last full frame. Falls back to nothing if no
+    // region is dirty. Structural changes (resize, overlays, menus) still use
+    // the full redraw() path.
+    // How far widget chrome paints OUTSIDE widget bounds: elevation shadows
+    // (blur growth + vertical offset) and the focus ring (2px outside + 2px
+    // stroke). The dirty region is inflated by this so repainting a widget
+    // also clears and redraws its overhanging chrome.
+    fn chrome_overhang(): int {
+        let o = this.theme.elevation3_blur + this.theme.elevation3_dy;
+        if (o < 6) { o = 6; }
+        return o + 2;
+    }
+
+    fn repaint() {
+        if (!this.has_dirty) { return; }
+        let w = this.surf.width();
+        let h = this.surf.height();
+        let ov = this.chrome_overhang();
+        let x0 = this.dirty.x - ov;
+        let y0 = this.dirty.y - ov;
+        let x1 = this.dirty.x + this.dirty.w + ov;
+        let y1 = this.dirty.y + this.dirty.h + ov;
+        if (x0 < 0) { x0 = 0; }
+        if (y0 < 0) { y0 = 0; }
+        if (x1 > w) { x1 = w; }
+        if (y1 > h) { y1 = h; }
+        this.has_dirty = false;
+        if (x1 <= x0 || y1 <= y0) { return; }
+        let d = Rect(x0, y0, x1 - x0, y1 - y0);
+        // Clip to the region on the rich tier so translucent chrome (shadows)
+        // can't re-composite over last frame's pixels outside the cleared
+        // area — that's what made hovered buttons' shadows darken over time.
+        this.painter.clip_push(d, 0);
+        this.painter.fill(d, this.theme.bg);
+        if (this.root != null) {
+            this.root.draw_within(this.painter, this.theme, d);
+        }
+        if (this.menubar != null && rect_overlaps(this.menubar.bounds, d)) {
+            this.menubar.draw(this.painter, this.theme);
+        }
+        if (this.overlay != null && rect_overlaps(this.overlay.bounds, d)) {
+            this.overlay.draw(this.painter, this.theme);
+        }
+        for (let t in this.toasts) {
+            if (rect_overlaps(t.bounds, d)) { t.draw(this.painter, this.theme); }
+        }
+        this.painter.clip_pop();
+        // present only the changed rect — full-window blits per hover/caret
+        // repaint were the single biggest frame cost on the rich tier
+        this.painter.present_rect(d);
+    }
+
+    // Key release (EV_KEY_UP, previously dropped): route to the focused widget
+    // or the open overlay's focus. No text, just the key code.
+    fn on_key_up_ev(k: int) {
+        if (this.overlay != null) {
+            if (this.overlay.on_key_up(k)) { this.redraw(); }
+            return;
+        }
+        let f = this.focused_widget();
+        if (f != null && f.on_key_up(k)) {
+            this.mark_dirty(f.bounds);
+            this.repaint();
+        }
+    }
+
+    fn on_key_ev(k: int, ch: string) {
+        if (this.overlay != null) {
+            if (k == KEY_ESC) {
+                this.dismiss_overlay();
+                this.redraw();
+            } else if (this.overlay.on_key(k, ch)) {
+                this.redraw();
+            }
+            return;
+        }
+        if (k == KEY_TAB) {
+            let old = this.focused_widget();
+            // Shift+Tab walks focus backwards.
+            if ((this.mods & MOD_SHIFT) != 0) { this.focus_prev(); }
+            else { this.focus_next(); }
+            let now = this.focused_widget();
+            // only the two widgets whose focus border changed need repainting
+            if (old != null) { this.mark_dirty(old.bounds); }
+            if (now != null) { this.mark_dirty(now.bounds); }
+            this.repaint();
+        } else if (k == KEY_ESC && this.close_on_esc) {
+            this.running = false;
+        } else {
+            let f = this.focused_widget();
+            if (f != null && f.on_key(k, ch)) {
+                this.mark_dirty(f.bounds);
+                this.repaint();
+            }
+        }
+    }
+
+    fn on_mouse_ev(x: int, y: int) {
+        this.drag_x = x;
+        this.drag_y = y;
+        // toasts sit above everything and get first crack at a click (a Snackbar
+        // action button) — but a miss falls through so they never block input.
+        let n = this.toasts.len;
+        for (let i in 0..n) {
+            let t = this.toasts[n - 1 - i];
+            if (contains(t.bounds, x, y)) {
+                if (t.on_click(x, y)) { this.redraw(); return; }
+            }
+        }
+        if (this.overlay != null) {
+            if (!contains(this.overlay.bounds, x, y) && !this.overlay.modal) {
+                this.dismiss_overlay();
+                this.redraw();
+            } else if (contains(this.overlay.bounds, x, y)) {
+                if (this.overlay.on_click(x, y)) { this.redraw(); }
+            }
+            return;
+        }
+        if (this.menubar != null && contains(this.menubar.bounds, x, y)) {
+            this.set_hover(this.menubar.hit(x, y));
+            this.set_press(this.hover_w);
+            if (this.menubar.on_click(x, y)) { this.redraw(); }
+            return;
+        }
+        let target: Widget = null;
+        if (this.root != null) { target = this.root.hit(x, y); }
+        if (target != null) {
+            this.set_hover(target);
+            this.set_press(target);
+            // anchor the press for long-press + drag-slop tracking
+            this.press_ms = this.surf.now_ms();
+            this.press_x = x;
+            this.press_y = y;
+            this.dragging = false;
+            this.long_press_fired = false;
+            let changed = false;
+            if (target.focusable) {
+                this.focus_widget(target);
+                changed = true;
+            }
+            if (target.on_click(x, y)) { changed = true; }
+            // double-click: a second press on the same widget within the time
+            // window and inside the slop.
+            let now = this.surf.now_ms();
+            if (this.last_click_w == target
+                && now - this.last_click_ms <= DOUBLE_CLICK_MS
+                && abs_i(x - this.last_click_x) <= DRAG_SLOP
+                && abs_i(y - this.last_click_y) <= DRAG_SLOP) {
+                if (target.on_double_click(x, y)) { changed = true; }
+                this.last_click_w = null; // consume — a triple click isn't two doubles
+            } else {
+                this.last_click_w = target;
+                this.last_click_ms = now;
+                this.last_click_x = x;
+                this.last_click_y = y;
+            }
+            if (changed) {
+                // A click handler may change state visible elsewhere in the
+                // tree (Label text, StatusBar, ProgressBar …), so do a full
+                // redraw — the dirty-region optimization only covers the
+                // clicked widget itself.
+                this.redraw();
+            }
+        }
+    }
+
+    // WS9b: right-button press. Hit-tests the same tree as on_mouse_ev but
+    // dispatches on_context instead of on_click, and doesn't touch focus or
+    // press capture — a right-click opening a context menu shouldn't steal
+    // either from whatever the left button is doing.
+    fn on_context_ev(x: int, y: int) {
+        if (this.overlay != null) {
+            if (contains(this.overlay.bounds, x, y)) {
+                if (this.overlay.on_context(x, y)) { this.redraw(); }
+            }
+            return;
+        }
+        if (this.menubar != null && contains(this.menubar.bounds, x, y)) {
+            if (this.menubar.on_context(x, y)) { this.redraw(); }
+            return;
+        }
+        let target: Widget = null;
+        if (this.root != null) { target = this.root.hit(x, y); }
+        if (target != null) {
+            if (target.on_context(x, y)) { this.redraw(); }
+        }
+    }
+
+    // hover source: track the deepest widget under the moving cursor. When it
+    // changes, the previous and new widgets are dirtied so they repaint with/
+    // without the hover overlay. The lean tier has no alpha so the overlay is
+    // a no-op there, but hover state is still tracked for any widget that
+    // branches on it. Empty areas clear hover.
+    //
+    // WS9a: also the drag source — while press_w holds the capture, forward
+    // the delta since the last move/press to it via on_drag.
+    fn on_mouse_move(x: int, y: int) {
+        if (this.press_w != null) {
+            let dx = x - this.drag_x;
+            let dy = y - this.drag_y;
+            this.drag_x = x;
+            this.drag_y = y;
+            // once the press moves past the slop, begin a drag (fires
+            // on_drag_start once) — this also cancels a pending long-press.
+            if (!this.dragging
+                && (abs_i(x - this.press_x) > DRAG_SLOP
+                    || abs_i(y - this.press_y) > DRAG_SLOP)) {
+                this.dragging = true;
+                if (this.press_w.on_drag_start(x, y)) { this.redraw(); }
+            }
+            if (this.press_w.on_drag(dx, dy)) { this.redraw(); }
+        }
+        let target: Widget = null;
+        if (this.overlay != null) {
+            if (contains(this.overlay.bounds, x, y)) {
+                target = this.overlay.hit(x, y);
+            } else if (!this.overlay.modal) {
+                target = null;
+            }
+            this.set_hover(target);
+            return;
+        }
+        if (this.menubar != null && contains(this.menubar.bounds, x, y)) {
+            this.set_hover(this.menubar.hit(x, y));
+            return;
+        }
+        if (this.root != null) { target = this.root.hit(x, y); }
+        this.set_hover(target);
+    }
+
+    fn on_mouse_up(x: int, y: int) {
+        // release the press capture; repaint the affected widget so it drops
+        // its pressed overlay.
+        let pw = this.press_w;
+        let was_dragging = this.dragging;
+        this.press_w = null;
+        this.dragging = false;
+        this.long_press_fired = false;
+        if (pw != null) {
+            pw.pressed = false;
+            let changed = false;
+            if (was_dragging) {
+                // a drag just ended
+                if (pw.on_drag_end(x, y)) { changed = true; }
+            } else if (contains(pw.bounds, x, y)) {
+                // click-completion: released inside the pressed widget
+                if (pw.on_release(x, y)) { changed = true; }
+            }
+            if (changed) { this.redraw(); }
+            else {
+                this.mark_dirty(pw.bounds);
+                this.repaint();
+            }
+        }
+    }
+
+    // Set the current hover widget, dirtying the previous and new one when
+    // they differ so each repaints with/without its hover overlay.
+    fn set_hover(w: Widget) {
+        if (w == this.hover_w) { return; }
+        let old = this.hover_w;
+        this.hover_w = w;
+        if (old != null) {
+            old.hovered = false;
+            old.on_hover_leave();
+            this.mark_dirty(old.bounds);
+        }
+        if (w != null) {
+            w.hovered = true;
+            w.on_hover_enter();
+            this.mark_dirty(w.bounds);
+        }
+        this.repaint();
+    }
+
+    fn set_press(w: Widget) {
+        if (this.press_w != null) { this.press_w.pressed = false; }
+        this.press_w = w;
+        if (w != null) { w.pressed = true; }
+    }
+
+    // Mouse wheel: walk from the deepest widget under the cursor up the
+    // parent chain until a widget consumes the scroll (e.g. ScrollView),
+    // then repaint just the consumer's bounds — a scroll only changes
+    // pixels inside the scrolling widget.
+    fn on_wheel_ev(x: int, y: int, delta: int) {
+        if (this.overlay != null) {
+            if (contains(this.overlay.bounds, x, y)) {
+                if (this.overlay.on_scroll_at(x, y, delta)) {
+                    this.mark_dirty(this.overlay.bounds);
+                    this.repaint();
+                }
+            }
+            return;
+        }
+        let target: Widget = null;
+        if (this.root != null) { target = this.root.hit(x, y); }
+        let w = target;
+        while (w != null) {
+            if (w.on_scroll(delta)) {
+                this.mark_dirty(w.bounds);
+                this.repaint();
+                return;
+            }
+            w = w.parent;
+        }
+    }
+
+    fn run() {
+        // scale the theme's px metrics for HiDPI (idempotent; also covers a
+        // theme the app swapped in after construction)
+        this.theme.apply_scale(this.scale);
+        this.layout();
+        this.redraw();
+        this.running = true;
+        let last_ms = this.surf.now_ms();
+        while (this.running) {
+            // WS9c: only pay for the timer tick while something is actually
+            // animating — a static app blocks on wait() exactly as before.
+            // While animating, advance by REAL elapsed time on every loop
+            // pass (not a fixed 16ms only on EV_TIMER): input events return
+            // early from wait_timeout, and without this a moving mouse would
+            // starve the timer and freeze every animation; slow frames would
+            // dilate time instead of dropping frames.
+            // A held press (not yet a drag) also needs a timed wake so an
+            // idle long-press fires without further input.
+            let pressing = this.press_w != null && !this.dragging
+                           && !this.long_press_fired;
+            let ev = 0;
+            if (this.animations.len > 0) {
+                ev = this.surf.wait_timeout(16);
+                let now = this.surf.now_ms();
+                let dt = now - last_ms;
+                last_ms = now;
+                if (dt > 100) { dt = 100; } // clamp a stall to one long frame
+                if (dt > 0) { this.tick(dt); }
+            } else if (pressing) {
+                let rem = LONG_PRESS_MS - (this.surf.now_ms() - this.press_ms);
+                if (rem < 1) { rem = 1; }
+                ev = this.surf.wait_timeout(rem);
+                last_ms = this.surf.now_ms();
+            } else {
+                ev = this.surf.wait();
+                last_ms = this.surf.now_ms(); // idle wait: don't bank the gap
+            }
+            this.mods = this.surf.mods();
+            // long-press: press still held, unmoved, past the threshold.
+            if (this.press_w != null && !this.dragging && !this.long_press_fired
+                && this.surf.now_ms() - this.press_ms >= LONG_PRESS_MS) {
+                this.long_press_fired = true;
+                if (this.press_w.on_long_press(this.drag_x, this.drag_y)) {
+                    this.redraw();
+                }
+            }
+            if (ev == EV_TIMER) {
+                // already ticked above; nothing else to dispatch
+            } else if (ev == EV_EXPOSE) {
+                this.redraw();
+            } else if (ev == EV_RESIZE) {
+                this.painter.on_resize(this.surf.width(), this.surf.height());
+                this.layout();
+                this.redraw();
+            } else if (ev == EV_CLOSE) {
+                this.running = false;
+            } else if (ev == EV_KEY) {
+                this.on_key_ev(this.surf.key(), this.surf.text_ev());
+            } else if (ev == EV_KEY_UP) {
+                this.on_key_up_ev(this.surf.key());
+            } else if (ev == EV_MOUSE_DOWN) {
+                this.on_mouse_ev(this.surf.mouse_x(), this.surf.mouse_y());
+            } else if (ev == EV_MOUSE_UP) {
+                this.on_mouse_up(this.surf.mouse_x(), this.surf.mouse_y());
+            } else if (ev == EV_MOUSE_MOVE) {
+                this.on_mouse_move(this.surf.mouse_x(), this.surf.mouse_y());
+            } else if (ev == EV_MOUSE_WHEEL) {
+                this.on_wheel_ev(this.surf.mouse_x(), this.surf.mouse_y(),
+                                 this.surf.wheel());
+            } else if (ev == EV_MOUSE_RDOWN) {
+                this.on_context_ev(this.surf.mouse_x(), this.surf.mouse_y());
+            }
+        }
+        // break handler->owner->tree reference cycles so RC frees everything;
+        // apps never need a manual teardown.
+        if (this.root != null) { this.root.release_all(); }
+        if (this.menubar != null) { this.menubar.release_all(); }
+        if (this.overlay != null) { this.overlay.release_all(); }
+        for (let t in this.toasts) { t.release_all(); }
+        this.toasts = [];
+        this.root = null;
+        this.menubar = null;
+        this.overlay = null;
+        this.hover_w = null;
+        this.press_w = null;
+        this.focusables = [];
+        this.focus_i = -1;
+    }
+}

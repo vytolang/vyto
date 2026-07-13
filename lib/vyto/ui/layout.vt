@@ -1,0 +1,1105 @@
+// vyto/ui/layout — the layout containers: Column and Row (flex stacks) and
+// Spacer. Constraint-driven containers (Padding/Center/Container/…) land here.
+// Plus Align, Stack/Positioned, Wrap, Grid, Flexible, Divider.
+
+import { Widget, Painter, Theme, Size, BoxConstraints, bcLoose, bcTight } from "vyto/ui/core";
+import { Rect, contains,
+         KEY_UP, KEY_DOWN, KEY_HOME, KEY_END, KEY_PAGEUP, KEY_PAGEDOWN } from "vyto/surface";
+
+// main-axis distribution (CSS justify-content). Only bites when no child has a
+// grow factor — a growing child eats the free space first, leaving none to
+// distribute.
+export const JUSTIFY_START: int = 0;    // pack at the start (default)
+export const JUSTIFY_CENTER: int = 1;   // pack the block centered
+export const JUSTIFY_END: int = 2;      // pack at the end
+export const JUSTIFY_BETWEEN: int = 3;  // first/last flush to edges, gaps equal
+export const JUSTIFY_AROUND: int = 4;   // equal gaps, half-gaps at the edges
+export const JUSTIFY_EVENLY: int = 5;   // equal gaps including both edges
+
+// cross-axis alignment (CSS align-items / align-self, see Widget.selfAlign).
+export const CROSS_STRETCH: int = 0;    // fill the cross axis (default)
+export const CROSS_START: int = 1;      // hug the leading edge, natural size
+export const CROSS_CENTER: int = 2;     // center on the cross axis
+export const CROSS_END: int = 3;        // hug the trailing edge
+
+// [startOffset, extraGap] added to a Column/Row's main-axis packing to realize
+// a JUSTIFY_* mode across `free` leftover pixels among `n` children.
+fn dist_offsets(mode: int, free: int, n: int): int[] {
+    if (free <= 0 || n <= 0) { return [0, 0]; }
+    if (mode == JUSTIFY_CENTER) { return [free / 2, 0]; }
+    if (mode == JUSTIFY_END) { return [free, 0]; }
+    if (mode == JUSTIFY_BETWEEN) {
+        if (n == 1) { return [free / 2, 0]; }   // one child: center it
+        return [0, free / (n - 1)];
+    }
+    if (mode == JUSTIFY_AROUND) {
+        let g = free / n;
+        return [g / 2, g];
+    }
+    if (mode == JUSTIFY_EVENLY) {
+        let g = free / (n + 1);
+        return [g, g];
+    }
+    return [0, 0];  // JUSTIFY_START
+}
+
+// [offset, size] for one child on the cross axis: how to place a `natural`-sized
+// child within `avail` cross pixels under a CROSS_* mode.
+fn cross_place(mode: int, avail: int, natural: int): int[] {
+    if (mode == CROSS_STRETCH) { return [0, avail]; }
+    let sz = natural;
+    if (sz > avail) { sz = avail; }
+    if (mode == CROSS_CENTER) { return [(avail - sz) / 2, sz]; }
+    if (mode == CROSS_END) { return [avail - sz, sz]; }
+    return [0, sz];  // CROSS_START
+}
+
+// vertical stack; children stretched to the inner width
+export class Column extends Widget {
+    padding: int;    // -1 = theme default
+    spacing: int;    // -1 = theme default
+    mainAlign: int;  // JUSTIFY_* — vertical distribution of free space
+    crossAlign: int; // CROSS_* — horizontal alignment of children
+
+    fn init(kids: Widget[]) {
+        super.init();
+        this.padding = -1;
+        this.spacing = -1;
+        this.mainAlign = JUSTIFY_START;
+        this.crossAlign = CROSS_STRETCH;
+        for (let k in kids) {
+            this.add(k);
+        }
+    }
+
+    fn pad_of(th: Theme): int {
+        if (this.padding < 0) { return th.pad; }
+        return this.padding;
+    }
+    fn gap_of(th: Theme): int {
+        if (this.spacing < 0) { return th.spacing; }
+        return this.spacing;
+    }
+
+    builder fn gap(n: int) { this.spacing = n; return this; }
+    builder fn pad(n: int) { this.padding = n; return this; }
+    builder fn justify(n: int) { this.mainAlign = n; return this; }
+    builder fn align(n: int) { this.crossAlign = n; return this; }
+
+    override fn measure(s: Painter, th: Theme): Size {
+        let pad = this.pad_of(th);
+        let gap = this.gap_of(th);
+        let w = 0;
+        let h = 0;
+        let n = this.children.len;
+        for (let c in this.children) {
+            // Use layout() with a large width so height-dependent-on-width
+            // children (Text) report their wrapped height.
+            let bc = new BoxConstraints(0, 100000, 0, 100000);
+            let cs = c.layout(s, th, bc);
+            if (cs.w > w) { w = cs.w; }
+            h += cs.h;
+        }
+        if (n > 1) { h += gap * (n - 1); }
+        return Size(w + 2 * pad, h + 2 * pad);
+    }
+
+    override fn arrange(s: Painter, th: Theme, r: Rect) {
+        this.bounds = r;
+        let pad = this.pad_of(th);
+        let gap = this.gap_of(th);
+        let inner = Rect(r.x + pad, r.y + pad, r.w - 2 * pad, r.h - 2 * pad);
+        let n = this.children.len;
+        if (n == 0) { return; }
+        // Use layout() at the actual inner width so height-dependent-on-width
+        // children get the correct wrapped height. Record natural width too, for
+        // cross-axis (horizontal) alignment when not stretching.
+        let naturals: int[] = [];
+        let widths: int[] = [];
+        let fixed = 0;
+        let total_grow = 0;
+        for (let c in this.children) {
+            let bc = new BoxConstraints(0, inner.w, 0, 100000);
+            let cs = c.layout(s, th, bc);
+            naturals.push(cs.h);
+            widths.push(cs.w);
+            fixed += cs.h;
+            total_grow += c.grow;
+        }
+        let leftover = inner.h - fixed - gap * (n - 1);
+        if (leftover < 0) { leftover = 0; }
+        // Free space grow children didn't claim is distributed by mainAlign.
+        let free = leftover;
+        if (total_grow > 0) { free = 0; }
+        let od = dist_offsets(this.mainAlign, free, n);
+        let given = 0;
+        let flex_seen = 0;
+        let flex_total = 0;
+        for (let c in this.children) {
+            if (c.grow > 0) { flex_total += 1; }
+        }
+        let y = inner.y + od[0];
+        for (let i in 0..n) {
+            let c = this.children[i];
+            let ch = naturals[i];
+            if (c.grow > 0 && total_grow > 0) {
+                flex_seen += 1;
+                let share = leftover * c.grow / total_grow;
+                if (flex_seen == flex_total) { share = leftover - given; }
+                given += share;
+                ch += share;
+            }
+            let ca = c.alignSelf;
+            if (ca < 0) { ca = this.crossAlign; }
+            let cp = cross_place(ca, inner.w, widths[i]);
+            c.arrange(s, th, Rect(inner.x + cp[0], y, cp[1], ch));
+            y += ch + gap + od[1];
+        }
+    }
+}
+
+// horizontal stack; children stretched to the inner height
+export class Row extends Widget {
+    padding: int;
+    spacing: int;
+    mainAlign: int;  // JUSTIFY_* — horizontal distribution of free space
+    crossAlign: int; // CROSS_* — vertical alignment of children
+
+    fn init(kids: Widget[]) {
+        super.init();
+        this.padding = -1;
+        this.spacing = -1;
+        this.mainAlign = JUSTIFY_START;
+        this.crossAlign = CROSS_STRETCH;
+        for (let k in kids) {
+            this.add(k);
+        }
+    }
+
+    fn pad_of(th: Theme): int {
+        if (this.padding < 0) { return 0; }
+        return this.padding;
+    }
+    fn gap_of(th: Theme): int {
+        if (this.spacing < 0) { return th.spacing; }
+        return this.spacing;
+    }
+
+    builder fn gap(n: int) { this.spacing = n; return this; }
+    builder fn pad(n: int) { this.padding = n; return this; }
+    builder fn justify(n: int) { this.mainAlign = n; return this; }
+    builder fn align(n: int) { this.crossAlign = n; return this; }
+
+    override fn measure(s: Painter, th: Theme): Size {
+        let pad = this.pad_of(th);
+        let gap = this.gap_of(th);
+        let w = 0;
+        let h = 0;
+        let n = this.children.len;
+        for (let c in this.children) {
+            let cs = c.measure(s, th);
+            if (cs.h > h) { h = cs.h; }
+            w += cs.w;
+        }
+        if (n > 1) { w += gap * (n - 1); }
+        return Size(w + 2 * pad, h + 2 * pad);
+    }
+
+    override fn arrange(s: Painter, th: Theme, r: Rect) {
+        this.bounds = r;
+        let pad = this.pad_of(th);
+        let gap = this.gap_of(th);
+        let inner = Rect(r.x + pad, r.y + pad, r.w - 2 * pad, r.h - 2 * pad);
+        let n = this.children.len;
+        if (n == 0) { return; }
+        // Record natural height too, for cross-axis (vertical) alignment when
+        // not stretching.
+        let naturals: int[] = [];
+        let heights: int[] = [];
+        let fixed = 0;
+        let total_grow = 0;
+        for (let c in this.children) {
+            let cs = c.measure(s, th);
+            naturals.push(cs.w);
+            heights.push(cs.h);
+            fixed += cs.w;
+            total_grow += c.grow;
+        }
+        let leftover = inner.w - fixed - gap * (n - 1);
+        if (leftover < 0) { leftover = 0; }
+        // Free space grow children didn't claim is distributed by mainAlign.
+        let free = leftover;
+        if (total_grow > 0) { free = 0; }
+        let od = dist_offsets(this.mainAlign, free, n);
+        let given = 0;
+        let flex_seen = 0;
+        let flex_total = 0;
+        for (let c in this.children) {
+            if (c.grow > 0) { flex_total += 1; }
+        }
+        let x = inner.x + od[0];
+        for (let i in 0..n) {
+            let c = this.children[i];
+            let cw = naturals[i];
+            if (c.grow > 0 && total_grow > 0) {
+                flex_seen += 1;
+                let share = leftover * c.grow / total_grow;
+                if (flex_seen == flex_total) { share = leftover - given; }
+                given += share;
+                cw += share;
+            }
+            let ca = c.alignSelf;
+            if (ca < 0) { ca = this.crossAlign; }
+            let cp = cross_place(ca, inner.h, heights[i]);
+            c.arrange(s, th, Rect(x, inner.y + cp[0], cw, cp[1]));
+            x += cw + gap + od[1];
+        }
+    }
+}
+
+// flexible empty space inside a Column/Row
+export class Spacer extends Widget {
+    fn init() {
+        super.init();
+        this.grow = 1;
+    }
+    override fn measure(s: Painter, th: Theme): Size {
+        return Size(0, 0);
+    }
+}
+
+// ---------------------------------------------------- constraint containers
+
+// A single-child wrapper. Subclasses override arrange() to place the child;
+// the base measure()/child accessor are shared. A wrapper with no child
+// behaves as an empty box.
+export class Box extends Widget {
+    fn child(): Widget {
+        if (this.children.len == 0) { return null; }
+        return this.children[0];
+    }
+}
+
+// Insets its child by `inset` pixels on every side. The child fills the
+// remaining inner rect (constraints deflated by 2*inset each axis).
+export class Padding extends Box {
+    inset: int;
+
+    fn init(inset: int, child: Widget) {
+        super.init();
+        this.inset = inset;
+        if (child != null) { this.add(child); }
+    }
+
+    override fn measure(s: Painter, th: Theme): Size {
+        let c = this.child();
+        if (c == null) { return Size(2 * this.inset, 2 * this.inset); }
+        let cs = c.measure(s, th);
+        return Size(cs.w + 2 * this.inset, cs.h + 2 * this.inset);
+    }
+
+    override fn arrange(s: Painter, th: Theme, r: Rect) {
+        this.bounds = r;
+        let c = this.child();
+        if (c == null) { return; }
+        let i = this.inset;
+        c.arrange(s, th, Rect(r.x + i, r.y + i, r.w - 2 * i, r.h - 2 * i));
+    }
+}
+
+// Positions its child at the child's natural size, centered in the space this
+// widget is given. The child is loosely constrained (may shrink to fit but is
+// not stretched) — the canonical constraint-driven container.
+export class Center extends Box {
+    fn init(child: Widget) {
+        super.init();
+        if (child != null) { this.add(child); }
+    }
+
+    override fn measure(s: Painter, th: Theme): Size {
+        let c = this.child();
+        if (c == null) { return Size(0, 0); }
+        return c.measure(s, th);
+    }
+
+    override fn arrange(s: Painter, th: Theme, r: Rect) {
+        this.bounds = r;
+        let c = this.child();
+        if (c == null) { return; }
+        let cs = c.layout(s, th, bcLoose(r.w, r.h));  // natural, clamped to r
+        let cx = r.x + (r.w - cs.w) / 2;
+        let cy = r.y + (r.h - cs.h) / 2;
+        c.arrange(s, th, Rect(cx, cy, cs.w, cs.h));
+    }
+}
+
+// Forces a fixed w x h. Its child (if any) fills that box.
+export class SizedBox extends Box {
+    w: int;
+    h: int;
+
+    fn init(w: int, h: int, child: Widget) {
+        super.init();
+        this.w = w;
+        this.h = h;
+        if (child != null) { this.add(child); }
+    }
+
+    override fn measure(s: Painter, th: Theme): Size {
+        return Size(this.w, this.h);
+    }
+
+    override fn arrange(s: Painter, th: Theme, r: Rect) {
+        this.bounds = r;
+        let c = this.child();
+        if (c != null) { c.arrange(s, th, r); }
+    }
+}
+
+// Fills the main axis of a Column/Row by flex factor (default 1). Equivalent
+// to setting `.grow` on a widget, but reads declaratively and wraps any child.
+export class Expanded extends Box {
+    fn init(child: Widget) {
+        super.init();
+        this.grow = 1;
+        if (child != null) { this.add(child); }
+    }
+
+    override fn measure(s: Painter, th: Theme): Size {
+        let c = this.child();
+        if (c == null) { return Size(0, 0); }
+        return c.measure(s, th);
+    }
+
+    override fn arrange(s: Painter, th: Theme, r: Rect) {
+        this.bounds = r;
+        let c = this.child();
+        if (c != null) { c.arrange(s, th, r); }
+    }
+}
+
+// Box-model container: an optional background fill, inner padding, and an
+// optional fixed size. Pass -1 for fixedW/fixedH to size to the child, and -1
+// for bg to skip the fill. The Flutter `Container` workhorse.
+export class Container extends Box {
+    fixedW: int;
+    fixedH: int;
+    pad: int;
+    bg: int;
+
+    fn init(fixedW: int, fixedH: int, pad: int, bg: int, child: Widget) {
+        super.init();
+        this.fixedW = fixedW;
+        this.fixedH = fixedH;
+        this.pad = pad;
+        this.bg = bg;
+        if (child != null) { this.add(child); }
+    }
+
+    override fn measure(s: Painter, th: Theme): Size {
+        let w = 2 * this.pad;
+        let h = 2 * this.pad;
+        let c = this.child();
+        if (c != null) {
+            // Use layout() instead of measure() so height-dependent-on-width
+            // children (like Text) get the correct wrapped height at the
+            // available width.
+            let bc = new BoxConstraints(0, 100000, 0, 100000);
+            let cs = c.layout(s, th, bc);
+            w = cs.w + 2 * this.pad;
+            h = cs.h + 2 * this.pad;
+        }
+        if (this.fixedW >= 0) { w = this.fixedW; }
+        if (this.fixedH >= 0) { h = this.fixedH; }
+        return Size(w, h);
+    }
+
+    override fn arrange(s: Painter, th: Theme, r: Rect) {
+        this.bounds = r;
+        let c = this.child();
+        if (c == null) { return; }
+        let p = this.pad;
+        let inner = Rect(r.x + p, r.y + p, r.w - 2 * p, r.h - 2 * p);
+        // Re-layout the child at the actual inner width so wrapping matches
+        let cs = c.layout(s, th, new BoxConstraints(0, inner.w, 0, inner.h));
+        c.arrange(s, th, Rect(inner.x, inner.y, inner.w, cs.h));
+    }
+
+    override fn draw(s: Painter, th: Theme) {
+        this.draw_chrome(s, th);
+        for (let c in this.children) { c.draw(s, th); }
+    }
+
+    // painted by both the full-redraw and partial-repaint paths
+    override fn draw_chrome(s: Painter, th: Theme) {
+        if (this.bg >= 0) { s.fill(this.bounds, this.bg); }
+    }
+}
+
+// ---------------------------------------------------- additional containers
+
+// Align: places a child at a fractional anchor (ax, ay in 0..1) at natural size.
+export class Align extends Box {
+    ax: float;
+    ay: float;
+
+    fn init(ax: float, ay: float, child: Widget) {
+        super.init();
+        this.ax = ax;
+        this.ay = ay;
+        if (child != null) { this.add(child); }
+    }
+
+    override fn measure(s: Painter, th: Theme): Size {
+        let c = this.child();
+        if (c == null) { return Size(0, 0); }
+        return c.measure(s, th);
+    }
+
+    override fn arrange(s: Painter, th: Theme, r: Rect) {
+        this.bounds = r;
+        let c = this.child();
+        if (c == null) { return; }
+        let cs = c.layout(s, th, bcLoose(r.w, r.h));
+        let cx = r.x + ((r.w - cs.w) as float * this.ax) as int;
+        let cy = r.y + ((r.h - cs.h) as float * this.ay) as int;
+        c.arrange(s, th, Rect(cx, cy, cs.w, cs.h));
+    }
+}
+
+// Positioned: offset/size for a child inside a Stack, RELATIVE to the rect
+// the Stack hands it (left/top are offsets from the stack's origin, so a
+// stack composes the same wherever it lands in the layout).
+export class Positioned extends Box {
+    left: int;
+    top: int;
+    w: int;
+    h: int;
+
+    fn init(left: int, top: int, w: int, h: int, child: Widget) {
+        super.init();
+        this.left = left;
+        this.top = top;
+        this.w = w;
+        this.h = h;
+        if (child != null) { this.add(child); }
+    }
+
+    override fn measure(s: Painter, th: Theme): Size {
+        if (this.w >= 0 && this.h >= 0) { return Size(this.w, this.h); }
+        let c = this.child();
+        if (c == null) { return Size(0, 0); }
+        return c.measure(s, th);
+    }
+
+    override fn arrange(s: Painter, th: Theme, r: Rect) {
+        let cw = this.w;
+        let ch = this.h;
+        let c = this.child();
+        if (cw < 0 && c != null) { cw = c.measure(s, th).w; }
+        if (ch < 0 && c != null) { ch = c.measure(s, th).h; }
+        let pr = Rect(r.x + this.left, r.y + this.top, cw, ch);
+        this.bounds = pr; // cover the child for hit-testing
+        if (c != null) { c.arrange(s, th, pr); }
+    }
+}
+
+// Stack: z-layered children drawn in order. Un-Positioned children sit at
+// the stack origin at their natural size; Positioned children offset from
+// the stack origin.
+export class Stack extends Widget {
+    override fn measure(s: Painter, th: Theme): Size {
+        let w = 0;
+        let h = 0;
+        for (let c in this.children) {
+            let cs = c.measure(s, th);
+            if (cs.w > w) { w = cs.w; }
+            if (cs.h > h) { h = cs.h; }
+        }
+        return Size(w, h);
+    }
+
+    override fn arrange(s: Painter, th: Theme, r: Rect) {
+        this.bounds = r;
+        for (let c in this.children) {
+            let cs = c.measure(s, th);
+            c.arrange(s, th, Rect(r.x, r.y, cs.w, cs.h));
+        }
+    }
+}
+
+// Wrap: flows children left-to-right, wrapping to a new line past maxW.
+export class Wrap extends Widget {
+    spacing: int;
+    line_spacing: int;
+
+    fn init(spacing: int, line_spacing: int, kids: Widget[]) {
+        super.init();
+        this.spacing = spacing;
+        this.line_spacing = line_spacing;
+        for (let k in kids) { this.add(k); }
+    }
+
+    // Natural size: everything on one line — measure() has no available
+    // width to wrap against. layout(bc) reports the real wrapped size.
+    override fn measure(s: Painter, th: Theme): Size {
+        let w = 0;
+        let line_h = 0;
+        let n = this.children.len;
+        for (let c in this.children) {
+            let cs = c.measure(s, th);
+            w += cs.w;
+            if (cs.h > line_h) { line_h = cs.h; }
+        }
+        if (n > 1) { w += this.spacing * (n - 1); }
+        return Size(w, line_h);
+    }
+
+    // Wrapped size at the offered max width — the same flow arrange() runs,
+    // so the height a parent reserves always matches what gets painted.
+    override fn layout(s: Painter, th: Theme, bc: BoxConstraints): Size {
+        let max_w = bc.maxW;
+        let x = 0;
+        let y = 0;
+        let line_h = 0;
+        let used_w = 0;
+        for (let c in this.children) {
+            let cs = c.measure(s, th);
+            if (x + cs.w > max_w && x > 0) {
+                y += line_h + this.line_spacing;
+                x = 0;
+                line_h = 0;
+            }
+            x += cs.w + this.spacing;
+            if (x - this.spacing > used_w) { used_w = x - this.spacing; }
+            if (cs.h > line_h) { line_h = cs.h; }
+        }
+        return bc.constrain(Size(used_w, y + line_h));
+    }
+
+    override fn arrange(s: Painter, th: Theme, r: Rect) {
+        this.bounds = r;
+        let x = r.x;
+        let y = r.y;
+        let line_h = 0;
+        let n = this.children.len;
+        for (let i in 0..n) {
+            let c = this.children[i];
+            let cs = c.measure(s, th);
+            if (x + cs.w > r.x + r.w && x > r.x) {
+                x = r.x;
+                y += line_h + this.line_spacing;
+                line_h = 0;
+            }
+            c.arrange(s, th, Rect(x, y, cs.w, cs.h));
+            x += cs.w + this.spacing;
+            if (cs.h > line_h) { line_h = cs.h; }
+        }
+    }
+}
+
+// Grid: fixed N columns, equal cells, row count derived from child count.
+export class Grid extends Widget {
+    cols: int;
+    spacing: int;
+
+    fn init(cols: int, spacing: int, kids: Widget[]) {
+        super.init();
+        this.cols = cols;
+        this.spacing = spacing;
+        for (let k in kids) { this.add(k); }
+    }
+
+    override fn measure(s: Painter, th: Theme): Size {
+        let n = this.children.len;
+        if (n == 0) { return Size(0, 0); }
+        let rows = (n + this.cols - 1) / this.cols;
+        // measure max cell size
+        let max_w = 0;
+        let max_h = 0;
+        for (let c in this.children) {
+            let cs = c.measure(s, th);
+            if (cs.w > max_w) { max_w = cs.w; }
+            if (cs.h > max_h) { max_h = cs.h; }
+        }
+        let w = max_w * this.cols + this.spacing * (this.cols - 1);
+        let h = max_h * rows + this.spacing * (rows - 1);
+        return Size(w, h);
+    }
+
+    override fn arrange(s: Painter, th: Theme, r: Rect) {
+        this.bounds = r;
+        let n = this.children.len;
+        if (n == 0) { return; }
+        let rows = (n + this.cols - 1) / this.cols;
+        let cw = (r.w - this.spacing * (this.cols - 1)) / this.cols;
+        let ch = (r.h - this.spacing * (rows - 1)) / rows;
+        if (cw < 0) { cw = 0; }
+        if (ch < 0) { ch = 0; }
+        for (let i in 0..n) {
+            let col = i % this.cols;
+            let row = i / this.cols;
+            let x = r.x + col * (cw + this.spacing);
+            let y = r.y + row * (ch + this.spacing);
+            this.children[i].arrange(s, th, Rect(x, y, cw, ch));
+        }
+    }
+}
+
+// Flexible: like Expanded but may shrink below natural (flex-shrink).
+export class Flexible extends Box {
+    fn init(child: Widget) {
+        super.init();
+        this.grow = 1;
+        if (child != null) { this.add(child); }
+    }
+
+    override fn measure(s: Painter, th: Theme): Size {
+        let c = this.child();
+        if (c == null) { return Size(0, 0); }
+        return c.measure(s, th);
+    }
+
+    override fn layout(s: Painter, th: Theme, bc: BoxConstraints): Size {
+        let c = this.child();
+        if (c == null) { return bc.constrain(Size(0, 0)); }
+        // allow shrinking: pick the smaller of natural and constrained
+        let nat = c.measure(s, th);
+        let cons = bc.constrain(nat);
+        return Size(cons.w, cons.h);
+    }
+
+    override fn arrange(s: Painter, th: Theme, r: Rect) {
+        this.bounds = r;
+        let c = this.child();
+        if (c != null) { c.arrange(s, th, r); }
+    }
+}
+
+// Divider: 1px line (theme.muted), horizontal or vertical.
+export class Divider extends Widget {
+    vertical: bool;
+
+    fn init(vertical: bool) {
+        super.init();
+        this.vertical = vertical;
+    }
+
+    override fn measure(s: Painter, th: Theme): Size {
+        if (this.vertical) { return Size(1, 40); }
+        return Size(40, 1);
+    }
+
+    override fn draw(s: Painter, th: Theme) {
+        if (this.vertical) {
+            let mx = this.bounds.x + this.bounds.w / 2;
+            s.line(mx, this.bounds.y, mx, this.bounds.y + this.bounds.h, th.muted);
+        } else {
+            let my = this.bounds.y + this.bounds.h / 2;
+            s.line(this.bounds.x, my, this.bounds.x + this.bounds.w, my, th.muted);
+        }
+    }
+}
+
+// ------------------------------------------------------- ClippedPainter
+
+// A Painter wrapper that clips all drawing to a rectangle. There is no clip
+// primitive in the Painter API, so this intercepts every draw call and either
+// drops it (fully outside), trims it (partially outside), or passes it through.
+// Used by ScrollView to prevent content from painting outside its viewport.
+export class ClippedPainter extends Painter {
+    inner: Painter;
+    clip: Rect;
+
+    fn init(inner: Painter, clip: Rect) {
+        this.inner = inner;
+        this.clip = clip;
+    }
+
+    fn intersect(r: Rect): Rect {
+        return r.intersect(this.clip);
+    }
+
+    override fn fill(r: Rect, color: int) {
+        let cr = this.intersect(r);
+        if (cr.w > 0 && cr.h > 0) { this.inner.fill(cr, color); }
+    }
+
+    override fn frame(r: Rect, color: int) {
+        let cr = this.intersect(r);
+        if (cr.w > 0 && cr.h > 0) { this.inner.frame(cr, color); }
+    }
+
+    override fn line(x0: int, y0: int, x1: int, y1: int, color: int) {
+        // Skip lines fully outside the clip rect on either axis.
+        // (Proper Cohen-Sutherland clipping is overkill for our 1px lines.)
+        let cx0 = this.clip.x;
+        let cy0 = this.clip.y;
+        let cx1 = this.clip.x + this.clip.w;
+        let cy1 = this.clip.y + this.clip.h;
+        if (x0 < cx0 && x1 < cx0) { return; }
+        if (x0 >= cx1 && x1 >= cx1) { return; }
+        if (y0 < cy0 && y1 < cy0) { return; }
+        if (y0 >= cy1 && y1 >= cy1) { return; }
+        this.inner.line(x0, y0, x1, y1, color);
+    }
+
+    override fn text(x: int, y: int, s: string, color: int) {
+        // Skip text whose baseline is above or below the clip rect.
+        if (y < this.clip.y || y >= this.clip.y + this.clip.h) { return; }
+        if (x < this.clip.x || x >= this.clip.x + this.clip.w) { return; }
+        this.inner.text(x, y, s, color);
+    }
+
+    override fn text_in(r: Rect, pad: int, s: string, color: int) {
+        let cr = this.intersect(r);
+        if (cr.w <= 0 || cr.h <= 0) { return; }
+        // Adjust pad if the left edge was clipped.
+        let np = pad;
+        if (r.x < this.clip.x) { np = pad - (this.clip.x - r.x); }
+        if (np < 0) { np = 0; }
+        this.inner.text_in(cr, np, s, color);
+    }
+
+    // Widened-vocabulary passes-through: intersect the rounded/circle rects and
+    // forward; the inner painter does its own clipping for what it can.
+    override fn fill_round(r: Rect, radius: int, color: int) {
+        let cr = this.intersect(r);
+        if (cr.w > 0 && cr.h > 0) {
+            // shrink the radius to the smaller clipped dimension if needed
+            let rd = radius;
+            if (cr.w < 2 * rd) { rd = cr.w / 2; }
+            if (cr.h < 2 * rd) { rd = cr.h / 2; }
+            this.inner.fill_round(cr, rd, color);
+        }
+    }
+
+    override fn stroke_round(r: Rect, radius: int, width: int, color: int) {
+        // stroke overflows the rect; only forward when the rect is at least
+        // partially inside (the strokes around the clipped-inset rect leak a
+        // little at the clip edge — acceptable degraded clip on the lean tier).
+        if (this.intersect(r).w > 0) { this.inner.stroke_round(r, radius, width, color); }
+    }
+
+    override fn circle(cx: int, cy: int, radius: int, color: int) {
+        let r = Rect(cx - radius, cy - radius, radius * 2, radius * 2);
+        if (this.intersect(r).w > 0) { this.inner.circle(cx, cy, radius, color); }
+    }
+
+    override fn stroke_circle(cx: int, cy: int, radius: int, width: int, color: int) {
+        let r = Rect(cx - radius, cy - radius, radius * 2, radius * 2);
+        if (this.intersect(r).w > 0) { this.inner.stroke_circle(cx, cy, radius, width, color); }
+    }
+
+    override fn gradient_v(r: Rect, radius: int, top: int, bottom: int) {
+        let cr = this.intersect(r);
+        if (cr.w > 0 && cr.h > 0) { this.inner.gradient_v(cr, radius, top, bottom); }
+    }
+
+    override fn shadow(r: Rect, radius: int, blur: int, dy: int, color: int) {
+        // soft shadow: forward only when its anchor rect intersects the clip
+        if (this.intersect(r).w > 0) { this.inner.shadow(r, radius, blur, dy, color); }
+    }
+
+    // Nested clip: push another rect clip intersected with this painter's clip.
+    override fn clip_push(r: Rect, radius: int) {
+        let cr = this.intersect(r);
+        this.inner.clip_push(cr, radius);
+    }
+
+    override fn clip_pop() { this.inner.clip_pop(); }
+
+    override fn line_w(x0: int, y0: int, x1: int, y1: int, width: int, color: int) {
+        let cx0 = this.clip.x;
+        let cy0 = this.clip.y;
+        let cx1 = this.clip.x + this.clip.w;
+        let cy1 = this.clip.y + this.clip.h;
+        if (x0 < cx0 && x1 < cx0) { return; }
+        if (x0 >= cx1 && x1 >= cx1) { return; }
+        if (y0 < cy0 && y1 < cy0) { return; }
+        if (y0 >= cy1 && y1 >= cy1) { return; }
+        this.inner.line_w(x0, y0, x1, y1, width, color);
+    }
+
+    // Metrics — pass through unchanged.
+    override fn set_weight(w: int) { this.inner.set_weight(w); }
+    override fn text_width(s: string): int { return this.inner.text_width(s); }
+    override fn font_ascent(): int { return this.inner.font_ascent(); }
+    override fn font_height(): int { return this.inner.font_height(); }
+    override fn width(): int { return this.inner.width(); }
+    override fn height(): int { return this.inner.height(); }
+    override fn present() { this.inner.present(); }
+    override fn present_rect(r: Rect) { this.inner.present_rect(r); }
+    override fn on_resize(w: int, h: int) { this.inner.on_resize(w, h); }
+    // geometric trimming, not a pixel clip — report false so nested users
+    // keep their fallback behavior
+    override fn can_clip(): bool { return false; }
+}
+
+// ------------------------------------------------------- ScrollView
+
+// Vertical scroll viewport for a single child. The child is arranged at its
+// natural height, offset upward by scroll_y; a ClippedPainter prevents drawing
+// outside the viewport. Up/Down arrows scroll by one line, Home/End jump to
+// top/bottom. The ScrollView joins the focus ring so it can receive scroll keys.
+export class ScrollView extends Box {
+    scroll_y: int;
+    content_h: int;
+    cached_s: Painter;
+    cached_th: Theme;
+    cached_r: Rect;
+
+    fn init(child: Widget) {
+        super.init();
+        this.scroll_y = 0;
+        this.content_h = 0;
+        this.focusable = true;
+        if (child != null) { this.add(child); }
+    }
+
+    fn max_scroll(): int {
+        let m = this.content_h - this.bounds.h;
+        if (m < 0) { m = 0; }
+        return m;
+    }
+
+    fn scroll_to(y: int) {
+        if (y < 0) { y = 0; }
+        let mx = this.max_scroll();
+        if (y > mx) { y = mx; }
+        this.scroll_y = y;
+    }
+
+    fn scroll_by(delta: int) {
+        this.scroll_to(this.scroll_y + delta);
+    }
+
+    fn rearrange() {
+        if (this.cached_s != null) {
+            this.arrange(this.cached_s, this.cached_th, this.cached_r);
+        }
+    }
+
+    // Report the child's width but 0 height — the ScrollView is meant to
+    // fill whatever vertical space its parent gives it (via grow=1) and
+    // scroll the child within that. Reporting the child's natural height
+    // would make the parent (e.g. Column) allocate that full height,
+    // defeating the scroll.
+    override fn measure(s: Painter, th: Theme): Size {
+        let c = this.child();
+        if (c == null) { return Size(0, 0); }
+        let cs = c.measure(s, th);
+        this.content_h = cs.h;
+        return Size(cs.w, 0);
+    }
+
+    override fn arrange(s: Painter, th: Theme, r: Rect) {
+        this.bounds = r;
+        this.cached_s = s;
+        this.cached_th = th;
+        this.cached_r = r;
+        let c = this.child();
+        if (c == null) { return; }
+        let cs = c.measure(s, th);
+        this.content_h = cs.h;
+        // clamp scroll_y to valid range
+        if (this.scroll_y > this.max_scroll()) { this.scroll_y = this.max_scroll(); }
+        // arrange child at natural height, offset by -scroll_y
+        c.arrange(s, th, Rect(r.x, r.y - this.scroll_y, r.w, cs.h));
+    }
+
+    override fn draw(s: Painter, th: Theme) {
+        // fill the viewport background so stale pixels are cleared
+        s.fill(this.bounds, th.bg);
+        let c = this.child();
+        if (c == null) { return; }
+        if (s.can_clip()) {
+            // real pixel clip (both tiers now): partial lines at the viewport
+            // edge crop instead of popping in/out; no wrapper allocation
+            s.clip_push(this.bounds, 0);
+            c.draw(s, th);
+            s.clip_pop();
+        } else {
+            // geometric fallback for painters without a clip (RecordPainter)
+            let cp = new ClippedPainter(s, this.bounds);
+            c.draw(cp, th);
+        }
+    }
+
+    // Partial repaint: intersect dirty rect with the viewport, fill, then
+    // draw the child clipped to the intersection.
+    override fn draw_within(s: Painter, th: Theme, d: Rect) {
+        let b = this.bounds;
+        // intersect d with our bounds
+        let x0 = d.x;
+        if (x0 < b.x) { x0 = b.x; }
+        let y0 = d.y;
+        if (y0 < b.y) { y0 = b.y; }
+        let x1 = d.x + d.w;
+        if (x1 > b.x + b.w) { x1 = b.x + b.w; }
+        let y1 = d.y + d.h;
+        if (y1 > b.y + b.h) { y1 = b.y + b.h; }
+        if (x1 <= x0 || y1 <= y0) { return; }
+        let clip = Rect(x0, y0, x1 - x0, y1 - y0);
+        s.fill(clip, th.bg);
+        let c = this.child();
+        if (c == null) { return; }
+        if (s.can_clip()) {
+            s.clip_push(clip, 0);
+            c.draw_within(s, th, clip);
+            s.clip_pop();
+        } else {
+            let cp = new ClippedPainter(s, clip);
+            c.draw_within(cp, th, clip);
+        }
+    }
+
+    override fn on_key(k: int, ch: string): bool {
+        let fh = 20;
+        if (this.cached_s != null) { fh = this.cached_s.font_height() + 4; }
+        if (k == KEY_DOWN) {
+            if (this.scroll_y < this.max_scroll()) {
+                this.scroll_by(fh);
+                this.rearrange();
+                return true;
+            }
+            return false;
+        }
+        if (k == KEY_UP) {
+            if (this.scroll_y > 0) {
+                this.scroll_by(-fh);
+                this.rearrange();
+                return true;
+            }
+            return false;
+        }
+        if (k == KEY_PAGEDOWN) {
+            if (this.scroll_y < this.max_scroll()) {
+                let page = this.bounds.h - fh; // one line of overlap for context
+                if (page < fh) { page = fh; }
+                this.scroll_by(page);
+                this.rearrange();
+                return true;
+            }
+            return false;
+        }
+        if (k == KEY_PAGEUP) {
+            if (this.scroll_y > 0) {
+                let page = this.bounds.h - fh;
+                if (page < fh) { page = fh; }
+                this.scroll_by(-page);
+                this.rearrange();
+                return true;
+            }
+            return false;
+        }
+        if (k == KEY_HOME) {
+            if (this.scroll_y > 0) {
+                this.scroll_to(0);
+                this.rearrange();
+                return true;
+            }
+            return false;
+        }
+        if (k == KEY_END) {
+            if (this.scroll_y < this.max_scroll()) {
+                this.scroll_to(this.max_scroll());
+                this.rearrange();
+                return true;
+            }
+            return false;
+        }
+        return false;
+    }
+
+    // Mouse wheel: scroll by delta * line_height. The delta comes from the
+    // surface layer (X11 Button4/5 = +/-3, Win32 WHEEL_DELTA/120 * 3).
+    override fn on_scroll(delta: int): bool {
+        if (this.max_scroll() == 0) { return false; }
+        let fh = 20;
+        if (this.cached_s != null) { fh = this.cached_s.font_height() + 4; }
+        let before = this.scroll_y;
+        this.scroll_by(delta * fh);
+        if (this.scroll_y != before) {
+            this.rearrange();
+            return true;
+        }
+        return false;
+    }
+
+    // Only hit-test the child if the point is within our viewport.
+    override fn hit(px: int, py: int): Widget {
+        if (!contains(this.bounds, px, py)) { return null; }
+        let c = this.child();
+        if (c != null) {
+            let found = c.hit(px, py);
+            if (found != null) { return found; }
+        }
+        return this;
+    }
+}
+
+// Virtualised fixed-row list: builds only the rows currently on screen, so a
+// million-item list costs the same as a screenful. `count()` yields the row
+// count and `build(i)` produces the widget for row i on demand.
+//
+//     new ListView(64, () => model.rows.len, (i) => new ChatRow(model.rows[i]))
+//
+// Rows are rebuilt each frame from the callbacks — keep `build` cheap and free
+// of per-row persistent state (store that in the model, as ListBox does).
+export class ListView extends Widget {
+    row_h: int;
+    count: fn(): int;
+    build: fn(int): Widget;
+    scroll: int;        // pixel scroll offset from the top
+
+    fn init(row_h: int, count: fn(): int, build: fn(int): Widget) {
+        super.init();
+        this.row_h = row_h;
+        this.count = count;
+        this.build = build;
+        this.scroll = 0;
+        this.focusable = true;
+    }
+
+    fn content_h(): int { return this.count() * this.row_h; }
+
+    fn clamp_scroll() {
+        let max = this.content_h() - this.bounds.h;
+        if (max < 0) { max = 0; }
+        if (this.scroll > max) { this.scroll = max; }
+        if (this.scroll < 0) { this.scroll = 0; }
+    }
+
+    override fn measure(s: Painter, th: Theme): Size {
+        return Size(0, this.row_h * 4);   // flexible; real height comes from arrange
+    }
+
+    override fn arrange(s: Painter, th: Theme, r: Rect) {
+        this.bounds = r;
+        this.clamp_scroll();
+    }
+
+    override fn draw(s: Painter, th: Theme) {
+        let n = this.count();
+        let first = this.scroll / this.row_h;
+        let off = this.scroll % this.row_h;
+        let vis = this.bounds.h / this.row_h + 2;
+        s.clip_push(this.bounds, 0);
+        for (let i in 0..vis) {
+            let idx = first + i;
+            if (idx < 0 || idx >= n) { continue; }
+            let w = this.build(idx);
+            let y = this.bounds.y - off + i * this.row_h;
+            w.arrange(s, th, Rect(this.bounds.x, y, this.bounds.w, this.row_h));
+            w.draw(s, th);
+        }
+        s.clip_pop();
+    }
+
+    override fn on_scroll(delta: int): bool {
+        this.scroll += delta * this.row_h;
+        this.clamp_scroll();
+        return true;
+    }
+}

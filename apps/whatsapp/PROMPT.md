@@ -1,12 +1,12 @@
-# Build Prompt — VoltChat (WhatsApp Desktop UI Clone)
+# Build Prompt — VytoChat (WhatsApp Desktop UI Clone)
 
-Build a WhatsApp-desktop UI clone as a single Volt app at `apps/whatsapp/whatsapp.vt`, using **only** the bundled `volt/ui` widget toolkit. This is a UI clone: mock/in-memory data, no networking. Match WhatsApp Desktop's visual layout and interaction feel.
+Build a WhatsApp-desktop UI clone as a single Vyto app at `apps/whatsapp/whatsapp.vt`, using **only** the bundled `vyto/ui` widget toolkit. This is a UI clone: mock/in-memory data, no networking. Match WhatsApp Desktop's visual layout and interaction feel.
 
 ## Reference the existing showcase first
 
 Read `apps/gallery/gallery.vt` before writing anything. It is the canonical, working example of every pattern you need: `Window` setup, `GfxPainter` vs `--surface` tiers, `Theme` construction, `MenuBar`/`Toolbar`/`StatusBar`, `TabView`, `ScrollView`, event callbacks (`onClick`, `onSubmit`, `onToggle`, `onSelect`, `onChange`), and custom `Container`/`Column`/`Row` composition. Follow its import style, its `font_path()` helper, and its `main()` shape.
 
-## Toolkit you have (from `volt/ui`)
+## Toolkit you have (from `vyto/ui`)
 
 - **Layout**: `Column`, `Row`, `Spacer`, `Box`, `Padding`, `Center`, `SizedBox`, `Expanded`, `Container`, `Align`, `Stack`, `Positioned`, `Wrap`, `Grid`, `Flexible`, `Divider`, `ScrollView`
 - **Form**: `Label`, `Button`, `TextField`, `Checkbox`, `ListBox`, `TextArea`, `RadioGroup`, `Switch`, `SegmentedControl`, `Stepper`, `Dropdown`, `ProgressBar`
@@ -21,7 +21,7 @@ Key constructor signatures (verify against source before use):
 - `Badge(label, bg, color, child)` — overlays a count/tag on `child`. Use for unread counts.
 - `Chip(label, deletable, bg)`.
 - `SizedBox(w, h, child)` — `-1` on an axis to leave it free. Use to pin panel widths/heights.
-- Colors come from `rgb(r,g,b)` (import from `volt/surface`).
+- Colors come from `rgb(r,g,b)` (import from `vyto/surface`).
 
 ## Layout to reproduce
 
@@ -57,7 +57,7 @@ Root: `win.root = new Row([sidebar, new Divider(false), conversation])`. Pin the
 
 ## Custom widgets you must write
 
-`volt/ui` has no avatar, chat-row, or bubble primitive, so subclass `Widget` and override `measure`, `arrange`, `draw` (and `on_click` for rows). Model them on how the toolkit's own widgets are structured in `lib/volt/ui/*.vt`.
+`vyto/ui` has no avatar, chat-row, or bubble primitive, so subclass `Widget` and override `measure`, `arrange`, `draw` (and `on_click` for rows). Model them on how the toolkit's own widgets are structured in `lib/vyto/ui/*.vt`.
 
 - **Avatar**: fixed square `Container` fill in a per-contact color with a centered initial `Label`. Note: the `Painter` interface exposes only `fill` / `frame` / `line` / `text` — **there is no rounded-rect primitive**, so avatars and bubbles are squared rectangles. Don't attempt rounded corners unless you first confirm a painter method for it; a clean flat rectangle reads fine.
 - **ChatRow**: fixed-height widget laying out `[avatar] [Column(name, last-message-preview muted)] [Spacer] [Column(time, unread Badge)]`. Highlight the selected row with the theme `sel` color. Override `on_click` to select the conversation.
@@ -89,7 +89,7 @@ th.pad = 12; th.spacing = 8;
 
 ## `main()` wiring (mirror `gallery.vt`)
 
-- `let win = new Window("VoltChat", 980, 660);`
+- `let win = new Window("VytoChat", 980, 660);`
 - Parse `--surface`; when absent, `win.use_painter(new GfxPainter(win.surface(), font_path(), 15.0))` for AA text. Keep it working in both tiers.
 - Set `win.theme = whatsapp_dark()`.
 - Optional `MenuBar` (File → Exit; View → toggle theme) and a `StatusBar` at the bottom showing the active contact / message count — good for cheap feedback and consistency with the gallery.
@@ -104,10 +104,10 @@ th.pad = 12; th.spacing = 8;
 
 ## Constraints & acceptance
 
-- **Only** `volt/ui` (+ `volt/gfx/painter`, `volt/surface`) imports. No new engine/runtime code.
+- **Only** `vyto/ui` (+ `vyto/gfx/painter`, `vyto/surface`) imports. No new engine/runtime code.
 - Must compile and run both tiers:
-  - Rich: `./voltc run apps/whatsapp/whatsapp.vt`
-  - Lean: `./voltc run apps/whatsapp/whatsapp.vt -- --surface`
+  - Rich: `./vytoc run apps/whatsapp/whatsapp.vt`
+  - Lean: `./vytoc run apps/whatsapp/whatsapp.vt -- --surface`
 - After any state change that alters layout, call `win.layout()` then `win.redraw()` (see gallery).
 - Every interactive control does something observable (updates the pane, the status bar, or prints to stdout).
 - Keep the file self-contained and commented in the header block like `gallery.vt` (title, render tiers, build/run commands, one-line architecture summary).

@@ -1,0 +1,281 @@
+// vyto/ui/selection — text selection + an Android-style floating action
+// toolbar. The three text widgets (Text, TextField, TextArea) compose a
+// SelectionModel and supply their own x->offset hit-test geometry; everything
+// generic — the offset math, word expansion, the default Copy/Select-All
+// actions, and the SelectionToolbar overlay — lives here so a widget adds
+// selection with a model field + a few event overrides.
+//
+// Selection offsets are byte indices into a widget's *display text* (what the
+// user sees and would copy): for Text that is the wrapped visual lines joined
+// by "\n"; for TextField the raw string; for TextArea the logical lines joined
+// by "\n". The model never assumes a widget layout — the host supplies the
+// current display text through a closure so copy always reflects live content.
+
+import { Widget, Window, Painter, Theme, EASE_OUT_CUBIC } from "vyto/ui/core";
+import { Surface, Rect, contains, with_alpha } from "vyto/surface";
+import { utf8_next } from "vyto/util/helper";
+
+// --------------------------------------------------------------- SelectionModel
+
+// The selection state a text widget composes. anchor is where the selection
+// was started (a press / double-click); focus is the moving end (drag / shift).
+// Both are byte offsets into the display text returned by text_fn.
+export class SelectionModel {
+    host: weak Widget;
+    text_fn: fn(): string;   // supplies the current display text; null => ""
+    // Optional: build a custom toolbar widget instead of the default
+    // SelectionToolbar — the extension point for a restyled/reshaped bar.
+    toolbar_factory: fn(int, int, SelectionAction[], SelectionModel): SelectionToolbar;
+    anchor: int;
+    focus: int;
+    active: bool;
+
+    fn init(host: Widget) {
+        this.host = host;
+        this.anchor = 0;
+        this.focus = 0;
+        this.active = false;
+    }
+
+    fn lo(): int { if (this.anchor < this.focus) { return this.anchor; } return this.focus; }
+    fn hi(): int { if (this.anchor < this.focus) { return this.focus; } return this.anchor; }
+    fn empty(): bool { return this.lo() == this.hi(); }
+
+    fn set(a: int, f: int) { this.anchor = a; this.focus = f; this.active = true; }
+    fn clear() { this.anchor = 0; this.focus = 0; this.active = false; }
+
+    fn full_text(): string {
+        if (this.text_fn != null) { return this.text_fn(); }
+        return "";
+    }
+
+    // The selected substring, clamped to the live display text (which may have
+    // shrunk since the offsets were set).
+    fn selected_text(): string {
+        let t = this.full_text();
+        let a = this.lo();
+        let b = this.hi();
+        if (b > t.len) { b = t.len; }
+        if (a > b) { a = b; }
+        if (a < 0) { a = 0; }
+        return t.slice(a, b);
+    }
+
+    fn select_all() {
+        let t = this.full_text();
+        this.anchor = 0;
+        this.focus = t.len;
+        this.active = true;
+    }
+
+    // Break the model->host / model->closure cycle at teardown.
+    fn drop() {
+        this.text_fn = null;
+        this.toolbar_factory = null;
+        this.host = null;
+    }
+}
+
+fn is_ws(b: int): bool { return b == 32 || b == 9 || b == 10 || b == 13; }
+
+// --------------------------------------------------------------- hit-test math
+
+// Map an x-offset within a single rendered line (px from the line's left edge)
+// to a byte offset into `line`. Walks whole UTF-8 sequences accumulating
+// measured prefix widths and snaps to the nearer glyph boundary. Takes the
+// Surface (not a Painter) so it is callable from event handlers, which have no
+// Painter but can reach metrics via win.surf.
+export fn col_at_x(surf: Surface, line: string, target: int): int {
+    if (target <= 0) { return 0; }
+    let i = 0;
+    let prev_w = 0;
+    while (i < line.len) {
+        let n = utf8_next(line, i);
+        let w = surf.text_width(line.slice(0, n));
+        if (w >= target) {
+            let mid = (prev_w + w) / 2;
+            if (target <= mid) { return i; }
+            return n;
+        }
+        prev_w = w;
+        i = n;
+    }
+    return line.len;
+}
+
+// Expand the selection to the word (or whitespace run) containing byte offset
+// `off` in the model's display text. Used by double-click and long-press.
+export fn select_word(sel: SelectionModel, off: int) {
+    let t = sel.full_text();
+    if (t.len == 0) { sel.set(0, 0); return; }
+    let o = off;
+    if (o >= t.len) { o = t.len - 1; }
+    if (o < 0) { o = 0; }
+    if (is_ws(t[o])) {
+        // sitting on whitespace: select the contiguous whitespace run
+        let lo = o;
+        while (lo > 0 && is_ws(t[lo - 1])) { lo -= 1; }
+        let hi = o;
+        while (hi < t.len && is_ws(t[hi])) { hi += 1; }
+        sel.set(lo, hi);
+        return;
+    }
+    let lo = o;
+    while (lo > 0 && !is_ws(t[lo - 1])) { lo -= 1; }
+    let hi = o;
+    while (hi < t.len && !is_ws(t[hi])) { hi += 1; }
+    sel.set(lo, hi);
+}
+
+// --------------------------------------------------------------- actions
+
+// One toolbar button: a label and a callback that receives the live model.
+export class SelectionAction {
+    label: string;
+    run: fn(SelectionModel);
+
+    fn init(label: string, run: fn(SelectionModel)) {
+        this.label = label;
+        this.run = run;
+    }
+}
+
+// The default action set every selectable widget offers: Copy (to the system
+// clipboard) and Select All. Apps append their own SelectionActions to extend
+// the toolbar without subclassing anything.
+export fn default_actions(win: Window): SelectionAction[] {
+    let w = win;
+    let copy = new SelectionAction("Copy", (sel) => {
+        let t = sel.selected_text();
+        if (t.len > 0) { w.surf.set_clipboard(t); }
+    });
+    let all = new SelectionAction("Select All", (sel) => {
+        sel.select_all();
+        if (sel.host != null) { sel.host.invalidate(); }
+    });
+    return [copy, all];
+}
+
+// --------------------------------------------------------------- SelectionToolbar
+
+// The floating action bar shown above a selection — a plain Widget opened as
+// the Window overlay, so it is dismissed by an outside click like any popover
+// and can be restyled by subclassing (override draw) or reshaped by swapping
+// the action list. Modelled on Popover's self-placement.
+export class SelectionToolbar extends Widget {
+    anchor_x: int;      // horizontal centre of the selection
+    anchor_y: int;      // top edge of the selection (toolbar sits above it)
+    actions: SelectionAction[];
+    sel: SelectionModel;
+    alpha: float;       // fade-in progress (honoured on the rich gfx tier)
+    pad: int;
+    gap: int;
+    btn_x: int[];       // per-action left x, computed in place()
+    btn_w: int[];       // per-action width, computed in place()
+
+    fn init(ax: int, ay: int, actions: SelectionAction[], sel: SelectionModel) {
+        super.init();
+        this.anchor_x = ax;
+        this.anchor_y = ay;
+        this.actions = actions;
+        this.sel = sel;
+        this.modal = false;
+        this.alpha = 0.0;
+        this.pad = 10;
+        this.gap = 4;
+        this.btn_x = [];
+        this.btn_w = [];
+        let self = this;
+        this.animate_value(0.0, 1.0, 120, false, EASE_OUT_CUBIC, (a) => { self.alpha = a; });
+    }
+
+    fn btn_rect(i: int): Rect {
+        return Rect(this.btn_x[i], this.bounds.y + this.pad,
+                    this.btn_w[i], this.bounds.h - 2 * this.pad);
+    }
+
+    override fn place(s: Painter, th: Theme) {
+        this.btn_x = [];
+        this.btn_w = [];
+        let h = s.font_height() + 2 * this.pad;
+        let total = this.pad;
+        for (let a in this.actions) {
+            let bw = s.text_width(a.label) + 2 * this.pad;
+            this.btn_w.push(bw);
+            total += bw + this.gap;
+        }
+        if (this.actions.len > 0) { total -= this.gap; }
+        total += this.pad;
+        let w = total;
+        let x = this.anchor_x - w / 2;
+        let y = this.anchor_y - h - 8;      // above the selection
+        if (y < 0) { y = this.anchor_y + 8; } // no room above: flip below
+        if (x + w > s.width()) { x = s.width() - w; }
+        if (x < 0) { x = 0; }
+        if (y + h > s.height()) { y = s.height() - h; }
+        this.bounds = Rect(x, y, w, h);
+        let bx = x + this.pad;
+        for (let i in 0..this.actions.len) {
+            this.btn_x.push(bx);
+            bx += this.btn_w[i] + this.gap;
+        }
+    }
+
+    override fn draw(s: Painter, th: Theme) {
+        let av = (this.alpha * 255.0) as int;
+        if (av < 0) { av = 0; }
+        if (av > 255) { av = 255; }
+        let fill = with_alpha(th.surface_raised, av);
+        let border = with_alpha(th.border, av);
+        this.win.skin.panel.paint(s, th, this.bounds, th.radius_md, fill, border, 2);
+        let ink = with_alpha(th.on_surface, av);
+        for (let i in 0..this.actions.len) {
+            let r = this.btn_rect(i);
+            s.text_center(r, this.actions[i].label, ink);
+        }
+    }
+
+    override fn on_click(x: int, y: int): bool {
+        if (!contains(this.bounds, x, y)) {
+            if (this.win != null) { this.win.dismiss_overlay(); }
+            return true;
+        }
+        for (let i in 0..this.actions.len) {
+            if (contains(this.btn_rect(i), x, y)) {
+                let a = this.actions[i];
+                if (a.run != null && this.sel != null) { a.run(this.sel); }
+                if (this.win != null) { this.win.dismiss_overlay(); }
+                return true;
+            }
+        }
+        return true;
+    }
+
+    override fn drop_handlers() {
+        this.actions = [];
+        this.sel = null;
+    }
+}
+
+// Build and open the selection toolbar over a selection. anchor_x is the
+// horizontal centre of the selected run; anchor_y_top is its top edge. `extra`
+// (may be null) appends app-supplied actions after Copy / Select All. No-op if
+// the widget isn't mounted or the selection is empty.
+export fn open_selection_toolbar(host: Widget, sel: SelectionModel,
+                                 anchor_x: int, anchor_y_top: int,
+                                 extra: SelectionAction[]) {
+    let win = host.win;
+    if (win == null) { return; }
+    if (sel.empty()) { return; }
+    let acts = default_actions(win);
+    if (extra != null) {
+        for (let a in extra) { acts.push(a); }
+    }
+    let tb: SelectionToolbar = null;
+    if (sel.toolbar_factory != null) {
+        tb = sel.toolbar_factory(anchor_x, anchor_y_top, acts, sel);
+    } else {
+        tb = new SelectionToolbar(anchor_x, anchor_y_top, acts, sel);
+    }
+    win.open_overlay(tb);
+}

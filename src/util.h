@@ -1,5 +1,5 @@
-#ifndef VOLT_UTIL_H
-#define VOLT_UTIL_H
+#ifndef VYTO_UTIL_H
+#define VYTO_UTIL_H
 
 #include <stdbool.h>
 #include <stddef.h>

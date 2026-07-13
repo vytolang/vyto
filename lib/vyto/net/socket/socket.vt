@@ -1,0 +1,239 @@
+// vyto/net/socket — raw TCP/UDP sockets.
+//
+//     let s = socket_connect("example.com", 80);
+//     s.sendText("GET / HTTP/1.0\r\nHost: example.com\r\n\r\n");
+//     print(s.recvText(4096));
+//
+// Blocking (Vyto has no threads); guard against a dead peer with setTimeoutMs.
+// The fd lives inside `Socket` and is closed by deinit, so a dropped socket
+// releases its descriptor deterministically. connect/listen/accept return null
+// on failure (a soft runtime condition); operating on a closed socket is a
+// programmer error and panics. Linux + macOS; IPv4/IPv6 for connect, IPv4 for
+// the listen/UDP helpers.
+
+extern "C" {
+    fn vsock_connect(host: cstring, port: i32): i32;
+    fn vsock_listen(host: cstring, port: i32, backlog: i32): i32;
+    fn vsock_accept(fd: i32): i32;
+    fn vsock_local_port(fd: i32): i32;
+    fn vsock_send(fd: i32, buf: cstring, n: i64): i64;
+    fn vsock_recv(fd: i32, buf: cstring, cap: i64): i64;
+    fn vsock_set_timeout(fd: i32, ms: i32): i32;
+    fn vsock_set_nodelay(fd: i32, on: i32): i32;
+    fn vsock_close(fd: i32);
+    fn vsock_udp_bind(host: cstring, port: i32): i32;
+    fn vsock_sendto(fd: i32, host: cstring, port: i32, buf: cstring, n: i64): i64;
+    fn vsock_recvfrom(fd: i32, buf: cstring, cap: i64): i64;
+
+    // non-blocking (async)
+    fn vsock_set_nonblocking(fd: i32, on: i32): i32;
+    fn vsock_try_recv(fd: i32, buf: cstring, cap: i64): i64;
+    fn vsock_try_send(fd: i32, buf: cstring, n: i64): i64;
+    fn vsock_try_accept(fd: i32): i32;
+    fn vsock_connect_async(host: cstring, port: i32): i32;
+    fn vsock_conn_result(fd: i32): i32;
+
+    // poll set (event loop)
+    fn vpoll_new(): rawptr;
+    fn vpoll_add(h: rawptr, fd: i32, events: i32): i32;
+    fn vpoll_mod(h: rawptr, fd: i32, events: i32): i32;
+    fn vpoll_del(h: rawptr, fd: i32): i32;
+    fn vpoll_wait(h: rawptr, timeout_ms: i32): i32;
+    fn vpoll_ready_fd(h: rawptr, i: i32): i32;
+    fn vpoll_ready_events(h: rawptr, i: i32): i32;
+    fn vpoll_free(h: rawptr);
+}
+
+// Event bits for PollSet (match the native VP_* contract).
+export const POLL_READ:  int = 1;
+export const POLL_WRITE: int = 2;
+export const POLL_ERR:   int = 4;
+
+// Result of a non-blocking read. `status`: >0 = bytes in `data`, 0 = peer
+// closed (EOF), -1 = would-block (retry later), -2 = error. `data` is populated
+// (and right-sized) only when status > 0.
+export class RecvResult {
+    status: int;
+    data: byte[];
+    fn init(status: int, data: byte[]) { this.status = status; this.data = data; }
+    fn wouldBlock(): bool { return this.status == -1; }
+    fn eof(): bool { return this.status == 0; }
+}
+
+// Copy the first `n` bytes of `buf` into a right-sized array.
+fn take(buf: byte[], n: int): byte[] {
+    if (n <= 0) { return bytes(0); }
+    if (n == buf.len) { return buf; }
+    let out = bytes(n);
+    let i = 0;
+    while (i < n) { out[i] = buf[i]; i += 1; }
+    return out;
+}
+
+export class Socket {
+    fd: i32;
+
+    fn init(fd: i32) { this.fd = fd; }
+
+    fn ensure() { if ((this.fd as int) < 0) { panic("vyto/net/socket: operation on a closed socket"); } }
+    fn isValid(): bool { return (this.fd as int) >= 0; }
+
+    // ---- TCP stream ----
+    fn send(data: byte[]): int {
+        this.ensure();
+        return vsock_send(this.fd, data as cstring, data.len as i64) as int;
+    }
+    fn sendText(s: string): int {
+        this.ensure();
+        return vsock_send(this.fd, s.cstr(), s.len as i64) as int;
+    }
+    // Read up to `n` bytes; result length is what was actually read (0 on EOF
+    // or timeout).
+    fn recv(n: int): byte[] {
+        this.ensure();
+        if (n <= 0) { return bytes(0); }
+        let buf = bytes(n);
+        let got = vsock_recv(this.fd, buf as cstring, n as i64) as int;
+        return take(buf, got);
+    }
+    fn recvText(n: int): string { return str(this.recv(n) as cstring); }
+
+    // Accept the next pending connection on a listening socket (null on error).
+    fn accept(): Socket {
+        this.ensure();
+        let c = vsock_accept(this.fd) as int;
+        if (c < 0) { return null; }
+        return new Socket(c as i32);
+    }
+    // The bound local port (useful after socket_listen(0) picked an ephemeral one).
+    fn localPort(): int { this.ensure(); return vsock_local_port(this.fd) as int; }
+
+    fn setTimeoutMs(ms: int): bool { this.ensure(); return vsock_set_timeout(this.fd, ms as i32) as int == 0; }
+    fn setNoDelay(on: bool): bool {
+        this.ensure();
+        let v = 0;
+        if (on) { v = 1; }
+        return vsock_set_nodelay(this.fd, v as i32) as int == 0;
+    }
+
+    // ---- UDP datagram ----
+    fn sendTo(host: string, port: int, data: byte[]): int {
+        this.ensure();
+        return vsock_sendto(this.fd, host.cstr(), port as i32, data as cstring, data.len as i64) as int;
+    }
+    fn recvFrom(n: int): byte[] {
+        this.ensure();
+        if (n <= 0) { return bytes(0); }
+        let buf = bytes(n);
+        let got = vsock_recvfrom(this.fd, buf as cstring, n as i64) as int;
+        return take(buf, got);
+    }
+
+    // ---- non-blocking (async) ----
+    // Switch the socket between blocking and non-blocking mode.
+    fn setNonBlocking(on: bool): bool {
+        this.ensure();
+        let v = 0;
+        if (on) { v = 1; }
+        return vsock_set_nonblocking(this.fd, v as i32) as int == 0;
+    }
+    // Non-blocking read of up to `n` bytes. Inspect the RecvResult's status to
+    // tell bytes / EOF / would-block / error apart.
+    fn tryRecv(n: int): RecvResult {
+        this.ensure();
+        if (n <= 0) { return new RecvResult(0, bytes(0)); }
+        let buf = bytes(n);
+        let r = vsock_try_recv(this.fd, buf as cstring, n as i64) as int;
+        if (r > 0) { return new RecvResult(r, take(buf, r)); }
+        return new RecvResult(r, bytes(0));
+    }
+    // Non-blocking write. Returns bytes sent (>=0), -1 would-block, -2 error.
+    fn trySend(data: byte[]): int {
+        this.ensure();
+        return vsock_try_send(this.fd, data as cstring, data.len as i64) as int;
+    }
+    // Non-blocking accept. Null when nothing is pending (or on error); the
+    // accepted socket is itself non-blocking.
+    fn tryAccept(): Socket {
+        this.ensure();
+        let c = vsock_try_accept(this.fd) as int;
+        if (c < 0) { return null; }
+        return new Socket(c as i32);
+    }
+    // For a socket from socket_connect_async: once it is POLL_WRITE-ready,
+    // 0 = connected, >0 = errno (failed), -1 = getsockopt error.
+    fn connResult(): int { this.ensure(); return vsock_conn_result(this.fd) as int; }
+
+    fn close() {
+        if ((this.fd as int) >= 0) { vsock_close(this.fd); this.fd = -1 as i32; }
+    }
+    deinit { this.close(); }
+}
+
+// A set of sockets watched for readiness — the honest single-thread concurrency
+// primitive (nginx-style). epoll on Linux, poll(2) elsewhere; identical bits
+// either way. Register fds with events (POLL_READ | POLL_WRITE), block in
+// `wait`, then walk the ready list. `readyFd` returns a raw fd, so keep your own
+// Map<int, Socket> of live connections.
+//
+//     let ps = new PollSet();
+//     ps.add(listener, POLL_READ);
+//     while (true) {
+//         let n = ps.wait(-1);
+//         let i = 0;
+//         while (i < n) {
+//             let fd = ps.readyFd(i);
+//             ... dispatch on fd ...
+//             i += 1;
+//         }
+//     }
+export class PollSet {
+    h: rawptr;
+    fn init() { this.h = vpoll_new(); }
+
+    fn add(s: Socket, events: int): bool { return vpoll_add(this.h, s.fd, events as i32) as int == 0; }
+    fn addFd(fd: int, events: int): bool { return vpoll_add(this.h, fd as i32, events as i32) as int == 0; }
+    fn modify(s: Socket, events: int): bool { return vpoll_mod(this.h, s.fd, events as i32) as int == 0; }
+    fn remove(s: Socket): bool { return vpoll_del(this.h, s.fd) as int == 0; }
+    fn removeFd(fd: int): bool { return vpoll_del(this.h, fd as i32) as int == 0; }
+
+    // Block up to timeoutMs (-1 = forever, 0 = poll now). Returns the number of
+    // ready fds (0 on timeout), -1 on error.
+    fn wait(timeoutMs: int): int { return vpoll_wait(this.h, timeoutMs as i32) as int; }
+    fn readyFd(i: int): int { return vpoll_ready_fd(this.h, i as i32) as int; }
+    fn readyEvents(i: int): int { return vpoll_ready_events(this.h, i as i32) as int; }
+
+    deinit { if (this.h != null) { vpoll_free(this.h); this.h = null; } }
+}
+
+// Connect a TCP socket to host:port (IPv4 or IPv6). Null on failure.
+export fn socket_connect(host: string, port: int): Socket {
+    let fd = vsock_connect(host.cstr(), port as i32) as int;
+    if (fd < 0) { return null; }
+    return new Socket(fd as i32);
+}
+
+// Start a non-blocking TCP connect (returns before the handshake completes).
+// Null on setup failure. Poll the socket for POLL_WRITE, then check connResult()
+// == 0 before using it.
+export fn socket_connect_async(host: string, port: int): Socket {
+    let fd = vsock_connect_async(host.cstr(), port as i32) as int;
+    if (fd < 0) { return null; }
+    return new Socket(fd as i32);
+}
+
+// Listen for TCP connections on all interfaces. Pass port 0 for an ephemeral
+// port (read it back with localPort). Null on failure.
+export fn socket_listen(port: int): Socket { return socket_listen_on("", port, 16); }
+export fn socket_listen_on(host: string, port: int, backlog: int): Socket {
+    let fd = vsock_listen(host.cstr(), port as i32, backlog as i32) as int;
+    if (fd < 0) { return null; }
+    return new Socket(fd as i32);
+}
+
+// Bind a UDP socket. Null on failure.
+export fn socket_udp_bind(port: int): Socket {
+    let fd = vsock_udp_bind("".cstr(), port as i32) as int;
+    if (fd < 0) { return null; }
+    return new Socket(fd as i32);
+}

@@ -1,0 +1,674 @@
+// vyto/ui/nav — navigation widgets: Tabs/TabView, Accordion/Expander,
+// Toolbar, StatusBar.
+
+import { Widget, Painter, Theme, Size, BoxConstraints, bcLoose,
+         WEIGHT_REG, WEIGHT_BOLD } from "vyto/ui/core";
+import { Rect, contains, mix, KEY_LEFT, KEY_RIGHT, KEY_UP, KEY_DOWN } from "vyto/surface";
+
+// ------------------------------------------------------- Tabs / TabView
+
+// A tab strip + a content area switching the active panel.
+export class TabView extends Widget {
+    tab_labels: string[];
+    active: int;
+    tab_h: int;
+    onSwitch: fn(int);
+    tab_x: int[];      // cached left edge of each tab
+    tab_w_arr: int[];  // cached width of each tab
+
+    fn init(labels: string[]) {
+        super.init();
+        this.tab_labels = labels;
+        this.active = 0;
+        this.tab_h = 28;
+        this.tab_x = [];
+        this.tab_w_arr = [];
+        this.focusable = true;
+    }
+
+    fn add_panel(child: Widget) {
+        this.add(child);
+    }
+
+    fn switch_tab(i: int) {
+        if (i < 0 || i >= this.tab_labels.len) { return; }
+        this.active = i;
+        if (this.onSwitch != null) { this.onSwitch(i); }
+        // re-layout so the newly active panel gets arranged, then repaint
+        let w = this.win;
+        if (w != null) {
+            w.layout();
+            w.redraw();
+        }
+    }
+
+    fn tab_w(s: Painter, idx: int): int {
+        return s.text_width(this.tab_labels[idx]) + 20;
+    }
+
+    override fn measure(s: Painter, th: Theme): Size {
+        let tw = 0;
+        for (let i in 0..this.tab_labels.len) {
+            tw += this.tab_w(s, i);
+        }
+        let w = tw;
+        let h = this.tab_h;
+        if (this.active < this.children.len) {
+            let cs = this.children[this.active].measure(s, th);
+            if (cs.w > w) { w = cs.w; }
+            h += cs.h + 2;
+        }
+        return Size(w, h);
+    }
+
+    override fn layout(s: Painter, th: Theme, bc: BoxConstraints): Size {
+        let sz = bc.constrain(this.measure(s, th));
+        // cache tab positions for hit-testing
+        let xs: int[] = [];
+        let ws: int[] = [];
+        let x = this.bounds.x;
+        for (let i in 0..this.tab_labels.len) {
+            let tw = this.tab_w(s, i);
+            xs.push(x);
+            ws.push(tw);
+            x += tw;
+        }
+        this.tab_x = xs;
+        this.tab_w_arr = ws;
+        return sz;
+    }
+
+    override fn arrange(s: Painter, th: Theme, r: Rect) {
+        this.bounds = r;
+        // re-cache tab positions for hit-testing
+        let xs: int[] = [];
+        let ws: int[] = [];
+        let x = r.x;
+        for (let i in 0..this.tab_labels.len) {
+            let tw = this.tab_w(s, i);
+            xs.push(x);
+            ws.push(tw);
+            x += tw;
+        }
+        this.tab_x = xs;
+        this.tab_w_arr = ws;
+        // arrange ALL children into the content rect so they all have
+        // valid bounds; draw() only renders the active one.
+        let cr = Rect(r.x, r.y + this.tab_h + 2, r.w, r.h - this.tab_h - 2);
+        for (let i in 0..this.children.len) {
+            this.children[i].arrange(s, th, cr);
+        }
+    }
+
+    override fn draw(s: Painter, th: Theme) {
+        this.draw_chrome(s, th);
+        // active panel only — inactive panels are not rendered
+        if (this.active < this.children.len) {
+            this.children[this.active].draw(s, th);
+        }
+    }
+
+    // Partial repaint: only walk the active panel.
+    override fn draw_within(s: Painter, th: Theme, d: Rect) {
+        // prune if we don't intersect the dirty rect
+        let b = this.bounds;
+        if (b.x + b.w <= d.x || d.x + d.w <= b.x ||
+            b.y + b.h <= d.y || d.y + d.h <= b.y) { return; }
+        this.draw_chrome(s, th);
+        if (this.active < this.children.len) {
+            this.children[this.active].draw_within(s, th, d);
+        }
+    }
+
+    override fn draw_chrome(s: Painter, th: Theme) {
+        // tab strip background
+        s.fill(Rect(this.bounds.x, this.bounds.y, this.bounds.w, this.tab_h), th.surface);
+        let x = this.bounds.x;
+        let xs: int[] = [];
+        let ws: int[] = [];
+        for (let i in 0..this.tab_labels.len) {
+            let tw = this.tab_w(s, i);
+            xs.push(x);
+            ws.push(tw);
+            let tr = Rect(x, this.bounds.y, tw, this.tab_h);
+            if (i == this.active) {
+                s.set_weight(WEIGHT_BOLD);
+                s.text_in(tr, 10, this.tab_labels[i], th.on_surface);
+                s.set_weight(WEIGHT_REG);
+                // active-tab accent underline
+                let uw = tw - 20;
+                if (uw < 0) { uw = tw; }
+                let ux = x + 10;
+                s.fill(Rect(ux, this.bounds.y + this.tab_h - 3, uw, 3), th.primary);
+            } else {
+                let col = th.on_surface_muted;
+                if (this.hovered) { col = mix(th.on_surface_muted, th.on_surface, 0.35); }
+                s.text_in(tr, 10, this.tab_labels[i], col);
+            }
+            x += tw;
+        }
+        this.tab_x = xs;
+        this.tab_w_arr = ws;
+        // separator hairline under the strip
+        s.line(this.bounds.x, this.bounds.y + this.tab_h,
+               this.bounds.x + this.bounds.w, this.bounds.y + this.tab_h, th.divider);
+    }
+
+    // Only the active panel participates in hit-testing — inactive panels
+    // all share the same content rect, so without this override the hit test
+    // would find whichever panel happens to be last in the children array.
+    override fn hit(px: int, py: int): Widget {
+        // tab strip: the TabView itself is the target
+        if (py >= this.bounds.y && py < this.bounds.y + this.tab_h) {
+            if (contains(this.bounds, px, py)) { return this; }
+            return null;
+        }
+        // content area: only hit-test the active panel
+        if (this.active < this.children.len) {
+            return this.children[this.active].hit(px, py);
+        }
+        return null;
+    }
+
+    override fn on_click(x: int, y: int): bool {
+        if (y < this.bounds.y || y >= this.bounds.y + this.tab_h) { return false; }
+        for (let i in 0..this.tab_x.len) {
+            if (x >= this.tab_x[i] && x < this.tab_x[i] + this.tab_w_arr[i]) {
+                this.switch_tab(i);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    override fn on_key(k: int, ch: string): bool {
+        if (k == KEY_LEFT) {
+            if (this.active > 0) { this.switch_tab(this.active - 1); return true; }
+        }
+        if (k == KEY_RIGHT) {
+            if (this.active < this.tab_labels.len - 1) { this.switch_tab(this.active + 1); return true; }
+        }
+        return false;
+    }
+
+    // Only collect focusable widgets from the active panel — inactive panels
+    // are not visible and should not be in the Tab ring.
+    override fn collect_focus(out: Widget[]) {
+        if (this.focusable) { out.push(this); }
+        if (this.active < this.children.len) {
+            this.children[this.active].collect_focus(out);
+        }
+    }
+
+    override fn drop_handlers() {
+        this.onSwitch = null;
+    }
+}
+
+// ------------------------------------------------------- Accordion / Expander
+
+// Collapsible titled sections.
+export class Accordion extends Widget {
+    titles: string[];
+    expanded: bool[];
+    onToggle: fn(int, bool);
+    cached_hh: int;     // cached header height for click hit-testing
+    cached_child_h: int[]; // cached child heights for click hit-testing
+    hover_i: int;       // header row under the cursor (-1 = none), for hover tint
+
+    fn init(titles: string[]) {
+        super.init();
+        this.titles = titles;
+        this.expanded = [];
+        this.cached_hh = 26;
+        this.cached_child_h = [];
+        this.hover_i = -1;
+        for (let i in 0..titles.len) {
+            this.expanded.push(false);
+            this.cached_child_h.push(0);
+        }
+    }
+
+    fn add_section(child: Widget) {
+        this.add(child);
+    }
+
+    fn toggle(i: int) {
+        if (i < 0 || i >= this.titles.len) { return; }
+        this.expanded[i] = !this.expanded[i];
+        if (this.onToggle != null) { this.onToggle(i, this.expanded[i]); }
+        // expanding/collapsing changes the layout — re-layout, then repaint via
+        // the dirty-region path (invalidate) rather than a full-window redraw so
+        // the accordion doesn't flash the whole window on every toggle.
+        let w = this.win;
+        if (w != null) {
+            w.layout();
+            this.invalidate();
+            w.repaint();
+        }
+    }
+
+    fn header_h(s: Painter): int { return s.font_height() + 12; }
+
+    override fn measure(s: Painter, th: Theme): Size {
+        let w = 0;
+        let h = 0;
+        let hh = this.header_h(s);
+        for (let i in 0..this.titles.len) {
+            let tw = s.text_width(this.titles[i]) + 30;
+            if (tw > w) { w = tw; }
+            h += hh;
+            if (this.expanded[i] && i < this.children.len) {
+                let cs = this.children[i].measure(s, th);
+                h += cs.h + th.spacing;
+                if (cs.w + 20 > w) { w = cs.w + 20; }
+            }
+        }
+        return Size(w, h);
+    }
+
+    override fn arrange(s: Painter, th: Theme, r: Rect) {
+        this.bounds = r;
+        this.cached_hh = this.header_h(s);
+        let y = r.y;
+        let hh = this.cached_hh;
+        let chs: int[] = [];
+        for (let i in 0..this.titles.len) {
+            chs.push(0);
+        }
+        for (let i in 0..this.titles.len) {
+            y += hh;
+            if (this.expanded[i] && i < this.children.len) {
+                let cs = this.children[i].measure(s, th);
+                this.children[i].arrange(s, th, Rect(r.x + 12, y, r.w - 24, cs.h));
+                chs[i] = cs.h;
+                y += cs.h + th.spacing;
+            }
+        }
+        this.cached_child_h = chs;
+    }
+
+    // All the accordion's own painting — headers, chevrons, titles, dividers —
+    // lives here (not in draw), so a dirty-region repaint (hover, a child edit)
+    // restores it. Children are positioned by arrange(); this only reads their
+    // cached heights to place dividers/next header. Mirrors TabView.draw_chrome.
+    override fn draw_chrome(s: Painter, th: Theme) {
+        let y = this.bounds.y;
+        let hh = this.cached_hh;
+        for (let i in 0..this.titles.len) {
+            let hr = Rect(this.bounds.x, y, this.bounds.w, hh);
+            let header_bg = th.surface_raised;
+            if (this.hover_i == i) { header_bg = mix(th.surface_raised, th.on_surface, 0.04); }
+            s.fill(hr, header_bg);
+            // stroked chevron (right = collapsed, down = expanded), not a letter
+            let ccx = hr.x + 12;
+            let ccy = hr.y + hh / 2;
+            if (this.expanded[i]) {
+                s.line_w(ccx - 4, ccy - 2, ccx, ccy + 2, 2, th.on_surface);
+                s.line_w(ccx, ccy + 2, ccx + 4, ccy - 2, 2, th.on_surface);
+            } else {
+                s.line_w(ccx - 2, ccy - 4, ccx + 2, ccy, 2, th.on_surface);
+                s.line_w(ccx + 2, ccy, ccx - 2, ccy + 4, 2, th.on_surface);
+            }
+            s.set_weight(WEIGHT_BOLD);
+            s.text_in(hr, 22, this.titles[i], th.on_surface);
+            s.set_weight(WEIGHT_REG);
+            y += hh;
+            if (this.expanded[i] && i < this.cached_child_h.len) {
+                y += this.cached_child_h[i] + th.spacing;
+            }
+            s.line(this.bounds.x, y, this.bounds.x + this.bounds.w, y, th.divider);
+        }
+    }
+
+    override fn draw(s: Painter, th: Theme) {
+        this.cached_hh = this.header_h(s);
+        this.draw_chrome(s, th);
+        for (let i in 0..this.titles.len) {
+            if (this.expanded[i] && i < this.children.len) {
+                this.children[i].draw(s, th);
+            }
+        }
+    }
+
+    override fn draw_within(s: Painter, th: Theme, d: Rect) {
+        let b = this.bounds;
+        if (b.x + b.w <= d.x || d.x + d.w <= b.x ||
+            b.y + b.h <= d.y || d.y + d.h <= b.y) { return; }
+        this.draw_chrome(s, th);
+        for (let i in 0..this.titles.len) {
+            if (this.expanded[i] && i < this.children.len) {
+                this.children[i].draw_within(s, th, d);
+            }
+        }
+    }
+
+    // Header index at local y (-1 when y is over a body or gap). Uses th.spacing
+    // so it stays aligned with arrange()/draw_chrome (was a hardcoded +8).
+    fn header_at(py: int): int {
+        let cy = this.bounds.y;
+        let hh = this.cached_hh;
+        let gap = 8;
+        if (this.win != null) { gap = this.win.theme.spacing; }
+        for (let i in 0..this.titles.len) {
+            if (py >= cy && py < cy + hh) { return i; }
+            cy += hh;
+            if (this.expanded[i] && i < this.cached_child_h.len) {
+                cy += this.cached_child_h[i] + gap;
+            }
+        }
+        return -1;
+    }
+
+    override fn on_click(x: int, y: int): bool {
+        let i = this.header_at(y);
+        if (i >= 0) { this.toggle(i); return true; }
+        return false;
+    }
+
+    // Track the hovered header for the tint. hit() runs on every hover move
+    // (Window.set_hover), so recomputing here keeps hover_i live without a
+    // per-position hover callback; a body/gap yields -1 (no header tinted).
+    override fn hit(px: int, py: int): Widget {
+        // base hit, but only visible (expanded) children are hittable
+        // (super.hit isn't callable in Vyto; inline the deepest-child walk).
+        let found: Widget = null;
+        let n = this.titles.len;
+        for (let i in 0..n) {
+            let idx = n - 1 - i;
+            if (this.expanded[idx] && idx < this.children.len) {
+                let f = this.children[idx].hit(px, py);
+                if (f != null) { found = f; break; }
+            }
+        }
+        if (found == null && contains(this.bounds, px, py)) { found = this; }
+        if (contains(this.bounds, px, py)) {
+            let hi = this.header_at(py);
+            if (hi != this.hover_i) { this.hover_i = hi; this.invalidate(); }
+        }
+        return found;
+    }
+
+    override fn on_hover_leave(): bool {
+        if (this.hover_i != -1) { this.hover_i = -1; return true; }
+        return false;
+    }
+
+    override fn drop_handlers() {
+        this.onToggle = null;
+    }
+}
+
+// ---------------------------------------------------------------- Toolbar
+
+// Horizontal action strip of buttons (icon support later).
+export class Toolbar extends Widget {
+    padding: int;
+    spacing: int;
+
+    fn init(padding: int, spacing: int, kids: Widget[]) {
+        super.init();
+        this.padding = padding;
+        this.spacing = spacing;
+        for (let k in kids) { this.add(k); }
+    }
+
+    override fn measure(s: Painter, th: Theme): Size {
+        let w = 2 * this.padding;
+        let h = 0;
+        let n = this.children.len;
+        for (let c in this.children) {
+            let cs = c.measure(s, th);
+            w += cs.w;
+            if (cs.h > h) { h = cs.h; }
+        }
+        if (n > 1) { w += this.spacing * (n - 1); }
+        return Size(w, h + 2 * this.padding);
+    }
+
+    override fn arrange(s: Painter, th: Theme, r: Rect) {
+        this.bounds = r;
+        let x = r.x + this.padding;
+        let y = r.y + this.padding;
+        let inner_h = r.h - 2 * this.padding;
+        for (let c in this.children) {
+            let cs = c.measure(s, th);
+            c.arrange(s, th, Rect(x, y, cs.w, inner_h));
+            x += cs.w + this.spacing;
+        }
+    }
+
+    override fn draw(s: Painter, th: Theme) {
+        s.fill(this.bounds, th.surface_raised);
+        s.line(this.bounds.x, this.bounds.y,
+               this.bounds.x + this.bounds.w, this.bounds.y, th.divider);
+        for (let c in this.children) { c.draw(s, th); }
+    }
+}
+
+// --------------------------------------------------------------- StatusBar
+
+// Bottom info strip with left/right text slots.
+export class StatusBar extends Widget {
+    left_text: string;
+    right_text: string;
+
+    fn init(left_text: string, right_text: string) {
+        super.init();
+        this.left_text = left_text;
+        this.right_text = right_text;
+    }
+
+    fn bar_h(s: Painter): int { return s.font_height() + 8; }
+
+    override fn measure(s: Painter, th: Theme): Size {
+        return Size(200, this.bar_h(s));
+    }
+
+    override fn arrange(s: Painter, th: Theme, r: Rect) {
+        this.bounds = r;
+    }
+
+    override fn draw(s: Painter, th: Theme) {
+        s.fill(this.bounds, th.surface);
+        s.line(this.bounds.x, this.bounds.y,
+               this.bounds.x + this.bounds.w, this.bounds.y, th.divider);
+        s.text_in(Rect(this.bounds.x + 8, this.bounds.y,
+                       this.bounds.w / 2, this.bounds.h), 0, this.left_text, th.on_surface_muted);
+        let rw = s.text_width(this.right_text);
+        s.text_in(Rect(this.bounds.x + this.bounds.w - rw - 8, this.bounds.y,
+                       rw + 8, this.bounds.h), 0, this.right_text, th.on_surface_muted);
+    }
+}
+
+// --------------------------------------------------------------- Breadcrumb
+
+// A horizontal path trail: clickable ancestor crumbs separated by chevrons,
+// the last crumb bold and inert (the current location). Leaf widget — painting
+// in draw() is correct (the base draw_within draws leaves whole).
+export class Breadcrumb extends Widget {
+    crumbs: string[];
+    onSelect: fn(int);
+    hover_i: int;
+    seg_x: int[];   // cached per-crumb hit x-start (set in draw)
+    seg_w: int[];   // cached per-crumb text width
+
+    fn init(crumbs: string[]) {
+        super.init();
+        this.crumbs = crumbs;
+        this.hover_i = -1;
+        this.seg_x = [];
+        this.seg_w = [];
+    }
+
+    fn sep_w(): int { return 18; }
+
+    override fn measure(s: Painter, th: Theme): Size {
+        let w = 8;
+        let n = this.crumbs.len;
+        for (let i in 0..n) {
+            w += s.text_width(this.crumbs[i]);
+            if (i < n - 1) { w += this.sep_w(); }
+        }
+        return Size(w, s.font_height() + 10);
+    }
+
+    override fn draw(s: Painter, th: Theme) {
+        this.seg_x = [];
+        this.seg_w = [];
+        let x = this.bounds.x + 4;
+        let cy = this.bounds.y + this.bounds.h / 2;
+        let base = s.baseline_in(this.bounds);
+        let n = this.crumbs.len;
+        for (let i in 0..n) {
+            let tw = s.text_width(this.crumbs[i]);
+            this.seg_x.push(x);
+            this.seg_w.push(tw);
+            let last = i == n - 1;
+            let col = th.on_surface_muted;
+            if (last) { col = th.on_surface; s.set_weight(WEIGHT_BOLD); }
+            else if (this.hover_i == i) { col = th.primary; }
+            s.text(x, base, this.crumbs[i], col);
+            if (last) { s.set_weight(WEIGHT_REG); }
+            x += tw;
+            if (!last) {
+                let ccx = x + this.sep_w() / 2;
+                s.line_w(ccx - 2, cy - 4, ccx + 2, cy, 2, th.on_surface_subtle);
+                s.line_w(ccx + 2, cy, ccx - 2, cy + 4, 2, th.on_surface_subtle);
+                x += this.sep_w();
+            }
+        }
+    }
+
+    fn crumb_at(px: int): int {
+        for (let i in 0..this.seg_x.len) {
+            if (px >= this.seg_x[i] && px < this.seg_x[i] + this.seg_w[i]) { return i; }
+        }
+        return -1;
+    }
+
+    override fn on_click(x: int, y: int): bool {
+        let i = this.crumb_at(x);
+        // the last crumb is the current location — inert
+        if (i >= 0 && i < this.crumbs.len - 1) {
+            if (this.onSelect != null) { this.onSelect(i); }
+            return true;
+        }
+        return false;
+    }
+
+    override fn hit(px: int, py: int): Widget {
+        if (contains(this.bounds, px, py)) {
+            let hi = this.crumb_at(px);
+            if (hi == this.crumbs.len - 1) { hi = -1; } // don't tint the current
+            if (hi != this.hover_i) { this.hover_i = hi; this.invalidate(); }
+            return this;
+        }
+        return null;
+    }
+
+    override fn on_hover_leave(): bool {
+        if (this.hover_i != -1) { this.hover_i = -1; return true; }
+        return false;
+    }
+
+    override fn drop_handlers() {
+        this.onSelect = null;
+    }
+}
+
+// --------------------------------------------------------------- NavRail / Sidebar
+
+const NAVRAIL_ROW_H: int = 40;
+
+// A vertical navigation list: one selected item (accent bar + pill), hover
+// tint, keyboard Up/Down. Label-only (compose an Icon column in the app if
+// wanted). Leaf widget.
+export class NavRail extends Widget {
+    items: string[];
+    selected: int;
+    onSelect: fn(int);
+    hover_i: int;
+    rail_w: int;
+
+    fn init(items: string[]) {
+        super.init();
+        this.items = items;
+        this.selected = 0;
+        this.hover_i = -1;
+        this.rail_w = 168;
+        this.focusable = true;
+    }
+
+    override fn measure(s: Painter, th: Theme): Size {
+        return Size(this.rail_w, NAVRAIL_ROW_H * this.items.len + 8);
+    }
+
+    override fn draw(s: Painter, th: Theme) {
+        s.fill(this.bounds, th.surface_raised);
+        s.line(this.bounds.x + this.bounds.w - 1, this.bounds.y,
+               this.bounds.x + this.bounds.w - 1, this.bounds.y + this.bounds.h, th.divider);
+        let y = this.bounds.y + 4;
+        for (let i in 0..this.items.len) {
+            let rr = Rect(this.bounds.x + 6, y, this.bounds.w - 12, NAVRAIL_ROW_H - 4);
+            if (i == this.selected) {
+                s.fill_round(rr, th.radius_md, th.selection);
+                s.fill(Rect(this.bounds.x, y + 6, 3, NAVRAIL_ROW_H - 16), th.primary);
+            } else if (i == this.hover_i) {
+                s.fill_round(rr, th.radius_md, mix(th.surface_raised, th.on_surface, 0.05));
+            }
+            let col = th.on_surface;
+            if (i == this.selected) { col = th.primary; s.set_weight(WEIGHT_BOLD); }
+            s.text_in(rr, 12, this.items[i], col);
+            if (i == this.selected) { s.set_weight(WEIGHT_REG); }
+            y += NAVRAIL_ROW_H;
+        }
+    }
+
+    fn row_at(py: int): int {
+        let r = (py - this.bounds.y - 4) / NAVRAIL_ROW_H;
+        if (r < 0 || r >= this.items.len) { return -1; }
+        return r;
+    }
+
+    fn choose(i: int) {
+        this.selected = i;
+        if (this.onSelect != null) { this.onSelect(i); }
+    }
+
+    override fn on_click(x: int, y: int): bool {
+        let i = this.row_at(y);
+        if (i >= 0) { this.choose(i); return true; }
+        return false;
+    }
+
+    override fn on_key(k: int, ch: string): bool {
+        if (k == KEY_DOWN) {
+            if (this.selected < this.items.len - 1) { this.choose(this.selected + 1); }
+            return true;
+        }
+        if (k == KEY_UP) {
+            if (this.selected > 0) { this.choose(this.selected - 1); }
+            return true;
+        }
+        return false;
+    }
+
+    override fn hit(px: int, py: int): Widget {
+        if (contains(this.bounds, px, py)) {
+            let hi = this.row_at(py);
+            if (hi != this.hover_i) { this.hover_i = hi; this.invalidate(); }
+            return this;
+        }
+        return null;
+    }
+
+    override fn on_hover_leave(): bool {
+        if (this.hover_i != -1) { this.hover_i = -1; return true; }
+        return false;
+    }
+
+    override fn drop_handlers() {
+        this.onSelect = null;
+    }
+}

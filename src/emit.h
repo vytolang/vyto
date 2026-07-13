@@ -1,5 +1,5 @@
-#ifndef VOLT_EMIT_H
-#define VOLT_EMIT_H
+#ifndef VYTO_EMIT_H
+#define VYTO_EMIT_H
 
 #include "ast.h"
 

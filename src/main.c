@@ -43,7 +43,7 @@ static bool file_exists(const char *path) {
     return stat(path, &st) == 0;
 }
 
-/* Locate the stdlib directory: $VOLT_HOME/lib, else lib/ next to the voltc
+/* Locate the stdlib directory: $VYTO_HOME/lib, else lib/ next to the vytoc
    executable (or one level up, matching the runtime search). Cached; NULL
    when no lib directory exists. Canonicalized for prefix checks. */
 static const char *find_lib_dir(void) {
@@ -52,7 +52,7 @@ static const char *find_lib_dir(void) {
     if (cached) return libdir;
     cached = true;
     char real[PATH_MAX];
-    const char *env = getenv("VOLT_HOME");
+    const char *env = getenv("VYTO_HOME");
     if (env) {
         const char *p = arena_printf(&g_arena, "%s/lib", env);
         if (file_exists(p) && realpath(p, real)) return libdir = arena_strdup(&g_arena, real);
@@ -95,14 +95,14 @@ static void resolve_imports(Module *m, const char *basedir) {
             if (!path)
                 fatal_at(d->loc, "cannot resolve import \"%s\" (searched %s and %s)",
                          d->import_path, basedir,
-                         lib ? lib : "the stdlib — none found; set VOLT_HOME");
+                         lib ? lib : "the stdlib — none found; set VYTO_HOME");
         }
         d->import_module = load_module(path);
     }
 }
 
 /* Module name for a stdlib file: the lib-relative path, sanitized, with the
-   package layout's duplicate leaf collapsed (volt/ui/ui.vt -> volt_ui). This
+   package layout's duplicate leaf collapsed (vyto/ui/ui.vt -> volt_ui). This
    keeps lib module names collision-proof against user module stems. */
 static const char *lib_module_name(const char *libdir, const char *canon) {
     const char *rel = canon + strlen(libdir);
@@ -170,12 +170,12 @@ static int run_cmd(const char *cmd, bool verbose) {
     return WIFEXITED(rc) ? WEXITSTATUS(rc) : 128;
 }
 
-/* Locate the runtime directory relative to the voltc executable. */
+/* Locate the runtime directory relative to the vytoc executable. */
 static const char *find_runtime_dir(void) {
-    const char *env = getenv("VOLT_HOME");
+    const char *env = getenv("VYTO_HOME");
     if (env) {
         const char *p = arena_printf(&g_arena, "%s/runtime", env);
-        if (file_exists(arena_printf(&g_arena, "%s/volt_rt.c", p))) return p;
+        if (file_exists(arena_printf(&g_arena, "%s/vyto_rt.c", p))) return p;
     }
     char exe[4096];
     ssize_t n = readlink("/proc/self/exe", exe, sizeof exe - 1);
@@ -187,9 +187,9 @@ static const char *find_runtime_dir(void) {
             arena_printf(&g_arena, "%s/../runtime", d),
         };
         for (size_t i = 0; i < 2; i++)
-            if (file_exists(arena_printf(&g_arena, "%s/volt_rt.c", cands[i]))) return cands[i];
+            if (file_exists(arena_printf(&g_arena, "%s/vyto_rt.c", cands[i]))) return cands[i];
     }
-    fatal("cannot locate the Volt runtime (set VOLT_HOME)");
+    fatal("cannot locate the Vyto runtime (set VYTO_HOME)");
     return NULL;
 }
 
@@ -212,7 +212,7 @@ static bool cc_supports_san(const char *cc) {
     return cached == 1;
 }
 
-static const char *volt_triple(void) {
+static const char *vyto_triple(void) {
 #if defined(_WIN32) && defined(_M_X64)
     return "windows-x64";
 #elif defined(__APPLE__) && defined(__aarch64__)
@@ -240,9 +240,9 @@ static bool has_suffix(const char *s, const char *suf) {
 
 static void usage(void) {
     fprintf(stderr,
-            "voltc — the Volt compiler\n"
+            "vytoc — the Vyto compiler\n"
             "usage:\n"
-            "  voltc build <file.vt> [-o out] [--release] [--bundle] [--verbose]\n"
+            "  vytoc build <file.vt> [-o out] [--release] [--bundle] [--verbose]\n"
             "              [--target <triple>] [--cc <compiler cmd>]\n"
             "              [--freestanding] [--no-float] [--no-fs]\n"
             "    --bundle       statically link prebuilt native libs + the C++ runtime\n"
@@ -251,9 +251,9 @@ static void usage(void) {
             "                   the embedder supplies; output is lib<name>.a, not an exe\n"
             "    --no-float     stub float-to-string (no soft-float formatter pulled in)\n"
             "    --no-fs        drop the filesystem layer (File ops become no-ops/panics)\n"
-            "  voltc run   <file.vt> [--release] [--verbose] [-- args...]\n"
+            "  vytoc run   <file.vt> [--release] [--verbose] [-- args...]\n"
             "targets: linux-x64 linux-arm64 macos-x64 macos-arm64 windows-x64\n"
-            "  --cc (or VOLT_CC) overrides the C compiler; put sysroots/flags inside it,\n"
+            "  --cc (or VYTO_CC) overrides the C compiler; put sysroots/flags inside it,\n"
             "  e.g. --cc 'zig cc -target aarch64-linux-gnu' or (freestanding)\n"
             "  --cc 'arm-none-eabi-gcc -mcpu=cortex-m4 -ffreestanding'\n");
     exit(2);
@@ -306,10 +306,10 @@ int main(int argc, char **argv) {
     if (freestanding && do_run)
         fatal("freestanding builds produce a library, not a runnable executable — "
               "link libvolt.a into your firmware and flash it");
-    if (!cc_override) cc_override = getenv("VOLT_CC");
+    if (!cc_override) cc_override = getenv("VYTO_CC");
     if (target && !known_triple(target))
-        fatal("unknown target '%s' (see voltc --help for the list)", target);
-    const char *host = volt_triple();
+        fatal("unknown target '%s' (see vytoc --help for the list)", target);
+    const char *host = vyto_triple();
     const char *triple = target ? target : host;
     bool cross = strcmp(triple, host) != 0;
     bool win_target = strncmp(triple, "windows", 7) == 0;
@@ -322,7 +322,7 @@ int main(int argc, char **argv) {
     check_all(g_modules, entry);
 
     /* ---- emit C into the cache dir (per-target subdir for explicit targets) ---- */
-    const char *cache = arena_printf(&g_arena, "%s/.volt-cache", dir_of(input));
+    const char *cache = arena_printf(&g_arena, "%s/.vyto-cache", dir_of(input));
     mkdir(cache, 0755);
     if (target) {
         cache = arena_printf(&g_arena, "%s/%s", cache, target);
@@ -332,17 +332,17 @@ int main(int argc, char **argv) {
     const char *rtdir = find_runtime_dir();
     if (freestanding && !cc_override)
         fatal("freestanding builds need a bare-metal toolchain — pass one with "
-              "--cc or VOLT_CC (e.g. --cc 'arm-none-eabi-gcc -mcpu=cortex-m4')");
+              "--cc or VYTO_CC (e.g. --cc 'arm-none-eabi-gcc -mcpu=cortex-m4')");
     const char *cc;
     if (cc_override) {
         cc = cc_override;
     } else if (cross || (target && win_target)) {
         cc = default_cross_cc(triple);
         if (!cc)
-            fatal("no default cross compiler for %s — pass one with --cc or VOLT_CC", triple);
+            fatal("no default cross compiler for %s — pass one with --cc or VYTO_CC", triple);
         char *probe = arena_printf(&g_arena, "command -v %s >/dev/null 2>&1", cc);
         if (run_cmd(probe, false) != 0)
-            fatal("cross compiler '%s' not found — install it or pass --cc/VOLT_CC "
+            fatal("cross compiler '%s' not found — install it or pass --cc/VYTO_CC "
                   "(e.g. --cc 'zig cc -target ...')", cc);
     } else {
         cc = have_tcc() && !release ? "tcc" : "cc";
@@ -377,22 +377,22 @@ int main(int argc, char **argv) {
     bool relink = false;
 
     /* runtime object (cc name sanitized: --cc commands may contain spaces) */
-    const char *rt_o = arena_printf(&g_arena, "%s/volt_rt_%s%s%s.o", cache, sanitize(cc),
+    const char *rt_o = arena_printf(&g_arena, "%s/vyto_rt_%s%s%s.o", cache, sanitize(cc),
                                     release ? "_rel" : "", prof);
-    const char *rt_c = arena_printf(&g_arena, "%s/volt_rt.c", rtdir);
-    /* builtin-method helpers are amalgamated into volt_rt.c via #include, so the
-       compile unit is still volt_rt.c; track their mtimes so edits rebuild it. */
-    static const char *rt_amalg[] = {"volt_rt_num.c", "volt_rt_str.c",
-                                     "volt_rt_arr.c", "volt_rt_map.c"};
+    const char *rt_c = arena_printf(&g_arena, "%s/vyto_rt.c", rtdir);
+    /* builtin-method helpers are amalgamated into vyto_rt.c via #include, so the
+       compile unit is still vyto_rt.c; track their mtimes so edits rebuild it. */
+    static const char *rt_amalg[] = {"vyto_rt_num.c", "vyto_rt_str.c",
+                                     "vyto_rt_arr.c", "vyto_rt_map.c"};
     long rt_newest = file_mtime(rt_c);
-    long rt_h_mt = file_mtime(arena_printf(&g_arena, "%s/volt_rt.h", rtdir));
+    long rt_h_mt = file_mtime(arena_printf(&g_arena, "%s/vyto_rt.h", rtdir));
     if (rt_h_mt > rt_newest) rt_newest = rt_h_mt;
     for (size_t i = 0; i < sizeof rt_amalg / sizeof *rt_amalg; i++) {
         long t = file_mtime(arena_printf(&g_arena, "%s/%s", rtdir, rt_amalg[i]));
         if (t > rt_newest) rt_newest = t;
     }
     if (!file_exists(rt_o) || rt_newest > file_mtime(rt_o)) {
-        char *c = arena_printf(&g_arena, "%s %s%s -w -c -o %s %s/volt_rt.c", cc, opt, fsflags, rt_o,
+        char *c = arena_printf(&g_arena, "%s %s%s -w -c -o %s %s/vyto_rt.c", cc, opt, fsflags, rt_o,
                                rtdir);
         if (run_cmd(c, verbose) != 0) fatal("runtime compilation failed");
         relink = true;
@@ -505,7 +505,7 @@ int main(int argc, char **argv) {
 
     /* newest header on disk: an interrupted previous build may have left
        fresh .c/.h files with stale .o files and no "changed" flag this run */
-    long latest_h = file_mtime(arena_printf(&g_arena, "%s/volt_rt.h", rtdir));
+    long latest_h = file_mtime(arena_printf(&g_arena, "%s/vyto_rt.h", rtdir));
     for (Module *m = g_modules; m; m = m->next) {
         long t = file_mtime(arena_printf(&g_arena, "%s/mod_%s.h", cache, m->name));
         if (t > latest_h) latest_h = t;

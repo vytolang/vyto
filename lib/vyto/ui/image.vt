@@ -1,0 +1,62 @@
+// vyto/ui/image — Image, split out of display.vt into its own module.
+//
+// SPIKE FINDING (2026-07-09): with Image defined in the same module as
+// Avatar (both display.vt), merely *compiling* Image (never instantiating
+// it at runtime) corrupted Avatar's rendering elsewhere in the same program
+// — confirmed via bisection down to a single repro line, and confirmed to
+// be memory corruption rather than a naming collision (removing Image's
+// deinit shifted *which* row corrupted rather than fixing it). Moving Image
+// to its own module is the workaround under test; if this doesn't clear it,
+// the bug is deeper than module-proximity and needs a vytoc-level fix.
+import { Widget, Painter, Theme, Size } from "vyto/ui/core";
+import { Rect } from "vyto/surface";
+import { is_http_url } from "vyto/util/helper";
+
+// A decoded bitmap (PNG/JPEG/BMP/QOI) at an explicit size. Width/height are
+// required at construction, not introspected from the file: measure()/
+// layout run before any draw() call, so there's no Painter available yet to
+// decode-and-query natural size — matches how SizedBox/Container already
+// take explicit dimensions rather than inventing lazy-layout machinery.
+// A failed decode (bad path, or the palette-PNG limitation documented in
+// gfx_shim.h) still renders a flat placeholder, never a blank hole — see
+// GfxPainter.draw_image / Painter.draw_image.
+export class Image extends Widget {
+    path: string;
+    w: int;
+    h: int;
+    radius: int;    // -1 = square corners; else a rounded-corner clip
+    handle: rawptr;
+    load_failed: bool; // tried and failed: don't refetch every draw
+
+    fn init(path: string, w: int, h: int) {
+        super.init();
+        this.path = path;
+        this.w = w;
+        this.h = h;
+        this.radius = -1;
+    }
+
+    override fn measure(s: Painter, th: Theme): Size {
+        return Size(this.w, this.h);
+    }
+
+    override fn draw(s: Painter, th: Theme) {
+        if (this.handle == null && !this.load_failed) {
+            // load once; a failure must never retry per frame — a URL fetch
+            // is synchronous with a multi-second timeout
+            if (is_http_url(this.path)) { this.handle = s.load_image_url(this.path); }
+            else { this.handle = s.load_image(this.path); }
+            if (this.handle == null) { this.load_failed = true; }
+        }
+        if (this.radius >= 0) { s.clip_push(this.bounds, this.radius); }
+        // GfxPainter.draw_image
+        s.draw_image(this.handle, this.bounds);
+        if (this.radius >= 0) { s.clip_pop(); }
+    }
+
+    deinit {
+        if (this.handle != null && this.win != null) {
+            this.win.painter.free_image(this.handle);
+        }
+    }
+}

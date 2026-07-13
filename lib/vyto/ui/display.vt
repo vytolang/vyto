@@ -1,0 +1,876 @@
+// vyto/ui/display — read-only display widgets: Text (word-wrapped multi-line),
+// Card (elevated panel), Badge (count chip), Chip (compact label), Icon
+// (hand-drawn vector glyph set), Avatar (circular initials/photo badge).
+// Image lives in its own module, vyto/ui/image.vt — see its file header.
+
+import { Widget, Painter, Theme, Size, BoxConstraints, bcLoose,
+         WEIGHT_REG, WEIGHT_BOLD, EASE_LINEAR } from "vyto/ui/core";
+import { Tween } from "vyto/ui/anim";
+import { Rect, mix, MOD_CTRL } from "vyto/surface";
+import { SelectionModel, SelectionAction, col_at_x, select_word,
+         open_selection_toolbar } from "vyto/ui/selection";
+import { sin, cos, PI } from "vyto/math";
+import { is_http_url } from "vyto/util/helper";
+import { Path } from "vyto/geom/path";
+
+// Alignment constants for Text
+const ALIGN_LEFT: int = 0;
+const ALIGN_CENTER: int = 1;
+const ALIGN_RIGHT: int = 2;
+
+// --------------------------------------------------------------- Text / Paragraph
+
+// Read-only, word-wrapped, multi-line text. The first widget whose height
+// depends on the offered width — layout() does greedy word-wrap.
+export class Text extends Widget {
+    text: string;
+    align: int;       // ALIGN_LEFT / ALIGN_CENTER / ALIGN_RIGHT
+    color: int;       // -1 = theme.ink
+    cached_lines: string[];
+    cached_w: int;
+    cached_count: int;
+    cached_text: string; // content the cache was computed from
+    // Text selection (drag / double-click / long-press) + copy. Selection
+    // offsets index the *display text* — the wrapped visual lines joined by
+    // "\n" (display_text) — so a copy yields exactly what the user sees.
+    selectable: bool;
+    sel: SelectionModel;
+    selectionActions: SelectionAction[]; // app-supplied extra toolbar buttons
+
+    fn init(text: string) {
+        super.init();
+        this.text = text;
+        this.align = ALIGN_LEFT;
+        this.color = -1;
+        this.cached_lines = [];
+        this.cached_w = -1;
+        this.cached_count = 0;
+        this.cached_text = "";
+        this.selectable = true;
+        this.focusable = true;   // so Ctrl+C / Ctrl+A reach a focused paragraph
+        this.sel = new SelectionModel(this);
+        let self = this;
+        this.sel.text_fn = () => { return self.display_text(); };
+        this.selectionActions = [];
+    }
+
+    // The wrapped visual lines joined by "\n": the selectable/copyable text.
+    fn display_text(): string {
+        let out = "";
+        for (let i in 0..this.cached_count) {
+            if (i > 0) { out = out + "\n"; }
+            out = out + this.cached_lines[i];
+        }
+        return out;
+    }
+
+    // Visual-line index containing display-text byte offset `off`.
+    fn line_of_offset(off: int): int {
+        let base = 0;
+        for (let i in 0..this.cached_count) {
+            let end = base + this.cached_lines[i].len;
+            if (off <= end) { return i; }
+            base = end + 1;
+        }
+        if (this.cached_count > 0) { return this.cached_count - 1; }
+        return 0;
+    }
+
+    // Map an absolute pointer (x,y) to a display-text byte offset, replicating
+    // draw()'s per-line geometry. Uses win.surf for metrics (event handlers
+    // have no Painter). Assumes the lean tier's surf metrics match the painter.
+    fn offset_at(x: int, y: int): int {
+        if (this.cached_count == 0 || this.win == null) { return 0; }
+        let surf = this.win.surf;
+        let lh = surf.font_height();
+        let adv = lh + 2;
+        let li = 0;
+        if (adv > 0) { li = (y - this.bounds.y) / adv; }
+        if (li < 0) { li = 0; }
+        if (li >= this.cached_count) { li = this.cached_count - 1; }
+        let ln = this.cached_lines[li];
+        let tw = surf.text_width(ln);
+        let ox = this.bounds.x;
+        if (this.align == ALIGN_CENTER) { ox = this.bounds.x + (this.bounds.w - tw) / 2; }
+        else if (this.align == ALIGN_RIGHT) { ox = this.bounds.x + this.bounds.w - tw; }
+        let col = col_at_x(surf, ln, x - ox);
+        let base = 0;
+        for (let i in 0..li) { base += this.cached_lines[i].len + 1; }
+        return base + col;
+    }
+
+    fn show_toolbar(px: int) {
+        if (this.win == null || this.sel.empty()) { return; }
+        let li = this.line_of_offset(this.sel.lo());
+        let lh = this.win.surf.font_height();
+        let ytop = this.bounds.y + li * (lh + 2);
+        open_selection_toolbar(this, this.sel, px, ytop, this.selectionActions);
+    }
+
+    fn wrap_lines(s: Painter, max_w: int) {
+        this.cached_lines = [];
+        this.cached_w = max_w;
+        this.cached_text = this.text;
+        if (max_w <= 0) {
+            this.cached_count = 0;
+            return;
+        }
+        let words = split_words(this.text);
+        let line = "";
+        for (let w in words) {
+            let trial = "";
+            if (line.len == 0) { trial = w; } else { trial = line + " " + w; }
+            if (s.text_width(trial) > max_w && line.len > 0) {
+                this.cached_lines.push(line);
+                line = w;
+            } else {
+                line = trial;
+            }
+        }
+        if (line.len > 0) { this.cached_lines.push(line); }
+        this.cached_count = this.cached_lines.len;
+    }
+
+    // Estimate: single-line width. Real wrapping happens in layout() or
+    // draw() when the actual width is known. This lets Container/Column
+    // at least know the text exists.
+    override fn measure(s: Painter, th: Theme): Size {
+        let w = s.text_width(this.text);
+        let h = s.font_height();
+        return Size(w, h);
+    }
+
+    // Re-wrap if the width or the text differs from what we cached.
+    fn ensure_wrapped(s: Painter) {
+        let bw = this.bounds.w;
+        if (this.cached_w != bw || this.cached_count == 0 || !(this.cached_text == this.text)) {
+            this.wrap_lines(s, bw);
+        }
+    }
+
+    override fn layout(s: Painter, th: Theme, bc: BoxConstraints): Size {
+        let max_w = bc.maxW;
+        if (max_w < 0) { max_w = 0; }
+        // cache hit: same width and content — skip the re-wrap entirely
+        // (layout runs 2+ times per frame; wrapping shapes text per word)
+        if (!(this.cached_w == max_w && this.cached_count > 0 &&
+              this.cached_text == this.text)) {
+            this.wrap_lines(s, max_w);
+        }
+        let used_w = 0;
+        for (let ln in this.cached_lines) {
+            let lw = s.text_width(ln);
+            if (lw > used_w) { used_w = lw; }
+        }
+        if (used_w > max_w) { used_w = max_w; }
+        let lh = s.font_height();
+        let total_h = this.cached_count * lh;
+        if (this.cached_count > 1) { total_h += (this.cached_count - 1) * 2; }
+        if (total_h < lh) { total_h = lh; }
+        return bc.constrain(Size(used_w, total_h));
+    }
+
+    override fn draw(s: Painter, th: Theme) {
+        this.ensure_wrapped(s);
+        let c = this.color;
+        if (c < 0) { c = th.ink; }
+        let lh = s.font_height();
+        let asc = s.font_ascent();
+        let sel_on = this.selectable && this.sel != null && !this.sel.empty();
+        let lo = 0;
+        let hi = 0;
+        if (sel_on) { lo = this.sel.lo(); hi = this.sel.hi(); }
+        let base = 0;
+        let y = this.bounds.y + asc;
+        let top = this.bounds.y;
+        for (let i in 0..this.cached_count) {
+            let ln = this.cached_lines[i];
+            let tw = s.text_width(ln);
+            let x = this.bounds.x;
+            if (this.align == ALIGN_CENTER) {
+                x = this.bounds.x + (this.bounds.w - tw) / 2;
+            } else if (this.align == ALIGN_RIGHT) {
+                x = this.bounds.x + this.bounds.w - tw;
+            }
+            if (sel_on) {
+                // this visual line spans display offsets [base, base+len)
+                let ll = lo - base;
+                let lr = hi - base;
+                if (ll < 0) { ll = 0; }
+                if (lr > ln.len) { lr = ln.len; }
+                if (lr > ll) {
+                    let pre = s.text_width(ln.slice(0, ll));
+                    let selw = s.text_width(ln.slice(0, lr)) - pre;
+                    s.fill(Rect(x + pre, top, selw, lh), th.selection);
+                }
+            }
+            s.text(x, y, ln, c);
+            base += ln.len + 1;
+            y += lh + 2;
+            top += lh + 2;
+        }
+    }
+
+    override fn on_click(x: int, y: int): bool {
+        if (!this.selectable) { return false; }
+        let off = this.offset_at(x, y);
+        this.sel.set(off, off);   // collapse: a plain click clears the selection
+        return true;
+    }
+
+    override fn on_drag_start(x: int, y: int): bool {
+        if (!this.selectable) { return false; }
+        // anchor was set at the press point by on_click; extend from there.
+        return true;
+    }
+
+    override fn on_drag(dx: int, dy: int): bool {
+        if (!this.selectable || this.win == null) { return false; }
+        this.sel.focus = this.offset_at(this.win.drag_x, this.win.drag_y);
+        this.sel.active = true;
+        this.invalidate();
+        return true;
+    }
+
+    override fn on_drag_end(x: int, y: int): bool {
+        if (!this.selectable) { return false; }
+        if (!this.sel.empty()) { this.show_toolbar(x); }
+        return true;
+    }
+
+    override fn on_double_click(x: int, y: int): bool {
+        if (!this.selectable) { return false; }
+        select_word(this.sel, this.offset_at(x, y));
+        this.invalidate();
+        this.show_toolbar(x);
+        return true;
+    }
+
+    override fn on_long_press(x: int, y: int): bool {
+        if (!this.selectable) { return false; }
+        select_word(this.sel, this.offset_at(x, y));
+        this.invalidate();
+        this.show_toolbar(x);
+        return true;
+    }
+
+    override fn on_key(k: int, ch: string): bool {
+        if (!this.selectable || this.win == null) { return false; }
+        if ((this.win.mods & MOD_CTRL) != 0) {
+            if (k == 99) { // Ctrl+C — copy selection, or the whole text if none
+                let t = this.sel.selected_text();
+                if (t.len == 0) { t = this.text; }
+                this.win.surf.set_clipboard(t);
+                return true;
+            }
+            if (k == 97) { // Ctrl+A — select all
+                this.sel.select_all();
+                this.invalidate();
+                return true;
+            }
+        }
+        return false;
+    }
+
+    override fn drop_handlers() {
+        if (this.sel != null) { this.sel.drop(); }
+    }
+}
+
+// Helper: split a string into words on whitespace.
+fn split_words(s: string): string[] {
+    let out: string[] = [];
+    let start = 0;
+    let i = 0;
+    while (i < s.len) {
+        if (s[i] == 32 || s[i] == 9 || s[i] == 10) {
+            if (i > start) { out.push(s.slice(start, i)); }
+            start = i + 1;
+        }
+        i += 1;
+    }
+    if (i > start) { out.push(s.slice(start, i)); }
+    return out;
+}
+
+// ---------------------------------------------------------------- Card
+
+// Container-like elevated panel with bg fill, padding, and an optional title.
+// On the gfx tier a shadow/rounded corner is nice; here we use a plain frame.
+export class Card extends Widget {
+    title: string;
+    pad: int;
+    bg: int;
+    border: int;
+
+    fn init(pad: int, bg: int, border: int, title: string, child: Widget) {
+        super.init();
+        this.pad = pad;
+        this.bg = bg;
+        this.border = border;
+        this.title = title;
+        if (child != null) { this.add(child); }
+    }
+
+    fn child(): Widget {
+        if (this.children.len == 0) { return null; }
+        return this.children[0];
+    }
+
+    fn title_h(s: Painter): int {
+        if (this.title.len == 0) { return 0; }
+        return s.font_height() + 8;
+    }
+
+    override fn measure(s: Painter, th: Theme): Size {
+        let c = this.child();
+        let w = 2 * this.pad;
+        let h = 2 * this.pad + this.title_h(s);
+        if (c != null) {
+            // Use layout() so Text wraps at the available width and reports
+            // the correct multi-line height.
+            let bc = new BoxConstraints(0, 100000, 0, 100000);
+            let cs = c.layout(s, th, bc);
+            w = cs.w + 2 * this.pad;
+            h += cs.h;
+        }
+        return Size(w, h);
+    }
+
+    override fn arrange(s: Painter, th: Theme, r: Rect) {
+        this.bounds = r;
+        let c = this.child();
+        if (c == null) { return; }
+        let th_h = this.title_h(s);
+        let p = this.pad;
+        let inner = Rect(r.x + p, r.y + th_h + p, r.w - 2 * p, r.h - th_h - 2 * p);
+        // Re-layout at actual inner width so wrapping matches
+        let cs = c.layout(s, th, new BoxConstraints(0, inner.w, 0, inner.h));
+        c.arrange(s, th, Rect(inner.x, inner.y, inner.w, cs.h));
+    }
+
+    override fn draw(s: Painter, th: Theme) {
+        this.draw_chrome(s, th);
+        let c = this.child();
+        if (c != null) { c.draw(s, th); }
+    }
+
+    override fn draw_chrome(s: Painter, th: Theme) {
+        let radius = th.radius_md;
+        let bg = this.bg;
+        if (bg < 0) { bg = th.surface_raised; }
+        let br = this.border;
+        if (br < 0) { br = th.border; }
+        // raised surface: soft shadow + rounded fill + border. Title/divider
+        // stay local (not PanelChrome.paint_titled): Card's title height
+        // (+8) and padding (this.pad, per-instance) differ from the fixed
+        // (+10 / 12px) formula shared by Dialog and its titled-modal
+        // siblings, so it isn't the same duplicated shape they consolidate.
+        this.win.skin.panel.paint(s, th, this.bounds, radius, bg, br, 1);
+        if (this.title.len > 0) {
+            let th_h = this.title_h(s);
+            // bold title sits on the card surface (modern, no accent bar)
+            let tr = Rect(this.bounds.x + this.pad, this.bounds.y,
+                          this.bounds.w - this.pad, th_h);
+            s.set_weight(WEIGHT_BOLD);
+            s.text_in(tr, 0, this.title, th.on_surface);
+            s.set_weight(WEIGHT_REG);
+            // hairline divider under the title
+            s.line(this.bounds.x + this.pad, this.bounds.y + th_h - 1,
+                   this.bounds.x + this.bounds.w - this.pad,
+                   this.bounds.y + th_h - 1, th.divider);
+        }
+    }
+}
+
+// ---------------------------------------------------------------- Badge
+
+// Small count/label chip overlaid on the top-right corner of a child.
+export class Badge extends Widget {
+    label: string;
+    bg: int;
+    color: int;
+
+    fn init(label: string, bg: int, color: int, child: Widget) {
+        super.init();
+        this.label = label;
+        this.bg = bg;
+        this.color = color;
+        if (child != null) { this.add(child); }
+    }
+
+    fn child(): Widget {
+        if (this.children.len == 0) { return null; }
+        return this.children[0];
+    }
+
+    fn badge_size(s: Painter): Size {
+        let tw = s.text_width(this.label);
+        let pad = 6;
+        return Size(tw + 2 * pad, s.font_height() + 2 * pad);
+    }
+
+    override fn measure(s: Painter, th: Theme): Size {
+        let c = this.child();
+        if (c == null) { return this.badge_size(s); }
+        let cs = c.measure(s, th);
+        return cs;
+    }
+
+    override fn arrange(s: Painter, th: Theme, r: Rect) {
+        this.bounds = r;
+        let c = this.child();
+        if (c == null) { return; }
+        c.arrange(s, th, r);
+    }
+
+    override fn draw(s: Painter, th: Theme) {
+        let kid = this.child();
+        if (kid != null) { kid.draw(s, th); }
+        let bs = this.badge_size(s);
+        let bx = this.bounds.x + this.bounds.w - bs.w;
+        let by = this.bounds.y;
+        let br = Rect(bx, by, bs.w, bs.h);
+        let bg = this.bg;
+        if (bg < 0) { bg = th.primary; }
+        let col = this.color;
+        if (col < 0) { col = th.on_primary; }
+        // circular badge — fully rounded (radius = height/2) for a count chip
+        s.fill_round(br, bs.h / 2, bg);
+        s.set_weight(WEIGHT_BOLD);
+        s.text_in(br, 6, this.label, col);
+        s.set_weight(WEIGHT_REG);
+    }
+}
+
+// ---------------------------------------------------------------- Chip
+
+// Compact rounded label, optionally with an onDelete closure.
+export class Chip extends Widget {
+    label: string;
+    deletable: bool;
+    onDelete: fn(Chip);
+    bg: int;
+
+    fn init(label: string, deletable: bool, bg: int) {
+        super.init();
+        this.label = label;
+        this.deletable = deletable;
+        this.bg = bg;
+        this.focusable = true;
+    }
+
+    fn fire_delete() {
+        if (this.onDelete != null) { this.onDelete(this); }
+    }
+
+    fn chip_h(s: Painter): int { return s.font_height() + 10; }
+
+    fn delete_w(s: Painter): int {
+        if (!this.deletable) { return 0; }
+        return s.text_width("x") + 12;
+    }
+
+    override fn measure(s: Painter, th: Theme): Size {
+        let tw = s.text_width(this.label);
+        let dw = this.delete_w(s);
+        let pad = 10;
+        return Size(tw + dw + 2 * pad, this.chip_h(s));
+    }
+
+    override fn draw(s: Painter, th: Theme) {
+        let bg = this.bg;
+        if (bg < 0) { bg = th.secondary; }
+        if (this.hovered) { bg = mix(bg, th.on_surface, 0.06); }
+        let radius = this.chip_h(s) / 2;    // a true pill
+        s.fill_round(this.bounds, radius, bg);
+        if (this.focused) {
+            this.win.skin.focus.paint(s, th, this.bounds, radius);
+        }
+        let dw = this.delete_w(s);
+        let pad = 10;
+        let tr = Rect(this.bounds.x + pad, this.bounds.y,
+                      this.bounds.w - pad - dw, this.bounds.h);
+        s.set_weight(WEIGHT_BOLD);
+        s.text_in(tr, 4, this.label, th.on_secondary);
+        s.set_weight(WEIGHT_REG);
+        if (this.deletable) {
+            let xr = Rect(this.bounds.x + this.bounds.w - dw, this.bounds.y,
+                          dw, this.bounds.h);
+            s.text_in(xr, 4, "x", th.on_surface_muted);
+        }
+    }
+
+    override fn on_click(x: int, y: int): bool {
+        if (this.deletable) {
+            let dw = 0;
+            // approximate: if click is in the right portion, delete
+            let xr = this.bounds.x + this.bounds.w - 24;
+            if (x >= xr) { this.fire_delete(); return true; }
+        }
+        return false;
+    }
+
+    override fn on_key(k: int, ch: string): bool {
+        if (k == 32 || k == 127) { // space or delete key
+            if (this.deletable) { this.fire_delete(); return true; }
+        }
+        return false;
+    }
+
+    override fn drop_handlers() {
+        this.onDelete = null;
+    }
+}
+
+// ---------------------------------------------------------------- Icon
+
+// Small vector glyph set — no icon font/vector asset exists in this toolkit
+// yet (a long-open roadmap gap), so these are hand-drawn from Painter
+// primitives: fill/fill_round/circle/stroke_circle/line/polygon/stroke_arc.
+// No Chrome family backs this (matches Badge/Chip precedent) — icons aren't
+// shape-pluggable the way buttons/fields/toggles/panels/tracks are; a skin
+// wanting different iconography would want a different glyph set entirely,
+// out of scope here.
+const ICON_CHEVRON_LEFT: int = 0;
+const ICON_CHEVRON_RIGHT: int = 1;
+const ICON_CHEVRON_DOWN: int = 2;
+const ICON_CLOSE: int = 3;
+const ICON_CHECK: int = 4;
+const ICON_PLUS: int = 5;
+const ICON_SEARCH: int = 6;
+const ICON_GEAR: int = 7;
+const ICON_HOME: int = 8;
+const ICON_BELL: int = 9;
+const ICON_PERSON: int = 10;
+const ICON_WIFI: int = 11;
+const ICON_SIGNAL: int = 12;
+const ICON_BATTERY: int = 13;
+const ICON_CAMERA: int = 14;
+const ICON_MAIL: int = 15;
+const ICON_MESSAGE: int = 16;
+const ICON_PHOTO: int = 17;
+const ICON_STAR: int = 18;
+const ICON_HEART: int = 19;
+const ICON_MAP_PIN: int = 20;
+const ICON_MUSIC: int = 21;
+
+export class Icon extends Widget {
+    icon: int;
+    size: int;
+    color: int;      // -1 = th.on_surface
+    bg: int;          // -1 = transparent glyph-only; >=0 = filled rounded-square behind it ("app icon" mode)
+    bg_radius: int;
+
+    fn init(icon: int, size: int) {
+        super.init();
+        this.icon = icon;
+        this.size = size;
+        this.color = -1;
+        this.bg = -1;
+        this.bg_radius = size / 4;
+    }
+
+    override fn measure(s: Painter, th: Theme): Size {
+        return Size(this.size, this.size);
+    }
+
+    // unit-square (0..1) -> pixel coordinates within this.bounds
+    fn fx(u: float): int { return this.bounds.x + (u * (this.bounds.w as float)) as int; }
+    fn fy(u: float): int { return this.bounds.y + (u * (this.bounds.h as float)) as int; }
+    // float versions for sub-pixel vector Paths (curved glyphs)
+    fn fxf(u: float): float { return (this.bounds.x as float) + u * (this.bounds.w as float); }
+    fn fyf(u: float): float { return (this.bounds.y as float) + u * (this.bounds.h as float); }
+
+    // build a closed polygon Path from parallel pixel-point arrays — lets the
+    // straight-edged glyphs render through the vector path pipeline (crisp on
+    // the rich tier, flattened to a polygon on the lean tier) instead of the
+    // old s.polygon call.
+    fn poly_path(xs: i32[], ys: i32[]): Path {
+        let p = new Path();
+        if (xs.len == 0) { return p; }
+        p.moveTo(xs[0] as float, ys[0] as float);
+        for (let i in 1..xs.len) { p.lineTo(xs[i] as float, ys[i] as float); }
+        p.close();
+        return p;
+    }
+
+    // ~2px stroke: a real anti-aliased stroke on the rich tier (line_w),
+    // three offset 1px lines on the lean tier (the base fallback).
+    fn thick_line(s: Painter, x0: int, y0: int, x1: int, y1: int, color: int) {
+        s.line_w(x0, y0, x1, y1, 2, color);
+    }
+
+    override fn draw(s: Painter, th: Theme) {
+        if (this.bg >= 0) {
+            s.fill_round(this.bounds, this.bg_radius, this.bg);
+        }
+        let col = this.color;
+        if (col < 0) { col = th.on_surface; }
+        this.draw_glyph(s, col);
+    }
+
+    fn draw_glyph(s: Painter, color: int) {
+        let sz = this.bounds.w as float;
+        if (this.icon == ICON_CHEVRON_LEFT) {
+            this.thick_line(s, this.fx(0.60), this.fy(0.25), this.fx(0.38), this.fy(0.50), color);
+            this.thick_line(s, this.fx(0.38), this.fy(0.50), this.fx(0.60), this.fy(0.75), color);
+        } else if (this.icon == ICON_CHEVRON_RIGHT) {
+            this.thick_line(s, this.fx(0.40), this.fy(0.25), this.fx(0.62), this.fy(0.50), color);
+            this.thick_line(s, this.fx(0.62), this.fy(0.50), this.fx(0.40), this.fy(0.75), color);
+        } else if (this.icon == ICON_CHEVRON_DOWN) {
+            this.thick_line(s, this.fx(0.25), this.fy(0.40), this.fx(0.50), this.fy(0.62), color);
+            this.thick_line(s, this.fx(0.50), this.fy(0.62), this.fx(0.75), this.fy(0.40), color);
+        } else if (this.icon == ICON_CLOSE) {
+            this.thick_line(s, this.fx(0.28), this.fy(0.28), this.fx(0.72), this.fy(0.72), color);
+            this.thick_line(s, this.fx(0.72), this.fy(0.28), this.fx(0.28), this.fy(0.72), color);
+        } else if (this.icon == ICON_CHECK) {
+            this.thick_line(s, this.fx(0.22), this.fy(0.52), this.fx(0.42), this.fy(0.72), color);
+            this.thick_line(s, this.fx(0.42), this.fy(0.72), this.fx(0.80), this.fy(0.28), color);
+        } else if (this.icon == ICON_PLUS) {
+            this.thick_line(s, this.fx(0.5), this.fy(0.22), this.fx(0.5), this.fy(0.78), color);
+            this.thick_line(s, this.fx(0.22), this.fy(0.5), this.fx(0.78), this.fy(0.5), color);
+        } else if (this.icon == ICON_SEARCH) {
+            s.stroke_circle(this.fx(0.42), this.fy(0.42), (0.20 * sz) as int, 2, color);
+            this.thick_line(s, this.fx(0.58), this.fy(0.58), this.fx(0.80), this.fy(0.80), color);
+        } else if (this.icon == ICON_GEAR) {
+            let cx = this.fx(0.5); let cy = this.fy(0.5);
+            s.stroke_circle(cx, cy, (0.28 * sz) as int, 2, color);
+            s.circle(cx, cy, (0.10 * sz) as int, color);
+            let i = 0;
+            while (i < 6) {
+                let a = (i as float) * (PI / 3.0);
+                let x0 = cx + ((0.28 * sz) * cos(a)) as int;
+                let y0 = cy + ((0.28 * sz) * sin(a)) as int;
+                let x1 = cx + ((0.42 * sz) * cos(a)) as int;
+                let y1 = cy + ((0.42 * sz) * sin(a)) as int;
+                this.thick_line(s, x0, y0, x1, y1, color);
+                i += 1;
+            }
+        } else if (this.icon == ICON_HOME) {
+            // roof and walls close in width (real overhang, not an arrow shaft)
+            let xs: i32[] = [this.fx(0.5) as i32, this.fx(0.82) as i32, this.fx(0.18) as i32];
+            let ys: i32[] = [this.fy(0.15) as i32, this.fy(0.46) as i32, this.fy(0.46) as i32];
+            s.fill_path(this.poly_path(xs, ys), color);
+            s.fill(Rect(this.fx(0.22), this.fy(0.44), this.fx(0.78) - this.fx(0.22), this.fy(0.85) - this.fy(0.44)), color);
+        } else if (this.icon == ICON_BELL) {
+            // clapper centered on the body's bottom edge so it reads as one
+            // connected shape, not two disjoint blobs
+            s.fill_round(Rect(this.fx(0.26), this.fy(0.18), this.fx(0.74) - this.fx(0.26), this.fy(0.64) - this.fy(0.18)),
+                        (0.20 * sz) as int, color);
+            s.circle(this.fx(0.5), this.fy(0.64), (0.06 * sz) as int, color);
+        } else if (this.icon == ICON_PERSON) {
+            // body top overlaps the head's bottom edge — no gap between them
+            s.circle(this.fx(0.5), this.fy(0.30), (0.16 * sz) as int, color);
+            s.fill_round(Rect(this.fx(0.26), this.fy(0.40), this.fx(0.74) - this.fx(0.26), this.fy(0.82) - this.fy(0.40)),
+                        (0.16 * sz) as int, color);
+        } else if (this.icon == ICON_WIFI) {
+            let cx = this.fx(0.5); let cy = this.fy(0.65);
+            s.stroke_arc(cx, cy, (0.12 * sz) as int, (0.12 * sz) as int, 200, 140, 2, color);
+            s.stroke_arc(cx, cy, (0.24 * sz) as int, (0.24 * sz) as int, 200, 140, 2, color);
+            s.stroke_arc(cx, cy, (0.36 * sz) as int, (0.36 * sz) as int, 200, 140, 2, color);
+            s.circle(cx, cy, (0.04 * sz) as int, color);
+        } else if (this.icon == ICON_SIGNAL) {
+            let bw = 0.15 * sz;
+            s.fill(Rect(this.fx(0.15), this.fy(0.55), bw as int, this.fy(0.85) - this.fy(0.55)), color);
+            s.fill(Rect(this.fx(0.38), this.fy(0.40), bw as int, this.fy(0.85) - this.fy(0.40)), color);
+            s.fill(Rect(this.fx(0.61), this.fy(0.25), bw as int, this.fy(0.85) - this.fy(0.25)), color);
+            s.fill(Rect(this.fx(0.84) - (bw as int), this.fy(0.15), bw as int, this.fy(0.85) - this.fy(0.15)), color);
+        } else if (this.icon == ICON_BATTERY) {
+            s.stroke_round(Rect(this.fx(0.10), this.fy(0.30), this.fx(0.82) - this.fx(0.10), this.fy(0.70) - this.fy(0.30)),
+                          (0.04 * sz) as int, 2, color);
+            s.fill(Rect(this.fx(0.84), this.fy(0.40), this.fx(0.90) - this.fx(0.84), this.fy(0.60) - this.fy(0.40)), color);
+            s.fill(Rect(this.fx(0.15), this.fy(0.36), this.fx(0.55) - this.fx(0.15), this.fy(0.64) - this.fy(0.36)), color);
+        } else if (this.icon == ICON_CAMERA) {
+            s.fill_round(Rect(this.fx(0.15), this.fy(0.35), this.fx(0.85) - this.fx(0.15), this.fy(0.80) - this.fy(0.35)),
+                        (0.06 * sz) as int, color);
+            s.fill_round(Rect(this.fx(0.36), this.fy(0.22), this.fx(0.64) - this.fx(0.36), this.fy(0.38) - this.fy(0.22)),
+                        (0.02 * sz) as int, color);
+            s.stroke_circle(this.fx(0.5), this.fy(0.58), (0.14 * sz) as int, 2, color);
+        } else if (this.icon == ICON_MAIL) {
+            s.stroke_round(Rect(this.fx(0.12), this.fy(0.25), this.fx(0.88) - this.fx(0.12), this.fy(0.75) - this.fy(0.25)),
+                          (0.04 * sz) as int, 2, color);
+            this.thick_line(s, this.fx(0.12), this.fy(0.25), this.fx(0.5), this.fy(0.52), color);
+            this.thick_line(s, this.fx(0.5), this.fy(0.52), this.fx(0.88), this.fy(0.25), color);
+        } else if (this.icon == ICON_MESSAGE) {
+            s.fill_round(Rect(this.fx(0.12), this.fy(0.20), this.fx(0.88) - this.fx(0.12), this.fy(0.68) - this.fy(0.20)),
+                        (0.14 * sz) as int, color);
+            let xs: i32[] = [this.fx(0.30) as i32, this.fx(0.42) as i32, this.fx(0.24) as i32];
+            let ys: i32[] = [this.fy(0.65) as i32, this.fy(0.65) as i32, this.fy(0.85) as i32];
+            s.fill_path(this.poly_path(xs, ys), color);
+        } else if (this.icon == ICON_PHOTO) {
+            s.stroke_round(Rect(this.fx(0.10), this.fy(0.18), this.fx(0.90) - this.fx(0.10), this.fy(0.82) - this.fy(0.18)),
+                          (0.06 * sz) as int, 2, color);
+            s.circle(this.fx(0.32), this.fy(0.35), (0.08 * sz) as int, color);
+            let xs: i32[] = [this.fx(0.15) as i32, this.fx(0.40) as i32, this.fx(0.60) as i32, this.fx(0.75) as i32, this.fx(0.88) as i32];
+            let ys: i32[] = [this.fy(0.75) as i32, this.fy(0.45) as i32, this.fy(0.65) as i32, this.fy(0.50) as i32, this.fy(0.75) as i32];
+            s.fill_path(this.poly_path(xs, ys), color);
+        } else if (this.icon == ICON_STAR) {
+            let cx = this.fx(0.5); let cy = this.fy(0.5);
+            let outer = 0.42 * sz; let inner = 0.18 * sz;
+            let xs: i32[] = [];
+            let ys: i32[] = [];
+            let i = 0;
+            while (i < 10) {
+                let r = outer;
+                if (i % 2 == 1) { r = inner; }
+                let a = (-PI / 2.0) + (i as float) * (PI / 5.0);
+                xs.push((cx as float + r * cos(a)) as i32);
+                ys.push((cy as float + r * sin(a)) as i32);
+                i += 1;
+            }
+            s.fill_path(this.poly_path(xs, ys), color);
+        } else if (this.icon == ICON_HEART) {
+            // a real two-lobe cubic heart (replaces the old two-circles + a
+            // triangle approximation): smooth curves on the rich tier, a
+            // flattened polygon on the lean tier.
+            let hp = new Path();
+            hp.moveTo(this.fxf(0.5), this.fyf(0.32));
+            hp.cubicTo(this.fxf(0.50), this.fyf(0.12), this.fxf(0.10), this.fyf(0.08),
+                       this.fxf(0.10), this.fyf(0.40));
+            hp.cubicTo(this.fxf(0.10), this.fyf(0.60), this.fxf(0.36), this.fyf(0.74),
+                       this.fxf(0.5), this.fyf(0.88));
+            hp.cubicTo(this.fxf(0.64), this.fyf(0.74), this.fxf(0.90), this.fyf(0.60),
+                       this.fxf(0.90), this.fyf(0.40));
+            hp.cubicTo(this.fxf(0.90), this.fyf(0.08), this.fxf(0.50), this.fyf(0.12),
+                       this.fxf(0.5), this.fyf(0.32));
+            hp.close();
+            s.fill_path(hp, color);
+        } else if (this.icon == ICON_MAP_PIN) {
+            // a teardrop pin: round head tapering to a point at the bottom
+            // (replaces circle + triangle), with a punched-out center dot.
+            let pp = new Path();
+            pp.moveTo(this.fxf(0.5), this.fyf(0.88));
+            pp.cubicTo(this.fxf(0.10), this.fyf(0.52), this.fxf(0.12), this.fyf(0.10),
+                       this.fxf(0.5), this.fyf(0.10));
+            pp.cubicTo(this.fxf(0.88), this.fyf(0.10), this.fxf(0.90), this.fyf(0.52),
+                       this.fxf(0.5), this.fyf(0.88));
+            pp.close();
+            s.fill_path(pp, color);
+        } else if (this.icon == ICON_MUSIC) {
+            s.circle(this.fx(0.28), this.fy(0.72), (0.10 * sz) as int, color);
+            this.thick_line(s, this.fx(0.36), this.fy(0.72), this.fx(0.36), this.fy(0.22), color);
+            let xs: i32[] = [this.fx(0.36) as i32, this.fx(0.62) as i32, this.fx(0.36) as i32];
+            let ys: i32[] = [this.fy(0.22) as i32, this.fy(0.30) as i32, this.fy(0.38) as i32];
+            s.fill_path(this.poly_path(xs, ys), color);
+        }
+    }
+}
+
+// ---------------------------------------------------------------- Avatar
+
+// A circular contact/profile badge: initials-on-a-color-fill by default, or
+// a real photo (clipped to a circle) when imagePath is set. No Chrome family
+// (same reasoning as Icon) — reuses load_image/draw_image/clip_push/clip_pop
+// directly rather than composing an Image widget instance, the same
+// relationship Card has to Button (no widget-in-widget composition for a
+// two-line paint job).
+export class Avatar extends Widget {
+    initials: string;
+    bg: int;             // -1 = th.primary
+    color: int;          // -1 = th.on_primary
+    size: int;
+    imagePath: string;   // "" = initials mode
+    handle: rawptr;       // lazy-loaded image handle, image mode only
+    load_failed: bool;    // tried and failed: don't refetch every draw
+
+    fn init(initials: string, size: int) {
+        super.init();
+        this.initials = initials;
+        this.size = size;
+        this.bg = -1;
+        this.color = -1;
+        this.imagePath = "";
+    }
+
+    override fn measure(s: Painter, th: Theme): Size {
+        return Size(this.size, this.size);
+    }
+
+    override fn draw(s: Painter, th: Theme) {
+        let r = this.size / 2;
+        if (this.imagePath.len > 0) {
+            if (this.handle == null && !this.load_failed) {
+                // load once; a failure must never retry per frame — a URL
+                // fetch is synchronous with a multi-second timeout
+                if (is_http_url(this.imagePath)) { this.handle = s.load_image_url(this.imagePath); }
+                else { this.handle = s.load_image(this.imagePath); }
+                if (this.handle == null) { this.load_failed = true; }
+            }
+            if (this.handle != null) {
+                s.clip_push(this.bounds, r);
+                s.draw_image(this.handle, this.bounds);
+                s.clip_pop();
+                return;
+            }
+            // fall through to initials if the file failed to decode
+        }
+        let bg = this.bg;
+        if (bg < 0) { bg = th.primary; }
+        let col = this.color;
+        if (col < 0) { col = th.on_primary; }
+        let cx = this.bounds.x + r;
+        let cy = this.bounds.y + r;
+        s.circle(cx, cy, r, bg);
+        s.set_weight(WEIGHT_BOLD);
+        let tw = s.text_width(this.initials);
+        let pad = (this.bounds.w - tw) / 2;
+        s.text_in(this.bounds, pad, this.initials, col);
+        s.set_weight(WEIGHT_REG);
+    }
+
+    deinit {
+        if (this.handle != null && this.win != null) {
+            this.win.painter.free_image(this.handle);
+        }
+    }
+}
+
+// ---------------------------------------------------------------- Spinner
+
+// Indeterminate busy indicator: a rotating 3/4 arc. A looping Tween keeps the
+// 60fps clock alive; the sweep angle is derived from the monotonic clock so
+// rotation is continuous (a ping-pong Tween value would wobble). On the lean
+// tier stroke_arc degrades to a full ring (still a visible "busy" mark).
+export class Spinner extends Widget {
+    size: int;
+    color: int;    // -1 = th.primary
+    width: int;    // stroke width
+    phase: float;  // tween progress (drives repaint; angle comes from the clock)
+    tween: Tween;
+
+    fn init(size: int) {
+        super.init();
+        this.size = size;
+        this.color = -1;
+        this.width = 3;
+        this.phase = 0.0;
+    }
+
+    override fn measure(s: Painter, th: Theme): Size {
+        return Size(this.size, this.size);
+    }
+
+    override fn draw(s: Painter, th: Theme) {
+        if (this.tween == null) {
+            // value unused — the tween exists only to drive ~60fps repaints
+            let self = this;
+            this.tween = this.animate(1000, true, EASE_LINEAR, (t) => { self.phase = t; });
+        }
+        let c = this.color;
+        if (c < 0) { c = th.primary; }
+        let cx = this.bounds.x + this.bounds.w / 2;
+        let cy = this.bounds.y + this.bounds.h / 2;
+        let r = this.size / 2 - this.width;
+        if (r < 1) { r = 1; }
+        let ms = 0;
+        if (this.win != null) { ms = this.win.surf.now_ms(); }
+        let start = (ms / 3) % 360;
+        s.stroke_arc(cx, cy, r, r, start, 270, this.width, c);
+    }
+
+    override fn drop_handlers() {
+        if (this.tween != null) { this.tween.cancel(); this.tween = null; }
+    }
+}
+

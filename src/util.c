@@ -7,7 +7,7 @@ static ArenaChunk *chunk_new(size_t min) {
     size_t cap = 1 << 20;
     if (cap < min) cap = min;
     ArenaChunk *c = malloc(sizeof(ArenaChunk) + cap);
-    if (!c) { fprintf(stderr, "voltc: out of memory\n"); exit(1); }
+    if (!c) { fprintf(stderr, "vytoc: out of memory\n"); exit(1); }
     c->next = NULL;
     c->used = 0;
     c->cap = cap;
@@ -148,7 +148,7 @@ void fatal_at(Loc loc, const char *fmt, ...) {
 void fatal(const char *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
-    fprintf(stderr, "voltc: error: ");
+    fprintf(stderr, "vytoc: error: ");
     vfprintf(stderr, fmt, ap);
     fprintf(stderr, "\n");
     va_end(ap);

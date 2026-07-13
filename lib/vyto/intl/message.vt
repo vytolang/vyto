@@ -1,0 +1,319 @@
+// vyto/intl/message — ICU-MessageFormat-subset catalogs with CLDR plurals.
+//
+//     // cart.de.json: { "items": "{n, plural, one{# Artikel} other{# Artikel}} im Korb" }
+//     let cat = loadCatalog(locale("de-DE"), "cart.de.json");
+//     cat.msg("items", args().count("n", 3))     // "3 Artikel im Korb"
+//
+// ICU's C MessageFormat entry is varargs and can't be driven from a dynamic
+// argument set in portable C, so the pattern grammar is parsed *here* — while
+// the two genuinely locale-dependent pieces are delegated to ICU: CLDR plural
+// selection (PluralRules) and number formatting (vyto/intl/number).
+//
+// Supported pattern grammar (a practical subset of ICU MessageFormat):
+//   literal text            — with '' -> ' and '...' quoting of { } #
+//   {name}                  — substitute the argument (numbers get formatted)
+//   {name, number}          — locale number format of a numeric argument
+//   {name, plural, SELECTORS}        — cardinal plural; '#' = the count
+//   {name, selectordinal, SELECTORS} — ordinal plural
+//   {name, select, KEYS}    — choose by a string argument (e.g. gender)
+// where a plural selector is `=N` (exact) or a CLDR keyword
+// (zero/one/two/few/many/other) and each is followed by `{ submessage }`.
+
+import { Locale, PLURAL_CARDINAL, PLURAL_ORDINAL } from "vyto/intl";
+import { formatNumber } from "vyto/intl/number";
+import { json_parse, JsonValue } from "vyto/util/json";
+import { file_open } from "vyto/io/file";
+
+extern "C" {
+    fn intl_plural_open(locale: cstring, kind: i32): rawptr;
+    fn intl_plural_close(h: rawptr);
+    fn intl_plural_select(h: rawptr, n: f64, out: cstring, cap: i32): i32;
+}
+
+// ---- plural rules --------------------------------------------------------
+
+// CLDR plural rules for a locale. select(n) returns the keyword ("one",
+// "few", "many", "other", ...) that `n` falls into.
+export class PluralRules {
+    handle: rawptr;
+
+    fn init(loc: Locale, kind: int) {
+        this.handle = intl_plural_open(loc.id.cstr(), kind as i32);
+        if (this.handle == null) {
+            panic("vyto/intl: plural rules open failed for '" + loc.id + "'");
+        }
+    }
+    deinit { intl_plural_close(this.handle); }
+
+    fn select(n: float): string {
+        let cap = 16;
+        let buf = bytes(cap);
+        let m = intl_plural_select(this.handle, n, buf as cstring, cap as i32) as int;
+        if (m < 0) { panic("vyto/intl: plural select failed"); }
+        return str(buf as cstring);
+    }
+}
+
+export fn pluralRules(loc: Locale, kind: int): PluralRules { return new PluralRules(loc, kind); }
+
+// ---- message arguments ---------------------------------------------------
+
+const MA_NUM: int = 0;
+const MA_STR: int = 1;
+
+class MsgArg {
+    kind: int;
+    f: float;
+    s: string;
+    fn init(k: int) { this.kind = k; }
+}
+fn newNum(v: float): MsgArg  { let a = new MsgArg(MA_NUM); a.f = v; return a; }
+fn newStr(v: string): MsgArg { let a = new MsgArg(MA_STR); a.s = v; return a; }
+
+// Named argument set for a message, built fluently:
+//     argSet().whole("n", 3).text("who", "Ada")
+// (`args` is a builtin — the CLI argument vector — so this helper is argSet.)
+export class Args {
+    m: Map<string, MsgArg>;
+    fn init() { this.m = new Map<string, MsgArg>(); }
+    fn num(name: string, v: float): Args   { this.m.set(name, newNum(v)); return this; }
+    fn whole(name: string, v: int): Args   { this.m.set(name, newNum(v as float)); return this; }
+    fn text(name: string, v: string): Args { this.m.set(name, newStr(v)); return this; }
+}
+export fn argSet(): Args { return new Args(); }
+
+// ---- the MessageFormat-subset engine ------------------------------------
+
+fn is_space(c: int): bool { return c == 32 || c == 9 || c == 10 || c == 13; }
+fn is_digit(c: int): bool { return c >= 48 && c <= 57; }
+fn is_alpha(c: int): bool { return (c >= 97 && c <= 122) || (c >= 65 && c <= 90); }
+
+class MsgFormatter {
+    p: string;
+    pos: int;
+    loc: Locale;
+    a: Map<string, MsgArg>;
+
+    fn init(p: string, loc: Locale, a: Map<string, MsgArg>) {
+        this.p = p; this.pos = 0; this.loc = loc; this.a = a;
+    }
+
+    fn skipWs() {
+        while (this.pos < this.p.len && is_space(this.p[this.pos])) { this.pos += 1; }
+    }
+
+    // Read up to the next ',' or '}' (an argument name), trimmed.
+    fn readName(): string {
+        let start = this.pos;
+        while (this.pos < this.p.len && this.p[this.pos] != 44 && this.p[this.pos] != 125) {
+            this.pos += 1;
+        }
+        return this.p.slice(start, this.pos).trim();
+    }
+
+    // Read a run of letters (a type or select keyword).
+    fn readToken(): string {
+        this.skipWs();
+        let start = this.pos;
+        while (this.pos < this.p.len && is_alpha(this.p[this.pos])) { this.pos += 1; }
+        return this.p.slice(start, this.pos);
+    }
+
+    // A plural selector: "=N" exact or a keyword.
+    fn readSelector(): string {
+        this.skipWs();
+        if (this.pos < this.p.len && this.p[this.pos] == 61) { // '='
+            let start = this.pos;
+            this.pos += 1;
+            while (this.pos < this.p.len && is_digit(this.p[this.pos])) { this.pos += 1; }
+            return this.p.slice(start, this.pos);
+        }
+        return this.readToken();
+    }
+
+    // Consume through the matching close brace of the current argument.
+    fn skipToClose() {
+        let depth = 0;
+        while (this.pos < this.p.len) {
+            let c = this.p[this.pos];
+            if (c == 123) { depth += 1; }
+            else if (c == 125) {
+                if (depth == 0) { this.pos += 1; return; }
+                depth -= 1;
+            }
+            this.pos += 1;
+        }
+    }
+
+    fn argNum(name: string): float {
+        if (this.a.has(name)) {
+            let a = this.a.get(name);
+            if (a.kind == MA_NUM) { return a.f; }
+        }
+        return 0.0;
+    }
+    fn argStr(name: string): string {
+        if (this.a.has(name)) {
+            let a = this.a.get(name);
+            if (a.kind == MA_STR) { return a.s; }
+            return formatNumber(a.f, this.loc);
+        }
+        return "";
+    }
+
+    // Parse a (sub)message until end-of-input or an unescaped top-level '}'.
+    // `hash` is the text that '#' expands to in this scope.
+    fn message(hash: string): string {
+        let out = "";
+        while (this.pos < this.p.len) {
+            let c = this.p[this.pos];
+            if (c == 125) { break; }                                   // '}'
+            if (c == 123) { out = out + this.argument(hash); continue; } // '{'
+            if (c == 35) { out = out + hash; this.pos += 1; continue; }  // '#'
+            if (c == 39) {                                              // '\''  quoting
+                this.pos += 1;
+                if (this.pos < this.p.len && this.p[this.pos] == 39) {  // '' -> '
+                    out = out + "'"; this.pos += 1; continue;
+                }
+                while (this.pos < this.p.len && this.p[this.pos] != 39) {
+                    out = out + this.p.slice(this.pos, this.pos + 1);
+                    this.pos += 1;
+                }
+                if (this.pos < this.p.len) { this.pos += 1; }           // closing '
+                continue;
+            }
+            out = out + this.p.slice(this.pos, this.pos + 1);
+            this.pos += 1;
+        }
+        return out;
+    }
+
+    // Parse a "{...}" argument (pos is at '{'); returns its formatted text.
+    fn argument(hash: string): string {
+        this.pos += 1; // '{'
+        this.skipWs();
+        let name = this.readName();
+        this.skipWs();
+        if (this.pos < this.p.len && this.p[this.pos] == 125) {          // {name}
+            this.pos += 1;
+            return this.argStr(name);
+        }
+        if (this.pos < this.p.len && this.p[this.pos] == 44) { this.pos += 1; } // ','
+        let type = this.readToken();
+        this.skipWs();
+        if (type == "number") {
+            this.skipToClose();
+            return formatNumber(this.argNum(name), this.loc);
+        }
+        if (type == "plural" || type == "selectordinal") {
+            if (this.pos < this.p.len && this.p[this.pos] == 44) { this.pos += 1; }
+            return this.plural(name, type == "selectordinal");
+        }
+        if (type == "select") {
+            if (this.pos < this.p.len && this.p[this.pos] == 44) { this.pos += 1; }
+            return this.select(name);
+        }
+        // unknown/absent type: treat as a simple substitution
+        this.skipToClose();
+        return this.argStr(name);
+    }
+
+    fn plural(name: string, ordinal: bool): string {
+        let count = this.argNum(name);
+        let hash = formatNumber(count, this.loc);
+        let kind = PLURAL_CARDINAL;
+        if (ordinal) { kind = PLURAL_ORDINAL; }
+        let pr = new PluralRules(this.loc, kind);
+        let kw = pr.select(count);
+
+        let chosen = "";      let haveChosen = false;
+        let exactMsg = "";    let haveExact = false;
+        let otherMsg = "";
+        while (true) {
+            this.skipWs();
+            if (this.pos >= this.p.len || this.p[this.pos] == 125) { break; }
+            let sel = this.readSelector();
+            this.skipWs();
+            if (this.pos >= this.p.len || this.p[this.pos] != 123) { break; }
+            this.pos += 1; // '{'
+            let sub = this.message(hash);
+            if (this.pos < this.p.len && this.p[this.pos] == 125) { this.pos += 1; } // submessage '}'
+            if (sel.starts_with("=")) {
+                if (!haveExact && count == (sel.slice(1, sel.len).to_int() as float)) {
+                    exactMsg = sub; haveExact = true;
+                }
+            } else {
+                if (sel == "other") { otherMsg = sub; }
+                if (!haveChosen && sel == kw) { chosen = sub; haveChosen = true; }
+            }
+        }
+        if (this.pos < this.p.len && this.p[this.pos] == 125) { this.pos += 1; } // argument '}'
+        if (haveExact) { return exactMsg; }
+        if (haveChosen) { return chosen; }
+        return otherMsg;
+    }
+
+    fn select(name: string): string {
+        let key = this.argStr(name);
+        let chosen = "";  let haveChosen = false;
+        let otherMsg = "";
+        while (true) {
+            this.skipWs();
+            if (this.pos >= this.p.len || this.p[this.pos] == 125) { break; }
+            let sel = this.readToken();
+            this.skipWs();
+            if (this.pos >= this.p.len || this.p[this.pos] != 123) { break; }
+            this.pos += 1; // '{'
+            let sub = this.message("");
+            if (this.pos < this.p.len && this.p[this.pos] == 125) { this.pos += 1; }
+            if (sel == "other") { otherMsg = sub; }
+            if (!haveChosen && sel == key) { chosen = sub; haveChosen = true; }
+        }
+        if (this.pos < this.p.len && this.p[this.pos] == 125) { this.pos += 1; }
+        if (haveChosen) { return chosen; }
+        return otherMsg;
+    }
+}
+
+// Format one ICU-subset `pattern` for `loc` with the named `argmap`.
+fn format_message(pattern: string, loc: Locale, argmap: Map<string, MsgArg>): string {
+    let f = new MsgFormatter(pattern, loc, argmap);
+    return f.message("");
+}
+
+// Format a standalone pattern (no catalog).
+export fn message(pattern: string, loc: Locale, a: Args): string {
+    return format_message(pattern, loc, a.m);
+}
+
+// ---- catalog -------------------------------------------------------------
+
+// A key -> pattern table for one locale, loaded from a flat JSON object.
+export class Catalog {
+    loc: Locale;
+    root: JsonValue;
+
+    fn init(loc: Locale, root: JsonValue) { this.loc = loc; this.root = root; }
+
+    fn has(key: string): bool { return this.root.has(key); }
+
+    // Format `key`'s pattern with `a`. A missing key yields "[key]".
+    fn msg(key: string, a: Args): string {
+        if (!this.root.has(key)) { return "[" + key + "]"; }
+        return format_message(this.root.get(key).asString(), this.loc, a.m);
+    }
+    // Convenience for messages with no arguments.
+    fn get(key: string): string { return this.msg(key, new Args()); }
+}
+
+// Build a catalog from an in-memory JSON string (flat object of key->pattern).
+export fn catalogFromJson(loc: Locale, text: string): Catalog {
+    return new Catalog(loc, json_parse(text));
+}
+
+// Load a catalog from a JSON file.
+export fn loadCatalog(loc: Locale, path: string): Catalog {
+    let f = file_open(path, "r");
+    if (f == null) { panic("vyto/intl: cannot open catalog '" + path + "'"); }
+    return catalogFromJson(loc, f.readText());
+}

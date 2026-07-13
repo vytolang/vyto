@@ -1653,8 +1653,8 @@ static void emit_class_struct(ClassDecl *cd, SBuf *h, bool *emitted, ClassDecl *
 void emit_module(Module *m, bool is_entry, bool checks, bool freestanding, SBuf *h, SBuf *c) {
     g_checks = checks;
     /* ---------- header ---------- */
-    sb_printf(h, "#ifndef VOLT_MOD_%s_H\n#define VOLT_MOD_%s_H\n", m->name, m->name);
-    sb_puts(h, "#include \"volt_rt.h\"\n");
+    sb_printf(h, "#ifndef VYTO_MOD_%s_H\n#define VYTO_MOD_%s_H\n", m->name, m->name);
+    sb_puts(h, "#include \"vyto_rt.h\"\n");
     for (int i = 0; i < m->ndecls; i++)
         if (m->decls[i]->kind == D_IMPORT)
             sb_printf(h, "#include \"mod_%s.h\"\n", m->decls[i]->import_module->name);

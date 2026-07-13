@@ -1,6 +1,6 @@
-/* xshim — the part of X11 that voltbind cannot express: the XEvent union,
+/* xshim — the part of X11 that vytobind cannot express: the XEvent union,
  * macros, and font handling. Everything else the app calls straight from
- * the voltbind-generated Xlib binding. */
+ * the vytobind-generated Xlib binding. */
 #ifndef XSHIM_H
 #define XSHIM_H
 

@@ -1,5 +1,5 @@
-#ifndef VOLT_PARSE_H
-#define VOLT_PARSE_H
+#ifndef VYTO_PARSE_H
+#define VYTO_PARSE_H
 
 #include "ast.h"
 

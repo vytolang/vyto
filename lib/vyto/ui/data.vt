@@ -1,0 +1,593 @@
+// vyto/ui/data — data widgets: TreeView (hierarchical expand/collapse) and
+// Table (a string-cell DataGrid with a search box, sortable columns,
+// pagination, row selection, and per-row actions). Generics are shelved, so
+// the model is string cells (rows: string[][]); a Table owns its data so it can
+// filter/sort/paginate it directly.
+
+import { Widget, Painter, Theme, Size, BoxConstraints } from "vyto/ui/core";
+import { SearchField, Button } from "vyto/ui/form";
+import { Rect, contains, mix, KEY_UP, KEY_DOWN, KEY_LEFT, KEY_RIGHT,
+         KEY_ENTER, KEY_SPACE } from "vyto/surface";
+
+// ---- string helpers (no generics / stdlib string compare) ----------------
+
+fn lc_byte(b: int): int {
+    if (b >= 65 && b <= 90) { return b + 32; }
+    return b;
+}
+
+// case-insensitive substring test
+fn contains_ci(hay: string, needle: string): bool {
+    if (needle.len == 0) { return true; }
+    if (needle.len > hay.len) { return false; }
+    for (let i in 0..hay.len - needle.len + 1) {
+        let ok = true;
+        for (let j in 0..needle.len) {
+            if (lc_byte(hay[i + j]) != lc_byte(needle[j])) { ok = false; break; }
+        }
+        if (ok) { return true; }
+    }
+    return false;
+}
+
+// byte-wise compare: -1 / 0 / 1
+fn str_cmp(a: string, b: string): int {
+    let n = a.len;
+    if (b.len < n) { n = b.len; }
+    for (let i in 0..n) {
+        if (a[i] != b[i]) {
+            if (a[i] < b[i]) { return -1; }
+            return 1;
+        }
+    }
+    if (a.len < b.len) { return -1; }
+    if (a.len > b.len) { return 1; }
+    return 0;
+}
+
+// ------------------------------------------------------- TreeNode / TreeView
+
+// A tree node the app builds and hands to a TreeView. `data` is a free app key.
+export class TreeNode {
+    label: string;
+    children: TreeNode[];
+    expanded: bool;
+    data: int;
+
+    fn init(label: string) {
+        this.label = label;
+        this.children = [];
+        this.expanded = false;
+        this.data = 0;
+    }
+
+    fn add(child: TreeNode): TreeNode {
+        this.children.push(child);
+        return this;
+    }
+
+    fn leaf(): bool { return this.children.len == 0; }
+}
+
+const TREE_ROW_H: int = 24;
+
+// A scrollable hierarchical list. Visible nodes are flattened each frame (depth
+// = indent). Click a chevron to expand/collapse, a row to select; keyboard
+// Up/Down move, Right/Left expand/collapse, Enter/Space activate.
+export class TreeView extends Widget {
+    roots: TreeNode[];
+    flat: TreeNode[];   // visible nodes, rebuilt each layout/draw
+    depth: int[];
+    selected: int;      // index into flat (-1 none)
+    scroll: int;        // pixel scroll
+    onSelect: fn(TreeNode);
+    view_w: int;
+    view_h: int;
+
+    fn init() {
+        super.init();
+        this.roots = [];
+        this.flat = [];
+        this.depth = [];
+        this.selected = -1;
+        this.scroll = 0;
+        this.focusable = true;
+        this.view_w = 240;
+        this.view_h = 240;
+    }
+
+    fn add_root(n: TreeNode) { this.roots.push(n); }
+
+    fn flatten(n: TreeNode, d: int) {
+        this.flat.push(n);
+        this.depth.push(d);
+        if (n.expanded) {
+            for (let c in n.children) { this.flatten(c, d + 1); }
+        }
+    }
+
+    fn rebuild() {
+        this.flat = [];
+        this.depth = [];
+        for (let r in this.roots) { this.flatten(r, 0); }
+        if (this.selected >= this.flat.len) { this.selected = this.flat.len - 1; }
+    }
+
+    fn cur(): TreeNode {
+        if (this.selected >= 0 && this.selected < this.flat.len) { return this.flat[this.selected]; }
+        return null;
+    }
+
+    override fn measure(s: Painter, th: Theme): Size {
+        this.rebuild();
+        return Size(this.view_w, this.view_h);
+    }
+
+    fn clamp_scroll() {
+        let content = TREE_ROW_H * this.flat.len + 4;
+        let maxs = content - this.bounds.h;
+        if (maxs < 0) { maxs = 0; }
+        if (this.scroll > maxs) { this.scroll = maxs; }
+        if (this.scroll < 0) { this.scroll = 0; }
+    }
+
+    override fn draw(s: Painter, th: Theme) {
+        this.rebuild();
+        this.clamp_scroll();
+        s.fill_round(this.bounds, th.radius_md, th.surface_raised);
+        s.stroke_round(this.bounds, th.radius_md, 1, th.border);
+        if (this.focused) { this.win.skin.focus.paint(s, th, this.bounds, th.radius_md); }
+        s.clip_push(this.bounds, th.radius_md);
+        let on = th.on_surface;
+        for (let i in 0..this.flat.len) {
+            let ry = this.bounds.y + 2 - this.scroll + i * TREE_ROW_H;
+            if (ry + TREE_ROW_H < this.bounds.y || ry > this.bounds.y + this.bounds.h) { continue; }
+            let n = this.flat[i];
+            let d = this.depth[i];
+            if (i == this.selected) {
+                s.fill_round(Rect(this.bounds.x + 2, ry, this.bounds.w - 4, TREE_ROW_H - 2),
+                             th.radius_sm, th.selection);
+            }
+            let ind = 10 + d * 16;
+            let cx = this.bounds.x + ind;
+            let cy = ry + TREE_ROW_H / 2;
+            if (!n.leaf()) {
+                if (n.expanded) {
+                    s.line_w(cx - 4, cy - 2, cx, cy + 2, 2, on);
+                    s.line_w(cx, cy + 2, cx + 4, cy - 2, 2, on);
+                } else {
+                    s.line_w(cx - 2, cy - 4, cx + 2, cy, 2, on);
+                    s.line_w(cx + 2, cy, cx - 2, cy + 4, 2, on);
+                }
+            }
+            let tr = Rect(this.bounds.x + ind + 14, ry, this.bounds.w - ind - 16, TREE_ROW_H);
+            s.text_in(tr, 0, n.label, on);
+        }
+        s.clip_pop();
+    }
+
+    fn row_at(py: int): int {
+        let r = (py - this.bounds.y - 2 + this.scroll) / TREE_ROW_H;
+        if (r < 0 || r >= this.flat.len) { return -1; }
+        return r;
+    }
+
+    override fn on_click(x: int, y: int): bool {
+        let i = this.row_at(y);
+        if (i < 0) { return false; }
+        this.selected = i;
+        let n = this.flat[i];
+        let d = this.depth[i];
+        let chev = this.bounds.x + 10 + d * 16;
+        if (!n.leaf() && x < chev + 12) {
+            n.expanded = !n.expanded;
+        } else if (this.onSelect != null) {
+            this.onSelect(n);
+        }
+        return true;
+    }
+
+    override fn on_key(k: int, ch: string): bool {
+        if (k == KEY_DOWN) {
+            if (this.selected < this.flat.len - 1) { this.selected += 1; }
+            return true;
+        }
+        if (k == KEY_UP) {
+            if (this.selected > 0) { this.selected -= 1; }
+            return true;
+        }
+        if (k == KEY_RIGHT) {
+            let n = this.cur();
+            if (n != null && !n.leaf() && !n.expanded) { n.expanded = true; }
+            return true;
+        }
+        if (k == KEY_LEFT) {
+            let n = this.cur();
+            if (n != null && !n.leaf() && n.expanded) { n.expanded = false; }
+            return true;
+        }
+        if (k == KEY_ENTER || k == KEY_SPACE) {
+            let n = this.cur();
+            if (n != null && this.onSelect != null) { this.onSelect(n); }
+            return true;
+        }
+        return false;
+    }
+
+    override fn on_scroll(delta: int): bool {
+        this.scroll += delta * TREE_ROW_H;
+        this.clamp_scroll();
+        return true;
+    }
+
+    override fn drop_handlers() {
+        this.onSelect = null;
+    }
+}
+
+// ------------------------------------------------------- Table (DataGrid)
+
+// One column of a Table. `width` is fixed pixels; `align` 0/1/2 = L/C/R.
+export class TableColumn {
+    title: string;
+    width: int;
+    align: int;
+    sortable: bool;
+
+    fn init(title: string, width: int) {
+        this.title = title;
+        this.width = width;
+        this.align = 0;
+        this.sortable = true;
+    }
+}
+
+const TBL_HDR_H: int = 30;
+const TBL_ROW_H: int = 28;
+const TBL_FOOT_H: int = 36;
+
+// A DataGrid over string rows with a built-in search box, sortable columns,
+// pagination, single-row selection, and an optional trailing actions cell.
+// The Table owns its data (rows), so search/sort/paginate operate on a `view`
+// index list without the app re-supplying data.
+export class Table extends Widget {
+    columns: TableColumn[];
+    rows: string[][];
+    view: int[];            // filtered + sorted indices into rows
+    query: string;
+    sort_col: int;          // -1 = unsorted
+    sort_asc: bool;
+    page: int;
+    page_size: int;
+    selected: int;          // index into rows (full model), -1 none
+    hover_row: int;         // view-relative visible row, -1
+    onSelect: fn(int);
+    actions: string[];      // per-row action labels (trailing cell)
+    action_w: int;          // width of the actions cell (0 = none)
+    onAction: fn(int, int); // (row index in full model, action index)
+    search: SearchField;
+    prev_btn: Button;
+    next_btn: Button;
+
+    fn init(columns: TableColumn[]) {
+        super.init();
+        this.columns = columns;
+        this.rows = [];
+        this.view = [];
+        this.query = "";
+        this.sort_col = -1;
+        this.sort_asc = true;
+        this.page = 0;
+        this.page_size = 8;
+        this.selected = -1;
+        this.hover_row = -1;
+        this.actions = [];
+        this.action_w = 0;
+        this.focusable = true;
+        this.search = new SearchField("Search");
+        this.prev_btn = new Button("Prev");
+        this.next_btn = new Button("Next");
+        this.add(this.search);
+        this.add(this.prev_btn);
+        this.add(this.next_btn);
+        let self = this;
+        this.search.onChange = (q) => { self.set_query(q); };
+        this.prev_btn.onClick = (b) => { self.go_page(-1); };
+        this.next_btn.onClick = (b) => { self.go_page(1); };
+    }
+
+    fn set_rows(rows: string[][]) {
+        this.rows = rows;
+        this.selected = -1;
+        this.apply();
+    }
+
+    fn set_actions(labels: string[]) {
+        this.actions = labels;
+        this.action_w = labels.len * 64;
+    }
+
+    fn set_query(q: string) {
+        this.query = q;
+        this.page = 0;
+        this.apply();
+        this.invalidate();
+    }
+
+    // rebuild `view`: filter by query, then sort by sort_col.
+    fn apply() {
+        this.view = [];
+        for (let i in 0..this.rows.len) {
+            if (this.query.len == 0) { this.view.push(i); }
+            else {
+                let hit = false;
+                for (let c in this.rows[i]) {
+                    if (contains_ci(c, this.query)) { hit = true; break; }
+                }
+                if (hit) { this.view.push(i); }
+            }
+        }
+        if (this.sort_col >= 0) { this.sort_view(); }
+        let mp = this.max_page();
+        if (this.page > mp) { this.page = mp; }
+    }
+
+    fn cell(row: int, col: int): string {
+        if (col < this.rows[row].len) { return this.rows[row][col]; }
+        return "";
+    }
+
+    // insertion sort of `view` by the active column (stable enough for a grid).
+    fn sort_view() {
+        let c = this.sort_col;
+        for (let i in 1..this.view.len) {
+            let v = this.view[i];
+            let j = i - 1;
+            while (j >= 0) {
+                let cmp = str_cmp(this.cell(this.view[j], c), this.cell(v, c));
+                if (!this.sort_asc) { cmp = -cmp; }
+                if (cmp > 0) { this.view[j + 1] = this.view[j]; j -= 1; }
+                else { break; }
+            }
+            this.view[j + 1] = v;
+        }
+    }
+
+    fn max_page(): int {
+        if (this.view.len == 0) { return 0; }
+        let mp = (this.view.len - 1) / this.page_size;
+        return mp;
+    }
+
+    fn go_page(delta: int) {
+        this.page += delta;
+        if (this.page < 0) { this.page = 0; }
+        let mp = this.max_page();
+        if (this.page > mp) { this.page = mp; }
+        this.invalidate();
+    }
+
+    fn toggle_sort(c: int) {
+        if (this.sort_col == c) { this.sort_asc = !this.sort_asc; }
+        else { this.sort_col = c; this.sort_asc = true; }
+        this.apply();
+        this.invalidate();
+    }
+
+    fn grid_w(): int {
+        let w = 0;
+        for (let col in this.columns) { w += col.width; }
+        return w + this.action_w;
+    }
+
+    fn search_h(): int { return 34; }
+
+    override fn measure(s: Painter, th: Theme): Size {
+        let w = this.grid_w();
+        if (w < 240) { w = 240; }
+        let h = this.search_h() + TBL_HDR_H + this.page_size * TBL_ROW_H + TBL_FOOT_H;
+        return Size(w, h);
+    }
+
+    override fn arrange(s: Painter, th: Theme, r: Rect) {
+        this.bounds = r;
+        let fh = s.font_height();
+        // search box on the top-right
+        let sw = 200;
+        if (sw > r.w - 16) { sw = r.w - 16; }
+        this.search.arrange(s, th, Rect(r.x + r.w - sw - 8, r.y + 4, sw, fh + 12));
+        // footer buttons on the bottom-right
+        let by = r.y + r.h - TBL_FOOT_H + 4;
+        let bw = 64;
+        this.next_btn.arrange(s, th, Rect(r.x + r.w - bw - 8, by, bw, TBL_FOOT_H - 10));
+        this.prev_btn.arrange(s, th, Rect(r.x + r.w - 2 * bw - 16, by, bw, TBL_FOOT_H - 10));
+    }
+
+    fn col_x(i: int): int {
+        let x = this.bounds.x;
+        for (let k in 0..i) { x += this.columns[k].width; }
+        return x;
+    }
+
+    fn body_top(): int { return this.bounds.y + this.search_h() + TBL_HDR_H; }
+    fn footer_top(): int { return this.bounds.y + this.bounds.h - TBL_FOOT_H; }
+
+    fn draw_cell(s: Painter, col: TableColumn, cx: int, cw: int, y: int, h: int, text: string, color: int) {
+        let tw = s.text_width(text);
+        let pad = 8;
+        if (col.align == 1) { pad = (cw - tw) / 2; }
+        else if (col.align == 2) { pad = cw - tw - 8; }
+        if (pad < 4) { pad = 4; }
+        s.text_in(Rect(cx, y, cw, h), pad, text, color);
+    }
+
+    override fn draw(s: Painter, th: Theme) {
+        s.fill_round(this.bounds, th.radius_md, th.surface_raised);
+        s.stroke_round(this.bounds, th.radius_md, 1, th.border);
+        // --- header ---
+        let hy = this.bounds.y + this.search_h();
+        s.fill(Rect(this.bounds.x, hy, this.bounds.w, TBL_HDR_H), th.surface_sunken);
+        s.set_weight(2); // bold
+        for (let i in 0..this.columns.len) {
+            let col = this.columns[i];
+            let cx = this.col_x(i);
+            let label = col.title;
+            this.draw_cell(s, col, cx, col.width, hy, TBL_HDR_H, label, th.on_surface);
+            if (this.sort_col == i) {
+                let ax = cx + col.width - 14;
+                let ay = hy + TBL_HDR_H / 2;
+                if (this.sort_asc) {
+                    s.line_w(ax - 3, ay + 2, ax, ay - 2, 2, th.primary);
+                    s.line_w(ax, ay - 2, ax + 3, ay + 2, 2, th.primary);
+                } else {
+                    s.line_w(ax - 3, ay - 2, ax, ay + 2, 2, th.primary);
+                    s.line_w(ax, ay + 2, ax + 3, ay - 2, 2, th.primary);
+                }
+            }
+        }
+        s.set_weight(0);
+        s.line(this.bounds.x, hy + TBL_HDR_H, this.bounds.x + this.bounds.w, hy + TBL_HDR_H, th.divider);
+        // --- body (current page slice of view) ---
+        let start = this.page * this.page_size;
+        let by = this.body_top();
+        s.clip_push(Rect(this.bounds.x, by, this.bounds.w, this.page_size * TBL_ROW_H), 0);
+        let act_x = this.bounds.x + this.bounds.w - this.action_w;
+        for (let r in 0..this.page_size) {
+            let vi = start + r;
+            if (vi >= this.view.len) { break; }
+            let ri = this.view[vi];
+            let ry = by + r * TBL_ROW_H;
+            if (ri == this.selected) {
+                s.fill(Rect(this.bounds.x, ry, this.bounds.w, TBL_ROW_H), th.selection);
+            } else if (r == this.hover_row) {
+                s.fill(Rect(this.bounds.x, ry, this.bounds.w, TBL_ROW_H),
+                       mix(th.surface_raised, th.on_surface, 0.04));
+            }
+            for (let i in 0..this.columns.len) {
+                let col = this.columns[i];
+                this.draw_cell(s, col, this.col_x(i), col.width, ry, TBL_ROW_H,
+                               this.cell(ri, i), th.on_surface);
+            }
+            // trailing action cell
+            if (this.action_w > 0) {
+                let aw = this.action_w / this.actions.len;
+                for (let a in 0..this.actions.len) {
+                    let axr = Rect(act_x + a * aw, ry, aw, TBL_ROW_H);
+                    s.text_in(axr, 6, this.actions[a], th.primary);
+                }
+            }
+        }
+        s.clip_pop();
+        // --- footer ---
+        let fy = this.footer_top();
+        s.line(this.bounds.x, fy, this.bounds.x + this.bounds.w, fy, th.divider);
+        let mp = this.max_page();
+        let label = "Page " + (this.page + 1) + " of " + (mp + 1)
+                  + "  (" + this.view.len + " rows)";
+        s.text_in(Rect(this.bounds.x + 8, fy, this.bounds.w / 2, TBL_FOOT_H), 0,
+                  label, th.on_surface_muted);
+        // children (search box + prev/next buttons)
+        this.search.draw(s, th);
+        this.prev_btn.draw(s, th);
+        this.next_btn.draw(s, th);
+    }
+
+    // The Table paints its header/body/footer in draw() and also has child
+    // widgets (search box, page buttons). On a dirty-region repaint the base
+    // draw_within would clear the rect and redraw ONLY the children — erasing
+    // the grid until the next full redraw (the "table vanishes on hover" bug).
+    // Repaint the whole widget instead whenever the dirty rect touches it.
+    override fn draw_within(s: Painter, th: Theme, d: Rect) {
+        let b = this.bounds;
+        if (b.x + b.w <= d.x || d.x + d.w <= b.x ||
+            b.y + b.h <= d.y || d.y + d.h <= b.y) { return; }
+        this.draw(s, th);
+    }
+
+    override fn on_click(x: int, y: int): bool {
+        let hy = this.bounds.y + this.search_h();
+        // header → sort
+        if (y >= hy && y < hy + TBL_HDR_H) {
+            for (let i in 0..this.columns.len) {
+                let cx = this.col_x(i);
+                if (x >= cx && x < cx + this.columns[i].width && this.columns[i].sortable) {
+                    this.toggle_sort(i);
+                    return true;
+                }
+            }
+            return true;
+        }
+        // body → select or action
+        let by = this.body_top();
+        if (y >= by && y < by + this.page_size * TBL_ROW_H) {
+            let r = (y - by) / TBL_ROW_H;
+            let vi = this.page * this.page_size + r;
+            if (vi >= this.view.len) { return true; }
+            let ri = this.view[vi];
+            let act_x = this.bounds.x + this.bounds.w - this.action_w;
+            if (this.action_w > 0 && x >= act_x) {
+                let aw = this.action_w / this.actions.len;
+                let a = (x - act_x) / aw;
+                if (a >= 0 && a < this.actions.len && this.onAction != null) {
+                    this.onAction(ri, a);
+                }
+                return true;
+            }
+            this.selected = ri;
+            if (this.onSelect != null) { this.onSelect(ri); }
+            return true;
+        }
+        return true;
+    }
+
+    override fn on_key(k: int, ch: string): bool {
+        if (k == KEY_DOWN) { this.move_sel(1); return true; }
+        if (k == KEY_UP) { this.move_sel(-1); return true; }
+        if (k == KEY_RIGHT) { this.go_page(1); return true; }
+        if (k == KEY_LEFT) { this.go_page(-1); return true; }
+        return false;
+    }
+
+    // move selection within the view, following pages.
+    fn move_sel(delta: int) {
+        // current view index of selection
+        let vi = -1;
+        for (let i in 0..this.view.len) { if (this.view[i] == this.selected) { vi = i; } }
+        vi += delta;
+        if (vi < 0) { vi = 0; }
+        if (vi >= this.view.len) { vi = this.view.len - 1; }
+        if (vi < 0) { return; }
+        this.selected = this.view[vi];
+        this.page = vi / this.page_size;
+        if (this.onSelect != null) { this.onSelect(this.selected); }
+        this.invalidate();
+    }
+
+    override fn hit(px: int, py: int): Widget {
+        // let the child search box / buttons win, else this.
+        let n = this.children.len;
+        for (let i in 0..n) {
+            let c = this.children[n - 1 - i];
+            let f = c.hit(px, py);
+            if (f != null) { return f; }
+        }
+        if (contains(this.bounds, px, py)) {
+            let by = this.body_top();
+            let hr = -1;
+            if (py >= by && py < by + this.page_size * TBL_ROW_H) { hr = (py - by) / TBL_ROW_H; }
+            if (hr != this.hover_row) { this.hover_row = hr; this.invalidate(); }
+            return this;
+        }
+        return null;
+    }
+
+    override fn on_hover_leave(): bool {
+        if (this.hover_row != -1) { this.hover_row = -1; return true; }
+        return false;
+    }
+
+    override fn drop_handlers() {
+        this.onSelect = null;
+        this.onAction = null;
+    }
+}

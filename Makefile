@@ -3,21 +3,21 @@ CFLAGS  ?= -std=c99 -O2 -Wall -Wextra -g
 SRC     := src/main.c src/util.c src/lex.c src/parse.c src/check.c src/emit.c
 HDR     := src/util.h src/lex.h src/ast.h src/parse.h src/check.h src/emit.h
 
-all: voltc voltbind
+all: vytoc vytobind
 
-voltc: $(SRC) $(HDR)
+vytoc: $(SRC) $(HDR)
 	$(CC) $(CFLAGS) -o $@ $(SRC)
 
-voltbind: src/voltbind.c src/util.c src/util.h
-	$(CC) $(CFLAGS) -o $@ src/voltbind.c src/util.c
+vytobind: src/vytobind.c src/util.c src/util.h
+	$(CC) $(CFLAGS) -o $@ src/vytobind.c src/util.c
 
 .PHONY: all test clean
 
-test: voltc voltbind
+test: vytoc vytobind
 	./tests/run_tests.sh
 
 clean:
-	rm -f voltc voltbind
-	rm -rf examples/.volt-cache tests/tmp tests/ui/.volt-cache
-	rm -rf tests/fixtures/libpath/.volt-cache tests/fixtures/libpath/shadow/.volt-cache
+	rm -f vytoc vytobind
+	rm -rf examples/.vyto-cache tests/tmp tests/ui/.vyto-cache
+	rm -rf tests/fixtures/libpath/.vyto-cache tests/fixtures/libpath/shadow/.vyto-cache
 	rm -rf examples/greeter/native examples/greeter/greeter.vt

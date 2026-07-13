@@ -1,4 +1,4 @@
-# Volt Benchmark Issues Report
+# Vyto Benchmark Issues Report
 
 Generated from benchmarks run on 2026-07-06.
 Tests: Fibonacci, Primes, Matrix Multiply, Ackermann, Array Ops, Log Parsing (1M lines), 15-Queens, SQLite (1M rows write + read).
@@ -13,15 +13,15 @@ in the Performance Summary.
 
 **Severity: High**
 
-Volt now has `& | ^ ~ << >>` and `&= |= ^= <<= >>=`, with Go-style
+Vyto now has `& | ^ ~ << >>` and `&= |= ^= <<= >>=`, with Go-style
 precedence (`& << >>` bind like `*`; `| ^` like `+`), so `a & mask == 0`
 parses sanely. Shifts keep the left operand's type.
 
 Result: the bitmask N-Queens (`07_nqueens_bitmask.vt`) runs at **1.02x C**
 (1.24s vs 1.21s, n=15) — the array-based workaround needed 87.8s.
 
-```volt
-let avail = (~(cols | d1 | d2)) & mask;   // now valid Volt
+```vyto
+let avail = (~(cols | d1 | d2)) & mask;   // now valid Vyto
 ```
 
 ---
@@ -44,7 +44,7 @@ memory; use FFI streaming when peak RSS matters.
 
 Unary `&` on a value-type local/parameter yields `rawptr`:
 
-```volt
+```vyto
 let db: rawptr = null;
 sqlite3_open("logs.db".cstr(), &db);   // ppDb out-param, no C wrapper
 ```
@@ -62,7 +62,7 @@ ref-counted value is a compile error.
 `byte[]`/`i8[]` casts to `cstring`/`rawptr` as a borrowed view of the
 buffer, and the new `bytes(n)` builtin allocates a zeroed n-byte array:
 
-```volt
+```vyto
 let buf = bytes(4096);
 fgets(buf as cstring, 4096, f);   // no malloc/free via FFI
 ```
@@ -76,7 +76,7 @@ fgets(buf as cstring, 4096, f);   // no malloc/free via FFI
 Extern fns are now emitted under private identifiers aliased to the real
 symbol via `__asm__` (`extern void* vx_strstr(...) __asm__("strstr")`), so
 declarations can never collide with system headers pulled in by
-`volt_rt.h`. Declaring `strstr(hay: cstring, needle: cstring): rawptr`
+`vyto_rt.h`. Declaring `strstr(hay: cstring, needle: cstring): rawptr`
 just works.
 
 ---
@@ -110,7 +110,7 @@ unsigned → wider unsigned, unsigned → strictly wider signed. Applies to
 assignment, arguments, returns, and mixed-width arithmetic/comparisons
 (result is the wider type):
 
-```volt
+```vyto
 if (sqlite3_exec(db, sql, null, null, null) != SQLITE_OK) { ... }  // no cast
 ```
 
@@ -142,7 +142,7 @@ integer state beats array state where it matters.
 
 **Severity: Medium**
 
-`bytes(n)` + `buf as cstring` gives C a Volt-owned buffer with no copies,
+`bytes(n)` + `buf as cstring` gives C a Vyto-owned buffer with no copies,
 and `readlines()` removed the per-line copy tax. Reading foreign C buffers
 without copying (a span/slice type) is still future work.
 
@@ -161,7 +161,7 @@ enforced immutability); deferred.
 
 ### Compute Benchmarks
 
-| Benchmark | Volt (release) | C (-O2) | Ratio | v0.1 ratio |
+| Benchmark | Vyto (release) | C (-O2) | Ratio | v0.1 ratio |
 |-----------|---------------|---------|-------|------------|
 | Fibonacci(40) | 0.21s | 0.245s | ~1.0x | 1.03x |
 | Primes (10M) | 0.19s | 0.103s | ~1.9x | 2.50x |
@@ -176,7 +176,7 @@ enforced immutability); deferred.
 | Language | Time | Peak Memory | vs C |
 |----------|------|-------------|------|
 | **C (-O2)** | 2.68s | 4,480 KB | 1.0x |
-| **Volt (release)** | 2.81s | 4,480 KB | 1.05x |
+| **Vyto (release)** | 2.81s | 4,480 KB | 1.05x |
 | **Python (streaming)** | 9.78s (v0.1 run) | 12,672 KB | ~3.6x |
 
 The two headline gaps from v0.1 — bitwise algorithms (350x) and FFI-heavy

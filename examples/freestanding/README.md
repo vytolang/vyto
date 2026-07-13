@@ -1,10 +1,10 @@
 # Freestanding runtime example
 
-Proof that Volt runs with **no libc** — the profile that unlocks bare-metal /
+Proof that Vyto runs with **no libc** — the profile that unlocks bare-metal /
 embedded / display targets (see [docs/PORTABILITY.md](../../docs/PORTABILITY.md)
 roadmap item 4).
 
-`voltc build app.vt --freestanding` compiles the runtime and modules with
+`vytoc build app.vt --freestanding` compiles the runtime and modules with
 `-ffreestanding -DVT_NO_LIBC -fno-builtin` and emits `libapp.a` (no `main`, no
 link step). The runtime touches the platform only through six hooks:
 
@@ -34,7 +34,7 @@ and call `vt_main()` from the reset handler:
 then link `libapp.a + host_hooks.o + startup.o` against your linker script with
 `arm-none-eabi-gcc` (or any bare-metal C toolchain), e.g.:
 
-    voltc build app.vt --freestanding \
+    vytoc build app.vt --freestanding \
         --cc 'arm-none-eabi-gcc -mcpu=cortex-m4 -mthumb' -o libapp.a
 
 Add `--no-float` on no-FPU parts (float→string becomes a stub) and note that

@@ -1,0 +1,532 @@
+// vyto/ui/feedback — modal dialogs and floating panels: ConfirmDialog,
+// InputDialog, Popover. Builds on the Window overlay path.
+
+import { Widget, Painter, Theme, Window, Size, BoxConstraints,
+         EASE_LINEAR, WEIGHT_BOLD } from "vyto/ui/core";
+import { Tween } from "vyto/ui/anim";
+import { Button, TextField, Label } from "vyto/ui/form";
+import { Text } from "vyto/ui/display";
+import { Menu, MenuItem, MenuPopup } from "vyto/ui/menu";
+import { Rect, contains, mix, with_alpha, KEY_ENTER } from "vyto/surface";
+
+// severity levels shared by AlertBanner / AlertDialog / Toast
+export const SEV_NONE: int = 0;
+export const SEV_INFO: int = 1;
+export const SEV_SUCCESS: int = 2;
+export const SEV_WARNING: int = 3;
+export const SEV_ERROR: int = 4;
+
+// Resolve a severity to its theme color (SEV_NONE -> primary).
+export fn severity_color(th: Theme, sev: int): int {
+    if (sev == SEV_INFO) { return th.info; }
+    if (sev == SEV_SUCCESS) { return th.success; }
+    if (sev == SEV_WARNING) { return th.warning; }
+    if (sev == SEV_ERROR) { return th.danger; }
+    return th.primary;
+}
+
+// Draw a small severity glyph (info 'i', success check, warning/error '!')
+// inside a filled circle of radius r centered at (cx,cy). Reused by banner+dialog.
+export fn draw_severity_glyph(s: Painter, cx: int, cy: int, r: int, color: int, on: int, sev: int) {
+    s.circle(cx, cy, r, color);
+    if (sev == SEV_SUCCESS) {
+        s.line_w(cx - r/2, cy, cx - r/6, cy + r/2, 2, on);
+        s.line_w(cx - r/6, cy + r/2, cx + r/2, cy - r/3, 2, on);
+    } else {
+        // 'i' / '!' : a dot + a stem
+        s.circle(cx, cy - r/2, 1, on);
+        s.fill(Rect(cx - 1, cy - r/4, 2, r/2 + r/6), on);
+    }
+}
+
+// ------------------------------------------------------- ConfirmDialog
+
+// Modal yes/no dialog; extends Dialog pattern.
+export class ConfirmDialog extends Widget {
+    title: string;
+    message: string;
+    onConfirm: fn();
+    onCancel: fn();
+    ok_btn: Button;
+    cancel_btn: Button;
+    msg_text: Text;
+
+    fn init(title: string, message: string) {
+        super.init();
+        this.title = title;
+        this.message = message;
+        this.modal = true;
+        this.ok_btn = new Button("OK");
+        this.cancel_btn = new Button("Cancel");
+        this.msg_text = new Text(message);
+        this.add(this.msg_text);
+        this.add(this.ok_btn);
+        this.add(this.cancel_btn);
+    }
+
+    fn do_confirm() {
+        let cb = this.onConfirm;
+        let w = this.win;
+        w.dismiss_overlay();
+        if (cb != null) { cb(); }
+    }
+
+    fn do_cancel() {
+        let cb = this.onCancel;
+        let w = this.win;
+        w.dismiss_overlay();
+        if (cb != null) { cb(); }
+    }
+
+    override fn place(s: Painter, th: Theme) {
+        let dw = 300;
+        let fh = s.font_height();
+        let ctrl_h = fh + 12;
+        // measure wrapped text
+        this.msg_text.layout(s, th, new BoxConstraints(0, dw - 32, 0, 300));
+        let msg_h = this.msg_text.cached_count * (fh + 2);
+        if (msg_h < fh + 4) { msg_h = fh + 4; }
+        let dh = fh + 16 + msg_h + 16 + ctrl_h + 16;
+        let x = (s.width() - dw) / 2;
+        let y = (s.height() - dh) / 2;
+        this.bounds = Rect(x, y, dw, dh);
+        let msg_y = y + fh + 16;
+        this.msg_text.bounds = Rect(x + 16, msg_y, dw - 32, msg_h);
+        let bw = 80;
+        let btn_y = y + dh - 16 - ctrl_h;
+        this.cancel_btn.bounds = Rect(x + dw - 16 - bw, btn_y, bw, ctrl_h);
+        this.ok_btn.bounds = Rect(x + dw - 16 - 2 * bw - 8, btn_y, bw, ctrl_h);
+    }
+
+    override fn draw(s: Painter, th: Theme) {
+        let radius = th.radius_lg;
+        this.win.skin.panel.paint_titled(s, th, this.bounds, radius,
+                                         th.surface_raised, th.border, 3, this.title);
+        this.msg_text.draw(s, th);
+        this.ok_btn.draw(s, th);
+        this.cancel_btn.draw(s, th);
+    }
+
+    override fn on_key(k: int, ch: string): bool {
+        if (k == KEY_ENTER) { this.do_confirm(); return true; }
+        return false;
+    }
+
+    override fn on_click(x: int, y: int): bool {
+        if (contains(this.ok_btn.bounds, x, y)) { this.do_confirm(); return true; }
+        if (contains(this.cancel_btn.bounds, x, y)) { this.do_cancel(); return true; }
+        return true; // swallow clicks inside the modal
+    }
+
+    override fn drop_handlers() {
+        this.onConfirm = null;
+        this.onCancel = null;
+    }
+}
+
+// ------------------------------------------------------- InputDialog
+
+// Modal prompt with a TextField; onAccept(text).
+export class InputDialog extends Widget {
+    title: string;
+    prompt: string;
+    initial: string;
+    onAccept: fn(string);
+    onCancel: fn();
+    field: TextField;
+    ok_btn: Button;
+    cancel_btn: Button;
+    prompt_text: Text;
+
+    fn init(title: string, prompt: string, initial: string) {
+        super.init();
+        this.title = title;
+        this.prompt = prompt;
+        this.initial = initial;
+        this.modal = true;
+        this.field = new TextField("");
+        this.field.set_text(initial);
+        this.ok_btn = new Button("OK");
+        this.cancel_btn = new Button("Cancel");
+        this.prompt_text = new Text(prompt);
+        this.add(this.prompt_text);
+        this.add(this.field);
+        this.add(this.ok_btn);
+        this.add(this.cancel_btn);
+    }
+
+    fn do_accept() {
+        let cb = this.onAccept;
+        let t = this.field.text;
+        let w = this.win;
+        w.dismiss_overlay();
+        if (cb != null) { cb(t); }
+    }
+
+    fn do_cancel() {
+        let cb = this.onCancel;
+        let w = this.win;
+        w.dismiss_overlay();
+        if (cb != null) { cb(); }
+    }
+
+    override fn place(s: Painter, th: Theme) {
+        let dw = 340;
+        let fh = s.font_height();
+        let ctrl_h = fh + 12;
+        // measure prompt text
+        this.prompt_text.layout(s, th, new BoxConstraints(0, dw - 24, 0, 100));
+        let prompt_h = this.prompt_text.cached_count * (fh + 2);
+        if (prompt_h < fh) { prompt_h = fh; }
+        let dh = fh + 16 + prompt_h + 8 + ctrl_h + 12 + ctrl_h + 16;
+        let x = (s.width() - dw) / 2;
+        let y = (s.height() - dh) / 2;
+        this.bounds = Rect(x, y, dw, dh);
+        let prompt_y = y + fh + 16;
+        this.prompt_text.bounds = Rect(x + 12, prompt_y, dw - 24, prompt_h);
+        let field_y = prompt_y + prompt_h + 8;
+        this.field.bounds = Rect(x + 12, field_y, dw - 24, ctrl_h);
+        let btn_y = field_y + ctrl_h + 12;
+        let bw = 80;
+        this.cancel_btn.bounds = Rect(x + dw - 16 - bw, btn_y, bw, ctrl_h);
+        this.ok_btn.bounds = Rect(x + dw - 16 - 2 * bw - 8, btn_y, bw, ctrl_h);
+    }
+
+    override fn draw(s: Painter, th: Theme) {
+        let radius = th.radius_lg;
+        this.win.skin.panel.paint_titled(s, th, this.bounds, radius,
+                                         th.surface_raised, th.border, 3, this.title);
+        this.prompt_text.draw(s, th);
+        this.field.draw(s, th);
+        this.ok_btn.draw(s, th);
+        this.cancel_btn.draw(s, th);
+    }
+
+    override fn on_key(k: int, ch: string): bool {
+        if (k == KEY_ENTER) { this.do_accept(); return true; }
+        return this.field.on_key(k, ch);
+    }
+
+    override fn on_click(x: int, y: int): bool {
+        if (contains(this.ok_btn.bounds, x, y)) { this.do_accept(); return true; }
+        if (contains(this.cancel_btn.bounds, x, y)) { this.do_cancel(); return true; }
+        if (contains(this.field.bounds, x, y)) { this.field.on_click(x, y); return true; }
+        return true;
+    }
+
+    override fn drop_handlers() {
+        this.onAccept = null;
+        this.onCancel = null;
+    }
+}
+
+// ---------------------------------------------------------------- Popover
+
+// A non-modal floating panel anchored to a point; dismiss on outside click.
+// Modelled on MenuPopup's placement.
+export class Popover extends Widget {
+    anchor_x: int;
+    anchor_y: int;
+    dismiss_on_outside: bool;
+
+    fn init(ax: int, ay: int) {
+        super.init();
+        this.anchor_x = ax;
+        this.anchor_y = ay;
+        this.modal = false;
+        this.dismiss_on_outside = true;
+    }
+
+    override fn place(s: Painter, th: Theme) {
+        // measure children to compute size
+        let w = 40;
+        let h = 20;
+        for (let c in this.children) {
+            let cs = c.measure(s, th);
+            if (cs.w + 16 > w) { w = cs.w + 16; }
+            h += cs.h + 8;
+        }
+        let x = this.anchor_x;
+        let y = this.anchor_y;
+        if (x + w > s.width()) { x = s.width() - w; }
+        if (y + h > s.height()) { y = this.anchor_y - h; }
+        if (x < 0) { x = 0; }
+        if (y < 0) { y = 0; }
+        this.bounds = Rect(x, y, w, h);
+        // arrange children
+        let cy = y + 8;
+        for (let c in this.children) {
+            let cs = c.measure(s, th);
+            c.arrange(s, th, Rect(x + 8, cy, w - 16, cs.h));
+            cy += cs.h + 8;
+        }
+    }
+
+    override fn draw(s: Painter, th: Theme) {
+        // was flat fill+frame on legacy tokens (never modernized); now matches
+        // every other floating overlay (MenuPopup/DropdownPopup): rounded +
+        // shadow, elevation 2.
+        this.win.skin.panel.paint(s, th, this.bounds, th.radius_md, th.surface_raised, th.border, 2);
+        for (let c in this.children) { c.draw(s, th); }
+    }
+
+    override fn on_click(x: int, y: int): bool {
+        if (!contains(this.bounds, x, y)) {
+            if (this.dismiss_on_outside) {
+                let w = this.win;
+                if (w != null) { w.dismiss_overlay(); }
+            }
+            return true;
+        }
+        for (let c in this.children) {
+            if (contains(c.bounds, x, y)) {
+                if (c.on_click(x, y)) { return true; }
+            }
+        }
+        return true;
+    }
+
+    override fn on_key(k: int, ch: string): bool {
+        for (let c in this.children) {
+            if (c.on_key(k, ch)) { return true; }
+        }
+        return false;
+    }
+}
+
+// ------------------------------------------------------- Tooltip
+
+// A small dark hint bubble. Lives in the Window toast layer (non-capturing) so
+// it never blocks hover/input like an overlay would. The app shows it on
+// on_hover_enter/on_long_press via show_tooltip() and hides it on leave.
+export class Tooltip extends Widget {
+    anchor_x: int;
+    anchor_y: int;
+    text: string;
+
+    fn init(ax: int, ay: int, text: string) {
+        super.init();
+        this.anchor_x = ax;
+        this.anchor_y = ay;
+        this.text = text;
+    }
+
+    override fn place(s: Painter, th: Theme) {
+        let w = s.text_width(this.text) + 16;
+        let h = s.font_height() + 10;
+        let x = this.anchor_x - w / 2;
+        let y = this.anchor_y - h - 6;       // above the anchor
+        if (y < 0) { y = this.anchor_y + 18; } // flip below
+        if (x + w > s.width()) { x = s.width() - w; }
+        if (x < 0) { x = 0; }
+        this.bounds = Rect(x, y, w, h);
+    }
+
+    override fn draw(s: Painter, th: Theme) {
+        s.fill_round(this.bounds, th.radius_sm, th.on_surface);
+        s.text_in(this.bounds, 8, this.text, th.surface_raised);
+    }
+}
+
+// Show/replace the single hint tooltip in the toast layer. Returns the widget
+// so the caller can hide it with win.remove_toast(tip) on hover-leave.
+export fn show_tooltip(win: Window, ax: int, ay: int, text: string): Tooltip {
+    let tip = new Tooltip(ax, ay, text);
+    win.show_toast(tip);
+    return tip;
+}
+
+// ------------------------------------------------------- Toast / Snackbar
+
+// A transient bottom notification in the Window toast layer. Fades in, holds,
+// fades out, and self-removes — driven by one non-looping lifetime Tween. An
+// optional action button makes it a Snackbar. `severity` tints the accent.
+export class Toast extends Widget {
+    message: string;
+    action_label: string;    // "" = plain toast
+    onAction: fn();
+    severity: int;
+    life_ms: int;
+    alpha: float;
+    started: bool;
+    tween: Tween;
+    act_x: int;              // cached action hit region (set in place)
+    act_w: int;
+
+    fn init(message: string) {
+        super.init();
+        this.message = message;
+        this.action_label = "";
+        this.severity = SEV_NONE;
+        this.life_ms = 3000;
+        this.alpha = 0.0;
+        this.started = false;
+        this.act_x = 0;
+        this.act_w = 0;
+    }
+
+    override fn place(s: Painter, th: Theme) {
+        let mw = s.text_width(this.message);
+        let aw = 0;
+        if (this.action_label.len > 0) { aw = s.text_width(this.action_label) + 28; }
+        let w = mw + 32 + aw;
+        if (w > s.width() - 24) { w = s.width() - 24; }
+        let h = s.font_height() + 24;
+        // stack index (0 = oldest, at the bottom); newer toasts sit higher
+        let idx = 0;
+        let total = this.win.toasts.len;
+        for (let i in 0..total) { if (this.win.toasts[i] == this) { idx = i; } }
+        let x = (s.width() - w) / 2;
+        let y = s.height() - 24 - h - (total - 1 - idx) * (h + 10);
+        this.bounds = Rect(x, y, w, h);
+        this.act_w = aw;
+        this.act_x = x + w - aw;
+    }
+
+    fn on_life(t: float) {
+        if (t < 0.12) { this.alpha = t / 0.12; }
+        else if (t > 0.85) {
+            this.alpha = (1.0 - t) / 0.15;
+            if (this.alpha < 0.0) { this.alpha = 0.0; }
+        } else { this.alpha = 1.0; }
+        this.invalidate();
+        if (t >= 1.0) {
+            let w = this.win;
+            if (w != null) { w.remove_toast(this); }
+        }
+    }
+
+    override fn draw(s: Painter, th: Theme) {
+        if (!this.started && this.win != null) {
+            this.started = true;
+            let self = this;
+            this.tween = this.animate(this.life_ms, false, EASE_LINEAR, (t) => { self.on_life(t); });
+        }
+        let av = (this.alpha * 255.0) as int;
+        if (av < 0) { av = 0; }
+        if (av > 255) { av = 255; }
+        let fill = with_alpha(th.on_surface, av);
+        s.fill_round(this.bounds, th.radius_md, fill);
+        if (this.severity != SEV_NONE) {
+            s.fill(Rect(this.bounds.x, this.bounds.y + 6, 4, this.bounds.h - 12),
+                   with_alpha(severity_color(th, this.severity), av));
+        }
+        let ink = with_alpha(th.surface_raised, av);
+        let tr = Rect(this.bounds.x + 16, this.bounds.y,
+                      this.bounds.w - 16 - this.act_w, this.bounds.h);
+        s.text_in(tr, 0, this.message, ink);
+        if (this.action_label.len > 0) {
+            let ar = Rect(this.act_x, this.bounds.y, this.act_w, this.bounds.h);
+            s.set_weight(WEIGHT_BOLD);
+            s.text_in(ar, 8, this.action_label, with_alpha(th.primary, av));
+            s.set_weight(0);
+        }
+    }
+
+    override fn on_click(x: int, y: int): bool {
+        if (this.action_label.len > 0 && x >= this.act_x) {
+            let cb = this.onAction;
+            let w = this.win;
+            if (w != null) { w.remove_toast(this); }
+            if (cb != null) { cb(); }
+            return true;
+        }
+        return false;
+    }
+
+    override fn drop_handlers() {
+        this.onAction = null;
+        if (this.tween != null) { this.tween.cancel(); this.tween = null; }
+    }
+}
+
+// Show a plain toast.
+export fn show_toast_msg(win: Window, message: string, sev: int): Toast {
+    let t = new Toast(message);
+    t.severity = sev;
+    win.show_toast(t);
+    return t;
+}
+
+// Show a snackbar (toast + action button).
+export fn show_snackbar(win: Window, message: string, action: string, onAction: fn()): Toast {
+    let t = new Toast(message);
+    t.action_label = action;
+    t.onAction = onAction;
+    t.life_ms = 4500;
+    win.show_toast(t);
+    return t;
+}
+
+// ------------------------------------------------------- ContextMenu
+
+// Thin holder over Menu/MenuPopup: build items, then open() at a point (wire it
+// from a host widget's on_context). MenuPopup already self-places, key-navigates
+// and dismisses. add() returns the MenuItem so the caller wires onSelect.
+export class ContextMenu {
+    menu: Menu;
+
+    fn init() {
+        this.menu = new Menu("");
+    }
+
+    fn add(label: string): MenuItem {
+        return this.menu.add(label);
+    }
+
+    fn open(win: Window, x: int, y: int) {
+        if (win != null) { win.open_overlay(new MenuPopup(this.menu, x, y)); }
+    }
+}
+
+// ------------------------------------------------------- AlertBanner
+
+// An inline, in-layout severity banner (info/success/warning/error): tinted
+// surface, an accent bar + glyph, a message, and an optional close ✕. Not an
+// overlay — place it in a Column like any widget. Leaf widget.
+export class AlertBanner extends Widget {
+    severity: int;
+    message: string;
+    dismissable: bool;
+    onClose: fn();
+
+    fn init(severity: int, message: string) {
+        super.init();
+        this.severity = severity;
+        this.message = message;
+        this.dismissable = true;
+    }
+
+    override fn measure(s: Painter, th: Theme): Size {
+        return Size(s.text_width(this.message) + 88, s.font_height() + 22);
+    }
+
+    override fn draw(s: Painter, th: Theme) {
+        let c = severity_color(th, this.severity);
+        let bg = mix(th.surface, c, 0.14);
+        s.fill_round(this.bounds, th.radius_md, bg);
+        s.fill(Rect(this.bounds.x, this.bounds.y + 4, 4, this.bounds.h - 8), c);
+        let cy = this.bounds.y + this.bounds.h / 2;
+        draw_severity_glyph(s, this.bounds.x + 24, cy, 9, c, th.on_status, this.severity);
+        let tr = Rect(this.bounds.x + 42, this.bounds.y,
+                      this.bounds.w - 42 - 24, this.bounds.h);
+        s.text_in(tr, 0, this.message, th.on_surface);
+        if (this.dismissable) {
+            let xx = this.bounds.x + this.bounds.w - 16;
+            s.line_w(xx - 4, cy - 4, xx + 4, cy + 4, 2, th.on_surface_muted);
+            s.line_w(xx + 4, cy - 4, xx - 4, cy + 4, 2, th.on_surface_muted);
+        }
+    }
+
+    override fn on_click(x: int, y: int): bool {
+        if (this.dismissable && x >= this.bounds.x + this.bounds.w - 28) {
+            if (this.onClose != null) { this.onClose(); }
+            return true;
+        }
+        return false;
+    }
+
+    override fn drop_handlers() {
+        this.onClose = null;
+    }
+}

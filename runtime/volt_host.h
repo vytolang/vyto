@@ -1,9 +1,9 @@
-/* Volt host-hook contract — the seam between the runtime and the platform.
+/* Vyto host-hook contract — the seam between the runtime and the platform.
  *
- * Every libc touch-point in volt_rt.c (allocation, byte output, abort) routes
+ * Every libc touch-point in vyto_rt.c (allocation, byte output, abort) routes
  * through these six functions instead of calling malloc/fwrite/exit directly.
  *
- *   Hosted builds (the default): volt_rt.c defines the hooks as thin static
+ *   Hosted builds (the default): vyto_rt.c defines the hooks as thin static
  *   wrappers over libc (see its top). This header stays libc-free so it never
  *   leaks stdio/stdlib types (e.g. div_t) into module headers, and existing
  *   linux/macos/windows targets are byte-for-byte unchanged.
@@ -14,8 +14,8 @@
  *   a breakpoint. No libc is referenced anywhere.
  *
  * See docs/PORTABILITY.md for the embedder walkthrough. */
-#ifndef VOLT_HOST_H
-#define VOLT_HOST_H
+#ifndef VYTO_HOST_H
+#define VYTO_HOST_H
 
 #include <stddef.h>
 
@@ -37,4 +37,4 @@ void  vt_host_write_err(const char *buf, size_t len);  /* stderr channel; may al
 VT_NORETURN void vt_host_abort(void);       /* replaces exit(101); must not return */
 #endif
 
-#endif /* VOLT_HOST_H */
+#endif /* VYTO_HOST_H */

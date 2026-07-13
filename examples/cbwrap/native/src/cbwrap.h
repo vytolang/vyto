@@ -1,4 +1,4 @@
-/* cbwrap — a callback-driven C API for demonstrating Volt's cthunk. */
+/* cbwrap — a callback-driven C API for demonstrating Vyto's cthunk. */
 #ifndef CBWRAP_H
 #define CBWRAP_H
 

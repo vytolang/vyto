@@ -1,0 +1,66 @@
+// vyto/ui/anim — a minimal Tween on the EV_TIMER clock. Window.run() only
+// switches from the blocking wait() to a ~60fps wait_timeout() while at
+// least one Tween is active (core.vt), so a static app pays nothing.
+//
+// Tween itself only does time bookkeeping: it calls on_tick with the raw
+// (0..1, or ping-ponging 0..1..0 when looping) progress each advance; the
+// closure applies its own easing via ease_linear/ease_out_cubic below if it
+// wants anything other than linear.
+
+// The easing functions now live in the standalone vyto/anim module (the full
+// set — quad/cubic/back/bounce/sine). Re-exported here so existing call sites
+// (`import { ease_linear, ... } from "vyto/ui"`) keep working unchanged.
+import { ease_linear, ease_out_cubic } from "vyto/anim";
+
+import { Rect } from "vyto/surface";
+
+export class Tween {
+    duration_ms: int;
+    elapsed_ms: int;
+    loop: bool;          // true: ping-pong 0->1->0 forever instead of stopping at 1
+    done: bool;
+    on_tick: fn(float);
+    // Dirty-region animation: when track_bounds is set, Window.tick repaints
+    // only `bounds` instead of the whole window. The widget's on_tick closure
+    // keeps `bounds` current (it already captures the widget).
+    bounds: Rect;
+    track_bounds: bool;
+
+    fn init(duration_ms: int, loop: bool) {
+        this.duration_ms = duration_ms;
+        if (this.duration_ms < 1) { this.duration_ms = 1; }
+        this.loop = loop;
+        this.elapsed_ms = 0;
+        this.done = false;
+    }
+
+    // Stop permanently: Window.tick drops cancelled Tweens on its next pass,
+    // returning the event loop to the blocking wait when none remain.
+    fn cancel() {
+        this.done = true;
+        this.on_tick = null;
+    }
+
+    // Advance by dt_ms, call on_tick with the new raw progress, and return
+    // true if the widget holding this Tween should redraw. Non-looping
+    // Tweens report done=true once they reach 1.0 and stop ticking.
+    fn advance(dt_ms: int): bool {
+        if (this.done) { return false; }
+        this.elapsed_ms += dt_ms;
+        let t = 0.0;
+        if (this.loop) {
+            let cycle = this.duration_ms * 2;
+            let phase = this.elapsed_ms % cycle;
+            if (phase < this.duration_ms) {
+                t = phase as float / this.duration_ms as float;
+            } else {
+                t = 1.0 - (phase - this.duration_ms) as float / this.duration_ms as float;
+            }
+        } else {
+            t = this.elapsed_ms as float / this.duration_ms as float;
+            if (t >= 1.0) { t = 1.0; this.done = true; }
+        }
+        if (this.on_tick != null) { this.on_tick(t); }
+        return true;
+    }
+}

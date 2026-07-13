@@ -1,0 +1,284 @@
+// vyto/net/http — a fluent HTTP(S) client: methods, headers, query, body, and
+// a parsed response. Blocking (Vyto has no threads), bounded by a timeout.
+//
+//     let r = get("https://api.example.com/things")
+//                 .header("Authorization", "Bearer " + tok)
+//                 .query("limit", "10")
+//                 .timeoutMs(5000)
+//                 .send();
+//     if (r.ok()) { let j = r.json(); ... }
+//
+//     let r2 = post("https://api.example.com/things").json(payload).send();
+//
+// The native response buffer is owned by `Response` and freed by its deinit.
+// A transport failure (host down, timeout, TLS error) is soft: `status()` is 0
+// and `ok()` is false. Requires libcurl (like vyto/net); Linux + macOS.
+
+#link "curl" if "linux"
+#link "curl" if "macos"
+
+import { json_parse, JsonValue } from "vyto/util/json";
+
+extern "C" {
+    fn http_perform(method: cstring, url: cstring, header_lines: cstring,
+                    body: cstring, body_len: i64, timeout_ms: i64): rawptr;
+    fn http_status(h: rawptr): i64;
+    fn http_body_data(h: rawptr): cstring;
+    fn http_body_len(h: rawptr): i64;
+    fn http_body_copy(h: rawptr, out: cstring, cap: i64): i64;
+    fn http_headers(h: rawptr): cstring;
+    fn http_free(h: rawptr);
+    fn http_stream(method: cstring, url: cstring, header_lines: cstring,
+                   body: cstring, body_len: i64, timeout_ms: i64,
+                   sink: rawptr, sink_ud: rawptr): i64;
+    fn http_chunk_copy(src: cstring, dst: cstring, len: i32);
+    fn http_multi_new(): rawptr;
+    fn http_multi_add(h: rawptr, method: cstring, url: cstring, header_lines: cstring,
+                      body: cstring, body_len: i64, timeout_ms: i64): rawptr;
+    fn http_multi_perform(h: rawptr, timeout_ms: i32): i32;
+    fn http_multi_next_done(h: rawptr): rawptr;
+    fn http_multi_free(h: rawptr);
+}
+
+// A completed HTTP response. Owns the native buffer; freed on teardown.
+export class Response {
+    h: rawptr;
+    fn init(h: rawptr) { this.h = h; }
+
+    fn status(): int { return http_status(this.h) as int; }
+    fn ok(): bool { let s = this.status(); return s >= 200 && s < 300; }
+
+    // Body as text (NUL bytes truncate — use bytes() for binary).
+    fn text(): string { return str(http_body_data(this.h)); }
+    // Body as raw bytes (binary-safe).
+    fn bytes(): byte[] {
+        let n = http_body_len(this.h) as int;
+        if (n <= 0) { return bytes(0); }
+        let buf = bytes(n);
+        let got = http_body_copy(this.h, buf as cstring, n as i64) as int;
+        if (got == n) { return buf; }
+        let out = bytes(got);
+        let i = 0;
+        while (i < got) { out[i] = buf[i]; i += 1; }
+        return out;
+    }
+    // Body parsed as JSON (a Null value if the body is not valid JSON).
+    fn json(): JsonValue { return json_parse(this.text()); }
+
+    // Response headers, keys lowercased for case-insensitive lookup.
+    fn headers(): Map<string, string> {
+        let m = new Map<string, string>();
+        let raw = str(http_headers(this.h));
+        let lines = raw.split("\n");
+        for (let line in lines) {
+            let ln = line.trim();
+            let c = ln.index_of(":");
+            if (c > 0) {
+                let k = ln.slice(0, c).trim().to_lower();
+                let v = ln.slice(c + 1, ln.len).trim();
+                m.set(k, v);
+            }
+        }
+        return m;
+    }
+    // A single header value (case-insensitive), or "" if absent.
+    fn header(k: string): string {
+        let m = this.headers();
+        let key = k.to_lower();
+        if (m.has(key)) { return m.get(key); }
+        return "";
+    }
+
+    deinit { if (this.h != null) { http_free(this.h); this.h = null; } }
+}
+
+// A request under construction. Chain the builder methods, then `send`.
+export class Request {
+    method: string;
+    url: string;
+    hdrs: string;      // "Key: Value\n" accumulated
+    payload: string;
+    hasBody: bool;
+    timeout: int;
+    queried: bool;     // has the URL already gained a '?'
+
+    fn init(method: string, url: string) {
+        this.method = method;
+        this.url = url;
+        this.hdrs = "";
+        this.payload = "";
+        this.hasBody = false;
+        this.timeout = 0;
+        this.queried = url.index_of("?") >= 0;
+    }
+
+    fn header(k: string, v: string): Request {
+        this.hdrs = this.hdrs + k + ": " + v + "\n";
+        return this;
+    }
+    fn query(k: string, v: string): Request {
+        let sep = "?";
+        if (this.queried) { sep = "&"; }
+        this.url = this.url + sep + url_encode(k) + "=" + url_encode(v);
+        this.queried = true;
+        return this;
+    }
+    fn body(s: string): Request {
+        this.payload = s;
+        this.hasBody = true;
+        return this;
+    }
+    fn json(v: JsonValue): Request {
+        this.payload = v.stringify();
+        this.hasBody = true;
+        return this.header("Content-Type", "application/json");
+    }
+    fn timeoutMs(ms: int): Request { this.timeout = ms; return this; }
+
+    fn send(): Response {
+        let blen = 0;
+        if (this.hasBody) { blen = this.payload.len; }
+        let h = http_perform(this.method.cstr(), this.url.cstr(), this.hdrs.cstr(),
+                             this.payload.cstr(), blen as i64, this.timeout as i64);
+        return new Response(h);
+    }
+
+    // A deterministic dump of the assembled request (no network) — handy for
+    // tests and debugging.
+    fn preview(): string {
+        let s = this.method + " " + this.url + "\n";
+        s = s + this.hdrs;
+        if (this.hasBody) { s = s + "body: " + this.payload; }
+        return s;
+    }
+}
+
+// ---- concurrent client (curl_multi) -------------------------------------
+//
+// Run many requests at once on a single thread (Vyto has no threads). Queue
+// built Requests with `add`, then `runAll` drives them all concurrently and
+// returns the Responses as they complete. Wall-clock is ~the slowest request,
+// not the sum.
+//
+//     let pool = new HttpPool();
+//     pool.add(http_get("https://a/1"));
+//     pool.add(http_get("https://a/2"));
+//     for (let r in pool.runAll(30000)) { print(r.status()); }
+//
+// Each Response owns its native buffer (freed on teardown), exactly like a
+// Response from Request.send.
+export class HttpPool {
+    h: rawptr;
+    pending: int;
+    fn init() { this.h = http_multi_new(); this.pending = 0; }
+
+    // Queue a built request. Its per-request timeout (timeoutMs) still applies.
+    fn add(req: Request) {
+        let blen = 0;
+        if (req.hasBody) { blen = req.payload.len; }
+        http_multi_add(this.h, req.method.cstr(), req.url.cstr(), req.hdrs.cstr(),
+                       req.payload.cstr(), blen as i64, req.timeout as i64);
+        this.pending += 1;
+    }
+
+    // Drive one round: block up to timeoutMs waiting on activity, then return
+    // every Response that finished this round (empty if none yet). For building
+    // your own event loop; most callers want runAll.
+    fn poll(timeoutMs: int): Response[] {
+        let done: Response[] = [];
+        if (this.pending <= 0) { return done; }
+        http_multi_perform(this.h, timeoutMs as i32);
+        while (true) {
+            let r = http_multi_next_done(this.h);
+            if (r == null) { break; }
+            done.push(new Response(r));
+            this.pending -= 1;
+        }
+        return done;
+    }
+
+    // Block, driving all queued transfers concurrently, until every one
+    // finishes; return the Responses in completion order.
+    fn runAll(timeoutMs: int): Response[] {
+        let out: Response[] = [];
+        while (this.pending > 0) {
+            let batch = this.poll(timeoutMs);
+            for (let r in batch) { out.push(r); }
+        }
+        return out;
+    }
+
+    deinit { if (this.h != null) { http_multi_free(this.h); this.h = null; } }
+}
+
+// ---- streaming ----------------------------------------------------------
+//
+// Deliver the response body to `onChunk` piece-by-piece as it arrives, instead
+// of buffering it all. The chunk is a borrowed cstring valid only for the
+// duration of the call — copy out what you keep (str(chunk) for text, or
+// http_chunk_bytes(chunk, len) for binary). Returns the HTTP status (0 on
+// transport error). No total-time cap by default, so long-lived streams (SSE,
+// chunked NDJSON, log tails) stay open; pass timeoutMs > 0 for a hard cap.
+//
+//     http_stream_get("https://host/events", (chunk, len) => {
+//         print(str(chunk));            // handle each chunk
+//     });
+
+export fn http_stream_get(url: string, onChunk: fn(cstring, i32)): int {
+    return http_stream("GET".cstr(), url.cstr(), "".cstr(), "".cstr(), 0, 0,
+                       cthunk(onChunk), onChunk as rawptr) as int;
+}
+
+export fn http_stream_post(url: string, body: string, onChunk: fn(cstring, i32)): int {
+    return http_stream("POST".cstr(), url.cstr(), "".cstr(), body.cstr(), body.len as i64, 0,
+                       cthunk(onChunk), onChunk as rawptr) as int;
+}
+
+// Full control: any method, header lines ("Key: Value\n"-joined), body, and an
+// optional total timeout (0 = none).
+export fn http_stream_request(method: string, url: string, headers: string, body: string,
+                              timeoutMs: int, onChunk: fn(cstring, i32)): int {
+    let blen = 0;
+    if (body.len > 0) { blen = body.len; }
+    return http_stream(method.cstr(), url.cstr(), headers.cstr(), body.cstr(), blen as i64,
+                       timeoutMs as i64, cthunk(onChunk), onChunk as rawptr) as int;
+}
+
+// Binary-safe copy of a streamed chunk into a Vyto byte[].
+export fn http_chunk_bytes(chunk: cstring, len: int): byte[] {
+    let b = bytes(len);
+    http_chunk_copy(chunk, b as cstring, len as i32);
+    return b;
+}
+
+export fn http_request(method: string, url: string): Request { return new Request(method, url); }
+export fn http_get(url: string): Request { return new Request("GET", url); }
+export fn http_post(url: string): Request { return new Request("POST", url); }
+export fn http_put(url: string): Request { return new Request("PUT", url); }
+export fn http_delete(url: string): Request { return new Request("DELETE", url); }
+export fn http_head(url: string): Request { return new Request("HEAD", url); }
+
+// Percent-encode a query component (RFC 3986 unreserved set passes through).
+export fn url_encode(s: string): string {
+    let out = "";
+    let i = 0;
+    while (i < s.len) {
+        let c = s[i];
+        let unreserved = (c >= 48 && c <= 57) || (c >= 65 && c <= 90) ||
+                         (c >= 97 && c <= 122) || c == 45 || c == 46 || c == 95 || c == 126;
+        if (unreserved) {
+            out = out + s.slice(i, i + 1);
+        } else {
+            out = out + "%" + hex2(c);
+        }
+        i += 1;
+    }
+    return out;
+}
+
+fn hex2(c: int): string {
+    let digits = "0123456789ABCDEF";
+    let hi = (c >> 4) & 0xF;
+    let lo = c & 0xF;
+    return digits.slice(hi, hi + 1) + digits.slice(lo, lo + 1);
+}

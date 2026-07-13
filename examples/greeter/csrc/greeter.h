@@ -1,5 +1,5 @@
 /* greeter — demo library shipped as a prebuilt .so.
- * The Volt binding (greeter.vt) is generated from this header by voltbind. */
+ * The Vyto binding (greeter.vt) is generated from this header by vytobind. */
 #ifndef GREETER_H
 #define GREETER_H
 
@@ -19,7 +19,7 @@ double greeter_scale(double x, float factor);
 GreetStats greeter_stats(void);
 void greeter_reset(void);
 
-/* not representable in Volt v0.1 — voltbind must skip these */
+/* not representable in Vyto v0.1 — vytobind must skip these */
 int greeter_printf(const char *fmt, ...);
 void greeter_each(void (*cb)(const char *item));
 

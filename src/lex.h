@@ -1,5 +1,5 @@
-#ifndef VOLT_LEX_H
-#define VOLT_LEX_H
+#ifndef VYTO_LEX_H
+#define VYTO_LEX_H
 
 #include "util.h"
 

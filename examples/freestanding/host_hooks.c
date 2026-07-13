@@ -1,7 +1,7 @@
-/* host_hooks.c — a libc-backed implementation of the six Volt host hooks.
+/* host_hooks.c — a libc-backed implementation of the six Vyto host hooks.
  *
  * This is the *host stand-in* used to exercise the freestanding runtime on a
- * normal desktop, with no cross toolchain. The Volt runtime itself is compiled
+ * normal desktop, with no cross toolchain. The Vyto runtime itself is compiled
  * `--freestanding` (-DVT_NO_LIBC) and reaches the platform ONLY through these
  * functions; here we route them to libc and provide an `int main` that calls
  * the exported `vt_main()`. On a real MCU you would instead back these with a

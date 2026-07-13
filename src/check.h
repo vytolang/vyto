@@ -1,5 +1,5 @@
-#ifndef VOLT_CHECK_H
-#define VOLT_CHECK_H
+#ifndef VYTO_CHECK_H
+#define VYTO_CHECK_H
 
 #include "ast.h"
 
