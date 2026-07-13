@@ -266,71 +266,108 @@ fn main() {
 
 ### Networking — `vyto/net/socket`
 
-A minimal HTTP/1.1 server. Vyto has no threads, so it serves one connection
-to completion before accepting the next. From
-[apps/httpd](apps/httpd/httpd.vt) (trimmed).
+Vyto has no threads (§13) — but that doesn't mean one connection at a time.
+Non-blocking sockets plus a `PollSet` event loop give real single-thread
+concurrency, nginx-style: a slow client dribbling its request never blocks
+anyone behind it. From [apps/httpd2](apps/httpd2.vt) (trimmed).
 
 ```js
-import { socket_listen, Socket } from "vyto/net/socket";
+import { socket_listen, Socket, PollSet,
+         POLL_READ, POLL_WRITE, POLL_ERR } from "vyto/net/socket";
 import { unixSec } from "vyto/util/time";
 import { jobj, jint, jstr, json_encode } from "vyto/util/json";
+
+class Conn { // READING until "\r\n\r\n" arrives, then WRITING until drained
+    sock: Socket;
+    inbuf: string;
+    out: byte[];
+    off: int;
+    writing: bool;
+    fn init(sock: Socket) { this.sock = sock; this.inbuf = ""; this.out = bytes(0); this.off = 0; this.writing = false; }
+    fn fd(): int { return this.sock.fd as int; }
+}
 
 fn main() {
     let srv = socket_listen(8080);
     if (srv == null) { print("cannot bind :8080"); return; }
+    srv.setNonBlocking(true); let srvFd = srv.fd as int;
     print("listening on http://127.0.0.1:8080");
-
+    let ps = new PollSet(); ps.add(srv, POLL_READ);
+    let conns = new Map<string, Conn>(); // fd -> Conn
     while (true) {
-        let conn = srv.accept();
-        if (conn == null) { continue; }
-        conn.setTimeoutMs(5000);
-        handle(conn);
-        conn.close();
+        let n = ps.wait(-1);
+        let i = 0;
+        while (i < n) {
+            let fd = ps.readyFd(i);
+            if (fd == srvFd) { acceptAll(srv, ps, conns); }
+            else if (conns.has(str(fd))) {
+                let c = conns.get(str(fd));
+                if ((ps.readyEvents(i) & POLL_ERR) != 0) { drop(ps, conns, c); }
+                else if (c.writing) { onWritable(ps, conns, c); }
+                else { onReadable(ps, conns, c); }
+            }
+            i += 1;
+        }
     }
 }
 
-fn handle(conn: Socket) {
-    let req = readRequest(conn);
-    if (req == "") { return; }
+fn acceptAll(srv: Socket, ps: PollSet, conns: Map<string, Conn>) {
+    while (true) {
+        let s = srv.tryAccept();
+        if (s == null) { break; } // would-block — accept backlog drained
+        conns.set(str(s.fd as int), new Conn(s));
+        ps.add(s, POLL_READ);
+    }
+}
 
-    let eol = req.index_of("\r\n");
-    let line = req;
-    if (eol >= 0) { line = req.slice(0, eol); }
-    let sp = line.index_of(" ");
-    let method = line.slice(0, sp);
-    let rest = line.slice(sp + 1, line.len);
-    let path = rest.slice(0, rest.index_of(" "));
+fn onReadable(ps: PollSet, conns: Map<string, Conn>, c: Conn) {
+    let rr = c.sock.tryRecv(4096);
+    if (rr.wouldBlock()) { return; }
+    if (rr.status <= 0) { drop(ps, conns, c); return; } // EOF or error
+    c.inbuf = c.inbuf + str(rr.data as cstring);
+    if (c.inbuf.index_of("\r\n\r\n") < 0) { return; } // header incomplete
+    c.out = route(c.inbuf); c.writing = true;
+    ps.modify(c.sock, POLL_WRITE);
+    onWritable(ps, conns, c); // try to send immediately
+}
 
-    print(method + " " + path);
+fn onWritable(ps: PollSet, conns: Map<string, Conn>, c: Conn) {
+    while (c.off < c.out.len) {
+        let sent = c.sock.trySend(c.out.slice(c.off, c.out.len));
+        if (sent == -1) { return; } // would-block — resume on the next event
+        if (sent < 0) { drop(ps, conns, c); return; } // error
+        c.off += sent;
+    }
+    drop(ps, conns, c); // fully sent — Connection: close
+}
 
+fn route(req: string): byte[] {
+    let path = req.slice(0, req.index_of("\r\n")).split(" ")[1];
+    print(path);
     if (path == "/") {
-        send(conn, 200, "text/html", "<h1>vyto httpd</h1><a href=/api/time>/api/time</a>");
+        return resp(200, "text/html", "<h1>vyto httpd2</h1><a href=/api/time>/api/time</a>");
     } else if (path == "/api/time") {
         let o = jobj();
-        o.set("service", jstr("vyto-httpd"));
+        o.set("service", jstr("vyto-httpd2"));
         o.set("unix", jint(unixSec() as int));
-        send(conn, 200, "application/json", json_encode(o));
-    } else {
-        send(conn, 404, "text/plain", "404 not found: " + path + "\n");
+        return resp(200, "application/json", json_encode(o));
     }
+    return resp(404, "text/plain", "404 not found: " + path + "\n");
 }
 
-// Read request bytes up to the end of the header block.
-fn readRequest(conn: Socket): string {
-    let acc = "";
-    while (acc.len < 65536) {
-        let chunk = conn.recvText(4096);
-        if (chunk.len == 0) { break; }
-        acc = acc + chunk;
-        if (acc.index_of("\r\n\r\n") >= 0) { break; }
-    }
-    return acc;
-}
-
-fn send(conn: Socket, code: int, ctype: string, body: string) {
+fn resp(code: int, ctype: string, body: string): byte[] {
     let head = "HTTP/1.1 " + code + " OK\r\nContent-Type: " + ctype
              + "\r\nContent-Length: " + body.len + "\r\nConnection: close\r\n\r\n";
-    conn.sendText(head + body);
+    return strBytes(head + body);
+}
+fn drop(ps: PollSet, conns: Map<string, Conn>, c: Conn) {
+    ps.remove(c.sock); c.sock.close(); conns.remove(str(c.fd()));
+}
+fn strBytes(s: string): byte[] {
+    let b = bytes(s.len);
+    let i = 0;
+    while (i < s.len) { b[i] = s[i] as byte; i += 1; }
+    return b;
 }
 ```
 
