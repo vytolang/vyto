@@ -104,11 +104,8 @@ it then depends only on base system libraries (libc, libX11):
 - **Safety**: bounds-checked arrays, checked downcasts, `panic` with
   file:line.
 
-See [docs/SPEC.md](docs/SPEC.md) for the full language reference,
-[docs/PORTABILITY.md](docs/PORTABILITY.md) for the path to other platforms
-(Windows, Android, iOS, embedded, …),
-[docs/UI-TOOLKIT.md](docs/UI-TOOLKIT.md) for the bundled-toolkit strategy
-(`volt/ui`, native facades, escape hatches), and `examples/` for a tour.
+See `examples/` (`01_hello` … `50_worker_pool`) for a tour of the language
+and stdlib.
 
 ## Layout
 
@@ -117,7 +114,6 @@ src/       compiler (C99): lexer, recursive-descent parser, checker, C emitter
 runtime/   volt_rt.{c,h}: RC objects, strings, arrays, maps, closures
 lib/volt/  bundled stdlib modules: math (libm), surface, ui
 examples/  01_hello … 12_math + golden .expected outputs
-docs/      SPEC.md
 ```
 
 ## Native dependencies
