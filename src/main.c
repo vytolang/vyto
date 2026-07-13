@@ -102,7 +102,7 @@ static void resolve_imports(Module *m, const char *basedir) {
 }
 
 /* Module name for a stdlib file: the lib-relative path, sanitized, with the
-   package layout's duplicate leaf collapsed (vyto/ui/ui.vt -> volt_ui). This
+   package layout's duplicate leaf collapsed (vyto/ui/ui.vt -> vyto_ui). This
    keeps lib module names collision-proof against user module stems. */
 static const char *lib_module_name(const char *libdir, const char *canon) {
     const char *rel = canon + strlen(libdir);
@@ -305,7 +305,7 @@ int main(int argc, char **argv) {
     if (!do_run && strcmp(cmd, "build") != 0) usage();
     if (freestanding && do_run)
         fatal("freestanding builds produce a library, not a runnable executable — "
-              "link libvolt.a into your firmware and flash it");
+              "link libvyto.a into your firmware and flash it");
     if (!cc_override) cc_override = getenv("VYTO_CC");
     if (target && !known_triple(target))
         fatal("unknown target '%s' (see vytoc --help for the list)", target);
@@ -525,7 +525,7 @@ int main(int argc, char **argv) {
 
     /* ---- freestanding: archive, don't link ----
        Bare-metal has no hosted crt0/main and often no linker at this stage —
-       the embedder links libvolt.a with their vt_host_* hooks, startup, and
+       the embedder links libvyto.a with their vt_host_* hooks, startup, and
        linker script. ar just bundles objects, so the host ar handles cross
        objects fine. No -lm, no rpath, no exe. */
     if (freestanding) {

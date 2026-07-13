@@ -449,13 +449,13 @@ void *vs_open(const char *title, int w, int h) {
         wc.lpfnWndProc = vs_wndproc;
         wc.hInstance = GetModuleHandle(NULL);
         wc.hCursor = LoadCursor(NULL, IDC_ARROW);
-        wc.lpszClassName = "VoltSurface";
+        wc.lpszClassName = "VytoSurface";
         if (!RegisterClassA(&wc)) { free(s); return NULL; }
         registered = 1;
     }
     RECT r = {0, 0, w, h};
     AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
-    s->hwnd = CreateWindowA("VoltSurface", title, WS_OVERLAPPEDWINDOW, CW_USEDEFAULT,
+    s->hwnd = CreateWindowA("VytoSurface", title, WS_OVERLAPPEDWINDOW, CW_USEDEFAULT,
                             CW_USEDEFAULT, r.right - r.left, r.bottom - r.top, NULL, NULL,
                             GetModuleHandle(NULL), NULL);
     if (!s->hwnd) { free(s); return NULL; }

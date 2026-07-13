@@ -446,7 +446,7 @@ static bool parse_struct_body(CStruct *sc) {
 
 /* ---------------- type mapping ---------------- */
 
-static const char *volt_keywords[] = {
+static const char *vyto_keywords[] = {
     "fn", "let", "const", "struct", "class", "extends", "virtual", "override", "init",
     "deinit", "new", "weak", "import", "export", "from", "extern", "if", "else", "while",
     "for", "in", "return", "break", "continue", "true", "false", "null", "this", "as",
@@ -455,14 +455,14 @@ static const char *volt_keywords[] = {
     "str", "len", "push", "pop", "set", "get", "has", "remove", "cstr", NULL,
 };
 
-static bool is_volt_keyword(const char *s) {
-    for (int i = 0; volt_keywords[i]; i++)
-        if (s == intern(volt_keywords[i])) return true;
+static bool is_vyto_keyword(const char *s) {
+    for (int i = 0; vyto_keywords[i]; i++)
+        if (s == intern(vyto_keywords[i])) return true;
     return false;
 }
 
 /* map a C type to a Vyto type name; NULL = unmappable */
-static const char *volt_type(const CType *t, bool is_ret) {
+static const char *vyto_type(const CType *t, bool is_ret) {
     if (t->base == B_FNPTR) return "rawptr"; /* pass thunks from cthunk() */
     if (t->ptr > 0) {
         if ((t->base == B_CHAR || t->base == B_SCHAR) && t->ptr == 1) return "cstring";
@@ -731,15 +731,15 @@ int main(int argc, char **argv) {
     int nsel = 0;
     for (CFn *f = fns; f; f = f->next) {
         if (!pass_filter(f->name)) continue;
-        if (is_volt_keyword(f->name)) { add_skip(f->name, "name is a Vyto keyword"); continue; }
-        bool ok = volt_type(&f->ret, true) != NULL;
+        if (is_vyto_keyword(f->name)) { add_skip(f->name, "name is a Vyto keyword"); continue; }
+        bool ok = vyto_type(&f->ret, true) != NULL;
         if (!ok) add_skip(f->name, "unmappable return type");
         for (int i = 0; ok && i < f->nparams; i++) {
             if (f->params[i].type.base == B_VOID && f->params[i].type.ptr == 0 && f->nparams == 1) {
                 f->nparams = 0;
                 break;
             }
-            if (!volt_type(&f->params[i].type, false)) {
+            if (!vyto_type(&f->params[i].type, false)) {
                 ok = false;
                 add_skip(f->name, "unmappable parameter type");
             }
@@ -751,13 +751,13 @@ int main(int argc, char **argv) {
     /* structs used by value */
     for (CStruct *s = structs; s; s = s->next) {
         if (!s->value_used || !s->mappable || !s->has_body || s->emitted) continue;
-        if (is_volt_keyword(s->name) || s->name[0] == '_') continue;
+        if (is_vyto_keyword(s->name) || s->name[0] == '_') continue;
         s->emitted = true;
         printf("    struct %s {", s->name);
         for (int i = 0; i < s->nfields; i++) {
-            const char *vt = volt_type(&s->fields[i].type, false);
+            const char *vt = vyto_type(&s->fields[i].type, false);
             const char *fn2 = s->fields[i].name;
-            printf(" %s: %s;", is_volt_keyword(fn2) ? arena_printf(&g_arena, "%s_", fn2) : fn2,
+            printf(" %s: %s;", is_vyto_keyword(fn2) ? arena_printf(&g_arena, "%s_", fn2) : fn2,
                    vt ? vt : "rawptr");
         }
         printf(" }\n");
@@ -767,10 +767,10 @@ int main(int argc, char **argv) {
         printf("    fn %s(", f->name);
         for (int p = 0; p < f->nparams; p++) {
             const char *pn = f->params[p].name;
-            if (!pn || is_volt_keyword(pn)) pn = arena_printf(&g_arena, "a%d", p);
-            printf("%s%s: %s", p ? ", " : "", pn, volt_type(&f->params[p].type, false));
+            if (!pn || is_vyto_keyword(pn)) pn = arena_printf(&g_arena, "a%d", p);
+            printf("%s%s: %s", p ? ", " : "", pn, vyto_type(&f->params[p].type, false));
         }
-        const char *rt = volt_type(&f->ret, true);
+        const char *rt = vyto_type(&f->ret, true);
         if (strcmp(rt, "void") == 0) printf(");\n");
         else printf("): %s;\n", rt);
     }
@@ -779,7 +779,7 @@ int main(int argc, char **argv) {
     /* consts from enums + #defines */
     bool any_const = false;
     for (CConst *cc2 = consts; cc2; cc2 = cc2->next) {
-        if (!pass_filter(cc2->name) || is_volt_keyword(cc2->name)) continue;
+        if (!pass_filter(cc2->name) || is_vyto_keyword(cc2->name)) continue;
         /* dedupe: first wins */
         bool dup = false;
         for (CConst *prev = consts; prev != cc2; prev = prev->next)
