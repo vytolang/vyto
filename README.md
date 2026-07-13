@@ -279,68 +279,112 @@ import { jobj, jint, jstr, json_encode } from "vyto/util/json";
 
 class Conn { // READING until "\r\n\r\n" arrives, then WRITING until drained
     sock: Socket;
-    inbuf: string;
-    out: byte[];
-    off: int;
-    writing: bool;
-    fn init(sock: Socket) { this.sock = sock; this.inbuf = ""; this.out = bytes(0); this.off = 0; this.writing = false; }
-    fn fd(): int { return this.sock.fd as int; }
+    inbuf: string;   // request bytes buffered so far
+    out: byte[];     // full response, built once the request is complete
+    off: int;        // how much of `out` has been sent already
+    writing: bool;    // false = reading the request, true = sending the response
+    fn init(sock: Socket) { 
+      this.sock = sock; 
+      this.inbuf = ""; 
+      this.out = bytes(0); 
+      this.off = 0; 
+      this.writing = false; 
+    }
+    fn fd(): int {  // used as the connection's key in the `conns` map
+      return this.sock.fd as int; 
+    }
 }
 
 fn main() {
     let srv = socket_listen(8080);
-    if (srv == null) { print("cannot bind :8080"); return; }
-    srv.setNonBlocking(true); let srvFd = srv.fd as int;
+    if (srv == null) { 
+      print("cannot bind :8080"); 
+      return; 
+    }
+    // non-blocking: accept()/recv()/send() return immediately instead of
+    // blocking, so one thread can juggle many connections at once
+    srv.setNonBlocking(true); 
+    let srvFd = srv.fd as int;
     print("listening on http://127.0.0.1:8080");
-    let ps = new PollSet(); ps.add(srv, POLL_READ);
-    let conns = new Map<string, Conn>(); // fd -> Conn
+    let ps = new PollSet();      // the poll set: one wait() covers every fd below
+    ps.add(srv, POLL_READ);      // watch the listener for incoming connections
+    let conns = new Map<string, Conn>(); // fd (as string) -> Conn
     while (true) {
-        let n = ps.wait(-1);
+        let n = ps.wait(-1);     // block until >=1 fd is ready; n = how many
         let i = 0;
         while (i < n) {
             let fd = ps.readyFd(i);
-            if (fd == srvFd) { acceptAll(srv, ps, conns); }
+            if (fd == srvFd) { 
+              acceptAll(srv, ps, conns); // listener ready: accept new connections
+            }
             else if (conns.has(str(fd))) {
                 let c = conns.get(str(fd));
-                if ((ps.readyEvents(i) & POLL_ERR) != 0) { drop(ps, conns, c); }
-                else if (c.writing) { onWritable(ps, conns, c); }
-                else { onReadable(ps, conns, c); }
+                if ((ps.readyEvents(i) & POLL_ERR) != 0) { 
+                  drop(ps, conns, c);       // connection errored or hung up
+                }
+                else if (c.writing) { 
+                  onWritable(ps, conns, c); // mid-response: keep sending
+                }
+                else { 
+                  onReadable(ps, conns, c); // still reading the request
+                }
             }
             i += 1;
         }
     }
 }
 
+// Keep accepting until the backlog is drained — one POLL_READ event on the
+// listener can mean several pending connections.
 fn acceptAll(srv: Socket, ps: PollSet, conns: Map<string, Conn>) {
     while (true) {
         let s = srv.tryAccept();
         if (s == null) { break; } // would-block — accept backlog drained
         conns.set(str(s.fd as int), new Conn(s));
-        ps.add(s, POLL_READ);
+        ps.add(s, POLL_READ);     // new connection starts in READ mode
     }
 }
 
+// Fires when a connection has bytes to read. Accumulates into `inbuf` until
+// the header block is complete, then hands off to route() and flips to WRITE.
 fn onReadable(ps: PollSet, conns: Map<string, Conn>, c: Conn) {
     let rr = c.sock.tryRecv(4096);
-    if (rr.wouldBlock()) { return; }
-    if (rr.status <= 0) { drop(ps, conns, c); return; } // EOF or error
+    if (rr.wouldBlock()) { 
+      return; // nothing to read yet — try again on the next event
+    }
+    if (rr.status <= 0) { 
+      drop(ps, conns, c); 
+      return; 
+    } // EOF or error
     c.inbuf = c.inbuf + str(rr.data as cstring);
-    if (c.inbuf.index_of("\r\n\r\n") < 0) { return; } // header incomplete
-    c.out = route(c.inbuf); c.writing = true;
-    ps.modify(c.sock, POLL_WRITE);
+    if (c.inbuf.index_of("\r\n\r\n") < 0) { 
+      return; 
+    } // header incomplete
+    c.out = route(c.inbuf); c.writing = true; // build the response, switch to WRITE
+    ps.modify(c.sock, POLL_WRITE);            // wait for this socket to be writable
     onWritable(ps, conns, c); // try to send immediately
 }
 
+// Fires when a connection can accept more bytes. Resumes from `c.off`, so a
+// response that doesn't fit the socket buffer in one write just continues
+// here on the next POLL_WRITE event.
 fn onWritable(ps: PollSet, conns: Map<string, Conn>, c: Conn) {
     while (c.off < c.out.len) {
         let sent = c.sock.trySend(c.out.slice(c.off, c.out.len));
-        if (sent == -1) { return; } // would-block — resume on the next event
-        if (sent < 0) { drop(ps, conns, c); return; } // error
+        if (sent == -1) { 
+          return; 
+        } // would-block — resume on the next event
+        if (sent < 0) { 
+          drop(ps, conns, c); 
+          return; 
+        } // error
         c.off += sent;
     }
     drop(ps, conns, c); // fully sent — Connection: close
 }
 
+// Parse "METHOD /path HTTP/1.1" and dispatch — the only two routes are
+// / (html) and /api/time (json); everything else is a 404.
 fn route(req: string): byte[] {
     let path = req.slice(0, req.index_of("\r\n")).split(" ")[1];
     print(path);
@@ -355,14 +399,17 @@ fn route(req: string): byte[] {
     return resp(404, "text/plain", "404 not found: " + path + "\n");
 }
 
+// Assemble a complete HTTP/1.1 response (headers + body) as bytes.
 fn resp(code: int, ctype: string, body: string): byte[] {
     let head = "HTTP/1.1 " + code + " OK\r\nContent-Type: " + ctype
              + "\r\nContent-Length: " + body.len + "\r\nConnection: close\r\n\r\n";
     return strBytes(head + body);
 }
+// Connection finished (fully sent) or failed: unregister and forget it.
 fn drop(ps: PollSet, conns: Map<string, Conn>, c: Conn) {
     ps.remove(c.sock); c.sock.close(); conns.remove(str(c.fd()));
 }
+// string -> byte[] — Socket.trySend only accepts raw bytes.
 fn strBytes(s: string): byte[] {
     let b = bytes(s.len);
     let i = 0;
