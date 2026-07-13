@@ -494,6 +494,24 @@ without them):
   `libicu-dev` (Debian/Ubuntu) or `libicu-devel` (Fedora). For `--bundle` or
   targets without a system ICU, run `lib/vyto/intl/native/build-icu.sh`.
 
+## Platform status
+
+Vyto compiles to C99 against an ~1.9K-line runtime with no dependencies
+beyond `malloc`/`stdio`/`string.h`, so the language itself is portable
+anywhere a C compiler is. Status below is about the *surface* (windowing)
+backend and stdlib native shims, which vary per target.
+
+| Platform | Status | Notes |
+|----------|--------|-------|
+| **Linux** (x86_64, arm64) | ✅ Fully supported | Primary dev + CI platform. X11 GUI backend, full stdlib, `make test` runs here. |
+| **Embedded / bare-metal** | ✅ Core supported | `--freestanding` builds the compiler and runtime with zero libc — six `vt_host_*` hooks (alloc/realloc/free/write/write_err/abort) are the entire platform seam, output is a linkable `.a`. Verified in the test suite. No display driver ships in-tree; that's embedder-supplied, as with any bare-metal C project. |
+| **Windows** | 🚧 Partial, untested | `--target windows-x64` cross-compile is wired (MinGW), and LLP64 type mapping (`clong`/`culong`) is done. A Win32 GDI surface backend exists in `vsurf.c` (WndProc → event queue) but has never been built or run — no Windows/MinGW toolchain in CI yet. Some stdlib shims (`util/fmt`, `math`) are Windows-clean as-is; others (`net/socket` via Winsock, `os/worker` which needs `fork()`) need adaptation. |
+| **macOS** (x86_64, arm64) | 🚧 Partial, untested | Cross-compile triples exist but need your own `--cc` (no bundled cross toolchain from Linux). CLI/stdlib should build as-is (POSIX + C99). GUI currently falls through to the X11 backend (needs XQuartz) — no native Cocoa/Metal surface shim yet. |
+| **Android** | 📋 Planned | No NDK integration or surface shim in the tree yet. |
+| **iOS** | 📋 Planned | No native surface shim or Xcode project. `apps/iphone` is a themed UI simulator running on the desktop backend, not an actual iOS build. |
+
+Legend: ✅ works today · 🚧 partially wired, unverified · 📋 not started.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
