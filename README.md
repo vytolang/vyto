@@ -107,13 +107,67 @@ it then depends only on base system libraries (libc, libX11):
 See `examples/` (`01_hello` … `50_worker_pool`) for a tour of the language
 and stdlib.
 
+## Standard library
+
+Bundled under `lib/vyto/`, imported as `vyto/<path>`. Modules marked ⚙ are
+backed by a native shim (compiled from source or a `#link`ed system library);
+everything else is pure Vyto.
+
+**Core & utilities**
+
+| Module | What it gives you |
+|--------|-------------------|
+| `vyto/util/fmt` ⚙ | printf-style formatting (`fmt`, `fixed`, `hex`, `commas`, …) |
+| `vyto/util/json` | JSON parse/encode (`JsonValue`, `json_parse`, `json_encode`) |
+| `vyto/util/date` ⚙ · `vyto/util/time` ⚙ | calendar dates (strftime/strptime) · clocks, durations, timers |
+| `vyto/math` ⚙ | libm math (`sin`, `sqrt`, `pow`, …) |
+| `vyto/io/file` ⚙ | files & paths (`File`, read/write, `file_exists`, `mkdirs`, …) |
+| `vyto/os` ⚙ | environment, args, process helpers |
+| `vyto/os/worker` ⚙ | `fork()`-based `WorkerPool` — CPU parallelism, no shared state |
+
+**Internationalization** — `vyto/intl` ⚙ (ICU-backed)
+
+| Module | What it gives you |
+|--------|-------------------|
+| `vyto/intl` | `Locale`, locale detection, shared enums |
+| `vyto/intl/unicode` | codepoints, NFC/NFD normalization, locale case, grapheme/word/line segmentation, collation |
+| `vyto/intl/number` | locale number / currency / percent formatting |
+| `vyto/intl/datefmt` | locale date/time formatting |
+| `vyto/intl/message` | ICU-MessageFormat subset + CLDR plurals + JSON catalogs |
+
+**Networking** — `vyto/net` ⚙
+
+| Module | What it gives you |
+|--------|-------------------|
+| `vyto/net/http` ⚙ | HTTP client, `HttpPool` fan-out (libcurl multi) |
+| `vyto/net/socket` ⚙ | TCP/UDP sockets, non-blocking mode, `PollSet` event loop |
+| `vyto/net/websocket` ⚙ | WebSocket client |
+
+**Graphics & UI**
+
+| Module | What it gives you |
+|--------|-------------------|
+| `vyto/surface` ⚙ | windowing + event loop (X11 / Win32 / framebuffer / headless) |
+| `vyto/gfx` ⚙ | 2D canvas (blend2d): shapes, gradients, text, images |
+| `vyto/ui` | widget toolkit — layout, widgets, dialogs, nav, skins (iOS/macOS/Material) |
+| `vyto/anim` · `vyto/geom` | animation/easing · geometry & vector paths |
+
+**Hardware** — `vyto/hw`
+
+| Module | What it gives you |
+|--------|-------------------|
+| `vyto/hw/serial` ⚙ | serial / TTY ports as poll-able fds |
+| `vyto/hw/usb` ⚙ | USB device enumeration |
+
+Some packages need a one-time native setup — see [Native dependencies](#native-dependencies).
+
 ## Layout
 
 ```
 src/       compiler (C99): lexer, recursive-descent parser, checker, C emitter
 runtime/   vyto_rt.{c,h}: RC objects, strings, arrays, maps, closures
-lib/vyto/  bundled stdlib modules: math (libm), surface, ui
-examples/  01_hello … 12_math + golden .expected outputs
+lib/vyto/  bundled stdlib modules (see "Standard library" above)
+examples/  01_hello … 50_worker_pool + golden .expected outputs
 ```
 
 ## Native dependencies
