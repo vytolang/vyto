@@ -1521,6 +1521,13 @@ void *vs_open(const char *title, int w, int h) {
     s->a_clip_prop = XInternAtom(dpy, "VS_CLIP", False);
     s->gc = XCreateGC(dpy, s->win, 0, 0);
     s->pgc = XCreateGC(dpy, s->win, 0, 0);
+    /* Prefer an iso10646-1 (Unicode/16-bit) core font so XDrawString16 can
+       render glyphs beyond Latin-1 (⌫ ± π √ …). Fall back to the 8-bit
+       9x15/fixed fonts — XDrawString16 still draws their low range correctly. */
+    if (!font) font = XLoadQueryFont(dpy, "-misc-fixed-medium-r-normal--15-140-75-75-c-90-iso10646-1");
+    if (!font) font = XLoadQueryFont(dpy, "-misc-fixed-medium-r-normal--15-*-*-*-*-*-iso10646-1");
+    if (!font) font = XLoadQueryFont(dpy, "-*-*-medium-r-normal--15-*-*-*-*-*-iso10646-1");
+    if (!font) font = XLoadQueryFont(dpy, "-*-*-medium-r-normal--*-*-*-*-*-*-iso10646-1");
     if (!font) font = XLoadQueryFont(dpy, "9x15");
     if (!font) font = XLoadQueryFont(dpy, "fixed");
     if (font) XSetFont(dpy, s->gc, font->fid);
@@ -1628,6 +1635,42 @@ void vs_draw_line(void *vs, int x0, int y0, int x1, int y1, int rgb) {
     XDrawLine(s->dpy, s->back, s->gc, x0, y0, x1, y1);
 }
 
+/* Decode a UTF-8 string into XChar2b (16-bit) glyph indices so text can be
+   drawn with XDrawString16 against an iso10646-1 (Unicode) core font. XChar2b
+   is BMP-only; code points outside the BMP (or malformed bytes) fold to U+FFFD.
+   Returns the glyph count and heap-allocates *out (caller frees). Worst case is
+   one glyph per byte, so strlen+1 slots always suffice. */
+static int utf8_to_xchar2b(const char *str, XChar2b **out) {
+    size_t n = strlen(str);
+    XChar2b *buf = malloc((n + 1) * sizeof(XChar2b));
+    if (!buf) { *out = NULL; return 0; }
+    int count = 0;
+    size_t i = 0;
+    while (i < n) {
+        unsigned char c = (unsigned char)str[i];
+        unsigned int cp;
+        int len;
+        if (c < 0x80)              { cp = c;        len = 1; }
+        else if ((c >> 5) == 0x6)  { cp = c & 0x1F; len = 2; }
+        else if ((c >> 4) == 0xE)  { cp = c & 0x0F; len = 3; }
+        else if ((c >> 3) == 0x1E) { cp = c & 0x07; len = 4; }
+        else                       { cp = 0xFFFD;   len = 1; }
+        int ok = 1;
+        for (int k = 1; k < len; k++) {
+            if (i + (size_t)k >= n || ((unsigned char)str[i + k] & 0xC0) != 0x80) { ok = 0; break; }
+            cp = (cp << 6) | ((unsigned char)str[i + k] & 0x3F);
+        }
+        if (!ok) { cp = 0xFFFD; len = 1; }
+        if (cp > 0xFFFF) cp = 0xFFFD;   /* XChar2b cannot address beyond the BMP */
+        buf[count].byte1 = (unsigned char)(cp >> 8);
+        buf[count].byte2 = (unsigned char)(cp & 0xFF);
+        count++;
+        i += (size_t)len;
+    }
+    *out = buf;
+    return count;
+}
+
 void vs_draw_text(void *vs, int x, int y, const char *str, int rgb) {
     VSurf *s = vs;
     if (s->fb_on) {
@@ -1636,7 +1679,11 @@ void vs_draw_text(void *vs, int x, int y, const char *str, int rgb) {
     }
     if (!s->dpy) return;
     XSetForeground(s->dpy, s->gc, pixel_of(s->dpy, rgb));
-    XDrawString(s->dpy, s->back, s->gc, x, y, str, (int)strlen(str));
+    XChar2b *g;
+    int n = utf8_to_xchar2b(str, &g);
+    if (!g) { XDrawString(s->dpy, s->back, s->gc, x, y, str, (int)strlen(str)); return; }
+    XDrawString16(s->dpy, s->back, s->gc, x, y, g, n);
+    free(g);
 }
 
 /* per-surface staging XImage, (re)sized on demand */
@@ -1753,7 +1800,12 @@ int vs_text_width(void *vs, const char *str) {
     VSurf *s = vs;
     if (s->fb_on) return FB_FONT_W * (int)strlen(str);
     if (!s->dpy || !font) return 9 * (int)strlen(str);
-    return XTextWidth(font, str, (int)strlen(str));
+    XChar2b *g;
+    int n = utf8_to_xchar2b(str, &g);
+    if (!g) return XTextWidth(font, str, (int)strlen(str));
+    int w = XTextWidth16(font, g, n);
+    free(g);
+    return w;
 }
 
 int vs_font_ascent(void *vs) {
