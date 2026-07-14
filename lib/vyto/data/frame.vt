@@ -1,0 +1,374 @@
+// vyto/data/frame — a native columnar data engine (DataFrame) built for
+// Excel-scale data: millions of rows, thousands of columns, with sort, filter,
+// search, and aggregation that stay sub-second and memory-lean.
+//
+// Storage is struct-of-arrays: each column is one contiguous typed buffer
+// (int / float / bool / string-into-a-shared-arena) held in C (coltable.c). A
+// cell read is a single indexed load with no boxing. Sort and filter never move
+// column data — they reorder/compact an index permutation naming the visible
+// rows — so a 1M-row sort is a permutation of one int64 array and a filter is a
+// single compacting pass.
+//
+//     let df = new DataFrame(1000000);
+//     let id = df.addColumn("id", CK_I64);
+//     let val = df.addColumn("value", CK_F64);
+//     df.reserve(1000000);
+//     for (let i in 0..1000000) { df.beginRow().setInt(id, i).setFloat(val, i * 2.0).endRow(); }
+//     df.sort(val, false);              // descending, native, sub-1s
+//     df.resetView(); df.filterInt(id, OP_GE, 500000);
+//     let total = df.agg(val, AGG_SUM);
+//
+// Memory contract (dense): bytes ~= nrow * (sum of column widths) + 8*nrow.
+// int/float col = 8B/row, bool = 1B/row, string = 12B/row + arena bytes. Dense
+// thousands-of-columns scale as nrow*ncol*8, so size accordingly. The DataFrame
+// owns the native store; ARC deinit frees it once (same pattern as File).
+
+import { bufReader, file_size } from "vyto/io/file";
+import { json_parse, json_each, JsonValue } from "vyto/util/json";
+
+extern "C" {
+    fn ct_new(ncap: i64): rawptr;
+    fn ct_reserve(h: rawptr, nrow: i64);
+    fn ct_add_col(h: rawptr, name: cstring, kind: i32): i32;
+    fn ct_begin_row(h: rawptr);
+    fn ct_set_i64(h: rawptr, col: i32, v: i64);
+    fn ct_set_f64(h: rawptr, col: i32, v: f64);
+    fn ct_set_bool(h: rawptr, col: i32, v: i32);
+    fn ct_set_str(h: rawptr, col: i32, s: cstring, n: i64);
+    fn ct_end_row(h: rawptr);
+    fn ct_nrow(h: rawptr): i64;
+    fn ct_ncol(h: rawptr): i64;
+    fn ct_view_len(h: rawptr): i64;
+    fn ct_col_kind(h: rawptr, col: i32): i32;
+    fn ct_cell_str(h: rawptr, vrow: i64, col: i32, buf: cstring, cap: i64): i64;
+    fn ct_cell_i64(h: rawptr, vrow: i64, col: i32): i64;
+    fn ct_cell_f64(h: rawptr, vrow: i64, col: i32): f64;
+    fn ct_sort(h: rawptr, col: i32, dir: i32);
+    fn ct_sort_keys(h: rawptr, cols: rawptr, dirs: rawptr, nk: i32);
+    fn ct_reset_view(h: rawptr);
+    fn ct_filter_i64(h: rawptr, col: i32, op: i32, operand: i64);
+    fn ct_filter_f64(h: rawptr, col: i32, op: i32, operand: f64);
+    fn ct_filter_str(h: rawptr, col: i32, op: i32, needle: cstring);
+    fn ct_search(h: rawptr, needle: cstring);
+    fn ct_agg(h: rawptr, col: i32, kind: i32): f64;
+    fn ct_derive(h: rawptr, name: cstring, op: i32, a: i32, b: i32): i32;
+    fn ct_free(h: rawptr);
+}
+
+// Column kinds.
+export const CK_I64: int = 0;
+export const CK_F64: int = 1;
+export const CK_BOOL: int = 2;
+export const CK_STR: int = 3;
+
+// Filter comparison ops (numeric); string filter uses OP_EQ / OP_CONTAINS.
+export const OP_EQ: int = 0;
+export const OP_NE: int = 1;
+export const OP_LT: int = 2;
+export const OP_LE: int = 3;
+export const OP_GT: int = 4;
+export const OP_GE: int = 5;
+export const OP_CONTAINS: int = 6;
+
+// Aggregate kinds.
+export const AGG_SUM: int = 0;
+export const AGG_MIN: int = 1;
+export const AGG_MAX: int = 2;
+export const AGG_AVG: int = 3;
+export const AGG_COUNT: int = 4;
+
+// Derive (computed-column) arithmetic ops.
+export const DV_ADD: int = 0;
+export const DV_SUB: int = 1;
+export const DV_MUL: int = 2;
+export const DV_DIV: int = 3;
+
+export class DataFrame {
+    h: rawptr;
+    names: string[];   // column titles, parallel to the native columns
+    kinds: int[];      // CK_* per column
+    scratch: byte[];   // reused cell-format buffer (lazily allocated)
+
+    // `cap` is an initial row-capacity hint (0 = grow on demand).
+    fn init(cap: int) {
+        this.h = ct_new(cap as i64);
+        if (this.h == null) { panic("vyto/data: DataFrame allocation failed"); }
+        this.names = [];
+        this.kinds = [];
+    }
+
+    // ---- schema & build ---------------------------------------------------
+
+    // Add a column; returns its index. Call before appending rows.
+    fn addColumn(name: string, kind: int): int {
+        let c = ct_add_col(this.h, name.cstr(), kind as i32) as int;
+        this.names.push(name);
+        this.kinds.push(kind);
+        return c;
+    }
+
+    // Pre-size all columns to `n` rows (one alloc each) so a bulk load below is
+    // realloc-free.
+    fn reserve(n: int) { ct_reserve(this.h, n as i64); }
+
+    // Row builder — fluent: beginRow().setInt(..).setFloat(..).endRow().
+    fn beginRow(): DataFrame { ct_begin_row(this.h); return this; }
+    fn setInt(col: int, v: int): DataFrame { ct_set_i64(this.h, col as i32, v as i64); return this; }
+    fn setFloat(col: int, v: float): DataFrame { ct_set_f64(this.h, col as i32, v); return this; }
+    fn setBool(col: int, v: bool): DataFrame { let b = 0; if (v) { b = 1; } ct_set_bool(this.h, col as i32, b as i32); return this; }
+    fn setStr(col: int, s: string): DataFrame { ct_set_str(this.h, col as i32, s.cstr(), s.len as i64); return this; }
+    fn endRow(): DataFrame { ct_end_row(this.h); return this; }
+
+    // ---- shape ------------------------------------------------------------
+
+    fn nrow(): int { return ct_nrow(this.h) as int; }
+    fn ncol(): int { return ct_ncol(this.h) as int; }
+    // Rows currently visible (after any filter); equals nrow() with no filter.
+    fn viewLen(): int { return ct_view_len(this.h) as int; }
+    fn colName(i: int): string { return this.names[i]; }
+    fn colKind(i: int): int { return this.kinds[i]; }
+
+    // ---- cell read (by VISIBLE row, post filter+sort) ---------------------
+
+    // Formatted text of a visible cell — the only string a rendered cell costs.
+    fn cellStr(vrow: int, col: int): string {
+        if (this.scratch == null) { this.scratch = bytes(256); }
+        let n = ct_cell_str(this.h, vrow as i64, col as i32, this.scratch as cstring, 256) as int;
+        if (n <= 0) { return ""; }
+        return str(this.scratch as cstring);
+    }
+    fn cellInt(vrow: int, col: int): int { return ct_cell_i64(this.h, vrow as i64, col as i32) as int; }
+    fn cellFloat(vrow: int, col: int): float { return ct_cell_f64(this.h, vrow as i64, col as i32); }
+
+    // ---- sort -------------------------------------------------------------
+
+    // Sort the visible view by one column (asc=true → ascending). Stable.
+    fn sort(col: int, asc: bool) { let d = -1; if (asc) { d = 1; } ct_sort(this.h, col as i32, d as i32); }
+
+    // Multi-column sort: cols[0] is the primary key. `dirs[k]` >= 0 ascending,
+    // < 0 descending. Successive stable passes, least-significant key last.
+    fn sortBy(cols: int[], dirs: int[]) {
+        if (cols.len == 0) { return; }
+        ct_sort_keys(this.h, cols as rawptr, dirs as rawptr, cols.len as i32);
+    }
+
+    // ---- filter / search --------------------------------------------------
+
+    // Clear any filter: all rows visible again (keeps sort order lost — call
+    // sort afterward if you need it).
+    fn resetView() { ct_reset_view(this.h); }
+
+    // Narrow the view to rows where `col` <op> operand. Filters compose (AND).
+    fn filterInt(col: int, op: int, operand: int) { ct_filter_i64(this.h, col as i32, op as i32, operand as i64); }
+    fn filterFloat(col: int, op: int, operand: float) { ct_filter_f64(this.h, col as i32, op as i32, operand); }
+    // op OP_EQ (exact) or OP_CONTAINS (substring).
+    fn filterStr(col: int, op: int, needle: string) { ct_filter_str(this.h, col as i32, op as i32, needle.cstr()); }
+
+    // Global text search: keep rows where `q` occurs in any column's text.
+    fn search(q: string) { ct_search(this.h, q.cstr()); }
+
+    // ---- aggregate / derive ----------------------------------------------
+
+    // Aggregate a numeric column over the visible rows (AGG_*).
+    fn agg(col: int, kind: int): float { return ct_agg(this.h, col as i32, kind as i32); }
+
+    // Add a computed float column `name` = (col a) <op> (col b) over all rows;
+    // returns the new column index.
+    fn derive(name: string, op: int, a: int, b: int): int {
+        let c = ct_derive(this.h, name.cstr(), op as i32, a as i32, b as i32) as int;
+        this.names.push(name);
+        this.kinds.push(CK_F64);
+        return c;
+    }
+
+    deinit { ct_free(this.h); }
+}
+
+export fn dataFrame(cap: int): DataFrame { return new DataFrame(cap); }
+
+// ---- value-type classification (for ingest inference) ---------------------
+
+// True if `s` (trimmed) is a plain decimal integer, optionally signed.
+fn is_int_str(s: string): bool {
+    let t = s.trim();
+    if (t.len == 0) { return false; }
+    let i = 0;
+    if (t[0] == 43 || t[0] == 45) { i = 1; }   // '+' / '-'
+    if (i >= t.len) { return false; }
+    while (i < t.len) {
+        if (t[i] < 48 || t[i] > 57) { return false; }
+        i += 1;
+    }
+    return true;
+}
+
+// True if `s` (trimmed) looks like a decimal/scientific float.
+fn is_float_str(s: string): bool {
+    let t = s.trim();
+    if (t.len == 0) { return false; }
+    let digit = false;
+    let dot = false;
+    let exp = false;
+    let i = 0;
+    while (i < t.len) {
+        let c = t[i];
+        if (c >= 48 && c <= 57) { digit = true; }
+        else if (c == 46) { if (dot || exp) { return false; } dot = true; }   // '.'
+        else if (c == 101 || c == 69) { if (exp || !digit) { return false; } exp = true; }  // e/E
+        else if (c == 43 || c == 45) {                                        // sign
+            if (i != 0 && t[i - 1] != 101 && t[i - 1] != 69) { return false; }
+        } else { return false; }
+        i += 1;
+    }
+    return digit;
+}
+
+fn is_bool_str(s: string): bool {
+    let t = s.trim().to_lower();
+    return t == "true" || t == "false";
+}
+
+// Infer a column kind from one sample value.
+fn infer_kind(s: string): int {
+    if (is_int_str(s)) { return CK_I64; }
+    if (is_float_str(s)) { return CK_F64; }
+    if (is_bool_str(s)) { return CK_BOOL; }
+    return CK_STR;
+}
+
+// Set column `col` of the row under construction from a raw string field,
+// coercing to the column's kind.
+fn set_field(df: DataFrame, col: int, kind: int, field: string) {
+    if (kind == CK_I64) { df.setInt(col, field.trim().to_int()); }
+    else if (kind == CK_F64) { df.setFloat(col, field.trim().to_float()); }
+    else if (kind == CK_BOOL) { df.setBool(col, field.trim().to_lower() == "true"); }
+    else { df.setStr(col, field); }
+}
+
+// ---- CSV ingest -----------------------------------------------------------
+
+// Load a comma-separated file, inferring each column's type from the first data
+// row. With `hasHeader`, the first line names the columns; otherwise columns are
+// named col0, col1, … . Streamed a line at a time in bounded memory.
+export fn loadCsv(path: string, hasHeader: bool): DataFrame {
+    let df = new DataFrame(0);
+    let r = bufReader(path);
+    if (r == null) { return df; }
+
+    let names: string[] = [];
+    if (hasHeader && !r.eof()) { names = r.readLine().split(","); }
+
+    // pull the first data row to drive type inference + a capacity estimate
+    let first: string[] = [];
+    let firstLen = 0;
+    while (!r.eof() && first.len == 0) {
+        let line = r.readLine();
+        if (line == "" && r.eof()) { break; }
+        if (line.trim() == "") { continue; }
+        first = line.split(",");
+        firstLen = line.len;
+    }
+    if (first.len == 0) { r.close(); return df; }
+
+    for (let i in 0..first.len) {
+        let nm = "col" + str(i);
+        if (i < names.len) { nm = names[i].trim(); }
+        df.addColumn(nm, infer_kind(first[i]));
+    }
+
+    // reserve from file size / first-row byte length (a rough row estimate)
+    let sz = file_size(path);
+    if (sz > 0 && firstLen > 0) { df.reserve(sz / (firstLen + 1) + 16); }
+
+    append_csv_row(df, first);
+    while (!r.eof()) {
+        let line = r.readLine();
+        if (line == "" && r.eof()) { break; }
+        if (line.trim() == "") { continue; }
+        append_csv_row(df, line.split(","));
+    }
+    r.close();
+    return df;
+}
+
+fn append_csv_row(df: DataFrame, fields: string[]) {
+    df.beginRow();
+    let n = df.ncol();
+    for (let i in 0..n) {
+        if (i < fields.len) { set_field(df, i, df.colKind(i), fields[i]); }
+    }
+    df.endRow();
+}
+
+// ---- JSON ingest ----------------------------------------------------------
+
+// Seed columns from a sample object: integral numbers → int, other numbers →
+// float, booleans → bool, everything else → string.
+fn seed_schema(df: DataFrame, o: JsonValue) {
+    let keys = o.objKeys();
+    for (let i in 0..keys.len) {
+        let k = keys[i];
+        let v = o.get(k);
+        df.addColumn(k, json_kind(v));
+    }
+}
+
+fn json_kind(v: JsonValue): int {
+    if (v.isObj() || v.isArr()) { return CK_STR; }
+    // numbers: integral → int for id-like columns, else float
+    let f = v.asFloat();
+    let s = v.asString();
+    if (s != "") { return CK_STR; }
+    if (f == (f as int) as float) { return CK_I64; }
+    return CK_F64;
+}
+
+// Append one object as a row, filling columns positionally by name.
+fn append_json_obj(df: DataFrame, o: JsonValue) {
+    df.beginRow();
+    let n = df.ncol();
+    for (let i in 0..n) {
+        let jv = o.get(df.colName(i));
+        let k = df.colKind(i);
+        if (k == CK_STR) { df.setStr(i, jv.asString()); }
+        else if (k == CK_BOOL) { df.setBool(i, jv.asBool()); }
+        else if (k == CK_F64) { df.setFloat(i, jv.asFloat()); }
+        else { df.setInt(i, jv.asInt()); }
+    }
+    df.endRow();
+}
+
+// Load newline-delimited JSON (one object per line). Schema seeded from the
+// first object. Streamed in bounded memory.
+export fn loadNdjson(path: string): DataFrame {
+    let df = new DataFrame(0);
+    let r = bufReader(path);
+    if (r == null) { return df; }
+    let seeded = false;
+    while (!r.eof()) {
+        let line = r.readLine();
+        if (line == "" && r.eof()) { break; }
+        if (line.trim() == "") { continue; }
+        let o = json_parse(line);
+        if (!o.isObj()) { continue; }
+        if (!seeded) { seed_schema(df, o); seeded = true; }
+        append_json_obj(df, o);
+    }
+    r.close();
+    return df;
+}
+
+// Load a single big JSON array of objects via the streaming parser (O(1) DOM
+// memory — each element is parsed, appended, and freed before the next).
+export fn loadJsonArray(path: string): DataFrame {
+    let df = new DataFrame(0);
+    let text = readfile(path);
+    let seeded = [false];   // closure captures by value; use a ref container
+    json_each(text, (o) => {
+        if (o.isObj()) {
+            if (!seeded[0]) { seed_schema(df, o); seeded[0] = true; }
+            append_json_obj(df, o);
+        }
+    });
+    return df;
+}

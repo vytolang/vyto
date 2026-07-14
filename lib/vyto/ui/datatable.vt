@@ -1,0 +1,414 @@
+// vyto/ui/datatable — a virtualized data grid for Excel-scale data: millions of
+// rows and thousands of columns, backed by a native columnar DataFrame
+// (vyto/data/frame). It renders only the cells currently on screen, so a
+// 1,000,000 x 1,000 grid costs the same to draw as a 100 x 10 one, and it pushes
+// sort / filter / search / aggregation down to the native engine where they stay
+// sub-second.
+//
+//     let df = loadCsv("huge.csv", true);
+//     let dt = new DataTable(df);
+//     dt.onSelect = (vrow) => { ... };
+//     col.add(dt.flex(1));      // give it room in a Column
+//
+// Unlike the paginated Table (vyto/ui/data), DataTable scrolls both axes,
+// windows rows AND columns, holds no string model of its own (cells are
+// formatted on demand from the engine), and does its sort/filter natively — so
+// it does not fall over as the row/column counts grow.
+
+import { Widget, Painter, Theme, Size } from "vyto/ui/core";
+import { SearchField } from "vyto/ui/form";
+import { Rect, contains, mix, KEY_UP, KEY_DOWN, KEY_HOME, KEY_END,
+         KEY_PAGEUP, KEY_PAGEDOWN, MOD_SHIFT } from "vyto/surface";
+import { DataFrame, CK_STR, CK_BOOL, AGG_SUM } from "vyto/data/frame";
+
+const DT_SEARCH_H: int = 34;
+const DT_HDR_H: int = 30;
+const DT_ROW_H: int = 26;
+const DT_FOOT_H: int = 30;
+const DT_SCROLL_W: int = 6;   // scrollbar thumb thickness
+
+// One rendered column: a fixed pixel `width`, text `align` (0/1/2 = L/C/R), and
+// the source `col` index into the DataFrame.
+export class DtColumn {
+    title: string;
+    width: int;
+    align: int;
+    col: int;
+    sortable: bool;
+
+    fn init(title: string, width: int, col: int) {
+        this.title = title;
+        this.width = width;
+        this.align = 0;
+        this.col = col;
+        this.sortable = true;
+    }
+}
+
+export class DataTable extends Widget {
+    df: DataFrame;
+    cols: DtColumn[];
+    colx: int[];        // prefix-sum of widths; colx[i] = left x of column i, colx[n] = total
+    scroll_y: int;      // pixel offset from the top of the row area
+    scroll_x: int;      // pixel offset from the left of the column area
+    row_h: int;
+    selected: int;      // visible-row index, -1 = none
+    hover_row: int;     // visible-row index under the cursor, -1
+    sort_col: int;      // DataFrame column index, -1 = unsorted
+    sort_asc: bool;
+    query: string;
+    agg_col: int;       // DataFrame column to show a live sum for in the footer, -1 = none
+    onSelect: fn(int);  // called with the selected visible-row index
+    search: SearchField;
+
+    fn init(df: DataFrame) {
+        super.init();
+        this.df = df;
+        this.cols = [];
+        this.colx = [];
+        this.scroll_y = 0;
+        this.scroll_x = 0;
+        this.row_h = DT_ROW_H;
+        this.selected = -1;
+        this.hover_row = -1;
+        this.sort_col = -1;
+        this.sort_asc = true;
+        this.query = "";
+        this.agg_col = -1;
+        this.focusable = true;
+        this.search = new SearchField("Search");
+        this.add(this.search);
+        let self = this;
+        this.search.onChange = (q) => { self.set_query(q); };
+        this.autoColumns();
+    }
+
+    // Build a column per DataFrame field with sensible default widths and right-
+    // aligned numerics. Replaces any existing column set.
+    fn autoColumns() {
+        this.cols = [];
+        let n = this.df.ncol();
+        for (let i in 0..n) {
+            let k = this.df.colKind(i);
+            let w = 90;
+            if (k == CK_STR) { w = 160; }
+            else if (k == CK_BOOL) { w = 70; }
+            let c = new DtColumn(this.df.colName(i), w, i);
+            if (k != CK_STR && k != CK_BOOL) { c.align = 2; } // numerics right-aligned
+            this.cols.push(c);
+        }
+        this.rebuild_colx();
+    }
+
+    fn setColumnWidth(i: int, w: int) {
+        if (i >= 0 && i < this.cols.len) { this.cols[i].width = w; this.rebuild_colx(); this.invalidate(); }
+    }
+
+    // Show a live SUM of DataFrame column `col` (over the visible rows) in the
+    // footer; -1 to disable.
+    fn setAggColumn(col: int) { this.agg_col = col; this.invalidate(); }
+
+    fn rebuild_colx() {
+        this.colx = [];
+        this.colx.reserve(this.cols.len + 1);
+        let x = 0;
+        this.colx.push(0);
+        for (let i in 0..this.cols.len) { x += this.cols[i].width; this.colx.push(x); }
+    }
+
+    fn content_w(): int { if (this.colx.len == 0) { return 0; } return this.colx[this.colx.len - 1]; }
+    fn content_h(): int { return this.df.viewLen() * this.row_h; }
+    fn body_top(): int { return this.bounds.y + DT_SEARCH_H + DT_HDR_H; }
+    fn body_h(): int { return this.bounds.h - DT_SEARCH_H - DT_HDR_H - DT_FOOT_H; }
+
+    fn clamp() {
+        let maxy = this.content_h() - this.body_h();
+        if (maxy < 0) { maxy = 0; }
+        if (this.scroll_y > maxy) { this.scroll_y = maxy; }
+        if (this.scroll_y < 0) { this.scroll_y = 0; }
+        let maxx = this.content_w() - this.bounds.w;
+        if (maxx < 0) { maxx = 0; }
+        if (this.scroll_x > maxx) { this.scroll_x = maxx; }
+        if (this.scroll_x < 0) { this.scroll_x = 0; }
+    }
+
+    // First column whose right edge is past scroll_x — the leftmost visible
+    // column. Binary search on the prefix sums so thousands of columns cost
+    // O(log n), not O(n), per frame.
+    fn first_visible_col(): int {
+        let lo = 0;
+        let hi = this.cols.len;
+        while (lo < hi) {
+            let mid = (lo + hi) / 2;
+            if (this.colx[mid + 1] <= this.scroll_x) { lo = mid + 1; } else { hi = mid; }
+        }
+        return lo;
+    }
+
+    // ---- view (native filter + sort) -------------------------------------
+
+    // Recompute the visible view: reset, apply the search filter, then re-apply
+    // the active sort — all in the native engine.
+    fn apply_view() {
+        this.df.resetView();
+        if (this.query != "") { this.df.search(this.query); }
+        if (this.sort_col >= 0) { this.df.sort(this.sort_col, this.sort_asc); }
+        this.clamp();
+    }
+
+    fn set_query(q: string) {
+        this.query = q;
+        this.selected = -1;
+        this.scroll_y = 0;
+        this.apply_view();
+        this.invalidate();
+    }
+
+    fn toggle_sort(dfcol: int) {
+        if (this.sort_col == dfcol) { this.sort_asc = !this.sort_asc; }
+        else { this.sort_col = dfcol; this.sort_asc = true; }
+        this.apply_view();
+        this.invalidate();
+    }
+
+    // ---- layout -----------------------------------------------------------
+
+    override fn measure(s: Painter, th: Theme): Size {
+        let w = this.content_w() + 2;
+        if (w < 320) { w = 320; }
+        if (w > 900) { w = 900; }
+        return Size(w, DT_SEARCH_H + DT_HDR_H + this.row_h * 10 + DT_FOOT_H);
+    }
+
+    override fn arrange(s: Painter, th: Theme, r: Rect) {
+        this.bounds = r;
+        let sw = 220;
+        if (sw > r.w - 16) { sw = r.w - 16; }
+        this.search.arrange(s, th, Rect(r.x + r.w - sw - 8, r.y + 4, sw, s.font_height() + 12));
+        this.clamp();
+    }
+
+    // ---- draw -------------------------------------------------------------
+
+    fn draw_cell(s: Painter, c: DtColumn, cx: int, y: int, h: int, text: string, color: int) {
+        let pad = 8;
+        if (c.align == 1) { pad = (c.width - s.text_width(text)) / 2; }
+        else if (c.align == 2) { pad = c.width - s.text_width(text) - 8; }
+        if (pad < 4) { pad = 4; }
+        s.text_in(Rect(cx, y, c.width, h), pad, text, color);
+    }
+
+    override fn draw(s: Painter, th: Theme) {
+        let b = this.bounds;
+        s.fill_round(b, th.radius_md, th.surface_raised);
+        s.stroke_round(b, th.radius_md, 1, th.border);
+
+        let first_col = this.first_visible_col();
+        let hy = b.y + DT_SEARCH_H;
+
+        // --- header (clipped horizontally to the body width) ---
+        s.fill(Rect(b.x, hy, b.w, DT_HDR_H), th.surface_sunken);
+        s.clip_push(Rect(b.x, hy, b.w, DT_HDR_H), 0);
+        s.set_weight(2);
+        let ci = first_col;
+        while (ci < this.cols.len) {
+            let cx = b.x - this.scroll_x + this.colx[ci];
+            if (cx >= b.x + b.w) { break; }
+            let c = this.cols[ci];
+            this.draw_cell(s, c, cx, hy, DT_HDR_H, c.title, th.on_surface);
+            if (this.sort_col == c.col) {
+                let ax = cx + c.width - 14;
+                let ay = hy + DT_HDR_H / 2;
+                if (this.sort_asc) {
+                    s.line_w(ax - 3, ay + 2, ax, ay - 2, 2, th.primary);
+                    s.line_w(ax, ay - 2, ax + 3, ay + 2, 2, th.primary);
+                } else {
+                    s.line_w(ax - 3, ay - 2, ax, ay + 2, 2, th.primary);
+                    s.line_w(ax, ay + 2, ax + 3, ay - 2, 2, th.primary);
+                }
+            }
+            ci += 1;
+        }
+        s.set_weight(0);
+        s.clip_pop();
+        s.line(b.x, hy + DT_HDR_H, b.x + b.w, hy + DT_HDR_H, th.divider);
+
+        // --- body (windowed rows x windowed columns) ---
+        let by = this.body_top();
+        let bh = this.body_h();
+        let vlen = this.df.viewLen();
+        let firstRow = this.scroll_y / this.row_h;
+        let off = this.scroll_y % this.row_h;
+        let vis = bh / this.row_h + 2;
+        s.clip_push(Rect(b.x, by, b.w, bh), 0);
+        for (let i in 0..vis) {
+            let vrow = firstRow + i;
+            if (vrow >= vlen) { break; }
+            let ry = by - off + i * this.row_h;
+            if (vrow == this.selected) {
+                s.fill(Rect(b.x, ry, b.w, this.row_h), th.selection);
+            } else if (vrow == this.hover_row) {
+                s.fill(Rect(b.x, ry, b.w, this.row_h), mix(th.surface_raised, th.on_surface, 0.04));
+            }
+            let cj = first_col;
+            while (cj < this.cols.len) {
+                let cx = b.x - this.scroll_x + this.colx[cj];
+                if (cx >= b.x + b.w) { break; }
+                let c = this.cols[cj];
+                this.draw_cell(s, c, cx, ry, this.row_h, this.df.cellStr(vrow, c.col), th.on_surface);
+                cj += 1;
+            }
+        }
+        s.clip_pop();
+
+        this.draw_scrollbars(s, th, by, bh, vlen);
+
+        // --- footer ---
+        let fy = b.y + b.h - DT_FOOT_H;
+        s.line(b.x, fy, b.x + b.w, fy, th.divider);
+        let label = str(vlen) + " rows";
+        if (vlen != this.df.nrow()) { label = str(vlen) + " of " + str(this.df.nrow()) + " rows"; }
+        if (this.agg_col >= 0) { label = label + "   Σ=" + str(this.df.agg(this.agg_col, AGG_SUM)); }
+        s.text_in(Rect(b.x + 8, fy, b.w - 16, DT_FOOT_H), 0, label, th.on_surface_muted);
+
+        this.search.draw(s, th);
+    }
+
+    fn draw_scrollbars(s: Painter, th: Theme, by: int, bh: int, vlen: int) {
+        let b = this.bounds;
+        // vertical
+        let ch = this.content_h();
+        if (ch > bh && bh > 0) {
+            let thumb = bh * bh / ch;
+            if (thumb < 20) { thumb = 20; }
+            let track = bh - thumb;
+            let maxy = ch - bh;
+            let ty = by;
+            if (maxy > 0) { ty = by + track * this.scroll_y / maxy; }
+            s.fill_round(Rect(b.x + b.w - DT_SCROLL_W - 2, ty, DT_SCROLL_W, thumb), 3, th.on_surface_muted);
+        }
+        // horizontal
+        let cw = this.content_w();
+        if (cw > b.w) {
+            let thumb = b.w * b.w / cw;
+            if (thumb < 20) { thumb = 20; }
+            let track = b.w - thumb;
+            let maxx = cw - b.w;
+            let tx = b.x;
+            if (maxx > 0) { tx = b.x + track * this.scroll_x / maxx; }
+            s.fill_round(Rect(tx, by + bh - DT_SCROLL_W - 2, thumb, DT_SCROLL_W), 3, th.on_surface_muted);
+        }
+    }
+
+    // Repaint the whole widget on any overlapping dirty rect (same reason as
+    // Table: the base draw_within would redraw only the child search box and
+    // erase the grid).
+    override fn draw_within(s: Painter, th: Theme, d: Rect) {
+        let b = this.bounds;
+        if (b.x + b.w <= d.x || d.x + d.w <= b.x ||
+            b.y + b.h <= d.y || d.y + d.h <= b.y) { return; }
+        this.draw(s, th);
+    }
+
+    // ---- events -----------------------------------------------------------
+
+    override fn on_scroll(delta: int): bool {
+        if ((this.mods() & MOD_SHIFT) != 0) { this.scroll_x += delta * 40; }
+        else { this.scroll_y += delta * this.row_h; }
+        this.clamp();
+        return true;
+    }
+
+    // visible row under a y coordinate, or -1 if outside the body / past the end
+    fn row_at(y: int): int {
+        let by = this.body_top();
+        if (y < by || y >= by + this.body_h()) { return -1; }
+        let vrow = (y - by + this.scroll_y) / this.row_h;
+        if (vrow < 0 || vrow >= this.df.viewLen()) { return -1; }
+        return vrow;
+    }
+
+    override fn on_click(x: int, y: int): bool {
+        let b = this.bounds;
+        let hy = b.y + DT_SEARCH_H;
+        // header → sort the column under the cursor
+        if (y >= hy && y < hy + DT_HDR_H) {
+            let cxContent = x - b.x + this.scroll_x;
+            let ci = this.first_visible_col();
+            while (ci < this.cols.len) {
+                if (cxContent >= this.colx[ci] && cxContent < this.colx[ci + 1]) {
+                    if (this.cols[ci].sortable) { this.toggle_sort(this.cols[ci].col); }
+                    return true;
+                }
+                ci += 1;
+            }
+            return true;
+        }
+        // body → select
+        let vrow = this.row_at(y);
+        if (vrow >= 0) {
+            this.selected = vrow;
+            if (this.onSelect != null) { this.onSelect(vrow); }
+            this.invalidate();
+        }
+        return true;
+    }
+
+    override fn on_key(k: int, ch: string): bool {
+        let vlen = this.df.viewLen();
+        if (vlen == 0) { return false; }
+        let page = this.body_h() / this.row_h;
+        if (k == KEY_DOWN) { return this.move_sel(1); }
+        if (k == KEY_UP) { return this.move_sel(-1); }
+        if (k == KEY_PAGEDOWN) { return this.move_sel(page); }
+        if (k == KEY_PAGEUP) { return this.move_sel(-page); }
+        if (k == KEY_HOME) { return this.move_sel(-vlen); }
+        if (k == KEY_END) { return this.move_sel(vlen); }
+        return false;
+    }
+
+    fn move_sel(delta: int): bool {
+        let vlen = this.df.viewLen();
+        let v = this.selected + delta;   // selected == -1 acts as "before row 0"
+        if (v < 0) { v = 0; }
+        if (v >= vlen) { v = vlen - 1; }
+        this.selected = v;
+        this.ensure_visible(v);
+        if (this.onSelect != null) { this.onSelect(v); }
+        this.invalidate();
+        return true;
+    }
+
+    fn ensure_visible(vrow: int) {
+        let top = vrow * this.row_h;
+        let bot = top + this.row_h;
+        if (top < this.scroll_y) { this.scroll_y = top; }
+        else if (bot > this.scroll_y + this.body_h()) { this.scroll_y = bot - this.body_h(); }
+        this.clamp();
+    }
+
+    override fn hit(px: int, py: int): Widget {
+        let n = this.children.len;
+        for (let i in 0..n) {
+            let c = this.children[n - 1 - i];
+            let f = c.hit(px, py);
+            if (f != null) { return f; }
+        }
+        if (contains(this.bounds, px, py)) {
+            let hr = this.row_at(py);
+            if (hr != this.hover_row) { this.hover_row = hr; this.invalidate(); }
+            return this;
+        }
+        return null;
+    }
+
+    override fn on_hover_leave(): bool {
+        if (this.hover_row != -1) { this.hover_row = -1; return true; }
+        return false;
+    }
+
+    override fn drop_handlers() { this.onSelect = null; }
+}
+
+// Build a DataTable bound to `df` with auto-generated columns.
+export fn dataTable(df: DataFrame): DataTable { return new DataTable(df); }

@@ -1,0 +1,61 @@
+// vyto/data DataFrame — a native columnar engine for millions of rows: build a
+// table, sort/filter/aggregate over an index view (column data never moves), add
+// a computed column, and round-trip through CSV. The vyto/ui DataTable widget
+// renders one of these, drawing only the cells on screen.
+import { DataFrame, loadCsv, CK_I64, CK_F64, CK_STR,
+         OP_GE, OP_CONTAINS, AGG_SUM, AGG_MAX, AGG_AVG, DV_MUL } from "vyto/data/frame";
+import { bufWriter, file_remove } from "vyto/io/file";
+
+fn main() {
+    let df = new DataFrame(8);
+    let id = df.addColumn("id", CK_I64);
+    let qty = df.addColumn("qty", CK_I64);
+    let price = df.addColumn("price", CK_F64);
+    let city = df.addColumn("city", CK_STR);
+
+    let cities = ["Oslo", "Bergen", "Oslo", "Troms", "Bergen"];
+    let qtys = [3, 7, 2, 9, 5];
+    df.reserve(5);
+    for (let i in 0..5) {
+        df.beginRow().setInt(id, i).setInt(qty, qtys[i]).setFloat(price, ((i + 1) as float) * 10.0).setStr(city, cities[i]).endRow();
+    }
+    print("rows=" + str(df.nrow()) + " cols=" + str(df.ncol()));
+
+    // sort by qty descending — reorders the view, not the columns
+    df.sort(qty, false);
+    print("top qty row: id=" + df.cellStr(0, id) + " qty=" + df.cellStr(0, qty) + " city=" + df.cellStr(0, city));
+
+    // aggregate the whole table
+    print("total qty=" + str(df.agg(qty, AGG_SUM)) + " max qty=" + str(df.agg(qty, AGG_MAX)) + " avg price=" + str(df.agg(price, AGG_AVG)));
+
+    // computed column: revenue = qty * price
+    let rev = df.derive("revenue", DV_MUL, qty, price);
+    df.sort(rev, false);
+    print("best revenue=" + str(df.cellFloat(0, rev)) + " (city " + df.cellStr(0, city) + ")");
+
+    // filter: qty >= 5, then narrow to a city — filters compose (AND)
+    df.resetView();
+    df.filterInt(qty, OP_GE, 5);
+    print("qty>=5 rows=" + str(df.viewLen()) + " sum=" + str(df.agg(qty, AGG_SUM)));
+    df.filterStr(city, OP_CONTAINS, "Bergen");
+    print("...and Bergen rows=" + str(df.viewLen()));
+
+    // global search across all columns
+    df.resetView();
+    df.search("Oslo");
+    print("search 'Oslo' rows=" + str(df.viewLen()));
+
+    // CSV round-trip: write, reload with type inference, re-aggregate
+    let w = bufWriter("dt_example.csv", 4096);
+    w.write("id,qty,price,city\n");
+    df.resetView();
+    for (let i in 0..df.nrow()) {
+        w.write(df.cellStr(i, id)).write(",").write(df.cellStr(i, qty)).write(",")
+         .write(df.cellStr(i, price)).write(",").write(df.cellStr(i, city)).write("\n");
+    }
+    w.close();
+    let c = loadCsv("dt_example.csv", true);
+    print("reloaded rows=" + str(c.nrow()) + " kinds=" + str(c.colKind(0)) + str(c.colKind(1)) + str(c.colKind(2)) + str(c.colKind(3)));
+    print("reloaded total qty=" + str(c.agg(1, AGG_SUM)));
+    file_remove("dt_example.csv");
+}
