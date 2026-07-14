@@ -758,6 +758,11 @@ static char *emit_call(Em *em, Expr *e, bool *fresh) {
             *fresh = false;
             return arena_printf(&g_arena, "vt_arr_clear(%s, \"%s\", %d)", ex_b(em, recv),
                                 c_escape(e->loc.file, strlen(e->loc.file)), e->loc.line);
+        case B_ARR_RESERVE:
+            *fresh = false;
+            return arena_printf(&g_arena, "vt_arr_reserve(%s, %s, \"%s\", %d)", ex_b(em, recv),
+                                ex_b(em, a[0]), c_escape(e->loc.file, strlen(e->loc.file)),
+                                e->loc.line);
         case B_ARR_INSERT: {
             Type *et = recv->type->elem;
             const char *tv = newtemp(em, et, false); /* borrowed; insert retains internally */
@@ -1503,9 +1508,13 @@ static void emit_stmt(Em *em, Stmt *s) {
         em->indent++;
         epush(em, true);
         ind(em);
-        sb_printf(em->out, "%s %s = *(%s*)vt_arr_at(%s, %s, \"%s\", %d);\n", c_type(et),
-                  s->local->cname, c_type(et), ta, iv, c_escape(s->loc.file, strlen(s->loc.file)),
-                  s->loc.line);
+        /* iv runs [0, len) and the load sits right after the loop condition, so
+           the index is in bounds by construction — skip the per-element bounds
+           check (raw slot read) and let the C compiler vectorize the loop.
+           ta->data/->len are reloaded each iteration, so a body that grows the
+           array (aliased push) stays correct, matching vt_arr_at semantics. */
+        sb_printf(em->out, "%s %s = ((%s*)%s->data)[%s];\n", c_type(et),
+                  s->local->cname, c_type(et), ta, iv);
         if (type_is_ref(et)) {
             ind(em);
             sb_printf(em->out, "vt_retain(%s);\n", s->local->cname);

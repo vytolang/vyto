@@ -81,7 +81,7 @@ void vt_set_args(int argc, char **argv); /* stashed by main() */
 struct VtArray *vt_args(void);            /* args as string[], excluding argv[0] */
 
 /* ---- panic ---- */
-void vt_panic_c(const char *file, int line, const char *msg);
+VT_NORETURN void vt_panic_c(const char *file, int line, const char *msg);
 
 /* ---- checked signed integer arithmetic ----
    Emitted for signed int/i8/i16/i32/i64 arithmetic in checked (debug) builds;
@@ -139,7 +139,7 @@ int64_t vt_str_index(VtString *s, int64_t i, const char *file, int line);
 static inline const char *vt_str_cstr(VtString *s) { return s ? s->data : ""; }
 
 void vt_print(VtString *s);
-void vt_panic(const char *file, int line, VtString *msg);
+VT_NORETURN void vt_panic(const char *file, int line, VtString *msg);
 
 /* ---- file I/O ---- */
 VtString *vt_file_read(VtString *path, const char *file, int line); /* panics if unreadable */
@@ -164,7 +164,16 @@ static inline void *vt_arr_data(VtArray *a) { return a ? a->data : NULL; }
 void vt_arr_push(VtArray *a, const void *elem);                        /* retains if ref */
 void vt_arr_push_at(VtArray *a, const void *elem, const char *file, int line); /* null-checked push */
 void vt_arr_pop(VtArray *a, void *out, const char *file, int line);    /* transfers ownership */
-void *vt_arr_at(VtArray *a, int64_t i, const char *file, int line);    /* bounds-checked slot ptr */
+/* Bounds/null failure path for vt_arr_at — cold, out-of-line, never returns. */
+VT_NORETURN void vt_arr_oob(VtArray *a, int64_t i, const char *file, int line);
+/* Bounds-checked element slot. Hot path is a single unsigned compare (folds the
+   i<0 and i>=len cases) and inlines at the call site — like C++'s
+   vector::operator[]; the panic path stays out-of-line so the loop body stays
+   tight and the C compiler can hoist/vectorize around it. */
+static inline void *vt_arr_at(VtArray *a, int64_t i, const char *file, int line) {
+    if (!a || (uint64_t)i >= (uint64_t)a->len) vt_arr_oob(a, i, file, line);
+    return a->data + i * a->elem_size;
+}
 void vt_arr_set(VtArray *a, int64_t i, const void *elem, const char *file, int line);
 
 /* ---- maps (string keys, 8-byte value slots) ---- */
@@ -264,6 +273,7 @@ int64_t vt_arr_index_of(VtArray *a, const void *elem, int eq, const char *file, 
 bool vt_arr_contains(VtArray *a, const void *elem, int eq, const char *file, int line);
 void vt_arr_reverse(VtArray *a, const char *file, int line);
 void vt_arr_clear(VtArray *a, const char *file, int line);
+void vt_arr_reserve(VtArray *a, int64_t n, const char *file, int line); /* grow cap to >= n */
 void vt_arr_insert(VtArray *a, int64_t i, const void *elem, const char *file, int line);
 void vt_arr_remove_at(VtArray *a, int64_t i, void *out, const char *file, int line);
 void vt_arr_extend(VtArray *a, VtArray *o, const char *file, int line);

@@ -1,0 +1,136 @@
+// vyto/util/text — an O(n) StringBuilder plus small string helpers.
+//
+// Vyto strings are immutable, so `s = s + x` in a loop is O(n²): each `+`
+// allocates a fresh string and copies all prior content. StringBuilder appends
+// into a single growable buffer (doubling), turning repeated building into O(n):
+//
+//     let sb = new StringBuilder(4096);
+//     for (let i in 0..200000) { sb.append("item").appendInt(i).append(","); }
+//     let s = sb.toString();
+//
+// Integers/floats are formatted straight into the buffer (appendInt/appendFloat)
+// with no intermediate string allocation. Appends are binary-safe (interior NUL
+// bytes are kept); toString() is NUL-terminated/strlen-based, so it truncates at
+// the first embedded NUL — the same caveat as `str(bytes as cstring)` used by
+// File.readText and Socket.recvText.
+
+extern "C" {
+    fn sb_new(cap: i64): rawptr;
+    fn sb_append(h: rawptr, s: cstring, n: i64);
+    fn sb_append_i64(h: rawptr, v: i64);
+    fn sb_append_f64(h: rawptr, v: f64);
+    fn sb_append_byte(h: rawptr, b: i32);
+    fn sb_len(h: rawptr): i64;
+    fn sb_cstr(h: rawptr): cstring;
+    fn sb_clear(h: rawptr);
+    fn sb_free(h: rawptr);
+}
+
+export class StringBuilder {
+    h: rawptr;
+
+    // `cap` is an initial capacity hint in bytes; the buffer grows as needed.
+    fn init(cap: int) {
+        this.h = sb_new(cap as i64);
+        if (this.h == null) { panic("vyto/util/text: StringBuilder allocation failed"); }
+    }
+
+    // Each append returns the receiver, so calls chain fluently.
+    fn append(s: string): StringBuilder { sb_append(this.h, s.cstr(), s.len as i64); return this; }
+    fn appendInt(v: int): StringBuilder { sb_append_i64(this.h, v as i64); return this; }
+    fn appendFloat(v: float): StringBuilder { sb_append_f64(this.h, v); return this; }
+    fn appendByte(b: int): StringBuilder { sb_append_byte(this.h, b as i32); return this; }
+
+    // Byte length accumulated so far.
+    fn len(): int { return sb_len(this.h) as int; }
+    // Reset to empty, keeping the allocated capacity for reuse.
+    fn clear() { sb_clear(this.h); }
+    // Materialize the accumulated bytes as a string (NUL-truncated — see header).
+    fn toString(): string { return str(sb_cstr(this.h)); }
+
+    deinit { sb_free(this.h); }
+}
+
+// Fresh builder with the given initial capacity hint.
+export fn stringBuilder(cap: int): StringBuilder { return new StringBuilder(cap); }
+
+// ---- free string helpers (pure Vyto over the string builtin methods) -------
+
+// One-byte string from a code (0..255). Code 0 yields "" (a NUL can't live in a
+// cstring-backed string). For full Unicode scalars use vyto/intl/unicode.encode.
+export fn chr(code: int): string {
+    if (code == 0) { return ""; }
+    let b = bytes(2);
+    b[0] = code as byte;
+    return str(b as cstring);
+}
+
+// Byte value at index i (0..len-1); bounds-checked like `s[i]`.
+export fn ord(s: string, i: int): int { return s[i]; }
+
+// Drop a leading `p` if present, else return `s` unchanged.
+export fn strip_prefix(s: string, p: string): string {
+    if (p.len > 0 && s.starts_with(p)) { return s.slice(p.len, s.len); }
+    return s;
+}
+// Drop a trailing `p` if present, else return `s` unchanged.
+export fn strip_suffix(s: string, p: string): string {
+    if (p.len > 0 && s.ends_with(p)) { return s.slice(0, s.len - p.len); }
+    return s;
+}
+
+// Replace only the first occurrence of `old` with `neu` (contrast `s.replace`,
+// which replaces all). Empty `old`, or no match, returns `s` unchanged.
+export fn replace_first(s: string, old: string, neu: string): string {
+    if (old.len == 0) { return s; }
+    let i = s.index_of(old);
+    if (i < 0) { return s; }
+    return s.slice(0, i) + neu + s.slice(i + old.len, s.len);
+}
+
+// Uppercase the first byte (ASCII); the rest is left untouched.
+export fn capitalize(s: string): string {
+    if (s.len == 0) { return s; }
+    return s.slice(0, 1).to_upper() + s.slice(1, s.len);
+}
+
+// First `n` bytes (clamped to [0, len]).
+export fn left(s: string, n: int): string {
+    if (n <= 0) { return ""; }
+    if (n >= s.len) { return s; }
+    return s.slice(0, n);
+}
+// Last `n` bytes (clamped to [0, len]).
+export fn right(s: string, n: int): string {
+    if (n <= 0) { return ""; }
+    if (n >= s.len) { return s; }
+    return s.slice(s.len - n, s.len);
+}
+
+// True when `s` is empty or contains only whitespace.
+export fn is_blank(s: string): bool { return s.trim().is_empty(); }
+
+// ASCII case-insensitive equality.
+export fn equals_ignore_case(a: string, b: string): bool {
+    return a.to_lower() == b.to_lower();
+}
+
+// Center `s` in a field of `width`, padding both sides with `fill` (extra pad
+// goes on the right). Returns `s` unchanged when already wide enough.
+export fn center(s: string, width: int, fill: string): string {
+    if (s.len >= width || fill.len == 0) { return s; }
+    let total = width - s.len;
+    let leftPad = total / 2;
+    return s.pad_start(s.len + leftPad, fill).pad_end(width, fill);
+}
+
+// First index of `sub` at or after byte offset `at`, or -1. An `at` past the
+// end yields -1; a negative `at` is treated as 0. ('from' is a keyword.)
+export fn index_of_from(s: string, sub: string, at: int): int {
+    let start = at;
+    if (start < 0) { start = 0; }
+    if (start > s.len) { return -1; }
+    let rel = s.slice(start, s.len).index_of(sub);
+    if (rel < 0) { return -1; }
+    return start + rel;
+}

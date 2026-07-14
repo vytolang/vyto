@@ -390,7 +390,7 @@ void *vt_checked_cast(void *p, const VtType *t, const char *file, int line) {
     return p;
 }
 
-void vt_panic_c(const char *file, int line, const char *msg) {
+VT_NORETURN void vt_panic_c(const char *file, int line, const char *msg) {
     char buf[256];
     vt_snprintf(buf, sizeof buf, "%s:%d: panic: %s\n", file, line, msg);
     vt_puts_err(buf);
@@ -521,7 +521,7 @@ uint64_t vt_ck_shru(uint64_t a, int64_t b, int bits, const char *file, int line)
     return a >> b;
 }
 
-void vt_panic(const char *file, int line, VtString *msg) {
+VT_NORETURN void vt_panic(const char *file, int line, VtString *msg) {
     vt_panic_c(file, line, msg ? msg->data : "(null)");
 }
 
@@ -828,15 +828,13 @@ void vt_arr_pop(VtArray *a, void *out, const char *file, int line) {
     /* ownership transfers to caller: no release, no retain */
 }
 
-void *vt_arr_at(VtArray *a, int64_t i, const char *file, int line) {
+/* Cold failure path for the inlined vt_arr_at (see vyto_rt.h). */
+VT_NORETURN void vt_arr_oob(VtArray *a, int64_t i, const char *file, int line) {
     if (!a) vt_panic_c(file, line, "index into null array");
-    if (i < 0 || i >= a->len) {
-        char buf[96];
-        vt_snprintf(buf, sizeof buf, "array index %lld out of bounds (len %lld)",
-                    (long long)i, (long long)a->len);
-        vt_panic_c(file, line, buf);
-    }
-    return a->data + i * a->elem_size;
+    char buf[96];
+    vt_snprintf(buf, sizeof buf, "array index %lld out of bounds (len %lld)",
+                (long long)i, (long long)a->len);
+    vt_panic_c(file, line, buf);
 }
 
 void vt_arr_set(VtArray *a, int64_t i, const void *elem, const char *file, int line) {

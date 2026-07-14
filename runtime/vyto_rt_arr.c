@@ -58,6 +58,17 @@ void vt_arr_clear(VtArray *a, const char *file, int line) {
     a->len = 0;
 }
 
+/* reserve capacity for at least `n` elements in one realloc, so a following
+ * push loop never grows the buffer again. Does not change len (no elements are
+ * added); n <= cap is a no-op. */
+void vt_arr_reserve(VtArray *a, int64_t n, const char *file, int line) {
+    if (!a) vt_panic_c(file, line, "reserve on null array");
+    if (n <= a->cap) return;
+    a->data = vt_host_realloc(a->data, (size_t)(n * a->elem_size));
+    if (!a->data) vt_oom();
+    a->cap = n;
+}
+
 void vt_arr_insert(VtArray *a, int64_t i, const void *elem, const char *file, int line) {
     if (!a) vt_panic_c(file, line, "insert into null array");
     if (i < 0 || i > a->len) vt_panic_c(file, line, "insert index out of bounds");

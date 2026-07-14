@@ -1348,6 +1348,13 @@ static Type *check_call(Ctx *c, Expr *e, Type *expected) {
                 e->builtin = n == intern("reverse") ? B_ARR_REVERSE : B_ARR_CLEAR;
                 return e->type = ty_void();
             }
+            if (n == intern("reserve")) {
+                if (e->nargs != 1) fatal_at(e->loc, "reserve takes 1 argument");
+                check_expr(c, e->args[0], ty_int());
+                want(c, e->args[0], ty_int(), "reserve capacity");
+                e->ref = REF_BUILTIN; e->builtin = B_ARR_RESERVE;
+                return e->type = ty_void();
+            }
             if (n == intern("insert")) {
                 if (e->nargs != 2) fatal_at(e->loc, "insert takes 2 arguments");
                 check_expr(c, e->args[0], ty_int());
