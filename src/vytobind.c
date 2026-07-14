@@ -144,6 +144,11 @@ static void skip_to_semi(void) {
     }
 }
 
+/* Set when skip_noise swallowed an __asm__("sym") rename: the declared name is
+   not the link symbol, so the declaration must be skipped. Cleared by parse_top
+   before each top-level declaration. */
+static bool saw_asm_rename;
+
 /* skip gcc noise words wherever they may appear */
 static bool skip_noise(void) {
     bool any = false;
@@ -162,7 +167,7 @@ static bool skip_noise(void) {
             if (is_p("(")) skip_balanced("(", ")");
             /* an asm rename changes the link symbol — poison the declaration */
             if (name == intern("__asm__") || name == intern("__asm") || name == intern("asm"))
-                return true; /* handled by caller via re-check; treat as noise */
+                saw_asm_rename = true;
             any = true;
             continue;
         }
@@ -531,6 +536,7 @@ static void parse_typedef(void) {
 
 static void parse_top(void) {
     while (cur()->kind != CT_EOF) {
+        saw_asm_rename = false;
         skip_noise();
         if (eat_p(";")) continue;
         if (is_kw("typedef")) { parse_typedef(); continue; }
@@ -573,6 +579,10 @@ static void parse_top(void) {
             skip_noise();
             if (is_p("{")) { skip_balanced("{", "}"); continue; } /* inline definition: no symbol */
             skip_to_semi();
+            if (saw_asm_rename) {
+                bad = true;
+                add_skip(name, "__asm__ rename: declared name is not the link symbol");
+            }
             if (!bad) {
                 /* dedupe */
                 bool dup = false;

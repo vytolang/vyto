@@ -86,10 +86,18 @@ void vt_arr_remove_at(VtArray *a, int64_t i, void *out, const char *file, int li
 
 void vt_arr_extend(VtArray *a, VtArray *o, const char *file, int line) {
     if (!a || !o) vt_panic_c(file, line, "extend on null array");
-    /* snapshot the length: a.extend(a) must not chase its own growth. Reading
-     * o->data inside the loop is deliberate — when a == o, push may realloc the
-     * shared buffer and the first n elements land intact in the new block. */
+    /* snapshot the length (a.extend(a) must not chase its own growth) and
+     * reserve capacity up front: push must never realloc mid-loop — when
+     * a == o the element pointer passed to push aims into the shared buffer,
+     * and a realloc inside push would leave it dangling. */
     int64_t n = o->len;
+    if (a->len + n > a->cap) {
+        int64_t nc = a->cap ? a->cap : 8;
+        while (nc < a->len + n) nc *= 2;
+        a->data = vt_host_realloc(a->data, (size_t)(nc * a->elem_size));
+        if (!a->data) vt_oom();
+        a->cap = nc;
+    }
     for (int64_t i = 0; i < n; i++) vt_arr_push(a, o->data + i * o->elem_size);
 }
 

@@ -378,7 +378,9 @@ static Expr *parse_primary(Parser *p) {
         if (!accept(p, T_INIT)) fatal_at(e->loc, "only 'super.init(...)' is supported");
         e->is_super_call = true;
         e->name = intern("init");
-        e->args = parse_args(p, &e->nargs);
+        /* named form must survive to the checker: dropping labels here would
+           bind super.init(b: 2, a: 1) positionally and silently swap values */
+        e->args = parse_args_named(p, &e->nargs, &e->arg_names);
         return e;
     }
     case T_NEW: {

@@ -349,6 +349,9 @@ static char *fnptr_sig(Type *ret, const char *self_ct, Type **params, int nparam
 static char *bits_of(Em *em, Expr *e, Type *t) {
     char *v = ex_v(em, e, t);
     if (type_is_ref(t)) return arena_printf(&g_arena, "((uint64_t)(uintptr_t)%s)", v);
+    /* f32 stores raw float bits in the low 32, so vt_map_values (elem_size 4)
+       copies a valid float; double bits truncated to 4 bytes would be garbage */
+    if (t->kind == TY_F32) return arena_printf(&g_arena, "vt_f32bits(%s)", v);
     if (type_is_float(t)) return arena_printf(&g_arena, "vt_f64bits(%s)", v);
     return arena_printf(&g_arena, "((uint64_t)(%s))", v);
 }
@@ -356,6 +359,7 @@ static char *bits_of(Em *em, Expr *e, Type *t) {
 static char *unbits(char *frag, Type *t) {
     if (type_is_ref(t))
         return arena_printf(&g_arena, "((%s)(uintptr_t)%s)", c_type(t), frag);
+    if (t->kind == TY_F32) return arena_printf(&g_arena, "vt_bits2f32(%s)", frag);
     if (type_is_float(t)) return arena_printf(&g_arena, "vt_bits2f64(%s)", frag);
     return arena_printf(&g_arena, "((%s)%s)", c_type(t), frag);
 }
@@ -1375,6 +1379,19 @@ static void emit_assign(Em *em, Expr *e) {
     }
 }
 
+/* A return may fire while enclosing statements (e.g. a for-each holding its
+   iterated array in an owned spill temp) still have live stmt temps below the
+   return's watermark. Emit releases for them on this path only — without
+   unregistering, since the enclosing statement's own end-of-stmt flush must
+   still cover the fall-through path. VT_RELEASE nulls the temp, and every ref
+   temp starts at 0, so the two paths each release exactly once. */
+static void release_outer_stmt_temps(Em *em, int wm) {
+    for (int i = wm - 1; i >= 0; i--) {
+        ind(em);
+        sb_printf(em->out, "VT_RELEASE(%s);\n", em->stmt_temps[i]);
+    }
+}
+
 static void release_for_jump(Em *em, bool through_loop) {
     for (EScope *s = em->scope; s; s = s->parent) {
         escope_release(em, s);
@@ -1509,6 +1526,7 @@ static void emit_stmt(Em *em, Stmt *s) {
                 ind(em);
                 sb_printf(em->out, "%s = %s;\n", tr, ex_o(em, s->expr, rt));
                 flush_temps(em, wm, true);
+                release_outer_stmt_temps(em, wm);
                 release_for_jump(em, false);
                 ind(em);
                 sb_printf(em->out, "return %s;\n", tr);
@@ -1517,12 +1535,14 @@ static void emit_stmt(Em *em, Stmt *s) {
                 ind(em);
                 sb_printf(em->out, "%s = %s;\n", tr, ex_v(em, s->expr, rt));
                 flush_temps(em, wm, true);
+                release_outer_stmt_temps(em, wm);
                 release_for_jump(em, false);
                 ind(em);
                 sb_printf(em->out, "return %s;\n", tr);
             }
         } else {
             flush_temps(em, wm, true);
+            release_outer_stmt_temps(em, wm);
             release_for_jump(em, false);
             ind(em);
             sb_puts(em->out, "return;\n");

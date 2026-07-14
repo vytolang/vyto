@@ -191,6 +191,10 @@ void vt_map_remove(VtMap *m, VtString *key, const char *file, int line);
 
 static inline uint64_t vt_f64bits(double d) { uint64_t u; memcpy(&u, &d, 8); return u; }
 static inline double vt_bits2f64(uint64_t u) { double d; memcpy(&d, &u, 8); return d; }
+/* f32 map values live in the slot's low 32 bits as raw float bits, so
+   vt_map_values (which copies elem_size bytes) reconstitutes them exactly. */
+static inline uint64_t vt_f32bits(float f) { uint32_t u; memcpy(&u, &f, 4); return u; }
+static inline float vt_bits2f32(uint64_t u) { uint32_t v = (uint32_t)u; float f; memcpy(&f, &v, 4); return f; }
 
 /* ---- closures ---- */
 
