@@ -423,6 +423,20 @@ if [ -f /usr/include/X11/Xlib.h ]; then
         echo "FAIL app_gallery2_builds"
         fail=1
     fi
+    # datagrid: DataTable over the native columnar engine (synthetic 200k rows)
+    dg_bin=apps/datagrid/.vyto-cache/datagrid_test
+    if ./vytoc build apps/datagrid/datagrid.vt -o "$dg_bin" >/dev/null 2>&1; then
+        printf 'close\n' > tests/tmp/datagrid.events
+        if VS_HEADLESS=1 VS_EVENTS=tests/tmp/datagrid.events "$dg_bin" 2>&1 | grep -q "datagrid closed"; then
+            echo "PASS app_datagrid_runs"
+        else
+            echo "FAIL app_datagrid_runs"
+            fail=1
+        fi
+    else
+        echo "FAIL app_datagrid_runs (build failed)"
+        fail=1
+    fi
     if ./vytoc build apps/notepad/notepad.vt >/dev/null; then
         echo "PASS app_notepad_builds"
     else

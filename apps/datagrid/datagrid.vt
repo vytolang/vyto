@@ -1,0 +1,89 @@
+// datagrid — a standalone spreadsheet-style viewer over the native columnar
+// engine (vyto/data) rendered by the virtualized DataTable widget
+// (vyto/ui/datatable). Loads a CSV given on the command line, or generates a
+// synthetic 200k-row sales table so it runs with no arguments:
+//
+//     vytoc run apps/datagrid/datagrid.vt                 # synthetic data
+//     vytoc run apps/datagrid/datagrid.vt -- sales.csv    # load a CSV
+//
+// Header-click sorts, the search box filters, the region buttons are quick
+// filters, and the footer shows a live sum of revenue over the visible rows —
+// all pushed down to the native engine, so it stays responsive at scale.
+
+import { Window, Column, Row, Label, Button } from "vyto/ui";
+import { DataTable } from "vyto/ui/datatable";
+import { DataFrame, loadCsv, CK_I64, CK_F64, CK_STR, DV_MUL } from "vyto/data/frame";
+
+const N: int = 200000;
+
+// Build a synthetic sales table: id, region, product, qty, price, + a derived
+// revenue = qty * price column.
+fn synth(): DataFrame {
+    let df = new DataFrame(N);
+    let id = df.addColumn("id", CK_I64);
+    let region = df.addColumn("region", CK_STR);
+    let product = df.addColumn("product", CK_STR);
+    let qty = df.addColumn("qty", CK_I64);
+    let price = df.addColumn("price", CK_F64);
+
+    let regions = ["Oslo", "Bergen", "Troms", "Molde", "Stavanger"];
+    let products = ["Cable", "Widget", "Sensor", "Board", "Module", "Relay"];
+    df.reserve(N);
+    let i = 0;
+    while (i < N) {
+        let q = (i % 50) + 1;
+        let p = (((i * 7) % 900) + 100) as float;
+        df.beginRow()
+          .setInt(id, i)
+          .setStr(region, regions[i % 5])
+          .setStr(product, products[i % 6])
+          .setInt(qty, q)
+          .setFloat(price, p)
+          .endRow();
+        i += 1;
+    }
+    df.derive("revenue", DV_MUL, qty, price);   // computed column
+    return df;
+}
+
+fn revenue_col(df: DataFrame): int {
+    let i = 0;
+    while (i < df.ncol()) { if (df.colName(i) == "revenue") { return i; } i += 1; }
+    return df.ncol() - 1;
+}
+
+fn main() {
+    let a = args();
+    let df = new DataFrame(0);
+    if (a.len > 0) { df = loadCsv(a[0], true); }
+    else { df = synth(); }
+
+    let dt = new DataTable(df);
+    let rev = revenue_col(df);
+    dt.setAggColumn(rev);
+    dt.sort_col = rev;
+    dt.sort_asc = false;
+    dt.apply_view();          // start sorted by revenue, descending
+
+    // quick region filters reuse the engine's global search
+    let self = dt;
+    let oslo = new Button("Oslo");
+    let bergen = new Button("Bergen");
+    let troms = new Button("Troms");
+    let all = new Button("All");
+    let sortRev = new Button("Sort revenue");
+    oslo.onClick = (b) => self.set_query("Oslo");
+    bergen.onClick = (b) => self.set_query("Bergen");
+    troms.onClick = (b) => self.set_query("Troms");
+    all.onClick = (b) => self.set_query("");
+    sortRev.onClick = (b) => self.toggle_sort(rev);
+
+    let win = new Window("DataGrid — " + str(df.nrow()) + " rows x " + str(df.ncol()) + " cols", 820, 560);
+    win.root = new Column([
+        new Label("DataGrid: header-click sorts, search filters, buttons quick-filter region"),
+        new Row([oslo, bergen, troms, all, sortRev]),
+        dt.flex(1),
+    ]);
+    win.run();
+    print("datagrid closed");
+}
