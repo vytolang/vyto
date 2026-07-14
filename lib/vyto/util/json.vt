@@ -118,13 +118,19 @@ export fn jobj(): JsonValue { return new JsonValue(JS_OBJ); }
 
 // ---- parser --------------------------------------------------------------
 
+// Maximum container nesting the parser accepts (and the serializer emits).
+// Recursive descent means depth = stack frames; unbounded input like
+// "[[[[..." would otherwise crash on stack overflow instead of soft-failing.
+const JSON_MAX_DEPTH: int = 1024;
+
 class Parser {
     s: string;
     pos: int;
     n: int;
     err: string;
+    depth: int;
 
-    fn init(s: string) { this.s = s; this.pos = 0; this.n = s.len; this.err = ""; }
+    fn init(s: string) { this.s = s; this.pos = 0; this.n = s.len; this.err = ""; this.depth = 0; }
 
     fn fail(msg: string): JsonValue {
         if (this.err == "") { this.err = fmt("%s at byte %d", [fs(msg), fi(this.pos)]); }
@@ -141,6 +147,17 @@ class Parser {
     }
 
     fn value(): JsonValue {
+        this.depth += 1;
+        if (this.depth > JSON_MAX_DEPTH) {
+            this.depth -= 1;
+            return this.fail("nesting deeper than 1024 levels");
+        }
+        let v = this.value_inner();
+        this.depth -= 1;
+        return v;
+    }
+
+    fn value_inner(): JsonValue {
         this.ws();
         if (this.pos >= this.n) { return this.fail("unexpected end of input"); }
         let c = this.s[this.pos];
@@ -161,17 +178,30 @@ class Parser {
         return v;
     }
 
+    // Strict number scan (sign, int, .frac, exponent). to_float PANICS on a
+    // malformed token, so the shape must be fully validated here — the
+    // "json_parse never panics" contract depends on it.
     fn number(): JsonValue {
         let start = this.pos;
-        if (this.pos < this.n && this.s[this.pos] == 45) { this.pos += 1; }
-        while (this.pos < this.n && this.is_num_byte(this.s[this.pos])) { this.pos += 1; }
-        if (this.pos == start) { return this.fail("invalid number"); }
+        if (this.pos < this.n && this.s[this.pos] == 45) { this.pos += 1; } // '-'
+        let intStart = this.pos;
+        while (this.pos < this.n && this.s[this.pos] >= 48 && this.s[this.pos] <= 57) { this.pos += 1; }
+        if (this.pos == intStart) { return this.fail("invalid number"); }
+        if (this.pos < this.n && this.s[this.pos] == 46) {                  // '.'
+            this.pos += 1;
+            let fracStart = this.pos;
+            while (this.pos < this.n && this.s[this.pos] >= 48 && this.s[this.pos] <= 57) { this.pos += 1; }
+            if (this.pos == fracStart) { return this.fail("invalid number"); }
+        }
+        if (this.pos < this.n && (this.s[this.pos] == 101 || this.s[this.pos] == 69)) { // e E
+            this.pos += 1;
+            if (this.pos < this.n && (this.s[this.pos] == 43 || this.s[this.pos] == 45)) { this.pos += 1; }
+            let expStart = this.pos;
+            while (this.pos < this.n && this.s[this.pos] >= 48 && this.s[this.pos] <= 57) { this.pos += 1; }
+            if (this.pos == expStart) { return this.fail("invalid number"); }
+        }
         let tok = this.s.slice(start, this.pos);
         return jnum(tok.to_float());
-    }
-
-    fn is_num_byte(c: int): bool {
-        return (c >= 48 && c <= 57) || c == 43 || c == 45 || c == 46 || c == 101 || c == 69;
     }
 
     // Parse a JSON string literal starting at the opening quote.
@@ -221,6 +251,7 @@ class Parser {
 
     // At a 'u'; consume 4 hex digits (and a surrogate pair if present) and
     // return the UTF-8 encoding. Leaves pos on the last consumed hex digit.
+    // Unpaired/stray surrogates become U+FFFD instead of invalid UTF-8.
     fn unicode_escape(): string {
         let cp = this.hex4();
         if (cp >= 0xD800 && cp <= 0xDBFF) {
@@ -228,21 +259,43 @@ class Parser {
             if (this.pos + 2 < this.n && this.s[this.pos + 1] == 92 && this.s[this.pos + 2] == 117) {
                 this.pos += 2; // move onto the second 'u'
                 let lo = this.hex4();
-                cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                if (lo >= 0xDC00 && lo <= 0xDFFF) {
+                    cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                } else {
+                    // not a low surrogate: replace the high one, keep the
+                    // second escape's character (itself replaced if stray)
+                    let second = lo;
+                    if (second >= 0xD800 && second <= 0xDFFF) { second = 0xFFFD; }
+                    return utf8_encode(0xFFFD) + utf8_encode(second);
+                }
+            } else {
+                cp = 0xFFFD; // unpaired high surrogate
             }
+        } else if (cp >= 0xDC00 && cp <= 0xDFFF) {
+            cp = 0xFFFD; // stray low surrogate
         }
         return utf8_encode(cp);
     }
 
     // Reads 4 hex digits starting just after the current 'u'; advances pos to
-    // the last digit. Returns the code unit (0 on malformed).
+    // the last digit. Sets err (and returns U+FFFD) on a short or non-hex
+    // escape — silently reading garbage as 0 would corrupt round-trips.
     fn hex4(): int {
         let v = 0;
         let k = 0;
         while (k < 4 && this.pos + 1 < this.n) {
             this.pos += 1;
-            v = (v << 4) | hex_digit(this.s[this.pos]);
+            let c = this.s[this.pos];
+            if (!is_hex(c)) {
+                if (this.err == "") { this.err = fmt("bad \\u escape at byte %d", [fi(this.pos)]); }
+                return 0xFFFD;
+            }
+            v = (v << 4) | hex_digit(c);
             k += 1;
+        }
+        if (k < 4) {
+            if (this.err == "") { this.err = "bad \\u escape (truncated)"; }
+            return 0xFFFD;
         }
         return v;
     }
@@ -322,6 +375,9 @@ export fn json_encode_pretty(v: JsonValue): string { return v.stringifyPretty();
 fn write_value(v: JsonValue, out: string, pretty: bool, depth: int): string {
     // out is passed by value (captured strings snapshot); return the extended
     // string and let the caller reassign. Kept simple over a builder object.
+    // A parse can't exceed JSON_MAX_DEPTH, so only a hand-built cyclic/deep
+    // tree trips this — a programmer error, so panic (not sentinel).
+    if (depth > JSON_MAX_DEPTH) { panic("json: stringify nesting deeper than 1024 levels"); }
     if (v.kind == JS_NULL) { return out + "null"; }
     if (v.kind == JS_BOOL) { if (v.bval) { return out + "true"; } return out + "false"; }
     if (v.kind == JS_NUM) { return out + num_str(v.num); }
@@ -401,6 +457,10 @@ fn hex_digit(c: int): int {
     if (c >= 97 && c <= 102) { return c - 97 + 10; }
     if (c >= 65 && c <= 70) { return c - 65 + 10; }
     return 0;
+}
+
+fn is_hex(c: int): bool {
+    return (c >= 48 && c <= 57) || (c >= 97 && c <= 102) || (c >= 65 && c <= 70);
 }
 
 fn chr(code: int): string {

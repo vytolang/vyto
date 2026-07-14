@@ -54,11 +54,18 @@ export class WebSocket {
         this.sock.send(encodeFrame(opcode, payload));
     }
 
+    // Treat a short read / oversized frame as a dead connection: stop and hand
+    // the caller a close message instead of panicking on a truncated frame.
+    fn dead(): WsMessage {
+        this.open = false;
+        return new WsMessage(WS_CLOSE, bytes(0));
+    }
+
     // Block for the next data frame. Server pings are answered with a pong and
     // skipped; a close frame sets open=false and is returned to the caller.
     fn recv(): WsMessage {
         let h2 = readExact(this.sock, 2);
-        if (h2.len < 2) { this.open = false; return new WsMessage(WS_CLOSE, bytes(0)); }
+        if (h2.len < 2) { return this.dead(); }
         let b0 = h2[0] as int;
         let b1 = h2[1] as int;
         let opcode = b0 & 0x0F;
@@ -66,17 +73,28 @@ export class WebSocket {
         let len = b1 & 0x7F;
         if (len == 126) {
             let e = readExact(this.sock, 2);
+            if (e.len < 2) { return this.dead(); }
             len = ((e[0] as int) << 8) | (e[1] as int);
         } else if (len == 127) {
             let e = readExact(this.sock, 8);
+            if (e.len < 8) { return this.dead(); }
             len = 0;
             let k = 0;
             while (k < 8) { len = (len << 8) | (e[k] as int); k += 1; }
         }
+        // cap the declared payload (the wire allows a full 64-bit length —
+        // don't let a hostile server drive an arbitrarily large allocation)
+        if (len < 0 || len > 67108864) { return this.dead(); } // 64 MiB
         let mask = bytes(4);
-        if (masked) { mask = readExact(this.sock, 4); }
+        if (masked) {
+            mask = readExact(this.sock, 4);
+            if (mask.len < 4) { return this.dead(); }
+        }
         let payload = bytes(0);
-        if (len > 0) { payload = readExact(this.sock, len); }
+        if (len > 0) {
+            payload = readExact(this.sock, len);
+            if (payload.len < len) { return this.dead(); }
+        }
         if (masked) {
             let i = 0;
             while (i < len) { payload[i] = ((payload[i] as int) ^ (mask[i & 3] as int)) as byte; i += 1; }
@@ -141,7 +159,23 @@ export fn ws_connect(url: string): WebSocket {
 
     let resp = readHandshake(sock);
     if (resp.index_of(" 101") < 0) { sock.close(); return null; }
+    // RFC 6455 §4.1: the server must echo base64(SHA1(key + magic GUID)).
+    // A mismatch means we are not talking to a real WebSocket endpoint
+    // (a transparent proxy or a broken server) — refuse the connection.
+    let expect = base64_encode(sha1(strBytes(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11")));
+    if (header_value(resp, "sec-websocket-accept") != expect) { sock.close(); return null; }
     return new WebSocket(sock);
+}
+
+// Value of a header line in a raw HTTP header block (name lowercase), or "".
+fn header_value(resp: string, name: string): string {
+    for (let ln in resp.split("\r\n")) {
+        let c = ln.index_of(":");
+        if (c > 0 && ln.slice(0, c).trim().to_lower() == name) {
+            return ln.slice(c + 1, ln.len).trim();
+        }
+    }
+    return "";
 }
 
 // ---- framing helpers -----------------------------------------------------
@@ -219,6 +253,85 @@ fn strBytes(s: string): byte[] {
     let i = 0;
     while (i < s.len) { b[i] = s[i] as byte; i += 1; }
     return b;
+}
+
+// 32-bit rotate-left on values kept masked to 32 bits.
+fn rotl32(x: int, n: int): int {
+    let v = x & 0xFFFFFFFF;
+    return ((v << n) | (v >> (32 - n))) & 0xFFFFFFFF;
+}
+
+// SHA-1 (FIPS 180-1), pure Vyto — needed only for the RFC 6455 handshake
+// accept check, so no crypto library gets linked. 20-byte digest.
+export fn sha1(data: byte[]): byte[] {
+    let ml = data.len;
+    let total = ml + 1;
+    while (total % 64 != 56) { total += 1; }
+    total += 8;
+    let msg = bytes(total); // zeroed: padding comes for free
+    let i = 0;
+    while (i < ml) { msg[i] = data[i]; i += 1; }
+    msg[ml] = 0x80 as byte;
+    let bits = ml * 8;
+    let k = 0;
+    while (k < 8) { msg[total - 1 - k] = ((bits >> (k * 8)) & 0xFF) as byte; k += 1; }
+
+    let h0 = 0x67452301;
+    let h1 = 0xEFCDAB89;
+    let h2 = 0x98BADCFE;
+    let h3 = 0x10325476;
+    let h4 = 0xC3D2E1F0;
+
+    let off = 0;
+    while (off < total) {
+        let w: int[] = [];
+        let t = 0;
+        while (t < 16) {
+            let p = off + t * 4;
+            w.push(((msg[p] as int) << 24) | ((msg[p + 1] as int) << 16) |
+                   ((msg[p + 2] as int) << 8) | (msg[p + 3] as int));
+            t += 1;
+        }
+        while (t < 80) {
+            w.push(rotl32(w[t - 3] ^ w[t - 8] ^ w[t - 14] ^ w[t - 16], 1));
+            t += 1;
+        }
+        let a = h0; let b = h1; let c = h2; let d = h3; let e = h4;
+        let r = 0;
+        while (r < 80) {
+            let f = 0;
+            let kc = 0;
+            if (r < 20) { f = (b & c) | ((~b) & d); kc = 0x5A827999; }
+            else if (r < 40) { f = b ^ c ^ d; kc = 0x6ED9EBA1; }
+            else if (r < 60) { f = (b & c) | (b & d) | (c & d); kc = 0x8F1BBCDC; }
+            else { f = b ^ c ^ d; kc = 0xCA62C1D6; }
+            let tmp = (rotl32(a, 5) + (f & 0xFFFFFFFF) + e + kc + w[r]) & 0xFFFFFFFF;
+            e = d;
+            d = c;
+            c = rotl32(b, 30);
+            b = a;
+            a = tmp;
+            r += 1;
+        }
+        h0 = (h0 + a) & 0xFFFFFFFF;
+        h1 = (h1 + b) & 0xFFFFFFFF;
+        h2 = (h2 + c) & 0xFFFFFFFF;
+        h3 = (h3 + d) & 0xFFFFFFFF;
+        h4 = (h4 + e) & 0xFFFFFFFF;
+        off += 64;
+    }
+
+    let hs = [h0, h1, h2, h3, h4];
+    let dg = bytes(20);
+    let j = 0;
+    while (j < 5) {
+        dg[j * 4] = ((hs[j] >> 24) & 0xFF) as byte;
+        dg[j * 4 + 1] = ((hs[j] >> 16) & 0xFF) as byte;
+        dg[j * 4 + 2] = ((hs[j] >> 8) & 0xFF) as byte;
+        dg[j * 4 + 3] = (hs[j] & 0xFF) as byte;
+        j += 1;
+    }
+    return dg;
 }
 
 export fn base64_encode(data: byte[]): string {

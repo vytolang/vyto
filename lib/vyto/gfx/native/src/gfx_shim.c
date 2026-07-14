@@ -31,7 +31,11 @@ static uint32_t rgba32_of(int color) {
 static uint32_t opaque(int rgb) { return 0xFF000000u | ((uint32_t)rgb & 0xFFFFFFu); }
 
 GfxCanvas *gfx_canvas_new(int w, int h) {
-    if (w <= 0 || h <= 0) return NULL;
+    /* clamp instead of returning NULL: most gfx_* entry points deref the
+       handle unchecked, so a 0-sized window during resize must still yield
+       a live (1x1) canvas rather than a null-deref time bomb */
+    if (w < 1) w = 1;
+    if (h < 1) h = 1;
     GfxCanvas *c = calloc(1, sizeof *c);
     if (!c) return NULL;
     c->w = w;

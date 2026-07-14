@@ -40,6 +40,13 @@ static size_t body_cb(void *ptr, size_t sz, size_t nm, void *ud) {
 static size_t hdr_cb(void *ptr, size_t sz, size_t nm, void *ud) {
     HttpResp *r = (HttpResp *)ud;
     size_t n = sz * nm;
+    /* FOLLOWLOCATION delivers every hop's header block through this callback.
+       A status line starts each block — reset so only the FINAL response's
+       headers are kept (a redirect's stale values must not shadow them). */
+    if (n >= 5 && strncmp((const char *)ptr, "HTTP/", 5) == 0) {
+        r->hlen = 0;
+        if (r->hdr) r->hdr[0] = 0;
+    }
     grow(&r->hdr, &r->hlen, &r->hcap, (const char *)ptr, n); /* best-effort */
     return n;
 }
@@ -97,8 +104,12 @@ static void configure_easy(CURL *curl, const char *method, const char *url,
         curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, method);
 
     if (body && body_len > 0) {
-        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body);
+        /* COPYPOSTFIELDS (size set first, per curl docs): POSTFIELDS is the
+           one string option curl does NOT copy, and on the multi path the
+           Vyto Request (and its body string) may be freed long before the
+           transfer runs — a use-after-free with plain POSTFIELDS. */
         curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, body_len);
+        curl_easy_setopt(curl, CURLOPT_COPYPOSTFIELDS, body);
     } else if (method && strcmp(method, "POST") == 0) {
         curl_easy_setopt(curl, CURLOPT_POSTFIELDS, "");
         curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, 0L);
@@ -202,8 +213,9 @@ long http_stream(const char *method, const char *url, const char *header_lines,
     if (method && *method && strcmp(method, "GET") != 0)
         curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, method);
     if (body && body_len > 0) {
-        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body);
+        /* copy the body (size first) — see configure_easy */
         curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, body_len);
+        curl_easy_setopt(curl, CURLOPT_COPYPOSTFIELDS, body);
     } else if (method && strcmp(method, "POST") == 0) {
         curl_easy_setopt(curl, CURLOPT_POSTFIELDS, "");
         curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, 0L);

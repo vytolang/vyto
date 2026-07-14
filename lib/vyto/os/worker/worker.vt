@@ -105,12 +105,19 @@ export class WorkerPool {
 
     // Call when a fd from workerFds() is reported readable by your PollSet.
     // Returns the finished Result (and hands the freed worker its next queued
-    // job), or null if `fd` isn't a worker or the worker died.
+    // job), or null if `fd` isn't a worker or an idle worker died. A worker
+    // that dies MID-JOB is retired and its ticket surfaces as an empty-output
+    // Result, so map()/callers never wait forever on a lost ticket.
     fn onReady(fd: int): Result {
         let w = this.workerOf(fd);
         if (w < 0) { return null; }
         let len = w_read_len(fd as i32) as int;
-        if (len < 0) { this.busy[w] = false; this.ticketOf[w] = -1; return null; }
+        if (len < 0) {
+            let tk = this.ticketOf[w];
+            this.retire(w);
+            if (tk < 0) { return null; }
+            return new Result(tk, bytes(0));
+        }
         let buf = bytes(len);
         if (len > 0) { w_read_bytes(fd as i32, buf as cstring, len as i32); }
         let tk = this.ticketOf[w];
@@ -135,6 +142,9 @@ export class WorkerPool {
     }
 
     // Run every input across the pool and return the outputs in input order.
+    // A dead pool (no live workers, e.g. every fork failed or every child
+    // crashed) returns the remaining outputs as empty byte[]s instead of
+    // blocking forever on a PollSet that can never fire.
     fn map(inputs: byte[][]): byte[][] {
         let base = this.nextTicket;
         for (let inp in inputs) { this.submit(inp); }
@@ -142,7 +152,7 @@ export class WorkerPool {
         let k = 0;
         while (k < inputs.len) { results.push(bytes(0)); k += 1; }
         let done = 0;
-        while (done < inputs.len) {
+        while (done < inputs.len && this.fds.len > 0) {
             let batch = this.poll(-1);
             for (let r in batch) {
                 results[r.ticket - base] = r.output;
@@ -167,6 +177,17 @@ export class WorkerPool {
         this.busy[w] = true;
         this.ticketOf[w] = tk;
         w_write_frame(this.fds[w] as i32, input as cstring, input.len as i32);
+    }
+    // Remove a dead worker: close + reap it and drop it from every parallel
+    // array so freeWorker/dispatch never route a job to a corpse.
+    fn retire(w: int) {
+        this.ps.removeFd(this.fds[w]);
+        w_close(this.fds[w] as i32);
+        w_reap(this.pids[w] as i32);
+        this.fds.remove_at(w);
+        this.pids.remove_at(w);
+        this.busy.remove_at(w);
+        this.ticketOf.remove_at(w);
     }
     fn drainOne(w: int) {
         if (this.pending.len > 0) {
