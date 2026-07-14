@@ -6,6 +6,7 @@
    Vyto `File` whose `deinit` calls vfile_close exactly once. */
 
 #include <stdio.h>
+#include <string.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 
@@ -15,6 +16,17 @@ void *vfile_open(const char *path, const char *mode) {
 long vfile_read(void *f, char *buf, long cap) {
     if (!f || cap <= 0) return 0;
     return (long)fread(buf, 1, (size_t)cap, (FILE *)f);
+}
+/* Read one line (up to and including '\n', or to EOF) into buf/cap via stdio's
+   buffered fgets — the streaming counterpart to reading the whole file. Returns
+   the byte count (0 at EOF with nothing read). A line longer than cap-1 comes
+   back in cap-1 chunks across successive calls (the '\n' arrives on the final
+   chunk), so the caller stitches them. Text-oriented: strlen-based, so a line
+   with an embedded NUL is reported short. */
+long vfile_readline(void *f, char *buf, long cap) {
+    if (!f || cap <= 1) return 0;
+    if (!fgets(buf, (int)cap, (FILE *)f)) return 0;
+    return (long)strlen(buf);
 }
 long vfile_write(void *f, const char *buf, long n) {
     if (!f || n < 0) return -1;

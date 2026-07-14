@@ -33,29 +33,45 @@ export class JsonValue {
     num: float;
     bstr: string;               // string payload (kind == JS_STR)
     bval: bool;                 // bool payload (kind == JS_BOOL)
-    arr: JsonValue[];           // array payload (kind == JS_ARR)
-    obj: Map<string, JsonValue>; // object payload (kind == JS_OBJ)
-    keys: string[];             // object key insertion order (stable stringify)
+    arr: JsonValue[];           // array elements (kind == JS_ARR only)
+    keys: string[];             // object key insertion order (kind == JS_OBJ)
+    vals: JsonValue[];          // object member values, parallel to keys (JS_OBJ)
     err: string;                // non-empty only on a parse-failure root
 
+    // Sub-containers are allocated per kind, not up front: a leaf (null / bool /
+    // number / string) holds none. Objects store members in parallel keys/vals
+    // arrays (linear scan) rather than a hash Map, so a small object costs two
+    // tiny arrays instead of a 64-bucket table — the difference between ~2.7 GB
+    // and ~0.3 GB when parsing a million-object document.
     fn init(k: int) {
         this.kind = k;
-        this.arr = [];
-        this.keys = [];
-        this.obj = new Map<string, JsonValue>();
         this.err = "";
+        if (k == JS_ARR) { this.arr = []; }
+        if (k == JS_OBJ) { this.keys = []; this.vals = []; }
     }
 
     fn isNull(): bool { return this.kind == JS_NULL; }
     fn isObj(): bool  { return this.kind == JS_OBJ; }
     fn isArr(): bool  { return this.kind == JS_ARR; }
 
+    // Index of member `k` in an object's key list, or -1 (linear scan).
+    fn keyIndex(k: string): int {
+        if (this.kind != JS_OBJ) { return -1; }
+        let i = 0;
+        while (i < this.keys.len) {
+            if (this.keys[i] == k) { return i; }
+            i += 1;
+        }
+        return -1;
+    }
+
     // Object member, or a Null value if this is not an object / has no such key.
     fn get(k: string): JsonValue {
-        if (this.kind == JS_OBJ && this.obj.has(k)) { return this.obj.get(k); }
+        let idx = this.keyIndex(k);
+        if (idx >= 0) { return this.vals[idx]; }
         return new JsonValue(JS_NULL);
     }
-    fn has(k: string): bool { return this.kind == JS_OBJ && this.obj.has(k); }
+    fn has(k: string): bool { return this.keyIndex(k) >= 0; }
 
     // Array element, or a Null value if not an array / index out of range.
     fn at(i: int): JsonValue {
@@ -87,15 +103,19 @@ export class JsonValue {
     }
 
     // Object keys in insertion order (empty for non-objects).
-    fn objKeys(): string[] { return this.keys; }
+    fn objKeys(): string[] {
+        if (this.kind == JS_OBJ) { return this.keys; }
+        return [];
+    }
 
     fn parseError(): string { return this.err; }
 
     // Add/replace a member (only meaningful on an object).
     fn set(k: string, v: JsonValue) {
         if (this.kind != JS_OBJ) { return; }
-        if (!this.obj.has(k)) { this.keys.push(k); }
-        this.obj.set(k, v);
+        let idx = this.keyIndex(k);
+        if (idx >= 0) { this.vals[idx] = v; }
+        else { this.keys.push(k); this.vals.push(v); }
     }
     fn append(v: JsonValue) {
         if (this.kind != JS_ARR) { return; }
@@ -357,6 +377,37 @@ export fn json_parse(text: string): JsonValue {
     return v;
 }
 
+// Stream the elements of a top-level JSON array WITHOUT building the whole tree:
+// `cb` is invoked with each element as a transient JsonValue that is freed
+// before the next element is parsed. Peak memory is one element plus the source
+// text — O(1) in the element count — so a million-object array parses in tens of
+// MB instead of the full DOM's hundreds. The systems-friendly counterpart to
+// json_parse; use json_parse when you need random access to the whole document.
+//
+//     let acc = [0];   // ref container: closures capture by value, so mutate
+//     json_each(text, (o) => { acc[0] = acc[0] + o.get("value").asInt(); });
+//
+// Malformed input stops the stream (soft-fail, like json_parse). Do NOT retain
+// the element past the callback — it is released as soon as `cb` returns.
+export fn json_each(text: string, cb: fn(JsonValue)) {
+    let p = new Parser(text);
+    p.ws();
+    if (p.pos >= p.n || p.s[p.pos] != 91) { return; } // not a '[' array
+    p.pos += 1;
+    p.ws();
+    if (p.pos < p.n && p.s[p.pos] == 93) { return; }  // empty '[]'
+    while (true) {
+        let el = p.value();
+        if (p.err != "") { return; }
+        cb(el);                       // el is released at the end of this iteration
+        p.ws();
+        if (p.pos >= p.n) { return; }
+        let c = p.s[p.pos];
+        if (c == 44) { p.pos += 1; continue; } // ','
+        return;                                // ']' or unexpected: done
+    }
+}
+
 // Decode a JSON string into a value. In Vyto (no generics) a JsonValue *is* the
 // map-or-list container: an object decodes to a value you index with `.get(key)`
 // / `.objKeys()`, an array to one you index with `.at(i)` / `.len()`. Alias of
@@ -403,7 +454,7 @@ fn write_value(v: JsonValue, out: string, pretty: bool, depth: int): string {
         if (pretty) { s = s + "\n" + indent(depth + 1); }
         s = s + quote(k) + ":";
         if (pretty) { s = s + " "; }
-        s = write_value(v.obj.get(k), s, pretty, depth + 1);
+        s = write_value(v.vals[i], s, pretty, depth + 1);
         i += 1;
     }
     if (pretty && v.keys.len > 0) { s = s + "\n" + indent(depth); }

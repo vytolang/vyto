@@ -16,9 +16,12 @@
 // open that fails (missing file, bad mode) is an expected runtime condition and
 // returns null.
 
+import { StringBuilder } from "vyto/util/text";
+
 extern "C" {
     fn vfile_open(path: cstring, mode: cstring): rawptr;
     fn vfile_read(f: rawptr, buf: cstring, cap: i64): i64;
+    fn vfile_readline(f: rawptr, buf: cstring, cap: i64): i64;
     fn vfile_write(f: rawptr, buf: cstring, n: i64): i64;
     fn vfile_seek(f: rawptr, off: i64, whence: i32): i32;
     fn vfile_tell(f: rawptr): i64;
@@ -51,6 +54,7 @@ fn take(buf: byte[], n: int): byte[] {
 export class File {
     h: rawptr;
     path: string;
+    lb: byte[];   // reusable scratch buffer for readLine (lazily allocated)
 
     fn init(h: rawptr, path: string) { this.h = h; this.path = path; }
 
@@ -87,6 +91,41 @@ export class File {
         return str(b as cstring);
     }
 
+    // Read the next line, without its trailing newline (a '\r\n' is stripped
+    // too), advancing the read position. Returns "" both for a blank line and at
+    // end of file — pair with eof() to tell them apart:
+    //
+    //     while (!f.eof()) {
+    //         let line = f.readLine();
+    //         if (line == "" && f.eof()) { break; }
+    //         ... use line ...
+    //     }
+    //
+    // Streams the file a line at a time (bounded memory), unlike the readlines
+    // builtin which materializes every line at once. Lines longer than 64 KiB
+    // are stitched across reads, so any length is handled; text-oriented (an
+    // embedded NUL ends the line early, like readText).
+    fn readLine(): string {
+        this.ensure();
+        let cap = 65536;
+        if (this.lb == null) { this.lb = bytes(cap); } // one buffer per File, reused
+        let out = "";
+        while (true) {
+            let n = vfile_readline(this.h, this.lb as cstring, cap as i64) as int;
+            if (n <= 0) { break; }
+            let chunk = str(this.lb as cstring);
+            if (chunk.len > 0 && chunk[chunk.len - 1] == 10) { // '\n': line done
+                out = out + chunk;
+                break;
+            }
+            out = out + chunk; // no newline yet: a >64 KiB line, or EOF next call
+        }
+        let e = out.len;
+        if (e > 0 && out[e - 1] == 10) { e -= 1; }
+        if (e > 0 && out[e - 1] == 13) { e -= 1; }
+        return out.slice(0, e);
+    }
+
     // Write raw bytes; returns the count written (-1 on error).
     fn writeBytes(b: byte[]): int {
         this.ensure();
@@ -120,6 +159,106 @@ export fn file_open(path: string, mode: string): File {
     let h = vfile_open(path.cstr(), mode.cstr());
     if (h == null) { return null; }
     return new File(h, path);
+}
+
+// Buffered streaming writer — the write counterpart to File.readLine. Text is
+// accumulated in a StringBuilder and flushed to the file once it reaches `cap`
+// bytes, so producing a huge document uses bounded memory instead of
+// materializing the whole thing first:
+//
+//     let w = bufWriter("out.ndjson", 65536);
+//     for (...) { w.write("{\"id\":").writeInt(id).write("}\n"); }
+//     w.close();   // flushes the tail, then closes the file
+//
+// Numbers are formatted straight into the buffer (writeInt/writeFloat) with no
+// intermediate string. Each writer returns itself so calls chain.
+export class BufWriter {
+    f: File;
+    sb: StringBuilder;
+    cap: int;
+
+    fn init(f: File, cap: int) {
+        this.f = f;
+        this.cap = cap;
+        this.sb = new StringBuilder(cap);
+    }
+
+    fn write(s: string): BufWriter { this.sb.append(s); this.tick(); return this; }
+    fn writeInt(v: int): BufWriter { this.sb.appendInt(v); this.tick(); return this; }
+    fn writeFloat(v: float): BufWriter { this.sb.appendFloat(v); this.tick(); return this; }
+
+    fn tick() { if (this.sb.len() >= this.cap) { this.flush(); } }
+
+    // Write any buffered bytes out now.
+    fn flush() {
+        if (this.sb.len() > 0) {
+            this.f.writeText(this.sb.toString());
+            this.sb.clear();
+        }
+    }
+
+    // Flush the tail and close the file. Also runs from deinit if not called.
+    fn close() { this.flush(); this.f.close(); }
+
+    deinit { this.close(); }
+}
+
+// Open `path` for writing (truncating) and wrap it in a BufWriter with a `cap`-
+// byte flush threshold. Null if the file can't be opened.
+export fn bufWriter(path: string, cap: int): BufWriter {
+    let f = file_open(path, "w");
+    if (f == null) { return null; }
+    return new BufWriter(f, cap);
+}
+
+// Buffered streaming reader — the read twin of BufWriter, for walking a large
+// file a line (or chunk) at a time in bounded memory: log tails, CSV/TSV rows,
+// NDJSON, any newline-delimited record format with thousands/millions of rows.
+// Line reads are backed by File.readLine (stdio-buffered underneath).
+//
+//     let r = bufReader("big.csv");
+//     while (!r.eof()) {
+//         let row = r.readLine();
+//         if (row == "" && r.eof()) { break; }
+//         ... split row on ',' ...
+//     }
+//     r.close();
+//
+// or drive it with a callback (closures capture by value, so accumulate through
+// a ref container, as with json_each):
+//
+//     let n = [0];
+//     bufReader("big.csv").eachLine((row) => { n[0] = n[0] + 1; });
+export class BufReader {
+    f: File;
+
+    fn init(f: File) { this.f = f; }
+
+    // Next line without its trailing newline; "" at EOF (pair with eof()).
+    fn readLine(): string { return this.f.readLine(); }
+    // Up to `n` raw bytes (binary-safe); length is what was actually read.
+    fn read(n: int): byte[] { return this.f.read(n); }
+    fn eof(): bool { return this.f.eof(); }
+
+    // Call `cb` with each line until end of file (newlines stripped). Empty
+    // interior lines are delivered; the final EOF sentinel is not.
+    fn eachLine(cb: fn(string)) {
+        while (!this.f.eof()) {
+            let line = this.f.readLine();
+            if (line == "" && this.f.eof()) { break; }
+            cb(line);
+        }
+    }
+
+    fn close() { this.f.close(); }
+    deinit { this.close(); }
+}
+
+// Open `path` for reading and wrap it in a BufReader. Null if it can't be opened.
+export fn bufReader(path: string): BufReader {
+    let f = file_open(path, "r");
+    if (f == null) { return null; }
+    return new BufReader(f);
 }
 
 // ---- filesystem queries & mutations -------------------------------------
