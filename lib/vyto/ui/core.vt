@@ -1122,6 +1122,12 @@ export class Widget {
 
     fn release_all() {
         this.drop_handlers();
+        // Cancel any tween declared before this widget was mounted (its on_tick
+        // closure captures the widget/tween, an RC cycle); cancel() nulls it.
+        if (this.pending_anims != null) {
+            for (let t in this.pending_anims) { t.cancel(); }
+            this.pending_anims = [];
+        }
         for (let c in this.children) {
             c.release_all();
         }
@@ -1249,6 +1255,7 @@ export class Window {
                 }
             }
             if (!t.done) { alive.push(t); }
+            else { t.on_tick = null; }  // break the on_tick closure's RC cycle (captures tween+widget)
         }
         this.animations = alive;
         if (full) {
@@ -1794,6 +1801,10 @@ export class Window {
         }
         // break handler->owner->tree reference cycles so RC frees everything;
         // apps never need a manual teardown.
+        // Cancel any still-active tween (looping, or mid-flight at close): each
+        // one's on_tick closure strong-captures its widget + itself.
+        for (let t in this.animations) { t.cancel(); }
+        this.animations = [];
         if (this.root != null) { this.root.release_all(); }
         if (this.menubar != null) { this.menubar.release_all(); }
         if (this.overlay != null) { this.overlay.release_all(); }
