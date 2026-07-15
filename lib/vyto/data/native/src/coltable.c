@@ -22,7 +22,8 @@
 #include <stdio.h>
 #include <stdint.h>
 
-enum { CT_I64 = 0, CT_F64 = 1, CT_BOOL = 2, CT_STR = 3, CT_CAT = 4 };
+enum { CT_I64 = 0, CT_F64 = 1, CT_BOOL = 2, CT_STR = 3, CT_CAT = 4,
+       CT_I32 = 5, CT_I16 = 6, CT_F32 = 7 };
 
 /* one column.
    - scalar kinds: `data` is int64 / double / uint8, one per row.
@@ -52,7 +53,7 @@ typedef struct {
     Col *cols;
     int ncol, ccap;    /* column count / column-array capacity */
     int64_t nrow, cap; /* row count / row capacity of every column */
-    int64_t *idx;      /* visible permutation, first `vlen` entries live */
+    int32_t *idx;      /* visible permutation (4B/row); rows capped at 2^31 */
     int64_t vlen;      /* number of visible rows (after filter) */
 } CT;
 
@@ -60,10 +61,14 @@ typedef struct {
 
 static size_t col_elem(int kind) {
     if (kind == CT_F64) return sizeof(double);
+    if (kind == CT_F32) return sizeof(float);
     if (kind == CT_BOOL) return 1;
-    if (kind == CT_CAT) return sizeof(int32_t); /* dictionary code per row */
+    if (kind == CT_I16) return sizeof(int16_t);
+    if (kind == CT_I32 || kind == CT_CAT) return sizeof(int32_t); /* i32, or dict code */
     return sizeof(int64_t); /* CT_I64 */
 }
+
+static void scalar_put_i(Col *c, int64_t r, int64_t v);  /* defined below */
 
 /* ------------------------------------------------- categorical dictionary */
 
@@ -151,7 +156,7 @@ static int ct_grow(CT *t, int64_t need) {
             col->data = nd;
         }
     }
-    int64_t *ni = (int64_t *)realloc(t->idx, (size_t)nc * sizeof(int64_t));
+    int32_t *ni = (int32_t *)realloc(t->idx, (size_t)nc * sizeof(int32_t));
     if (!ni) return 0;
     t->idx = ni;
     t->cap = nc;
@@ -201,9 +206,7 @@ int ct_add_col(void *h, const char *name, int kind) {
     for (int64_t r = 0; r < t->nrow; r++) {
         if (kind == CT_STR) { col->soff[r] = (int64_t)col->alen; col->slen[r] = 0; }
         else if (kind == CT_CAT) ((int32_t *)col->data)[r] = 0;
-        else if (kind == CT_F64) ((double *)col->data)[r] = 0.0;
-        else if (kind == CT_BOOL) ((uint8_t *)col->data)[r] = 0;
-        else ((int64_t *)col->data)[r] = 0;
+        else scalar_put_i(col, r, 0);
     }
     return t->ncol++;
 }
@@ -221,37 +224,44 @@ void ct_begin_row(void *h) {
         Col *col = &t->cols[c];
         if (col->kind == CT_STR) { col->soff[r] = (int64_t)col->alen; col->slen[r] = 0; }
         else if (col->kind == CT_CAT) ((int32_t *)col->data)[r] = 0;
-        else if (col->kind == CT_F64) ((double *)col->data)[r] = 0.0;
-        else if (col->kind == CT_BOOL) ((uint8_t *)col->data)[r] = 0;
-        else ((int64_t *)col->data)[r] = 0;
+        else scalar_put_i(col, r, 0);
     }
+}
+
+/* Store an integer into a scalar column at row `r` (exact for the integer
+   kinds — no double round-trip; smaller kinds wrap on overflow like a C cast). */
+static void scalar_put_i(Col *c, int64_t r, int64_t v) {
+    if (c->kind == CT_I64) ((int64_t *)c->data)[r] = v;
+    else if (c->kind == CT_I32) ((int32_t *)c->data)[r] = (int32_t)v;
+    else if (c->kind == CT_I16) ((int16_t *)c->data)[r] = (int16_t)v;
+    else if (c->kind == CT_BOOL) ((uint8_t *)c->data)[r] = v != 0 ? 1 : 0;
+    else if (c->kind == CT_F64) ((double *)c->data)[r] = (double)v;
+    else if (c->kind == CT_F32) ((float *)c->data)[r] = (float)v;
+}
+
+/* Store a float into a scalar column at row `r`, truncating for integer kinds. */
+static void scalar_put_f(Col *c, int64_t r, double v) {
+    if (c->kind == CT_F64) ((double *)c->data)[r] = v;
+    else if (c->kind == CT_F32) ((float *)c->data)[r] = (float)v;
+    else scalar_put_i(c, r, (int64_t)v);
 }
 
 void ct_set_i64(void *h, int col, long long v) {
     CT *t = (CT *)h;
     if (!t || col < 0 || col >= t->ncol) return;
-    Col *c = &t->cols[col];
-    if (c->kind == CT_F64) ((double *)c->data)[t->nrow] = (double)v;
-    else if (c->kind == CT_BOOL) ((uint8_t *)c->data)[t->nrow] = v ? 1 : 0;
-    else ((int64_t *)c->data)[t->nrow] = (int64_t)v;
+    scalar_put_i(&t->cols[col], t->nrow, (int64_t)v);
 }
 
 void ct_set_f64(void *h, int col, double v) {
     CT *t = (CT *)h;
     if (!t || col < 0 || col >= t->ncol) return;
-    Col *c = &t->cols[col];
-    if (c->kind == CT_I64) ((int64_t *)c->data)[t->nrow] = (int64_t)v;
-    else if (c->kind == CT_BOOL) ((uint8_t *)c->data)[t->nrow] = v != 0.0 ? 1 : 0;
-    else ((double *)c->data)[t->nrow] = v;
+    scalar_put_f(&t->cols[col], t->nrow, v);
 }
 
 void ct_set_bool(void *h, int col, int v) {
     CT *t = (CT *)h;
     if (!t || col < 0 || col >= t->ncol) return;
-    Col *c = &t->cols[col];
-    if (c->kind == CT_BOOL) ((uint8_t *)c->data)[t->nrow] = v ? 1 : 0;
-    else if (c->kind == CT_F64) ((double *)c->data)[t->nrow] = v ? 1.0 : 0.0;
-    else ((int64_t *)c->data)[t->nrow] = v ? 1 : 0;
+    scalar_put_i(&t->cols[col], t->nrow, v ? 1 : 0);
 }
 
 void ct_set_str(void *h, int col, const char *s, long n) {
@@ -314,10 +324,17 @@ long ct_col_name(void *h, int col, char *buf, long cap) {
 
 static double cell_num(const Col *c, int64_t row) {
     if (c->kind == CT_F64) return ((double *)c->data)[row];
+    if (c->kind == CT_F32) return (double)((float *)c->data)[row];
     if (c->kind == CT_BOOL) return ((uint8_t *)c->data)[row] ? 1.0 : 0.0;
     if (c->kind == CT_I64) return (double)((int64_t *)c->data)[row];
+    if (c->kind == CT_I32) return (double)((int32_t *)c->data)[row];
+    if (c->kind == CT_I16) return (double)((int16_t *)c->data)[row];
     return 0.0;
 }
+
+/* True for the integer-valued scalar kinds (cellStr prints them without a
+   decimal point). */
+static int kind_is_int(int k) { return k == CT_I64 || k == CT_I32 || k == CT_I16; }
 
 /* Format visible row `vrow`, column `col` into buf (NUL-terminated), returning
    the byte length. Scalars via snprintf, strings copied from the arena. This is
@@ -340,9 +357,9 @@ long ct_cell_str(void *h, long vrow, int col, char *buf, long cap) {
         buf[n] = 0;
         return n;
     }
-    if (c->kind == CT_I64) return snprintf(buf, (size_t)cap, "%lld", (long long)((int64_t *)c->data)[row]);
+    if (kind_is_int(c->kind)) return snprintf(buf, (size_t)cap, "%lld", (long long)cell_num(c, row));
     if (c->kind == CT_BOOL) { const char *s = ((uint8_t *)c->data)[row] ? "true" : "false"; long n = (long)strlen(s); memcpy(buf, s, (size_t)n + 1); return n; }
-    return snprintf(buf, (size_t)cap, "%g", ((double *)c->data)[row]);
+    return snprintf(buf, (size_t)cap, "%g", cell_num(c, row));
 }
 
 long long ct_cell_i64(void *h, long vrow, int col) {
@@ -403,10 +420,10 @@ static void ct_msort(CT *t, const int *cols, const int *dirs, int nk) {
     int64_t n = t->vlen;
     if (n < 2) return;
     SortCtx s = { t, cols, dirs, nk };
-    int64_t *src = t->idx;
-    int64_t *tmp = (int64_t *)malloc((size_t)n * sizeof(int64_t));
+    int32_t *src = t->idx;
+    int32_t *tmp = (int32_t *)malloc((size_t)n * sizeof(int32_t));
     if (!tmp) return;
-    int64_t *buf = tmp, *cur = src;
+    int32_t *buf = tmp, *cur = src;
     for (int64_t w = 1; w < n; w *= 2) {
         for (int64_t i = 0; i < n; i += 2 * w) {
             int64_t l = i, mid = i + w < n ? i + w : n, r = i + 2 * w < n ? i + 2 * w : n;
@@ -418,9 +435,9 @@ static void ct_msort(CT *t, const int *cols, const int *dirs, int nk) {
             while (a < mid) buf[o++] = cur[a++];
             while (b < r) buf[o++] = cur[b++];
         }
-        int64_t *sw = cur; cur = buf; buf = sw;
+        int32_t *sw = cur; cur = buf; buf = sw;
     }
-    if (cur != src) { memcpy(src, cur, (size_t)n * sizeof(int64_t)); }
+    if (cur != src) { memcpy(src, cur, (size_t)n * sizeof(int32_t)); }
     free(tmp);
 }
 
@@ -532,9 +549,9 @@ void ct_search(void *h, const char *needle) {
                 hit = mem_contains(p, l, needle, nn);
             } else {
                 int n;
-                if (c->kind == CT_I64) n = snprintf(tmp, sizeof tmp, "%lld", (long long)((int64_t *)c->data)[row]);
-                else if (c->kind == CT_BOOL) n = snprintf(tmp, sizeof tmp, "%s", ((uint8_t *)c->data)[row] ? "true" : "false");
-                else n = snprintf(tmp, sizeof tmp, "%g", ((double *)c->data)[row]);
+                if (c->kind == CT_BOOL) n = snprintf(tmp, sizeof tmp, "%s", ((uint8_t *)c->data)[row] ? "true" : "false");
+                else if (kind_is_int(c->kind)) n = snprintf(tmp, sizeof tmp, "%lld", (long long)cell_num(c, row));
+                else n = snprintf(tmp, sizeof tmp, "%g", cell_num(c, row));
                 hit = mem_contains(tmp, n, needle, nn);
             }
         }
