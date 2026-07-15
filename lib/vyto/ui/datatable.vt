@@ -60,6 +60,7 @@ export class DataTable extends Widget {
     agg_col: int;       // DataFrame column to show a live sum for in the footer, -1 = none
     onSelect: fn(int);  // called with the selected visible-row index
     search: SearchField;
+    drag_mode: int;     // 0 = none, 1 = dragging vertical scrollbar, 2 = horizontal
 
     fn init(df: DataFrame) {
         super.init();
@@ -75,6 +76,7 @@ export class DataTable extends Widget {
         this.sort_asc = true;
         this.query = "";
         this.agg_col = -1;
+        this.drag_mode = 0;
         this.focusable = true;
         this.search = new SearchField("Search");
         this.add(this.search);
@@ -329,8 +331,50 @@ export class DataTable extends Widget {
         return vrow;
     }
 
+    // Grab margin around the thin scrollbar thumbs so they are easy to hit.
+    fn scrollbar_grab(): int { return DT_SCROLL_W + 8; }
+
     override fn on_click(x: int, y: int): bool {
         let b = this.bounds;
+        let by = this.body_top();
+        let bh = this.body_h();
+        // vertical scrollbar (right edge, over the body): grab the thumb, or
+        // click the track to jump — then keep dragging.
+        let ch = this.content_h();
+        if (ch > bh && bh > 0 && x >= b.x + b.w - this.scrollbar_grab()
+            && y >= by && y < by + bh) {
+            let thumb = bh * bh / ch;
+            if (thumb < 20) { thumb = 20; }
+            let track = bh - thumb;
+            let maxy = ch - bh;
+            let ty = by;
+            if (maxy > 0) { ty = by + track * this.scroll_y / maxy; }
+            if ((y < ty || y >= ty + thumb) && track > 0) {   // track click → center thumb on cursor
+                this.scroll_y = (y - by - thumb / 2) * maxy / track;
+                this.clamp();
+                this.invalidate();
+            }
+            this.drag_mode = 1;
+            return true;
+        }
+        // horizontal scrollbar (bottom edge of the body)
+        let cw = this.content_w();
+        if (cw > b.w && y >= by + bh - this.scrollbar_grab() && y < by + bh
+            && x >= b.x && x < b.x + b.w) {
+            let thumb = b.w * b.w / cw;
+            if (thumb < 20) { thumb = 20; }
+            let track = b.w - thumb;
+            let maxx = cw - b.w;
+            let tx = b.x;
+            if (maxx > 0) { tx = b.x + track * this.scroll_x / maxx; }
+            if ((x < tx || x >= tx + thumb) && track > 0) {
+                this.scroll_x = (x - b.x - thumb / 2) * maxx / track;
+                this.clamp();
+                this.invalidate();
+            }
+            this.drag_mode = 2;
+            return true;
+        }
         let hy = b.y + DT_SEARCH_H;
         // header → sort the column under the cursor
         if (y >= hy && y < hy + DT_HDR_H) {
@@ -354,6 +398,37 @@ export class DataTable extends Widget {
         }
         return true;
     }
+
+    // Drag a scrollbar thumb: map the pixel delta along the track back to a
+    // content offset so the thumb tracks the cursor 1:1.
+    override fn on_drag(dx: int, dy: int): bool {
+        let bh = this.body_h();
+        if (this.drag_mode == 1 && bh > 0) {
+            let ch = this.content_h();
+            let thumb = bh * bh / ch;
+            if (thumb < 20) { thumb = 20; }
+            let track = bh - thumb;
+            if (track > 0) { this.scroll_y += dy * (ch - bh) / track; }
+            this.clamp();
+            this.invalidate();
+            return true;
+        }
+        if (this.drag_mode == 2) {
+            let b = this.bounds;
+            let cw = this.content_w();
+            let thumb = b.w * b.w / cw;
+            if (thumb < 20) { thumb = 20; }
+            let track = b.w - thumb;
+            if (track > 0) { this.scroll_x += dx * (cw - b.w) / track; }
+            this.clamp();
+            this.invalidate();
+            return true;
+        }
+        return false;
+    }
+
+    override fn on_drag_end(x: int, y: int): bool { this.drag_mode = 0; return false; }
+    override fn on_release(x: int, y: int): bool { this.drag_mode = 0; return false; }
 
     override fn on_key(k: int, ch: string): bool {
         let vlen = this.df.viewLen();
