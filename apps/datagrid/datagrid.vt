@@ -12,20 +12,27 @@
 
 import { Window, Column, Row, Label, Button } from "vyto/ui";
 import { DataTable } from "vyto/ui/datatable";
-import { DataFrame, loadCsv, CK_I64, CK_F64, CK_STR, DV_MUL } from "vyto/data/frame";
+import { DataFrame, loadCsv, CK_I64, CK_F64, CK_STR, CK_CAT, DV_MUL } from "vyto/data/frame";
 
-const N: int = 200000;
+// Memory scales linearly in the row count. The repeated-text columns (Region,
+// Customer, Product) are dictionary-encoded (CK_CAT below), so they cost 4 bytes
+// per row plus one copy of each distinct value instead of a full string per row.
+// ~52 bytes/row here: 5,000,000 rows ~= 255 MB (raw CK_STR would be ~2x).
+const N: int = 5000000;
 
 // Build a synthetic sales table: id, region, product, qty, price, + a derived
 // revenue = qty * price column.
 fn synth(): DataFrame {
     let df = new DataFrame(N);
-    let id = df.addColumn("id", CK_I64);
-    let region = df.addColumn("region", CK_STR);
-    let product = df.addColumn("product", CK_STR);
-    let qty = df.addColumn("qty", CK_I64);
-    let price = df.addColumn("price", CK_F64);
-
+    let id = df.addColumn("ID", CK_I64);
+    let region = df.addColumn("Region", CK_CAT);    // few distinct → dictionary-encoded
+    let name = df.addColumn("Customer", CK_CAT);
+    let product = df.addColumn("Product", CK_CAT);
+    let qty = df.addColumn("Qty", CK_I64);
+    let price = df.addColumn("Price", CK_F64);
+    
+    let names_a = ["Bob", "Robert", "Grace", "Mary", "Mario", "Mike"];
+    let names_b = ["Spence", "Hopper", "Nanty", "Almond", "Kirk", "Mulley"];
     let regions = ["Oslo", "Bergen", "Troms", "Molde", "Stavanger"];
     let products = ["Cable", "Widget", "Sensor", "Board", "Module", "Relay"];
     df.reserve(N);
@@ -33,8 +40,10 @@ fn synth(): DataFrame {
     while (i < N) {
         let q = (i % 50) + 1;
         let p = (((i * 7) % 900) + 100) as float;
+        let n = names_a[i % 6] + " " + names_b[i % 6];
         df.beginRow()
           .setInt(id, i)
+          .setStr(name, n)
           .setStr(region, regions[i % 5])
           .setStr(product, products[i % 6])
           .setInt(qty, q)

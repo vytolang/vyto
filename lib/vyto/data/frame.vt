@@ -60,6 +60,12 @@ export const CK_I64: int = 0;
 export const CK_F64: int = 1;
 export const CK_BOOL: int = 2;
 export const CK_STR: int = 3;
+// Dictionary-encoded (categorical) text: each row stores a 4-byte code into a
+// shared dictionary of the distinct values. For low-cardinality columns
+// (regions, statuses, repeated labels) this is a large memory win over CK_STR —
+// one copy of each value instead of one string per row — while sort / filter /
+// search behave identically. Not for high-cardinality free text (use CK_STR).
+export const CK_CAT: int = 4;
 
 // Filter comparison ops (numeric); string filter uses OP_EQ / OP_CONTAINS.
 export const OP_EQ: int = 0;
@@ -242,7 +248,7 @@ fn set_field(df: DataFrame, col: int, kind: int, field: string) {
     if (kind == CK_I64) { df.setInt(col, field.trim().to_int()); }
     else if (kind == CK_F64) { df.setFloat(col, field.trim().to_float()); }
     else if (kind == CK_BOOL) { df.setBool(col, field.trim().to_lower() == "true"); }
-    else { df.setStr(col, field); }
+    else { df.setStr(col, field); }   // CK_STR and CK_CAT both take a string
 }
 
 // ---- CSV ingest -----------------------------------------------------------
@@ -330,7 +336,7 @@ fn append_json_obj(df: DataFrame, o: JsonValue) {
     for (let i in 0..n) {
         let jv = o.get(df.colName(i));
         let k = df.colKind(i);
-        if (k == CK_STR) { df.setStr(i, jv.asString()); }
+        if (k == CK_STR || k == CK_CAT) { df.setStr(i, jv.asString()); }
         else if (k == CK_BOOL) { df.setBool(i, jv.asBool()); }
         else if (k == CK_F64) { df.setFloat(i, jv.asFloat()); }
         else { df.setInt(i, jv.asInt()); }
