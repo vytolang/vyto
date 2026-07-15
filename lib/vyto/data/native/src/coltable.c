@@ -21,9 +21,15 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdint.h>
+#include <ctype.h>
 
 enum { CT_I64 = 0, CT_F64 = 1, CT_BOOL = 2, CT_STR = 3, CT_CAT = 4,
-       CT_I32 = 5, CT_I16 = 6, CT_F32 = 7 };
+       CT_I32 = 5, CT_I16 = 6, CT_F32 = 7, CT_AUTO = 8 };
+
+/* A promotable (CK_AUTO) column starts as CT_I16 and widens itself as values
+   arrive; promote once its dictionary grows past this many distinct values
+   (categorical then costs more than raw strings). */
+#define CT_CAT_MAX_DICT 65536
 
 /* one column.
    - scalar kinds: `data` is int64 / double / uint8, one per row.
@@ -47,6 +53,7 @@ typedef struct {
     int ndict, dcap;   /* live dict entries / capacity */
     int32_t *dhash;    /* open-addressed intern index (entry+1; 0 = empty) */
     int dhmask;        /* dhash size - 1 (power of two), 0 = unallocated */
+    uint8_t promotable; /* CK_AUTO: self-widen `kind` as values arrive */
 } Col;
 
 typedef struct {
@@ -189,6 +196,7 @@ int ct_add_col(void *h, const char *name, int kind) {
     }
     Col *col = &t->cols[t->ncol];
     memset(col, 0, sizeof *col);
+    if (kind == CT_AUTO) { col->promotable = 1; kind = CT_I16; } /* start narrow, self-widen */
     col->kind = kind;
     col->name = name ? strdup(name) : strdup("");
     /* size the new column to the current row capacity so it lines up with the
@@ -228,6 +236,9 @@ void ct_begin_row(void *h) {
     }
 }
 
+static double cell_num(const Col *c, int64_t row);  /* defined below */
+static int kind_is_int(int k);
+
 /* Store an integer into a scalar column at row `r` (exact for the integer
    kinds — no double round-trip; smaller kinds wrap on overflow like a C cast). */
 static void scalar_put_i(Col *c, int64_t r, int64_t v) {
@@ -246,22 +257,200 @@ static void scalar_put_f(Col *c, int64_t r, double v) {
     else scalar_put_i(c, r, (int64_t)v);
 }
 
+/* Append raw bytes as a CT_STR row. */
+static void str_append(Col *c, int64_t row, const char *s, int32_t n) {
+    if (c->alen + (size_t)n > c->acap) {
+        size_t na = c->acap ? c->acap : 256;
+        while (na < c->alen + (size_t)n) na *= 2;
+        char *nb = (char *)realloc(c->arena, na);
+        if (!nb) return;
+        c->arena = nb; c->acap = na;
+    }
+    c->soff[row] = (int64_t)c->alen;
+    c->slen[row] = n;
+    if (n > 0) { memcpy(c->arena + c->alen, s, (size_t)n); c->alen += (size_t)n; }
+}
+
+/* Store text into a text column (CT_CAT interns, CT_STR appends). */
+static void text_store(Col *c, int64_t row, const char *s, int32_t n) {
+    if (c->kind == CT_CAT) {
+        int code = cat_intern(c, s, n);
+        if (code >= 0) ((int32_t *)c->data)[row] = code;
+    } else {
+        str_append(c, row, s, n);
+    }
+}
+
+/* ------------------------------------------------- auto (CK_AUTO) promotion */
+
+/* Format a scalar row's value as text (into buf); returns the byte length. */
+static int fmt_scalar(const Col *c, int64_t row, char *buf, int cap) {
+    if (kind_is_int(c->kind)) return snprintf(buf, (size_t)cap, "%lld", (long long)cell_num(c, row));
+    return snprintf(buf, (size_t)cap, "%g", cell_num(c, row));
+}
+
+/* Rewrite a scalar column to a wider scalar `newkind`, converting each existing
+   row. Cheap because it fires at most a handful of times over a whole load. */
+static void numeric_convert(Col *c, int64_t nrow, int64_t cap, int newkind) {
+    void *nb = malloc((size_t)cap * col_elem(newkind));
+    if (!nb) return;
+    void *old = c->data;
+    int oldk = c->kind;
+    c->data = nb; c->kind = newkind;
+    for (int64_t r = 0; r < nrow; r++) {
+        Col tmp = *c; tmp.data = old; tmp.kind = oldk;   /* read through old view */
+        double v = cell_num(&tmp, r);
+        if (kind_is_int(newkind)) scalar_put_i(c, r, (int64_t)v);
+        else scalar_put_f(c, r, v);
+    }
+    free(old);
+}
+
+/* Convert a scalar column to CT_CAT: each existing value becomes its text form,
+   interned into a fresh dictionary. */
+static void numeric_to_cat(Col *c, int64_t nrow, int64_t cap) {
+    int32_t *codes = (int32_t *)malloc((size_t)cap * sizeof(int32_t));
+    if (!codes) return;
+    void *old = c->data;
+    int oldk = c->kind;
+    char buf[48];
+    for (int64_t r = 0; r < nrow; r++) {
+        Col tmp = *c; tmp.data = old; tmp.kind = oldk;
+        int n = fmt_scalar(&tmp, r, buf, sizeof buf);
+        codes[r] = cat_intern(c, buf, n);   /* builds c->arena/doff/dlen/dhash */
+    }
+    c->data = codes; c->kind = CT_CAT;
+    free(old);
+}
+
+/* Convert a CT_CAT column to CT_STR (materialize each row's dictionary string).
+   Used when the value count outgrows the dictionary's benefit. */
+static void cat_to_str(Col *c, int64_t nrow, int64_t cap) {
+    int64_t *soff = (int64_t *)malloc((size_t)cap * sizeof(int64_t));
+    int32_t *slen = (int32_t *)malloc((size_t)cap * sizeof(int32_t));
+    if (!soff || !slen) { free(soff); free(slen); return; }
+    int32_t *codes = (int32_t *)c->data;
+    char *dict = c->arena; int64_t *doff = c->doff; int32_t *dlen = c->dlen;
+    /* build a fresh arena; keep the dict arena around until we've copied out */
+    char *na = NULL; size_t nalen = 0, nacap = 0;
+    for (int64_t r = 0; r < nrow; r++) {
+        int32_t code = codes[r];
+        int32_t l = (code >= 0 && code < c->ndict) ? dlen[code] : 0;
+        if (nalen + (size_t)l > nacap) {
+            size_t g = nacap ? nacap : 256;
+            while (g < nalen + (size_t)l) g *= 2;
+            char *t = (char *)realloc(na, g); if (!t) { free(na); free(soff); free(slen); return; }
+            na = t; nacap = g;
+        }
+        soff[r] = (int64_t)nalen;
+        slen[r] = l;
+        if (l > 0) { memcpy(na + nalen, dict + doff[code], (size_t)l); nalen += (size_t)l; }
+    }
+    free(c->data); free(c->arena); free(c->doff); free(c->dlen); free(c->dhash);
+    c->data = NULL; c->soff = soff; c->slen = slen;
+    c->arena = na; c->alen = nalen; c->acap = nacap;
+    c->doff = NULL; c->dlen = NULL; c->dhash = NULL; c->ndict = 0; c->dcap = 0; c->dhmask = 0;
+    c->kind = CT_STR;
+}
+
+static int f32_safe(double v) { return (double)(float)v == v; }
+
+/* smallest signed-int kind that holds v */
+static int int_kind_for(int64_t v) {
+    if (v >= -32768 && v <= 32767) return CT_I16;
+    if (v >= -2147483648LL && v <= 2147483647LL) return CT_I32;
+    return CT_I64;
+}
+static int wider_int(int a, int b) {   /* pick the wider of two int kinds */
+    int wa = a == CT_I16 ? 0 : a == CT_I32 ? 1 : 2;
+    int wb = b == CT_I16 ? 0 : b == CT_I32 ? 1 : 2;
+    int w = wa > wb ? wa : wb;
+    return w == 0 ? CT_I16 : w == 1 ? CT_I32 : CT_I64;
+}
+
+/* Feed one value into a promotable column at row `row`; `nrow` = committed rows
+   (those needing conversion on a widen). */
+static void auto_feed_i(Col *c, int64_t row, int64_t nrow, int64_t cap, int64_t v) {
+    if (kind_is_int(c->kind)) {
+        int need = wider_int(c->kind, int_kind_for(v));
+        if (need != c->kind) numeric_convert(c, nrow, cap, need);
+        scalar_put_i(c, row, v);
+    } else if (c->kind == CT_F32 || c->kind == CT_F64) {
+        scalar_put_i(c, row, v);
+    } else { /* text */
+        char buf[32]; int n = snprintf(buf, sizeof buf, "%lld", (long long)v);
+        text_store(c, row, buf, n);
+    }
+}
+
+static void auto_feed_f(Col *c, int64_t row, int64_t nrow, int64_t cap, double v) {
+    if (kind_is_int(c->kind)) {
+        numeric_convert(c, nrow, cap, f32_safe(v) ? CT_F32 : CT_F64);
+        scalar_put_f(c, row, v);
+    } else if (c->kind == CT_F32) {
+        if (!f32_safe(v)) numeric_convert(c, nrow, cap, CT_F64);
+        scalar_put_f(c, row, v);
+    } else if (c->kind == CT_F64) {
+        scalar_put_f(c, row, v);
+    } else { /* text */
+        char buf[32]; int n = snprintf(buf, sizeof buf, "%g", v);
+        text_store(c, row, buf, n);
+    }
+}
+
+/* Classify a field: 0 = int (→*iv), 1 = float (→*dv), 2 = text. */
+static int parse_scalar(const char *s, int32_t n, int64_t *iv, double *dv) {
+    const char *p = s, *e = s + n;
+    while (p < e && isspace((unsigned char)*p)) p++;
+    if (p == e) return 2;
+    char *end;
+    long long i = strtoll(p, &end, 10);
+    const char *q = end;
+    while (q < e && isspace((unsigned char)*q)) q++;
+    if (end != p && q == e) { *iv = (int64_t)i; return 0; }
+    double d = strtod(p, &end);
+    q = end;
+    while (q < e && isspace((unsigned char)*q)) q++;
+    if (end != p && q == e) { *dv = d; return 1; }
+    return 2;
+}
+
+static void auto_feed_str(Col *c, int64_t row, int64_t nrow, int64_t cap, const char *s, int32_t n) {
+    if (c->kind == CT_CAT || c->kind == CT_STR) {
+        text_store(c, row, s, n);
+        if (c->kind == CT_CAT && c->ndict > CT_CAT_MAX_DICT) cat_to_str(c, nrow + 1, cap);
+        return;
+    }
+    /* numeric column: does the text parse as a number? */
+    int64_t iv; double dv;
+    int k = parse_scalar(s, n, &iv, &dv);
+    if (k == 0) { auto_feed_i(c, row, nrow, cap, iv); }
+    else if (k == 1) { auto_feed_f(c, row, nrow, cap, dv); }
+    else { numeric_to_cat(c, nrow, cap); text_store(c, row, s, n); }  /* non-numeric → categorical */
+}
+
 void ct_set_i64(void *h, int col, long long v) {
     CT *t = (CT *)h;
     if (!t || col < 0 || col >= t->ncol) return;
-    scalar_put_i(&t->cols[col], t->nrow, (int64_t)v);
+    Col *c = &t->cols[col];
+    if (c->promotable) auto_feed_i(c, t->nrow, t->nrow, t->cap, (int64_t)v);
+    else scalar_put_i(c, t->nrow, (int64_t)v);
 }
 
 void ct_set_f64(void *h, int col, double v) {
     CT *t = (CT *)h;
     if (!t || col < 0 || col >= t->ncol) return;
-    scalar_put_f(&t->cols[col], t->nrow, v);
+    Col *c = &t->cols[col];
+    if (c->promotable) auto_feed_f(c, t->nrow, t->nrow, t->cap, v);
+    else scalar_put_f(c, t->nrow, v);
 }
 
 void ct_set_bool(void *h, int col, int v) {
     CT *t = (CT *)h;
     if (!t || col < 0 || col >= t->ncol) return;
-    scalar_put_i(&t->cols[col], t->nrow, v ? 1 : 0);
+    Col *c = &t->cols[col];
+    if (c->promotable) auto_feed_i(c, t->nrow, t->nrow, t->cap, v ? 1 : 0);
+    else scalar_put_i(c, t->nrow, v ? 1 : 0);
 }
 
 void ct_set_str(void *h, int col, const char *s, long n) {
@@ -269,24 +458,14 @@ void ct_set_str(void *h, int col, const char *s, long n) {
     if (!t || col < 0 || col >= t->ncol) return;
     Col *c = &t->cols[col];
     if (!s || n < 0) return;
+    if (c->promotable) { auto_feed_str(c, t->nrow, t->nrow, t->cap, s, (int32_t)n); return; }
     if (c->kind == CT_CAT) {
         int code = cat_intern(c, s, (int32_t)n);
         if (code >= 0) ((int32_t *)c->data)[t->nrow] = code;
         return;
     }
     if (c->kind != CT_STR) return;
-    if (c->alen + (size_t)n > c->acap) {
-        size_t na = c->acap ? c->acap : 256;
-        while (na < c->alen + (size_t)n) na *= 2;
-        char *nb = (char *)realloc(c->arena, na);
-        if (!nb) return;
-        c->arena = nb;
-        c->acap = na;
-    }
-    c->soff[t->nrow] = (int64_t)c->alen;
-    c->slen[t->nrow] = (int32_t)n;
-    memcpy(c->arena + c->alen, s, (size_t)n);
-    c->alen += (size_t)n;
+    str_append(c, t->nrow, s, (int32_t)n);
 }
 
 void ct_end_row(void *h) {

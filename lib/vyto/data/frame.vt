@@ -73,6 +73,14 @@ export const CK_CAT: int = 4;
 export const CK_I32: int = 5;
 export const CK_I16: int = 6;
 export const CK_F32: int = 7;
+// Self-describing column: pick the most efficient kind automatically. The column
+// starts narrow (i16) and the engine widens it only as far as the data forces —
+// i16 → i32 → i64, → f32 → f64 when a fractional value appears, and → dictionary
+// (categorical), then plain text if the distinct count gets large. Feed it via
+// setInt/setFloat/setStr, or a loader (which feeds raw strings and lets the
+// engine classify). colKind() reports the resolved concrete kind afterward. Best
+// default for ingest when the schema isn't known up front.
+export const CK_AUTO: int = 8;
 
 // Filter comparison ops (numeric); string filter uses OP_EQ / OP_CONTAINS.
 export const OP_EQ: int = 0;
@@ -139,7 +147,9 @@ export class DataFrame {
     // Rows currently visible (after any filter); equals nrow() with no filter.
     fn viewLen(): int { return ct_view_len(this.h) as int; }
     fn colName(i: int): string { return this.names[i]; }
-    fn colKind(i: int): int { return this.kinds[i]; }
+    // The column's resolved concrete kind (a CK_AUTO column reports whatever it
+    // settled on — i16/i32/i64/f32/f64/cat/str — not CK_AUTO).
+    fn colKind(i: int): int { return ct_col_kind(this.h, i as i32) as int; }
 
     // ---- cell read (by VISIBLE row, post filter+sort) ---------------------
 
@@ -199,70 +209,13 @@ export class DataFrame {
 
 export fn dataFrame(cap: int): DataFrame { return new DataFrame(cap); }
 
-// ---- value-type classification (for ingest inference) ---------------------
-
-// True if `s` (trimmed) is a plain decimal integer, optionally signed.
-fn is_int_str(s: string): bool {
-    let t = s.trim();
-    if (t.len == 0) { return false; }
-    let i = 0;
-    if (t[0] == 43 || t[0] == 45) { i = 1; }   // '+' / '-'
-    if (i >= t.len) { return false; }
-    while (i < t.len) {
-        if (t[i] < 48 || t[i] > 57) { return false; }
-        i += 1;
-    }
-    return true;
-}
-
-// True if `s` (trimmed) looks like a decimal/scientific float.
-fn is_float_str(s: string): bool {
-    let t = s.trim();
-    if (t.len == 0) { return false; }
-    let digit = false;
-    let dot = false;
-    let exp = false;
-    let i = 0;
-    while (i < t.len) {
-        let c = t[i];
-        if (c >= 48 && c <= 57) { digit = true; }
-        else if (c == 46) { if (dot || exp) { return false; } dot = true; }   // '.'
-        else if (c == 101 || c == 69) { if (exp || !digit) { return false; } exp = true; }  // e/E
-        else if (c == 43 || c == 45) {                                        // sign
-            if (i != 0 && t[i - 1] != 101 && t[i - 1] != 69) { return false; }
-        } else { return false; }
-        i += 1;
-    }
-    return digit;
-}
-
-fn is_bool_str(s: string): bool {
-    let t = s.trim().to_lower();
-    return t == "true" || t == "false";
-}
-
-// Infer a column kind from one sample value.
-fn infer_kind(s: string): int {
-    if (is_int_str(s)) { return CK_I64; }
-    if (is_float_str(s)) { return CK_F64; }
-    if (is_bool_str(s)) { return CK_BOOL; }
-    return CK_STR;
-}
-
-// Set column `col` of the row under construction from a raw string field,
-// coercing to the column's kind.
-fn set_field(df: DataFrame, col: int, kind: int, field: string) {
-    if (kind == CK_I64) { df.setInt(col, field.trim().to_int()); }
-    else if (kind == CK_F64) { df.setFloat(col, field.trim().to_float()); }
-    else if (kind == CK_BOOL) { df.setBool(col, field.trim().to_lower() == "true"); }
-    else { df.setStr(col, field); }   // CK_STR and CK_CAT both take a string
-}
-
 // ---- CSV ingest -----------------------------------------------------------
 
-// Load a comma-separated file, inferring each column's type from the first data
-// row. With `hasHeader`, the first line names the columns; otherwise columns are
-// named col0, col1, … . Streamed a line at a time in bounded memory.
+// Load a comma-separated file. Every column is CK_AUTO, so the native engine
+// infers and narrows each column's kind from the actual data — int width, float
+// precision, or dictionary-encoded text — as rows stream in. With `hasHeader`
+// the first line names the columns; otherwise they are col0, col1, … . Bounded
+// memory.
 export fn loadCsv(path: string, hasHeader: bool): DataFrame {
     let df = new DataFrame(0);
     let r = bufReader(path);
@@ -286,7 +239,7 @@ export fn loadCsv(path: string, hasHeader: bool): DataFrame {
     for (let i in 0..first.len) {
         let nm = "col" + str(i);
         if (i < names.len) { nm = names[i].trim(); }
-        df.addColumn(nm, infer_kind(first[i]));
+        df.addColumn(nm, CK_AUTO);   // engine infers + narrows the kind from the data
     }
 
     // reserve from file size / first-row byte length (a rough row estimate)
@@ -308,45 +261,35 @@ fn append_csv_row(df: DataFrame, fields: string[]) {
     df.beginRow();
     let n = df.ncol();
     for (let i in 0..n) {
-        if (i < fields.len) { set_field(df, i, df.colKind(i), fields[i]); }
+        if (i < fields.len) { df.setStr(i, fields[i]); }   // CK_AUTO classifies the field
     }
     df.endRow();
 }
 
 // ---- JSON ingest ----------------------------------------------------------
 
-// Seed columns from a sample object: integral numbers → int, other numbers →
-// float, booleans → bool, everything else → string.
+// Seed one CK_AUTO column per key of a sample object; the engine settles each
+// column's kind from the values fed in.
 fn seed_schema(df: DataFrame, o: JsonValue) {
     let keys = o.objKeys();
-    for (let i in 0..keys.len) {
-        let k = keys[i];
-        let v = o.get(k);
-        df.addColumn(k, json_kind(v));
-    }
+    for (let i in 0..keys.len) { df.addColumn(keys[i], CK_AUTO); }
 }
 
-fn json_kind(v: JsonValue): int {
-    if (v.isObj() || v.isArr()) { return CK_STR; }
-    // numbers: integral → int for id-like columns, else float
-    let f = v.asFloat();
-    let s = v.asString();
-    if (s != "") { return CK_STR; }
-    if (f == (f as int) as float) { return CK_I64; }
-    return CK_F64;
-}
-
-// Append one object as a row, filling columns positionally by name.
+// Append one object as a row, feeding each value by its JSON type so CK_AUTO
+// picks the tightest kind (integral numbers stay ints; text/mixed → categorical).
 fn append_json_obj(df: DataFrame, o: JsonValue) {
     df.beginRow();
     let n = df.ncol();
     for (let i in 0..n) {
         let jv = o.get(df.colName(i));
-        let k = df.colKind(i);
-        if (k == CK_STR || k == CK_CAT) { df.setStr(i, jv.asString()); }
-        else if (k == CK_BOOL) { df.setBool(i, jv.asBool()); }
-        else if (k == CK_F64) { df.setFloat(i, jv.asFloat()); }
-        else { df.setInt(i, jv.asInt()); }
+        if (jv.isNum()) {
+            let f = jv.asFloat();
+            if (f == (f as int) as float) { df.setInt(i, jv.asInt()); }
+            else { df.setFloat(i, f); }
+        } else if (jv.isStr()) { df.setStr(i, jv.asString()); }
+        else if (jv.isBool()) { let b = "false"; if (jv.asBool()) { b = "true"; } df.setStr(i, b); }
+        else if (jv.isObj() || jv.isArr()) { df.setStr(i, jv.stringify()); }
+        else { df.setStr(i, ""); }   // null → empty
     }
     df.endRow();
 }
