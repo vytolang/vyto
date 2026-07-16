@@ -1,0 +1,391 @@
+// vyto/reactive — fine-grained reactive state management.
+//
+//   import { Reactive, sig_int, computed, effect, batch } from "vyto/reactive";
+//
+// The model is fine-grained *signals* (not a virtual-DOM diff): a `Signal<T>`
+// is an observable cell, a `Computed<T>` is a memoized derivation, and an
+// `Effect` runs a side effect when its dependencies change. Dependencies are
+// tracked automatically — reading a signal inside a computed/effect subscribes
+// to it — so only the nodes actually affected by a change recompute.
+//
+// Design constraints (see local/docs/REACTIVITY.md for the full rationale):
+//
+//   * No mutable module globals in Vyto, so there is no hidden "current
+//     computation" — every node belongs to an explicit `Reactive` domain that
+//     owns the observer stack and the effect scheduler.
+//   * Propagation is glitch-free: a change marks the downstream cone, then a
+//     single `flush()` pulls values in dependency order. A diamond dependency
+//     recomputes once; an effect fires at most once per batch; a write of an
+//     equal value (per the node's `eq`) produces zero work.
+//   * Memory safety under reference counting: forward edges (observer -> its
+//     sources) are strong, back edges (source -> its observers) are `weak`, so
+//     the dependency graph has no strong cycle. Effect closures capture state
+//     strongly, so effects are rooted by the domain and released on
+//     `Reactive.dispose()` — mirroring how the UI toolkit breaks handler cycles.
+//   * Single-threaded: matches the runtime's non-atomic RC and unguarded weak
+//     table. Cross-thread reactivity is future work.
+
+// Node lifecycle states.
+const CLEAN: int = 0;   // value is current
+const CHECK: int = 1;   // a transitive source *might* have changed — verify on pull
+const DIRTY: int = 2;   // a direct source changed — must recompute
+
+// Runaway-update guard: an effect that writes a signal it depends on would loop
+// forever; we stop and report instead of hanging.
+const MAX_FLUSH: int = 1000000;
+
+// A weak, non-owning reference to a node. Arrays cannot hold `weak` elements
+// directly, so a subscriber list is an array of these holders; the `node`
+// slot auto-nulls the instant the target is freed, and iteration skips nulls.
+class WeakNode {
+    node: weak ReactiveNode;
+    fn init(n: ReactiveNode) { this.node = n; }
+}
+
+// Base class for every graph participant (Signal / Computed / Effect). Holds
+// the dependency edges and the dirty-tracking state; subclasses add the typed
+// value and the recompute behaviour.
+export class ReactiveNode {
+    rt: weak Reactive;              // owning domain (weak: the domain outlives nodes)
+    state: int;                    // CLEAN / CHECK / DIRTY
+    version: int;                  // bumped whenever this node's value changes
+    sources: ReactiveNode[];       // strong: the deps read during the last compute
+    source_ver: int[];             // their versions at that time (parallel array)
+    observers: WeakNode[];         // weak: nodes that depend on this one
+    is_effect: bool;
+    disposed: bool;
+
+    // Subclasses call this from their own `init` to set up the base fields.
+    // Every node registers with its domain so `Reactive.dispose()` can reach it
+    // and null its closure — the only way to break a capture cycle (a closure
+    // that captures the object which transitively owns the domain) under
+    // reference counting. This mirrors the UI toolkit's `drop_handlers()`.
+    fn init_node(r: Reactive) {
+        this.rt = r;
+        this.state = CLEAN;
+        this.version = 0;
+        this.sources = [];
+        this.source_ver = [];
+        this.observers = [];
+        this.is_effect = false;
+        this.disposed = false;
+        r.register(this);
+    }
+
+    // Record that `this` (a running computation) read `s`. Establishes the
+    // strong forward edge and the weak back edge, both deduped.
+    fn add_source(s: ReactiveNode) {
+        for (let e in this.sources) { if (e == s) { return; } }
+        this.sources.push(s);
+        this.source_ver.push(s.version);
+        s.add_observer(this);
+    }
+
+    fn add_observer(o: ReactiveNode) {
+        for (let h in this.observers) { if (h.node == o) { return; } }
+        this.observers.push(new WeakNode(o));
+    }
+
+    // Remove `o` from the observer list, compacting any auto-nulled slots.
+    fn remove_observer(o: ReactiveNode) {
+        let i = 0;
+        while (i < this.observers.len) {
+            let h = this.observers[i];
+            if (h.node == null) { this.observers.remove_at(i); }
+            else { if (h.node == o) { this.observers.remove_at(i); } else { i = i + 1; } }
+        }
+    }
+
+    // Drop every incoming dependency edge (called before a recompute, which
+    // rebuilds them, and on dispose).
+    fn unlink_sources() {
+        for (let s in this.sources) { s.remove_observer(this); }
+        this.sources = [];
+        this.source_ver = [];
+    }
+
+    // Mark this node stale. `dirty` = a *direct* source changed (definitely
+    // recompute); otherwise a transitive source might have (verify on pull).
+    // We only propagate on the first CLEAN-> transition, so each node is walked
+    // once and effects are scheduled exactly once.
+    fn mark(dirty: bool) {
+        if (this.disposed) { return; }
+        if (this.state == CLEAN) {
+            if (dirty) { this.state = DIRTY; } else { this.state = CHECK; }
+            if (this.is_effect) {
+                if (this.rt != null) { this.rt.schedule(this); }
+            }
+            let i = 0;
+            while (i < this.observers.len) {
+                let h = this.observers[i];
+                if (h.node == null) { this.observers.remove_at(i); }
+                else { h.node.mark(false); i = i + 1; }
+            }
+        } else {
+            if (dirty) { if (this.state == CHECK) { this.state = DIRTY; } }
+        }
+    }
+
+    // Bring this node up to date (pull). CHECK is resolved by verifying whether
+    // any source's version actually moved — a CHECK that turns out clean costs
+    // no recompute.
+    fn update() {
+        if (this.state == CLEAN) { return; }
+        if (this.disposed) { this.state = CLEAN; return; }
+        if (this.state == CHECK) {
+            let i = 0;
+            let d = false;
+            while (i < this.sources.len) {
+                let s = this.sources[i];
+                s.update();
+                if (s.version != this.source_ver[i]) { d = true; }
+                i = i + 1;
+            }
+            if (d) { this.state = DIRTY; } else { this.state = CLEAN; }
+        }
+        if (this.state == DIRTY) { this.recompute(); }
+        this.state = CLEAN;
+    }
+
+    // Re-run the computation with dependency tracking active.
+    fn recompute() {
+        this.unlink_sources();
+        if (this.rt != null) {
+            this.rt.push_obs(this);
+            this.recompute_self();
+            this.rt.pop_obs();
+        }
+    }
+
+    // Type-specific recompute: Signal none, Computed recomputes value, Effect runs.
+    virtual fn recompute_self() { }
+    // Type-specific teardown (Effect nulls its captured closure).
+    virtual fn on_dispose() { }
+
+    fn dispose() {
+        if (this.disposed) { return; }
+        this.disposed = true;
+        this.unlink_sources();
+        this.on_dispose();
+        this.state = CLEAN;
+    }
+}
+
+// An observable value cell. `eq` decides whether a `set` is a real change.
+export class Signal<T> extends ReactiveNode {
+    value: T;
+    eq: fn(T, T): bool;
+
+    fn init(r: Reactive, v: T, e: fn(T, T): bool) {
+        this.init_node(r);
+        this.value = v;
+        this.eq = e;
+    }
+
+    fn get(): T {
+        if (this.rt != null) { this.rt.track(this); }
+        return this.value;
+    }
+
+    fn set(v: T) {
+        if (this.eq(this.value, v)) { return; }   // no-op write: zero propagation
+        this.value = v;
+        this.version = this.version + 1;
+        // notify direct observers, then flush unless inside a batch
+        let i = 0;
+        while (i < this.observers.len) {
+            let h = this.observers[i];
+            if (h.node == null) { this.observers.remove_at(i); }
+            else { h.node.mark(true); i = i + 1; }
+        }
+        if (this.rt != null) {
+            if (this.rt.batch_depth == 0) { this.rt.flush(); }
+        }
+    }
+}
+
+// A memoized derived value. Lazy: it recomputes only when read while stale.
+export class Computed<T> extends ReactiveNode {
+    value: T;
+    compute: fn(): T;
+    eq: fn(T, T): bool;
+    has_value: bool;
+
+    fn init(r: Reactive, f: fn(): T, e: fn(T, T): bool) {
+        this.init_node(r);
+        this.compute = f;
+        this.eq = e;
+        this.has_value = false;
+        this.state = DIRTY;   // compute on first read
+    }
+
+    fn get(): T {
+        this.update();
+        if (this.rt != null) { this.rt.track(this); }
+        return this.value;
+    }
+
+    override fn recompute_self() {
+        let old = this.value;
+        let had = this.has_value;
+        this.value = this.compute();
+        this.has_value = true;
+        // bump version only on a genuine change, so downstream CHECK can resolve
+        // to clean when the derived value is unchanged
+        if (!had) { this.version = this.version + 1; }
+        else { if (!this.eq(old, this.value)) { this.version = this.version + 1; } }
+    }
+
+    // A computed's `compute` closure may capture its owner; null it on dispose
+    // so the capture cycle is broken (same reason effects null `run`).
+    override fn on_dispose() {
+        this.compute = null;
+    }
+}
+
+// A side effect that re-runs when its dependencies change. Runs once on
+// creation to establish its initial dependency set.
+export class Effect extends ReactiveNode {
+    run: fn();
+
+    fn init(r: Reactive, run: fn()) {
+        this.init_node(r);
+        this.is_effect = true;
+        this.run = run;
+    }
+
+    fn run_initial() {
+        this.state = DIRTY;
+        this.update();
+    }
+
+    override fn recompute_self() {
+        if (this.run != null) { this.run(); }
+    }
+
+    override fn on_dispose() {
+        this.run = null;
+    }
+}
+
+// A reactive domain: owns the current-observer stack, the batch depth, the
+// effect scheduler, and the set of live effects (which it roots).
+export class Reactive {
+    stack: ReactiveNode[];         // current-observer stack (top = running node)
+    pending: ReactiveNode[];       // effects scheduled to run on flush
+    all: ReactiveNode[];           // every node in the domain (roots them; enables dispose)
+    batch_depth: int;
+    on_flush: fn();                // optional hook fired after each flush (UI repaint)
+
+    fn init() {
+        this.stack = [];
+        this.pending = [];
+        this.all = [];
+        this.batch_depth = 0;
+    }
+
+    // Called from every node's init_node — the domain owns its graph.
+    fn register(n: ReactiveNode) { this.all.push(n); }
+
+    fn top(): ReactiveNode {
+        if (this.stack.len == 0) { return null; }
+        return this.stack.last();
+    }
+    fn push_obs(n: ReactiveNode) { this.stack.push(n); }
+    fn pop_obs() { this.stack.pop(); }
+
+    // Subscribe the currently-running node to `n`.
+    fn track(n: ReactiveNode) {
+        let obs = this.top();
+        if (obs != null) { obs.add_source(n); }
+    }
+
+    fn schedule(e: ReactiveNode) { this.pending.push(e); }
+
+    // Run all scheduled effects; re-scheduling during a run is drained too.
+    fn flush() {
+        let guard = 0;
+        while (this.pending.len > 0) {
+            guard = guard + 1;
+            if (guard > MAX_FLUSH) {
+                print("vyto/reactive: update cycle detected — aborting flush");
+                this.pending = [];
+                return;
+            }
+            let e = this.pending.remove_at(0);
+            e.update();
+        }
+        if (this.on_flush != null) { this.on_flush(); }
+    }
+
+    // Run an effect once (it is already registered via init_node).
+    fn add_effect(e: Effect) {
+        e.run_initial();
+    }
+
+    // Dispose every node — nulling all `compute`/`run` closures, which is what
+    // breaks any capture cycle — then drop the domain's strong roots. After this
+    // the graph is inert and, once the app drops its own handles, fully freed.
+    fn dispose() {
+        for (let n in this.all) { n.dispose(); }
+        this.all = [];
+        this.pending = [];
+        this.stack = [];
+    }
+}
+
+// ---- factory helpers ----
+//
+// Generic factories over any T for which the caller supplies an equality test.
+// (There is no universal `==` for a generic T — structs, for one, are not
+// comparable — so equality is always explicit.)
+
+export fn signal<T>(rt: Reactive, v: T, eq: fn(T, T): bool): Signal<T> {
+    return new Signal<T>(rt, v, eq);
+}
+
+export fn computed<T>(rt: Reactive, f: fn(): T, eq: fn(T, T): bool): Computed<T> {
+    return new Computed<T>(rt, f, eq);
+}
+
+export fn effect(rt: Reactive, run: fn()): Effect {
+    let e = new Effect(rt, run);
+    rt.add_effect(e);
+    return e;
+}
+
+// Group multiple writes so dependent effects run once, after all writes land.
+export fn batch(rt: Reactive, f: fn()) {
+    rt.batch_depth = rt.batch_depth + 1;
+    f();
+    rt.batch_depth = rt.batch_depth - 1;
+    if (rt.batch_depth == 0) { rt.flush(); }
+}
+
+// Convenience constructors for the common primitive payloads, with the natural
+// equality baked in (value equality for numbers/strings/bools).
+export fn sig_int(rt: Reactive, v: int): Signal<int> {
+    return new Signal<int>(rt, v, (a, b) => a == b);
+}
+export fn sig_i64(rt: Reactive, v: i64): Signal<i64> {
+    return new Signal<i64>(rt, v, (a, b) => a == b);
+}
+export fn sig_float(rt: Reactive, v: float): Signal<float> {
+    return new Signal<float>(rt, v, (a, b) => a == b);
+}
+export fn sig_bool(rt: Reactive, v: bool): Signal<bool> {
+    return new Signal<bool>(rt, v, (a, b) => a == b);
+}
+export fn sig_str(rt: Reactive, v: string): Signal<string> {
+    return new Signal<string>(rt, v, (a, b) => a == b);
+}
+
+export fn comp_int(rt: Reactive, f: fn(): int): Computed<int> {
+    return new Computed<int>(rt, f, (a, b) => a == b);
+}
+export fn comp_str(rt: Reactive, f: fn(): string): Computed<string> {
+    return new Computed<string>(rt, f, (a, b) => a == b);
+}
+export fn comp_bool(rt: Reactive, f: fn(): bool): Computed<bool> {
+    return new Computed<bool>(rt, f, (a, b) => a == b);
+}

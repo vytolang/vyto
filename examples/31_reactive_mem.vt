@@ -1,0 +1,49 @@
+// vyto/reactive — memory-safety stress.
+//
+// A `Model` owns a reactive domain and registers a computed AND an effect whose
+// closures capture the model itself. That is a strong reference cycle
+// (model -> rt -> node -> closure -> model) which reference counting cannot
+// collect on its own — `rt.dispose()` breaks it by nulling every node closure.
+//
+// This runs many create/mutate/destroy cycles; with dispose the resident set
+// stays flat (verified separately under ASan and with /usr/bin/time RSS — see
+// local/docs/REACTIVITY.md). Here it simply must run to completion without
+// crashing or corrupting memory.
+
+import { Reactive, Signal, Computed, sig_int, comp_int, effect, batch } from "vyto/reactive";
+
+class Model {
+    rt: Reactive;
+    count: Signal<int>;
+    doubled: Computed<int>;
+    last: int;
+    fn init() {
+        let self = this;
+        this.rt = new Reactive();
+        this.count = sig_int(this.rt, 0);
+        this.doubled = comp_int(this.rt, () => self.count.get() * 2);
+        this.last = 0;
+        effect(this.rt, () => { self.last = self.doubled.get(); });
+    }
+    fn bump(n: int) {
+        let self = this;
+        batch(this.rt, () => { self.count.set(self.count.get() + n); });
+    }
+    fn kill() { this.rt.dispose(); }
+}
+
+fn main() {
+    let sum = 0;
+    let i = 0;
+    while (i < 5000) {
+        let m = new Model();
+        m.bump(3);
+        m.bump(4);
+        sum = sum + m.last;     // 2 * (0+3+4) = 14 each iteration
+        m.kill();               // breaks the cycle; memory stays flat
+        i = i + 1;
+    }
+    print("iterations=" + str(i));
+    print("checksum=" + str(sum));   // 5000 * 14 = 70000
+    print("reactive mem ok");
+}

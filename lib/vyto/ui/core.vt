@@ -18,6 +18,7 @@ import { ease_linear, ease_in_quad, ease_out_quad, ease_in_out_quad,
          ease_in_cubic, ease_out_cubic, ease_in_out_cubic,
          ease_out_back, ease_out_bounce, ease_in_out_sine } from "vyto/anim";
 import { Path } from "vyto/geom/path";
+import { Reactive, effect, Effect } from "vyto/reactive";
 
 export struct Size {
     w: int;
@@ -1349,6 +1350,8 @@ export class Window {
                          // read it via Widget.mods() in on_key/on_click/on_drag
     scale: float;        // UI scale factor (1.0 = 96dpi); themes are scaled by
                          // it at run(); pass it to GfxPainter font sizes too
+    rt: Reactive;        // per-window reactive domain (vyto/reactive); effects
+                         // created via watch() update widgets on signal changes
 
     fn init(title: string, w: int, h: int) {
         this.surf = new Surface(title, w, h);
@@ -1361,6 +1364,17 @@ export class Window {
         this.focus_i = -1;
         this.close_on_esc = true;
         this.scale = this.surf.scale();
+        this.rt = new Reactive();
+    }
+
+    // Bind reactive state to the UI: `body` reads signals/computeds and updates
+    // widgets (typically `w.invalidate()` on the ones it changes). It runs once
+    // now and re-runs whenever a dependency changes. Within an event handler the
+    // normal post-dispatch redraw presents the result. The effect is owned by
+    // this window's domain and disposed on close, so a body capturing widgets
+    // never leaks (the capture cycle is broken at teardown).
+    fn watch(body: fn()): Effect {
+        return effect(this.rt, body);
     }
 
     // Register a Tween to be advanced on the ~60fps clock; call from a
@@ -1933,6 +1947,10 @@ export class Window {
         }
         // break handler->owner->tree reference cycles so RC frees everything;
         // apps never need a manual teardown.
+        // Dispose the reactive domain first: watch() effects strong-capture the
+        // widgets they update, so nulling their closures here breaks that cycle
+        // before release_all() frees the tree.
+        if (this.rt != null) { this.rt.dispose(); }
         // Cancel any still-active tween (looping, or mid-flight at close): each
         // one's on_tick closure strong-captures its widget + itself.
         for (let t in this.animations) { t.cancel(); }

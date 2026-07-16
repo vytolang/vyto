@@ -1,0 +1,58 @@
+// vyto/reactive — fine-grained signals, computeds, and effects.
+//
+// Demonstrates the accuracy guarantees: a diamond dependency recomputes each
+// node exactly once (glitch-free), an equal-value write does nothing, a batch
+// flushes effects once, and dependency tracking is dynamic (stale dependencies
+// are dropped so they no longer trigger recomputes).
+
+import { Reactive, sig_int, sig_bool, comp_int, effect, batch } from "vyto/reactive";
+
+fn main() {
+    let rt = new Reactive();
+
+    // ---- diamond: root -> {a, b} -> c ----
+    // Each computed prints when it actually recomputes, so we can see that a
+    // single root change recomputes each node once, never twice (no glitch).
+    let root = sig_int(rt, 1);
+    let a = comp_int(rt, () => { let r = root.get() + 1; print("  ~a"); return r; });
+    let b = comp_int(rt, () => { let r = root.get() * 2; print("  ~b"); return r; });
+    let c = comp_int(rt, () => { let r = a.get() + b.get(); print("  ~c"); return r; });
+
+    print("initial:");
+    effect(rt, () => { print("c=" + str(c.get())); });
+
+    print("root=5:");
+    root.set(5);              // a,b,c each recompute once; effect fires once
+
+    print("root=5 again (no-op):");
+    root.set(5);              // equal value -> zero work, nothing printed
+
+    // ---- batch: two writes, one effect run ----
+    print("batch x,y:");
+    let x = sig_int(rt, 0);
+    let y = sig_int(rt, 0);
+    let sum = comp_int(rt, () => x.get() + y.get());
+    effect(rt, () => { print("sum=" + str(sum.get())); });   // prints sum=0
+    batch(rt, () => {
+        x.set(3);
+        y.set(4);
+    });                       // one run -> sum=7
+
+    // ---- dynamic dependencies ----
+    // `sel` reads `use_a`, then either `va` or `vb`. Writing the branch that
+    // isn't currently selected must NOT recompute it.
+    print("dynamic deps:");
+    let use_a = sig_bool(rt, true);
+    let va = sig_int(rt, 10);
+    let vb = sig_int(rt, 20);
+    let sel = comp_int(rt, () => { if (use_a.get()) { return va.get(); } return vb.get(); });
+    effect(rt, () => { print("sel=" + str(sel.get())); });    // sel=10
+
+    vb.set(99);               // vb not a dependency -> nothing
+    use_a.set(false);         // now depends on vb -> sel=99
+    va.set(11);               // va no longer a dependency -> nothing
+    vb.set(100);              // sel=100
+
+    rt.dispose();
+    print("done");
+}
