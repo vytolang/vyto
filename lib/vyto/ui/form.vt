@@ -46,7 +46,9 @@ export class Label extends Widget {
 }
 
 export class Button extends Widget {
-    label: string;
+    label: string;      // display text (what's painted on the button)
+    value: string;      // logical value (what the app reads on click); defaults
+                        // to label, set it when display text != the value
     onClick: fn(Button);
     lift: float;        // 0..1 hover-lift amount, animated on enter/leave
     lift_tw: Tween;     // in-flight lift animation (cancelled on re-trigger)
@@ -54,8 +56,16 @@ export class Button extends Widget {
     fn init(label: string) {
         super.init();
         this.label = label;
+        this.value = label;   // default: value mirrors the label
         this.focusable = true;
         this.lift = 0.0;
+    }
+
+    // Set the logical value independent of the display label. Returns this for
+    // fluent construction: new Button("OK").with_value("confirm").
+    fn with_value(v: string): Button {
+        this.value = v;
+        return this;
     }
 
     fn fire() {
@@ -440,14 +450,23 @@ export class SearchField extends TextField {
 }
 
 export class Checkbox extends Widget {
-    label: string;
+    label: string;      // display text
+    value: string;      // logical value / form key; defaults to label
     checked: bool;
     onToggle: fn(bool);
 
     fn init(label: string) {
         super.init();
         this.label = label;
+        this.value = label;   // default: value mirrors the label
         this.focusable = true;
+    }
+
+    // Set the form value independent of the display label. Fluent:
+    // new Checkbox("Accept terms").with_value("accepted").
+    fn with_value(v: string): Checkbox {
+        this.value = v;
+        return this;
     }
 
     fn toggle() {
@@ -1349,7 +1368,8 @@ export class Switch extends Widget {
 
 // Single-select horizontal button group.
 export class SegmentedControl extends Widget {
-    labels: string[];
+    labels: string[];   // display text per segment
+    values: string[];   // logical value per segment; empty => falls back to labels
     selected: int;
     onSelect: fn(int);
     cached_seg_w: int;
@@ -1357,9 +1377,24 @@ export class SegmentedControl extends Widget {
     fn init(labels: string[]) {
         super.init();
         this.labels = labels;
+        this.values = [];
         this.selected = 0;
         this.cached_seg_w = 0;
         this.focusable = true;
+    }
+
+    // Value at index i: the parallel value if provided, else the label.
+    fn value_of(i: int): string {
+        if (i >= 0 && i < this.values.len) { return this.values[i]; }
+        if (i >= 0 && i < this.labels.len) { return this.labels[i]; }
+        return "";
+    }
+
+    fn selected_value(): string { return this.value_of(this.selected); }
+
+    fn with_values(v: string[]): SegmentedControl {
+        this.values = v;
+        return this;
     }
 
     fn seg_w(s: Painter): int {
@@ -1563,15 +1598,31 @@ export class Stepper extends Widget {
 
 // A button that opens a MenuPopup-style overlay list; onSelect(index).
 export class Dropdown extends Widget {
-    items: string[];
+    labels: string[];   // display text per item
+    values: string[];   // logical value per item; empty => falls back to labels
     selected: int;
     onSelect: fn(int);
 
-    fn init(items: string[]) {
+    fn init(labels: string[]) {
         super.init();
-        this.items = items;
+        this.labels = labels;
+        this.values = [];
         this.selected = 0;
         this.focusable = true;
+    }
+
+    // Value at index i: the parallel value if provided, else the label.
+    fn value_of(i: int): string {
+        if (i >= 0 && i < this.values.len) { return this.values[i]; }
+        if (i >= 0 && i < this.labels.len) { return this.labels[i]; }
+        return "";
+    }
+
+    fn selected_value(): string { return this.value_of(this.selected); }
+
+    fn with_values(v: string[]): Dropdown {
+        this.values = v;
+        return this;
     }
 
     fn open_popup() {
@@ -1581,14 +1632,14 @@ export class Dropdown extends Widget {
     }
 
     fn pick(i: int) {
-        if (i < 0 || i >= this.items.len) { return; }
+        if (i < 0 || i >= this.labels.len) { return; }
         this.selected = i;
         if (this.onSelect != null) { this.onSelect(i); }
     }
 
     override fn measure(s: Painter, th: Theme): Size {
         let w = 40;
-        for (let it in this.items) {
+        for (let it in this.labels) {
             let iw = s.text_width(it) + 40;
             if (iw > w) { w = iw; }
         }
@@ -1601,8 +1652,8 @@ export class Dropdown extends Widget {
         // communicates state, so redundant hover tint is a wash either way).
         this.win.skin.field.paint_box(s, th, this.bounds, this.focused, this.hovered, this.win.skin);
         let label = "";
-        if (this.selected >= 0 && this.selected < this.items.len) {
-            label = this.items[this.selected];
+        if (this.selected >= 0 && this.selected < this.labels.len) {
+            label = this.labels[this.selected];
         }
         s.set_weight(th.type_body_weight);
         s.text_in(this.bounds, 8, label, th.on_surface);
@@ -1646,11 +1697,11 @@ class DropdownPopup extends Widget {
     override fn place(s: Painter, th: Theme) {
         this.row_h = s.font_height() + 8;
         let w = 40;
-        for (let it in this.dd.items) {
+        for (let it in this.dd.labels) {
             let iw = s.text_width(it) + 16;
             if (iw > w) { w = iw; }
         }
-        let h = this.dd.items.len * this.row_h + 2;
+        let h = this.dd.labels.len * this.row_h + 2;
         let x = this.dd.bounds.x;
         let y = this.dd.bounds.y + this.dd.bounds.h;
         if (x + w > s.width()) { x = s.width() - w; }
@@ -1659,7 +1710,7 @@ class DropdownPopup extends Widget {
     }
 
     fn choose() {
-        if (this.sel < 0 || this.sel >= this.dd.items.len) { return; }
+        if (this.sel < 0 || this.sel >= this.dd.labels.len) { return; }
         // Capture references before dismiss_overlay() drops us from the
         // Window's overlay slot — after that, `this` may be freed.
         let dd = this.dd;
@@ -1673,30 +1724,30 @@ class DropdownPopup extends Widget {
         let radius = th.radius_md;
         // elevated dropdown menu: a soft shadow trails the panel
         this.win.skin.panel.paint(s, th, this.bounds, radius, th.surface_raised, th.border, 2);
-        for (let i in 0..this.dd.items.len) {
+        for (let i in 0..this.dd.labels.len) {
             let r = Rect(this.bounds.x + 2, this.bounds.y + 1 + i * this.row_h,
                          this.bounds.w - 4, this.row_h);
             if (i == this.sel) {
                 s.fill_round(r, th.radius_sm, th.selection);
                 s.set_weight(WEIGHT_BOLD);
-                s.text_in(r, 8, this.dd.items[i], th.primary);
+                s.text_in(r, 8, this.dd.labels[i], th.primary);
                 s.set_weight(WEIGHT_REG);
             } else {
-                s.text_in(r, 8, this.dd.items[i], th.on_surface);
+                s.text_in(r, 8, this.dd.labels[i], th.on_surface);
             }
         }
     }
 
     override fn on_key(k: int, ch: string): bool {
         if (k == KEY_UP) { if (this.sel > 0) { this.sel -= 1; } return true; }
-        if (k == KEY_DOWN) { if (this.sel < this.dd.items.len - 1) { this.sel += 1; } return true; }
+        if (k == KEY_DOWN) { if (this.sel < this.dd.labels.len - 1) { this.sel += 1; } return true; }
         if (k == KEY_ENTER || k == 32) { this.choose(); return true; }
         return false;
     }
 
     override fn on_click(x: int, y: int): bool {
         let row = (y - this.bounds.y - 1) / this.row_h;
-        if (row >= 0 && row < this.dd.items.len) {
+        if (row >= 0 && row < this.dd.labels.len) {
             this.sel = row;
             this.choose();
         }
