@@ -417,6 +417,9 @@ static Local *scope_find(Scope *s, const char *name) {
 static Local *define_local(Ctx *c, const char *name, Type *type, bool is_param, Loc loc) {
     for (ScopeEntry *e = c->scope->entries; e; e = e->next)
         if (e->name == name) fatal_at(loc, "duplicate name '%s' in this scope", name);
+    Decl *cd = mod_lookup(c->mod, name);
+    if (cd && cd->kind == D_CONST)
+        fatal_at(loc, "cannot shadow constant '%s'", name);
     Local *l = NEW(Local);
     l->name = name;
     l->type = type;
@@ -1965,7 +1968,12 @@ static Type *check_expr(Ctx *c, Expr *e, Type *expected) {
         Type *lt;
         if (lhs->kind == EX_IDENT) {
             Local *l = lookup_value(c, lhs, lhs->name);
-            if (!l) fatal_at(lhs->loc, "unknown variable '%s'", lhs->name);
+            if (!l) {
+                Decl *cd = mod_lookup(c->mod, lhs->name);
+                if (cd && cd->kind == D_CONST)
+                    fatal_at(lhs->loc, "cannot assign to constant '%s'", lhs->name);
+                fatal_at(lhs->loc, "unknown variable '%s'", lhs->name);
+            }
             if (lhs->ref == REF_CAPTURE)
                 fatal_at(lhs->loc, "cannot assign to captured variable (captures are by value)");
             l->assigned = true;
@@ -2379,8 +2387,9 @@ static CVal fold_const_decl(Decl *d) {
 
 static void check_const(Module *m, Decl *d) {
     Expr *e = d->const_init;
-    /* null stays as-is (rawptr/cstring consts); everything else folds to a literal. */
-    if (e->kind != EX_NULL) fold_const_decl(d);
+    /* null stays as-is (rawptr/cstring consts); string literals stay as-is (emitted as
+       immortal strings); everything else folds to a numeric/bool literal. */
+    if (e->kind != EX_NULL && e->kind != EX_STR) fold_const_decl(d);
     e = d->const_init;
     Ctx c = {0};
     c.mod = m;

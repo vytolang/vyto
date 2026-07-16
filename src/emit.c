@@ -947,6 +947,9 @@ static char *ex(Em *em, Expr *e, bool *fresh) {
         case REF_LOCAL: case REF_PARAM: return arena_strdup(&g_arena, e->local->cname);
         case REF_CAPTURE: return arena_printf(&g_arena, "_env->c_%s", e->name);
         case REF_CONST:
+            /* string consts are lazy accessors: call them; all others are plain globals. */
+            if (e->decl->const_init->kind == EX_STR)
+                return arena_printf(&g_arena, "v_%s_%s()", e->decl->module->name, e->name);
             return arena_printf(&g_arena, "v_%s_%s", e->decl->module->name, e->name);
         case REF_GLOBAL_FN: {
             /* function used as a closure value: emit a thunk once, and hand
@@ -1894,6 +1897,16 @@ void emit_module(Module *m, bool is_entry, bool checks, bool freestanding, SBuf 
             break;
         case D_CONST: {
             Expr *e = d->const_init;
+            if (e->kind == EX_STR) {
+                /* string consts are immortal strings, built lazily on first use; a
+                   static inline accessor avoids unused-variable warnings across TUs. */
+                sb_printf(h, "static inline VtString* v_%s_%s(void) {\n"
+                             "    static VtString* _s;\n"
+                             "    return _s ? _s : (_s = vt_str_immortal(\"%s\", %d));\n"
+                             "}\n",
+                          m->name, d->name, c_escape(e->sval, e->slen), (int)e->slen);
+                break;
+            }
             const char *v;
             if (e->kind == EX_INT) v = arena_printf(&g_arena, "%lldLL", (long long)e->ival);
             else if (e->kind == EX_FLOAT) v = arena_printf(&g_arena, "%.17g", e->fval);
