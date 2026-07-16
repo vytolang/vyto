@@ -1,0 +1,1999 @@
+// vyto/ui/chart — a small charting library: fast, smooth charts of the common
+// kinds with minimal code. One-liner factories (lineChart, barChart, areaChart,
+// pieChart) mirror the dataTable(df) ergonomics; fluent setters tune the rest.
+//
+//     let c = lineChart([1.0, 4.0, 2.0, 8.0, 5.0]).title("Sales").smooth(true);
+//     win.root = new Center([c]);
+//
+// Rendering is rich-first: on the gfx tier (GfxPainter) curves/fills are
+// anti-aliased; on the lean X11 tier every primitive degrades automatically
+// (Path.flatten, polygon bounding fills) — same graceful-degrade contract as
+// the rest of vyto/ui. No new drawing primitives are introduced; this is a pure
+// composition over the Painter vocabulary in core.vt.
+//
+// Live data: hold your series in a signal and repaint from win.watch:
+//     win.watch(() => { chart.series[0].values = data.get(); chart.invalidate(); });
+
+import { Widget, Painter, Theme, Size, EASE_OUT_CUBIC } from "vyto/ui/core";
+import { Tween } from "vyto/ui/anim";
+import { Rect, mix, with_alpha, rgb } from "vyto/surface";
+import { sin, cos, sqrt, atan2, PI, TAU, floor, ceil, pow, log10, fmax, fmin } from "vyto/math";
+import { Path } from "vyto/geom/path";
+import { fixed } from "vyto/util/fmt";
+
+// ------------------------------------------------------------ data model
+
+// A named list of y-values. `color` 0 means "auto" — pull from the theme
+// palette by series index. A class (not a struct) so setters can mutate it in
+// place and callers can share it with a signal.
+export class Series {
+    name: string;
+    values: float[];
+    color: int;
+
+    fn init(name: string, values: float[]) {
+        this.name = name;
+        this.values = values;
+        this.color = 0;
+    }
+}
+
+// Convenience constructor: an auto-colored series.
+export fn series(name: string, values: float[]): Series {
+    return new Series(name, values);
+}
+
+// ------------------------------------------------------------ value scaling
+
+struct Range {
+    lo: float;
+    hi: float;
+}
+
+// A "nice" y-axis: rounded min/max and a rounded tick step.
+struct AxisScale {
+    lo: float;
+    hi: float;
+    step: float;
+}
+
+// The classic Heckbert "nice number" rounding: snap x to 1/2/5 * 10^k. When
+// `round_it`, snap to the nearest such value; otherwise snap up (ceiling).
+fn nice_num(x: float, round_it: bool): float {
+    if (x <= 0.0) { return 1.0; }
+    let expv = floor(log10(x));
+    let f = x / pow(10.0, expv);   // 1..10
+    let nf = 10.0;
+    if (round_it) {
+        if (f < 1.5) { nf = 1.0; }
+        else if (f < 3.0) { nf = 2.0; }
+        else if (f < 7.0) { nf = 5.0; }
+    } else {
+        if (f <= 1.0) { nf = 1.0; }
+        else if (f <= 2.0) { nf = 2.0; }
+        else if (f <= 5.0) { nf = 5.0; }
+    }
+    return nf * pow(10.0, expv);
+}
+
+// Fractional digits to print for a given tick step.
+fn tick_prec(step: float): int {
+    if (step >= 1.0) { return 0; }
+    if (step >= 0.1) { return 1; }
+    return 2;
+}
+
+// Label for a log-axis decade value (a power of 10). Whole values print as
+// integers; sub-unit decades get just enough fractional digits.
+fn log_tick_label(v: float): string {
+    if (v >= 1.0) { return fixed(v, 0); }
+    if (v >= 0.1) { return fixed(v, 1); }
+    if (v >= 0.01) { return fixed(v, 2); }
+    return fixed(v, 3);
+}
+
+// ------------------------------------------------------------ path builders
+
+// A straight polyline through the pixel points.
+fn poly_line_path(xs: float[], ys: float[]): Path {
+    let p = new Path();
+    if (xs.len == 0) { return p; }
+    p.moveTo(xs[0], ys[0]);
+    for (let i in 1..xs.len) { p.lineTo(xs[i], ys[i]); }
+    return p;
+}
+
+// A smooth Catmull-Rom spline through the points, emitted as cubic Bézier
+// segments (crisp on the rich tier, flattened on the lean tier).
+fn smooth_path(xs: float[], ys: float[]): Path {
+    let p = new Path();
+    let n = xs.len;
+    if (n == 0) { return p; }
+    p.moveTo(xs[0], ys[0]);
+    if (n < 3) {
+        for (let i in 1..n) { p.lineTo(xs[i], ys[i]); }
+        return p;
+    }
+    for (let i in 0..(n - 1)) {
+        let p0i = i - 1;
+        if (p0i < 0) { p0i = 0; }
+        let p3i = i + 2;
+        if (p3i > n - 1) { p3i = n - 1; }
+        let x0 = xs[p0i]; let y0 = ys[p0i];
+        let x1 = xs[i];   let y1 = ys[i];
+        let x2 = xs[i + 1]; let y2 = ys[i + 1];
+        let x3 = xs[p3i]; let y3 = ys[p3i];
+        let c1x = x1 + (x2 - x0) / 6.0;
+        let c1y = y1 + (y2 - y0) / 6.0;
+        let c2x = x2 - (x3 - x1) / 6.0;
+        let c2y = y2 - (y3 - y1) / 6.0;
+        p.cubicTo(c1x, c1y, c2x, c2y, x2, y2);
+    }
+    return p;
+}
+
+// ------------------------------------------------------------ chart base
+
+// Shared machinery for every chart: card chrome, title, axes/grid, legend,
+// draw-in animation, and index hover/tooltip. Subclasses implement draw_plot().
+export class ChartBase extends Widget {
+    title_txt: string;
+    series: Series[];
+    labels: string[];
+    show_legend: bool;
+    show_grid: bool;
+    show_axes: bool;
+    range_set: bool;
+    ymin: float;
+    ymax: float;
+    log_y: bool;         // y-axis on a log10 scale (decade ticks)
+    reveal: float;       // 0..1 draw-in progress
+    animated: bool;
+    started: bool;
+    tween: Tween;
+    hover_idx: int;
+    pref_w: int;
+    pref_h: int;
+    last_plot: Rect;     // plot area from the most recent draw (for hit-testing)
+    last_sc: AxisScale;
+
+    fn init(series: Series[], labels: string[]) {
+        super.init();
+        this.title_txt = "";
+        this.series = series;
+        this.labels = labels;
+        this.show_legend = true;
+        this.show_grid = true;
+        this.show_axes = true;
+        this.range_set = false;
+        this.log_y = false;
+        this.reveal = 0.0;
+        this.animated = true;
+        this.started = false;
+        this.hover_idx = -1;
+        this.pref_w = 380;
+        this.pref_h = 260;
+        this.last_plot = Rect(0, 0, 0, 0);
+        this.last_sc = AxisScale(0.0, 1.0, 1.0);
+    }
+
+    // -- fluent setters (builder → returns the concrete subclass) ----------
+    builder fn title(t: string) { this.title_txt = t; return this; }
+    builder fn legend(b: bool) { this.show_legend = b; return this; }
+    builder fn grid(b: bool) { this.show_grid = b; return this; }
+    builder fn axes(b: bool) { this.show_axes = b; return this; }
+    builder fn range(lo: float, hi: float) {
+        this.range_set = true; this.ymin = lo; this.ymax = hi; return this;
+    }
+    // Put the y-axis on a log10 scale: ticks/grid land on decades and values map
+    // through log10. Non-positive values clamp to the axis floor.
+    builder fn logY(b: bool) { this.log_y = b; return this; }
+    builder fn size(w: int, h: int) { this.pref_w = w; this.pref_h = h; return this; }
+    builder fn color(i: int, c: int) {
+        if (i >= 0 && i < this.series.len) { this.series[i].color = c; }
+        return this;
+    }
+    // Skip the draw-in animation (snaps to final frame). Used by headless tests.
+    builder fn instant() { this.animated = false; this.reveal = 1.0; this.started = true; return this; }
+
+    override fn measure(s: Painter, th: Theme): Size {
+        return Size(this.pref_w, this.pref_h);
+    }
+
+    // -- palette ------------------------------------------------------------
+    fn palette(i: int, th: Theme): int {
+        let n = 7;
+        let k = i % n;
+        if (k == 0) { return th.primary_500; }
+        if (k == 1) { return th.success; }
+        if (k == 2) { return th.warning; }
+        if (k == 3) { return th.danger; }
+        if (k == 4) { return th.info; }
+        if (k == 5) { return th.primary_300; }
+        return th.neutral_500;
+    }
+    fn color_of(i: int, th: Theme): int {
+        if (i >= 0 && i < this.series.len && this.series[i].color != 0) {
+            return this.series[i].color;
+        }
+        return this.palette(i, th);
+    }
+
+    // -- data extents -------------------------------------------------------
+    // Longest series (number of categories / points).
+    fn cat_count(): int {
+        let m = 0;
+        for (let s in this.series) { if (s.values.len > m) { m = s.values.len; } }
+        return m;
+    }
+
+    // Subclasses that rest bars/area on a zero baseline return true.
+    virtual fn include_zero(): bool { return false; }
+
+    virtual fn data_range(): Range {
+        let lo = 0.0; let hi = 0.0; let any = false;
+        for (let s in this.series) {
+            for (let v in s.values) {
+                if (!any) { lo = v; hi = v; any = true; }
+                else { lo = fmin(lo, v); hi = fmax(hi, v); }
+            }
+        }
+        if (!any) { lo = 0.0; hi = 1.0; }
+        if (this.include_zero()) {
+            if (lo > 0.0) { lo = 0.0; }
+            if (hi < 0.0) { hi = 0.0; }
+        }
+        if (hi <= lo) { hi = lo + 1.0; }
+        return Range(lo, hi);
+    }
+
+    // Snap [lo,hi] out to whole decades for a log axis. `step` carries the
+    // decade count (unused by the log tick loop, which walks powers of 10).
+    fn compute_log_scale(): AxisScale {
+        let lo = this.ymin; let hi = this.ymax;
+        if (!this.range_set) { let rg = this.data_range(); lo = rg.lo; hi = rg.hi; }
+        // a log axis needs a strictly positive floor
+        if (hi <= 0.0) { hi = 1.0; }
+        if (lo <= 0.0) { lo = hi / 1000.0; }
+        if (lo >= hi) { lo = hi / 10.0; }
+        let elo = floor(log10(lo));
+        let ehi = ceil(log10(hi));
+        if (ehi <= elo) { ehi = elo + 1.0; }
+        return AxisScale(pow(10.0, elo), pow(10.0, ehi), ehi - elo);
+    }
+
+    fn compute_scale(target: int): AxisScale {
+        if (this.log_y) { return this.compute_log_scale(); }
+        if (this.range_set) {
+            let span = this.ymax - this.ymin;
+            if (span <= 0.0) { span = 1.0; }
+            let st = nice_num(span / ((target - 1) as float), true);
+            return AxisScale(this.ymin, this.ymax, st);
+        }
+        let rg = this.data_range();
+        let span = rg.hi - rg.lo;
+        if (span <= 0.0) { span = 1.0; }
+        let nspan = nice_num(span, false);
+        let step = nice_num(nspan / ((target - 1) as float), true);
+        let nlo = floor(rg.lo / step) * step;
+        let nhi = ceil(rg.hi / step) * step;
+        return AxisScale(nlo, nhi, step);
+    }
+
+    // value → pixel y (static, no animation)
+    fn vy(v: float, plot: Rect, sc: AxisScale): float {
+        let t = 0.0;
+        if (this.log_y) {
+            let lo = sc.lo; if (lo <= 0.0) { lo = 1.0; }
+            let vv = v; if (vv < lo) { vv = lo; }
+            let span = log10(sc.hi) - log10(lo);
+            if (span > 0.0) { t = (log10(vv) - log10(lo)) / span; }
+        } else {
+            t = (v - sc.lo) / (sc.hi - sc.lo);
+        }
+        return ((plot.y + plot.h) as float) - t * (plot.h as float);
+    }
+    // value → pixel y, interpolated from the baseline by `reveal` (draw-in)
+    fn vyr(v: float, plot: Rect, sc: AxisScale): float {
+        let base = (plot.y + plot.h) as float;
+        return base + (this.vy(v, plot, sc) - base) * this.reveal;
+    }
+
+    // category index → pixel x center. Line/area spread points edge-to-edge;
+    // BarChart overrides to slot centers.
+    virtual fn x_of(i: int, plot: Rect): int {
+        let n = this.cat_count();
+        if (n <= 1) { return plot.x + plot.w / 2; }
+        return plot.x + (i * plot.w) / (n - 1);
+    }
+
+    // -- animation ----------------------------------------------------------
+    fn ensure_anim() {
+        if (this.started) { return; }
+        this.started = true;
+        if (!this.animated) { this.reveal = 1.0; return; }
+        let self = this;
+        this.tween = this.animate_value(0.0, 1.0, 500, false, EASE_OUT_CUBIC, (v) => {
+            self.reveal = v;
+        });
+    }
+
+    override fn drop_handlers() {
+        if (this.tween != null) { this.tween.cancel(); this.tween = null; }
+    }
+
+    // -- draw ---------------------------------------------------------------
+    override fn draw(s: Painter, th: Theme) {
+        this.ensure_anim();
+        let b = this.bounds;
+        s.fill_round(b, th.radius_lg, th.surface_raised);
+        s.stroke_round(b, th.radius_lg, 1, th.border);
+
+        let pad = th.space_4;
+        let top = b.y + pad;
+        let bottom = b.y + b.h - pad;
+        let left = b.x + pad;
+        let right = b.x + b.w - pad;
+
+        // title
+        if (this.title_txt.len > 0) {
+            s.text(left, top + s.font_ascent(), this.title_txt, th.on_surface);
+            top += s.font_height() + th.space_2;
+        }
+
+        // legend strip along the bottom
+        if (this.show_legend && this.legend_count() > 0) {
+            let lh = s.font_height() + th.space_2;
+            bottom -= lh;
+            this.draw_legend(s, th, Rect(left, bottom + th.space_1, right - left, lh));
+        }
+
+        // scale + gutters
+        let sc = this.compute_scale(5);
+        this.last_sc = sc;
+        let gl = 0;
+        let gb = 0;
+        if (this.show_axes) {
+            gl = this.y_gutter(s, th, sc);
+            gb = s.font_height() + th.space_1;
+        }
+        let plot = Rect(left + gl, top, right - (left + gl), bottom - top - gb);
+        if (plot.w < 8 || plot.h < 8) { return; }
+        this.last_plot = plot;
+
+        if (this.show_axes) { this.draw_axes(s, th, plot, sc); }
+
+        s.clip_push(plot, 0);
+        this.draw_plot(s, th, plot, sc);
+        s.clip_pop();
+
+        this.draw_tooltip(s, th, plot, sc);
+    }
+
+    // Repaint the whole widget on any overlapping dirty rect (it both paints
+    // content and owns no child widgets that could repaint independently).
+    override fn draw_within(s: Painter, th: Theme, d: Rect) {
+        this.draw(s, th);
+    }
+
+    // width reserved for y-axis tick labels
+    fn y_gutter(s: Painter, th: Theme, sc: AxisScale): int {
+        let maxw = 0;
+        if (this.log_y) {
+            let e = floor(log10(sc.lo));
+            let ehi = ceil(log10(sc.hi));
+            while (e <= ehi + 0.5) {
+                let w = s.text_width(log_tick_label(pow(10.0, e)));
+                if (w > maxw) { maxw = w; }
+                e += 1.0;
+            }
+            return maxw + th.space_2;
+        }
+        let prec = tick_prec(sc.step);
+        let v = sc.lo;
+        while (v <= sc.hi + sc.step * 0.5) {
+            let w = s.text_width(fixed(v, prec));
+            if (w > maxw) { maxw = w; }
+            v += sc.step;
+        }
+        return maxw + th.space_2;
+    }
+
+    virtual fn draw_axes(s: Painter, th: Theme, plot: Rect, sc: AxisScale) {
+        this.draw_yaxis(s, th, plot, sc);
+    }
+
+    // y-axis ticks/grid + x category labels. Split out so subclasses that add
+    // their own axis decoration can reuse it without a super call (Vyto only
+    // supports super.init, not super.method).
+    fn draw_yaxis(s: Painter, th: Theme, plot: Rect, sc: AxisScale) {
+        if (this.log_y) {
+            let e = floor(log10(sc.lo));
+            let ehi = ceil(log10(sc.hi));
+            while (e <= ehi + 0.5) {
+                let val = pow(10.0, e);
+                let y = this.vy(val, plot, sc) as int;
+                if (this.show_grid) { s.line(plot.x, y, plot.x + plot.w, y, th.divider); }
+                let lbl = log_tick_label(val);
+                let ly = y + s.font_ascent() - s.font_height() / 2;
+                s.text(plot.x - th.space_2 - s.text_width(lbl), ly, lbl, th.on_surface_muted);
+                e += 1.0;
+            }
+        } else {
+            let prec = tick_prec(sc.step);
+            let v = sc.lo;
+            while (v <= sc.hi + sc.step * 0.5) {
+                let y = this.vy(v, plot, sc) as int;
+                if (this.show_grid) {
+                    s.line(plot.x, y, plot.x + plot.w, y, th.divider);
+                }
+                let lbl = fixed(v, prec);
+                let ly = y + s.font_ascent() - s.font_height() / 2;
+                s.text(plot.x - th.space_2 - s.text_width(lbl), ly, lbl, th.on_surface_muted);
+                v += sc.step;
+            }
+        }
+        // x category labels
+        if (this.labels.len > 0) {
+            let by = plot.y + plot.h + s.font_ascent() + th.space_1;
+            let n = this.cat_count();
+            for (let i in 0..n) {
+                if (i < this.labels.len) {
+                    let lbl = this.labels[i];
+                    let cx = this.x_of(i, plot);
+                    s.text(cx - s.text_width(lbl) / 2, by, lbl, th.on_surface_muted);
+                }
+            }
+        }
+    }
+
+    // -- legend (series-based; PieChart overrides for per-slice entries) ----
+    virtual fn legend_count(): int { return this.series.len; }
+    virtual fn legend_name(i: int): string { return this.series[i].name; }
+    virtual fn legend_color(i: int, th: Theme): int { return this.color_of(i, th); }
+
+    fn draw_legend(s: Painter, th: Theme, area: Rect) {
+        let sw = s.font_height() - 2;
+        let x = area.x;
+        let cy = area.y + area.h / 2;
+        let n = this.legend_count();
+        for (let i in 0..n) {
+            let name = this.legend_name(i);
+            if (name.len == 0) { name = "series " + str(i + 1); }
+            s.fill_round(Rect(x, cy - sw / 2, sw, sw), th.radius_sm, this.legend_color(i, th));
+            let tx = x + sw + th.space_1;
+            s.text(tx, cy + s.font_ascent() - s.font_height() / 2, name, th.on_surface);
+            x = tx + s.text_width(name) + th.space_4;
+        }
+    }
+
+    // -- hover / tooltip ----------------------------------------------------
+    // Charts with a categorical x-axis (line/area/bar) support index hover.
+    virtual fn index_hover(): bool { return true; }
+
+    override fn hit(px: int, py: int): Widget {
+        if (this.bounds.has(px, py)) {
+            if (this.index_hover()) {
+                let idx = this.nearest_index(px);
+                if (idx != this.hover_idx) { this.hover_idx = idx; this.repaint_now(); }
+            }
+            return this;
+        }
+        return null;
+    }
+
+    // Force a repaint of this widget NOW. hit() runs inside Window.on_mouse_move
+    // *before* set_hover(), and set_hover early-returns (no repaint) when the
+    // hovered widget hasn't changed — which it hasn't, the cursor is still over
+    // this chart. So a bare invalidate() would mark the rect dirty but never
+    // present it; the tooltip would freeze at its first position. Repaint here.
+    fn repaint_now() {
+        if (this.win != null) { this.win.mark_dirty(this.bounds); this.win.repaint(); }
+    }
+
+    override fn on_hover_leave(): bool {
+        if (this.hover_idx != -1) { this.hover_idx = -1; return true; }
+        return false;
+    }
+
+    fn nearest_index(px: int): int {
+        let n = this.cat_count();
+        if (n <= 0) { return -1; }
+        let best = -1;
+        let bestd = 1000000000;
+        for (let i in 0..n) {
+            let dx = px - this.x_of(i, this.last_plot);
+            if (dx < 0) { dx = -dx; }
+            if (dx < bestd) { bestd = dx; best = i; }
+        }
+        return best;
+    }
+
+    fn draw_tooltip(s: Painter, th: Theme, plot: Rect, sc: AxisScale) {
+        if (!this.index_hover()) { return; }
+        let i = this.hover_idx;
+        if (i < 0 || i >= this.cat_count()) { return; }
+        let hx = this.x_of(i, plot);
+        s.line(hx, plot.y, hx, plot.y + plot.h, th.neutral_400);
+
+        // dots + collect lines
+        let prec = tick_prec(sc.step);
+        let head = "";
+        if (i < this.labels.len) { head = this.labels[i]; }
+        let lines: string[] = [];
+        if (head.len > 0) { lines.push(head); }
+        for (let si in 0..this.series.len) {
+            let vals = this.series[si].values;
+            if (i < vals.len) {
+                let py = this.vy(vals[i], plot, sc) as int;
+                s.circle(hx, py, 3, this.color_of(si, th));
+                let nm = this.series[si].name;
+                if (nm.len == 0) { nm = "series " + str(si + 1); }
+                lines.push(nm + ": " + fixed(vals[i], prec));
+            }
+        }
+        if (lines.len == 0) { return; }
+
+        // box geometry
+        let tw = 0;
+        for (let ln in lines) { let w = s.text_width(ln); if (w > tw) { tw = w; } }
+        let lh = s.font_height() + 2;
+        let bw = tw + th.space_3 * 2;
+        let bh = lh * lines.len + th.space_2;
+        let bx = hx + th.space_2;
+        if (bx + bw > plot.x + plot.w) { bx = hx - th.space_2 - bw; }
+        if (bx < plot.x) { bx = plot.x; }
+        let by = plot.y + th.space_2;
+        s.fill_round(Rect(bx, by, bw, bh), th.radius_md, th.surface);
+        s.stroke_round(Rect(bx, by, bw, bh), th.radius_md, 1, th.border);
+        let ty = by + th.space_1;
+        for (let ln in lines) {
+            s.text(bx + th.space_3, ty + s.font_ascent(), ln, th.on_surface);
+            ty += lh;
+        }
+    }
+
+    // Subclasses render the data here, clipped to `plot`.
+    virtual fn draw_plot(s: Painter, th: Theme, plot: Rect, sc: AxisScale) { }
+}
+
+// ------------------------------------------------------------ line chart
+
+export class LineChart extends ChartBase {
+    smooth_on: bool;
+    markers_on: bool;
+
+    fn init(series: Series[], labels: string[]) {
+        super.init(series, labels);
+        this.smooth_on = false;
+        this.markers_on = true;
+    }
+
+    builder fn smooth(b: bool) { this.smooth_on = b; return this; }
+    builder fn markers(b: bool) { this.markers_on = b; return this; }
+
+    override fn draw_plot(s: Painter, th: Theme, plot: Rect, sc: AxisScale) {
+        for (let si in 0..this.series.len) {
+            let vals = this.series[si].values;
+            if (vals.len == 0) { continue; }
+            let color = this.color_of(si, th);
+            let xs: float[] = [];
+            let ys: float[] = [];
+            for (let i in 0..vals.len) {
+                xs.push(this.x_of(i, plot) as float);
+                ys.push(this.vyr(vals[i], plot, sc));
+            }
+            let path = poly_line_path(xs, ys);
+            if (this.smooth_on) { path = smooth_path(xs, ys); }
+            s.stroke_path(path, 2, color);
+            if (this.markers_on) {
+                for (let i in 0..xs.len) {
+                    s.circle(xs[i] as int, ys[i] as int, 3, color);
+                }
+            }
+        }
+    }
+}
+
+// ------------------------------------------------------------ area chart
+
+export class AreaChart extends ChartBase {
+    smooth_on: bool;
+    stacked_on: bool;
+
+    fn init(series: Series[], labels: string[]) {
+        super.init(series, labels);
+        this.smooth_on = true;
+        this.stacked_on = false;
+    }
+
+    builder fn smooth(b: bool) { this.smooth_on = b; return this; }
+    // Stack the series into cumulative bands instead of overlaying them.
+    builder fn stacked() { this.stacked_on = true; return this; }
+
+    override fn include_zero(): bool { return true; }
+
+    // Stacked: the y extent is the per-category *sum* of positive values, else
+    // the top band clips. (No super.method in Vyto, so the linear branch inlines
+    // the base include-zero logic.)
+    override fn data_range(): Range {
+        if (this.stacked_on) {
+            let n = this.cat_count();
+            let hi = 0.0;
+            for (let i in 0..n) {
+                let sum = 0.0;
+                for (let sr in this.series) {
+                    if (i < sr.values.len && sr.values[i] > 0.0) { sum += sr.values[i]; }
+                }
+                if (sum > hi) { hi = sum; }
+            }
+            if (hi <= 0.0) { hi = 1.0; }
+            return Range(0.0, hi);
+        }
+        let lo = 0.0; let hi = 0.0; let any = false;
+        for (let sr in this.series) {
+            for (let v in sr.values) {
+                if (!any) { lo = v; hi = v; any = true; }
+                else { lo = fmin(lo, v); hi = fmax(hi, v); }
+            }
+        }
+        if (!any) { lo = 0.0; hi = 1.0; }
+        if (lo > 0.0) { lo = 0.0; }
+        if (hi < 0.0) { hi = 0.0; }
+        if (hi <= lo) { hi = lo + 1.0; }
+        return Range(lo, hi);
+    }
+
+    override fn draw_plot(s: Painter, th: Theme, plot: Rect, sc: AxisScale) {
+        if (this.stacked_on) { this.draw_stacked(s, th, plot, sc); return; }
+        let base = (plot.y + plot.h) as float;
+        for (let si in 0..this.series.len) {
+            let vals = this.series[si].values;
+            if (vals.len == 0) { continue; }
+            let color = this.color_of(si, th);
+            let xs: float[] = [];
+            let ys: float[] = [];
+            for (let i in 0..vals.len) {
+                xs.push(this.x_of(i, plot) as float);
+                ys.push(this.vyr(vals[i], plot, sc));
+            }
+            // filled area: top edge, then down to the baseline and back
+            let fillp = poly_line_path(xs, ys);
+            if (this.smooth_on) { fillp = smooth_path(xs, ys); }
+            fillp.lineTo(xs[xs.len - 1], base);
+            fillp.lineTo(xs[0], base);
+            fillp.close();
+            s.fill_path(fillp, with_alpha(color, 70));
+            // crisp top stroke
+            let top = poly_line_path(xs, ys);
+            if (this.smooth_on) { top = smooth_path(xs, ys); }
+            s.stroke_path(top, 2, color);
+        }
+    }
+
+    // Cumulative bands, drawn bottom-up so higher bands overlay lower ones. Fill
+    // edges are straight (gap-free between bands); the top outline may smooth.
+    fn draw_stacked(s: Painter, th: Theme, plot: Rect, sc: AxisScale) {
+        let n = this.cat_count();
+        if (n == 0) { return; }
+        let acc: float[] = [];
+        for (let i in 0..n) { acc.push(0.0); }
+        for (let si in 0..this.series.len) {
+            let vals = this.series[si].values;
+            let color = this.color_of(si, th);
+            let xs: float[] = [];
+            let topy: float[] = [];
+            let boty: float[] = [];
+            for (let i in 0..n) {
+                let v = 0.0;
+                if (i < vals.len) { v = vals[i]; }
+                let below = acc[i];
+                let above = below + v;
+                xs.push(this.x_of(i, plot) as float);
+                boty.push(this.vyr(below, plot, sc));
+                topy.push(this.vyr(above, plot, sc));
+                acc[i] = above;
+            }
+            // band fill: straight top edge L→R, then straight bottom edge R→L
+            let fillp = poly_line_path(xs, topy);
+            for (let k in 0..n) {
+                let j = n - 1 - k;
+                fillp.lineTo(xs[j], boty[j]);
+            }
+            fillp.close();
+            s.fill_path(fillp, with_alpha(color, 90));
+            // crisp top outline (smooth optional)
+            let top = poly_line_path(xs, topy);
+            if (this.smooth_on) { top = smooth_path(xs, topy); }
+            s.stroke_path(top, 2, color);
+        }
+    }
+}
+
+// ------------------------------------------------------------ bar chart
+
+export class BarChart extends ChartBase {
+    stacked_on: bool;
+    group_frac: float;   // fraction of each category slot the bar group spans
+
+    fn init(series: Series[], labels: string[]) {
+        super.init(series, labels);
+        this.stacked_on = false;
+        this.group_frac = 0.7;
+    }
+
+    builder fn stacked() { this.stacked_on = true; return this; }
+    builder fn barWidth(frac: float) { this.group_frac = frac; return this; }
+
+    override fn include_zero(): bool { return true; }
+
+    // bars sit at slot centers, one slot per category
+    override fn x_of(i: int, plot: Rect): int {
+        let n = this.cat_count();
+        if (n <= 0) { return plot.x; }
+        return plot.x + (((i as float) + 0.5) * (plot.w as float) / (n as float)) as int;
+    }
+
+    override fn draw_plot(s: Painter, th: Theme, plot: Rect, sc: AxisScale) {
+        let n = this.cat_count();
+        if (n == 0) { return; }
+        let g = this.series.len;
+        if (g == 0) { return; }
+        let base = this.vy(0.0, plot, sc) as int;
+        let slot = (plot.w as float) / (n as float);
+        let radius = th.radius_sm;
+
+        for (let i in 0..n) {
+            let cx = (plot.x as float) + ((i as float) + 0.5) * slot;
+            if (this.stacked_on) {
+                let acc = 0.0;
+                for (let si in 0..g) {
+                    let vals = this.series[si].values;
+                    if (i >= vals.len) { continue; }
+                    let v0 = acc;
+                    acc += vals[i];
+                    let y0 = this.vyr(v0, plot, sc) as int;
+                    let y1 = this.vyr(acc, plot, sc) as int;
+                    let bw = (slot * 0.62) as int;
+                    let bx = (cx as int) - bw / 2;
+                    let ry = y1; let rh = y0 - y1;
+                    if (rh < 0) { ry = y0; rh = y1 - y0; }
+                    s.fill_round(Rect(bx, ry, bw, rh), radius, this.color_of(si, th));
+                }
+            } else {
+                let groupw = slot * this.group_frac;
+                let bw = groupw / (g as float);
+                let gx = cx - groupw / 2.0;
+                for (let si in 0..g) {
+                    let vals = this.series[si].values;
+                    if (i >= vals.len) { continue; }
+                    let y1 = this.vyr(vals[i], plot, sc) as int;
+                    let bx = (gx + (si as float) * bw) as int;
+                    let ry = y1; let rh = base - y1;
+                    if (rh < 0) { ry = base; rh = y1 - base; }
+                    s.fill_round(Rect(bx, ry, (bw as int) - 2, rh), radius, this.color_of(si, th));
+                }
+            }
+        }
+    }
+}
+
+// ------------------------------------------------------------ pie / donut
+
+export class PieChart extends ChartBase {
+    donut_frac: float;   // 0 = full pie; 0.5 = donut with a half-radius hole
+    labels_out: bool;    // draw outside labels + leader lines per slice
+    // geometry from the last draw, for slice hit-testing
+    geo_cx: float;
+    geo_cy: float;
+    geo_r: float;        // full (un-animated) outer radius
+    geo_inner: float;    // donut hole radius (0 for a full pie)
+    cum: float[];        // cumulative sweep boundaries, one per drawn slice + 1
+    sidx: int[];         // original value index for each drawn slice
+    total: float;
+    hpx: int;            // last hover cursor, for tooltip placement
+    hpy: int;
+
+    fn init(labels: string[], values: float[]) {
+        super.init([new Series("", values)], labels);
+        this.donut_frac = 0.0;
+        this.labels_out = false;
+        this.show_axes = false;
+        this.show_grid = false;
+        this.geo_r = 0.0;
+        this.cum = [];
+        this.sidx = [];
+        this.hpx = 0;
+        this.hpy = 0;
+    }
+
+    builder fn donut(frac: float) { this.donut_frac = frac; return this; }
+    // Draw each slice's label + percent outside the ring with a leader line
+    // (the pie shrinks to make room). Turning this off shows the legend instead.
+    builder fn sliceLabels(b: bool) { this.labels_out = b; return this; }
+
+    // pie hover is angular, not by x-index — handled in this.hit() below
+    override fn index_hover(): bool { return false; }
+
+    // legend entries are the slices
+    override fn legend_count(): int { return this.values().len; }
+    override fn legend_name(i: int): string {
+        if (i < this.labels.len) { return this.labels[i]; }
+        return "slice " + str(i + 1);
+    }
+    override fn legend_color(i: int, th: Theme): int { return this.palette(i, th); }
+
+    fn values(): float[] {
+        if (this.series.len == 0) { return []; }
+        return this.series[0].values;
+    }
+
+    // Which drawn slice is under the cursor? Returns the original value index,
+    // or -1 when outside the ring / in the donut hole.
+    override fn hit(px: int, py: int): Widget {
+        if (!this.bounds.has(px, py)) { return null; }
+        let idx = -1;
+        if (this.geo_r > 0.0 && this.cum.len >= 2) {
+            let dx = (px as float) - this.geo_cx;
+            let dy = (py as float) - this.geo_cy;
+            let dist = sqrt(dx * dx + dy * dy);
+            if (dist <= this.geo_r && dist >= this.geo_inner) {
+                // angle measured clockwise from the 12-o'clock start (-PI/2)
+                let rel = atan2(dy, dx) - (-PI / 2.0);
+                while (rel < 0.0) { rel += TAU; }
+                while (rel >= TAU) { rel -= TAU; }
+                for (let k in 0..(this.cum.len - 1)) {
+                    if (rel >= this.cum[k] && rel < this.cum[k + 1]) {
+                        idx = this.sidx[k];
+                    }
+                }
+            }
+        }
+        this.hpx = px;
+        this.hpy = py;
+        if (idx != this.hover_idx) { this.hover_idx = idx; this.repaint_now(); }
+        return this;
+    }
+
+    override fn draw_plot(s: Painter, th: Theme, plot: Rect, sc: AxisScale) {
+        let vals = this.values();
+        let total = 0.0;
+        for (let v in vals) { if (v > 0.0) { total += v; } }
+        if (total <= 0.0) { return; }
+        this.total = total;
+
+        let cx = (plot.x + plot.w / 2) as float;
+        let cy = (plot.y + plot.h / 2) as float;
+        let rr = plot.w;
+        if (plot.h < rr) { rr = plot.h; }
+        let rfull = (rr as float) / 2.0 - 6.0;      // stable radius for hit-testing
+        if (this.labels_out) { rfull = rfull * 0.68; }  // leave room for outside labels
+        if (rfull < 1.0) { return; }
+        let r = rfull * this.reveal;                 // radial draw-in
+
+        // record geometry + slice angle table
+        this.geo_cx = cx;
+        this.geo_cy = cy;
+        this.geo_r = rfull;
+        this.geo_inner = rfull * this.donut_frac;
+        let cum: float[] = [];
+        let sidx: int[] = [];
+        cum.push(0.0);
+
+        let a = -PI / 2.0;   // start at 12 o'clock
+        let acc = 0.0;
+        for (let i in 0..vals.len) {
+            if (vals[i] <= 0.0) { continue; }
+            let sweep = vals[i] / total * TAU;
+            let a1 = a + sweep;
+            let color = this.palette(i, th);
+            let ccx = cx;
+            let ccy = cy;
+            if (i == this.hover_idx) {
+                // pop the hovered slice out along its mid-angle + brighten
+                color = mix(color, rgb(255, 255, 255), 0.22);
+                let mid = (a + a1) / 2.0;
+                ccx = cx + 8.0 * cos(mid);
+                ccy = cy + 8.0 * sin(mid);
+            }
+            this.wedge(s, ccx, ccy, r, a, a1, color);
+            acc += sweep;
+            cum.push(acc);
+            sidx.push(i);
+            a = a1;
+        }
+        this.cum = cum;
+        this.sidx = sidx;
+
+        // donut hole
+        if (this.donut_frac > 0.0) {
+            let hole = (r * this.donut_frac) as int;
+            if (hole > 0) { s.circle(cx as int, cy as int, hole, th.surface_raised); }
+        }
+
+        if (this.labels_out) { this.draw_leaders(s, th); }
+        this.draw_slice_tooltip(s, th, plot);
+    }
+
+    // Outside label + leader per slice: a radial stub off the rim, a short
+    // horizontal jog, then the "name NN%" text. Slivers below 3% are skipped so
+    // labels don't collide.
+    fn draw_leaders(s: Painter, th: Theme) {
+        let vals = this.values();
+        let cx = this.geo_cx; let cy = this.geo_cy;
+        let r = this.geo_r * this.reveal;
+        for (let k in 0..this.sidx.len) {
+            if (k + 1 >= this.cum.len) { continue; }
+            let i = this.sidx[k];
+            let pct = vals[i] / this.total * 100.0;
+            if (pct < 3.0) { continue; }
+            let mid = (-PI / 2.0) + (this.cum[k] + this.cum[k + 1]) / 2.0;
+            let cm = cos(mid); let sm = sin(mid);
+            let x0 = cx + r * cm;        let y0 = cy + r * sm;
+            let x1 = cx + (r + 12.0) * cm; let y1 = cy + (r + 12.0) * sm;
+            let right = cm >= 0.0;
+            let x2 = x1 + 16.0;
+            if (!right) { x2 = x1 - 16.0; }
+            s.line(x0 as int, y0 as int, x1 as int, y1 as int, th.neutral_400);
+            s.line(x1 as int, y1 as int, x2 as int, y1 as int, th.neutral_400);
+            let name = "slice " + str(i + 1);
+            if (i < this.labels.len) { name = this.labels[i]; }
+            let lbl = name + " " + fixed(pct, 0) + "%";
+            let ty = (y1 as int) + s.font_ascent() - s.font_height() / 2;
+            if (right) { s.text(x2 as int + 4, ty, lbl, th.on_surface_muted); }
+            else { s.text(x2 as int - 4 - s.text_width(lbl), ty, lbl, th.on_surface_muted); }
+        }
+    }
+
+    fn draw_slice_tooltip(s: Painter, th: Theme, plot: Rect) {
+        let i = this.hover_idx;
+        if (i < 0 || i >= this.values().len) { return; }
+        let v = this.values()[i];
+        let pct = v / this.total * 100.0;
+        let name = "slice " + str(i + 1);
+        if (i < this.labels.len) { name = this.labels[i]; }
+        let l0 = name;
+        let l1 = fixed(v, 0) + "  (" + fixed(pct, 1) + "%)";
+        let tw = s.text_width(l0);
+        if (s.text_width(l1) > tw) { tw = s.text_width(l1); }
+        let lh = s.font_height() + 2;
+        let bw = tw + th.space_3 * 2;
+        let bh = lh * 2 + th.space_2;
+        let bx = this.hpx + th.space_2;
+        let by = this.hpy + th.space_2;
+        if (bx + bw > plot.x + plot.w) { bx = plot.x + plot.w - bw; }
+        if (by + bh > plot.y + plot.h) { by = plot.y + plot.h - bh; }
+        if (bx < plot.x) { bx = plot.x; }
+        if (by < plot.y) { by = plot.y; }
+        s.fill_round(Rect(bx, by, bw, bh), th.radius_md, th.surface);
+        s.stroke_round(Rect(bx, by, bw, bh), th.radius_md, 1, th.border);
+        let ty = by + th.space_1;
+        s.text(bx + th.space_3, ty + s.font_ascent(), l0, th.on_surface);
+        s.text(bx + th.space_3, ty + lh + s.font_ascent(), l1, th.on_surface_muted);
+    }
+
+    // A filled wedge as a triangle fan from the center along the arc.
+    fn wedge(s: Painter, cx: float, cy: float, r: float, a0: float, a1: float, color: int) {
+        let steps = ((a1 - a0) / (TAU / 64.0)) as int;
+        if (steps < 2) { steps = 2; }
+        let xs: i32[] = [];
+        let ys: i32[] = [];
+        xs.push(cx as i32); ys.push(cy as i32);
+        for (let k in 0..(steps + 1) ) {
+            let a = a0 + (a1 - a0) * (k as float) / (steps as float);
+            xs.push((cx + r * cos(a)) as i32);
+            ys.push((cy + r * sin(a)) as i32);
+        }
+        s.polygon(xs, ys, color);
+    }
+}
+
+// ------------------------------------------------------------ step chart
+
+// A line chart with stepped (square) transitions — for discrete/quantized
+// series (counts, states, staircase rates).
+export class StepChart extends ChartBase {
+    markers_on: bool;
+
+    fn init(series: Series[], labels: string[]) {
+        super.init(series, labels);
+        this.markers_on = false;
+    }
+
+    builder fn markers(b: bool) { this.markers_on = b; return this; }
+
+    override fn draw_plot(s: Painter, th: Theme, plot: Rect, sc: AxisScale) {
+        for (let si in 0..this.series.len) {
+            let vals = this.series[si].values;
+            if (vals.len == 0) { continue; }
+            let color = this.color_of(si, th);
+            let p = new Path();
+            let x0 = this.x_of(0, plot) as float;
+            let y0 = this.vyr(vals[0], plot, sc);
+            p.moveTo(x0, y0);
+            for (let i in 1..vals.len) {
+                let x = this.x_of(i, plot) as float;
+                let yprev = this.vyr(vals[i - 1], plot, sc);
+                let y = this.vyr(vals[i], plot, sc);
+                p.lineTo(x, yprev);   // horizontal run
+                p.lineTo(x, y);       // vertical step
+            }
+            s.stroke_path(p, 2, color);
+            if (this.markers_on) {
+                for (let i in 0..vals.len) {
+                    s.circle(this.x_of(i, plot), this.vyr(vals[i], plot, sc) as int, 3, color);
+                }
+            }
+        }
+    }
+}
+
+// ------------------------------------------------------------ histogram
+
+fn hist_bounds(raw: float[]): Range {
+    let lo = 0.0; let hi = 0.0; let any = false;
+    for (let v in raw) {
+        if (!any) { lo = v; hi = v; any = true; }
+        else { lo = fmin(lo, v); hi = fmax(hi, v); }
+    }
+    if (!any) { lo = 0.0; hi = 1.0; }
+    if (hi <= lo) { hi = lo + 1.0; }
+    return Range(lo, hi);
+}
+fn hist_counts(raw: float[], bins: int): float[] {
+    let nb = bins;
+    if (nb < 1) { nb = 1; }
+    let rg = hist_bounds(raw);
+    let step = (rg.hi - rg.lo) / (nb as float);
+    let c: float[] = [];
+    for (let i in 0..nb) { c.push(0.0); }
+    for (let v in raw) {
+        let bi = ((v - rg.lo) / step) as int;
+        if (bi < 0) { bi = 0; }
+        if (bi >= nb) { bi = nb - 1; }
+        c[bi] = c[bi] + 1.0;
+    }
+    return c;
+}
+fn hist_labels(raw: float[], bins: int): string[] {
+    let nb = bins;
+    if (nb < 1) { nb = 1; }
+    let rg = hist_bounds(raw);
+    let step = (rg.hi - rg.lo) / (nb as float);
+    let l: string[] = [];
+    for (let i in 0..nb) { l.push(fixed(rg.lo + (i as float) * step, 0)); }
+    return l;
+}
+
+// A frequency histogram: raw samples auto-binned into contiguous count bars.
+export class Histogram extends BarChart {
+    fn init(raw: float[], bins: int) {
+        super.init([new Series("freq", hist_counts(raw, bins))], hist_labels(raw, bins));
+        this.group_frac = 0.98;   // near-contiguous bars
+        this.show_legend = false;
+    }
+}
+
+// ------------------------------------------------------------ sparkline
+
+// A tiny, chrome-free inline trend line — no axes, grid, legend, or card. Fits
+// in a table cell or a label row. No animation (it's usually one of many).
+export class Sparkline extends ChartBase {
+    area_on: bool;
+    line_color: int;   // 0 = theme primary
+
+    fn init(values: float[]) {
+        super.init([new Series("", values)], []);
+        this.show_axes = false;
+        this.show_legend = false;
+        this.animated = false;
+        this.reveal = 1.0;
+        this.started = true;
+        this.pref_w = 120;
+        this.pref_h = 32;
+        this.area_on = false;
+        this.line_color = 0;
+    }
+
+    builder fn area(b: bool) { this.area_on = b; return this; }
+    builder fn stroke(c: int) { this.line_color = c; return this; }
+
+    override fn index_hover(): bool { return false; }
+
+    override fn draw(s: Painter, th: Theme) {
+        let vals = this.series[0].values;
+        if (vals.len == 0) { return; }
+        let b = this.bounds;
+        let color = this.line_color;
+        if (color == 0) { color = th.primary; }
+
+        let lo = vals[0]; let hi = vals[0];
+        for (let v in vals) { lo = fmin(lo, v); hi = fmax(hi, v); }
+        if (hi <= lo) { hi = lo + 1.0; }
+
+        let pad = 2;
+        let iw = b.w - pad * 2;
+        let ih = b.h - pad * 2;
+        let n = vals.len;
+        let xs: float[] = [];
+        let ys: float[] = [];
+        for (let i in 0..n) {
+            let fx = 0.0;
+            if (n > 1) { fx = (i as float) / ((n - 1) as float); }
+            let t = (vals[i] - lo) / (hi - lo);
+            xs.push((b.x + pad) as float + fx * (iw as float));
+            ys.push((b.y + pad) as float + (1.0 - t) * (ih as float));
+        }
+        if (this.area_on) {
+            let base = (b.y + b.h - pad) as float;
+            let fp = poly_line_path(xs, ys);
+            fp.lineTo(xs[xs.len - 1], base);
+            fp.lineTo(xs[0], base);
+            fp.close();
+            s.fill_path(fp, with_alpha(color, 60));
+        }
+        s.stroke_path(poly_line_path(xs, ys), 2, color);
+    }
+}
+
+// ------------------------------------------------------------ gauge
+
+// A single value on a 270° arc (a speedometer / progress ring). The fill color
+// tracks severity by default: green / amber / red as it approaches the max.
+export class Gauge extends ChartBase {
+    unit: string;
+    auto_color: bool;
+
+    fn init(value: float, maxv: float) {
+        super.init([new Series("", [value])], []);
+        this.range_set = true;
+        this.ymin = 0.0;
+        this.ymax = maxv;
+        this.show_axes = false;
+        this.show_legend = false;
+        this.unit = "";
+        this.auto_color = true;
+        this.pref_w = 220;
+        this.pref_h = 200;
+    }
+
+    builder fn unitLabel(u: string) { this.unit = u; return this; }
+    builder fn solid(c: int) { this.auto_color = false; this.series[0].color = c; return this; }
+
+    override fn index_hover(): bool { return false; }
+
+    fn value(): float { return this.series[0].values[0]; }
+
+    override fn draw(s: Painter, th: Theme) {
+        this.ensure_anim();
+        let b = this.bounds;
+        s.fill_round(b, th.radius_lg, th.surface_raised);
+        s.stroke_round(b, th.radius_lg, 1, th.border);
+
+        let pad = th.space_4;
+        let top = b.y + pad;
+        if (this.title_txt.len > 0) {
+            s.text(b.x + pad, top + s.font_ascent(), this.title_txt, th.on_surface);
+            top += s.font_height() + th.space_2;
+        }
+
+        let area = Rect(b.x + pad, top, b.w - pad * 2, b.y + b.h - pad - top);
+        let cx = area.x + area.w / 2;
+        let cy = area.y + area.h / 2;
+        let rr = area.w;
+        if (area.h < rr) { rr = area.h; }
+        let r = rr / 2 - 4;
+        if (r < 2) { return; }
+        let width = r / 5;
+        if (width < 4) { width = 4; }
+
+        let frac = (this.value() - this.ymin) / (this.ymax - this.ymin);
+        if (frac < 0.0) { frac = 0.0; }
+        if (frac > 1.0) { frac = 1.0; }
+
+        let color = this.series[0].color;
+        if (this.auto_color) {
+            color = th.success;
+            if (frac > 0.85) { color = th.danger; }
+            else if (frac > 0.65) { color = th.warning; }
+        }
+
+        // 270° track with a gap at the bottom; sweep clockwise from 135°
+        s.stroke_arc(cx, cy, r, r, 135, 270, width, th.surface_sunken);
+        let sweep = (270.0 * frac * this.reveal) as int;
+        if (sweep > 0) { s.stroke_arc(cx, cy, r, r, 135, sweep, width, color); }
+
+        // center readout
+        let vtxt = fixed(this.value(), 0);
+        if (this.unit.len > 0) { vtxt = vtxt + this.unit; }
+        s.text_center(Rect(cx - r, cy - s.font_height(), r * 2, s.font_height()), vtxt, th.on_surface);
+        let pct = fixed(frac * 100.0, 0) + "%";
+        s.text_center(Rect(cx - r, cy + 2, r * 2, s.font_height()), pct, th.on_surface_muted);
+    }
+}
+
+// ------------------------------------------------------------ scatter / bubble
+
+// An x/y point series. `sizes` (optional, parallel to xs/ys) drives bubble radii.
+export class Points {
+    name: string;
+    xs: float[];
+    ys: float[];
+    sizes: float[];
+    color: int;
+
+    fn init(name: string, xs: float[], ys: float[]) {
+        this.name = name;
+        this.xs = xs;
+        this.ys = ys;
+        this.sizes = [];
+        this.color = 0;
+    }
+}
+export fn points(name: string, xs: float[], ys: float[]): Points {
+    return new Points(name, xs, ys);
+}
+// A bubble series: `sizes` scales each point's radius.
+export fn bubble(name: string, xs: float[], ys: float[], sizes: float[]): Points {
+    let p = new Points(name, xs, ys);
+    p.sizes = sizes;
+    return p;
+}
+
+export class ScatterChart extends ChartBase {
+    pts: Points[];
+    hover_pi: int;   // hovered point-series index (with hover_idx = point index)
+
+    fn init(pts: Points[]) {
+        super.init([], []);
+        this.pts = pts;
+        this.hover_pi = -1;
+    }
+
+    override fn index_hover(): bool { return false; }
+    override fn legend_count(): int { return this.pts.len; }
+    override fn legend_name(i: int): string { return this.pts[i].name; }
+    override fn legend_color(i: int, th: Theme): int {
+        if (this.pts[i].color != 0) { return this.pts[i].color; }
+        return this.palette(i, th);
+    }
+    fn pcolor(i: int, th: Theme): int { return this.legend_color(i, th); }
+
+    override fn data_range(): Range {
+        let lo = 0.0; let hi = 0.0; let any = false;
+        for (let p in this.pts) {
+            for (let v in p.ys) {
+                if (!any) { lo = v; hi = v; any = true; }
+                else { lo = fmin(lo, v); hi = fmax(hi, v); }
+            }
+        }
+        if (!any) { lo = 0.0; hi = 1.0; }
+        if (hi <= lo) { hi = lo + 1.0; }
+        return Range(lo, hi);
+    }
+
+    fn x_range(): Range {
+        let lo = 0.0; let hi = 0.0; let any = false;
+        for (let p in this.pts) {
+            for (let v in p.xs) {
+                if (!any) { lo = v; hi = v; any = true; }
+                else { lo = fmin(lo, v); hi = fmax(hi, v); }
+            }
+        }
+        if (!any) { lo = 0.0; hi = 1.0; }
+        if (hi <= lo) { hi = lo + 1.0; }
+        return Range(lo, hi);
+    }
+
+    fn compute_xscale(target: int): AxisScale {
+        let rg = this.x_range();
+        let span = rg.hi - rg.lo;
+        if (span <= 0.0) { span = 1.0; }
+        let nspan = nice_num(span, false);
+        let step = nice_num(nspan / ((target - 1) as float), true);
+        let nlo = floor(rg.lo / step) * step;
+        let nhi = ceil(rg.hi / step) * step;
+        return AxisScale(nlo, nhi, step);
+    }
+
+    fn sx(v: float, plot: Rect, xsc: AxisScale): float {
+        let t = (v - xsc.lo) / (xsc.hi - xsc.lo);
+        return (plot.x as float) + t * (plot.w as float);
+    }
+    fn radius_of(p: Points, k: int): int {
+        if (p.sizes.len == 0) { return 4; }
+        let mx = 0.0;
+        for (let sv in p.sizes) { mx = fmax(mx, sv); }
+        if (mx <= 0.0) { return 4; }
+        let t = 0.0;
+        if (k < p.sizes.len) { t = p.sizes[k] / mx; }
+        return 4 + (12.0 * t) as int;
+    }
+
+    // draw x gridlines + numeric ticks unclipped (base draws the y axis)
+    override fn draw_axes(s: Painter, th: Theme, plot: Rect, sc: AxisScale) {
+        this.draw_yaxis(s, th, plot, sc);
+        let xsc = this.compute_xscale(5);
+        let prec = tick_prec(xsc.step);
+        let by = plot.y + plot.h + s.font_ascent() + th.space_1;
+        let v = xsc.lo;
+        while (v <= xsc.hi + xsc.step * 0.5) {
+            let x = this.sx(v, plot, xsc) as int;
+            if (this.show_grid) { s.line(x, plot.y, x, plot.y + plot.h, th.divider); }
+            let lbl = fixed(v, prec);
+            s.text(x - s.text_width(lbl) / 2, by, lbl, th.on_surface_muted);
+            v += xsc.step;
+        }
+    }
+
+    override fn draw_plot(s: Painter, th: Theme, plot: Rect, sc: AxisScale) {
+        let xsc = this.compute_xscale(5);
+        for (let pi in 0..this.pts.len) {
+            let p = this.pts[pi];
+            let color = this.pcolor(pi, th);
+            let n = p.xs.len;
+            for (let k in 0..n) {
+                if (k >= p.ys.len) { continue; }
+                let x = this.sx(p.xs[k], plot, xsc) as int;
+                let yf = this.vy(p.ys[k], plot, sc);
+                // fade/scale points in with reveal
+                let y = (plot.y + plot.h) as float + (yf - (plot.y + plot.h) as float) * this.reveal;
+                let rad = (this.radius_of(p, k) as float * this.reveal) as int;
+                if (rad < 1) { rad = 1; }
+                let c = with_alpha(color, 210);
+                if (pi == this.hover_pi && k == this.hover_idx) { c = color; rad += 2; }
+                s.circle(x, y as int, rad, c);
+            }
+        }
+        this.draw_point_tooltip(s, th, plot, sc, xsc);
+    }
+
+    override fn hit(px: int, py: int): Widget {
+        if (!this.bounds.has(px, py)) { return null; }
+        let plot = this.last_plot;
+        let sc = this.last_sc;
+        let xsc = this.compute_xscale(5);
+        let bpi = -1; let bk = -1; let bestd = 15 * 15;
+        for (let pi in 0..this.pts.len) {
+            let p = this.pts[pi];
+            for (let k in 0..p.xs.len) {
+                if (k >= p.ys.len) { continue; }
+                let x = this.sx(p.xs[k], plot, xsc) as int;
+                let y = this.vy(p.ys[k], plot, sc) as int;
+                let dx = px - x; let dy = py - y;
+                let d = dx * dx + dy * dy;
+                if (d < bestd) { bestd = d; bpi = pi; bk = k; }
+            }
+        }
+        if (bpi != this.hover_pi || bk != this.hover_idx) {
+            this.hover_pi = bpi; this.hover_idx = bk; this.repaint_now();
+        }
+        return this;
+    }
+
+    override fn on_hover_leave(): bool {
+        if (this.hover_pi != -1 || this.hover_idx != -1) {
+            this.hover_pi = -1; this.hover_idx = -1; return true;
+        }
+        return false;
+    }
+
+    fn draw_point_tooltip(s: Painter, th: Theme, plot: Rect, sc: AxisScale, xsc: AxisScale) {
+        let pi = this.hover_pi;
+        let k = this.hover_idx;
+        if (pi < 0 || pi >= this.pts.len) { return; }
+        let p = this.pts[pi];
+        if (k < 0 || k >= p.xs.len || k >= p.ys.len) { return; }
+        let l0 = p.name;
+        if (l0.len == 0) { l0 = "series " + str(pi + 1); }
+        let l1 = "(" + fixed(p.xs[k], tick_prec(xsc.step)) + ", "
+                     + fixed(p.ys[k], tick_prec(sc.step)) + ")";
+        let tw = s.text_width(l0);
+        if (s.text_width(l1) > tw) { tw = s.text_width(l1); }
+        let lh = s.font_height() + 2;
+        let bw = tw + th.space_3 * 2;
+        let bh = lh * 2 + th.space_2;
+        let ax = this.sx(p.xs[k], plot, xsc) as int;
+        let ay = this.vy(p.ys[k], plot, sc) as int;
+        let bx = ax + th.space_2;
+        let by = ay - bh - th.space_2;
+        if (bx + bw > plot.x + plot.w) { bx = ax - bw - th.space_2; }
+        if (bx < plot.x) { bx = plot.x; }
+        if (by < plot.y) { by = ay + th.space_2; }
+        s.fill_round(Rect(bx, by, bw, bh), th.radius_md, th.surface);
+        s.stroke_round(Rect(bx, by, bw, bh), th.radius_md, 1, th.border);
+        let ty = by + th.space_1;
+        s.text(bx + th.space_3, ty + s.font_ascent(), l0, th.on_surface);
+        s.text(bx + th.space_3, ty + lh + s.font_ascent(), l1, th.on_surface_muted);
+    }
+}
+
+// ------------------------------------------------------------ candlestick / OHLC
+
+// One financial bar: open / high / low / close.
+export struct OHLC {
+    open: float;
+    high: float;
+    low: float;
+    close: float;
+}
+
+export fn ohlc(open: float, high: float, low: float, close: float): OHLC {
+    return OHLC(open, high, low, close);
+}
+
+// A candlestick / OHLC chart: a body from open→close (green up, red down) with
+// a high–low wick. Categorical x like a bar chart; numeric y-axis inherited.
+export class CandlestickChart extends ChartBase {
+    bars: OHLC[];
+    up_color: int;       // 0 = theme success
+    down_color: int;     // 0 = theme danger
+    hpx: int;
+    hpy: int;
+
+    fn init(labels: string[], bars: OHLC[]) {
+        // seed the base with the closes so cat_count / x labels work
+        let closes: float[] = [];
+        for (let b in bars) { closes.push(b.close); }
+        super.init([new Series("", closes)], labels);
+        this.bars = bars;
+        this.up_color = 0;
+        this.down_color = 0;
+        this.hpx = 0;
+        this.hpy = 0;
+        this.show_legend = false;   // labels are categories, not series
+    }
+
+    builder fn upColor(c: int) { this.up_color = c; return this; }
+    builder fn downColor(c: int) { this.down_color = c; return this; }
+
+    // hover is by nearest bar (custom hit), not the base index tooltip
+    override fn index_hover(): bool { return false; }
+
+    override fn data_range(): Range {
+        let lo = 0.0; let hi = 0.0; let any = false;
+        for (let b in this.bars) {
+            if (!any) { lo = b.low; hi = b.high; any = true; }
+            else { lo = fmin(lo, b.low); hi = fmax(hi, b.high); }
+        }
+        if (!any) { lo = 0.0; hi = 1.0; }
+        if (hi <= lo) { hi = lo + 1.0; }
+        return Range(lo, hi);
+    }
+
+    // bars sit at slot centers, one slot per bar
+    override fn x_of(i: int, plot: Rect): int {
+        let n = this.bars.len;
+        if (n <= 0) { return plot.x; }
+        return plot.x + (((i as float) + 0.5) * (plot.w as float) / (n as float)) as int;
+    }
+
+    fn up_c(th: Theme): int {
+        if (this.up_color != 0) { return this.up_color; }
+        return th.success;
+    }
+    fn down_c(th: Theme): int {
+        if (this.down_color != 0) { return this.down_color; }
+        return th.danger;
+    }
+
+    override fn draw_plot(s: Painter, th: Theme, plot: Rect, sc: AxisScale) {
+        let n = this.bars.len;
+        if (n == 0) { return; }
+        let slot = (plot.w as float) / (n as float);
+        let bw = slot * 0.6;
+        if (bw < 3.0) { bw = 3.0; }
+        for (let i in 0..n) {
+            let b = this.bars[i];
+            let cx = this.x_of(i, plot);
+            let color = this.down_c(th);
+            if (b.close >= b.open) { color = this.up_c(th); }
+            // high–low wick
+            let yh = this.vyr(b.high, plot, sc) as int;
+            let yl = this.vyr(b.low, plot, sc) as int;
+            s.line(cx, yh, cx, yl, color);
+            // open↔close body
+            let yo = this.vyr(b.open, plot, sc) as int;
+            let yc = this.vyr(b.close, plot, sc) as int;
+            let top = yc; let h = yo - yc;
+            if (h < 0) { top = yo; h = yc - yo; }
+            if (h < 1) { h = 1; }
+            let bx = cx - (bw as int) / 2;
+            s.fill_round(Rect(bx, top, bw as int, h), th.radius_sm, color);
+        }
+        this.draw_ohlc_tooltip(s, th, plot, sc);
+    }
+
+    override fn hit(px: int, py: int): Widget {
+        if (!this.bounds.has(px, py)) { return null; }
+        let idx = -1;
+        let bestd = 1000000000;
+        for (let i in 0..this.bars.len) {
+            let dx = px - this.x_of(i, this.last_plot);
+            if (dx < 0) { dx = -dx; }
+            if (dx < bestd) { bestd = dx; idx = i; }
+        }
+        this.hpx = px; this.hpy = py;
+        if (idx != this.hover_idx) { this.hover_idx = idx; this.repaint_now(); }
+        return this;
+    }
+
+    fn draw_ohlc_tooltip(s: Painter, th: Theme, plot: Rect, sc: AxisScale) {
+        let i = this.hover_idx;
+        if (i < 0 || i >= this.bars.len) { return; }
+        let b = this.bars[i];
+        let prec = tick_prec(sc.step);
+        let cx = this.x_of(i, plot);
+        s.line(cx, plot.y, cx, plot.y + plot.h, th.neutral_400);
+        let lines: string[] = [];
+        if (i < this.labels.len && this.labels[i].len > 0) { lines.push(this.labels[i]); }
+        lines.push("O " + fixed(b.open, prec));
+        lines.push("H " + fixed(b.high, prec));
+        lines.push("L " + fixed(b.low, prec));
+        lines.push("C " + fixed(b.close, prec));
+        let tw = 0;
+        for (let ln in lines) { let w = s.text_width(ln); if (w > tw) { tw = w; } }
+        let lh = s.font_height() + 2;
+        let bw = tw + th.space_3 * 2;
+        let bh = lh * lines.len + th.space_2;
+        let bx = cx + th.space_2;
+        if (bx + bw > plot.x + plot.w) { bx = cx - th.space_2 - bw; }
+        if (bx < plot.x) { bx = plot.x; }
+        let by = plot.y + th.space_2;
+        s.fill_round(Rect(bx, by, bw, bh), th.radius_md, th.surface);
+        s.stroke_round(Rect(bx, by, bw, bh), th.radius_md, 1, th.border);
+        let ty = by + th.space_1;
+        for (let ln in lines) {
+            s.text(bx + th.space_3, ty + s.font_ascent(), ln, th.on_surface);
+            ty += lh;
+        }
+    }
+}
+
+// ------------------------------------------------------------ box plot
+
+// A five-number summary for one category (+ any 1.5·IQR outliers).
+export struct BoxStats {
+    lo: float;      // low whisker (min within fence)
+    q1: float;
+    med: float;
+    q3: float;
+    hi: float;      // high whisker (max within fence)
+}
+
+// Linear-interpolated quantile of a *sorted* array, q in [0,1].
+fn quantile(sorted: float[], q: float): float {
+    let n = sorted.len;
+    if (n == 0) { return 0.0; }
+    if (n == 1) { return sorted[0]; }
+    let pos = q * ((n - 1) as float);
+    let lo = floor(pos) as int;
+    let hi = lo + 1;
+    if (hi >= n) { return sorted[n - 1]; }
+    let frac = pos - (lo as float);
+    return sorted[lo] + (sorted[hi] - sorted[lo]) * frac;
+}
+
+// Sort a copy (insertion sort — sample counts here are small).
+fn sorted_copy(xs: float[]): float[] {
+    let a: float[] = [];
+    for (let v in xs) { a.push(v); }
+    for (let i in 1..a.len) {
+        let key = a[i];
+        let j = i - 1;
+        while (j >= 0 && a[j] > key) { a[j + 1] = a[j]; j -= 1; }
+        a[j + 1] = key;
+    }
+    return a;
+}
+
+// Five-number summary from raw samples, whiskers clamped to the 1.5·IQR fence.
+fn box_stats(samples: float[]): BoxStats {
+    let a = sorted_copy(samples);
+    if (a.len == 0) { return BoxStats(0.0, 0.0, 0.0, 0.0, 0.0); }
+    let q1 = quantile(a, 0.25);
+    let med = quantile(a, 0.5);
+    let q3 = quantile(a, 0.75);
+    let iqr = q3 - q1;
+    let flo = q1 - 1.5 * iqr;
+    let fhi = q3 + 1.5 * iqr;
+    let wlo = a[a.len - 1];
+    let whi = a[0];
+    for (let v in a) {
+        if (v >= flo && v < wlo) { wlo = v; }
+        if (v <= fhi && v > whi) { whi = v; }
+    }
+    return BoxStats(wlo, q1, med, q3, whi);
+}
+
+// A box-and-whisker plot: one box per category (quartiles + whiskers +
+// out-of-fence outlier dots). Categorical x like a bar chart.
+export class BoxPlot extends ChartBase {
+    stats: BoxStats[];
+    outliers: float[][];   // per category, parallel to stats
+
+    fn init(labels: string[], stats: BoxStats[], outliers: float[][]) {
+        // seed the base with the medians so cat_count / x labels work
+        let meds: float[] = [];
+        for (let st in stats) { meds.push(st.med); }
+        super.init([new Series("", meds)], labels);
+        this.stats = stats;
+        this.outliers = outliers;
+        this.show_legend = false;   // labels are categories, not series
+    }
+
+    override fn index_hover(): bool { return false; }
+
+    override fn data_range(): Range {
+        let lo = 0.0; let hi = 0.0; let any = false;
+        for (let st in this.stats) {
+            if (!any) { lo = st.lo; hi = st.hi; any = true; }
+            else { lo = fmin(lo, st.lo); hi = fmax(hi, st.hi); }
+        }
+        for (let os in this.outliers) {
+            for (let v in os) {
+                if (!any) { lo = v; hi = v; any = true; }
+                else { lo = fmin(lo, v); hi = fmax(hi, v); }
+            }
+        }
+        if (!any) { lo = 0.0; hi = 1.0; }
+        if (hi <= lo) { hi = lo + 1.0; }
+        return Range(lo, hi);
+    }
+
+    override fn x_of(i: int, plot: Rect): int {
+        let n = this.stats.len;
+        if (n <= 0) { return plot.x; }
+        return plot.x + (((i as float) + 0.5) * (plot.w as float) / (n as float)) as int;
+    }
+
+    override fn draw_plot(s: Painter, th: Theme, plot: Rect, sc: AxisScale) {
+        let n = this.stats.len;
+        if (n == 0) { return; }
+        let slot = (plot.w as float) / (n as float);
+        let bw = (slot * 0.5) as int;
+        if (bw < 4) { bw = 4; }
+        let cap = bw / 3;
+        for (let i in 0..n) {
+            let st = this.stats[i];
+            let cx = this.x_of(i, plot);
+            let color = this.color_of(0, th);
+            // whisker line + caps (animated grows from the median)
+            let ylo = this.vyr(st.lo, plot, sc) as int;
+            let yhi = this.vyr(st.hi, plot, sc) as int;
+            let yq1 = this.vyr(st.q1, plot, sc) as int;
+            let yq3 = this.vyr(st.q3, plot, sc) as int;
+            let ymed = this.vyr(st.med, plot, sc) as int;
+            s.line(cx, yhi, cx, yq3, th.on_surface_muted);
+            s.line(cx, yq1, cx, ylo, th.on_surface_muted);
+            s.line(cx - cap, yhi, cx + cap, yhi, th.on_surface_muted);
+            s.line(cx - cap, ylo, cx + cap, ylo, th.on_surface_muted);
+            // box q1..q3
+            let top = yq3; let h = yq1 - yq3;
+            if (h < 1) { h = 1; }
+            let bx = cx - bw / 2;
+            s.fill_round(Rect(bx, top, bw, h), th.radius_sm, with_alpha(color, 70));
+            s.stroke_round(Rect(bx, top, bw, h), th.radius_sm, 1, color);
+            // median line
+            s.line(bx, ymed, bx + bw, ymed, color);
+            // outliers
+            if (i < this.outliers.len) {
+                for (let v in this.outliers[i]) {
+                    let oy = this.vyr(v, plot, sc) as int;
+                    s.circle(cx, oy, 2, th.on_surface_muted);
+                }
+            }
+        }
+    }
+}
+
+// ------------------------------------------------------------ radar
+
+// A radar / spider chart: each series is a polygon over N shared axes (one per
+// category label). Grid rings + spokes are drawn from the shared value scale.
+export class RadarChart extends ChartBase {
+    fill_on: bool;
+
+    fn init(series: Series[], labels: string[]) {
+        super.init(series, labels);
+        this.show_axes = false;
+        this.show_grid = false;
+        this.fill_on = true;
+    }
+
+    builder fn fills(b: bool) { this.fill_on = b; return this; }
+
+    override fn index_hover(): bool { return false; }
+
+    override fn include_zero(): bool { return true; }
+
+    fn axis_count(): int {
+        let n = this.labels.len;
+        if (n < this.cat_count()) { n = this.cat_count(); }
+        return n;
+    }
+
+    // angle of axis k: start at 12 o'clock, go clockwise
+    fn axis_angle(k: int, n: int): float {
+        return (-PI / 2.0) + (k as float) * TAU / (n as float);
+    }
+
+    override fn draw_plot(s: Painter, th: Theme, plot: Rect, sc: AxisScale) {
+        let n = this.axis_count();
+        if (n < 3) { return; }
+        let cx = (plot.x + plot.w / 2) as float;
+        let cy = (plot.y + plot.h / 2) as float;
+        let rr = plot.w;
+        if (plot.h < rr) { rr = plot.h; }
+        let rmax = (rr as float) / 2.0 - 24.0;   // margin for axis labels
+        if (rmax < 4.0) { return; }
+        let span = sc.hi - sc.lo;
+        if (span <= 0.0) { span = 1.0; }
+
+        // grid rings at each tick + radial spokes
+        let v = sc.lo;
+        while (v <= sc.hi + sc.step * 0.5) {
+            let t = (v - sc.lo) / span;
+            let rx: i32[] = []; let ry: i32[] = [];
+            for (let k in 0..n) {
+                let a = this.axis_angle(k, n);
+                rx.push((cx + rmax * t * cos(a)) as i32);
+                ry.push((cy + rmax * t * sin(a)) as i32);
+            }
+            for (let k in 0..n) {
+                let k2 = (k + 1) % n;
+                s.line(rx[k], ry[k], rx[k2], ry[k2], th.divider);
+            }
+            v += sc.step;
+        }
+        for (let k in 0..n) {
+            let a = this.axis_angle(k, n);
+            let ex = (cx + rmax * cos(a)) as int;
+            let ey = (cy + rmax * sin(a)) as int;
+            s.line(cx as int, cy as int, ex, ey, th.divider);
+            // axis label just outside the vertex
+            if (k < this.labels.len) {
+                let lbl = this.labels[k];
+                let lx = (cx + (rmax + 6.0) * cos(a)) as int;
+                let ly = (cy + (rmax + 6.0) * sin(a)) as int + s.font_ascent() - s.font_height() / 2;
+                if (cos(a) < -0.3) { lx -= s.text_width(lbl); }
+                else if (cos(a) < 0.3) { lx -= s.text_width(lbl) / 2; }
+                s.text(lx, ly, lbl, th.on_surface_muted);
+            }
+        }
+
+        // one polygon per series
+        for (let si in 0..this.series.len) {
+            let vals = this.series[si].values;
+            let color = this.color_of(si, th);
+            let xs: i32[] = []; let ys: i32[] = [];
+            for (let k in 0..n) {
+                let val = sc.lo;
+                if (k < vals.len) { val = vals[k]; }
+                let t = (val - sc.lo) / span;
+                let r = rmax * t * this.reveal;
+                let a = this.axis_angle(k, n);
+                xs.push((cx + r * cos(a)) as i32);
+                ys.push((cy + r * sin(a)) as i32);
+            }
+            if (this.fill_on) { s.polygon(xs, ys, with_alpha(color, 55)); }
+            // outline + vertex dots
+            for (let k in 0..n) {
+                let k2 = (k + 1) % n;
+                s.line(xs[k] as int, ys[k] as int, xs[k2] as int, ys[k2] as int, color);
+            }
+            for (let k in 0..n) { s.circle(xs[k] as int, ys[k] as int, 2, color); }
+        }
+    }
+}
+
+// ------------------------------------------------------------ heatmap
+
+// A 2-D grid heatmap: cell color follows a sequential ramp from `cold`→`hot`
+// over the matrix min..max. Row/column labels sit along the left/top gutters.
+export class Heatmap extends ChartBase {
+    rows: string[];
+    cols: string[];
+    grid: float[][];      // grid[r][c]
+    cold: int;            // 0 = theme surface_sunken
+    hot: int;             // 0 = theme primary_500
+    show_values: bool;
+    hr: int;              // hovered row/col (-1 none)
+    hc: int;
+    vmin: float;
+    vmax: float;
+
+    fn init(rows: string[], cols: string[], grid: float[][]) {
+        super.init([], []);
+        this.rows = rows;
+        this.cols = cols;
+        this.grid = grid;
+        this.cold = 0;
+        this.hot = 0;
+        this.show_values = false;
+        this.hr = -1;
+        this.hc = -1;
+        this.show_axes = false;
+        this.show_grid = false;
+        this.show_legend = false;
+        this.recompute_extent();
+    }
+
+    builder fn colors(cold: int, hot: int) { this.cold = cold; this.hot = hot; return this; }
+    builder fn values(b: bool) { this.show_values = b; return this; }
+
+    fn recompute_extent() {
+        let any = false;
+        for (let row in this.grid) {
+            for (let v in row) {
+                if (!any) { this.vmin = v; this.vmax = v; any = true; }
+                else { this.vmin = fmin(this.vmin, v); this.vmax = fmax(this.vmax, v); }
+            }
+        }
+        if (!any) { this.vmin = 0.0; this.vmax = 1.0; }
+        if (this.vmax <= this.vmin) { this.vmax = this.vmin + 1.0; }
+    }
+
+    override fn index_hover(): bool { return false; }
+
+    fn cell_color(v: float, th: Theme): int {
+        let c0 = this.cold; if (c0 == 0) { c0 = th.surface_sunken; }
+        let c1 = this.hot;  if (c1 == 0) { c1 = th.primary_500; }
+        let t = (v - this.vmin) / (this.vmax - this.vmin);
+        if (t < 0.0) { t = 0.0; }
+        if (t > 1.0) { t = 1.0; }
+        return mix(c0, c1, t);
+    }
+
+    // plot rect split into a label gutter + the cell grid
+    fn grid_rect(s: Painter, plot: Rect): Rect {
+        let gl = 0;
+        for (let r in this.rows) { let w = s.text_width(r); if (w > gl) { gl = w; } }
+        let gt = s.font_height();
+        let x = plot.x + gl + 6;
+        let y = plot.y + gt + 4;
+        return Rect(x, y, plot.x + plot.w - x, plot.y + plot.h - y);
+    }
+
+    override fn draw_plot(s: Painter, th: Theme, plot: Rect, sc: AxisScale) {
+        let nr = this.grid.len;
+        if (nr == 0) { return; }
+        let nc = this.cols.len;
+        if (nc < 1) { for (let row in this.grid) { if (row.len > nc) { nc = row.len; } } }
+        if (nc == 0) { return; }
+        let g = this.grid_rect(s, plot);
+        let cw = (g.w as float) / (nc as float);
+        let ch = (g.h as float) / (nr as float);
+
+        // column labels along the top
+        for (let c in 0..nc) {
+            if (c < this.cols.len) {
+                let lbl = this.cols[c];
+                let cxp = g.x + (((c as float) + 0.5) * cw) as int;
+                s.text(cxp - s.text_width(lbl) / 2, plot.y + s.font_ascent(), lbl, th.on_surface_muted);
+            }
+        }
+        for (let r in 0..nr) {
+            // row label along the left
+            if (r < this.rows.len) {
+                let lbl = this.rows[r];
+                let ry = g.y + (((r as float) + 0.5) * ch) as int + s.font_ascent() - s.font_height() / 2;
+                s.text(plot.x, ry, lbl, th.on_surface_muted);
+            }
+            let row = this.grid[r];
+            for (let c in 0..nc) {
+                if (c >= row.len) { continue; }
+                let cx = g.x + ((c as float) * cw) as int;
+                let cy = g.y + ((r as float) * ch) as int;
+                let rw = (cw as int) - 1; if (rw < 1) { rw = 1; }
+                let rh = (ch as int) - 1; if (rh < 1) { rh = 1; }
+                // draw-in fade: cells lighten from the cold color
+                let col = this.cell_color(row[c], th);
+                let base = this.cold; if (base == 0) { base = th.surface_sunken; }
+                col = mix(base, col, this.reveal);
+                s.fill_round(Rect(cx, cy, rw, rh), th.radius_sm, col);
+                if (r == this.hr && c == this.hc) {
+                    s.stroke_round(Rect(cx, cy, rw, rh), th.radius_sm, 2, th.on_surface);
+                }
+                if (this.show_values && rw > 20 && rh > 12) {
+                    let vt = fixed(row[c], 0);
+                    s.text(cx + rw / 2 - s.text_width(vt) / 2,
+                           cy + rh / 2 + s.font_ascent() - s.font_height() / 2, vt, th.on_surface);
+                }
+            }
+        }
+    }
+}
+
+// ------------------------------------------------------------ factories
+
+// A single-series line chart over bare y-values.
+export fn lineChart(values: float[]): LineChart {
+    return new LineChart([new Series("", values)], []);
+}
+// A multi-series line chart with category labels.
+export fn lineChartN(labels: string[], series: Series[]): LineChart {
+    return new LineChart(series, labels);
+}
+// A single-series area chart.
+export fn areaChart(values: float[]): AreaChart {
+    return new AreaChart([new Series("", values)], []);
+}
+// A multi-series area chart with category labels.
+export fn areaChartN(labels: string[], series: Series[]): AreaChart {
+    return new AreaChart(series, labels);
+}
+// A bar chart (grouped by default; call .stacked() to stack).
+export fn barChart(labels: string[], series: Series[]): BarChart {
+    return new BarChart(series, labels);
+}
+// A pie/donut chart from labels + values.
+export fn pieChart(labels: string[], values: float[]): PieChart {
+    return new PieChart(labels, values);
+}
+// A single-series step chart over bare y-values.
+export fn stepChart(values: float[]): StepChart {
+    return new StepChart([new Series("", values)], []);
+}
+// A multi-series step chart with category labels.
+export fn stepChartN(labels: string[], series: Series[]): StepChart {
+    return new StepChart(series, labels);
+}
+// A frequency histogram of raw samples, auto-binned into `bins` bars.
+export fn histogram(values: float[], bins: int): Histogram {
+    return new Histogram(values, bins);
+}
+// A chrome-free inline sparkline.
+export fn sparkline(values: float[]): Sparkline {
+    return new Sparkline(values);
+}
+// A 270° gauge showing `value` against `maxv`.
+export fn gauge(value: float, maxv: float): Gauge {
+    return new Gauge(value, maxv);
+}
+// A single-series scatter plot from x/y arrays.
+export fn scatterChart(xs: float[], ys: float[]): ScatterChart {
+    return new ScatterChart([new Points("", xs, ys)]);
+}
+// A multi-series scatter/bubble plot.
+export fn scatterChartN(pts: Points[]): ScatterChart {
+    return new ScatterChart(pts);
+}
+// A candlestick / OHLC chart from labelled bars.
+export fn candlestick(labels: string[], bars: OHLC[]): CandlestickChart {
+    return new CandlestickChart(labels, bars);
+}
+// A box plot from raw per-category samples: quartiles + 1.5·IQR fences and
+// outliers are computed for you.
+export fn boxPlot(labels: string[], samples: float[][]): BoxPlot {
+    let stats: BoxStats[] = [];
+    let outs: float[][] = [];
+    for (let raw in samples) {
+        let st = box_stats(raw);
+        stats.push(st);
+        let o: float[] = [];
+        for (let v in raw) {
+            if (v < st.lo || v > st.hi) { o.push(v); }
+        }
+        outs.push(o);
+    }
+    return new BoxPlot(labels, stats, outs);
+}
+// A box plot from pre-computed five-number summaries (no outlier dots).
+export fn boxPlotStats(labels: string[], stats: BoxStats[]): BoxPlot {
+    let outs: float[][] = [];
+    for (let st in stats) { outs.push([]); }
+    return new BoxPlot(labels, stats, outs);
+}
+// A single-series radar chart over labelled axes.
+export fn radarChart(labels: string[], values: float[]): RadarChart {
+    return new RadarChart([new Series("", values)], labels);
+}
+// A multi-series radar chart.
+export fn radarChartN(labels: string[], series: Series[]): RadarChart {
+    return new RadarChart(series, labels);
+}
+// A 2-D heatmap over a row×col value matrix.
+export fn heatmap(rows: string[], cols: string[], grid: float[][]): Heatmap {
+    return new Heatmap(rows, cols, grid);
+}
