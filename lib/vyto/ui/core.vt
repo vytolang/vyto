@@ -13,6 +13,7 @@ import { Surface, Rect, contains, rgb, rgba, with_alpha, alpha_of, mix,
           EV_RESIZE, EV_CLOSE, EV_TIMER, MOD_SHIFT,
           KEY_ESC, KEY_TAB } from "vyto/surface";
 import { Tween } from "vyto/ui/anim";
+import { Scrollbar, SIDE_TOP, SIDE_RIGHT, SIDE_BOTTOM, SIDE_LEFT } from "vyto/ui/scrollbar";
 import { ease_linear, ease_in_quad, ease_out_quad, ease_in_out_quad,
          ease_in_cubic, ease_out_cubic, ease_in_out_cubic,
          ease_out_back, ease_out_bounce, ease_in_out_sine } from "vyto/anim";
@@ -887,10 +888,21 @@ export class Widget {
     // to a Window (e.g. in init) are stashed here and flushed into the Window's
     // clock by propagate_win once `win` is known. Null until first used.
     pending_anims: Tween[];
+    // Reusable scrollbars (vyto/ui/scrollbar). Null until add_scrollbar; each
+    // snaps to its edge and shows only while content overflows. scroll_x/scroll_y
+    // are the content offsets the default bars read/write; scroll_active is the
+    // index of the bar currently being dragged (-1 = none). scroll_children turns
+    // on container auto-scroll (offset + clip the children in the default draw).
+    scrollbars: Scrollbar[];
+    scroll_off_x: int;   // content offset the horizontal bar reads/writes
+    scroll_off_y: int;   // content offset the vertical bar reads/writes
+    scroll_active: int;
+    scroll_children: bool;
 
     fn init() {
         this.children = [];
         this.alignSelf = -1;
+        this.scroll_active = -1;
     }
 
     builder fn add(child: Widget) {
@@ -965,6 +977,115 @@ export class Widget {
         });
     }
 
+    // ------------------------------------------------------------ scrollbars
+    // Reusable, edge-snapping scrollbars (vyto/ui/scrollbar). Any widget adds one
+    // and delegates painting + press/drag to the helpers here; the Scrollbar is
+    // pure geometry and holds no back-reference to this widget (no RC cycle).
+
+    // Add a bar snapped to `edge` (SIDE_*). Returns it so the caller can tune
+    // thickness/grab. Vertical bars (LEFT/RIGHT) track scroll_y, horizontal
+    // (TOP/BOTTOM) track scroll_x, unless scroll_offset is overridden.
+    fn add_scrollbar(edge: int): Scrollbar {
+        if (this.scrollbars == null) { this.scrollbars = []; }
+        let sb = new Scrollbar(edge);
+        this.scrollbars.push(sb);
+        return sb;
+    }
+
+    // The scrollable region the bars snap to. Defaults to the whole widget;
+    // widgets with chrome (a header, say) override to the inner content band.
+    virtual fn scroll_viewport(): Rect { return this.bounds; }
+
+    // Natural content extent along each axis. Default = viewport size (no
+    // overflow → no bar). Scrolling widgets override with their true content size.
+    virtual fn scroll_content_w(): int { return this.scroll_viewport().w; }
+    virtual fn scroll_content_h(): int { return this.scroll_viewport().h; }
+
+    // The offset a given bar reads/writes. Default backs vertical bars with
+    // scroll_y and horizontal with scroll_x; a widget with its own field
+    // (ScrollView.scroll_y, ListView.scroll) overrides these two.
+    virtual fn scroll_offset(sb: Scrollbar): int {
+        if (sb.vertical()) { return this.scroll_off_y; }
+        return this.scroll_off_x;
+    }
+    virtual fn set_scroll_offset(sb: Scrollbar, v: int) {
+        if (sb.vertical()) { this.scroll_off_y = v; } else { this.scroll_off_x = v; }
+    }
+
+    fn scroll_content_len(sb: Scrollbar): int {
+        if (sb.vertical()) { return this.scroll_content_h(); }
+        return this.scroll_content_w();
+    }
+
+    // Clamp scroll_x/scroll_y into range against the current content + viewport.
+    fn scroll_clamp() {
+        let vp = this.scroll_viewport();
+        let mx = this.scroll_content_w() - vp.w;
+        let my = this.scroll_content_h() - vp.h;
+        if (mx < 0) { mx = 0; }
+        if (my < 0) { my = 0; }
+        if (this.scroll_off_x > mx) { this.scroll_off_x = mx; }
+        if (this.scroll_off_x < 0) { this.scroll_off_x = 0; }
+        if (this.scroll_off_y > my) { this.scroll_off_y = my; }
+        if (this.scroll_off_y < 0) { this.scroll_off_y = 0; }
+    }
+
+    // Paint every bar whose content overflows. Call at the end of draw().
+    fn paint_scrollbars(s: Painter, th: Theme) {
+        if (this.scrollbars == null) { return; }
+        let vp = this.scroll_viewport();
+        for (let sb in this.scrollbars) {
+            let content = this.scroll_content_len(sb);
+            if (!sb.overflow(vp, content)) { continue; }
+            s.fill_round(sb.track(vp), sb.thickness / 2, th.surface_sunken);
+            s.fill_round(sb.thumb(vp, content, this.scroll_offset(sb)), sb.thickness / 2, th.on_surface_muted);
+        }
+    }
+
+    // Press on a bar → capture it and (for a track press) jump. Returns true when
+    // a bar consumed the press (so callers skip their own click handling).
+    fn scrollbar_press(x: int, y: int): bool {
+        if (this.scrollbars == null) { return false; }
+        let vp = this.scroll_viewport();
+        for (let i in 0..this.scrollbars.len) {
+            let sb = this.scrollbars[i];
+            let content = this.scroll_content_len(sb);
+            if (sb.hits(vp, content, x, y)) {
+                this.set_scroll_offset(sb, sb.press_offset(vp, content, this.scroll_offset(sb), x, y));
+                this.scroll_active = i;
+                this.invalidate();
+                return true;
+            }
+        }
+        return false;
+    }
+
+    fn scrollbar_drag(dx: int, dy: int): bool {
+        if (this.scrollbars == null || this.scroll_active < 0
+            || this.scroll_active >= this.scrollbars.len) { return false; }
+        let sb = this.scrollbars[this.scroll_active];
+        let vp = this.scroll_viewport();
+        let content = this.scroll_content_len(sb);
+        let d = dx;
+        if (sb.vertical()) { d = dy; }
+        this.set_scroll_offset(sb, sb.drag_offset(vp, content, this.scroll_offset(sb), d));
+        this.invalidate();
+        return true;
+    }
+
+    fn scrollbar_release() { this.scroll_active = -1; }
+
+    // True if (px,py) lands on a live bar. Widgets whose child covers the bar
+    // area (ScrollView) call this in hit() to claim the press for themselves.
+    fn scrollbar_hit(px: int, py: int): bool {
+        if (this.scrollbars == null) { return false; }
+        let vp = this.scroll_viewport();
+        for (let sb in this.scrollbars) {
+            if (sb.hits(vp, this.scroll_content_len(sb), px, py)) { return true; }
+        }
+        return false;
+    }
+
     // natural size, bottom-up
     virtual fn measure(s: Painter, th: Theme): Size {
         return Size(this.bounds.w, this.bounds.h);
@@ -1019,9 +1140,11 @@ export class Widget {
         }
     }
 
-    // absolute coordinates; return true when state changed (needs redraw)
+    // absolute coordinates; return true when state changed (needs redraw).
+    // Default consults the widget's scrollbars first (a no-op when it has none),
+    // so a scrollable widget needs no click code of its own.
     virtual fn on_click(x: int, y: int): bool {
-        return false;
+        return this.scrollbar_press(x, y);
     }
 
     // Fired on every mouse move while this widget holds the press capture
@@ -1030,7 +1153,7 @@ export class Widget {
     // state changed (needs redraw). Bracketed by on_drag_start / on_drag_end;
     // Slider is the first consumer.
     virtual fn on_drag(dx: int, dy: int): bool {
-        return false;
+        return this.scrollbar_drag(dx, dy);
     }
 
     // Fired once when a press begins moving past the drag slop, before the
@@ -1040,6 +1163,7 @@ export class Widget {
         return false;
     }
     virtual fn on_drag_end(x: int, y: int): bool {
+        this.scrollbar_release();
         return false;
     }
 
@@ -1058,6 +1182,13 @@ export class Widget {
     // mouse wheel scrolled while the cursor is over this widget; delta is
     // positive for down, negative for up. Return true when consumed.
     virtual fn on_scroll(delta: int): bool {
+        // wheel scrolls the vertical content when this widget has scrollbars
+        if (this.scrollbars != null && this.scroll_content_h() > this.scroll_viewport().h) {
+            this.scroll_off_y += delta * 24;
+            this.scroll_clamp();
+            this.invalidate();
+            return true;
+        }
         return false;
     }
 
@@ -1065,6 +1196,7 @@ export class Widget {
     // cursor is still inside its bounds) — the click-completion companion to
     // on_click (which still fires on press-down). Absolute coords.
     virtual fn on_release(x: int, y: int): bool {
+        this.scrollbar_release();
         return false;
     }
 

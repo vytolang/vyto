@@ -20,12 +20,12 @@ import { SearchField } from "vyto/ui/form";
 import { Rect, contains, mix, KEY_UP, KEY_DOWN, KEY_HOME, KEY_END,
          KEY_PAGEUP, KEY_PAGEDOWN, MOD_SHIFT } from "vyto/surface";
 import { DataFrame, CK_STR, CK_CAT, CK_BOOL, AGG_SUM } from "vyto/data/frame";
+import { SIDE_RIGHT, SIDE_BOTTOM } from "vyto/ui/scrollbar";
 
 const DT_SEARCH_H: int = 34;
 const DT_HDR_H: int = 30;
 const DT_ROW_H: int = 26;
 const DT_FOOT_H: int = 30;
-const DT_SCROLL_W: int = 6;   // scrollbar thumb thickness
 
 // One rendered column: a fixed pixel `width`, text `align` (0/1/2 = L/C/R), and
 // the source `col` index into the DataFrame.
@@ -49,8 +49,6 @@ export class DataTable extends Widget {
     df: DataFrame;
     cols: DtColumn[];
     colx: int[];        // prefix-sum of widths; colx[i] = left x of column i, colx[n] = total
-    scroll_y: int;      // pixel offset from the top of the row area
-    scroll_x: int;      // pixel offset from the left of the column area
     row_h: int;
     selected: int;      // visible-row index, -1 = none
     hover_row: int;     // visible-row index under the cursor, -1
@@ -60,15 +58,13 @@ export class DataTable extends Widget {
     agg_col: int;       // DataFrame column to show a live sum for in the footer, -1 = none
     onSelect: fn(int);  // called with the selected visible-row index
     search: SearchField;
-    drag_mode: int;     // 0 = none, 1 = dragging vertical scrollbar, 2 = horizontal
+    // scroll_x / scroll_y and the scrollbars come from the base Widget.
 
     fn init(df: DataFrame) {
         super.init();
         this.df = df;
         this.cols = [];
         this.colx = [];
-        this.scroll_y = 0;
-        this.scroll_x = 0;
         this.row_h = DT_ROW_H;
         this.selected = -1;
         this.hover_row = -1;
@@ -76,8 +72,9 @@ export class DataTable extends Widget {
         this.sort_asc = true;
         this.query = "";
         this.agg_col = -1;
-        this.drag_mode = 0;
         this.focusable = true;
+        this.add_scrollbar(SIDE_RIGHT);    // vertical, snaps to the right edge
+        this.add_scrollbar(SIDE_BOTTOM);   // horizontal, snaps to the bottom
         this.search = new SearchField("Search");
         this.add(this.search);
         let self = this;
@@ -119,21 +116,17 @@ export class DataTable extends Widget {
         for (let i in 0..this.cols.len) { x += this.cols[i].width; this.colx.push(x); }
     }
 
-    fn content_w(): int { if (this.colx.len == 0) { return 0; } return this.colx[this.colx.len - 1]; }
-    fn content_h(): int { return this.df.viewLen() * this.row_h; }
+    // Base-Widget scroll overrides: the content extent and the scrollable band
+    // (below the search + header, above the footer) the bars snap to.
+    override fn scroll_content_w(): int { if (this.colx.len == 0) { return 0; } return this.colx[this.colx.len - 1]; }
+    override fn scroll_content_h(): int { return this.df.viewLen() * this.row_h; }
+    override fn scroll_viewport(): Rect {
+        return Rect(this.bounds.x, this.body_top(), this.bounds.w, this.body_h());
+    }
     fn body_top(): int { return this.bounds.y + DT_SEARCH_H + DT_HDR_H; }
     fn body_h(): int { return this.bounds.h - DT_SEARCH_H - DT_HDR_H - DT_FOOT_H; }
 
-    fn clamp() {
-        let maxy = this.content_h() - this.body_h();
-        if (maxy < 0) { maxy = 0; }
-        if (this.scroll_y > maxy) { this.scroll_y = maxy; }
-        if (this.scroll_y < 0) { this.scroll_y = 0; }
-        let maxx = this.content_w() - this.bounds.w;
-        if (maxx < 0) { maxx = 0; }
-        if (this.scroll_x > maxx) { this.scroll_x = maxx; }
-        if (this.scroll_x < 0) { this.scroll_x = 0; }
-    }
+    fn clamp() { this.scroll_clamp(); }
 
     // First column whose right edge is past scroll_x — the leftmost visible
     // column. Binary search on the prefix sums so thousands of columns cost
@@ -143,7 +136,7 @@ export class DataTable extends Widget {
         let hi = this.cols.len;
         while (lo < hi) {
             let mid = (lo + hi) / 2;
-            if (this.colx[mid + 1] <= this.scroll_x) { lo = mid + 1; } else { hi = mid; }
+            if (this.colx[mid + 1] <= this.scroll_off_x) { lo = mid + 1; } else { hi = mid; }
         }
         return lo;
     }
@@ -162,7 +155,7 @@ export class DataTable extends Widget {
     fn set_query(q: string) {
         this.query = q;
         this.selected = -1;
-        this.scroll_y = 0;
+        this.scroll_off_y = 0;
         this.apply_view();
         this.invalidate();
     }
@@ -177,7 +170,7 @@ export class DataTable extends Widget {
     // ---- layout -----------------------------------------------------------
 
     override fn measure(s: Painter, th: Theme): Size {
-        let w = this.content_w() + 2;
+        let w = this.scroll_content_w() + 2;
         if (w < 320) { w = 320; }
         if (w > 900) { w = 900; }
         return Size(w, DT_SEARCH_H + DT_HDR_H + this.row_h * 10 + DT_FOOT_H);
@@ -215,7 +208,7 @@ export class DataTable extends Widget {
         s.set_weight(2);
         let ci = first_col;
         while (ci < this.cols.len) {
-            let cx = b.x - this.scroll_x + this.colx[ci];
+            let cx = b.x - this.scroll_off_x + this.colx[ci];
             if (cx >= b.x + b.w) { break; }
             let c = this.cols[ci];
             this.draw_cell(s, c, cx, hy, DT_HDR_H, c.title, th.on_surface);
@@ -240,8 +233,8 @@ export class DataTable extends Widget {
         let by = this.body_top();
         let bh = this.body_h();
         let vlen = this.df.viewLen();
-        let firstRow = this.scroll_y / this.row_h;
-        let off = this.scroll_y % this.row_h;
+        let firstRow = this.scroll_off_y / this.row_h;
+        let off = this.scroll_off_y % this.row_h;
         let vis = bh / this.row_h + 2;
         s.clip_push(Rect(b.x, by, b.w, bh), 0);
         for (let i in 0..vis) {
@@ -255,7 +248,7 @@ export class DataTable extends Widget {
             }
             let cj = first_col;
             while (cj < this.cols.len) {
-                let cx = b.x - this.scroll_x + this.colx[cj];
+                let cx = b.x - this.scroll_off_x + this.colx[cj];
                 if (cx >= b.x + b.w) { break; }
                 let c = this.cols[cj];
                 this.draw_cell(s, c, cx, ry, this.row_h, this.df.cellStr(vrow, c.col), th.on_surface);
@@ -264,7 +257,7 @@ export class DataTable extends Widget {
         }
         s.clip_pop();
 
-        this.draw_scrollbars(s, th, by, bh, vlen);
+        this.paint_scrollbars(s, th);
 
         // --- footer ---
         let fy = b.y + b.h - DT_FOOT_H;
@@ -275,32 +268,6 @@ export class DataTable extends Widget {
         s.text_in(Rect(b.x + 8, fy, b.w - 16, DT_FOOT_H), 0, label, th.on_surface_muted);
 
         this.search.draw(s, th);
-    }
-
-    fn draw_scrollbars(s: Painter, th: Theme, by: int, bh: int, vlen: int) {
-        let b = this.bounds;
-        // vertical
-        let ch = this.content_h();
-        if (ch > bh && bh > 0) {
-            let thumb = bh * bh / ch;
-            if (thumb < 20) { thumb = 20; }
-            let track = bh - thumb;
-            let maxy = ch - bh;
-            let ty = by;
-            if (maxy > 0) { ty = by + track * this.scroll_y / maxy; }
-            s.fill_round(Rect(b.x + b.w - DT_SCROLL_W - 2, ty, DT_SCROLL_W, thumb), 3, th.on_surface_muted);
-        }
-        // horizontal
-        let cw = this.content_w();
-        if (cw > b.w) {
-            let thumb = b.w * b.w / cw;
-            if (thumb < 20) { thumb = 20; }
-            let track = b.w - thumb;
-            let maxx = cw - b.w;
-            let tx = b.x;
-            if (maxx > 0) { tx = b.x + track * this.scroll_x / maxx; }
-            s.fill_round(Rect(tx, by + bh - DT_SCROLL_W - 2, thumb, DT_SCROLL_W), 3, th.on_surface_muted);
-        }
     }
 
     // Repaint the whole widget on any overlapping dirty rect (same reason as
@@ -316,8 +283,8 @@ export class DataTable extends Widget {
     // ---- events -----------------------------------------------------------
 
     override fn on_scroll(delta: int): bool {
-        if ((this.mods() & MOD_SHIFT) != 0) { this.scroll_x += delta * 40; }
-        else { this.scroll_y += delta * this.row_h; }
+        if ((this.mods() & MOD_SHIFT) != 0) { this.scroll_off_x += delta * 40; }
+        else { this.scroll_off_y += delta * this.row_h; }
         this.clamp();
         return true;
     }
@@ -326,59 +293,20 @@ export class DataTable extends Widget {
     fn row_at(y: int): int {
         let by = this.body_top();
         if (y < by || y >= by + this.body_h()) { return -1; }
-        let vrow = (y - by + this.scroll_y) / this.row_h;
+        let vrow = (y - by + this.scroll_off_y) / this.row_h;
         if (vrow < 0 || vrow >= this.df.viewLen()) { return -1; }
         return vrow;
     }
 
     // Grab margin around the thin scrollbar thumbs so they are easy to hit.
-    fn scrollbar_grab(): int { return DT_SCROLL_W + 8; }
-
     override fn on_click(x: int, y: int): bool {
+        // a scrollbar press (thumb-grab or track-jump) wins first
+        if (this.scrollbar_press(x, y)) { return true; }
         let b = this.bounds;
-        let by = this.body_top();
-        let bh = this.body_h();
-        // vertical scrollbar (right edge, over the body): grab the thumb, or
-        // click the track to jump — then keep dragging.
-        let ch = this.content_h();
-        if (ch > bh && bh > 0 && x >= b.x + b.w - this.scrollbar_grab()
-            && y >= by && y < by + bh) {
-            let thumb = bh * bh / ch;
-            if (thumb < 20) { thumb = 20; }
-            let track = bh - thumb;
-            let maxy = ch - bh;
-            let ty = by;
-            if (maxy > 0) { ty = by + track * this.scroll_y / maxy; }
-            if ((y < ty || y >= ty + thumb) && track > 0) {   // track click → center thumb on cursor
-                this.scroll_y = (y - by - thumb / 2) * maxy / track;
-                this.clamp();
-                this.invalidate();
-            }
-            this.drag_mode = 1;
-            return true;
-        }
-        // horizontal scrollbar (bottom edge of the body)
-        let cw = this.content_w();
-        if (cw > b.w && y >= by + bh - this.scrollbar_grab() && y < by + bh
-            && x >= b.x && x < b.x + b.w) {
-            let thumb = b.w * b.w / cw;
-            if (thumb < 20) { thumb = 20; }
-            let track = b.w - thumb;
-            let maxx = cw - b.w;
-            let tx = b.x;
-            if (maxx > 0) { tx = b.x + track * this.scroll_x / maxx; }
-            if ((x < tx || x >= tx + thumb) && track > 0) {
-                this.scroll_x = (x - b.x - thumb / 2) * maxx / track;
-                this.clamp();
-                this.invalidate();
-            }
-            this.drag_mode = 2;
-            return true;
-        }
         let hy = b.y + DT_SEARCH_H;
         // header → sort the column under the cursor
         if (y >= hy && y < hy + DT_HDR_H) {
-            let cxContent = x - b.x + this.scroll_x;
+            let cxContent = x - b.x + this.scroll_off_x;
             let ci = this.first_visible_col();
             while (ci < this.cols.len) {
                 if (cxContent >= this.colx[ci] && cxContent < this.colx[ci + 1]) {
@@ -399,36 +327,8 @@ export class DataTable extends Widget {
         return true;
     }
 
-    // Drag a scrollbar thumb: map the pixel delta along the track back to a
-    // content offset so the thumb tracks the cursor 1:1.
-    override fn on_drag(dx: int, dy: int): bool {
-        let bh = this.body_h();
-        if (this.drag_mode == 1 && bh > 0) {
-            let ch = this.content_h();
-            let thumb = bh * bh / ch;
-            if (thumb < 20) { thumb = 20; }
-            let track = bh - thumb;
-            if (track > 0) { this.scroll_y += dy * (ch - bh) / track; }
-            this.clamp();
-            this.invalidate();
-            return true;
-        }
-        if (this.drag_mode == 2) {
-            let b = this.bounds;
-            let cw = this.content_w();
-            let thumb = b.w * b.w / cw;
-            if (thumb < 20) { thumb = 20; }
-            let track = b.w - thumb;
-            if (track > 0) { this.scroll_x += dx * (cw - b.w) / track; }
-            this.clamp();
-            this.invalidate();
-            return true;
-        }
-        return false;
-    }
-
-    override fn on_drag_end(x: int, y: int): bool { this.drag_mode = 0; return false; }
-    override fn on_release(x: int, y: int): bool { this.drag_mode = 0; return false; }
+    // Thumb drag + release come from the base Widget (on_drag/on_drag_end/
+    // on_release → scrollbar_drag/scrollbar_release).
 
     override fn on_key(k: int, ch: string): bool {
         let vlen = this.df.viewLen();
@@ -458,8 +358,8 @@ export class DataTable extends Widget {
     fn ensure_visible(vrow: int) {
         let top = vrow * this.row_h;
         let bot = top + this.row_h;
-        if (top < this.scroll_y) { this.scroll_y = top; }
-        else if (bot > this.scroll_y + this.body_h()) { this.scroll_y = bot - this.body_h(); }
+        if (top < this.scroll_off_y) { this.scroll_off_y = top; }
+        else if (bot > this.scroll_off_y + this.body_h()) { this.scroll_off_y = bot - this.body_h(); }
         this.clamp();
     }
 

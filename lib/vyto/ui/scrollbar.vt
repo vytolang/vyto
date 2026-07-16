@@ -1,0 +1,130 @@
+// vyto/ui/scrollbar — a reusable, edge-snapping scrollbar. Pure geometry: it
+// holds no reference to any widget (so it can never form a ref-counting cycle
+// with its owner), and it never touches a Painter — the base Widget renders it
+// (Widget.paint_scrollbars) and drives it (scrollbar_press/drag). A widget adds
+// one with Widget.add_scrollbar(SIDE_*), and it snaps to that edge of the
+// scroll viewport, showing only while the content overflows.
+//
+// All the query methods take the viewport rect `vp` (the scrollable region), the
+// content length along the bar's axis, and the current scroll offset — so the
+// same Scrollbar works for any widget without storing that state.
+
+import { Rect } from "vyto/surface";
+
+// Which edge the bar snaps to. LEFT/RIGHT are vertical bars; TOP/BOTTOM are
+// horizontal.
+export const SIDE_TOP: int = 0;
+export const SIDE_RIGHT: int = 1;
+export const SIDE_BOTTOM: int = 2;
+export const SIDE_LEFT: int = 3;
+
+export class Scrollbar {
+    edge: int;         // SIDE_*
+    thickness: int;    // drawn track/thumb thickness in px
+    grab: int;         // extra px inward that still counts as a press on the bar
+    min_thumb: int;    // smallest thumb length so it stays grabbable
+
+    fn init(edge: int) {
+        this.edge = edge;
+        this.thickness = 6;
+        this.grab = 8;
+        this.min_thumb = 20;
+    }
+
+    fn vertical(): bool { return this.edge == SIDE_LEFT || this.edge == SIDE_RIGHT; }
+
+    // Length of the viewport along this bar's axis.
+    fn vp_len(vp: Rect): int { if (this.vertical()) { return vp.h; } return vp.w; }
+
+    // content overflows the viewport → the bar should show / respond.
+    fn overflow(vp: Rect, content: int): bool { return content > this.vp_len(vp); }
+
+    // The track rect, snapped to the chosen edge of `vp`.
+    fn track(vp: Rect): Rect {
+        if (this.edge == SIDE_RIGHT) { return vp.take_right(this.thickness); }
+        if (this.edge == SIDE_LEFT) { return vp.take_left(this.thickness); }
+        if (this.edge == SIDE_TOP) { return vp.take_top(this.thickness); }
+        return vp.take_bottom(this.thickness);
+    }
+
+    fn thumb_len(vp: Rect, content: int): int {
+        let vlen = this.vp_len(vp);
+        if (content <= 0) { return vlen; }
+        let t = vlen * vlen / content;
+        if (t < this.min_thumb) { t = this.min_thumb; }
+        if (t > vlen) { t = vlen; }
+        return t;
+    }
+
+    // Thumb position offset (px from the viewport's leading edge) for a scroll
+    // offset. free = track length not covered by the thumb; maxoff = max scroll.
+    fn thumb_pos(vp: Rect, content: int, offset: int): int {
+        let vlen = this.vp_len(vp);
+        let free = vlen - this.thumb_len(vp, content);
+        let maxoff = content - vlen;
+        if (maxoff <= 0 || free <= 0) { return 0; }
+        let o = offset;
+        if (o < 0) { o = 0; }
+        if (o > maxoff) { o = maxoff; }
+        return free * o / maxoff;
+    }
+
+    // The thumb rect for the current offset.
+    fn thumb(vp: Rect, content: int, offset: int): Rect {
+        let tr = this.track(vp);
+        let len = this.thumb_len(vp, content);
+        let pos = this.thumb_pos(vp, content, offset);
+        if (this.vertical()) { return Rect(tr.x, vp.y + pos, tr.w, len); }
+        return Rect(vp.x + pos, tr.y, len, tr.h);
+    }
+
+    // Press hit-region: the track widened inward by `grab` so the thin bar is
+    // easy to grab.
+    fn hit_rect(vp: Rect): Rect {
+        let t = this.thickness + this.grab;
+        if (this.edge == SIDE_RIGHT) { return Rect(vp.x + vp.w - t, vp.y, t, vp.h); }
+        if (this.edge == SIDE_LEFT) { return Rect(vp.x, vp.y, t, vp.h); }
+        if (this.edge == SIDE_TOP) { return Rect(vp.x, vp.y, vp.w, t); }
+        return Rect(vp.x, vp.y + vp.h - t, vp.w, t);
+    }
+
+    fn hits(vp: Rect, content: int, px: int, py: int): bool {
+        return this.overflow(vp, content) && this.hit_rect(vp).has(px, py);
+    }
+
+    fn clamp_off(content: int, vp: Rect, o: int): int {
+        let maxoff = content - this.vp_len(vp);
+        if (maxoff < 0) { maxoff = 0; }
+        if (o < 0) { o = 0; }
+        if (o > maxoff) { o = maxoff; }
+        return o;
+    }
+
+    // New scroll offset for a press at (px,py): grabbing the thumb keeps the
+    // offset (drag continues it); pressing the track jumps the thumb's centre to
+    // the cursor.
+    fn press_offset(vp: Rect, content: int, offset: int, px: int, py: int): int {
+        let vlen = this.vp_len(vp);
+        let len = this.thumb_len(vp, content);
+        let free = vlen - len;
+        let maxoff = content - vlen;
+        let origin = vp.y;
+        let c = py;
+        if (!this.vertical()) { origin = vp.x; c = px; }
+        let pos = this.thumb_pos(vp, content, offset);
+        if (c >= origin + pos && c < origin + pos + len) { return offset; } // on the thumb
+        if (free <= 0 || maxoff <= 0) { return offset; }
+        let np = c - origin - len / 2;
+        return this.clamp_off(content, vp, np * maxoff / free);
+    }
+
+    // New scroll offset after dragging `d` px along the axis (d = dy for a
+    // vertical bar, dx for horizontal).
+    fn drag_offset(vp: Rect, content: int, offset: int, d: int): int {
+        let vlen = this.vp_len(vp);
+        let free = vlen - this.thumb_len(vp, content);
+        let maxoff = content - vlen;
+        if (free <= 0 || maxoff <= 0) { return offset; }
+        return this.clamp_off(content, vp, offset + d * maxoff / free);
+    }
+}

@@ -3,6 +3,7 @@
 // Plus Align, Stack/Positioned, Wrap, Grid, Flexible, Divider.
 
 import { Widget, Painter, Theme, Size, BoxConstraints, bcLoose, bcTight } from "vyto/ui/core";
+import { Scrollbar, SIDE_RIGHT } from "vyto/ui/scrollbar";
 import { Rect, contains,
          KEY_UP, KEY_DOWN, KEY_HOME, KEY_END, KEY_PAGEUP, KEY_PAGEDOWN } from "vyto/surface";
 
@@ -854,8 +855,14 @@ export class ScrollView extends Box {
         this.scroll_y = 0;
         this.content_h = 0;
         this.focusable = true;
+        this.add_scrollbar(SIDE_RIGHT);   // reusable base-Widget scrollbar
         if (child != null) { this.add(child); }
     }
+
+    // Feed the base scrollbar from ScrollView's own scroll state.
+    override fn scroll_content_h(): int { return this.content_h; }
+    override fn scroll_offset(sb: Scrollbar): int { return this.scroll_y; }
+    override fn set_scroll_offset(sb: Scrollbar, v: int) { this.scroll_to(v); this.rearrange(); }
 
     fn max_scroll(): int {
         let m = this.content_h - this.bounds.h;
@@ -924,6 +931,7 @@ export class ScrollView extends Box {
             let cp = new ClippedPainter(s, this.bounds);
             c.draw(cp, th);
         }
+        this.paint_scrollbars(s, th);   // over the (clipped) child
     }
 
     // Partial repaint: intersect dirty rect with the viewport, fill, then
@@ -1030,6 +1038,7 @@ export class ScrollView extends Box {
     // Only hit-test the child if the point is within our viewport.
     override fn hit(px: int, py: int): Widget {
         if (!contains(this.bounds, px, py)) { return null; }
+        if (this.scrollbar_hit(px, py)) { return this; }  // claim the bar over the child
         let c = this.child();
         if (c != null) {
             let found = c.hit(px, py);
@@ -1060,9 +1069,15 @@ export class ListView extends Widget {
         this.build = build;
         this.scroll = 0;
         this.focusable = true;
+        this.add_scrollbar(SIDE_RIGHT);   // reusable base-Widget scrollbar
     }
 
     fn content_h(): int { return this.count() * this.row_h; }
+
+    // Feed the base scrollbar from ListView's own scroll state.
+    override fn scroll_content_h(): int { return this.content_h(); }
+    override fn scroll_offset(sb: Scrollbar): int { return this.scroll; }
+    override fn set_scroll_offset(sb: Scrollbar, v: int) { this.scroll = v; this.clamp_scroll(); }
 
     fn clamp_scroll() {
         let max = this.content_h() - this.bounds.h;
@@ -1095,6 +1110,7 @@ export class ListView extends Widget {
             w.draw(s, th);
         }
         s.clip_pop();
+        this.paint_scrollbars(s, th);
     }
 
     override fn on_scroll(delta: int): bool {
