@@ -9,10 +9,9 @@
 // It lives in its own module so plain Canvas users (import "vyto/gfx") don't
 // pull in vyto/ui, and vyto/ui apps don't pull in blend2d unless they use this.
 import { Painter, WEIGHT_REG, WEIGHT_MED, WEIGHT_BOLD } from "vyto/ui";
-import { Canvas, loadImage, loadImageBytes, freeImage } from "vyto/gfx";
+import { Canvas, loadImage, freeImage } from "vyto/gfx";
 import { Surface, Rect, rgb } from "vyto/surface";
 import { Path } from "vyto/geom/path";
-import { fetchUrl, fetchFree, fetchLen, fetchData } from "vyto/net";
 
 // Build a candidate bold/medium face path from a regular TTF path by inserting
 // "Bold"/"Medium" before the extension — works for the DejaVu family shipped
@@ -187,16 +186,12 @@ export class GfxPainter extends Painter {
     }
 
     override fn load_image(path: string): rawptr { return loadImage(path); }
-    // Bridges vyto/net (fetch) to vyto/gfx (decode) — the only place they
-    // meet, same boundary role this file already plays for load_image so
-    // vyto/ui stays free of both blend2d and libcurl.
-    override fn load_image_url(url: string): rawptr {
-        let h = fetchUrl(url);
-        if (h == null) { return null; }
-        let handle = loadImageBytes(fetchData(h), fetchLen(h));
-        fetchFree(h);
-        return handle;
-    }
+    // load_image_url (network image decode) is deliberately NOT overridden here:
+    // the base Painter returns null (a widget then draws its placeholder). It
+    // lives in the opt-in GfxPainterNet (vyto/gfx/painter_net) instead, so a
+    // plain GfxPainter app doesn't link libcurl (+ ssl/crypto/gssapi) it never
+    // uses. Apps that show remote images use GfxPainterNet — same boundary role
+    // this file plays for blend2d, extended to the net stack.
     override fn draw_image(handle: rawptr, r: Rect) {
         // a failed decode (bad path, or the palette-PNG limitation — see
         // gfx_shim.h) still needs to draw *something*, same graceful-degrade

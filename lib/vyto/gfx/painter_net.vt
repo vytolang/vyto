@@ -1,0 +1,31 @@
+// vyto/gfx/painter_net — GfxPainterNet: a GfxPainter that can also decode images
+// fetched from a URL. It's split out from GfxPainter so that the common case (a
+// rich-tier app with no remote images) does NOT link libcurl and its transitive
+// TLS stack (ssl / crypto / gssapi / krb5) — those pages are pure dead weight
+// for an app that never calls load_image_url.
+//
+//     import { GfxPainterNet } from "vyto/gfx/painter_net";
+//     win.use_painter(new GfxPainterNet(win.surface(), fontPath, 15.0));
+//
+// Everything else is inherited from GfxPainter unchanged. This is the only lib
+// module that imports vyto/net, so linking curl is now opt-in at the call site.
+
+import { GfxPainter } from "vyto/gfx/painter";
+import { loadImageBytes } from "vyto/gfx";
+import { Surface } from "vyto/surface";
+import { fetchUrl, fetchFree, fetchLen, fetchData } from "vyto/net";
+
+export class GfxPainterNet extends GfxPainter {
+    fn init(surf: Surface, fontPath: string, fontSize: float) {
+        super.init(surf, fontPath, fontSize);
+    }
+
+    // Bridge vyto/net (fetch) to vyto/gfx (decode) — the one place they meet.
+    override fn load_image_url(url: string): rawptr {
+        let h = fetchUrl(url);
+        if (h == null) { return null; }
+        let handle = loadImageBytes(fetchData(h), fetchLen(h));
+        fetchFree(h);
+        return handle;
+    }
+}
