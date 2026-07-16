@@ -237,6 +237,58 @@ fn main() {
 }
 ```
 
+### Charts — `vyto/ui/chart`
+
+A charting library built purely on the `vyto/ui` Painter vocabulary — no new
+drawing primitives. One-liner factories mirror the widget ergonomics; fluent
+setters tune the rest. A shared `ChartBase` gives every chart nice-number axes,
+grid, legend, hover tooltips, and a draw-in animation, so each kind is only its
+own geometry. Fifteen kinds ship — line/area/bar/pie, plus radar, candlestick,
+box plot, heatmap, a log-scale axis, and more — each rich-first (blend2d AA) and
+auto-degrading on the lean X11 tier.
+
+```js
+import { Window, Grid, series, ohlc,
+         lineChart, barChart, pieChart, radarChartN, candlestick } from "vyto/ui";
+
+// A smooth line, from bare y-values.
+let line = lineChart([1.0, 4.0, 2.0, 8.0, 5.0])
+    .title("Sales")
+    .smooth(true);
+
+// Grouped bars over labelled categories.
+let bars = barChart(["Q1", "Q2", "Q3"], [
+    series("Web", [20.0, 34.0, 28.0]),
+]).title("Signups");
+
+// A donut with outside slice labels + leader lines.
+let pie = pieChart(["Rent", "Food", "Fun"], [1200.0, 650.0, 420.0])
+    .title("Budget")
+    .donut(0.55)
+    .sliceLabels(true);
+
+// A multi-axis radar (spider) chart.
+let radar = radarChartN(["Spd", "Pow", "Def", "HP", "Mag"], [
+    series("Knight", [6.0, 9.0, 4.0, 8.0, 2.0]),
+]).title("Stats");
+
+// Financial candlesticks: open / high / low / close per bar.
+let candle = candlestick(["Mon", "Tue", "Wed"], [
+    ohlc(30.0, 34.0, 28.0, 33.0),
+    ohlc(33.0, 36.0, 32.0, 32.5),
+    ohlc(32.5, 33.0, 27.0, 28.0),
+]).title("Price");
+
+let win = new Window("Charts", 1200, 520);
+win.root = new Grid(3, 12, [line, bars, pie, radar, candle]);
+win.run();
+```
+
+![vyto/ui charts](docs/images/charts.png)
+
+The full 15-chart showcase is [apps/charts](apps/charts/charts.vt) — run it rich
+(`./vytoc run apps/charts/charts.vt`) or lean (`… -- --surface`).
+
 ### CLI + JSON — `vyto/net/http`, `vyto/util/json`
 
 Fetch a JSON array from a REST endpoint and print it. From
