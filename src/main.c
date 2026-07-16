@@ -355,6 +355,19 @@ int main(int argc, char **argv) {
     if (freestanding) fsflags = " -ffreestanding -DVT_NO_LIBC -fno-builtin";
     if (no_float) fsflags = arena_printf(&g_arena, "%s -DVT_NO_FLOAT", fsflags);
     if (no_fs) fsflags = arena_printf(&g_arena, "%s -DVT_NO_FS", fsflags);
+    /* Dead-code stripping. Vyto compiles each .vt file as one translation unit
+       and does NO symbol-level tree-shaking, so importing a single symbol from a
+       module drags the whole module's code into the object. -ffunction-sections
+       / -fdata-sections put every function and datum in its own section; the
+       matching -Wl,--gc-sections at link time (added to the link command below)
+       then collects any section left unreferenced in the final program.
+       Measured on the charting lib: a lineChart-only program shrank 325KB -> 64KB
+       and the full 15-chart showcase 715KB -> 317KB, with no runtime cost —
+       vtable data sections reference every dynamically-dispatched method, so
+       gc-sections never drops a live override. tcc understands neither flag, so
+       skip it there (tcc is only the default for fast debug builds anyway). */
+    if (strcmp(cc, "tcc") != 0)
+        fsflags = arena_printf(&g_arena, "%s -ffunction-sections -fdata-sections", fsflags);
     /* Debug builds also trap overflow at the C level (defense in depth beyond
        the emitter's checked arithmetic), catching overflow in native/FFI code.
        Native host compilers only; skipped for cross/tcc/freestanding (ubsan
@@ -573,8 +586,14 @@ int main(int argc, char **argv) {
         const char *bundle_flags = bundle ? " -static-libstdc++ -static-libgcc" : "";
         const char *bundle_link = bundle
             ? arena_printf(&g_arena, "%s -lstdc++", bundle_deps.data) : "";
-        char *cmdline = arena_printf(&g_arena, "%s%s%s -o %s%s%s%s%s%s -lm", cc, san, bundle_flags,
-                                     exe, objs.data, shlibs.data, libs.data, bundle_link, rpath_flag);
+        /* Garbage-collect the per-function/per-datum sections emitted above, so
+           code from imported modules that the program never references is left
+           out of the final binary (see the -ffunction-sections note near the top
+           of this function). Paired flag; skipped for tcc, which emits neither. */
+        const char *gcsec = strcmp(cc, "tcc") != 0 ? " -Wl,--gc-sections" : "";
+        char *cmdline = arena_printf(&g_arena, "%s%s%s%s -o %s%s%s%s%s%s -lm", cc, san, bundle_flags,
+                                     gcsec, exe, objs.data, shlibs.data, libs.data, bundle_link,
+                                     rpath_flag);
         if (run_cmd(cmdline, verbose) != 0) fatal("link failed");
     }
     /* ship prebuilt libraries next to the executable */

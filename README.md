@@ -60,6 +60,20 @@ is no `libvyto.so` to ship. It depends only on the platform's own libraries
 without `vytoc` installed. A GUI app like snake lands around 48 KB; `strip` (or
 `--cc 'cc -s'`) trims it further.
 
+**Dead-code stripping is automatic.** Vyto compiles each `.vt` file as one
+translation unit with no symbol-level tree-shaking, so importing a single symbol
+from a module pulls that whole module's code into the object. To recover the
+difference, every build compiles with `-ffunction-sections -fdata-sections` and
+links with `-Wl,--gc-sections`, so any function or datum left unreferenced in the
+final program is dropped at link time — vtable data sections keep every
+dynamically-dispatched method reachable, so overrides are never wrongly removed.
+The effect is large: a program that imports only `lineChart` from the ~2000-line
+charting library links at **64 KB** instead of 325 KB, and an app that uses all
+15 chart kinds at 317 KB instead of 715 KB. An unused import therefore costs
+essentially nothing in the shipped binary. (The `tcc` fast-debug compiler
+supports neither flag, so they are skipped there; release builds use `cc`/`gcc`
+and get them.)
+
 Cross-compile the same way with `--target` (see below):
 
 ```sh
