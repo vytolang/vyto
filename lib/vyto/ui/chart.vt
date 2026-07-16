@@ -20,6 +20,7 @@ import { Rect, mix, with_alpha, rgb } from "vyto/surface";
 import { sin, cos, sqrt, atan2, PI, TAU, floor, ceil, pow, log10, fmax, fmin } from "vyto/math";
 import { Path } from "vyto/geom/path";
 import { fixed } from "vyto/util/fmt";
+import { DateTime, date_from_unix, date_to_unix, date_format, date_parse } from "vyto/util/date";
 
 // ------------------------------------------------------------ data model
 
@@ -92,6 +93,17 @@ fn log_tick_label(v: float): string {
     return fixed(v, 3);
 }
 
+// ------------------------------------------------------------ color ramp
+
+// A sequential color ramp: interpolate cold→hot by t, clamped to [0,1]. Shared
+// by Heatmap cells and Map choropleth fills.
+fn ramp(cold: int, hot: int, t: float): int {
+    let tt = t;
+    if (tt < 0.0) { tt = 0.0; }
+    if (tt > 1.0) { tt = 1.0; }
+    return mix(cold, hot, tt);
+}
+
 // ------------------------------------------------------------ path builders
 
 // A straight polyline through the pixel points.
@@ -132,6 +144,29 @@ fn smooth_path(xs: float[], ys: float[]): Path {
     return p;
 }
 
+// Fill the area under a pixel polyline with a true vertical gradient, one 1px
+// column at a time (no path-clip exists on any tier, so we synthesize the fill
+// from rect gradients). `xs`/`ys` are the flattened top-edge points, left→right;
+// `base` is the baseline y. On the rich tier each column is an AA vertical ramp;
+// on the lean tier gradient_v degrades to a flat mid-color — same graceful
+// contract as everything else.
+fn fill_gradient_under(s: Painter, xs: i32[], ys: i32[], base: int, top: int, bot: int) {
+    let n = xs.len;
+    if (n < 2) { return; }
+    for (let i in 0..(n - 1)) {
+        let x0 = xs[i]; let y0 = ys[i];
+        let x1 = xs[i + 1]; let y1 = ys[i + 1];
+        if (x1 <= x0) { continue; }
+        let span = (x1 - x0) as float;
+        for (let x in x0..(x1 + 1)) {
+            let t = ((x - x0) as float) / span;
+            let y = y0 + (((y1 - y0) as float) * t) as int;
+            let h = base - y;
+            if (h > 0) { s.gradient_v(Rect(x, y, 1, h), 0, top, bot); }
+        }
+    }
+}
+
 // ------------------------------------------------------------ chart base
 
 // Shared machinery for every chart: card chrome, title, axes/grid, legend,
@@ -156,6 +191,18 @@ export class ChartBase extends Widget {
     pref_h: int;
     last_plot: Rect;     // plot area from the most recent draw (for hit-testing)
     last_sc: AxisScale;
+    // x-viewport: the visible sub-window of the full x extent as a [0,1]
+    // fraction. Pan/zoom/brush move it; virtualization trims to it. Default
+    // full-range, so charts that don't opt into interaction are unaffected.
+    view_lo: float;
+    view_hi: float;
+    interactive_on: bool;
+    decimate_on: bool;
+    cursor_px: int;      // last cursor x (for zoom-to-cursor; no coords on wheel)
+    brush_mode: bool;    // drag selects a range to zoom into (vs. drag = pan)
+    brushing: bool;
+    brush_a: int;        // brush anchor / current x in pixels
+    brush_b: int;
 
     fn init(series: Series[], labels: string[]) {
         super.init();
@@ -165,6 +212,15 @@ export class ChartBase extends Widget {
         this.show_legend = true;
         this.show_grid = true;
         this.show_axes = true;
+        this.view_lo = 0.0;
+        this.view_hi = 1.0;
+        this.interactive_on = false;
+        this.decimate_on = true;
+        this.cursor_px = 0;
+        this.brush_mode = false;
+        this.brushing = false;
+        this.brush_a = 0;
+        this.brush_b = 0;
         this.range_set = false;
         this.log_y = false;
         this.reveal = 0.0;
@@ -367,6 +423,17 @@ export class ChartBase extends Widget {
         this.draw_plot(s, th, plot, sc);
         s.clip_pop();
 
+        // live brush selection rectangle
+        if (this.brushing) {
+            let a = this.brush_a; let b = this.brush_b;
+            if (a > b) { let t = a; a = b; b = t; }
+            if (a < plot.x) { a = plot.x; }
+            if (b > plot.x + plot.w) { b = plot.x + plot.w; }
+            if (b > a) {
+                s.fill_round(Rect(a, plot.y, b - a, plot.h), 0, with_alpha(th.primary, 45));
+            }
+        }
+
         this.draw_tooltip(s, th, plot, sc);
     }
 
@@ -473,6 +540,7 @@ export class ChartBase extends Widget {
 
     override fn hit(px: int, py: int): Widget {
         if (this.bounds.has(px, py)) {
+            this.cursor_px = px;   // for zoom-to-cursor (wheel carries no coords)
             if (this.index_hover()) {
                 let idx = this.nearest_index(px);
                 if (idx != this.hover_idx) { this.hover_idx = idx; this.repaint_now(); }
@@ -494,6 +562,99 @@ export class ChartBase extends Widget {
     override fn on_hover_leave(): bool {
         if (this.hover_idx != -1) { this.hover_idx = -1; return true; }
         return false;
+    }
+
+    // -- interaction: pan / zoom / brush (opt-in) ---------------------------
+    // Enable drag-to-pan + wheel-zoom on the x-viewport (charts that map x
+    // through vis_lo/vis_hi honor it, e.g. TimeSeriesChart). Double-click resets.
+    builder fn interactive() { this.interactive_on = true; return this; }
+    // Drag selects a range and zooms into it (implies interactive).
+    builder fn brush(b: bool) { this.brush_mode = b; this.interactive_on = true; return this; }
+    // Turn windowed decimation of dense series off (default on).
+    builder fn decimate(b: bool) { this.decimate_on = b; return this; }
+
+    override fn on_click(x: int, y: int): bool {
+        if (!this.interactive_on) { return false; }
+        this.cursor_px = x;
+        if (this.brush_mode) { this.brushing = true; this.brush_a = x; this.brush_b = x; }
+        return true;   // grab the drag capture
+    }
+    override fn on_drag_start(x: int, y: int): bool {
+        if (!this.interactive_on) { return false; }
+        if (this.brush_mode) { this.brushing = true; this.brush_a = x; this.brush_b = x; }
+        return true;
+    }
+    override fn on_drag(dx: int, dy: int): bool {
+        if (!this.interactive_on) { return false; }
+        if (this.brush_mode) {
+            this.brush_b += dx;
+            this.repaint_now();
+            return true;
+        }
+        let pw = this.last_plot.w;
+        if (pw <= 0) { return true; }
+        let span = this.view_hi - this.view_lo;
+        this.pan_by(-(dx as float) / (pw as float) * span);
+        this.repaint_now();
+        return true;
+    }
+    override fn on_drag_end(x: int, y: int): bool {
+        if (!this.interactive_on) { return false; }
+        if (this.brushing) { this.brushing = false; this.apply_brush(); this.repaint_now(); }
+        return true;
+    }
+    override fn on_scroll(delta: int): bool {
+        if (!this.interactive_on) { return false; }
+        let factor = 0.85;                    // wheel up (delta<0) = zoom in
+        if (delta > 0) { factor = 1.0 / 0.85; }
+        this.zoom_at(this.cursor_px, factor);
+        this.repaint_now();
+        return true;
+    }
+    override fn on_double_click(x: int, y: int): bool {
+        if (!this.interactive_on) { return false; }
+        this.view_lo = 0.0; this.view_hi = 1.0;
+        this.repaint_now();
+        return true;
+    }
+
+    fn pan_by(dfrac: float) {
+        let span = this.view_hi - this.view_lo;
+        let lo = this.view_lo + dfrac;
+        if (lo < 0.0) { lo = 0.0; }
+        if (lo + span > 1.0) { lo = 1.0 - span; }
+        this.view_lo = lo; this.view_hi = lo + span;
+    }
+    fn zoom_at(px: int, factor: float) {
+        let plot = this.last_plot;
+        if (plot.w <= 0) { return; }
+        let fc = ((px - plot.x) as float) / (plot.w as float);
+        if (fc < 0.0) { fc = 0.0; }
+        if (fc > 1.0) { fc = 1.0; }
+        let span = this.view_hi - this.view_lo;
+        let center = this.view_lo + fc * span;
+        let ns = span * factor;
+        if (ns > 1.0) { ns = 1.0; }
+        if (ns < 0.02) { ns = 0.02; }
+        let lo = center - fc * ns;
+        let hi = lo + ns;
+        if (lo < 0.0) { lo = 0.0; hi = ns; }
+        if (hi > 1.0) { hi = 1.0; lo = 1.0 - ns; }
+        this.view_lo = lo; this.view_hi = hi;
+    }
+    fn apply_brush() {
+        let plot = this.last_plot;
+        if (plot.w <= 0) { return; }
+        let a = this.brush_a; let b = this.brush_b;
+        if (a > b) { let t = a; a = b; b = t; }
+        if (b - a < 4) { return; }             // ignore accidental taps
+        let span = this.view_hi - this.view_lo;
+        let fa = ((a - plot.x) as float) / (plot.w as float);
+        let fb = ((b - plot.x) as float) / (plot.w as float);
+        if (fa < 0.0) { fa = 0.0; }
+        if (fb > 1.0) { fb = 1.0; }
+        this.view_hi = this.view_lo + fb * span;
+        this.view_lo = this.view_lo + fa * span;
     }
 
     fn nearest_index(px: int): int {
@@ -600,16 +761,21 @@ export class LineChart extends ChartBase {
 export class AreaChart extends ChartBase {
     smooth_on: bool;
     stacked_on: bool;
+    gradient_on: bool;
 
     fn init(series: Series[], labels: string[]) {
         super.init(series, labels);
         this.smooth_on = true;
         this.stacked_on = false;
+        this.gradient_on = false;
     }
 
     builder fn smooth(b: bool) { this.smooth_on = b; return this; }
     // Stack the series into cumulative bands instead of overlaying them.
     builder fn stacked() { this.stacked_on = true; return this; }
+    // Fill under the curve with a true vertical gradient (fades to the baseline)
+    // instead of a flat translucent tint.
+    builder fn gradientFill(b: bool) { this.gradient_on = b; return this; }
 
     override fn include_zero(): bool { return true; }
 
@@ -657,13 +823,22 @@ export class AreaChart extends ChartBase {
                 xs.push(this.x_of(i, plot) as float);
                 ys.push(this.vyr(vals[i], plot, sc));
             }
-            // filled area: top edge, then down to the baseline and back
-            let fillp = poly_line_path(xs, ys);
-            if (this.smooth_on) { fillp = smooth_path(xs, ys); }
-            fillp.lineTo(xs[xs.len - 1], base);
-            fillp.lineTo(xs[0], base);
-            fillp.close();
-            s.fill_path(fillp, with_alpha(color, 70));
+            if (this.gradient_on) {
+                // true vertical gradient under the curve (per-column ramp)
+                let edge = poly_line_path(xs, ys);
+                if (this.smooth_on) { edge = smooth_path(xs, ys); }
+                let fp = edge.flatten();
+                fill_gradient_under(s, fp.xs, fp.ys, base as int,
+                                    with_alpha(color, 130), with_alpha(color, 8));
+            } else {
+                // filled area: top edge, then down to the baseline and back
+                let fillp = poly_line_path(xs, ys);
+                if (this.smooth_on) { fillp = smooth_path(xs, ys); }
+                fillp.lineTo(xs[xs.len - 1], base);
+                fillp.lineTo(xs[0], base);
+                fillp.close();
+                s.fill_path(fillp, with_alpha(color, 70));
+            }
             // crisp top stroke
             let top = poly_line_path(xs, ys);
             if (this.smooth_on) { top = smooth_path(xs, ys); }
@@ -1080,6 +1255,7 @@ export class Histogram extends BarChart {
 // in a table cell or a label row. No animation (it's usually one of many).
 export class Sparkline extends ChartBase {
     area_on: bool;
+    gradient_on: bool;
     line_color: int;   // 0 = theme primary
 
     fn init(values: float[]) {
@@ -1092,10 +1268,13 @@ export class Sparkline extends ChartBase {
         this.pref_w = 120;
         this.pref_h = 32;
         this.area_on = false;
+        this.gradient_on = false;
         this.line_color = 0;
     }
 
     builder fn area(b: bool) { this.area_on = b; return this; }
+    // Gradient fill under the line (implies area).
+    builder fn gradientFill(b: bool) { this.gradient_on = b; this.area_on = b; return this; }
     builder fn stroke(c: int) { this.line_color = c; return this; }
 
     override fn index_hover(): bool { return false; }
@@ -1126,11 +1305,17 @@ export class Sparkline extends ChartBase {
         }
         if (this.area_on) {
             let base = (b.y + b.h - pad) as float;
-            let fp = poly_line_path(xs, ys);
-            fp.lineTo(xs[xs.len - 1], base);
-            fp.lineTo(xs[0], base);
-            fp.close();
-            s.fill_path(fp, with_alpha(color, 60));
+            if (this.gradient_on) {
+                let fp = poly_line_path(xs, ys).flatten();
+                fill_gradient_under(s, fp.xs, fp.ys, base as int,
+                                    with_alpha(color, 130), with_alpha(color, 8));
+            } else {
+                let fp = poly_line_path(xs, ys);
+                fp.lineTo(xs[xs.len - 1], base);
+                fp.lineTo(xs[0], base);
+                fp.close();
+                s.fill_path(fp, with_alpha(color, 60));
+            }
         }
         s.stroke_path(poly_line_path(xs, ys), 2, color);
     }
@@ -1839,10 +2024,7 @@ export class Heatmap extends ChartBase {
     fn cell_color(v: float, th: Theme): int {
         let c0 = this.cold; if (c0 == 0) { c0 = th.surface_sunken; }
         let c1 = this.hot;  if (c1 == 0) { c1 = th.primary_500; }
-        let t = (v - this.vmin) / (this.vmax - this.vmin);
-        if (t < 0.0) { t = 0.0; }
-        if (t > 1.0) { t = 1.0; }
-        return mix(c0, c1, t);
+        return ramp(c0, c1, (v - this.vmin) / (this.vmax - this.vmin));
     }
 
     // plot rect split into a label gutter + the cell grid
@@ -1901,6 +2083,456 @@ export class Heatmap extends ChartBase {
                            cy + rh / 2 + s.font_ascent() - s.font_height() / 2, vt, th.on_surface);
                 }
             }
+        }
+    }
+}
+
+// ------------------------------------------------------------ funnel
+
+// A funnel chart: stacked stages that taper by value (conversion funnels,
+// pipelines). Each stage is a trapezoid whose top width tracks its value and
+// bottom width tracks the next stage, so the shape narrows toward the tip.
+export class FunnelChart extends ChartBase {
+    neck_on: bool;   // draw the last stage as a rectangle (a "neck") instead of a taper
+
+    fn init(labels: string[], values: float[]) {
+        super.init([new Series("", values)], labels);
+        this.show_axes = false;
+        this.show_grid = false;
+        this.show_legend = false;
+        this.neck_on = false;
+    }
+
+    builder fn neck() { this.neck_on = true; return this; }
+
+    override fn index_hover(): bool { return false; }
+
+    fn vals(): float[] {
+        if (this.series.len == 0) { return []; }
+        return this.series[0].values;
+    }
+
+    // half-width of the band for value v, scaled by the draw-in reveal
+    fn half_w(v: float, maxv: float, plot: Rect): float {
+        let f = 0.0;
+        if (maxv > 0.0) { f = v / maxv; }
+        return f * (plot.w as float) * 0.45 * this.reveal;
+    }
+
+    override fn draw_plot(s: Painter, th: Theme, plot: Rect, sc: AxisScale) {
+        let v = this.vals();
+        let n = v.len;
+        if (n == 0) { return; }
+        let maxv = v[0];
+        for (let x in v) { if (x > maxv) { maxv = x; } }
+        if (maxv <= 0.0) { return; }
+
+        let cx = (plot.x + plot.w / 2) as float;
+        let bandh = (plot.h as float) / (n as float);
+        for (let i in 0..n) {
+            let yTop = (plot.y as float) + (i as float) * bandh;
+            let yBot = yTop + bandh - 2.0;
+            let topHw = this.half_w(v[i], maxv, plot);
+            // bottom width follows the next stage (or stays flat for a neck / last)
+            let botv = v[i];
+            if (i + 1 < n) { botv = v[i + 1]; }
+            if (this.neck_on && i == n - 1) { botv = v[i]; }
+            let botHw = this.half_w(botv, maxv, plot);
+            let color = this.palette(i, th);
+            if (i == this.hover_idx) { color = mix(color, rgb(255, 255, 255), 0.18); }
+
+            let xs: i32[] = [];
+            let ys: i32[] = [];
+            xs.push((cx - topHw) as i32); ys.push(yTop as i32);
+            xs.push((cx + topHw) as i32); ys.push(yTop as i32);
+            xs.push((cx + botHw) as i32); ys.push(yBot as i32);
+            xs.push((cx - botHw) as i32); ys.push(yBot as i32);
+            s.polygon(xs, ys, color);
+
+            // stage label + value + % of the top stage, centered
+            let name = "";
+            if (i < this.labels.len) { name = this.labels[i]; }
+            let pct = v[i] / maxv * 100.0;
+            let lbl = name + "  " + fixed(v[i], 0) + " (" + fixed(pct, 0) + "%)";
+            let ly = (yTop + bandh / 2.0) as int + s.font_ascent() - s.font_height() / 2;
+            s.text((cx as int) - s.text_width(lbl) / 2, ly, lbl, th.on_surface);
+        }
+    }
+
+    override fn hit(px: int, py: int): Widget {
+        if (!this.bounds.has(px, py)) { return null; }
+        let plot = this.last_plot;
+        let n = this.vals().len;
+        let idx = -1;
+        if (n > 0 && py >= plot.y && py < plot.y + plot.h) {
+            let band = plot.h / n;
+            if (band > 0) {
+                idx = (py - plot.y) / band;
+                if (idx >= n) { idx = n - 1; }
+            }
+        }
+        if (idx != this.hover_idx) { this.hover_idx = idx; this.repaint_now(); }
+        return this;
+    }
+
+    override fn on_hover_leave(): bool {
+        if (this.hover_idx != -1) { this.hover_idx = -1; return true; }
+        return false;
+    }
+}
+
+// ------------------------------------------------------------ map
+
+// One filled region: a single lat/lon ring (parallel arrays) + a scalar value
+// that drives its choropleth color. Multi-ring shapes / holes are out of scope
+// (use one MapRegion per ring). A class (not a struct) since it holds arrays.
+export class MapRegion {
+    name: string;
+    lat: float[];
+    lon: float[];
+    value: float;
+    fn init(name: string, lat: float[], lon: float[], value: float) {
+        this.name = name; this.lat = lat; this.lon = lon; this.value = value;
+    }
+}
+
+// A point marker at a lat/lon, radius scaled by `size` (like a bubble).
+export class MapPoint {
+    name: string;
+    lat: float;
+    lon: float;
+    size: float;
+    fn init(name: string, lat: float, lon: float, size: float) {
+        this.name = name; this.lat = lat; this.lon = lon; this.size = size;
+    }
+}
+
+export fn mapRegion(name: string, lat: float[], lon: float[], value: float): MapRegion {
+    return new MapRegion(name, lat, lon, value);
+}
+export fn mapPoint(name: string, lat: float, lon: float, size: float): MapPoint {
+    return new MapPoint(name, lat, lon, size);
+}
+
+// True when (px,py) is inside the ring, by the even-odd ray-cast rule.
+fn point_in_ring(px: float, py: float, xs: float[], ys: float[]): bool {
+    let n = xs.len;
+    if (n < 3) { return false; }
+    let inside = false;
+    let j = n - 1;
+    for (let i in 0..n) {
+        let yi = ys[i]; let yj = ys[j];
+        if ((yi > py) != (yj > py)) {
+            let xint = xs[i] + (xs[j] - xs[i]) * (py - yi) / (yj - yi);
+            if (px < xint) { inside = !inside; }
+        }
+        j = i;
+    }
+    return inside;
+}
+
+// A choropleth map with optional point overlays, on an equirectangular
+// projection. The caller supplies geometry (lat/lon rings + points); the lib
+// auto-fits the projection to the data extent so regional maps fill the plot.
+export class MapChart extends ChartBase {
+    regions: MapRegion[];
+    pts: MapPoint[];
+    cold: int;       // 0 = theme surface_sunken
+    hot: int;        // 0 = theme primary_500
+    // projection bounds (data extent), computed at init
+    lat_lo: float; lat_hi: float;
+    lon_lo: float; lon_hi: float;
+    vmin: float; vmax: float;
+    hpx: int; hpy: int;
+
+    fn init(regions: MapRegion[], pts: MapPoint[]) {
+        super.init([], []);
+        this.regions = regions;
+        this.pts = pts;
+        this.cold = 0;
+        this.hot = 0;
+        this.show_axes = false;
+        this.show_grid = false;
+        this.show_legend = false;
+        this.hpx = 0; this.hpy = 0;
+        this.fit_bounds();
+    }
+
+    builder fn colors(cold: int, hot: int) { this.cold = cold; this.hot = hot; return this; }
+
+    override fn index_hover(): bool { return false; }
+
+    fn fit_bounds() {
+        let any = false;
+        for (let r in this.regions) {
+            for (let k in 0..r.lat.len) {
+                let la = r.lat[k]; let lo = r.lon[k];
+                if (!any) { this.lat_lo = la; this.lat_hi = la; this.lon_lo = lo; this.lon_hi = lo; any = true; }
+                else {
+                    this.lat_lo = fmin(this.lat_lo, la); this.lat_hi = fmax(this.lat_hi, la);
+                    this.lon_lo = fmin(this.lon_lo, lo); this.lon_hi = fmax(this.lon_hi, lo);
+                }
+            }
+        }
+        for (let p in this.pts) {
+            if (!any) { this.lat_lo = p.lat; this.lat_hi = p.lat; this.lon_lo = p.lon; this.lon_hi = p.lon; any = true; }
+            else {
+                this.lat_lo = fmin(this.lat_lo, p.lat); this.lat_hi = fmax(this.lat_hi, p.lat);
+                this.lon_lo = fmin(this.lon_lo, p.lon); this.lon_hi = fmax(this.lon_hi, p.lon);
+            }
+        }
+        if (!any) { this.lat_lo = -90.0; this.lat_hi = 90.0; this.lon_lo = -180.0; this.lon_hi = 180.0; }
+        // pad by 5% so shapes don't touch the edges
+        let latpad = (this.lat_hi - this.lat_lo) * 0.05 + 0.001;
+        let lonpad = (this.lon_hi - this.lon_lo) * 0.05 + 0.001;
+        this.lat_lo -= latpad; this.lat_hi += latpad;
+        this.lon_lo -= lonpad; this.lon_hi += lonpad;
+        // value extent for the choropleth ramp
+        let vany = false;
+        for (let r in this.regions) {
+            if (!vany) { this.vmin = r.value; this.vmax = r.value; vany = true; }
+            else { this.vmin = fmin(this.vmin, r.value); this.vmax = fmax(this.vmax, r.value); }
+        }
+        if (!vany) { this.vmin = 0.0; this.vmax = 1.0; }
+        if (this.vmax <= this.vmin) { this.vmax = this.vmin + 1.0; }
+    }
+
+    // equirectangular projection: lon→x, lat→y (north up)
+    fn proj_x(lon: float, plot: Rect): float {
+        return (plot.x as float) + (lon - this.lon_lo) / (this.lon_hi - this.lon_lo) * (plot.w as float);
+    }
+    fn proj_y(lat: float, plot: Rect): float {
+        return (plot.y as float) + (this.lat_hi - lat) / (this.lat_hi - this.lat_lo) * (plot.h as float);
+    }
+
+    fn region_color(v: float, th: Theme): int {
+        // low→high as dark-blue→bright-blue; both stay visible on a dark theme
+        // (surface_sunken would render near-black for the lowest region).
+        let c0 = this.cold; if (c0 == 0) { c0 = th.primary_700; }
+        let c1 = this.hot;  if (c1 == 0) { c1 = th.primary_300; }
+        return ramp(c0, c1, (v - this.vmin) / (this.vmax - this.vmin));
+    }
+
+    override fn draw_plot(s: Painter, th: Theme, plot: Rect, sc: AxisScale) {
+        // regions: filled projected polygons + outline
+        for (let r in this.regions) {
+            let np = r.lat.len;
+            if (np < 3) { continue; }
+            let xs: i32[] = [];
+            let ys: i32[] = [];
+            for (let k in 0..np) {
+                xs.push(this.proj_x(r.lon[k], plot) as i32);
+                ys.push(this.proj_y(r.lat[k], plot) as i32);
+            }
+            s.polygon(xs, ys, this.region_color(r.value, th));
+            for (let k in 0..np) {
+                let k2 = (k + 1) % np;
+                s.line(xs[k] as int, ys[k] as int, xs[k2] as int, ys[k2] as int, th.border);
+            }
+        }
+        // points on top
+        for (let p in this.pts) {
+            let x = this.proj_x(p.lon, plot) as int;
+            let y = this.proj_y(p.lat, plot) as int;
+            let rad = 3 + (5.0 * p.size) as int;
+            if (rad < 3) { rad = 3; }
+            s.circle(x, y, rad, with_alpha(th.warning, 230));
+        }
+        this.draw_map_tooltip(s, th, plot);
+    }
+
+    override fn hit(px: int, py: int): Widget {
+        if (!this.bounds.has(px, py)) { return null; }
+        let plot = this.last_plot;
+        let idx = -1;
+        // nearest point wins if within its radius, else the region under cursor
+        let bestd = 14 * 14;
+        for (let pi in 0..this.pts.len) {
+            let p = this.pts[pi];
+            let dx = px - (this.proj_x(p.lon, plot) as int);
+            let dy = py - (this.proj_y(p.lat, plot) as int);
+            let d = dx * dx + dy * dy;
+            if (d < bestd) { bestd = d; idx = 1000 + pi; }
+        }
+        if (idx < 0) {
+            for (let ri in 0..this.regions.len) {
+                let r = this.regions[ri];
+                let np = r.lat.len;
+                if (np < 3) { continue; }
+                let xs: float[] = [];
+                let ys: float[] = [];
+                for (let k in 0..np) {
+                    xs.push(this.proj_x(r.lon[k], plot));
+                    ys.push(this.proj_y(r.lat[k], plot));
+                }
+                if (point_in_ring(px as float, py as float, xs, ys)) { idx = ri; }
+            }
+        }
+        this.hpx = px; this.hpy = py;
+        if (idx != this.hover_idx) { this.hover_idx = idx; this.repaint_now(); }
+        return this;
+    }
+
+    override fn on_hover_leave(): bool {
+        if (this.hover_idx != -1) { this.hover_idx = -1; return true; }
+        return false;
+    }
+
+    fn draw_map_tooltip(s: Painter, th: Theme, plot: Rect) {
+        let i = this.hover_idx;
+        if (i < 0) { return; }
+        let l0 = ""; let l1 = "";
+        if (i >= 1000) {
+            let p = this.pts[i - 1000];
+            l0 = p.name;
+            l1 = fixed(p.lat, 2) + ", " + fixed(p.lon, 2);
+        } else {
+            if (i >= this.regions.len) { return; }
+            let r = this.regions[i];
+            l0 = r.name;
+            l1 = fixed(r.value, 1);
+        }
+        if (l0.len == 0) { l0 = l1; l1 = ""; }
+        let tw = s.text_width(l0);
+        if (s.text_width(l1) > tw) { tw = s.text_width(l1); }
+        let lh = s.font_height() + 2;
+        let rows = 1; if (l1.len > 0) { rows = 2; }
+        let bw = tw + th.space_3 * 2;
+        let bh = lh * rows + th.space_2;
+        let bx = this.hpx + th.space_2;
+        let by = this.hpy + th.space_2;
+        if (bx + bw > plot.x + plot.w) { bx = plot.x + plot.w - bw; }
+        if (by + bh > plot.y + plot.h) { by = plot.y + plot.h - bh; }
+        if (bx < plot.x) { bx = plot.x; }
+        if (by < plot.y) { by = plot.y; }
+        s.fill_round(Rect(bx, by, bw, bh), th.radius_md, th.surface);
+        s.stroke_round(Rect(bx, by, bw, bh), th.radius_md, 1, th.border);
+        let ty = by + th.space_1;
+        s.text(bx + th.space_3, ty + s.font_ascent(), l0, th.on_surface);
+        if (l1.len > 0) { s.text(bx + th.space_3, ty + lh + s.font_ascent(), l1, th.on_surface_muted); }
+    }
+}
+
+// ------------------------------------------------------------ time series
+
+// Pick a calendar-ish round time step (in seconds) so a span shows ~4-6 ticks.
+fn time_nice_step(span_sec: float): float {
+    let steps: float[] = [
+        1.0, 5.0, 15.0, 30.0,
+        60.0, 300.0, 900.0, 1800.0,
+        3600.0, 10800.0, 21600.0, 43200.0,
+        86400.0, 604800.0, 2592000.0, 7776000.0, 31536000.0
+    ];
+    for (let st in steps) {
+        if (span_sec / st <= 6.0) { return st; }
+    }
+    return steps[steps.len - 1];
+}
+
+// strftime format that suits the visible span.
+fn time_fmt_for(span_sec: float): string {
+    if (span_sec < 86400.0) { return "%H:%M"; }
+    if (span_sec < 2592000.0) { return "%b %d"; }
+    if (span_sec < 63072000.0) { return "%b %Y"; }
+    return "%Y";
+}
+
+// Epoch-seconds helpers for building a time series.
+export fn epochOf(dt: DateTime): float { return date_to_unix(dt) as float; }
+export fn epochISO(s: string): float {
+    return date_to_unix(date_parse(s, "%Y-%m-%dT%H:%M:%S")) as float;
+}
+
+// A line chart over a real date/time x-axis: x values are epoch seconds. Ticks
+// snap to round calendar intervals and print as dates. Honors the x-viewport
+// (pan/zoom) and decimates very long series.
+export class TimeSeriesChart extends ChartBase {
+    times: float[];
+    smooth_on: bool;
+    gradient_on: bool;
+    tmin: float; tmax: float;
+
+    fn init(times: float[], series: Series[]) {
+        super.init(series, []);
+        this.times = times;
+        this.smooth_on = true;
+        this.gradient_on = false;
+        let any = false;
+        for (let t in times) {
+            if (!any) { this.tmin = t; this.tmax = t; any = true; }
+            else { this.tmin = fmin(this.tmin, t); this.tmax = fmax(this.tmax, t); }
+        }
+        if (!any) { this.tmin = 0.0; this.tmax = 1.0; }
+        if (this.tmax <= this.tmin) { this.tmax = this.tmin + 1.0; }
+    }
+
+    builder fn smooth(b: bool) { this.smooth_on = b; return this; }
+    builder fn gradientFill(b: bool) { this.gradient_on = b; return this; }
+
+    override fn index_hover(): bool { return false; }
+
+    // visible time window (full extent narrowed by the [view_lo,view_hi] fraction)
+    fn vis_lo(): float { return this.tmin + (this.tmax - this.tmin) * this.view_lo; }
+    fn vis_hi(): float { return this.tmin + (this.tmax - this.tmin) * this.view_hi; }
+
+    fn sx(t: float, plot: Rect): float {
+        let lo = this.vis_lo(); let hi = this.vis_hi();
+        return (plot.x as float) + (t - lo) / (hi - lo) * (plot.w as float);
+    }
+
+    override fn draw_axes(s: Painter, th: Theme, plot: Rect, sc: AxisScale) {
+        this.draw_yaxis(s, th, plot, sc);
+        let lo = this.vis_lo(); let hi = this.vis_hi();
+        let step = time_nice_step(hi - lo);
+        let fmt = time_fmt_for(hi - lo);
+        let by = plot.y + plot.h + s.font_ascent() + th.space_1;
+        let t = ceil(lo / step) * step;
+        while (t <= hi) {
+            let x = this.sx(t, plot) as int;
+            if (this.show_grid) { s.line(x, plot.y, x, plot.y + plot.h, th.divider); }
+            let lbl = date_format(date_from_unix(t as i64), fmt);
+            s.text(x - s.text_width(lbl) / 2, by, lbl, th.on_surface_muted);
+            t += step;
+        }
+    }
+
+    override fn draw_plot(s: Painter, th: Theme, plot: Rect, sc: AxisScale) {
+        let lo = this.vis_lo(); let hi = this.vis_hi();
+        for (let si in 0..this.series.len) {
+            let vals = this.series[si].values;
+            let n = vals.len;
+            if (n == 0) { continue; }
+            let color = this.color_of(si, th);
+            let xs: float[] = [];
+            let ys: float[] = [];
+            // one pixel-bucket at a time when decimating a dense series
+            let bucket = -1;
+            for (let i in 0..n) {
+                if (i >= this.times.len) { break; }
+                let t = this.times[i];
+                if (t < lo || t > hi) { continue; }   // virtualization: skip off-view
+                let x = this.sx(t, plot);
+                let y = this.vyr(vals[i], plot, sc);
+                if (this.decimate_on && n > plot.w * 2) {
+                    let bx = x as int;
+                    if (bx != bucket) { bucket = bx; xs.push(x); ys.push(y); }
+                    else if (ys.len > 0) { ys[ys.len - 1] = fmin(ys[ys.len - 1], y); }
+                } else {
+                    xs.push(x); ys.push(y);
+                }
+            }
+            if (xs.len == 0) { continue; }
+            if (this.gradient_on) {
+                let base = (plot.y + plot.h) as float;
+                let edge = poly_line_path(xs, ys);
+                if (this.smooth_on) { edge = smooth_path(xs, ys); }
+                let fp = edge.flatten();
+                fill_gradient_under(s, fp.xs, fp.ys, base as int,
+                                    with_alpha(color, 130), with_alpha(color, 8));
+            }
+            let line = poly_line_path(xs, ys);
+            if (this.smooth_on) { line = smooth_path(xs, ys); }
+            s.stroke_path(line, 2, color);
         }
     }
 }
@@ -1996,4 +2628,20 @@ export fn radarChartN(labels: string[], series: Series[]): RadarChart {
 // A 2-D heatmap over a row×col value matrix.
 export fn heatmap(rows: string[], cols: string[], grid: float[][]): Heatmap {
     return new Heatmap(rows, cols, grid);
+}
+// A funnel chart from labelled stage values.
+export fn funnel(labels: string[], values: float[]): FunnelChart {
+    return new FunnelChart(labels, values);
+}
+// A choropleth map with optional point overlays (equirectangular projection).
+export fn mapChart(regions: MapRegion[], points: MapPoint[]): MapChart {
+    return new MapChart(regions, points);
+}
+// A single-series time-series chart (x = epoch seconds).
+export fn timeSeries(times: float[], values: float[]): TimeSeriesChart {
+    return new TimeSeriesChart(times, [new Series("", values)]);
+}
+// A multi-series time-series chart.
+export fn timeSeriesN(times: float[], series: Series[]): TimeSeriesChart {
+    return new TimeSeriesChart(times, series);
 }
