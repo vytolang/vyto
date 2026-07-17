@@ -289,6 +289,45 @@ win.run();
 The full 15-chart showcase is [apps/charts](apps/charts/charts.vt) — run it rich
 (`./vytoc run apps/charts/charts.vt`) or lean (`… -- --surface`).
 
+### Data grid — `vyto/ui/datatable`
+
+A spreadsheet-grade table over a columnar `DataFrame` — one widget, built on the
+same Painter vocabulary. Its powers: native multi-key **sort**, per-column
+**filters** + global/scoped **search**, **group-by** with sticky footer
+**aggregates**, **multi-select** with a checkbox gutter, inline **cell editing**,
+drag-to-**resize**/**reorder** and **frozen** columns, zebra striping, per-column
+formatters + heat-maps, row-detail panels, and **CSV/TSV export** — all
+engine-side, so it stays snappy on frames with tens of thousands of rows.
+
+```js
+import { Window } from "vyto/ui";
+import { DataTable } from "vyto/ui/datatable";
+import { DataFrame, CK_AUTO, AGG_SUM } from "vyto/data/frame";
+
+let df = new DataFrame(0);
+let region  = df.addColumn("Region",  CK_AUTO);
+let revenue = df.addColumn("Revenue", CK_AUTO);
+// ... append rows ...
+
+let dt = new DataTable(df);
+dt.zebra = true;
+dt.setFrozen(1);              // pin the first column while the rest scroll
+dt.addAgg(revenue, AGG_SUM);  // sticky totals row
+dt.showTotals(true);
+dt.sortColumn(revenue, false); // sort by revenue, descending
+
+let win = new Window("Sales", 1000, 560);
+win.root = dt;
+win.run();
+```
+
+![vyto/ui DataTable](docs/images/datatable.png)
+
+The full showcase — sort/filter/search, group-by, a frozen ID column, currency
+formatters + revenue heat-map, inline filter row, totals, cell editing, and CSV
+export — is [apps/datagrid](apps/datagrid/datagrid.vt): run it rich
+(`./vytoc run apps/datagrid/datagrid.vt`) or lean (`… -- --surface`).
+
 ### CLI + JSON — `vyto/net/http`, `vyto/util/json`
 
 Fetch a JSON array from a REST endpoint and print it. From
