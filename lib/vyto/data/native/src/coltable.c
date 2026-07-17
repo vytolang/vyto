@@ -476,11 +476,58 @@ void ct_end_row(void *h) {
     t->vlen = t->nrow; /* no filter active while building */
 }
 
+/* Random-access cell writes (by VISIBLE row, post filter+sort) — the edit-in-
+   place path a data grid needs. Resolve the absolute row through the view
+   permutation, then reuse the same column writers the row builder uses. String
+   writes on a CT_STR column append to the arena (old bytes are orphaned, not
+   reclaimed); CT_CAT re-interns; the view (sort/filter) is left as-is. */
+void ct_set_cell_i64(void *h, long vrow, int col, long long v) {
+    CT *t = (CT *)h;
+    if (!t || vrow < 0 || vrow >= t->vlen || col < 0 || col >= t->ncol) return;
+    int64_t row = t->idx[vrow];
+    Col *c = &t->cols[col];
+    if (c->promotable) auto_feed_i(c, row, t->nrow, t->cap, (int64_t)v);
+    else scalar_put_i(c, row, (int64_t)v);
+}
+
+void ct_set_cell_f64(void *h, long vrow, int col, double v) {
+    CT *t = (CT *)h;
+    if (!t || vrow < 0 || vrow >= t->vlen || col < 0 || col >= t->ncol) return;
+    int64_t row = t->idx[vrow];
+    Col *c = &t->cols[col];
+    if (c->promotable) auto_feed_f(c, row, t->nrow, t->cap, v);
+    else scalar_put_f(c, row, v);
+}
+
+void ct_set_cell_str(void *h, long vrow, int col, const char *s, long n) {
+    CT *t = (CT *)h;
+    if (!t || vrow < 0 || vrow >= t->vlen || col < 0 || col >= t->ncol || !s || n < 0) return;
+    int64_t row = t->idx[vrow];
+    Col *c = &t->cols[col];
+    if (c->promotable) { auto_feed_str(c, row, t->nrow, t->cap, s, (int32_t)n); return; }
+    if (c->kind == CT_CAT) {
+        int code = cat_intern(c, s, (int32_t)n);
+        if (code >= 0) ((int32_t *)c->data)[row] = code;
+        return;
+    }
+    if (c->kind != CT_STR) return;
+    str_append(c, row, s, (int32_t)n);
+}
+
 /* ------------------------------------------------------------- shape */
 
 long ct_nrow(void *h) { return h ? (long)((CT *)h)->nrow : 0; }
 long ct_ncol(void *h) { return h ? (long)((CT *)h)->ncol : 0; }
 long ct_view_len(void *h) { return h ? (long)((CT *)h)->vlen : 0; }
+
+/* Source (absolute) row backing visible row `vrow` — the identity that a
+   caller can hold across sort/filter, since it survives view permutations.
+   Returns -1 if out of range. */
+long ct_src_row(void *h, long vrow) {
+    CT *t = (CT *)h;
+    if (!t || vrow < 0 || vrow >= t->vlen) return -1;
+    return (long)t->idx[vrow];
+}
 
 int ct_col_kind(void *h, int col) {
     CT *t = (CT *)h;

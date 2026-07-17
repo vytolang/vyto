@@ -39,10 +39,14 @@ extern "C" {
     fn ct_nrow(h: rawptr): i64;
     fn ct_ncol(h: rawptr): i64;
     fn ct_view_len(h: rawptr): i64;
+    fn ct_src_row(h: rawptr, vrow: i64): i64;
     fn ct_col_kind(h: rawptr, col: i32): i32;
     fn ct_cell_str(h: rawptr, vrow: i64, col: i32, buf: cstring, cap: i64): i64;
     fn ct_cell_i64(h: rawptr, vrow: i64, col: i32): i64;
     fn ct_cell_f64(h: rawptr, vrow: i64, col: i32): f64;
+    fn ct_set_cell_i64(h: rawptr, vrow: i64, col: i32, v: i64);
+    fn ct_set_cell_f64(h: rawptr, vrow: i64, col: i32, v: f64);
+    fn ct_set_cell_str(h: rawptr, vrow: i64, col: i32, s: cstring, n: i64);
     fn ct_sort(h: rawptr, col: i32, dir: i32);
     fn ct_sort_keys(h: rawptr, cols: rawptr, dirs: rawptr, nk: i32);
     fn ct_reset_view(h: rawptr);
@@ -146,6 +150,10 @@ export class DataFrame {
     fn ncol(): int { return ct_ncol(this.h) as int; }
     // Rows currently visible (after any filter); equals nrow() with no filter.
     fn viewLen(): int { return ct_view_len(this.h) as int; }
+    // The absolute source-row index backing visible row `vrow`. Stable across
+    // sort/filter (unlike the visible index), so a caller can remember a row's
+    // identity and re-find it after the view changes. -1 if out of range.
+    fn srcRow(vrow: int): int { return ct_src_row(this.h, vrow as i64) as int; }
     fn colName(i: int): string { return this.names[i]; }
     // The column's resolved concrete kind (a CK_AUTO column reports whatever it
     // settled on — i16/i32/i64/f32/f64/cat/str — not CK_AUTO).
@@ -162,6 +170,14 @@ export class DataFrame {
     }
     fn cellInt(vrow: int, col: int): int { return ct_cell_i64(this.h, vrow as i64, col as i32) as int; }
     fn cellFloat(vrow: int, col: int): float { return ct_cell_f64(this.h, vrow as i64, col as i32); }
+
+    // ---- cell write (random access, by VISIBLE row) ----------------------
+    // Edit a cell in place. The value is written to the row `vrow` currently
+    // maps to; the active sort/filter view is left unchanged (re-apply if the
+    // edit should re-sort/re-filter). String writes append to the arena.
+    fn setCellInt(vrow: int, col: int, v: int) { ct_set_cell_i64(this.h, vrow as i64, col as i32, v as i64); }
+    fn setCellFloat(vrow: int, col: int, v: float) { ct_set_cell_f64(this.h, vrow as i64, col as i32, v); }
+    fn setCellStr(vrow: int, col: int, s: string) { ct_set_cell_str(this.h, vrow as i64, col as i32, s.cstr(), s.len as i64); }
 
     // ---- sort -------------------------------------------------------------
 
