@@ -299,6 +299,44 @@ export class DataTable extends Widget {
         return "?";
     }
 
+    // Group a non-negative integer with thousands separators: 1402300000 →
+    // "1,402,300,000".
+    fn group_int(n: int): string {
+        let s = str(n);
+        if (s.len <= 3) { return s; }
+        let out = "";
+        let cnt = 0;
+        let i = s.len - 1;
+        while (i >= 0) {
+            out = s.slice(i, i + 1) + out;
+            cnt += 1;
+            if (cnt % 3 == 0 && i > 0) { out = "," + out; }
+            i -= 1;
+        }
+        return out;
+    }
+
+    // Format an aggregate value for display: grouped thousands, up to two
+    // decimals, never scientific notation (str()'s %g turns big sums into
+    // "1.4e+09"). Falls back to str() beyond the i64 range.
+    fn fmt_num(v: float): string {
+        let neg = v < 0.0;
+        let x = v; if (neg) { x = -x; }
+        let scaled = x * 100.0 + 0.5;
+        if (scaled >= 9.0e18) { return str(v); }   // out of i64 range
+        let cents = scaled as int;
+        let whole = cents / 100;
+        let frac = cents % 100;
+        let s = this.group_int(whole);
+        if (frac != 0) {
+            let f = str(frac);
+            if (f.len == 1) { f = "0" + f; }
+            s = s + "." + f;
+        }
+        if (neg) { s = "-" + s; }
+        return s;
+    }
+
     // ---- per-column filters (pushed to the native engine) -----------------
 
     // Filter to rows where numeric DataFrame column `col` <op> `operand`
@@ -1445,7 +1483,7 @@ export class DataTable extends Widget {
         for (let i in 0..this.aggs.len) {
             let a = this.aggs[i];
             label = label + "   " + this.df.colName(a.col) + " " +
-                    this.agg_tag(a.kind) + "=" + str(this.group_agg(a.col, a.kind, start, end));
+                    this.agg_tag(a.kind) + "=" + this.fmt_num(this.group_agg(a.col, a.kind, start, end));
         }
         s.set_weight(2);
         s.text_in(Rect(b.x + 30, vy, b.w - 38, h), 0, label, th.on_surface);
@@ -1461,14 +1499,19 @@ export class DataTable extends Widget {
         s.text_in(Rect(b.x + 30, vy, b.w - 38, h), 0, txt, th.on_surface_muted);
     }
 
-    // One totals cell: its column's registered aggregate, or blank.
+    // One totals cell: its column's registered aggregate, aligned under the
+    // column and clipped to it so a wide value can't bleed into its neighbours.
+    // No "Σ=" prefix — the row itself is the totals row; the value follows the
+    // column's own alignment (right for numerics).
     fn draw_totals_cell(s: Painter, th: Theme, ci: int, cx: int, ty: int) {
         let c = this.cols[ci];
         if (this.col_w(c) == 0) { return; }
         let a = this.agg_for(c.col);
         if (a == null) { return; }
-        let txt = this.agg_tag(a.kind) + "=" + str(this.df.agg(c.col, a.kind));
+        let txt = this.fmt_num(this.df.agg(c.col, a.kind));
+        s.clip_push(Rect(cx, ty, c.width, this.row_h), 0);
         this.draw_cell(s, c, cx, ty, this.row_h, txt, th.on_surface);
+        s.clip_pop();
     }
 
     // A selection checkbox centred vertically at `cyc`, in the gutter band.
@@ -1660,6 +1703,10 @@ export class DataTable extends Widget {
                 s.clip_pop();
             }
             s.set_weight(0);
+            // "Totals" label in the gutter / first column (which carries no agg)
+            if (this.fcount() == 0 || this.agg_for(this.cols[0].col) == null) {
+                s.text_in(Rect(b.x + 6, ty, this.gutter_w() + 80, this.row_h), 0, "Totals", th.on_surface_muted);
+            }
         }
 
         this.paint_scrollbars(s, th);
@@ -1669,10 +1716,14 @@ export class DataTable extends Widget {
         s.line(b.x, fy, b.x + b.w, fy, th.divider);
         let label = str(vlen) + " rows";
         if (vlen != this.df.nrow()) { label = str(vlen) + " of " + str(this.df.nrow()) + " rows"; }
-        for (let i in 0..this.aggs.len) {
-            let a = this.aggs[i];
-            label = label + "   " + this.df.colName(a.col) + " " +
-                    this.agg_tag(a.kind) + "=" + str(this.df.agg(a.col, a.kind));
+        // the aggregates already have their own row when totals is on — don't
+        // repeat them (and mangle) in the footer.
+        if (!this.totals_row) {
+            for (let i in 0..this.aggs.len) {
+                let a = this.aggs[i];
+                label = label + "   " + this.df.colName(a.col) + " " +
+                        this.agg_tag(a.kind) + "=" + this.fmt_num(this.df.agg(a.col, a.kind));
+            }
         }
         s.text_in(Rect(b.x + 8, fy, b.w - 16, DT_FOOT_H), 0, label, th.on_surface_muted);
 

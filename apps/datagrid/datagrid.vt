@@ -1,43 +1,73 @@
-// datagrid — a standalone spreadsheet-style viewer over the native columnar
-// engine (vyto/data) rendered by the virtualized DataTable widget
-// (vyto/ui/datatable). Loads a CSV given on the command line, or generates a
-// synthetic 200k-row sales table so it runs with no arguments:
+// datagrid — a showcase of the vyto/ui DataTable: a spreadsheet-grade grid over
+// the native columnar engine (vyto/data). Loads a CSV given on the command line,
+// or generates a synthetic sales table so it runs with no arguments:
 //
-//     vytoc run apps/datagrid/datagrid.vt                 # synthetic data
+//     vytoc run apps/datagrid/datagrid.vt                 # synthetic data (rich tier)
 //     vytoc run apps/datagrid/datagrid.vt -- sales.csv    # load a CSV
+//     vytoc run apps/datagrid/datagrid.vt -- --surface    # lean X11 tier
 //
-// Header-click sorts, the search box filters, the region buttons are quick
-// filters, and the footer shows a live sum of revenue over the visible rows —
-// all pushed down to the native engine, so it stays responsive at scale.
+// Renders on the rich blend2d tier by default (anti-aliased text, rounded
+// corners, soft shadows, true gradients); pass --surface to force the lean tier.
+//
+// Everything the widget can do is wired up here: native sort/filter/search,
+// multi-select + checkboxes, a frozen ID column, per-column currency formatters
+// and a revenue heat-map, an inline filter row, a sticky per-column totals row,
+// cell-cursor editing, group-by-Region, row detail panels, text wrap, CSV export
+// and clipboard copy — all pushed down to the engine, so it stays responsive.
 
-import { Window, Column, Row, Label, Button } from "vyto/ui";
+import { Window, Column, Row, Label, Button, Widget } from "vyto/ui";
 import { DataTable } from "vyto/ui/datatable";
-import { DataFrame, loadCsv, CK_AUTO, DV_MUL } from "vyto/data/frame";
+import { DataFrame, loadCsv, CK_AUTO, DV_MUL, OP_CONTAINS,
+         AGG_SUM, AGG_AVG } from "vyto/data/frame";
+import { rgb, mix } from "vyto/surface";
+import { fixed } from "vyto/util/fmt";
+import { GfxPainter } from "vyto/gfx/painter";
 
-// Memory scales linearly in the row count, and every column is CK_AUTO — the
-// engine sizes each one to its data: i32 (ID), i16 (Qty), f32 (Price), and
-// dictionary-encoded text (Region/Customer/Product). ~34 bytes/row: 1,000,000
-// rows ~= 40 MB. The all-wide layout (i64/f64 + full strings) is ~2.5x.
-const N: int = 1000000;
+// The rich vector tier (blend2d): anti-aliased text, real rounded corners,
+// soft shadows and gradients. `--surface` forces the lean X11 tier instead.
+fn font_path(): string {
+    return "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf";
+}
 
-// Build a synthetic sales table: id, region, product, qty, price, + a derived
-// revenue = qty * price column.
+// Snappy enough that the group/wrap toggles (which rebuild an O(view) visual
+// model) stay instant, while still large enough to show off virtualized scroll,
+// native sort, and sub-second filtering. Memory is ~34 bytes/row (CK_AUTO picks
+// i32/i16/f32 + dictionary text), so this is a few MB; scale N up freely for the
+// pure sort/filter/scroll story.
+const N: int = 100000;
+
 fn synth(): DataFrame {
     let df = new DataFrame(N);
-    // CK_AUTO: the engine picks the tightest kind per column from the data —
-    // here it settles on i32 (ID), i16 (Qty), f32 (Price), and dictionary-encoded
-    // text (Region/Customer/Product), the same layout you'd hand-pick.
+    // 19 stored columns spanning every kind CK_AUTO can settle on (narrow ints,
+    // f32, dictionary text, plain string) + a derived 20th (revenue).
     let id = df.addColumn("ID", CK_AUTO);
     let region = df.addColumn("Region", CK_AUTO);
     let name = df.addColumn("Customer", CK_AUTO);
     let product = df.addColumn("Product", CK_AUTO);
+    let channel = df.addColumn("Channel", CK_AUTO);
+    let status = df.addColumn("Status", CK_AUTO);
+    let priority = df.addColumn("Priority", CK_AUTO);
+    let warehouse = df.addColumn("Warehouse", CK_AUTO);
+    let sku = df.addColumn("SKU", CK_AUTO);
     let qty = df.addColumn("Qty", CK_AUTO);
     let price = df.addColumn("Price", CK_AUTO);
-    
+    let discount = df.addColumn("Discount", CK_AUTO);
+    let cost = df.addColumn("Cost", CK_AUTO);
+    let weight = df.addColumn("Weight", CK_AUTO);
+    let year = df.addColumn("Year", CK_AUTO);
+    let quarter = df.addColumn("Quarter", CK_AUTO);
+    let month = df.addColumn("Month", CK_AUTO);
+    let rating = df.addColumn("Rating", CK_AUTO);
+    let returns = df.addColumn("Returns", CK_AUTO);
+
     let names_a = ["Bob", "Robert", "Grace", "Mary", "Mario", "Mike"];
     let names_b = ["Spence", "Hopper", "Nanty", "Almond", "Kirk", "Mulley"];
     let regions = ["Oslo", "Bergen", "Troms", "Molde", "Stavanger"];
     let products = ["Cable", "Widget", "Sensor", "Board", "Module", "Relay"];
+    let channels = ["Web", "Store", "Partner"];
+    let statuses = ["Paid", "Pending", "Refunded"];
+    let priorities = ["Low", "Med", "High"];
+    let wh = ["A", "B", "C", "D", "E"];
     df.reserve(N);
     let i = 0;
     while (i < N) {
@@ -46,54 +76,155 @@ fn synth(): DataFrame {
         let n = names_a[i % 6] + " " + names_b[i % 6];
         df.beginRow()
           .setInt(id, i)
-          .setStr(name, n)
           .setStr(region, regions[i % 5])
+          .setStr(name, n)
           .setStr(product, products[i % 6])
+          .setStr(channel, channels[i % 3])
+          .setStr(status, statuses[(i / 3) % 3])
+          .setStr(priority, priorities[(i / 5) % 3])
+          .setStr(warehouse, "WH-" + wh[i % 5])
+          .setStr(sku, "SKU-" + str(1000 + (i % 9000)))
           .setInt(qty, q)
           .setFloat(price, p)
+          .setFloat(discount, ((i * 3) % 30) as float / 100.0)
+          .setFloat(cost, p * 0.6)
+          .setFloat(weight, (((i % 20) + 1) as float) * 0.25)
+          .setInt(year, 2023 + (i % 4))
+          .setInt(quarter, (i % 4) + 1)
+          .setInt(month, (i % 12) + 1)
+          .setInt(rating, (i % 5) + 1)
+          .setInt(returns, i % 4)
           .endRow();
         i += 1;
     }
-    df.derive("revenue", DV_MUL, qty, price);   // computed column
+    df.derive("revenue", DV_MUL, qty, price);   // computed 20th column
     return df;
 }
 
-fn revenue_col(df: DataFrame): int {
+fn col_of(df: DataFrame, nm: string): int {
     let i = 0;
-    while (i < df.ncol()) { if (df.colName(i) == "revenue") { return i; } i += 1; }
-    return df.ncol() - 1;
+    while (i < df.ncol()) { if (df.colName(i) == nm) { return i; } i += 1; }
+    return -1;
+}
+
+// A small labelled toggle button whose closure flips a 1-element ref and runs
+// `apply(state)`.
+fn toggle(label: string, apply: fn(bool)): Button {
+    let b = new Button(label);
+    let on = [false];
+    b.onClick = (btn) => { on[0] = !on[0]; apply(on[0]); };
+    return b;
 }
 
 fn main() {
     let a = args();
+    let use_surface = false;
+    let csv = "";
+    for (let i in 0..a.len) {
+        if (a[i] == "--surface") { use_surface = true; }
+        else if (csv == "") { csv = a[i]; }
+    }
     let df = new DataFrame(0);
-    if (a.len > 0) { df = loadCsv(a[0], true); }
-    else { df = synth(); }
+    let synthetic = csv == "";
+    if (synthetic) { df = synth(); } else { df = loadCsv(csv, true); }
 
     let dt = new DataTable(df);
-    let rev = revenue_col(df);
-    dt.setAggColumn(rev);
-    dt.sortColumn(rev, false);   // start sorted by revenue, descending
-
-    // quick region filters reuse the engine's global search
     let self = dt;
-    let oslo = new Button("Oslo");
-    let bergen = new Button("Bergen");
-    let troms = new Button("Troms");
-    let all = new Button("All");
-    let sortRev = new Button("Sort revenue");
-    oslo.onClick = (b) => self.set_query("Oslo");
-    bergen.onClick = (b) => self.set_query("Bergen");
-    troms.onClick = (b) => self.set_query("Troms");
-    all.onClick = (b) => self.set_query("");
-    sortRev.onClick = (b) => self.toggle_sort(rev);
 
-    let win = new Window("DataGrid — " + str(df.nrow()) + " rows x " + str(df.ncol()) + " cols", 820, 560);
-    win.root = new Column([
-        new Label("DataGrid: header-click sorts, search filters, buttons quick-filter region"),
-        new Row([oslo, bergen, troms, all, sortRev]),
-        dt.flex(1),
-    ]);
+    // ---- rich per-column configuration (synthetic schema) ----
+    let rev = col_of(df, "revenue");
+    let price = col_of(df, "Price");
+    let cost = col_of(df, "Cost");
+    let discount = col_of(df, "Discount");
+    let qty = col_of(df, "Qty");
+    let region = col_of(df, "Region");
+    let cust = col_of(df, "Customer");
+    let prod = col_of(df, "Product");
+
+    if (synthetic) {
+        // currency + percent formatters
+        dt.setFormatter(price, (d, vrow, c) => "$" + fixed(d.cellFloat(vrow, c), 2));
+        dt.setFormatter(cost, (d, vrow, c) => "$" + fixed(d.cellFloat(vrow, c), 2));
+        dt.setFormatter(rev, (d, vrow, c) => "$" + fixed(d.cellFloat(vrow, c), 0));
+        dt.setFormatter(discount, (d, vrow, c) => fixed(d.cellFloat(vrow, c) * 100.0, 0) + "%");
+        // widen the currency columns so their (large) totals fit without clipping
+        dt.setColumnWidth(price, 110);
+        dt.setColumnWidth(cost, 120);
+        dt.setColumnWidth(rev, 140);
+        // revenue heat-map: green when high, red when low
+        dt.setCellBg(rev, (d, vrow, c) => {
+            let v = d.cellFloat(vrow, c);
+            let t = v / 45000.0;             // qty(≤50) * price(≤1000) ≈ 45k ceiling
+            if (t > 1.0) { t = 1.0; }
+            if (t < 0.0) { t = 0.0; }
+            return mix(rgb(250, 224, 224), rgb(214, 245, 214), t);
+        });
+        // freeze ID + Region so they stay put while scrolling the other 18 cols
+        dt.setFrozen(2);
+        // sticky totals: sum revenue, average price, sum qty, sum cost
+        dt.addAgg(rev, AGG_SUM);
+        dt.addAgg(price, AGG_AVG);
+        dt.addAgg(qty, AGG_SUM);
+        dt.addAgg(cost, AGG_SUM);
+        dt.showTotals(true);
+        // start sorted by revenue, descending
+        dt.sortColumn(rev, false);
+        // row detail: expand a row (double-click) for a one-line summary
+        dt.setDetail((d, vrow) =>
+            "  ↳ " + d.cellStr(vrow, cust) + " bought " + d.cellStr(vrow, qty) +
+            " × " + d.cellStr(vrow, prod) + " @ $" + fixed(d.cellFloat(vrow, price), 2) +
+            "  =  $" + fixed(d.cellFloat(vrow, rev), 2));
+        dt.typeaheadColumn(cust);
+    } else {
+        // generic: totals on the last column, sorted by the first
+        dt.setAgg(df.ncol() - 1, AGG_SUM);
+        dt.showTotals(true);
+    }
+
+    // selection gutter + inline editing are useful on any schema
+    dt.showCheckboxes(true);
+    dt.showCellCursor(true);   // Enter or type edits the focused cell; Ctrl+C copies
+
+    // ---- toolbar ----
+    // quick region filters (native column filter) — synthetic only
+    let regionRow: Widget[] = [];
+    if (synthetic) {
+        let oslo = new Button("Oslo");    oslo.onClick   = (b) => self.setFilterStr(region, OP_CONTAINS, "Oslo");
+        let bergen = new Button("Bergen"); bergen.onClick = (b) => self.setFilterStr(region, OP_CONTAINS, "Bergen");
+        let troms = new Button("Troms");  troms.onClick  = (b) => self.setFilterStr(region, OP_CONTAINS, "Troms");
+        let clr = new Button("Clear");    clr.onClick    = (b) => self.clearFilters();
+        regionRow = [oslo, bergen, troms, clr];
+    }
+
+    // feature toggles
+    let tFilter = toggle("Filter row", (on) => self.showFilterRow(on));
+    let tWrap = toggle("Wrap", (on) => self.setWrap(on));
+    let tGroup = toggle("Group by Region", (on) => {
+        if (on && region >= 0) { self.setGroupBy(region); } else { self.setGroupBy(-1); }
+    });
+    let exportBtn = new Button("Export CSV");
+    exportBtn.onClick = (b) => {
+        writefile("datagrid_view.csv", self.exportCsv());
+        print("exported " + str(self.df.viewLen()) + " rows -> datagrid_view.csv");
+    };
+    let copyBtn = new Button("Copy sel");
+    copyBtn.onClick = (b) => { self.copySelection(); print("copied " + str(self.selectionCount()) + " row(s)"); };
+
+    let toolbar: Widget[] = [tFilter, tGroup, tWrap, exportBtn, copyBtn];
+
+    let title = "DataGrid — " + str(df.nrow()) + " rows × " + str(df.ncol()) + " cols";
+    let win = new Window(title, 960, 620);
+    if (!use_surface) { 
+        win.use_painter(new GfxPainter(win.surface(), font_path(), 15.0)); 
+    }
+    let head = new Label("Header-click sorts (shift = multi-key), right-click a header for its menu, " +
+                         "drag edges to resize / bodies to reorder, double-click a row for detail, " +
+                         "Enter/type to edit, Ctrl+C to copy.");
+    let rows: Column = new Column([head]);
+    if (regionRow.len > 0) { rows.add(new Row(regionRow)); }
+    rows.add(new Row(toolbar));
+    rows.add(dt.flex(1));
+    win.root = rows;
     win.run();
     print("datagrid closed");
 }
