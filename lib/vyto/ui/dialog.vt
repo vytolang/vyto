@@ -2,11 +2,14 @@
 // listing + filename field + OK/Cancel), and a MessageDialog notice.
 
 import { Widget, Painter, Theme, Window, BoxConstraints } from "vyto/ui/core";
-import { Button, TextField, ListBox, ProgressBar } from "vyto/ui/form";
+import { Button, TextField, ProgressBar } from "vyto/ui/form";
 import { Text } from "vyto/ui/display";
 import { severity_color, draw_severity_glyph,
          SEV_NONE, SEV_INFO, SEV_SUCCESS, SEV_WARNING, SEV_ERROR } from "vyto/ui/feedback";
-import { Rect, contains, KEY_ENTER, KEY_TAB } from "vyto/surface";
+import { Rect, contains, mix, KEY_ENTER, KEY_TAB, KEY_UP, KEY_DOWN, KEY_LEFT, KEY_RIGHT,
+         KEY_HOME, KEY_END, KEY_PAGEUP, KEY_PAGEDOWN, KEY_BACKSPACE, MOD_CTRL } from "vyto/surface";
+import { file_size, file_mtime, path_dirname, path_join } from "vyto/io/file";
+import { date_from_unix_local, date_format } from "vyto/util/date";
 
 // Modal panel base: centered, dims nothing (no alpha) but traps events via
 // the Window's overlay routing. Subclasses add child controls in place().
@@ -35,128 +38,571 @@ export class Dialog extends Widget {
 const FF_LIST: int = 0;
 const FF_PATH: int = 1;
 
-// A modal file picker: a directory listing (navigable via .. and subdirs),
-// a filename field, and OK/Cancel. onAccept(path) fires with the full path.
+const FP_ROW_H: int = 30;
+const FP_SEP_W: int = 16;          // breadcrumb chevron-separator gap
+const FP_DBLCLICK_MS: int = 400;
+
+// One directory entry: name + type + size (bytes, -1 if unknown) + mtime (unix
+// seconds, -1 if unknown). Built by FilePicker.load_entries from listdir+stat.
+class FileEntry {
+    name: string;
+    is_dir: bool;
+    size: int;
+    mtime: i64;
+    fn init(name: string, is_dir: bool, size: int, mtime: i64) {
+        this.name = name;
+        this.is_dir = is_dir;
+        this.size = size;
+        this.mtime = mtime;
+    }
+}
+
+// Bytes -> short human string: "820 B", "1.2 KB", "3.4 MB", "5.0 GB".
+fn human_size(bytes: int): string {
+    if (bytes < 0) { return ""; }
+    if (bytes < 1024) { return str(bytes) + " B"; }
+    let ku = 1024;
+    let kb = bytes / ku;
+    if (kb < 1024) {
+        let f = ((bytes - kb * ku) * 10) / ku;
+        return str(kb) + "." + str(f) + " KB";
+    }
+    let mu = 1024 * 1024;
+    let mb = bytes / mu;
+    if (mb < 1024) {
+        let f = ((bytes - mb * mu) * 10) / mu;
+        return str(mb) + "." + str(f) + " MB";
+    }
+    let gu = 1024 * 1024 * 1024;
+    let gb = bytes / gu;
+    let gf = ((bytes - gb * gu) * 10) / gu;
+    return str(gb) + "." + str(gf) + " GB";
+}
+
+// Hand-drawn folder / document glyph inside r (the toolkit's Icon set has no
+// file/folder glyph, so these are drawn from Painter primitives — same
+// precedent as Icon in vyto/ui/display).
+fn draw_file_glyph(s: Painter, r: Rect, is_dir: bool, color: int, bg: int) {
+    if (is_dir) {
+        // a folder: a small back tab, then the front body
+        let tabw = (r.w * 5) / 9;
+        s.fill_round(Rect(r.x, r.y + r.h / 4, tabw, r.h / 4), 2, color);
+        s.fill_round(Rect(r.x, r.y + r.h / 3, r.w, (r.h * 2) / 5), 2, color);
+    } else {
+        // a document: rounded body with a few bg "text" lines
+        let bx = r.x + r.w / 5;
+        let bw = (r.w * 3) / 5;
+        let by = r.y + r.h / 8;
+        let bh = (r.h * 3) / 4;
+        s.fill_round(Rect(bx, by, bw, bh), 2, color);
+        let lx = bx + bw / 5;
+        let lw = bw - (bw * 2) / 5;
+        let gap = bh / 4;
+        let ly = by + gap;
+        s.fill(Rect(lx, ly, lw, 1), bg);
+        s.fill(Rect(lx, ly + gap, lw, 1), bg);
+        s.fill(Rect(lx, ly + 2 * gap, lw, 1), bg);
+    }
+}
+
+// A modal file picker: a breadcrumb header, a scrollable file/folder list
+// (icon + name + modified date + size, folders first), a filename field, and
+// Cancel/OK. Full keyboard navigation. onAccept(path) fires with the full path.
 export class FilePicker extends Dialog {
     dir: string;
-    listbox: ListBox;
+    entries: FileEntry[];
+    selected: int;
+    scroll: int;             // first visible row
+    hover_row: int;
+    show_hidden: bool;
+    save_mode: bool;
+    focus_field: int;
     pathfield: TextField;
     ok: Button;
     cancel: Button;
-    save_mode: bool;
-    focus_field: int;
     onAccept: fn(string);
+
+    // rects captured in place() for hit-testing
+    list_rect: Rect;
+    header_rect: Rect;
+    up_rect: Rect;
+    hidden_rect: Rect;
+    crumb_labels: string[];
+    crumb_paths: string[];
+    crumb_x: int[];
+    crumb_w: int[];
+
+    // double-click emulation (overlays only receive on_click)
+    last_click_ms: int;
+    last_click_row: int;
 
     fn init(dir: string, save_mode: bool) {
         if (save_mode) { super.init("Save As"); } else { super.init("Open"); }
-        this.dir = dir;
         this.save_mode = save_mode;
-        this.listbox = new ListBox();
-        this.pathfield = new TextField("filename");
+        this.dir = this.norm_dir(dir);
+        this.entries = [];
+        this.selected = -1;
+        this.scroll = 0;
+        this.hover_row = -1;
+        this.show_hidden = false;
+        this.focus_field = FF_LIST;
+        this.pathfield = new TextField("File name");
         if (save_mode) { this.ok = new Button("Save"); } else { this.ok = new Button("Open"); }
         this.cancel = new Button("Cancel");
-        this.add(this.listbox);
         this.add(this.pathfield);
         this.add(this.ok);
         this.add(this.cancel);
-        this.focus_field = FF_LIST;
-        this.reload();
+        this.list_rect = Rect(0, 0, 0, 0);
+        this.header_rect = Rect(0, 0, 0, 0);
+        this.up_rect = Rect(0, 0, 0, 0);
+        this.hidden_rect = Rect(0, 0, 0, 0);
+        this.crumb_labels = [];
+        this.crumb_paths = [];
+        this.crumb_x = [];
+        this.crumb_w = [];
+        this.last_click_ms = 0;
+        this.last_click_row = -1;
+        this.load_entries();
     }
 
-    fn reload() {
-        let names = listdir(this.dir);
-        let ch: bool[] = [];
-        for (let i in 0..names.len) { ch.push(false); }
-        this.listbox.set_items(names, ch);
+    // strip trailing '/' (except a lone root)
+    fn norm_dir(d: string): string {
+        let n = d.len;
+        while (n > 1 && d[n - 1] == 47) { n -= 1; }
+        if (n == d.len) { return d; }
+        return d.slice(0, n);
     }
 
-    fn parent_of(d: string): string {
-        let cut = -1;
-        for (let i in 0..d.len) {
-            if (d[i] == 47) { cut = i; } // '/'
-        }
-        if (cut <= 0) { return "/"; }
-        return d.slice(0, cut);
-    }
-
-    fn join(name: string): string {
-        if (name == "..") { return this.parent_of(this.dir); }
-        if (name.len > 0 && name[0] == 47) { return name; }
-        return this.dir + "/" + name;
-    }
-
-    fn sync_path() {
-        if (this.listbox.selected >= 0 && this.listbox.selected < this.listbox.items.len) {
-            this.pathfield.set_text(this.listbox.items[this.listbox.selected]);
-        }
-    }
-
-    fn accept() {
-        let name = this.pathfield.text;
-        if (name.len == 0) { return; }
-        let full = this.join(name);
-        if (isdir(full) && !this.save_mode) {
-            this.dir = full;
-            this.pathfield.set_text("");
-            this.listbox.selected = -1;
-            this.reload();
+    // (re)read the current directory into `entries`: folders first, then files,
+    // each group alphabetical (listdir is already sorted). Hidden dotfiles are
+    // skipped unless show_hidden. Guarded: listdir panics on an unopenable dir.
+    fn load_entries() {
+        this.entries = [];
+        this.rebuild_crumbs();
+        if (!isdir(this.dir)) {
+            this.selected = -1;
+            this.scroll = 0;
             return;
         }
+        let names = listdir(this.dir);
+        let dirs: FileEntry[] = [];
+        let files: FileEntry[] = [];
+        for (let i in 0..names.len) {
+            let nm = names[i];
+            if (nm == "." || nm == "..") { continue; }
+            if (!this.show_hidden && nm.len > 0 && nm[0] == 46) { continue; } // '.'
+            let full = path_join(this.dir, nm);
+            let isd = isdir(full);
+            let e = new FileEntry(nm, isd, file_size(full), file_mtime(full));
+            if (isd) { dirs.push(e); } else { files.push(e); }
+        }
+        for (let i in 0..dirs.len) { this.entries.push(dirs[i]); }
+        for (let i in 0..files.len) { this.entries.push(files[i]); }
+        if (this.selected >= this.entries.len) { this.selected = this.entries.len - 1; }
+        if (this.selected < 0 && this.entries.len > 0) { this.selected = 0; }
+        if (this.scroll < 0) { this.scroll = 0; }
+        if (this.scroll >= this.entries.len) { this.scroll = 0; }
+    }
+
+    // keep the external contract: callers re-open the picker via reload()
+    fn reload() {
+        this.load_entries();
+    }
+
+    fn rebuild_crumbs() {
+        this.crumb_labels = [];
+        this.crumb_paths = [];
+        let d = this.dir;
+        let n = d.len;
+        if (n == 0) { d = "/"; n = 1; }
+        let start = 0;
+        if (d[0] == 47) {
+            this.crumb_labels.push("/");
+            this.crumb_paths.push("/");
+            start = 1;
+        }
+        let i = start;
+        while (i <= n) {
+            if (i == n || d[i] == 47) {
+                if (i > start) {
+                    this.crumb_labels.push(d.slice(start, i));
+                    this.crumb_paths.push(d.slice(0, i));
+                }
+                start = i + 1;
+            }
+            i += 1;
+        }
+        if (this.crumb_labels.len == 0) {
+            this.crumb_labels.push(d);
+            this.crumb_paths.push(d);
+        }
+    }
+
+    // ------------------------------------------------------- navigation
+
+    fn navigate_to(d: string) {
+        let nd = this.norm_dir(d);
+        if (!isdir(nd)) { return; }
+        this.dir = nd;
+        this.selected = 0;
+        this.scroll = 0;
+        this.pathfield.set_text("");
+        this.load_entries();
+    }
+
+    fn go_parent() {
+        let p = path_dirname(this.dir);
+        if (p.len == 0) { return; }
+        this.navigate_to(p);
+    }
+
+    // activate the selection: cd into a folder, or accept a file
+    fn enter_selected() {
+        if (this.selected < 0 || this.selected >= this.entries.len) { return; }
+        let e = this.entries[this.selected];
+        if (e.is_dir) {
+            this.navigate_to(path_join(this.dir, e.name));
+        } else {
+            this.accept_path(path_join(this.dir, e.name));
+        }
+    }
+
+    // mirror the highlighted file into the name field (folders you navigate)
+    fn sync_path() {
+        if (this.selected >= 0 && this.selected < this.entries.len) {
+            let e = this.entries[this.selected];
+            if (!e.is_dir) { this.pathfield.set_text(e.name); }
+        }
+    }
+
+    fn accept_path(full: string) {
         let cb = this.onAccept;
         this.dismiss();
         if (cb != null) { cb(full); }
     }
 
+    // OK button / Enter in the name field
+    fn accept() {
+        let name = this.pathfield.text;
+        if (name.len == 0) {
+            this.enter_selected();
+            return;
+        }
+        let full = name;
+        if (name[0] != 47) { full = path_join(this.dir, name); }
+        if (isdir(full)) {           // a directory name always navigates
+            this.navigate_to(full);
+            return;
+        }
+        this.accept_path(full);
+    }
+
+    fn toggle_hidden() {
+        this.show_hidden = !this.show_hidden;
+        this.load_entries();
+    }
+
+    // ------------------------------------------------------- list scrolling
+
+    fn visible_rows(): int {
+        let n = (this.list_rect.h - 2) / FP_ROW_H;
+        if (n < 1) { return 1; }
+        return n;
+    }
+
+    fn scroll_into_view() {
+        if (this.selected < 0) { return; }
+        let vis = this.visible_rows();
+        if (this.selected < this.scroll) { this.scroll = this.selected; }
+        if (this.selected >= this.scroll + vis) { this.scroll = this.selected - vis + 1; }
+    }
+
+    fn move_sel(delta: int) {
+        if (this.entries.len == 0) { return; }
+        let s = this.selected + delta;
+        if (s < 0) { s = 0; }
+        if (s >= this.entries.len) { s = this.entries.len - 1; }
+        this.selected = s;
+        this.scroll_into_view();
+        this.sync_path();
+    }
+
+    fn lower_eq(a: int, b: int): bool {
+        let la = a; if (la >= 65 && la <= 90) { la += 32; }
+        let lb = b; if (lb >= 65 && lb <= 90) { lb += 32; }
+        return la == lb;
+    }
+
+    // type-ahead: jump to the next entry whose name starts with `ch`
+    fn typeahead(ch: string) {
+        let n = this.entries.len;
+        if (n == 0) { return; }
+        let start = this.selected + 1;
+        for (let i in 0..n) {
+            let idx = (start + i) % n;
+            let nm = this.entries[idx].name;
+            if (nm.len > 0 && this.lower_eq(nm[0], ch[0])) {
+                this.selected = idx;
+                this.scroll_into_view();
+                this.sync_path();
+                return;
+            }
+        }
+    }
+
+    fn fmt_date(mtime: i64): string {
+        if (mtime < 0) { return ""; }
+        let dt = date_from_unix_local(mtime);
+        return date_format(dt, "%Y-%m-%d %H:%M");
+    }
+
+    fn now_ms(): int {
+        if (this.win != null) { return this.win.surf.now_ms(); }
+        return 0;
+    }
+
+    // ------------------------------------------------------- layout
+
     override fn place(s: Painter, th: Theme) {
-        let dw = 380;
-        let dh = 320;
-        let x = (s.width() - dw) / 2;
-        let y = (s.height() - dh) / 2;
+        let sw = s.width();
+        let sh = s.height();
+        let dw = (sw * 3) / 5;
+        if (dw < 460) { dw = 460; }
+        if (dw > 640) { dw = 640; }
+        if (dw > sw - 20) { dw = sw - 20; }
+        let dh = (sh * 7) / 10;
+        if (dh < 360) { dh = 360; }
+        if (dh > 560) { dh = 560; }
+        if (dh > sh - 20) { dh = sh - 20; }
+        let x = (sw - dw) / 2;
+        let y = (sh - dh) / 2;
         this.bounds = Rect(x, y, dw, dh);
+
         let fh = s.font_height();
         let titleh = fh + 10;
-        let pad = 12;
-        let listy = y + titleh + 8;
+        let pad = th.space_4;
         let ctrl = fh + 12;
-        let listh = dh - titleh - 8 - ctrl - ctrl - 8 * 3;
-        this.listbox.bounds = Rect(x + pad, listy, dw - 2 * pad, listh);
-        let fieldy = listy + listh + 8;
+        let crumbh = fh + 10;
+
+        let hx = x + pad;
+        let hy = y + titleh + 6;
+        let hw = dw - 2 * pad;
+        this.header_rect = Rect(hx, hy, hw, crumbh);
+        this.up_rect = Rect(hx, hy, crumbh, crumbh);
+        this.hidden_rect = Rect(hx + hw - crumbh, hy, crumbh, crumbh);
+
+        let btny = y + dh - pad - ctrl;
+        let fieldy = btny - 10 - ctrl;
+        let listy = hy + crumbh + 8;
+        let listh = fieldy - 10 - listy;
+        this.list_rect = Rect(x + pad, listy, dw - 2 * pad, listh);
+
         this.pathfield.bounds = Rect(x + pad, fieldy, dw - 2 * pad, ctrl);
-        let btny = fieldy + ctrl + 8;
-        let bw = 90;
+        let bw = 96;
         this.cancel.bounds = Rect(x + dw - pad - bw, btny, bw, ctrl);
         this.ok.bounds = Rect(x + dw - pad - 2 * bw - 8, btny, bw, ctrl);
-        this.listbox.focused = this.focus_field == FF_LIST;
+
         this.pathfield.focused = this.focus_field == FF_PATH;
+        this.scroll_into_view();
+    }
+
+    // compute each crumb's x/width; right-align the strip so the deepest
+    // segment stays visible when the path overflows (leading crumbs clip away)
+    fn layout_crumbs(s: Painter, x0: int, xmax: int) {
+        this.crumb_x = [];
+        this.crumb_w = [];
+        let widths: int[] = [];
+        let total = 0;
+        for (let i in 0..this.crumb_labels.len) {
+            let w = s.text_width(this.crumb_labels[i]);
+            widths.push(w);
+            total += w;
+            if (i > 0) { total += FP_SEP_W; }
+        }
+        let sx = x0;
+        if (total > xmax - x0) { sx = xmax - total; }
+        for (let i in 0..this.crumb_labels.len) {
+            this.crumb_x.push(sx);
+            this.crumb_w.push(widths[i]);
+            sx += widths[i];
+            if (i < this.crumb_labels.len - 1) { sx += FP_SEP_W; }
+        }
+    }
+
+    // ------------------------------------------------------- drawing
+
+    override fn draw(s: Painter, th: Theme) {
+        this.win.skin.panel.paint_titled(s, th, this.bounds, th.radius_lg,
+                                         th.surface_raised, th.border, 3, this.title);
+        this.draw_breadcrumb(s, th);
+        this.draw_list(s, th);
+        this.pathfield.draw(s, th);
+        this.ok.draw(s, th);
+        this.cancel.draw(s, th);
+    }
+
+    fn draw_breadcrumb(s: Painter, th: Theme) {
+        let h = this.header_rect;
+
+        // up-one-level chevron (points up)
+        let ur = this.up_rect;
+        let ucx = ur.x + ur.w / 2;
+        let ucy = ur.y + ur.h / 2;
+        s.line_w(ucx - 5, ucy + 2, ucx, ucy - 4, 2, th.on_surface_muted);
+        s.line_w(ucx, ucy - 4, ucx + 5, ucy + 2, 2, th.on_surface_muted);
+
+        // lay the crumbs out here (painter available) so crumb_x/crumb_w always
+        // match the current crumb_labels, even after a redraw with no re-place
+        this.layout_crumbs(s, ur.x + ur.w + 6, this.hidden_rect.x - 8);
+
+        // path segments (clipped to the strip between up + hidden controls)
+        s.clip_push(Rect(ur.x + ur.w, h.y, this.hidden_rect.x - (ur.x + ur.w), h.h), 0);
+        for (let i in 0..this.crumb_labels.len) {
+            let cx = this.crumb_x[i];
+            let cw = this.crumb_w[i];
+            let last = i == this.crumb_labels.len - 1;
+            let col = th.on_surface_muted;
+            if (last) { col = th.on_surface; }
+            s.text_in(Rect(cx, h.y, cw + 2, h.h), 0, this.crumb_labels[i], col);
+            if (!last) {
+                let gx = cx + cw + FP_SEP_W / 2;
+                let gy = h.y + h.h / 2;
+                s.line_w(gx - 2, gy - 4, gx + 2, gy, 2, th.on_surface_subtle);
+                s.line_w(gx + 2, gy, gx - 2, gy + 4, 2, th.on_surface_subtle);
+            }
+        }
+        s.clip_pop();
+
+        // show-hidden toggle (an eye; filled/primary when on)
+        let hr = this.hidden_rect;
+        let ecol = th.on_surface_muted;
+        if (this.show_hidden) { ecol = th.primary; }
+        let ex = hr.x + hr.w / 2;
+        let ey = hr.y + hr.h / 2;
+        s.stroke_circle(ex, ey, 6, 2, ecol);
+        s.circle(ex, ey, 2, ecol);
+    }
+
+    fn draw_list(s: Painter, th: Theme) {
+        let b = this.list_rect;
+        let radius = th.radius_md;
+        s.fill_round(b, radius, th.surface);
+        let border = th.border;
+        if (this.focus_field == FF_LIST) {
+            border = th.primary;
+            this.win.skin.focus.paint(s, th, b, radius);
+        }
+        s.stroke_round(b, radius, 1, border);
+
+        if (this.entries.len == 0) {
+            s.text_center(b, "This folder is empty", th.on_surface_muted);
+            return;
+        }
+
+        let vis = this.visible_rows();
+        s.clip_push(Rect(b.x + 1, b.y + 1, b.w - 2, b.h - 2), radius);
+        for (let i in 0..vis) {
+            let idx = this.scroll + i;
+            if (idx >= this.entries.len) { break; }
+            let e = this.entries[idx];
+            let r = Rect(b.x + 1, b.y + 1 + i * FP_ROW_H, b.w - 2, FP_ROW_H);
+            if (idx == this.selected) {
+                s.fill_round(Rect(r.x + 3, r.y + 2, r.w - 6, r.h - 4), th.radius_sm, th.selection);
+            } else if (idx == this.hover_row) {
+                s.fill_round(Rect(r.x + 3, r.y + 2, r.w - 6, r.h - 4), th.radius_sm,
+                             mix(th.surface, th.on_surface, 0.05));
+            }
+
+            let iconsz = 18;
+            let ir = Rect(r.x + 12, r.y + (FP_ROW_H - iconsz) / 2, iconsz, iconsz);
+            let icol = th.on_surface_muted;
+            if (e.is_dir) { icol = th.primary; }
+            draw_file_glyph(s, ir, e.is_dir, icol, th.surface);
+
+            let meta = this.fmt_date(e.mtime);
+            if (!e.is_dir) { meta = meta + "    " + human_size(e.size); }
+            let metaw = s.text_width(meta);
+
+            let namex = ir.x + iconsz + 12;
+            let namew = r.x + r.w - namex - metaw - 24;
+            if (namew < 40) { namew = 40; }
+            s.text_in(Rect(namex, r.y, namew, FP_ROW_H), 0, e.name, th.on_surface);
+            s.text_right(Rect(r.x, r.y, r.w - 12, FP_ROW_H), 0, meta, th.on_surface_muted);
+        }
+        s.clip_pop();
+    }
+
+    // ------------------------------------------------------- input
+
+    // mouse wheel: scroll the list one row per notch (the Window routes wheel
+    // events to an overlay via on_scroll_at). Positive delta scrolls down.
+    override fn on_scroll(delta: int): bool {
+        if (this.entries.len == 0) { return false; }
+        let vis = this.visible_rows();
+        let maxs = this.entries.len - vis;
+        if (maxs < 0) { maxs = 0; }
+        this.scroll += delta;
+        if (this.scroll > maxs) { this.scroll = maxs; }
+        if (this.scroll < 0) { this.scroll = 0; }
+        return true;
     }
 
     override fn on_key(k: int, ch: string): bool {
         if (k == KEY_TAB) {
             this.focus_field = FF_PATH - this.focus_field;
-            this.listbox.focused = this.focus_field == FF_LIST;
             this.pathfield.focused = this.focus_field == FF_PATH;
             return true;
         }
-        if (k == KEY_ENTER) {
-            if (this.focus_field == FF_LIST) { this.sync_path(); }
-            this.accept();
-            return true;
+        if (this.focus_field == FF_PATH) {
+            if (k == KEY_ENTER) { this.accept(); return true; }
+            return this.pathfield.on_key(k, ch);
         }
-        if (this.focus_field == FF_LIST) {
-            let r = this.listbox.on_key(k, ch);
+        // list-focused
+        if (k == KEY_UP) { this.move_sel(-1); return true; }
+        if (k == KEY_DOWN) { this.move_sel(1); return true; }
+        if (k == KEY_HOME) { this.selected = 0; this.scroll_into_view(); this.sync_path(); return true; }
+        if (k == KEY_END) {
+            this.selected = this.entries.len - 1;
+            this.scroll_into_view();
             this.sync_path();
             return true;
         }
-        return this.pathfield.on_key(k, ch);
+        if (k == KEY_PAGEUP) { this.move_sel(-this.visible_rows()); return true; }
+        if (k == KEY_PAGEDOWN) { this.move_sel(this.visible_rows()); return true; }
+        if (k == KEY_LEFT || k == KEY_BACKSPACE) { this.go_parent(); return true; }
+        if (k == KEY_RIGHT || k == KEY_ENTER) { this.enter_selected(); return true; }
+        if (ch == "h" && (this.mods() & MOD_CTRL) != 0) { this.toggle_hidden(); return true; }
+        // type-ahead on a printable key
+        if (ch.len == 1 && ch[0] >= 32) { this.typeahead(ch); return true; }
+        return true;
     }
 
     override fn on_click(x: int, y: int): bool {
         if (contains(this.cancel.bounds, x, y)) { this.dismiss(); return true; }
         if (contains(this.ok.bounds, x, y)) { this.accept(); return true; }
-        if (contains(this.listbox.bounds, x, y)) {
+        if (contains(this.up_rect, x, y)) { this.go_parent(); return true; }
+        if (contains(this.hidden_rect, x, y)) { this.toggle_hidden(); return true; }
+        for (let i in 0..this.crumb_labels.len) {
+            let cr = Rect(this.crumb_x[i], this.header_rect.y, this.crumb_w[i], this.header_rect.h);
+            if (contains(cr, x, y)) { this.navigate_to(this.crumb_paths[i]); return true; }
+        }
+        if (contains(this.list_rect, x, y)) {
             this.focus_field = FF_LIST;
-            this.listbox.on_click(x, y);
-            this.sync_path();
+            let row = (y - this.list_rect.y - 1) / FP_ROW_H;
+            let idx = this.scroll + row;
+            if (idx >= 0 && idx < this.entries.len) {
+                let now = this.now_ms();
+                if (idx == this.last_click_row && now - this.last_click_ms <= FP_DBLCLICK_MS) {
+                    this.selected = idx;
+                    this.last_click_row = -1;   // consume
+                    this.enter_selected();
+                    return true;
+                }
+                this.selected = idx;
+                this.sync_path();
+                this.last_click_row = idx;
+                this.last_click_ms = now;
+            }
             return true;
         }
         if (contains(this.pathfield.bounds, x, y)) {

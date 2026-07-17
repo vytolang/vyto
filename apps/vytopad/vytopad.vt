@@ -1,0 +1,1000 @@
+// VytoPad — a multi-tab notepad built on vyto/ui.
+//
+// Features: tabs, find/replace, go-to-line, line-number gutter, status bar,
+// file pickers, autosave, and a menu bar. Rendered through vyto/gfx for AA
+// text/shapes; filesystem and environment helpers come from vyto/io/file and
+// vyto/os, so no raw FFI is needed.
+//
+//   VYTO_PAD_FILE=/path/to/file   open this file at startup
+//   VYTO_PAD_DIR=/path            starting directory for the file picker
+//   VYTO_PAD_FONT=/path/to.ttf    override the default DejaVuSans font
+
+import { Window, Column, Row, Box, ClippedPainter, TextArea, TextField,
+         Button, Checkbox, SearchField,
+         MenuBar, Menu, FilePicker, MessageDialog,
+         InputDialog, ConfirmDialog, TabView,
+         EASE_LINEAR } from "vyto/ui";
+import { Widget, Painter, Theme, Size } from "vyto/ui/core";
+import { Rect, contains,
+         KEY_ENTER, KEY_ESC, KEY_TAB,
+         KEY_UP, KEY_DOWN, KEY_LEFT, KEY_RIGHT,
+         KEY_PAGEUP, KEY_PAGEDOWN, KEY_HOME, KEY_END,
+         MOD_SHIFT } from "vyto/surface";
+import { index_of_from } from "vyto/util/text";
+import { GfxPainter } from "vyto/gfx/painter";
+import { getenvOr, homeDir } from "vyto/os";
+import { file_exists, file_mkdirs, path_basename } from "vyto/io/file";
+import { Scrollbar, SIDE_RIGHT, SIDE_BOTTOM } from "vyto/ui/scrollbar";
+
+fn home_dir(): string {
+    let h = homeDir();
+    if (h.len == 0) { return "/tmp"; }
+    return h;
+}
+
+fn ensure_dir(path: string) {
+    if (!isdir(path)) { file_mkdirs(path); }
+}
+
+fn base_name(path: string): string {
+    return path_basename(path);
+}
+
+fn safe_name(path: string): string {
+    let s = base_name(path);
+    if (s.len == 0) { s = "untitled"; }
+    // collapse slashes/backslashes that would make autosave paths ambiguous
+    let out = "";
+    for (let i in 0..s.len) {
+        let c = s[i];
+        if (c == 47 || c == 92) { out += "_"; } // '/' or '\\'
+        else { out += chr(c); }
+    }
+    return out;
+}
+
+fn autosave_dir(): string {
+    let d = home_dir() + "/.vytopad/autosave";
+    ensure_dir(d);
+    return d;
+}
+
+fn autosave_path(path: string): string {
+    return autosave_dir() + "/" + safe_name(path) + ".autosave";
+}
+
+fn chr(code: int): string {
+    if (code == 0) { return ""; }
+    let b = bytes(2);
+    b[0] = code as byte;
+    return str(b as cstring);
+}
+
+// ---------------------------------------------------------------- Document
+
+class Document {
+    editor: TextArea;
+    gutter: LineNumberGutter;
+    scroller: ScrollBox;
+    row: Widget;
+    path: string;
+    title: string;
+    modified: bool;
+    last_edit_ms: int;
+    last_autosave_ms: int;
+
+    fn init(path0: string, text: string) {
+        this.editor = new TextArea();
+        this.editor.set_text(text);
+        this.editor.grow = 1;
+        this.gutter = new LineNumberGutter(this);
+        this.scroller = new ScrollBox(new Row([this.gutter, this.editor]));
+        this.scroller.grow = 1;
+        this.row = this.scroller;
+        this.path = path0;
+        this.title = this.make_title(path0);
+        this.modified = false;
+        this.last_edit_ms = 0;
+        this.last_autosave_ms = 0;
+    }
+
+    fn scroll_to_caret() {
+        let ed = this.editor;
+        if (ed.wrap_count == 0 || ed.line_h == 0) { return; }
+        let vrow = ed.visual_row_of(ed.caret_row, ed.caret_col);
+        let y = vrow * ed.line_h;
+        let lh = ed.line_h;
+        let view_h = this.scroller.bounds.h;
+        let scroll_y = this.scroller.scroll_y;
+        if (y < scroll_y) {
+            this.scroller.scroll_y = y;
+        } else if (y + lh > scroll_y + view_h) {
+            this.scroller.scroll_y = y + lh - view_h;
+        }
+        this.scroller.clamp_scroll();
+        this.scroller.rearrange();
+    }
+
+    fn make_title(path0: string): string {
+        if (path0.len == 0) { return "untitled"; }
+        return base_name(path0);
+    }
+
+    fn mark_modified() {
+        this.modified = true;
+        this.last_edit_ms = 1; // flag: edited since last autosave
+    }
+
+    fn text(): string { return this.editor.text(); }
+
+    fn save_to(path0: string) {
+        writefile(path0, this.text());
+        this.path = path0;
+        this.title = this.make_title(path0);
+        this.modified = false;
+        this.last_edit_ms = 0;
+        this.last_autosave_ms = 0;
+    }
+
+    fn maybe_autosave() {
+        if (!this.modified) { return; }
+        if (this.last_edit_ms == 0) { return; }
+        writefile(autosave_path(this.path), this.text());
+        this.last_edit_ms = 0;
+        this.last_autosave_ms = 1;
+    }
+
+    fn load_autosave_or(path0: string): bool {
+        let ap = autosave_path(path0);
+        if (file_exists(ap)) {
+            this.editor.set_text(readfile(ap));
+            this.modified = true;
+            this.last_edit_ms = 1;
+            return true;
+        }
+        return false;
+    }
+}
+
+// ---------------------------------------------------------------- Line-number gutter
+
+class LineNumberGutter extends Widget {
+    doc: Document;
+
+    fn init(doc: Document) {
+        super.init();
+        this.doc = doc;
+    }
+
+    fn needed_w(s: Painter): int {
+        // fixed width for up to 99999 lines (5 digits) so layout doesn't
+        // jitter as the document grows
+        let digits = 5;
+        return s.text_width("0") * digits + 14;
+    }
+
+    override fn measure(s: Painter, th: Theme): Size {
+        return Size(this.needed_w(s), 20);
+    }
+
+    override fn arrange(s: Painter, th: Theme, r: Rect) {
+        this.bounds = Rect(r.x, r.y, this.needed_w(s), r.h);
+    }
+
+    override fn draw(s: Painter, th: Theme) {
+        let ed = this.doc.editor;
+        let lh = ed.line_h;
+        if (lh < 8) { lh = s.font_height() + 2; }
+        s.fill(this.bounds, th.surface_sunken);
+        s.line(this.bounds.x + this.bounds.w - 1, this.bounds.y,
+               this.bounds.x + this.bounds.w - 1, this.bounds.y + this.bounds.h,
+               th.divider);
+        if (ed.wrap_map.len == 0 || ed.wrap_count == 0) { return; }
+        let ox = this.bounds.x + this.bounds.w - 6;
+        let top = ed.top;
+        for (let i in 0..ed.view_rows) {
+            let vrow = top + i;
+            if (vrow >= ed.wrap_count) { break; }
+            let li = ed.wrap_map[vrow];
+            let col = ed.wrap_col[vrow];
+            // only print the line number on the first visual row of a logical line
+            let print_num = col == 0;
+            if (vrow > 0) {
+                let prev = ed.wrap_map[vrow - 1];
+                if (prev != li) { print_num = true; }
+            }
+            let ty = this.bounds.y + 6 + i * lh + s.font_ascent();
+            if (print_num) {
+                let num = (li + 1).to_string();
+                let rw = s.text_width(num);
+                s.text(ox - rw, ty, num, th.on_surface_muted);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------- Status bar
+
+class PadStatusBar extends Widget {
+    app: VytoPad;
+
+    fn init(app: VytoPad) {
+        super.init();
+        this.app = app;
+    }
+
+    fn bar_h(s: Painter): int { return s.font_height() + 8; }
+
+    override fn measure(s: Painter, th: Theme): Size {
+        return Size(200, this.bar_h(s));
+    }
+
+    override fn arrange(s: Painter, th: Theme, r: Rect) {
+        this.bounds = r;
+    }
+
+    override fn draw(s: Painter, th: Theme) {
+        s.fill(this.bounds, th.surface);
+        s.line(this.bounds.x, this.bounds.y,
+               this.bounds.x + this.bounds.w, this.bounds.y, th.divider);
+        let doc = this.app.current_doc();
+        let left = "untitled";
+        let right = "Ln 1, Col 1  |  1 lines";
+        if (doc != null) {
+            let name = doc.path;
+            if (name.len == 0) { name = "untitled"; }
+            let m = "";
+            if (doc.modified) { m = " *"; }
+            left = name + m;
+            let ed = doc.editor;
+            right = "Ln " + (ed.caret_row + 1)
+                  + ", Col " + (ed.caret_col + 1)
+                  + "  |  " + ed.lines.len + " lines";
+        }
+        s.text_in(Rect(this.bounds.x + 8, this.bounds.y,
+                       this.bounds.w / 2, this.bounds.h), 0, left, th.on_surface_muted);
+        let rw = s.text_width(right);
+        s.text_in(Rect(this.bounds.x + this.bounds.w - rw - 8, this.bounds.y,
+                       rw + 8, this.bounds.h), 0, right, th.on_surface_muted);
+    }
+}
+
+// ---------------------------------------------------------------- Scroll box (vertical + horizontal)
+
+class ScrollBox extends Box {
+    scroll_x: int;
+    scroll_y: int;
+    content_w: int;
+    content_h: int;
+    cached_s: Painter;
+    cached_th: Theme;
+    cached_r: Rect;
+
+    fn init(child: Widget) {
+        super.init();
+        this.scroll_x = 0;
+        this.scroll_y = 0;
+        this.content_w = 0;
+        this.content_h = 0;
+        this.add_scrollbar(SIDE_RIGHT);
+        this.add_scrollbar(SIDE_BOTTOM);
+        if (child != null) { this.add(child); }
+    }
+
+    override fn scroll_content_w(): int { return this.content_w; }
+    override fn scroll_content_h(): int { return this.content_h; }
+    override fn scroll_viewport(): Rect { return this.bounds; }
+
+    override fn scroll_offset(sb: Scrollbar): int {
+        if (sb.vertical()) { return this.scroll_y; }
+        return this.scroll_x;
+    }
+
+    override fn set_scroll_offset(sb: Scrollbar, v: int) {
+        if (sb.vertical()) { this.scroll_y = v; }
+        else { this.scroll_x = v; }
+        this.clamp_scroll();
+        this.rearrange();
+    }
+
+    fn max_scroll_x(): int {
+        let m = this.content_w - this.bounds.w;
+        if (m < 0) { m = 0; }
+        return m;
+    }
+
+    fn max_scroll_y(): int {
+        let m = this.content_h - this.bounds.h;
+        if (m < 0) { m = 0; }
+        return m;
+    }
+
+    fn clamp_scroll() {
+        if (this.scroll_x < 0) { this.scroll_x = 0; }
+        if (this.scroll_x > this.max_scroll_x()) { this.scroll_x = this.max_scroll_x(); }
+        if (this.scroll_y < 0) { this.scroll_y = 0; }
+        if (this.scroll_y > this.max_scroll_y()) { this.scroll_y = this.max_scroll_y(); }
+    }
+
+    fn rearrange() {
+        if (this.cached_s != null) {
+            this.arrange(this.cached_s, this.cached_th, this.cached_r);
+        }
+    }
+
+    override fn measure(s: Painter, th: Theme): Size {
+        let c = this.child();
+        if (c == null) { return Size(0, 0); }
+        let cs = c.measure(s, th);
+        this.content_w = cs.w;
+        this.content_h = cs.h;
+        return Size(0, 0);
+    }
+
+    override fn arrange(s: Painter, th: Theme, r: Rect) {
+        this.bounds = r;
+        this.cached_s = s;
+        this.cached_th = th;
+        this.cached_r = r;
+        let c = this.child();
+        if (c == null) { return; }
+        let cs = c.measure(s, th);
+        // Let the child fill the viewport when its content is smaller, so
+        // grow children (the editor) actually stretch across the window.
+        let aw = cs.w;
+        if (aw < r.w) { aw = r.w; }
+        let ah = cs.h;
+        if (ah < r.h) { ah = r.h; }
+        this.content_w = aw;
+        this.content_h = ah;
+        this.clamp_scroll();
+        c.arrange(s, th, Rect(r.x - this.scroll_x, r.y - this.scroll_y, aw, ah));
+    }
+
+    override fn draw(s: Painter, th: Theme) {
+        s.fill(this.bounds, th.bg);
+        let c = this.child();
+        if (c == null) { return; }
+        if (s.can_clip()) {
+            s.clip_push(this.bounds, 0);
+            c.draw(s, th);
+            s.clip_pop();
+        } else {
+            let cp = new ClippedPainter(s, this.bounds);
+            c.draw(cp, th);
+        }
+        this.paint_scrollbars(s, th);
+    }
+
+    override fn draw_within(s: Painter, th: Theme, d: Rect) {
+        let b = this.bounds;
+        let x0 = d.x; if (x0 < b.x) { x0 = b.x; }
+        let y0 = d.y; if (y0 < b.y) { y0 = b.y; }
+        let x1 = d.x + d.w; if (x1 > b.x + b.w) { x1 = b.x + b.w; }
+        let y1 = d.y + d.h; if (y1 > b.y + b.h) { y1 = b.y + b.h; }
+        if (x1 <= x0 || y1 <= y0) { return; }
+        let clip = Rect(x0, y0, x1 - x0, y1 - y0);
+        s.fill(clip, th.bg);
+        let c = this.child();
+        if (c == null) { return; }
+        if (s.can_clip()) {
+            s.clip_push(clip, 0);
+            c.draw_within(s, th, clip);
+            s.clip_pop();
+        } else {
+            let cp = new ClippedPainter(s, clip);
+            c.draw_within(cp, th, clip);
+        }
+        this.paint_scrollbars(s, th);
+    }
+
+    override fn on_scroll(delta: int): bool {
+        let fh = 20;
+        if (this.cached_s != null) { fh = this.cached_s.font_height() + 4; }
+        let before_x = this.scroll_x;
+        let before_y = this.scroll_y;
+        if (this.win != null && (this.win.mods & MOD_SHIFT) != 0) {
+            this.scroll_x += delta * fh;
+        } else {
+            this.scroll_y += delta * fh;
+        }
+        this.clamp_scroll();
+        if (this.scroll_x != before_x || this.scroll_y != before_y) {
+            this.rearrange();
+            return true;
+        }
+        return false;
+    }
+
+    override fn on_key(k: int, ch: string): bool {
+        let fh = 20;
+        if (this.cached_s != null) { fh = this.cached_s.font_height() + 4; }
+        let before_x = this.scroll_x;
+        let before_y = this.scroll_y;
+        if (k == KEY_UP) { this.scroll_y -= fh; }
+        else if (k == KEY_DOWN) { this.scroll_y += fh; }
+        else if (k == KEY_LEFT) { this.scroll_x -= fh; }
+        else if (k == KEY_RIGHT) { this.scroll_x += fh; }
+        else if (k == KEY_PAGEUP) {
+            let page = this.bounds.h - fh;
+            if (page < fh) { page = fh; }
+            this.scroll_y -= page;
+        }
+        else if (k == KEY_PAGEDOWN) {
+            let page = this.bounds.h - fh;
+            if (page < fh) { page = fh; }
+            this.scroll_y += page;
+        }
+        else if (k == KEY_HOME) { this.scroll_x = 0; }
+        else if (k == KEY_END) { this.scroll_x = this.max_scroll_x(); }
+        else { return false; }
+        this.clamp_scroll();
+        if (this.scroll_x != before_x || this.scroll_y != before_y) {
+            this.rearrange();
+            return true;
+        }
+        return false;
+    }
+
+    override fn hit(px: int, py: int): Widget {
+        if (!contains(this.bounds, px, py)) { return null; }
+        if (this.scrollbar_hit(px, py)) { return this; }
+        let c = this.child();
+        if (c != null) {
+            let found = c.hit(px, py);
+            if (found != null) { return found; }
+        }
+        return this;
+    }
+}
+
+// ---------------------------------------------------------------- Dynamic tabs
+
+class DocTabs extends TabView {
+    docs: Document[];
+
+    fn init() {
+        super.init([]);
+        this.docs = [];
+    }
+
+    fn add_doc(doc: Document) {
+        this.tab_labels.push(doc.title);
+        this.docs.push(doc);
+        this.add_panel(doc.row);
+        this.switch_tab(this.tab_labels.len - 1);
+    }
+
+    fn update_label(i: int) {
+        if (i >= 0 && i < this.docs.len) {
+            let t = this.docs[i].title;
+            if (this.docs[i].modified) { t = t + " *"; }
+            this.tab_labels[i] = t;
+        }
+    }
+
+    fn refresh_labels() {
+        for (let i in 0..this.docs.len) { this.update_label(i); }
+    }
+
+    fn close_tab(i: int) {
+        if (i < 0 || i >= this.docs.len) { return; }
+        if (this.docs.len <= 1) { return; }
+        let keep_docs: Document[] = [];
+        let keep_labels: string[] = [];
+        let keep_children: Widget[] = [];
+        for (let j in 0..this.docs.len) {
+            if (j != i) {
+                keep_docs.push(this.docs[j]);
+                keep_labels.push(this.tab_labels[j]);
+                keep_children.push(this.children[j]);
+            }
+        }
+        this.docs = keep_docs;
+        this.tab_labels = keep_labels;
+        this.children = keep_children;
+        if (this.active >= this.docs.len) {
+            this.active = this.docs.len - 1;
+        }
+        let w = this.win;
+        if (w != null) {
+            w.layout();
+            w.redraw();
+        }
+    }
+
+    fn current(): Document {
+        if (this.active >= 0 && this.active < this.docs.len) {
+            return this.docs[this.active];
+        }
+        return null;
+    }
+}
+
+// ---------------------------------------------------------------- Find / Replace dialog
+
+class FindReplaceDialog extends Widget {
+    find_field: SearchField;
+    replace_field: TextField;
+    find_btn: Button;
+    replace_btn: Button;
+    replace_all_btn: Button;
+    close_btn: Button;
+    case_check: Checkbox;
+    onFind: fn(string, bool): bool;
+    onReplace: fn(string, string, bool): bool;
+    onReplaceAll: fn(string, string, bool): int;
+    focus_field: int;
+
+    fn init() {
+        super.init();
+        this.modal = true;
+        this.focus_field = 0;
+        this.find_field = new SearchField("Find");
+        this.replace_field = new TextField("Replace with");
+        this.find_btn = new Button("Find Next");
+        this.replace_btn = new Button("Replace");
+        this.replace_all_btn = new Button("Replace All");
+        this.close_btn = new Button("Close");
+        this.case_check = new Checkbox("Match case");
+        this.add(this.find_field);
+        this.add(this.replace_field);
+        this.add(this.find_btn);
+        this.add(this.replace_btn);
+        this.add(this.replace_all_btn);
+        this.add(this.close_btn);
+        this.add(this.case_check);
+    }
+
+    fn case_sensitive(): bool { return this.case_check.checked; }
+
+    fn find_text(): string { return this.find_field.text; }
+    fn replace_text(): string { return this.replace_field.text; }
+
+    override fn place(s: Painter, th: Theme) {
+        let dw = 420;
+        let fh = s.font_height();
+        let ctrl = fh + 12;
+        let dh = 16 + ctrl + 8 + ctrl + 16 + ctrl + 16;
+        let x = (s.width() - dw) / 2;
+        let y = (s.height() - dh) / 2;
+        this.bounds = Rect(x, y, dw, dh);
+        let cy = y + 16;
+        this.find_field.bounds = Rect(x + 12, cy, dw - 24, ctrl);
+        cy += ctrl + 8;
+        this.replace_field.bounds = Rect(x + 12, cy, dw - 24, ctrl);
+        cy += ctrl + 16;
+        this.case_check.bounds = Rect(x + 12, cy, 140, ctrl);
+        let bx = x + dw - 12;
+        let bw = 80;
+        this.close_btn.bounds = Rect(bx - bw, cy, bw, ctrl);
+        bx -= bw + 8;
+        this.replace_all_btn.bounds = Rect(bx - bw, cy, bw, ctrl);
+        bx -= bw + 8;
+        this.replace_btn.bounds = Rect(bx - bw, cy, bw, ctrl);
+        bx -= bw + 8;
+        this.find_btn.bounds = Rect(bx - bw, cy, bw, ctrl);
+    }
+
+    override fn draw(s: Painter, th: Theme) {
+        this.win.skin.panel.paint_titled(s, th, this.bounds, th.radius_lg,
+                                         th.surface_raised, th.border, 3, "Find / Replace");
+        for (let c in this.children) { c.draw(s, th); }
+    }
+
+    fn set_focus_field(f: int) {
+        this.focus_field = f;
+        this.find_field.focused = f == 0;
+        this.replace_field.focused = f == 1;
+    }
+
+    override fn on_key(k: int, ch: string): bool {
+        if (k == KEY_ESC) {
+            let w = this.win;
+            w.dismiss_overlay();
+            return true;
+        }
+        if (k == KEY_TAB) {
+            if (this.focus_field == 0) { this.set_focus_field(1); }
+            else { this.set_focus_field(0); }
+            return true;
+        }
+        if (k == KEY_ENTER) {
+            if (this.onFind != null) { this.onFind(this.find_text(), this.case_sensitive()); }
+            return true;
+        }
+        if (this.focus_field == 0) { return this.find_field.on_key(k, ch); }
+        return this.replace_field.on_key(k, ch);
+    }
+
+    override fn on_click(x: int, y: int): bool {
+        if (contains(this.close_btn.bounds, x, y)) {
+            let w = this.win;
+            w.dismiss_overlay();
+            return true;
+        }
+        if (contains(this.find_btn.bounds, x, y)) {
+            if (this.onFind != null) { this.onFind(this.find_text(), this.case_sensitive()); }
+            return true;
+        }
+        if (contains(this.replace_btn.bounds, x, y)) {
+            if (this.onReplace != null) { this.onReplace(this.find_text(), this.replace_text(), this.case_sensitive()); }
+            return true;
+        }
+        if (contains(this.replace_all_btn.bounds, x, y)) {
+            if (this.onReplaceAll != null) { this.onReplaceAll(this.find_text(), this.replace_text(), this.case_sensitive()); }
+            return true;
+        }
+        if (contains(this.find_field.bounds, x, y)) { this.set_focus_field(0); this.find_field.on_click(x, y); return true; }
+        if (contains(this.replace_field.bounds, x, y)) { this.set_focus_field(1); this.replace_field.on_click(x, y); return true; }
+        if (contains(this.case_check.bounds, x, y)) { this.case_check.on_click(x, y); return true; }
+        return true;
+    }
+
+    override fn drop_handlers() {
+        this.onFind = null;
+        this.onReplace = null;
+        this.onReplaceAll = null;
+    }
+}
+
+// ---------------------------------------------------------------- App
+
+
+class VytoPad {
+    win: Window;
+    tabs: DocTabs;
+    status: PadStatusBar;
+    file_picker_dir: string;
+
+    open_pk: FilePicker;
+    save_pk: FilePicker;
+    about_dlg: MessageDialog;
+    find_dlg: FindReplaceDialog;
+    goto_dlg: InputDialog;
+    unsaved_dlg: ConfirmDialog;
+
+    pending_close_idx: int;
+
+    fn init() {
+        this.tabs = new DocTabs();
+        this.tabs.grow = 1;
+        this.status = new PadStatusBar(this);
+        this.file_picker_dir = getenvOr("VYTO_PAD_DIR", getenvOr("PWD", "."));
+        this.pending_close_idx = -1;
+    }
+
+    fn add_doc(path0: string, text: string): Document {
+        let doc = new Document(path0, text);
+        let self = this;
+        doc.editor.onChange = () => { self.on_doc_changed(doc); };
+        this.tabs.add_doc(doc);
+        return doc;
+    }
+
+    fn on_doc_changed(doc: Document) {
+        doc.mark_modified();
+        doc.scroll_to_caret();
+        this.tabs.update_label(this.tabs.active);
+        this.refresh_status();
+        doc.gutter.invalidate();
+    }
+
+    fn current_doc(): Document { return this.tabs.current(); }
+
+    fn refresh_status() {
+        this.status.invalidate();
+    }
+
+    fn schedule_autosave() {
+        let self = this;
+        this.status.animate(10000, false, EASE_LINEAR, (t) => {
+            if (t >= 1.0) {
+                self.run_autosave();
+                self.schedule_autosave();
+            }
+        });
+    }
+
+    fn run_autosave() {
+        for (let doc in this.tabs.docs) {
+            doc.maybe_autosave();
+        }
+    }
+
+    fn do_new() {
+        this.add_doc("", "");
+        this.refresh_status();
+        this.win.layout();
+        this.win.redraw();
+    }
+
+    fn do_open() {
+        this.open_pk.reload();
+        this.win.open_overlay(this.open_pk);
+    }
+
+    fn do_save() {
+        let doc = this.current_doc();
+        if (doc == null) { return; }
+        if (doc.path.len > 0) {
+            doc.save_to(doc.path);
+            this.tabs.update_label(this.tabs.active);
+            this.refresh_status();
+            this.win.redraw();
+        } else {
+            this.do_save_as();
+        }
+    }
+
+    fn do_save_as() {
+        this.save_pk.reload();
+        this.win.open_overlay(this.save_pk);
+    }
+
+    fn do_close_tab() {
+        let i = this.tabs.active;
+        let doc = this.tabs.docs[i];
+        if (!doc.modified) {
+            this.tabs.close_tab(i);
+            this.refresh_status();
+            return;
+        }
+        this.pending_close_idx = i;
+        this.unsaved_dlg.message = "Save changes to " + doc.title + "?";
+        this.win.open_overlay(this.unsaved_dlg);
+    }
+
+    fn confirmed_close(save: bool) {
+        if (this.pending_close_idx < 0) { return; }
+        if (save) {
+            let doc = this.tabs.docs[this.pending_close_idx];
+            if (doc.path.len > 0) {
+                doc.save_to(doc.path);
+            } else {
+                this.do_save_as();
+                return;
+            }
+        }
+        let i = this.pending_close_idx;
+        this.pending_close_idx = -1;
+        this.tabs.close_tab(i);
+        this.refresh_status();
+        this.win.redraw();
+    }
+
+    fn do_find() {
+        this.find_dlg.find_field.set_text("");
+        this.find_dlg.replace_field.set_text("");
+        this.find_dlg.set_focus_field(0);
+        this.win.open_overlay(this.find_dlg);
+    }
+
+    fn do_replace() {
+        this.find_dlg.find_field.set_text("");
+        this.find_dlg.replace_field.set_text("");
+        this.find_dlg.set_focus_field(0);
+        this.win.open_overlay(this.find_dlg);
+    }
+
+    fn do_goto_line() {
+        this.goto_dlg.field.set_text("");
+        this.win.open_overlay(this.goto_dlg);
+    }
+
+    fn do_goto(n: int) {
+        let doc = this.current_doc();
+        if (doc == null) { return; }
+        let row = n - 1;
+        if (row < 0) { row = 0; }
+        if (row >= doc.editor.lines.len) { row = doc.editor.lines.len - 1; }
+        doc.editor.set_caret_offset(doc.editor.ta_offset(row, 0));
+        doc.editor.sel.clear();
+        doc.editor.invalidate();
+        this.refresh_status();
+        this.win.repaint();
+    }
+
+    fn do_find_next(query: string, case_sensitive: bool): bool {
+        let doc = this.current_doc();
+        if (doc == null || query.len == 0) { return false; }
+        let text = doc.editor.text();
+        let start = doc.editor.caret_offset();
+        if (start >= text.len) { start = 0; }
+        let idx = this.find_in(text, query, start, case_sensitive);
+        if (idx < 0 && start > 0) {
+            idx = this.find_in(text, query, 0, case_sensitive);
+        }
+        if (idx >= 0) {
+            doc.editor.set_caret_offset(idx);
+            doc.editor.sel.set(idx, idx + query.len);
+            doc.editor.invalidate();
+            this.win.repaint();
+            return true;
+        }
+        return false;
+    }
+
+    fn do_replace_one(query: string, replacement: string, case_sensitive: bool): bool {
+        let doc = this.current_doc();
+        if (doc == null || query.len == 0) { return false; }
+        let text = doc.editor.text();
+        let start = doc.editor.caret_offset();
+        let idx = this.find_in(text, query, start, case_sensitive);
+        if (idx < 0) { idx = this.find_in(text, query, 0, case_sensitive); }
+        if (idx >= 0) {
+            let before = text.slice(0, idx);
+            let after = text.slice(idx + query.len, text.len);
+            doc.editor.set_text(before + replacement + after);
+            doc.editor.set_caret_offset(idx + replacement.len);
+            doc.mark_modified();
+            this.tabs.update_label(this.tabs.active);
+            this.refresh_status();
+            doc.editor.invalidate();
+            this.win.repaint();
+            return true;
+        }
+        return false;
+    }
+
+    fn do_replace_all(query: string, replacement: string, case_sensitive: bool): int {
+        let doc = this.current_doc();
+        if (doc == null || query.len == 0) { return 0; }
+        let text = doc.editor.text();
+        let out = "";
+        let count = 0;
+        let i = 0;
+        while (i < text.len) {
+            let idx = this.find_in(text, query, i, case_sensitive);
+            if (idx < 0) {
+                out += text.slice(i, text.len);
+                break;
+            }
+            out += text.slice(i, idx);
+            out += replacement;
+            i = idx + query.len;
+            count += 1;
+        }
+        if (count > 0) {
+            doc.editor.set_text(out);
+            doc.mark_modified();
+            this.tabs.update_label(this.tabs.active);
+            this.refresh_status();
+            doc.editor.invalidate();
+            this.win.repaint();
+        }
+        return count;
+    }
+
+    fn find_in(text: string, query: string, start: int, case_sensitive: bool): int {
+        if (case_sensitive) { return index_of_from(text, query, start); }
+        return index_of_from(text.to_lower(), query.to_lower(), start);
+    }
+
+    fn do_about() {
+        this.win.open_overlay(this.about_dlg);
+    }
+
+    fn do_exit() {
+        this.win.close();
+    }
+
+    fn load_path(path: string) {
+        let text = "";
+        if (file_exists(path)) { text = readfile(path); }
+        let doc = this.add_doc(path, text);
+        if (file_exists(autosave_path(path))) {
+            doc.load_autosave_or(path);
+        }
+        this.refresh_status();
+    }
+
+    fn flush_autosave_on_exit() {
+        for (let doc in this.tabs.docs) {
+            doc.maybe_autosave();
+        }
+    }
+}
+
+// ---------------------------------------------------------------- main
+
+fn main() {
+    let start_file = getenvOr("VYTO_PAD_FILE", "");
+    let font_path = getenvOr("VYTO_PAD_FONT", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf");
+    let win = new Window("VytoPad", 800, 600);
+    win.use_painter(new GfxPainter(win.surface(), font_path, 15.0 * win.scale));
+    let app = new VytoPad();
+    app.win = win;
+
+    // top-level dialogs so their handlers are not nested closures
+    app.open_pk = new FilePicker(app.file_picker_dir, false);
+    app.open_pk.onAccept = (p) => {
+        app.load_path(p);
+        app.win.redraw();
+    };
+    app.save_pk = new FilePicker(app.file_picker_dir, true);
+    app.save_pk.onAccept = (p) => {
+        let doc = app.current_doc();
+        if (doc != null) {
+            doc.save_to(p);
+            app.tabs.update_label(app.tabs.active);
+            app.refresh_status();
+            app.win.redraw();
+            // if this save was triggered by closing an untitled tab, finish the close
+            if (app.pending_close_idx >= 0) {
+                let i = app.pending_close_idx;
+                app.pending_close_idx = -1;
+                app.tabs.close_tab(i);
+                app.refresh_status();
+                app.win.redraw();
+            }
+        }
+    };
+    app.about_dlg = new MessageDialog("About VytoPad",
+        "VytoPad — a multi-tab notepad built on vyto/ui.\nTabs, find/replace, go-to-line, line numbers, autosave.");
+
+    app.find_dlg = new FindReplaceDialog();
+    app.find_dlg.onFind = (q, c) => app.do_find_next(q, c);
+    app.find_dlg.onReplace = (q, r, c) => app.do_replace_one(q, r, c);
+    app.find_dlg.onReplaceAll = (q, r, c) => app.do_replace_all(q, r, c);
+
+    app.goto_dlg = new InputDialog("Go to Line", "Line number:", "");
+    app.goto_dlg.onAccept = (s) => {
+        let n = 0;
+        for (let i in 0..s.len) {
+            let c = s[i];
+            if (c >= 48 && c <= 57) {
+                n = n * 10 + (c - 48);
+            }
+        }
+        if (n > 0) { app.do_goto(n); }
+    };
+
+    app.unsaved_dlg = new ConfirmDialog("Unsaved changes", "Save changes?");
+    app.unsaved_dlg.onConfirm = () => { app.confirmed_close(true); };
+    app.unsaved_dlg.onCancel = () => { app.pending_close_idx = -1; };
+
+    // initial document
+    if (start_file.len > 0) {
+        app.load_path(start_file);
+    } else {
+        app.add_doc("", "");
+    }
+
+    // menu bar
+    let bar = new MenuBar();
+    let file = bar.add_menu(new Menu("File"));
+    file.add("New").onSelect = () => app.do_new();
+    file.add("Open...").onSelect = () => app.do_open();
+    file.add("Save").onSelect = () => app.do_save();
+    file.add("Save As...").onSelect = () => app.do_save_as();
+    file.add("Close Tab").onSelect = () => app.do_close_tab();
+    file.add("Exit").onSelect = () => app.do_exit();
+
+    let edit = bar.add_menu(new Menu("Edit"));
+    edit.add("Find...").onSelect = () => app.do_find();
+    edit.add("Replace...").onSelect = () => app.do_replace();
+    edit.add("Go to Line...").onSelect = () => app.do_goto_line();
+
+    let help = bar.add_menu(new Menu("Help"));
+    help.add("About").onSelect = () => app.do_about();
+
+    // refresh status when switching tabs
+    app.tabs.onSwitch = (i) => {
+        app.refresh_status();
+        app.win.layout();
+        app.win.redraw();
+    };
+
+    win.menubar = bar;
+    win.close_on_esc = false;
+    win.root = new Column([
+        app.tabs,
+        app.status,
+    ]);
+    app.schedule_autosave();
+    win.run();
+
+    app.flush_autosave_on_exit();
+    print("bye — VytoPad closed");
+}
