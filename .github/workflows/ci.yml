@@ -35,20 +35,37 @@ jobs:
         run: ./vytoc run examples/intl_demo.vt
 
   # Full suite (incl. gfx/ui) needs blend2d — build it, then run tests.
-  # Kept separate so a blend2d hiccup doesn't mask a core regression.
+  # Kept a separate job so a blend2d hiccup doesn't mask a core regression:
+  # build-and-smoke stays green on its own and doesn't depend on this one.
+  #
+  # The test step gates. Only the blend2d vendoring step is allowed to fail
+  # without failing the job — that's third-party build infrastructure, and it
+  # was the original reason the whole job was non-gating. Test failures are
+  # ours and must be surfaced.
   full-suite:
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
 
       - name: Install deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y libicu-dev cmake ninja-build libcurl4-openssl-dev libx11-dev
+          # fonts-dejavu-core: render-snapshot goldens are hashes of rasterized
+          # pixels, so the exact font file has to be present and pinned.
+          sudo apt-get install -y libicu-dev cmake ninja-build libcurl4-openssl-dev libx11-dev \
+                                  fonts-dejavu-core
 
       - name: Vendor blend2d (vyto/gfx)
+        id: blend2d
+        continue-on-error: true
         run: lib/vyto/gfx/native/build-blend2d.sh linux-x64
+
+      - name: Fail if blend2d could not be vendored
+        if: steps.blend2d.outcome == 'failure'
+        run: |
+          echo "blend2d vendoring failed — the gfx/ui suite cannot run."
+          echo "This is a build-infrastructure failure, not a test regression."
+          exit 1
 
       - name: Build + full test suite
         run: make test

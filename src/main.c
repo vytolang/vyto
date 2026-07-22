@@ -243,15 +243,17 @@ static void usage(void) {
             "vytoc — the Vyto compiler\n"
             "usage:\n"
             "  vytoc build <file.vt> [-o out] [--release] [--bundle] [--verbose]\n"
-            "              [--target <triple>] [--cc <compiler cmd>]\n"
+            "              [--target <triple>] [--cc <compiler cmd>] [--clean]\n"
             "              [--freestanding] [--no-float] [--no-fs]\n"
             "    --bundle       statically link prebuilt native libs + the C++ runtime\n"
             "                   into one self-contained exe (no shipped .so)\n"
+            "    --clean        delete this file's .vyto-cache first and rebuild from\n"
+            "                   scratch — use when a build looks stale after a lib edit\n"
             "    --freestanding no libc: route alloc/print/abort through vt_host_* hooks\n"
             "                   the embedder supplies; output is lib<name>.a, not an exe\n"
             "    --no-float     stub float-to-string (no soft-float formatter pulled in)\n"
             "    --no-fs        drop the filesystem layer (File ops become no-ops/panics)\n"
-            "  vytoc run   <file.vt> [--release] [--verbose] [-- args...]\n"
+            "  vytoc run   <file.vt> [--release] [--verbose] [--clean] [-- args...]\n"
             "targets: linux-x64 linux-arm64 macos-x64 macos-arm64 windows-x64\n"
             "  --cc (or VYTO_CC) overrides the C compiler; put sysroots/flags inside it,\n"
             "  e.g. --cc 'zig cc -target aarch64-linux-gnu' or (freestanding)\n"
@@ -284,7 +286,7 @@ int main(int argc, char **argv) {
     const char *cmd = argv[1];
     const char *input = argv[2];
     bool release = false, verbose = false, bundle = false;
-    bool freestanding = false, no_float = false, no_fs = false;
+    bool freestanding = false, no_float = false, no_fs = false, clean = false;
     const char *outpath = NULL, *target = NULL, *cc_override = NULL;
     int prog_argc = 0;
     char **prog_argv = NULL;
@@ -295,6 +297,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--freestanding") == 0) freestanding = true;
         else if (strcmp(argv[i], "--no-float") == 0) no_float = true;
         else if (strcmp(argv[i], "--no-fs") == 0) no_fs = true;
+        else if (strcmp(argv[i], "--clean") == 0) clean = true;
         else if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) outpath = argv[++i];
         else if (strcmp(argv[i], "--target") == 0 && i + 1 < argc) target = argv[++i];
         else if (strcmp(argv[i], "--cc") == 0 && i + 1 < argc) cc_override = argv[++i];
@@ -323,6 +326,15 @@ int main(int argc, char **argv) {
 
     /* ---- emit C into the cache dir (per-target subdir for explicit targets) ---- */
     const char *cache = arena_printf(&g_arena, "%s/.vyto-cache", dir_of(input));
+    /* --clean: discard this input's cache and build from scratch. The escape
+       hatch for a cache that is serving a stale object — see the incremental
+       rules further down, which decide per module from the *generated* C, not
+       from .vt mtimes. Scoped to this one cache dir, so it can't touch a
+       sibling project's build. */
+    if (clean) {
+        char *rm = arena_printf(&g_arena, "rm -rf %s", cache);
+        if (run_cmd(rm, verbose) != 0) fatal("cannot clear cache %s", cache);
+    }
     mkdir(cache, 0755);
     if (target) {
         cache = arena_printf(&g_arena, "%s/%s", cache, target);
@@ -432,6 +444,21 @@ int main(int argc, char **argv) {
         if (nseen < 128) seen_dirs[nseen++] = mdir;
 
         const char *nsrc = arena_printf(&g_arena, "%s/native/src", mdir);
+        /* Headers aren't tracked per-object (no dependency scanner), so a .h edit
+           would otherwise serve a stale .o. Rebuild every object in the package
+           when anything under native/src is newer than it — same conservative
+           newest-of-the-set rule the runtime uses above. */
+        long nsrc_newest = -1;
+        DIR *ndp = opendir(nsrc);
+        if (ndp) {
+            struct dirent *de;
+            while ((de = readdir(ndp))) {
+                if (de->d_name[0] == '.') continue;
+                long t = file_mtime(arena_printf(&g_arena, "%s/%s", nsrc, de->d_name));
+                if (t > nsrc_newest) nsrc_newest = t;
+            }
+            closedir(ndp);
+        }
         DIR *dp = opendir(nsrc);
         if (dp) {
             struct dirent *de;
@@ -440,7 +467,7 @@ int main(int argc, char **argv) {
                 const char *csrc = arena_printf(&g_arena, "%s/%s", nsrc, de->d_name);
                 const char *obj = arena_printf(&g_arena, "%s/native_%s_%s%s%s.o", cache, m->name,
                                                stem_of(de->d_name), release ? "_rel" : "", prof);
-                if (!file_exists(obj) || file_mtime(csrc) > file_mtime(obj)) {
+                if (!file_exists(obj) || nsrc_newest > file_mtime(obj)) {
                     char *cl = arena_printf(&g_arena, "%s %s%s -w -I%s -c -o %s %s", cc,
                                             release ? "-O2" : opt, fsflags, nsrc, obj, csrc);
                     if (run_cmd(cl, verbose) != 0)

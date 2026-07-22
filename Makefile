@@ -11,13 +11,18 @@ vytoc: $(SRC) $(HDR)
 vytobind: src/vytobind.c src/util.c src/util.h
 	$(CC) $(CFLAGS) -o $@ src/vytobind.c src/util.c
 
-.PHONY: all test clean
+.PHONY: all test clean clean-cache
 
 test: vytoc vytobind
 	./tests/run_tests.sh
 
-clean:
+# Every .vyto-cache in the tree, including apps/* which `clean` does not cover.
+# Run this before regenerating any golden — a stale cache validates the previous
+# build, not the current one.
+clean-cache:
+	find . -name .vyto-cache -prune -exec rm -rf {} +
+	rm -rf tests/tmp
+
+clean: clean-cache
 	rm -f vytoc vytobind
-	rm -rf examples/.vyto-cache tests/tmp tests/ui/.vyto-cache
-	rm -rf tests/fixtures/libpath/.vyto-cache tests/fixtures/libpath/shadow/.vyto-cache
 	rm -rf examples/greeter/native examples/greeter/greeter.vt
