@@ -1,0 +1,91 @@
+// Blur reached through Painter, not through a raw Canvas.
+//
+// The capability existed since B1 but no widget could use it: nothing on
+// Painter surfaced it, so the glass demo had to drop to a Canvas. These probes
+// check both tiers of the contract — the rich one actually blurs, and the
+// fallback stays a readable surface rather than going blank or transparent.
+
+import { Window, Painter, Theme, PanelChrome } from "vyto/ui";
+import { GfxPainter } from "vyto/gfx/painter";
+import { Rect, rgb, rgba, alpha_of } from "vyto/surface";
+
+const FONT: string = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf";
+
+fn check(label: string, cond: bool) {
+    let mark = "FAIL";
+    if (cond) { mark = "ok"; }
+    print(mark + " " + label);
+}
+
+// A Painter that records nothing and overrides nothing — the base-class
+// fallbacks, i.e. what a lean tier or a test double gets.
+class PlainPainter extends Painter {
+    fills: int;
+    fn init() { this.fills = 0; }
+    override fn fill_round(r: Rect, radius: float, color: int) {
+        this.fills += 1;
+        this.last = color;
+    }
+    last: int;
+}
+
+fn main() {
+    let win = new Window("Material", 240, 160);
+    let p = new GfxPainter(win.surface(), FONT, 15.0);
+    let th = new Theme();
+    let chrome = new PanelChrome();
+
+    check("rich tier reports blur", p.can_blur());
+
+    // A hard black/white edge: after a blur the midpoint must be neither.
+    p.fill(Rect(0.0, 0.0, 240.0, 160.0), rgb(255, 255, 255));
+    p.fill(Rect(0.0, 0.0, 120.0, 160.0), rgb(0, 0, 0));
+    p.blur(Rect(0.0, 0.0, 240.0, 160.0), 10.0);
+    let mid = p.canvas.pixelAt(120, 80);
+    let mr = (mid >> 16) & 0xFF;
+    check("blur softened a hard edge", mr > 40 && mr < 215);
+    check("blur left the far side alone", p.canvas.pixelAt(235, 80) == 0xFFFFFFFF);
+
+    // The frosted panel: over a busy backdrop, the tint must let the backdrop
+    // through rather than paint a flat slab. Sample two points that differed
+    // sharply before the material went down; they must still differ.
+    p.fill(Rect(0.0, 0.0, 240.0, 160.0), rgb(20, 24, 40));
+    p.fill(Rect(0.0, 0.0, 240.0, 80.0), rgb(240, 90, 60));
+    let before_top = p.canvas.pixelAt(120, 50);
+    let before_bot = p.canvas.pixelAt(120, 110);
+    check("backdrop starts contrasty", before_top != before_bot);
+
+    chrome.paint_material(p, th, Rect(20.0, 20.0, 200.0, 120.0), 16.0,
+                          th.material_tint, th.border, 0);
+    let after_top = p.canvas.pixelAt(120, 50);
+    let after_bot = p.canvas.pixelAt(120, 110);
+    check("material changed the pixels", after_top != before_top);
+    check("material is translucent, not a slab", after_top != after_bot);
+    check("material stays opaque to the window", alpha_of(after_top) == 255);
+
+    // Corner outside the rounded shape must be untouched by the material.
+    check("material respects its radius", p.canvas.pixelAt(21, 21) == before_top);
+
+    // Blur writes raw pixels, so it does not go through blend2d's clip and has
+    // to honor it by hand. A partial repaint clips to the dirty rect; a blur
+    // that ignored that would smear outside it, and because only the dirty
+    // rect is presented, the damage would sit in the back buffer until some
+    // later frame revealed it.
+    p.fill(Rect(0.0, 0.0, 240.0, 160.0), rgb(255, 255, 255));
+    p.fill(Rect(0.0, 0.0, 240.0, 40.0), rgb(0, 0, 0));
+    let outside_before = p.canvas.pixelAt(200, 45);
+    p.clip_push(Rect(0.0, 0.0, 100.0, 160.0), 0.0);
+    p.blur(Rect(0.0, 0.0, 240.0, 160.0), 12.0);
+    p.clip_pop();
+    check("blur stayed inside the clip", p.canvas.pixelAt(200, 45) == outside_before);
+    check("blur still ran inside the clip", p.canvas.pixelAt(50, 45) != outside_before);
+
+    // Fallback tier: no blur, but paint_material must still put down a
+    // surface — a skipped fill would leave text on bare backdrop.
+    let plain = new PlainPainter();
+    check("plain tier reports no blur", !plain.can_blur());
+    plain.backdrop(Rect(0.0, 0.0, 10.0, 10.0), 4.0, 12.0, rgba(252, 252, 255, 165));
+    check("fallback still filled", plain.fills == 1);
+    check("fallback filled opaque", alpha_of(plain.last) == 255);
+    check("fallback kept the tint's color", (plain.last & 0xFFFFFF) == 0xFCFCFF);
+}

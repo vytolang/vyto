@@ -33,6 +33,11 @@ typedef struct {
 #define GFX_CLIP_BOXES 4
 typedef struct {
     double x, y, w, h, r;               /* the shape, in device pixels */
+    /* Effective rectangular clip in device pixels, already intersected with
+       the enclosing one. blend2d applies the clip itself for everything drawn
+       through the context, but the blur paths write raw pixels and would
+       otherwise ignore it entirely — see clamp_region. */
+    int cx, cy, cw, ch;
     int nbox;
     int bx[GFX_CLIP_BOXES], by[GFX_CLIP_BOXES];
     int bw[GFX_CLIP_BOXES], bh[GFX_CLIP_BOXES];
@@ -407,7 +412,15 @@ static void shadow_recolor(uint8_t *p, intptr_t stride, int w, int h, uint32_t c
     }
 }
 
-/* Clamp a region to the canvas; returns 0 when nothing is left to do. */
+/* Clamp a region to the canvas AND to the active clip; 0 when nothing is left.
+ *
+ * The clip half matters because the blur paths below write pixels directly and
+ * so are invisible to blend2d's own clipping. A partial repaint clips to the
+ * dirty rect and redraws the widgets inside it; a frosted panel blurring the
+ * full width would smear pixels outside that rect, and since only the dirty
+ * rect gets presented the damage sits in the back buffer until some later
+ * frame reveals it. Same failure as the translucent-shadow one that made
+ * hovered buttons darken over time, and just as slow to track down. */
 static int clamp_region(GfxCanvas *c, double x, double y, double w, double h,
                         int *ox, int *oy, int *ow, int *oh) {
     int x0 = (int)floor(x), y0 = (int)floor(y);
@@ -416,6 +429,16 @@ static int clamp_region(GfxCanvas *c, double x, double y, double w, double h,
     if (y0 < 0) y0 = 0;
     if (x1 > c->w) x1 = c->w;
     if (y1 > c->h) y1 = c->h;
+    if (c->clip_top > 0) {
+        int top = c->clip_top - 1;
+        if (top < c->clip_cap) {
+            const GfxClip *cl = &c->clip[top];
+            if (x0 < cl->cx) x0 = cl->cx;
+            if (y0 < cl->cy) y0 = cl->cy;
+            if (x1 > cl->cx + cl->cw) x1 = cl->cx + cl->cw;
+            if (y1 > cl->cy + cl->ch) y1 = cl->cy + cl->ch;
+        }
+    }
     if (x1 <= x0 || y1 <= y0) return 0;
     *ox = x0; *oy = y0; *ow = x1 - x0; *oh = y1 - y0;
     return 1;
@@ -739,19 +762,30 @@ void gfx_clip_push(GfxCanvas *c, double x, double y, double w, double h, double 
     BLRect rc = { x, y, w, h };
     /* Depth advances on EVERY push, tracked or not, so pops stay paired. */
     int slot = c->clip_top++;
-    int track = r >= 0.5 && w > 0.0 && h > 0.0 && clip_reserve(c, slot);
+    int have_slot = clip_reserve(c, slot);
+    int track = 0;
 
-    if (track) {
-        /* The clip rect is given in user space; the pixels to save are in
-           device space. Map through the final transform, and give up on the
-           rounded part if it is rotated or skewed (the shape would no longer
-           be an axis-aligned round-rect). */
+    if (have_slot) {
+        GfxClip *cl = &c->clip[slot];
+        cl->nbox = 0;
+        /* Start from the enclosing clip, so the recorded box is the effective
+           one and nesting narrows it. */
+        if (slot > 0) {
+            const GfxClip *up = &c->clip[slot - 1];
+            cl->cx = up->cx; cl->cy = up->cy; cl->cw = up->cw; cl->ch = up->ch;
+        } else {
+            cl->cx = 0; cl->cy = 0; cl->cw = c->w; cl->ch = c->h;
+        }
+
+        /* The clip rect is given in user space; both the pixels to save and
+           the box to record are in device space. Map through the final
+           transform. A rotated or skewed one is left at the enclosing box —
+           conservative for the blur clamp, and it also gives up the rounded
+           corners, since the shape would no longer be an axis-aligned
+           round-rect. */
         BLMatrix2D m;
         bl_context_get_final_transform(&c->ctx, &m);
-        if (fabs(m.m01) > 1e-9 || fabs(m.m10) > 1e-9) {
-            track = 0;
-        } else {
-            GfxClip *cl = &c->clip[slot];
+        if (fabs(m.m01) <= 1e-9 && fabs(m.m10) <= 1e-9) {
             double sx = fabs(m.m00), sy = fabs(m.m11);
             double dx0 = m.m00 * x + m.m20, dx1 = m.m00 * (x + w) + m.m20;
             double dy0 = m.m11 * y + m.m21, dy1 = m.m11 * (y + h) + m.m21;
@@ -760,13 +794,21 @@ void gfx_clip_push(GfxCanvas *c, double x, double y, double w, double h, double 
             cl->w = fabs(dx1 - dx0);
             cl->h = fabs(dy1 - dy0);
             cl->r = r * (sx < sy ? sx : sy);
-            cl->nbox = 0;
-            if (cl->w <= 0.0 || cl->h <= 0.0 || cl->r < 0.5) track = 0;
-            else clip_save_corners(c, cl);
+
+            int nx0 = (int)floor(cl->x), ny0 = (int)floor(cl->y);
+            int nx1 = (int)ceil(cl->x + cl->w), ny1 = (int)ceil(cl->y + cl->h);
+            if (nx0 > cl->cx) { cl->cw -= nx0 - cl->cx; cl->cx = nx0; }
+            if (ny0 > cl->cy) { cl->ch -= ny0 - cl->cy; cl->cy = ny0; }
+            if (nx1 < cl->cx + cl->cw) cl->cw = nx1 - cl->cx;
+            if (ny1 < cl->cy + cl->ch) cl->ch = ny1 - cl->cy;
+            if (cl->cw < 0) cl->cw = 0;
+            if (cl->ch < 0) cl->ch = 0;
+
+            track = cl->w > 0.0 && cl->h > 0.0 && cl->r >= 0.5;
+            if (track) clip_save_corners(c, cl);
         }
     }
-    /* A bailed-out entry must still read as "nothing saved" on pop. */
-    if (!track && slot < c->clip_cap) c->clip[slot].nbox = 0;
+    (void)track;
 
     bl_context_save(&c->ctx, NULL);
     bl_context_clip_to_rect_d(&c->ctx, &rc);

@@ -232,6 +232,13 @@ export class Theme {
     space_5: float;
     space_6: float;
 
+    // --- material: the frosted surface (PanelChrome.paint_material). The tint
+    //     carries real alpha and is composited over the blurred backdrop, so
+    //     its opacity is the whole design — near-opaque stops reading as glass,
+    //     and too sheer stops being a surface text can sit on. ---
+    material_blur: float;
+    material_tint: int;
+
     // --- type scale: absolute px sizes, the twin of the space/radius scales.
     //     text_md is the body size and should match the size the painter
     //     loaded its faces at, so a tier that cannot resize text (the lean
@@ -282,6 +289,7 @@ export class Theme {
         this.space_4 = scale_px(this.space_4, f);
         this.space_5 = scale_px(this.space_5, f);
         this.space_6 = scale_px(this.space_6, f);
+        this.material_blur = scale_px(this.material_blur, f);
         // Type scales with everything else, but NOT through scale_px: that
         // rounds to whole pixels, and a rounded type ramp collapses — at 1.25
         // the 12/13 pair would both land on 16. Glyph rasterisation is happy
@@ -363,6 +371,9 @@ export class Theme {
         this.space_5 = 24;
         this.space_6 = 32;
 
+        this.material_blur = 18;
+        this.material_tint = rgba(252, 252, 255, 165);
+
         // type roles
         // type scale — a ~1.2 ratio around a 15px body, matching the size
         // GfxPainter is conventionally constructed with
@@ -423,6 +434,9 @@ export fn theme_dark(): Theme {
     th.divider           = rgb(44, 44, 54);
     th.selection         = mix(th.surface, th.primary, 0.30);
     th.shadow_color      = rgba(0, 0, 0, 210);  // see the light theme's note
+    // A dark material tints toward the surface rather than toward white; the
+    // light theme's pale tint over a dark backdrop would read as fog, not glass.
+    th.material_tint     = rgba(28, 30, 38, 175);
     th.info              = rgb(96, 148, 238);
     th.success           = rgb(64, 190, 120);
     th.warning           = rgb(232, 176, 64);
@@ -562,6 +576,29 @@ export class Painter {
     virtual fn shadow(r: Rect, radius: float, blur: float, dy: float, color: int) { }
     virtual fn clip_push(r: Rect, radius: float) { }
     virtual fn clip_pop() { }
+
+    // -- materials: blur over what has already been painted ---------------
+    // `blur` softens a region in place. `backdrop` is the frosted material —
+    // it blurs what is behind the region and composites a translucent tint
+    // over it, which is the effect behind sheets, popovers and vibrant bars.
+    // Both need pixels to read back, so both are rich-tier only.
+    //
+    // The base fallback for `backdrop` is a flat fill of the tint at full
+    // opacity. That is deliberately not "the tint as given": a translucent
+    // fill over unblurred content is a smear on a tier that composites alpha
+    // and a wrong solid color on one that does not, whereas the tint's own RGB
+    // is the color the material was designed to read as. A frosted panel
+    // degrades to a plain panel of about the right hue, which is the same
+    // bargain the rest of the vocabulary makes.
+    //
+    // Ask can_blur() when the answer changes the design rather than the
+    // fidelity — a skin that would place light text over a dark blur needs to
+    // know it is getting a pale solid instead.
+    virtual fn can_blur(): bool { return false; }
+    virtual fn blur(r: Rect, radius: float) { }
+    virtual fn backdrop(r: Rect, radius: float, amount: float, tint: int) {
+        this.fill_round(r, radius, with_alpha(tint, 255));
+    }
 
     // Multi-stop gradient (colors/positions parallel arrays, positions
     // ascending in [0,1]) — for skins needing more than gradient_v's 2-color
@@ -871,6 +908,28 @@ export class PanelChrome {
             s.shadow(r, radius, blur, dy, th.shadow_color);
         }
         s.fill_round(r, radius, fill);
+        s.stroke_round(r, radius, 1, border);
+    }
+
+    // Frosted variant: instead of an opaque fill, blur what is already behind
+    // the panel and composite a translucent tint over it. Safe to call
+    // unconditionally — Painter.backdrop falls back to a flat fill of the
+    // tint's own color on a tier that cannot blur.
+    //
+    // The caller must have painted the backdrop already: this reads pixels
+    // back, so anything drawn afterwards is simply not in the blur. That makes
+    // it a poor fit for a widget that paints before its siblings, and the
+    // reason this is a separate entry point rather than a flag on paint().
+    virtual fn paint_material(s: Painter, th: Theme, r: Rect, radius: float,
+                              tint: int, border: int, elevation: int) {
+        if (elevation > 0) {
+            let blur = th.elevation1_blur;
+            let dy = th.elevation1_dy;
+            if (elevation >= 2) { blur = th.elevation2_blur; dy = th.elevation2_dy; }
+            if (elevation >= 3) { blur = th.elevation3_blur; dy = th.elevation3_dy; }
+            s.shadow(r, radius, blur, dy, th.shadow_color);
+        }
+        s.backdrop(r, radius, th.material_blur, tint);
         s.stroke_round(r, radius, 1, border);
     }
 
