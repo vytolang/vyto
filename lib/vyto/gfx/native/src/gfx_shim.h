@@ -67,8 +67,15 @@ void gfx_stroke_arc(GfxCanvas *c, double cx, double cy, double rx, double ry,
                     double start_deg, double sweep_deg, double width, int color);
 
 /* clip stack: save state (incl. clip) and intersect the clip with a rect.
-   radius==0 → rectangular clip; radius>0 falls back to the bounding rect
-   (the blend2d C core exposes only rect clip). */
+   radius > 0 gives a genuine rounded clip with an antialiased edge — blend2d
+   has no clip-to-path in EITHER its C or C++ API, so the corners are emulated
+   by saving the pixels they can spill into and blending them back on pop (see
+   the long note at gfx_clip_push). The radius degrades to a plain rectangular
+   scissor under a rotated/skewed transform or if the corner copies cannot be
+   allocated; nothing else does.
+
+   Every push must be balanced by a pop — the saved corners are held until it
+   comes, and pushes share blend2d's state stack with gfx_save/gfx_restore. */
 void gfx_clip_push(GfxCanvas *c, double x, double y, double w, double h, double r);
 void gfx_clip_pop(GfxCanvas *c);
 
@@ -144,6 +151,12 @@ void gfx_backdrop_blur(GfxCanvas *c, double x, double y, double w, double h,
    exposes decoding only; PPM needs no codec and every image tool reads it. */
 unsigned gfx_hash(GfxCanvas *c);
 int gfx_write_ppm(GfxCanvas *c, const char *path); /* 1 ok, 0 fail */
+
+/* Read one pixel as 0xAARRGGBB (0 outside the canvas). The hash above says a
+   frame moved but not how, and a PPM needs a human; this lets a test state the
+   property it actually cares about — "this corner is background, that centre is
+   filled" — so a failure names the defect instead of just a changed number. */
+unsigned gfx_pixel_at(GfxCanvas *c, int x, int y);
 
 /* decoded images — PNG/JPEG/BMP/QOI, all built into libblend2d already (no
    extra codec dependency). Load-once opaque handle, same lifecycle shape as

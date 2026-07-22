@@ -10,6 +10,19 @@
 
 #define GFX_WEIGHTS 3   /* 0=regular, 1=medium/semi, 2=bold */
 
+/* One entry per gfx_clip_push. blend2d clips only to rectangles, so a rounded
+   clip is emulated: the pixels the corners will spill into are copied out on
+   push and blended back on pop (see gfx_clip_push). At most four corner blocks
+   are saved; `nbox` is 0 for a plain rectangular clip, which costs nothing. */
+#define GFX_CLIP_BOXES 4
+typedef struct {
+    double x, y, w, h, r;               /* the shape, in device pixels */
+    int nbox;
+    int bx[GFX_CLIP_BOXES], by[GFX_CLIP_BOXES];
+    int bw[GFX_CLIP_BOXES], bh[GFX_CLIP_BOXES];
+    uint8_t *save[GFX_CLIP_BOXES];
+} GfxClip;
+
 struct GfxCanvas {
     BLImageCore img;
     BLContextCore ctx;
@@ -24,6 +37,9 @@ struct GfxCanvas {
     BLImageCore sl_img;
     BLContextCore sl_ctx;
     int sl_w, sl_h;
+    /* rounded-clip stack, grown on demand and never shrunk */
+    GfxClip *clip;
+    int clip_top, clip_cap;
 };
 
 /* Resolve a 0xAARRGGBB color. Alpha means alpha: 0 is transparent. (This used
@@ -77,6 +93,10 @@ static void free_shadow_layer(GfxCanvas *c) {
 
 void gfx_canvas_free(GfxCanvas *c) {
     if (!c) return;
+    /* unbalanced clip pushes would otherwise leak their saved corners */
+    for (int i = 0; i < c->clip_top && i < c->clip_cap; i++)
+        for (int k = 0; k < c->clip[i].nbox; k++) free(c->clip[i].save[k]);
+    free(c->clip);
     free_shadow_layer(c);
     destroy_fonts(c);
     bl_context_destroy(&c->ctx);
@@ -553,16 +573,189 @@ void gfx_shadow_round(GfxCanvas *c, double x, double y, double w, double h,
     bl_context_blit_image_d(&c->ctx, &at, &c->sl_img, &src);
 }
 
-/* clip stack — blend2d C core exposes only rect clip; rounded radius degrades
-   to a rectangular scissor (acceptable per the graceful-degradation rule). */
+/* ---- clip stack ---------------------------------------------------------- *
+ * blend2d clips to rectangles only — there is no clip-to-path in either its C
+ * or its C++ API (core/context.h exposes clip_to_rect_i/d and nothing else),
+ * so a rounded clip has to be emulated rather than delegated.
+ *
+ * The trick is the one gfx_backdrop_blur already uses: a rounded clip differs
+ * from the rectangular one blend2d gives us ONLY in the four corners. So push
+ * the rect clip as usual, copy the corner pixels aside, let the caller draw
+ * over them, and on pop blend the originals back wherever the rounded shape
+ * does not cover. Content is never "not drawn"; it is drawn and then undone,
+ * which is pixel-identical because the copy is exact.
+ *
+ * Cost is four r*r blocks per push, not the whole region — a rounded clip on a
+ * 400x300 card with r=12 saves ~2.6KB, not 480KB.
+ *
+ * Nesting is LIFO and composes correctly: an inner clip pops (restoring its
+ * corners) before an outer one does, and the outer restores from a snapshot
+ * taken before the inner drew anything, which is exactly what a true nested
+ * clip would have produced.
+ *
+ * Limits, both degrading to the old rectangular scissor rather than misdrawing:
+ * a rotated or skewed transform (the device-space shape is no longer an
+ * axis-aligned round-rect), and allocation failure.
+ *
+ * Cost: a ROUNDED push/pop pair costs two synchronous context flushes, because
+ * reading and writing raw pixels means draining blend2d's queue both times. The
+ * corner copies themselves are noise next to that. Purely rectangular clips —
+ * the overwhelming majority, and every clip the lean tier issues — take the
+ * r < 0.5 path, save nothing, and flush nothing, so they cost exactly what they
+ * did before. Something like a scroll list giving every one of fifty rows its
+ * own rounded clip would serialise the pipeline a hundred times per frame; clip
+ * the viewport once instead. */
+
+static int clip_reserve(GfxCanvas *c, int slot) {
+    if (slot < c->clip_cap) return 1;
+    int cap = c->clip_cap ? c->clip_cap * 2 : 8;
+    while (cap <= slot) cap *= 2;
+    GfxClip *n = (GfxClip *)realloc(c->clip, (size_t)cap * sizeof *n);
+    if (!n) return 0;
+    c->clip = n;
+    c->clip_cap = cap;
+    return 1;
+}
+
+/* Copy out the pixels a rounded corner may spill into. Corner blocks are kept
+   disjoint so no pixel is saved (and later blended) twice; when the radius is
+   large enough that they would overlap — a pill or a circle — one block
+   covering the whole shape is used instead. */
+static void clip_save_corners(GfxCanvas *c, GfxClip *cl) {
+    int bs = (int)ceil(cl->r) + 1;      /* +1 for the antialiased edge */
+    int hw = (int)(cl->w * 0.5), hh = (int)(cl->h * 0.5);
+    int boxes[GFX_CLIP_BOXES][4];
+    int n, i;
+
+    cl->nbox = 0;
+    if (bs > hw || bs > hh) {           /* corners would overlap: save it whole */
+        n = 1;
+        boxes[0][0] = (int)floor(cl->x);
+        boxes[0][1] = (int)floor(cl->y);
+        boxes[0][2] = (int)ceil(cl->x + cl->w);
+        boxes[0][3] = (int)ceil(cl->y + cl->h);
+    } else {
+        int x0 = (int)floor(cl->x), y0 = (int)floor(cl->y);
+        int x1 = (int)ceil(cl->x + cl->w), y1 = (int)ceil(cl->y + cl->h);
+        n = 4;
+        boxes[0][0] = x0;      boxes[0][1] = y0;      boxes[0][2] = x0 + bs; boxes[0][3] = y0 + bs;
+        boxes[1][0] = x1 - bs; boxes[1][1] = y0;      boxes[1][2] = x1;      boxes[1][3] = y0 + bs;
+        boxes[2][0] = x0;      boxes[2][1] = y1 - bs; boxes[2][2] = x0 + bs; boxes[2][3] = y1;
+        boxes[3][0] = x1 - bs; boxes[3][1] = y1 - bs; boxes[3][2] = x1;      boxes[3][3] = y1;
+    }
+
+    BLImageData d;
+    gfx_flush(c);
+    bl_image_get_data(&c->img, &d);
+    const uint8_t *p = (const uint8_t *)d.pixel_data;
+    intptr_t stride = (intptr_t)d.stride;
+
+    for (i = 0; i < n; i++) {
+        int bx = boxes[i][0], by = boxes[i][1];
+        int ex = boxes[i][2], ey = boxes[i][3];
+        if (bx < 0) bx = 0;
+        if (by < 0) by = 0;
+        if (ex > c->w) ex = c->w;
+        if (ey > c->h) ey = c->h;
+        if (ex <= bx || ey <= by) continue;         /* off-canvas corner */
+
+        size_t rowbytes = (size_t)(ex - bx) * 4;
+        uint8_t *buf = (uint8_t *)malloc(rowbytes * (size_t)(ey - by));
+        if (!buf) { cl->nbox = 0; return; }         /* degrade to rect clip */
+        for (int yy = by; yy < ey; yy++)
+            memcpy(buf + (size_t)(yy - by) * rowbytes,
+                   p + (intptr_t)yy * stride + (intptr_t)bx * 4, rowbytes);
+
+        int k = cl->nbox++;
+        cl->bx[k] = bx; cl->by[k] = by;
+        cl->bw[k] = ex - bx; cl->bh[k] = ey - by;
+        cl->save[k] = buf;
+    }
+}
+
+/* Blend the saved pixels back wherever the rounded shape does not cover. */
+static void clip_restore_corners(GfxCanvas *c, GfxClip *cl) {
+    BLImageData d;
+    gfx_flush(c);
+    bl_image_get_data(&c->img, &d);
+    uint8_t *p = (uint8_t *)d.pixel_data;
+    intptr_t stride = (intptr_t)d.stride;
+
+    for (int i = 0; i < cl->nbox; i++) {
+        size_t rowbytes = (size_t)cl->bw[i] * 4;
+        for (int yy = 0; yy < cl->bh[i]; yy++) {
+            uint8_t *row = p + (intptr_t)(cl->by[i] + yy) * stride + (intptr_t)cl->bx[i] * 4;
+            const uint8_t *src = cl->save[i] + (size_t)yy * rowbytes;
+            for (int xx = 0; xx < cl->bw[i]; xx++) {
+                double sd = rrect_sd((double)(cl->bx[i] + xx) + 0.5,
+                                     (double)(cl->by[i] + yy) + 0.5,
+                                     cl->x, cl->y, cl->w, cl->h, cl->r);
+                double cov = 0.5 - sd;        /* 1 inside, 0 outside, ramp between */
+                if (cov >= 1.0) continue;     /* inside the shape: keep what was drawn */
+                if (cov <= 0.0) {             /* outside: undo it entirely */
+                    memcpy(row + xx * 4, src + xx * 4, 4);
+                    continue;
+                }
+                unsigned a = (unsigned)(cov * 255.0 + 0.5);
+                for (int ch = 0; ch < 4; ch++) {
+                    unsigned nb = row[xx * 4 + ch], ob = src[xx * 4 + ch];
+                    row[xx * 4 + ch] = (uint8_t)((nb * a + ob * (255u - a) + 127u) / 255u);
+                }
+            }
+        }
+        free(cl->save[i]);
+        cl->save[i] = NULL;
+    }
+    cl->nbox = 0;
+}
+
 void gfx_clip_push(GfxCanvas *c, double x, double y, double w, double h, double r) {
-    (void)r; /* rounded clip not available in the C core → rect scissor */
     BLRect rc = { x, y, w, h };
+    /* Depth advances on EVERY push, tracked or not, so pops stay paired. */
+    int slot = c->clip_top++;
+    int track = r >= 0.5 && w > 0.0 && h > 0.0 && clip_reserve(c, slot);
+
+    if (track) {
+        /* The clip rect is given in user space; the pixels to save are in
+           device space. Map through the final transform, and give up on the
+           rounded part if it is rotated or skewed (the shape would no longer
+           be an axis-aligned round-rect). */
+        BLMatrix2D m;
+        bl_context_get_final_transform(&c->ctx, &m);
+        if (fabs(m.m01) > 1e-9 || fabs(m.m10) > 1e-9) {
+            track = 0;
+        } else {
+            GfxClip *cl = &c->clip[slot];
+            double sx = fabs(m.m00), sy = fabs(m.m11);
+            double dx0 = m.m00 * x + m.m20, dx1 = m.m00 * (x + w) + m.m20;
+            double dy0 = m.m11 * y + m.m21, dy1 = m.m11 * (y + h) + m.m21;
+            cl->x = dx0 < dx1 ? dx0 : dx1;
+            cl->y = dy0 < dy1 ? dy0 : dy1;
+            cl->w = fabs(dx1 - dx0);
+            cl->h = fabs(dy1 - dy0);
+            cl->r = r * (sx < sy ? sx : sy);
+            cl->nbox = 0;
+            if (cl->w <= 0.0 || cl->h <= 0.0 || cl->r < 0.5) track = 0;
+            else clip_save_corners(c, cl);
+        }
+    }
+    /* A bailed-out entry must still read as "nothing saved" on pop. */
+    if (!track && slot < c->clip_cap) c->clip[slot].nbox = 0;
+
     bl_context_save(&c->ctx, NULL);
     bl_context_clip_to_rect_d(&c->ctx, &rc);
 }
 
 void gfx_clip_pop(GfxCanvas *c) {
+    if (c->clip_top > 0) {
+        int slot = --c->clip_top;
+        GfxClip *cl = slot < c->clip_cap ? &c->clip[slot] : NULL;
+        /* Restore BEFORE dropping the rect clip: the blend writes raw pixels,
+           so it is unaffected either way, but flushing while the clip is still
+           in force keeps any queued drawing inside the region it was clipped
+           to. */
+        if (cl && cl->nbox > 0) clip_restore_corners(c, cl);
+    }
     bl_context_restore(&c->ctx, NULL);
 }
 
@@ -771,6 +964,18 @@ unsigned gfx_hash(GfxCanvas *c) {
         }
     }
     return h;
+}
+
+unsigned gfx_pixel_at(GfxCanvas *c, int x, int y) {
+    BLImageData d;
+    if (x < 0 || y < 0 || x >= c->w || y >= c->h) return 0u;
+    gfx_flush(c);
+    bl_image_get_data(&c->img, &d);
+    const unsigned char *px = (const unsigned char *)d.pixel_data
+                            + (size_t)y * (size_t)d.stride + (size_t)x * 4;
+    /* stored BGRA (PRGB32, little-endian) → 0xAARRGGBB */
+    return ((unsigned)px[3] << 24) | ((unsigned)px[2] << 16)
+         | ((unsigned)px[1] << 8) | (unsigned)px[0];
 }
 
 int gfx_write_ppm(GfxCanvas *c, const char *path) {

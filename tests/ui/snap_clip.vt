@@ -1,0 +1,63 @@
+// Rounded clipping. blend2d has no clip-to-path in either its C or C++ API, so
+// gfx_clip_push emulates the corners; this asserts the emulation actually crops
+// them rather than degrading to the rectangular scissor it used to be.
+//
+// Probes, not a hash: a hash golden says a frame moved, and the tempting fix
+// for that is to regenerate it — which would sail straight past a regression
+// back to square corners. These name the property instead.
+
+import { Canvas } from "vyto/gfx";
+import { rgb } from "vyto/surface";
+
+const BG: int = 0xFFF0F2F6;
+const INK: int = 0xFF286EDC;
+
+fn probe(cv: Canvas, label: string, x: int, y: int, want: int) {
+    let got = cv.pixelAt(x, y);
+    let mark = "FAIL";
+    if (got == want) { mark = "ok"; }
+    print(mark + " " + label);
+}
+
+fn main() {
+    let cv = new Canvas(320, 220);
+    cv.clear(BG);
+
+    // a card whose content overflows it on every side
+    cv.clipPush(30.0, 30.0, 120.0, 90.0, 18.0);
+    cv.fillRect(10.0, 10.0, 200.0, 160.0, INK);
+    cv.clipPop();
+
+    // nested rounded clips: the inner one crops the outer's fill
+    cv.clipPush(180.0, 30.0, 110.0, 90.0, 14.0);
+    cv.fillRect(170.0, 20.0, 140.0, 120.0, rgb(220, 90, 60));
+    cv.clipPush(200.0, 45.0, 70.0, 60.0, 26.0);
+    cv.fillRect(170.0, 20.0, 140.0, 120.0, rgb(255, 220, 90));
+    cv.clipPop();
+    cv.clipPop();
+
+    // radius >= half the height: the corner blocks would overlap, so the whole
+    // region is saved instead
+    cv.clipPush(30.0, 150.0, 160.0, 40.0, 20.0);
+    cv.fillRect(20.0, 140.0, 200.0, 60.0, rgb(30, 160, 120));
+    cv.clipPop();
+
+    // radius 0 must stay exactly a rectangular scissor
+    cv.clipPush(210.0, 150.0, 80.0, 40.0, 0.0);
+    cv.fillRect(200.0, 140.0, 120.0, 60.0, rgb(120, 60, 200));
+    cv.clipPop();
+
+    cv.flush();
+
+    probe(cv, "card corner cropped",      32,  32, BG);
+    probe(cv, "card centre filled",       90,  75, INK);
+    probe(cv, "card edge mid-height",     32,  75, INK);
+    probe(cv, "card clipped above",       90,  25, BG);
+    probe(cv, "nested outer corner",     182,  32, BG);
+    probe(cv, "nested inner centre",     235,  75, rgb(255, 220, 90));
+    probe(cv, "nested inner corner",     202,  47, rgb(220, 90, 60));
+    probe(cv, "pill corner cropped",      32, 152, BG);
+    probe(cv, "pill centre",             110, 170, rgb(30, 160, 120));
+    probe(cv, "pill left at mid-height",  31, 170, rgb(30, 160, 120));
+    probe(cv, "radius 0 stays square",   212, 152, rgb(120, 60, 200));
+}
