@@ -32,12 +32,16 @@ export class GfxPainter extends Painter {
     canvas: Canvas;
     weight: int;      // current active weight (WEIGHT_REG/MED/BOLD)
     font_path: string; // kept for canvas re-creation on resize
-    font_size: float;
+    base_font_size: float;   // size the faces were loaded at (the scale's 1.0)
+    size_stack: float[];     // push_font/pop_font, saved (size, weight) pairs
+    weight_stack: int[];
 
     fn init(surf: Surface, fontPath: string, fontSize: float) {
         this.surf = surf;
         this.font_path = fontPath;
-        this.font_size = fontSize;
+        this.base_font_size = fontSize;
+        this.size_stack = [];
+        this.weight_stack = [];
         this.weight = WEIGHT_REG;
         this.make_canvas(surf.width(), surf.height());
     }
@@ -46,16 +50,16 @@ export class GfxPainter extends Painter {
         this.canvas = new Canvas(w, h);
         // regular weight always loads; medium/bold are best-effort — widgets
         // fall back to regular if a variant TTF isn't on disk.
-        this.canvas.loadFontWeight(this.font_path, this.font_size, WEIGHT_REG);
+        this.canvas.loadFontWeight(this.font_path, this.base_font_size, WEIGHT_REG);
         if (!this.canvas.loadFontWeight(derive_variant_path(this.font_path, "-Medium"),
-                                        this.font_size, WEIGHT_MED)) {
+                                        this.base_font_size, WEIGHT_MED)) {
             // reuse regular for medium so set_weight(med) never blanks text
-            this.canvas.loadFontWeight(this.font_path, this.font_size, WEIGHT_MED);
+            this.canvas.loadFontWeight(this.font_path, this.base_font_size, WEIGHT_MED);
         }
         if (!this.canvas.loadFontWeight(derive_variant_path(this.font_path, "-Bold"),
-                                        this.font_size, WEIGHT_BOLD)) {
+                                        this.base_font_size, WEIGHT_BOLD)) {
             this.canvas.loadFontWeight(derive_variant_path(this.font_path, "Bold"),
-                                       this.font_size, WEIGHT_BOLD);
+                                       this.base_font_size, WEIGHT_BOLD);
         }
         this.canvas.setWeight(this.weight);
     }
@@ -201,6 +205,28 @@ export class GfxPainter extends Painter {
         this.weight = w;
         this.canvas.setWeight(w);
     }
+
+    // Type scale. The canvas caches faces by path and sized fonts by
+    // (face, size), so pushing a size drawn earlier in the frame is a lookup
+    // rather than a font build — which is what makes it affordable to bracket
+    // every label with a push/pop.
+    override fn push_font(size: float, weight: int) {
+        this.size_stack.push(this.canvas.fontSize());
+        this.weight_stack.push(this.weight);
+        this.canvas.setFontSize(size);
+        this.set_weight(weight);
+    }
+
+    override fn pop_font() {
+        // An unbalanced pop would silently leave text at the wrong size for
+        // the rest of the frame; leaving the font alone makes it visible as
+        // "the size never came back" instead.
+        if (this.size_stack.len == 0) { return; }
+        this.canvas.setFontSize(this.size_stack.pop());
+        this.set_weight(this.weight_stack.pop());
+    }
+
+    override fn font_size(): float { return this.canvas.fontSize(); }
 
     // Surface.text takes a baseline origin; Canvas.text does too.
     override fn text(x: float, y: float, s: string, color: int) {

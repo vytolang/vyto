@@ -1,0 +1,102 @@
+// Type scale. A canvas used to own one font per weight, fixed at the size it
+// was loaded with, so three sizes was the hard ceiling and a type ramp was
+// impossible. These probes assert the ceiling is gone.
+//
+// Metrics are the real test rather than pixels: text_width and font_height
+// answer for whatever font is active, so if the size did not actually change
+// they come back identical, and a ramp of identical numbers is unmistakable.
+
+import { Canvas } from "vyto/gfx";
+import { rgb } from "vyto/surface";
+
+const FONT: string = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf";
+const BOLD: string = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf";
+const S: string = "Hamburgefonstiv";
+
+fn check(label: string, cond: bool) {
+    let mark = "FAIL";
+    if (cond) { mark = "ok"; }
+    print(mark + " " + label);
+}
+
+fn main() {
+    let cv = new Canvas(400, 300);
+    cv.clear(rgb(255, 255, 255));
+    if (!cv.loadFontWeight(FONT, 15.0, 0)) {
+        // A silent fallback would let every probe below agree on zero and pass.
+        print("FAIL cannot load " + FONT);
+        return;
+    }
+
+    check("loaded size is reported", cv.fontSize() == 15.0);
+
+    // widths must grow strictly with size — the ceiling test
+    let sizes: float[] = [11.0, 13.0, 15.0, 18.0, 22.0, 28.0];
+    let widths: float[] = [];
+    let heights: float[] = [];
+    for (let s in sizes) {
+        cv.setFontSize(s);
+        widths.push(cv.textWidth(S));
+        heights.push(cv.fontHeight());
+    }
+    let w_rising = true;
+    let h_rising = true;
+    for (let i in 1..6) {
+        if (widths[i] <= widths[i - 1]) { w_rising = false; }
+        if (heights[i] <= heights[i - 1]) { h_rising = false; }
+    }
+    check("text width rises across the ramp", w_rising);
+    check("font height rises across the ramp", h_rising);
+
+    // roughly proportional: 28px should be about 28/11 as wide as 11px
+    cv.setFontSize(11.0);
+    let w11 = cv.textWidth(S);
+    cv.setFontSize(28.0);
+    let w28 = cv.textWidth(S);
+    let ratio = w28 / w11;
+    check("width scales with size", ratio > 2.3 && ratio < 2.8);
+
+    // re-selecting a size must give the identical metric, not a rebuild that
+    // drifts — this is what the (face, size) cache is for
+    cv.setFontSize(15.0);
+    let first = cv.textWidth(S);
+    cv.setFontSize(22.0);
+    cv.setFontSize(15.0);
+    check("re-selecting a size is stable", cv.textWidth(S) == first);
+
+    // Size and weight are independent axes. Two faces from different files at
+    // one size exercises the face cache as well: bold must not disturb the
+    // regular entry, and the size must survive a weight change.
+    check("bold face loads", cv.loadFontWeight(BOLD, 15.0, 2));
+    cv.setFontSize(15.0);
+    cv.setWeight(0);
+    let reg15 = cv.textWidth(S);
+    cv.setWeight(2);
+    let bold15 = cv.textWidth(S);
+    check("bold is wider than regular at one size", bold15 > reg15);
+    check("weight change left the size alone", cv.fontSize() == 15.0);
+    cv.setWeight(0);
+    check("regular metric survived the bold load", cv.textWidth(S) == reg15);
+
+    // both axes at once: bold at a different size
+    cv.setWeight(2);
+    cv.setFontSize(28.0);
+    check("bold scales too", cv.textWidth(S) > bold15);
+    cv.setFontSize(15.0);
+    check("bold returns to its cached metric", cv.textWidth(S) == bold15);
+    cv.setWeight(0);
+
+    // size 0 restores the loaded size
+    cv.setWeight(0);
+    cv.setFontSize(22.0);
+    cv.setFontSize(0.0);
+    check("size 0 restores the loaded size", cv.fontSize() == 15.0);
+
+    // and it all still draws
+    cv.setFontSize(28.0);
+    cv.text(20.0, 60.0, S, rgb(20, 20, 30));
+    cv.setFontSize(11.0);
+    cv.text(20.0, 90.0, S, rgb(20, 20, 30));
+    cv.flush();
+    check("large text drew ink", cv.pixelAt(24, 52) != 0xFFFFFFFF);
+}

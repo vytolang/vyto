@@ -104,10 +104,18 @@ void gfx_stroke_path(GfxCanvas *c, const int *cmds, int nc,
                      const double *coords, int ncoord, double width, int color);
 
 /* text — load up to three weights (0=regular, 1=medium/semi, 2=bold), then
-   draw at a baseline origin with the active weight (defaults to 0). */
+   draw at a baseline origin with the active weight (defaults to 0).
+
+   A weight slot names a TYPEFACE, not a fixed size: gfx_set_font_size changes
+   the size the next draw uses, independently of the weight, so one canvas can
+   render a whole type scale. Faces are cached by path and sized fonts by
+   (face, size), so re-selecting a size already drawn costs a lookup, not a
+   font build. Passing size <= 0 restores the size the slots were loaded at. */
 int gfx_load_font(GfxCanvas *c, const char *ttf_path, double size);              /* regular slot, 1 ok */
 int gfx_load_font_weight(GfxCanvas *c, const char *ttf_path, double size, int weight); /* 1 ok, 0 fail */
 void gfx_set_font_weight(GfxCanvas *c, int weight); /* 0/1/2 */
+void gfx_set_font_size(GfxCanvas *c, double size);
+double gfx_get_font_size(GfxCanvas *c);
 void gfx_text(GfxCanvas *c, double x, double y, const char *utf8, int color);
 double gfx_text_width(GfxCanvas *c, const char *utf8);
 double gfx_font_ascent(GfxCanvas *c);

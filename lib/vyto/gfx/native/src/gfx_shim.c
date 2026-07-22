@@ -10,6 +10,22 @@
 
 #define GFX_WEIGHTS 3   /* 0=regular, 1=medium/semi, 2=bold */
 
+/* A parsed TTF, cached by path. Parsing is the expensive half of font setup,
+   so faces are shared by every size drawn from the same file. */
+typedef struct {
+    char *path;
+    BLFontFaceCore face;
+} GfxFace;
+
+/* A face realised at one size — cheap next to a face, but not free, so these
+   are cached too. Keyed by (face, size), which together with the weight slot's
+   face is the (path, size, weight) key. */
+typedef struct {
+    int face;
+    double size;
+    BLFontCore font;
+} GfxFont;
+
 /* One entry per gfx_clip_push. blend2d clips only to rectangles, so a rounded
    clip is emulated: the pixels the corners will spill into are copied out on
    push and blended back on pop (see gfx_clip_push). At most four corner blocks
@@ -26,9 +42,15 @@ typedef struct {
 struct GfxCanvas {
     BLImageCore img;
     BLContextCore ctx;
-    BLFontFaceCore face[GFX_WEIGHTS];
-    BLFontCore font[GFX_WEIGHTS];
-    int has_font[GFX_WEIGHTS];
+    /* Faces are cached by path and fonts by (face, size) — see the note above
+       gfx_load_font_weight. A weight slot names a face; the size is dynamic. */
+    GfxFace *faces;
+    int nfaces, faces_cap;
+    GfxFont *fonts;
+    int nfonts, fonts_cap;
+    int face_of[GFX_WEIGHTS];   /* weight slot → face index, -1 when unset */
+    double base_size;           /* size the slots were loaded at */
+    double cur_size;            /* size text is drawn at right now */
     int active_weight;
     int w, h;
     /* Scratch layer for shadow rasterisation, kept across calls: creating a
@@ -63,6 +85,7 @@ GfxCanvas *gfx_canvas_new(int w, int h) {
     c->w = w;
     c->h = h;
     c->active_weight = 0;
+    for (int i = 0; i < GFX_WEIGHTS; i++) c->face_of[i] = -1;
     if (bl_image_init_as(&c->img, w, h, BL_FORMAT_PRGB32) != BL_SUCCESS) { free(c); return NULL; }
     if (bl_context_init_as(&c->ctx, &c->img, NULL) != BL_SUCCESS) {
         bl_image_destroy(&c->img);
@@ -73,13 +96,16 @@ GfxCanvas *gfx_canvas_new(int w, int h) {
 }
 
 static void destroy_fonts(GfxCanvas *c) {
-    for (int i = 0; i < GFX_WEIGHTS; i++) {
-        if (c->has_font[i]) {
-            bl_font_destroy(&c->font[i]);
-            bl_font_face_destroy(&c->face[i]);
-            c->has_font[i] = 0;
-        }
+    for (int i = 0; i < c->nfonts; i++) bl_font_destroy(&c->fonts[i].font);
+    for (int i = 0; i < c->nfaces; i++) {
+        bl_font_face_destroy(&c->faces[i].face);
+        free(c->faces[i].path);
     }
+    free(c->fonts);
+    free(c->faces);
+    c->fonts = NULL; c->nfonts = 0; c->fonts_cap = 0;
+    c->faces = NULL; c->nfaces = 0; c->faces_cap = 0;
+    for (int i = 0; i < GFX_WEIGHTS; i++) c->face_of[i] = -1;
 }
 
 static void free_shadow_layer(GfxCanvas *c) {
@@ -852,43 +878,117 @@ void gfx_stroke_path(GfxCanvas *c, const int *cmds, int nc,
     bl_path_destroy(&p);
 }
 
+/* ---- fonts --------------------------------------------------------------- *
+ * A weight slot used to own one BLFont fixed at the size it was loaded with,
+ * so a canvas could draw exactly three sizes — one per weight — and a type
+ * scale was impossible. Now a slot names a FACE, and the size is a separate
+ * piece of state, so any (weight, size) pair can be drawn at any moment.
+ *
+ * Two caches, because the two halves have very different costs: parsing a TTF
+ * into a BLFontFace is the expensive part and is shared across every size from
+ * that file, while realising a face at a size is cheap but not free. Neither
+ * is evicted; a UI draws from a handful of (face, size) pairs and they are all
+ * live every frame, so eviction would only ever throw away something about to
+ * be asked for again. */
+
+static int face_index(GfxCanvas *c, const char *path) {
+    for (int i = 0; i < c->nfaces; i++)
+        if (strcmp(c->faces[i].path, path) == 0) return i;
+
+    if (c->nfaces == c->faces_cap) {
+        int cap = c->faces_cap ? c->faces_cap * 2 : 4;
+        GfxFace *n = (GfxFace *)realloc(c->faces, (size_t)cap * sizeof *n);
+        if (!n) return -1;
+        c->faces = n;
+        c->faces_cap = cap;
+    }
+    GfxFace *f = &c->faces[c->nfaces];
+    bl_font_face_init(&f->face);
+    if (bl_font_face_create_from_file(&f->face, path, 0) != BL_SUCCESS) {
+        bl_font_face_destroy(&f->face);
+        return -1;
+    }
+    size_t len = strlen(path) + 1;
+    f->path = (char *)malloc(len);
+    if (!f->path) { bl_font_face_destroy(&f->face); return -1; }
+    memcpy(f->path, path, len);
+    return c->nfaces++;
+}
+
+/* Returns a pointer INTO the cache array, so it is invalidated by the next
+   font_for that grows it. Every caller uses it and drops it within the same
+   call, which is what makes that safe — do not hold one across another lookup.
+   (Growing by realloc is itself fine: a BLFontCore is a 16-byte union of an
+   impl pointer and inline data, with nothing pointing back at it.) */
+static BLFontCore *font_for(GfxCanvas *c, int face, double size) {
+    if (face < 0 || face >= c->nfaces || size <= 0.0) return NULL;
+    for (int i = 0; i < c->nfonts; i++)
+        if (c->fonts[i].face == face && c->fonts[i].size == size)
+            return &c->fonts[i].font;
+
+    if (c->nfonts == c->fonts_cap) {
+        int cap = c->fonts_cap ? c->fonts_cap * 2 : 8;
+        GfxFont *n = (GfxFont *)realloc(c->fonts, (size_t)cap * sizeof *n);
+        if (!n) return NULL;
+        c->fonts = n;
+        c->fonts_cap = cap;
+    }
+    GfxFont *g = &c->fonts[c->nfonts];
+    bl_font_init(&g->font);
+    if (bl_font_create_from_face(&g->font, &c->faces[face].face, (float)size) != BL_SUCCESS) {
+        bl_font_destroy(&g->font);
+        return NULL;
+    }
+    g->face = face;
+    g->size = size;
+    return &c->fonts[c->nfonts++].font;
+}
+
 int gfx_load_font(GfxCanvas *c, const char *ttf_path, double size) {
     return gfx_load_font_weight(c, ttf_path, size, 0);
 }
 
 int gfx_load_font_weight(GfxCanvas *c, const char *ttf_path, double size, int weight) {
     if (weight < 0 || weight >= GFX_WEIGHTS) weight = 0;
-    /* release a previous font in this slot */
-    if (c->has_font[weight]) {
-        bl_font_destroy(&c->font[weight]);
-        bl_font_face_destroy(&c->face[weight]);
-        c->has_font[weight] = 0;
-    }
-    bl_font_face_init(&c->face[weight]);
-    if (bl_font_face_create_from_file(&c->face[weight], ttf_path, 0) != BL_SUCCESS) {
-        bl_font_face_destroy(&c->face[weight]);
-        return 0;
-    }
-    bl_font_init(&c->font[weight]);
-    if (bl_font_create_from_face(&c->font[weight], &c->face[weight], (float)size) != BL_SUCCESS) {
-        bl_font_destroy(&c->font[weight]);
-        bl_font_face_destroy(&c->face[weight]);
-        return 0;
-    }
-    c->has_font[weight] = 1;
-    if (!c->has_font[c->active_weight]) c->active_weight = weight;
+    int fi = face_index(c, ttf_path);
+    if (fi < 0) return 0;
+    /* Realise it now rather than at first draw, so a face that parses but
+       cannot be sized still reports failure from the load call — callers pick
+       their fallback TTF off this return value. */
+    if (!font_for(c, fi, size)) return 0;
+
+    c->face_of[weight] = fi;
+    c->base_size = size;
+    if (c->cur_size <= 0.0) c->cur_size = size;
+    if (c->face_of[c->active_weight] < 0) c->active_weight = weight;
     return 1;
 }
 
 void gfx_set_font_weight(GfxCanvas *c, int weight) {
     if (weight < 0 || weight >= GFX_WEIGHTS) weight = 0;
-    if (c->has_font[weight]) c->active_weight = weight;
-    else if (c->has_font[0]) c->active_weight = 0;
+    if (c->face_of[weight] >= 0) c->active_weight = weight;
+    else if (c->face_of[0] >= 0) c->active_weight = 0;
+}
+
+void gfx_set_font_size(GfxCanvas *c, double size) {
+    /* <= 0 restores the loaded size, so callers can reset without tracking it */
+    c->cur_size = size > 0.0 ? size : c->base_size;
+}
+
+double gfx_get_font_size(GfxCanvas *c) {
+    return c->cur_size > 0.0 ? c->cur_size : c->base_size;
 }
 
 static BLFontCore *active_font(GfxCanvas *c) {
-    if (c->has_font[c->active_weight]) return &c->font[c->active_weight];
-    for (int i = 0; i < GFX_WEIGHTS; i++) if (c->has_font[i]) return &c->font[i];
+    double size = c->cur_size > 0.0 ? c->cur_size : c->base_size;
+    BLFontCore *f = font_for(c, c->face_of[c->active_weight], size);
+    if (f) return f;
+    /* the active weight has no face (or would not realise): any loaded one
+       beats blank text, which is what the weight slots have always done */
+    for (int i = 0; i < GFX_WEIGHTS; i++) {
+        f = font_for(c, c->face_of[i], size);
+        if (f) return f;
+    }
     return NULL;
 }
 
