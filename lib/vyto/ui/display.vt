@@ -27,7 +27,7 @@ export class Text extends Widget {
     align: int;       // ALIGN_LEFT / ALIGN_CENTER / ALIGN_RIGHT
     color: int;       // -1 = theme.ink
     cached_lines: string[];
-    cached_w: int;
+    cached_w: float;
     cached_count: int;
     cached_text: string; // content the cache was computed from
     // Text selection (drag / double-click / long-press) + copy. Selection
@@ -82,36 +82,36 @@ export class Text extends Widget {
     fn offset_at(x: int, y: int): int {
         if (this.cached_count == 0 || this.win == null) { return 0; }
         let surf = this.win.surf;
-        let lh = surf.font_height();
-        let adv = lh + 2;
+        let lh = surf.font_height() as float;   // raw Surface metric is int
+        let adv = lh + 2.0;
         let li = 0;
-        if (adv > 0) { li = (y - this.bounds.y) / adv; }
+        if (adv > 0.0) { li = ((y as float - this.bounds.y) / adv) as int; }
         if (li < 0) { li = 0; }
         if (li >= this.cached_count) { li = this.cached_count - 1; }
         let ln = this.cached_lines[li];
-        let tw = surf.text_width(ln);
+        let tw = surf.text_width(ln) as float;
         let ox = this.bounds.x;
-        if (this.align == ALIGN_CENTER) { ox = this.bounds.x + (this.bounds.w - tw) / 2; }
-        else if (this.align == ALIGN_RIGHT) { ox = this.bounds.x + this.bounds.w - tw; }
-        let col = col_at_x(surf, ln, x - ox);
+        if (this.align == ALIGN_CENTER) { ox = this.bounds.center_x(tw); }
+        else if (this.align == ALIGN_RIGHT) { ox = this.bounds.right() - tw; }
+        let col = col_at_x(surf, ln, (x as float - ox) as int);
         let base = 0;
         for (let i in 0..li) { base += this.cached_lines[i].len + 1; }
         return base + col;
     }
 
-    fn show_toolbar(px: int) {
+    fn show_toolbar(px: float) {
         if (this.win == null || this.sel.empty()) { return; }
         let li = this.line_of_offset(this.sel.lo());
-        let lh = this.win.surf.font_height();
-        let ytop = this.bounds.y + li * (lh + 2);
+        let lh = this.win.surf.font_height() as float;
+        let ytop = this.bounds.y + (li as float) * (lh + 2.0);
         open_selection_toolbar(this, this.sel, px, ytop, this.selectionActions);
     }
 
-    fn wrap_lines(s: Painter, max_w: int) {
+    fn wrap_lines(s: Painter, max_w: float) {
         this.cached_lines = [];
         this.cached_w = max_w;
         this.cached_text = this.text;
-        if (max_w <= 0) {
+        if (max_w <= 0.0) {
             this.cached_count = 0;
             return;
         }
@@ -157,15 +157,15 @@ export class Text extends Widget {
               this.cached_text == this.text)) {
             this.wrap_lines(s, max_w);
         }
-        let used_w = 0;
+        let used_w = 0.0;
         for (let ln in this.cached_lines) {
             let lw = s.text_width(ln);
             if (lw > used_w) { used_w = lw; }
         }
         if (used_w > max_w) { used_w = max_w; }
         let lh = s.font_height();
-        let total_h = this.cached_count * lh;
-        if (this.cached_count > 1) { total_h += (this.cached_count - 1) * 2; }
+        let total_h = (this.cached_count as float) * lh;
+        if (this.cached_count > 1) { total_h += (this.cached_count - 1) as float * 2.0; }
         if (total_h < lh) { total_h = lh; }
         return bc.constrain(Size(used_w, total_h));
     }
@@ -188,9 +188,9 @@ export class Text extends Widget {
             let tw = s.text_width(ln);
             let x = this.bounds.x;
             if (this.align == ALIGN_CENTER) {
-                x = this.bounds.x + (this.bounds.w - tw) / 2;
+                x = this.bounds.center_x(tw);
             } else if (this.align == ALIGN_RIGHT) {
-                x = this.bounds.x + this.bounds.w - tw;
+                x = this.bounds.right() - tw;
             }
             if (sel_on) {
                 // this visual line spans display offsets [base, base+len)
@@ -234,7 +234,7 @@ export class Text extends Widget {
 
     override fn on_drag_end(x: int, y: int): bool {
         if (!this.selectable) { return false; }
-        if (!this.sel.empty()) { this.show_toolbar(x); }
+        if (!this.sel.empty()) { this.show_toolbar(x as float); }
         return true;
     }
 
@@ -242,7 +242,7 @@ export class Text extends Widget {
         if (!this.selectable) { return false; }
         select_word(this.sel, this.offset_at(x, y));
         this.invalidate();
-        this.show_toolbar(x);
+        this.show_toolbar(x as float);
         return true;
     }
 
@@ -250,7 +250,7 @@ export class Text extends Widget {
         if (!this.selectable) { return false; }
         select_word(this.sel, this.offset_at(x, y));
         this.invalidate();
-        this.show_toolbar(x);
+        this.show_toolbar(x as float);
         return true;
     }
 
@@ -299,11 +299,11 @@ fn split_words(s: string): string[] {
 // On the gfx tier a shadow/rounded corner is nice; here we use a plain frame.
 export class Card extends Widget {
     title: string;
-    pad: int;
+    pad: float;
     bg: int;
     border: int;
 
-    fn init(pad: int, bg: int, border: int, title: string, child: Widget) {
+    fn init(pad: float, bg: int, border: int, title: string, child: Widget) {
         super.init();
         this.pad = pad;
         this.bg = bg;
@@ -317,7 +317,7 @@ export class Card extends Widget {
         return this.children[0];
     }
 
-    fn title_h(s: Painter): int {
+    fn title_h(s: Painter): float {
         if (this.title.len == 0) { return 0; }
         return s.font_height() + 8;
     }
@@ -377,7 +377,7 @@ export class Card extends Widget {
             s.set_weight(WEIGHT_REG);
             // hairline divider under the title
             s.line(this.bounds.x + this.pad, this.bounds.y + th_h - 1,
-                   this.bounds.x + this.bounds.w - this.pad,
+                   this.bounds.right() - this.pad,
                    this.bounds.y + th_h - 1, th.divider);
         }
     }
@@ -406,7 +406,7 @@ export class Badge extends Widget {
 
     fn badge_size(s: Painter): Size {
         let tw = s.text_width(this.label);
-        let pad = 6;
+        let pad = 6.0;
         return Size(tw + 2 * pad, s.font_height() + 2 * pad);
     }
 
@@ -428,7 +428,7 @@ export class Badge extends Widget {
         let kid = this.child();
         if (kid != null) { kid.draw(s, th); }
         let bs = this.badge_size(s);
-        let bx = this.bounds.x + this.bounds.w - bs.w;
+        let bx = this.bounds.right() - bs.w;
         let by = this.bounds.y;
         let br = Rect(bx, by, bs.w, bs.h);
         let bg = this.bg;
@@ -464,38 +464,38 @@ export class Chip extends Widget {
         if (this.onDelete != null) { this.onDelete(this); }
     }
 
-    fn chip_h(s: Painter): int { return s.font_height() + 10; }
+    fn chip_h(s: Painter): float { return s.font_height() + 10.0; }
 
-    fn delete_w(s: Painter): int {
-        if (!this.deletable) { return 0; }
-        return s.text_width("x") + 12;
+    fn delete_w(s: Painter): float {
+        if (!this.deletable) { return 0.0; }
+        return s.text_width("x") + 12.0;
     }
 
     override fn measure(s: Painter, th: Theme): Size {
         let tw = s.text_width(this.label);
         let dw = this.delete_w(s);
-        let pad = 10;
-        return Size(tw + dw + 2 * pad, this.chip_h(s));
+        let pad = 10.0;
+        return Size(tw + dw + 2.0 * pad, this.chip_h(s));
     }
 
     override fn draw(s: Painter, th: Theme) {
         let bg = this.bg;
         if (bg < 0) { bg = th.secondary; }
         if (this.hovered) { bg = mix(bg, th.on_surface, 0.06); }
-        let radius = this.chip_h(s) / 2;    // a true pill
+        let radius = this.chip_h(s) / 2.0;  // a true pill
         s.fill_round(this.bounds, radius, bg);
         if (this.focused) {
             this.win.skin.focus.paint(s, th, this.bounds, radius);
         }
         let dw = this.delete_w(s);
-        let pad = 10;
+        let pad = 10.0;
         let tr = Rect(this.bounds.x + pad, this.bounds.y,
                       this.bounds.w - pad - dw, this.bounds.h);
         s.set_weight(WEIGHT_BOLD);
         s.text_in(tr, 4, this.label, th.on_secondary);
         s.set_weight(WEIGHT_REG);
         if (this.deletable) {
-            let xr = Rect(this.bounds.x + this.bounds.w - dw, this.bounds.y,
+            let xr = Rect(this.bounds.right() - dw, this.bounds.y,
                           dw, this.bounds.h);
             s.text_in(xr, 4, "x", th.on_surface_muted);
         }
@@ -503,10 +503,9 @@ export class Chip extends Widget {
 
     override fn on_click(x: int, y: int): bool {
         if (this.deletable) {
-            let dw = 0;
             // approximate: if click is in the right portion, delete
-            let xr = this.bounds.x + this.bounds.w - 24;
-            if (x >= xr) { this.fire_delete(); return true; }
+            let xr = this.bounds.right() - 24.0;
+            if (x as float >= xr) { this.fire_delete(); return true; }
         }
         return false;
     }
@@ -557,18 +556,18 @@ const ICON_MUSIC: int = 21;
 
 export class Icon extends Widget {
     icon: int;
-    size: int;
+    size: float;
     color: int;      // -1 = th.on_surface
     bg: int;          // -1 = transparent glyph-only; >=0 = filled rounded-square behind it ("app icon" mode)
-    bg_radius: int;
+    bg_radius: float;
 
-    fn init(icon: int, size: int) {
+    fn init(icon: int, size: float) {
         super.init();
         this.icon = icon;
         this.size = size;
         this.color = -1;
         this.bg = -1;
-        this.bg_radius = size / 4;
+        this.bg_radius = size / 4.0;
     }
 
     override fn measure(s: Painter, th: Theme): Size {
@@ -576,29 +575,30 @@ export class Icon extends Widget {
     }
 
     // unit-square (0..1) -> pixel coordinates within this.bounds
-    fn fx(u: float): int { return this.bounds.x + (u * (this.bounds.w as float)) as int; }
-    fn fy(u: float): int { return this.bounds.y + (u * (this.bounds.h as float)) as int; }
-    // float versions for sub-pixel vector Paths (curved glyphs)
-    fn fxf(u: float): float { return (this.bounds.x as float) + u * (this.bounds.w as float); }
-    fn fyf(u: float): float { return (this.bounds.y as float) + u * (this.bounds.h as float); }
+    fn fx(u: float): float { return this.bounds.x + u * this.bounds.w; }
+    fn fy(u: float): float { return this.bounds.y + u * this.bounds.h; }
+    // fxf/fyf were the sub-pixel variants back when fx/fy truncated to whole
+    // pixels; the whole paint stack is sub-pixel now, so they are aliases.
+    fn fxf(u: float): float { return this.fx(u); }
+    fn fyf(u: float): float { return this.fy(u); }
 
     // build a closed polygon Path from parallel pixel-point arrays — lets the
     // straight-edged glyphs render through the vector path pipeline (crisp on
     // the rich tier, flattened to a polygon on the lean tier) instead of the
     // old s.polygon call.
-    fn poly_path(xs: i32[], ys: i32[]): Path {
+    fn poly_path(xs: float[], ys: float[]): Path {
         let p = new Path();
         if (xs.len == 0) { return p; }
-        p.moveTo(xs[0] as float, ys[0] as float);
-        for (let i in 1..xs.len) { p.lineTo(xs[i] as float, ys[i] as float); }
+        p.moveTo(xs[0], ys[0]);
+        for (let i in 1..xs.len) { p.lineTo(xs[i], ys[i]); }
         p.close();
         return p;
     }
 
     // ~2px stroke: a real anti-aliased stroke on the rich tier (line_w),
     // three offset 1px lines on the lean tier (the base fallback).
-    fn thick_line(s: Painter, x0: int, y0: int, x1: int, y1: int, color: int) {
-        s.line_w(x0, y0, x1, y1, 2, color);
+    fn thick_line(s: Painter, x0: float, y0: float, x1: float, y1: float, color: int) {
+        s.line_w(x0, y0, x1, y1, 2.0, color);
     }
 
     override fn draw(s: Painter, th: Theme) {
@@ -631,92 +631,92 @@ export class Icon extends Widget {
             this.thick_line(s, this.fx(0.5), this.fy(0.22), this.fx(0.5), this.fy(0.78), color);
             this.thick_line(s, this.fx(0.22), this.fy(0.5), this.fx(0.78), this.fy(0.5), color);
         } else if (this.icon == ICON_SEARCH) {
-            s.stroke_circle(this.fx(0.42), this.fy(0.42), (0.20 * sz) as int, 2, color);
+            s.stroke_circle(this.fx(0.42), this.fy(0.42), 0.20 * sz, 2, color);
             this.thick_line(s, this.fx(0.58), this.fy(0.58), this.fx(0.80), this.fy(0.80), color);
         } else if (this.icon == ICON_GEAR) {
             let cx = this.fx(0.5); let cy = this.fy(0.5);
-            s.stroke_circle(cx, cy, (0.28 * sz) as int, 2, color);
-            s.circle(cx, cy, (0.10 * sz) as int, color);
+            s.stroke_circle(cx, cy, 0.28 * sz, 2, color);
+            s.circle(cx, cy, 0.10 * sz, color);
             let i = 0;
             while (i < 6) {
                 let a = (i as float) * (PI / 3.0);
-                let x0 = cx + ((0.28 * sz) * cos(a)) as int;
-                let y0 = cy + ((0.28 * sz) * sin(a)) as int;
-                let x1 = cx + ((0.42 * sz) * cos(a)) as int;
-                let y1 = cy + ((0.42 * sz) * sin(a)) as int;
+                let x0 = cx + 0.28 * sz * cos(a);
+                let y0 = cy + 0.28 * sz * sin(a);
+                let x1 = cx + 0.42 * sz * cos(a);
+                let y1 = cy + 0.42 * sz * sin(a);
                 this.thick_line(s, x0, y0, x1, y1, color);
                 i += 1;
             }
         } else if (this.icon == ICON_HOME) {
             // roof and walls close in width (real overhang, not an arrow shaft)
-            let xs: i32[] = [this.fx(0.5) as i32, this.fx(0.82) as i32, this.fx(0.18) as i32];
-            let ys: i32[] = [this.fy(0.15) as i32, this.fy(0.46) as i32, this.fy(0.46) as i32];
+            let xs: float[] = [this.fx(0.5), this.fx(0.82), this.fx(0.18)];
+            let ys: float[] = [this.fy(0.15), this.fy(0.46), this.fy(0.46)];
             s.fill_path(this.poly_path(xs, ys), color);
             s.fill(Rect(this.fx(0.22), this.fy(0.44), this.fx(0.78) - this.fx(0.22), this.fy(0.85) - this.fy(0.44)), color);
         } else if (this.icon == ICON_BELL) {
             // clapper centered on the body's bottom edge so it reads as one
             // connected shape, not two disjoint blobs
             s.fill_round(Rect(this.fx(0.26), this.fy(0.18), this.fx(0.74) - this.fx(0.26), this.fy(0.64) - this.fy(0.18)),
-                        (0.20 * sz) as int, color);
-            s.circle(this.fx(0.5), this.fy(0.64), (0.06 * sz) as int, color);
+                        0.20 * sz, color);
+            s.circle(this.fx(0.5), this.fy(0.64), 0.06 * sz, color);
         } else if (this.icon == ICON_PERSON) {
             // body top overlaps the head's bottom edge — no gap between them
-            s.circle(this.fx(0.5), this.fy(0.30), (0.16 * sz) as int, color);
+            s.circle(this.fx(0.5), this.fy(0.30), 0.16 * sz, color);
             s.fill_round(Rect(this.fx(0.26), this.fy(0.40), this.fx(0.74) - this.fx(0.26), this.fy(0.82) - this.fy(0.40)),
-                        (0.16 * sz) as int, color);
+                        0.16 * sz, color);
         } else if (this.icon == ICON_WIFI) {
             let cx = this.fx(0.5); let cy = this.fy(0.65);
-            s.stroke_arc(cx, cy, (0.12 * sz) as int, (0.12 * sz) as int, 200, 140, 2, color);
-            s.stroke_arc(cx, cy, (0.24 * sz) as int, (0.24 * sz) as int, 200, 140, 2, color);
-            s.stroke_arc(cx, cy, (0.36 * sz) as int, (0.36 * sz) as int, 200, 140, 2, color);
-            s.circle(cx, cy, (0.04 * sz) as int, color);
+            s.stroke_arc(cx, cy, 0.12 * sz, 0.12 * sz, 200, 140, 2, color);
+            s.stroke_arc(cx, cy, 0.24 * sz, 0.24 * sz, 200, 140, 2, color);
+            s.stroke_arc(cx, cy, 0.36 * sz, 0.36 * sz, 200, 140, 2, color);
+            s.circle(cx, cy, 0.04 * sz, color);
         } else if (this.icon == ICON_SIGNAL) {
             let bw = 0.15 * sz;
-            s.fill(Rect(this.fx(0.15), this.fy(0.55), bw as int, this.fy(0.85) - this.fy(0.55)), color);
-            s.fill(Rect(this.fx(0.38), this.fy(0.40), bw as int, this.fy(0.85) - this.fy(0.40)), color);
-            s.fill(Rect(this.fx(0.61), this.fy(0.25), bw as int, this.fy(0.85) - this.fy(0.25)), color);
-            s.fill(Rect(this.fx(0.84) - (bw as int), this.fy(0.15), bw as int, this.fy(0.85) - this.fy(0.15)), color);
+            s.fill(Rect(this.fx(0.15), this.fy(0.55), bw, this.fy(0.85) - this.fy(0.55)), color);
+            s.fill(Rect(this.fx(0.38), this.fy(0.40), bw, this.fy(0.85) - this.fy(0.40)), color);
+            s.fill(Rect(this.fx(0.61), this.fy(0.25), bw, this.fy(0.85) - this.fy(0.25)), color);
+            s.fill(Rect(this.fx(0.84) - bw, this.fy(0.15), bw, this.fy(0.85) - this.fy(0.15)), color);
         } else if (this.icon == ICON_BATTERY) {
             s.stroke_round(Rect(this.fx(0.10), this.fy(0.30), this.fx(0.82) - this.fx(0.10), this.fy(0.70) - this.fy(0.30)),
-                          (0.04 * sz) as int, 2, color);
+                          0.04 * sz, 2, color);
             s.fill(Rect(this.fx(0.84), this.fy(0.40), this.fx(0.90) - this.fx(0.84), this.fy(0.60) - this.fy(0.40)), color);
             s.fill(Rect(this.fx(0.15), this.fy(0.36), this.fx(0.55) - this.fx(0.15), this.fy(0.64) - this.fy(0.36)), color);
         } else if (this.icon == ICON_CAMERA) {
             s.fill_round(Rect(this.fx(0.15), this.fy(0.35), this.fx(0.85) - this.fx(0.15), this.fy(0.80) - this.fy(0.35)),
-                        (0.06 * sz) as int, color);
+                        0.06 * sz, color);
             s.fill_round(Rect(this.fx(0.36), this.fy(0.22), this.fx(0.64) - this.fx(0.36), this.fy(0.38) - this.fy(0.22)),
-                        (0.02 * sz) as int, color);
-            s.stroke_circle(this.fx(0.5), this.fy(0.58), (0.14 * sz) as int, 2, color);
+                        0.02 * sz, color);
+            s.stroke_circle(this.fx(0.5), this.fy(0.58), 0.14 * sz, 2, color);
         } else if (this.icon == ICON_MAIL) {
             s.stroke_round(Rect(this.fx(0.12), this.fy(0.25), this.fx(0.88) - this.fx(0.12), this.fy(0.75) - this.fy(0.25)),
-                          (0.04 * sz) as int, 2, color);
+                          0.04 * sz, 2, color);
             this.thick_line(s, this.fx(0.12), this.fy(0.25), this.fx(0.5), this.fy(0.52), color);
             this.thick_line(s, this.fx(0.5), this.fy(0.52), this.fx(0.88), this.fy(0.25), color);
         } else if (this.icon == ICON_MESSAGE) {
             s.fill_round(Rect(this.fx(0.12), this.fy(0.20), this.fx(0.88) - this.fx(0.12), this.fy(0.68) - this.fy(0.20)),
-                        (0.14 * sz) as int, color);
-            let xs: i32[] = [this.fx(0.30) as i32, this.fx(0.42) as i32, this.fx(0.24) as i32];
-            let ys: i32[] = [this.fy(0.65) as i32, this.fy(0.65) as i32, this.fy(0.85) as i32];
+                        0.14 * sz, color);
+            let xs: float[] = [this.fx(0.30), this.fx(0.42), this.fx(0.24)];
+            let ys: float[] = [this.fy(0.65), this.fy(0.65), this.fy(0.85)];
             s.fill_path(this.poly_path(xs, ys), color);
         } else if (this.icon == ICON_PHOTO) {
             s.stroke_round(Rect(this.fx(0.10), this.fy(0.18), this.fx(0.90) - this.fx(0.10), this.fy(0.82) - this.fy(0.18)),
-                          (0.06 * sz) as int, 2, color);
-            s.circle(this.fx(0.32), this.fy(0.35), (0.08 * sz) as int, color);
-            let xs: i32[] = [this.fx(0.15) as i32, this.fx(0.40) as i32, this.fx(0.60) as i32, this.fx(0.75) as i32, this.fx(0.88) as i32];
-            let ys: i32[] = [this.fy(0.75) as i32, this.fy(0.45) as i32, this.fy(0.65) as i32, this.fy(0.50) as i32, this.fy(0.75) as i32];
+                          0.06 * sz, 2, color);
+            s.circle(this.fx(0.32), this.fy(0.35), 0.08 * sz, color);
+            let xs: float[] = [this.fx(0.15), this.fx(0.40), this.fx(0.60), this.fx(0.75), this.fx(0.88)];
+            let ys: float[] = [this.fy(0.75), this.fy(0.45), this.fy(0.65), this.fy(0.50), this.fy(0.75)];
             s.fill_path(this.poly_path(xs, ys), color);
         } else if (this.icon == ICON_STAR) {
             let cx = this.fx(0.5); let cy = this.fy(0.5);
             let outer = 0.42 * sz; let inner = 0.18 * sz;
-            let xs: i32[] = [];
-            let ys: i32[] = [];
+            let xs: float[] = [];
+            let ys: float[] = [];
             let i = 0;
             while (i < 10) {
                 let r = outer;
                 if (i % 2 == 1) { r = inner; }
                 let a = (-PI / 2.0) + (i as float) * (PI / 5.0);
-                xs.push((cx as float + r * cos(a)) as i32);
-                ys.push((cy as float + r * sin(a)) as i32);
+                xs.push(cx as float + r * cos(a));
+                ys.push(cy as float + r * sin(a));
                 i += 1;
             }
             s.fill_path(this.poly_path(xs, ys), color);
@@ -748,10 +748,10 @@ export class Icon extends Widget {
             pp.close();
             s.fill_path(pp, color);
         } else if (this.icon == ICON_MUSIC) {
-            s.circle(this.fx(0.28), this.fy(0.72), (0.10 * sz) as int, color);
+            s.circle(this.fx(0.28), this.fy(0.72), 0.10 * sz, color);
             this.thick_line(s, this.fx(0.36), this.fy(0.72), this.fx(0.36), this.fy(0.22), color);
-            let xs: i32[] = [this.fx(0.36) as i32, this.fx(0.62) as i32, this.fx(0.36) as i32];
-            let ys: i32[] = [this.fy(0.22) as i32, this.fy(0.30) as i32, this.fy(0.38) as i32];
+            let xs: float[] = [this.fx(0.36), this.fx(0.62), this.fx(0.36)];
+            let ys: float[] = [this.fy(0.22), this.fy(0.30), this.fy(0.38)];
             s.fill_path(this.poly_path(xs, ys), color);
         }
     }
@@ -769,12 +769,12 @@ export class Avatar extends Widget {
     initials: string;
     bg: int;             // -1 = th.primary
     color: int;          // -1 = th.on_primary
-    size: int;
+    size: float;
     imagePath: string;   // "" = initials mode
     handle: rawptr;       // lazy-loaded image handle, image mode only
     load_failed: bool;    // tried and failed: don't refetch every draw
 
-    fn init(initials: string, size: int) {
+    fn init(initials: string, size: float) {
         super.init();
         this.initials = initials;
         this.size = size;
@@ -788,7 +788,7 @@ export class Avatar extends Widget {
     }
 
     override fn draw(s: Painter, th: Theme) {
-        let r = this.size / 2;
+        let r = this.size / 2.0;
         if (this.imagePath.len > 0) {
             if (this.handle == null && !this.load_failed) {
                 // load once; a failure must never retry per frame — a URL
@@ -833,17 +833,17 @@ export class Avatar extends Widget {
 // rotation is continuous (a ping-pong Tween value would wobble). On the lean
 // tier stroke_arc degrades to a full ring (still a visible "busy" mark).
 export class Spinner extends Widget {
-    size: int;
+    size: float;
     color: int;    // -1 = th.primary
-    width: int;    // stroke width
+    width: float;  // stroke width
     phase: float;  // tween progress (drives repaint; angle comes from the clock)
     tween: Tween;
 
-    fn init(size: int) {
+    fn init(size: float) {
         super.init();
         this.size = size;
         this.color = -1;
-        this.width = 3;
+        this.width = 3.0;
         this.phase = 0.0;
     }
 
@@ -859,14 +859,15 @@ export class Spinner extends Widget {
         }
         let c = this.color;
         if (c < 0) { c = th.primary; }
-        let cx = this.bounds.x + this.bounds.w / 2;
-        let cy = this.bounds.y + this.bounds.h / 2;
-        let r = this.size / 2 - this.width;
-        if (r < 1) { r = 1; }
+        let cx = this.bounds.cx();
+        let cy = this.bounds.cy();
+        let r = this.size / 2.0 - this.width;
+        if (r < 1.0) { r = 1.0; }
         let ms = 0;
         if (this.win != null) { ms = this.win.surf.now_ms(); }
-        let start = (ms / 3) % 360;
-        s.stroke_arc(cx, cy, r, r, start, 270, this.width, c);
+        // ms is an integer clock; the arc start angle is geometric
+        let start = ((ms / 3) % 360) as float;
+        s.stroke_arc(cx, cy, r, r, start, 270.0, this.width, c);
     }
 
     override fn drop_handlers() {

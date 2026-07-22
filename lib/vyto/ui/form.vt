@@ -82,10 +82,11 @@ export class Button extends Widget {
 
     override fn draw(s: Painter, th: Theme) {
         // subtle hover-lift: raise the chrome up to 3px while hovered. Hit
-        // bounds are unchanged — this is purely visual.
-        let dy = (this.lift * 3.0) as int;
+        // bounds are unchanged — this is purely visual. The offset is
+        // sub-pixel: it used to truncate to an int and visibly step 0→1→2→3.
+        let dy = this.lift * 3.0;
         let r = this.bounds;
-        if (dy > 0) { r = Rect(r.x, r.y - dy, r.w, r.h); }
+        if (dy > 0.0) { r = r.offset(0.0, -dy); }
         this.win.skin.button.paint(s, th, r, this.label,
                                    this.hovered, this.pressed, this.focused, this.win.skin);
     }
@@ -124,22 +125,22 @@ export class TextField extends Widget {
     text: string;
     placeholder: string;
     caret: int;                 // byte index into text (UTF-8 sequence start)
-    scroll_x: int;              // horizontal pan so the caret stays visible
+    scroll_x: float;            // horizontal pan so the caret stays visible
     onSubmit: fn(string);
     // Selection: anchor is the fixed end, caret tracks the moving end (focus).
     sel: SelectionModel;
     selectionActions: SelectionAction[]; // app-supplied extra toolbar buttons
     // horizontal padding of the text area — subclasses (SearchField) widen these
     // to inset leading/trailing icons. Default 8 on both sides.
-    pad_l: int;
-    pad_r: int;
+    pad_l: float;
+    pad_r: float;
 
     fn init(placeholder: string) {
         super.init();
         this.text = "";
         this.placeholder = placeholder;
         this.caret = 0;
-        this.scroll_x = 0;
+        this.scroll_x = 0.0;
         this.focusable = true;
         this.pad_l = 8;
         this.pad_r = 8;
@@ -152,14 +153,15 @@ export class TextField extends Widget {
     fn set_text(t: string) {
         this.text = t;
         this.caret = t.len;
-        this.scroll_x = 0;
+        this.scroll_x = 0.0;
         this.sel.clear();
     }
 
     // Map an absolute x to a byte offset in text (metrics via win.surf).
     fn offset_at(x: int): int {
         if (this.win == null) { return this.caret; }
-        return col_at_x(this.win.surf, this.text, x - this.bounds.x - this.pad_l + this.scroll_x);
+        return col_at_x(this.win.surf, this.text,
+                        (x as float - this.bounds.x - this.pad_l + this.scroll_x) as int);
     }
 
     // Move the caret; extend keeps the selection anchor (shift+move / drag),
@@ -188,7 +190,7 @@ export class TextField extends Widget {
         return true;
     }
 
-    fn show_toolbar(px: int) {
+    fn show_toolbar(px: float) {
         if (this.win == null || this.sel.empty()) { return; }
         open_selection_toolbar(this, this.sel, px, this.bounds.y, this.selectionActions);
     }
@@ -218,7 +220,7 @@ export class TextField extends Widget {
         // clip: long content must not paint past the rounded box
         let inner = Rect(this.bounds.x + this.pad_l, this.bounds.y,
                          this.bounds.w - this.pad_l - this.pad_r, this.bounds.h);
-        s.clip_push(inner, 0);
+        s.clip_push(inner, 0.0);
         // selection highlight sits behind the glyphs
         if (!this.sel.empty()) {
             let a = this.sel.lo();
@@ -226,7 +228,7 @@ export class TextField extends Widget {
             if (b > this.text.len) { b = this.text.len; }
             let ax = s.text_width(this.text.slice(0, a));
             let selw = s.text_width(this.text.slice(0, b)) - ax;
-            let sy = this.bounds.y + (this.bounds.h - s.font_height()) / 2;
+            let sy = this.bounds.center_y(s.font_height());
             s.fill(Rect(this.bounds.x + this.pad_l + ax - this.scroll_x, sy,
                         selw, s.font_height()), th.selection);
         }
@@ -239,7 +241,7 @@ export class TextField extends Widget {
         s.clip_pop();
         if (this.focused) {
             let cx = this.bounds.x + this.pad_l + caret_off - this.scroll_x;
-            let cy = this.bounds.y + (this.bounds.h - s.font_height()) / 2;
+            let cy = this.bounds.center_y(s.font_height());
             s.fill(Rect(cx, cy, 1, s.font_height()), th.primary);
         }
     }
@@ -265,7 +267,7 @@ export class TextField extends Widget {
     }
 
     override fn on_drag_end(x: int, y: int): bool {
-        if (!this.sel.empty()) { this.show_toolbar(x); }
+        if (!this.sel.empty()) { this.show_toolbar(x as float); }
         return true;
     }
 
@@ -273,7 +275,7 @@ export class TextField extends Widget {
         select_word(this.sel, this.offset_at(x));
         this.caret = this.sel.hi();
         this.invalidate();
-        this.show_toolbar(x);
+        this.show_toolbar(x as float);
         return true;
     }
 
@@ -407,14 +409,14 @@ export class SearchField extends TextField {
 
     override fn draw(s: Painter, th: Theme) {
         this.draw_field(s, th);
-        let cy = this.bounds.y + this.bounds.h / 2;
+        let cy = this.bounds.cy();
         // leading magnifier
         let gx = this.bounds.x + 13;
         s.stroke_circle(gx, cy - 1, 5, 2, th.on_surface_muted);
         s.line_w(gx + 4, cy + 3, gx + 9, cy + 8, 2, th.on_surface_muted);
         // trailing clear ✕ (only when there's text)
         if (this.text.len > 0) {
-            let xx = this.bounds.x + this.bounds.w - 14;
+            let xx = this.bounds.right() - 14;
             s.line_w(xx - 4, cy - 4, xx + 4, cy + 4, 2, th.on_surface_muted);
             s.line_w(xx + 4, cy - 4, xx - 4, cy + 4, 2, th.on_surface_muted);
         }
@@ -422,7 +424,7 @@ export class SearchField extends TextField {
 
     override fn on_click(x: int, y: int): bool {
         // click in the trailing pad clears the query
-        if (this.text.len > 0 && x >= this.bounds.x + this.bounds.w - this.pad_r) {
+        if (this.text.len > 0 && x as float >= this.bounds.right() - this.pad_r) {
             this.text = "";
             this.caret = 0;
             this.sel.clear();
@@ -481,8 +483,8 @@ export class Checkbox extends Widget {
     }
 
     override fn draw(s: Painter, th: Theme) {
-        let box = 16;
-        let by = this.bounds.y + (this.bounds.h - box) / 2;
+        let box = 16.0;
+        let by = this.bounds.center_y(box);
         let br = Rect(this.bounds.x, by, box, box);
         this.win.skin.toggle.paint_checkbox(s, th, br, this.checked, this.hovered, this.focused, this.win.skin);
         let tr = Rect(this.bounds.x + box + 6, this.bounds.y,
@@ -510,7 +512,7 @@ export class Checkbox extends Widget {
     }
 }
 
-const ROW_H: int = 26;
+const ROW_H: float = 26.0;
 
 export class ListBox extends Widget {
     items: string[];
@@ -538,7 +540,8 @@ export class ListBox extends Widget {
     }
 
     fn visible_rows(): int {
-        let n = (this.bounds.h - 2) / ROW_H;
+        // a row count, so the divide lands back in index space
+        let n = ((this.bounds.h - 2.0) / ROW_H) as int;
         if (n < 1) { return 1; }
         return n;
     }
@@ -583,7 +586,7 @@ export class ListBox extends Widget {
         for (let i in 0..vis) {
             let idx = this.scroll + i;
             if (idx >= this.items.len) { break; }
-            let r = Rect(b.x + 1, b.y + 1 + i * ROW_H, b.w - 2, ROW_H);
+            let r = Rect(b.x + 1, b.y + 1 + (i as float) * ROW_H, b.w - 2, ROW_H);
             if (idx == this.selected) {
                 // selection pill: a rounded secondary fill inset from the row
                 let pr = Rect(r.x + 2, r.y + 2, r.w - 4, r.h - 4);
@@ -601,7 +604,7 @@ export class ListBox extends Widget {
     }
 
     override fn on_click(x: int, y: int): bool {
-        let row = (y - this.bounds.y - 1) / ROW_H;
+        let row = ((y as float - this.bounds.y - 1.0) / ROW_H) as int;
         let idx = this.scroll + row;
         if (idx < 0 || idx >= this.items.len) { return false; }
         // toggle the checked state and fire the callback on every click
@@ -645,7 +648,7 @@ export class ListBox extends Widget {
 
 // -------------------------------------------------------------- TextArea
 
-const TA_PAD: int = 6;
+const TA_PAD: float = 6.0;
 
 // Multi-line text editor with word wrapping. Lines are held one-per-entry;
 // the caret is a (row, col) byte position. Wrapping is recomputed in draw()
@@ -656,7 +659,7 @@ export class TextArea extends Widget {
     caret_row: int;
     caret_col: int;
     top: int;        // first visible visual row
-    line_h: int;     // cached in draw()
+    line_h: float;   // cached in draw()
     view_rows: int;  // cached in draw()
     onChange: fn();
     wrap_map: int[];   // visual_row -> logical_row
@@ -664,7 +667,7 @@ export class TextArea extends Widget {
     wrap_count: int;   // total visual rows
     rev: int;          // bumped on every edit; keys the wrap cache
     wrapped_rev: int;  // rev the current wrap was computed at
-    wrap_w: int;       // width the current wrap was computed at
+    wrap_w: float;     // width the current wrap was computed at
     // Selection: offsets index the joined text() (logical lines + "\n"); the
     // (caret_row, caret_col) pair is the moving end (== sel.focus).
     sel: SelectionModel;
@@ -682,7 +685,7 @@ export class TextArea extends Widget {
         this.wrap_count = 1;
         this.rev = 1;
         this.wrapped_rev = 0;
-        this.wrap_w = -1;
+        this.wrap_w = -1.0;
         this.sel = new SelectionModel(this);
         let self = this;
         this.sel.text_fn = () => { return self.text(); };
@@ -740,7 +743,7 @@ export class TextArea extends Widget {
     fn offset_at(x: int, y: int): int {
         if (this.win == null || this.wrap_count == 0) { return this.caret_offset(); }
         let surf = this.win.surf;
-        let vrow = this.top + (y - this.bounds.y - TA_PAD) / this.line_h;
+        let vrow = this.top + ((y as float - this.bounds.y - TA_PAD) / this.line_h) as int;
         if (vrow < 0) { vrow = 0; }
         if (vrow >= this.wrap_count) { vrow = this.wrap_count - 1; }
         let li = this.wrap_map[vrow];
@@ -751,11 +754,11 @@ export class TextArea extends Widget {
         let nv = vrow + 1;
         if (nv < this.wrap_count && this.wrap_map[nv] == li) { end = this.wrap_col[nv]; }
         let piece = line.slice(cstart, end);
-        let local = col_at_x(surf, piece, x - (this.bounds.x + TA_PAD));
+        let local = col_at_x(surf, piece, (x as float - (this.bounds.x + TA_PAD)) as int);
         return this.ta_offset(li, cstart + local);
     }
 
-    fn show_toolbar(px: int) {
+    fn show_toolbar(px: float) {
         if (this.win == null || this.sel.empty()) { return; }
         open_selection_toolbar(this, this.sel, px, this.bounds.y, this.selectionActions);
     }
@@ -804,10 +807,10 @@ export class TextArea extends Widget {
     // Compute word-wrap for all logical lines at the given width.
     // Fills wrap_map/wrap_col: for each visual row, which logical row it
     // belongs to and the starting character column.
-    fn compute_wrap(s: Painter, max_w: int) {
+    fn compute_wrap(s: Painter, max_w: float) {
         this.wrap_map = [];
         this.wrap_col = [];
-        if (max_w <= 0) { max_w = 1; }
+        if (max_w <= 0.0) { max_w = 1.0; }
         for (let li in 0..this.lines.len) {
             let line = this.lines[li];
             if (line.len == 0) {
@@ -890,10 +893,10 @@ export class TextArea extends Widget {
     }
 
     override fn measure(s: Painter, th: Theme): Size {
-        let lh = s.font_height() + 2;
+        let lh = s.font_height() + 2.0;
         let rows = this.lines.len;
         if (rows < 4) { rows = 4; }
-        return Size(360, lh * rows + 2 * TA_PAD);
+        return Size(360.0, lh * rows as float + 2.0 * TA_PAD);
     }
 
     override fn on_key(k: int, ch: string): bool {
@@ -1079,7 +1082,7 @@ export class TextArea extends Widget {
     }
 
     override fn on_drag_end(x: int, y: int): bool {
-        if (!this.sel.empty()) { this.show_toolbar(x); }
+        if (!this.sel.empty()) { this.show_toolbar(x as float); }
         return true;
     }
 
@@ -1089,7 +1092,7 @@ export class TextArea extends Widget {
         this.sel.focus = this.sel.hi();
         this.sel.active = true;
         this.invalidate();
-        this.show_toolbar(x);
+        this.show_toolbar(x as float);
         return true;
     }
 
@@ -1098,10 +1101,11 @@ export class TextArea extends Widget {
     }
 
     override fn draw(s: Painter, th: Theme) {
-        this.line_h = s.font_height() + 2;
-        let inner_h = this.bounds.h - 2 * TA_PAD;
-        let inner_w = this.bounds.w - 2 * TA_PAD;
-        this.view_rows = inner_h / this.line_h;
+        this.line_h = s.font_height() + 2.0;
+        let inner_h = this.bounds.h - 2.0 * TA_PAD;
+        let inner_w = this.bounds.w - 2.0 * TA_PAD;
+        // a visible-row count, so the divide resolves back to an index
+        this.view_rows = (inner_h / this.line_h) as int;
         if (this.view_rows < 1) { this.view_rows = 1; }
 
         // word-wrap at the current width — cached; recomputed only when an
@@ -1148,7 +1152,7 @@ export class TextArea extends Widget {
                 if (end > col && line[end - 1] == 32) { end -= 1; }
             }
             let piece = line.slice(col, end);
-            let ty = this.bounds.y + TA_PAD + i * this.line_h + asc;
+            let ty = this.bounds.y + TA_PAD + (i as float) * this.line_h + asc;
             // selection highlight: intersect [sel_lo,sel_hi) with this row's
             // display-offset span [row_start, row_start + (end-col))
             if (sel_on) {
@@ -1161,7 +1165,7 @@ export class TextArea extends Widget {
                 if (b > a) {
                     let px0 = ox + s.text_width(piece.slice(0, a));
                     let selw = s.text_width(piece.slice(0, b)) - s.text_width(piece.slice(0, a));
-                    s.fill(Rect(px0, this.bounds.y + TA_PAD + i * this.line_h,
+                    s.fill(Rect(px0, this.bounds.y + TA_PAD + (i as float) * this.line_h,
                                 selw, this.line_h), th.selection);
                 }
             }
@@ -1175,7 +1179,7 @@ export class TextArea extends Widget {
             let line = this.lines[li];
             let caret_piece = line.slice(col, this.caret_col);
             let cx = ox + s.text_width(caret_piece);
-            let cy = this.bounds.y + TA_PAD + (caret_vrow - this.top) * this.line_h;
+            let cy = this.bounds.y + TA_PAD + (caret_vrow - this.top) as float * this.line_h;
             s.fill(Rect(cx, cy, 1, this.line_h), th.primary);
         }
         s.clip_pop();
@@ -1213,8 +1217,8 @@ export class RadioButton extends Widget {
     }
 
     override fn draw(s: Painter, th: Theme) {
-        let box = 16;
-        let by = this.bounds.y + (this.bounds.h - box) / 2;
+        let box = 16.0;
+        let by = this.bounds.center_y(box);
         let br = Rect(this.bounds.x, by, box, box);
         this.win.skin.toggle.paint_radio(s, th, br, this.selected, this.hovered, this.focused, this.win.skin);
         let tr = Rect(this.bounds.x + box + 6, this.bounds.y,
@@ -1273,15 +1277,15 @@ export class RadioGroup extends Widget {
     }
 
     override fn measure(s: Painter, th: Theme): Size {
-        let w = 0;
-        let h = 0;
+        let w = 0.0;
+        let h = 0.0;
         let n = this.children.len;
         for (let c in this.children) {
             let cs = c.measure(s, th);
             if (cs.w > w) { w = cs.w; }
             h += cs.h;
         }
-        if (n > 1) { h += th.spacing * (n - 1); }
+        if (n > 1) { h += th.spacing * (n - 1) as float; }
         return Size(w, h);
     }
 
@@ -1323,20 +1327,20 @@ export class Switch extends Widget {
         if (this.onToggle != null) { this.onToggle(this.on); }
     }
 
-    fn sw_w(s: Painter): int { return s.font_height() * 2 + 8; }
-    fn sw_h(s: Painter): int { return s.font_height() + 4; }
+    fn sw_w(s: Painter): float { return s.font_height() * 2.0 + 8.0; }
+    fn sw_h(s: Painter): float { return s.font_height() + 4.0; }
 
     override fn measure(s: Painter, th: Theme): Size {
         let w = this.sw_w(s);
         let h = this.sw_h(s);
-        return Size(w + 20, h);
+        return Size(w + 20.0, h);
     }
 
     override fn draw(s: Painter, th: Theme) {
         let sw = this.sw_w(s);
         let sh = this.sw_h(s);
         let bx = this.bounds.x;
-        let by = this.bounds.y + (this.bounds.h - sh) / 2;
+        let by = this.bounds.center_y(sh);
         let br = Rect(bx, by, sw, sh);
         this.win.skin.toggle.paint_switch(s, th, br, this.on, this.hovered, this.pressed,
                                           this.focused, this.win.skin);
@@ -1372,14 +1376,14 @@ export class SegmentedControl extends Widget {
     values: string[];   // logical value per segment; empty => falls back to labels
     selected: int;
     onSelect: fn(int);
-    cached_seg_w: int;
+    cached_seg_w: float;
 
     fn init(labels: string[]) {
         super.init();
         this.labels = labels;
         this.values = [];
         this.selected = 0;
-        this.cached_seg_w = 0;
+        this.cached_seg_w = 0.0;
         this.focusable = true;
     }
 
@@ -1397,10 +1401,10 @@ export class SegmentedControl extends Widget {
         return this;
     }
 
-    fn seg_w(s: Painter): int {
-        let w = 0;
+    fn seg_w(s: Painter): float {
+        let w = 0.0;
         for (let l in this.labels) {
-            let lw = s.text_width(l) + 20;
+            let lw = s.text_width(l) + 20.0;
             if (lw > w) { w = lw; }
         }
         return w;
@@ -1409,7 +1413,7 @@ export class SegmentedControl extends Widget {
     override fn measure(s: Painter, th: Theme): Size {
         let sw = this.seg_w(s);
         this.cached_seg_w = sw;
-        return Size(sw * this.labels.len, s.font_height() + 12);
+        return Size(sw * this.labels.len as float, s.font_height() + 12.0);
     }
 
     override fn arrange(s: Painter, th: Theme, r: Rect) {
@@ -1426,15 +1430,17 @@ export class SegmentedControl extends Widget {
         let radius = th.radius_md;
         // backdrop pill: surface_sunken track the segments sit in
         this.win.skin.track.paint_track(s, th, this.bounds, radius, th.surface_sunken);
-        // Segments split the full control width evenly (integer math avoids
-        // rounding gaps between adjacent cells). The selected segment is a
-        // rounded primary pill; the others are transparent.
-        let seg_in = 2;
+        // Segments split the full control width evenly. Each cell's right
+        // edge is computed the same way as the next cell's left edge, so they
+        // share an exact boundary and no seam can open between them — this
+        // used to rely on integer truncation for the same guarantee, at the
+        // cost of unevenly-wide segments.
+        let seg_in = 2.0;
         for (let i in 0..n) {
-            let sx = x0 + i * w / n;
-            let sxn = x0 + (i + 1) * w / n;
+            let sx = x0 + (i as float) * w / n as float;
+            let sxn = x0 + (i + 1) as float * w / n as float;
             let sr = Rect(sx + seg_in, this.bounds.y + seg_in,
-                          sxn - sx - 2 * seg_in, sh - 2 * seg_in);
+                          sxn - sx - 2.0 * seg_in, sh - 2.0 * seg_in);
             if (i == this.selected) {
                 let top = th.primary;
                 if (this.pressed) { top = th.primary_press; }
@@ -1456,7 +1462,7 @@ export class SegmentedControl extends Widget {
     // hit-test a segment index from absolute x — used for per-segment hover.
     fn hit_test_seg(i: int): bool {
         let n = this.labels.len;
-        if (n == 0 || this.bounds.w <= 0) { return false; }
+        if (n == 0 || this.bounds.w <= 0.0) { return false; }
         return this.hovered;
     }
 
@@ -1468,10 +1474,11 @@ export class SegmentedControl extends Widget {
 
     override fn on_click(x: int, y: int): bool {
         let n = this.labels.len;
-        if (n == 0 || this.bounds.w <= 0) { return false; }
-        let rel = x - this.bounds.x;
-        if (rel < 0 || rel >= this.bounds.w) { return false; }
-        let idx = rel * n / this.bounds.w;
+        if (n == 0 || this.bounds.w <= 0.0) { return false; }
+        let rel = x as float - this.bounds.x;
+        if (rel < 0.0 || rel >= this.bounds.w) { return false; }
+        // resolves to a segment index
+        let idx = (rel * n as float / this.bounds.w) as int;
         if (idx < 0 || idx >= n) { return false; }
         this.pick(idx);
         return true;
@@ -1503,7 +1510,7 @@ export class Stepper extends Widget {
     min_val: int;
     max_val: int;
     onChange: fn(int);
-    cached_btn_w: int;
+    cached_btn_w: float;
 
     fn init(value: int, min_val: int, max_val: int) {
         super.init();
@@ -1524,14 +1531,14 @@ export class Stepper extends Widget {
         }
     }
 
-    fn btn_w(s: Painter): int { return s.text_width("-") + 20; }
+    fn btn_w(s: Painter): float { return s.text_width("-") + 20.0; }
 
     override fn measure(s: Painter, th: Theme): Size {
         let bw = this.btn_w(s);
         this.cached_btn_w = bw;
-        let bh = s.font_height() + 12;
-        let vw = s.text_width("99999") + 16;
-        return Size(bw * 2 + vw + 8, bh);
+        let bh = s.font_height() + 12.0;
+        let vw = s.text_width("99999") + 16.0;
+        return Size(bw * 2.0 + vw + 8.0, bh);
     }
 
     override fn arrange(s: Painter, th: Theme, r: Rect) {
@@ -1541,14 +1548,14 @@ export class Stepper extends Widget {
 
     override fn draw(s: Painter, th: Theme) {
         this.cached_btn_w = this.btn_w(s);
-        let bh = s.font_height() + 12;
-        let by = this.bounds.y + (this.bounds.h - bh) / 2;
+        let bh = s.font_height() + 12.0;
+        let by = this.bounds.center_y(bh);
         let radius = th.radius_md;
         // Three equal columns fill the control width: [ - | value | + ].
         let x0 = this.bounds.x;
         let w = this.bounds.w;
-        let t1 = x0 + w / 3;
-        let t2 = x0 + 2 * w / 3;
+        let t1 = x0 + w / 3.0;
+        let t2 = x0 + 2.0 * w / 3.0;
         // shared surface: a single rounded panel with the value centered. No
         // focus ring here (unlike other FieldChrome consumers) — Stepper's
         // ring is drawn last, after its text, matching its original order.
@@ -1573,13 +1580,13 @@ export class Stepper extends Widget {
     override fn on_click(x: int, y: int): bool {
         let bh = this.bounds.h;
         let by = this.bounds.y;
-        if (y < by || y >= by + bh) { return false; }
-        let rel = x - this.bounds.x;
+        if (y as float < by || y as float >= by + bh) { return false; }
+        let rel = x as float - this.bounds.x;
         let w = this.bounds.w;
-        if (rel < 0 || rel >= w) { return false; }
+        if (rel < 0.0 || rel >= w) { return false; }
         // left third decrements, right third increments (matches draw()).
-        if (rel < w / 3) { this.step(-1); return true; }
-        if (rel >= 2 * w / 3) { this.step(1); return true; }
+        if (rel < w / 3.0) { this.step(-1); return true; }
+        if (rel >= 2.0 * w / 3.0) { this.step(1); return true; }
         return false;
     }
 
@@ -1638,7 +1645,7 @@ export class Dropdown extends Widget {
     }
 
     override fn measure(s: Painter, th: Theme): Size {
-        let w = 40;
+        let w = 40.0;
         for (let it in this.labels) {
             let iw = s.text_width(it) + 40;
             if (iw > w) { w = iw; }
@@ -1659,9 +1666,9 @@ export class Dropdown extends Widget {
         s.text_in(this.bounds, 8, label, th.on_surface);
         s.set_weight(WEIGHT_REG);
         // chevron-down glyph (a real stroke, not the letter "v")
-        let cw = 8;
-        let cx = this.bounds.x + this.bounds.w - 12 - cw / 2;
-        let cy = this.bounds.y + this.bounds.h / 2 - 1;
+        let cw = 8.0;
+        let cx = this.bounds.right() - 12 - cw / 2;
+        let cy = this.bounds.cy() - 1;
         s.line_w(cx - cw / 2, cy - 2, cx, cy + 2, 2, th.on_surface_muted);
         s.line_w(cx, cy + 2, cx + cw / 2, cy - 2, 2, th.on_surface_muted);
     }
@@ -1685,25 +1692,25 @@ export class Dropdown extends Widget {
 class DropdownPopup extends Widget {
     dd: Dropdown;
     sel: int;
-    row_h: int;
+    row_h: float;
 
     fn init(dd: Dropdown) {
         super.init();
         this.dd = dd;
         this.sel = dd.selected;
-        this.row_h = 20;
+        this.row_h = 20.0;
     }
 
     override fn place(s: Painter, th: Theme) {
-        this.row_h = s.font_height() + 8;
-        let w = 40;
+        this.row_h = s.font_height() + 8.0;
+        let w = 40.0;
         for (let it in this.dd.labels) {
-            let iw = s.text_width(it) + 16;
+            let iw = s.text_width(it) + 16.0;
             if (iw > w) { w = iw; }
         }
-        let h = this.dd.labels.len * this.row_h + 2;
+        let h = (this.dd.labels.len as float) * this.row_h + 2.0;
         let x = this.dd.bounds.x;
-        let y = this.dd.bounds.y + this.dd.bounds.h;
+        let y = this.dd.bounds.bottom();
         if (x + w > s.width()) { x = s.width() - w; }
         if (y + h > s.height()) { y = this.dd.bounds.y - h; }
         this.bounds = Rect(x, y, w, h);
@@ -1725,7 +1732,7 @@ class DropdownPopup extends Widget {
         // elevated dropdown menu: a soft shadow trails the panel
         this.win.skin.panel.paint(s, th, this.bounds, radius, th.surface_raised, th.border, 2);
         for (let i in 0..this.dd.labels.len) {
-            let r = Rect(this.bounds.x + 2, this.bounds.y + 1 + i * this.row_h,
+            let r = Rect(this.bounds.x + 2.0, this.bounds.y + 1.0 + (i as float) * this.row_h,
                          this.bounds.w - 4, this.row_h);
             if (i == this.sel) {
                 s.fill_round(r, th.radius_sm, th.selection);
@@ -1746,7 +1753,7 @@ class DropdownPopup extends Widget {
     }
 
     override fn on_click(x: int, y: int): bool {
-        let row = (y - this.bounds.y - 1) / this.row_h;
+        let row = ((y as float - this.bounds.y - 1.0) / this.row_h) as int;
         if (row >= 0 && row < this.dd.labels.len) {
             this.sel = row;
             this.choose();
@@ -1811,16 +1818,16 @@ export class ProgressBar extends Widget {
                     pb.sweep_t = t;
                 });
             }
-            let band_w = this.bounds.w / 3;
-            if (band_w < 8) { band_w = 8; }
+            let band_w = this.bounds.w / 3.0;
+            if (band_w < 8.0) { band_w = 8.0; }
             let travel = this.bounds.w - band_w;
-            let fx = this.bounds.x + (this.sweep_t * (travel as float)) as int;
+            let fx = this.bounds.x + this.sweep_t * travel;
             let fr = Rect(fx, this.bounds.y, band_w, this.bounds.h);
             this.win.skin.track.paint_fill(s, th, fr, radius, f, th.primary_700);
             return;
         }
-        let fw = (this.bounds.w as float * this.progress) as int;
-        if (fw > 2) {
+        let fw = this.bounds.w * this.progress;
+        if (fw > 2.0) {
             // gradient fill for depth (rich tier); the leading edge stays rounded
             let fr = Rect(this.bounds.x, this.bounds.y, fw, this.bounds.h);
             this.win.skin.track.paint_fill(s, th, fr, radius, f, th.primary_700);
@@ -1863,45 +1870,45 @@ export class Slider extends Widget {
 
     // horizontal travel available to the thumb centre (track minus thumb radius
     // on each end).
-    fn thumb_r(): int {
-        let r = this.bounds.h / 2;
-        if (r < 6) { r = 6; }
+    fn thumb_r(): float {
+        let r = this.bounds.h / 2.0;
+        if (r < 6.0) { r = 6.0; }
         return r;
     }
-    fn travel(): int {
-        let t = this.bounds.w - 2 * this.thumb_r();
-        if (t < 1) { t = 1; }
+    fn travel(): float {
+        let t = this.bounds.w - 2.0 * this.thumb_r();
+        if (t < 1.0) { t = 1.0; }
         return t;
     }
 
     override fn measure(s: Painter, th: Theme): Size {
-        return Size(160, s.font_height() + 8);
+        return Size(160.0, s.font_height() + 8.0);
     }
 
     // map an absolute x to a value along the track.
     fn value_at(x: int): float {
-        let rel = x - this.bounds.x - this.thumb_r();
-        return this.clamp01(rel as float / this.travel() as float);
+        let rel = x as float - this.bounds.x - this.thumb_r();
+        return this.clamp01(rel / this.travel());
     }
 
     override fn draw(s: Painter, th: Theme) {
         let r = this.thumb_r();
-        let cy = this.bounds.y + this.bounds.h / 2;
+        let cy = this.bounds.cy();
         // groove: a thin rounded track centred vertically
-        let gh = 4;
-        let groove = Rect(this.bounds.x + r, cy - gh / 2, this.travel(), gh);
-        this.win.skin.track.paint_track(s, th, groove, gh / 2, th.surface_sunken);
+        let gh = 4.0;
+        let groove = Rect(this.bounds.x + r, cy - gh / 2.0, this.travel(), gh);
+        this.win.skin.track.paint_track(s, th, groove, gh / 2.0, th.surface_sunken);
         // filled portion up to the thumb
-        let fx = (this.value * this.travel() as float) as int;
-        if (fx > 0) {
+        let fx = this.value * this.travel();
+        if (fx > 0.0) {
             let fr = Rect(groove.x, groove.y, fx, gh);
-            this.win.skin.track.paint_fill(s, th, fr, gh / 2, th.primary, th.primary_700);
+            this.win.skin.track.paint_fill(s, th, fr, gh / 2.0, th.primary, th.primary_700);
         }
         // thumb
         let tr = r;
-        if (this.dragging) { tr = r + 1; }
+        if (this.dragging) { tr = r + 1.0; }
         let cx = this.bounds.x + r + fx;
-        let tb = Rect(cx - tr, cy - tr, 2 * tr, 2 * tr);
+        let tb = Rect(cx - tr, cy - tr, 2.0 * tr, 2.0 * tr);
         let ink = th.primary;
         if (this.focused || this.dragging) { ink = th.primary_700; }
         s.fill_round(tb, tr, ink);
@@ -1920,7 +1927,7 @@ export class Slider extends Widget {
 
     override fn on_drag(dx: int, dy: int): bool {
         // move proportionally to the horizontal delta; Shift = fine control.
-        let span = this.travel() as float;
+        let span = this.travel();
         let d = dx as float / span;
         if ((this.mods() & MOD_SHIFT) != 0) { d = d / 4.0; }
         this.set_value(this.value + d);

@@ -150,19 +150,22 @@ fn smooth_path(xs: float[], ys: float[]): Path {
 // `base` is the baseline y. On the rich tier each column is an AA vertical ramp;
 // on the lean tier gradient_v degrades to a flat mid-color — same graceful
 // contract as everything else.
-fn fill_gradient_under(s: Painter, xs: i32[], ys: i32[], base: int, top: int, bot: int) {
+fn fill_gradient_under(s: Painter, xs: float[], ys: float[], base: float, top: int, bot: int) {
     let n = xs.len;
     if (n < 2) { return; }
     for (let i in 0..(n - 1)) {
         let x0 = xs[i]; let y0 = ys[i];
         let x1 = xs[i + 1]; let y1 = ys[i + 1];
         if (x1 <= x0) { continue; }
-        let span = (x1 - x0) as float;
-        for (let x in x0..(x1 + 1)) {
-            let t = ((x - x0) as float) / span;
-            let y = y0 + (((y1 - y0) as float) * t) as int;
+        let span = x1 - x0;
+        // the scanline walks whole device columns, so the loop bounds snap
+        for (let x in (x0 as int)..((x1 as int) + 1)) {
+            let t = (x as float - x0) / span;
+            // this synthesises the fill one device column at a time, so the
+            // column origin stays integral; only the height is geometric.
+            let y = y0 + (y1 - y0) * t;
             let h = base - y;
-            if (h > 0) { s.gradient_v(Rect(x, y, 1, h), 0, top, bot); }
+            if (h > 0.0) { s.gradient_v(Rect(x as float, y, 1.0, h), 0.0, top, bot); }
         }
     }
 }
@@ -187,8 +190,8 @@ export class ChartBase extends Widget {
     started: bool;
     tween: Tween;
     hover_idx: int;
-    pref_w: int;
-    pref_h: int;
+    pref_w: float;
+    pref_h: float;
     last_plot: Rect;     // plot area from the most recent draw (for hit-testing)
     last_sc: AxisScale;
     // x-viewport: the visible sub-window of the full x extent as a [0,1]
@@ -198,11 +201,11 @@ export class ChartBase extends Widget {
     view_hi: float;
     interactive_on: bool;
     decimate_on: bool;
-    cursor_px: int;      // last cursor x (for zoom-to-cursor; no coords on wheel)
+    cursor_px: float;    // last cursor x (for zoom-to-cursor; no coords on wheel)
     brush_mode: bool;    // drag selects a range to zoom into (vs. drag = pan)
     brushing: bool;
-    brush_a: int;        // brush anchor / current x in pixels
-    brush_b: int;
+    brush_a: float;      // brush anchor / current x in pixels
+    brush_b: float;
 
     fn init(series: Series[], labels: string[]) {
         super.init();
@@ -244,7 +247,7 @@ export class ChartBase extends Widget {
     // Put the y-axis on a log10 scale: ticks/grid land on decades and values map
     // through log10. Non-positive values clamp to the axis floor.
     builder fn logY(b: bool) { this.log_y = b; return this; }
-    builder fn size(w: int, h: int) { this.pref_w = w; this.pref_h = h; return this; }
+    builder fn size(w: float, h: float) { this.pref_w = w; this.pref_h = h; return this; }
     builder fn color(i: int, c: int) {
         if (i >= 0 && i < this.series.len) { this.series[i].color = c; }
         return this;
@@ -347,20 +350,22 @@ export class ChartBase extends Widget {
         } else {
             t = (v - sc.lo) / (sc.hi - sc.lo);
         }
-        return ((plot.y + plot.h) as float) - t * (plot.h as float);
+        return (plot.bottom()) - t * plot.h;
     }
     // value → pixel y, interpolated from the baseline by `reveal` (draw-in)
     fn vyr(v: float, plot: Rect, sc: AxisScale): float {
-        let base = (plot.y + plot.h) as float;
+        let base = plot.bottom();
         return base + (this.vy(v, plot, sc) - base) * this.reveal;
     }
 
     // category index → pixel x center. Line/area spread points edge-to-edge;
     // BarChart overrides to slot centers.
-    virtual fn x_of(i: int, plot: Rect): int {
+    virtual fn x_of(i: int, plot: Rect): float {
         let n = this.cat_count();
-        if (n <= 1) { return plot.x + plot.w / 2; }
-        return plot.x + (i * plot.w) / (n - 1);
+        if (n <= 1) { return plot.cx(); }
+        // Exact fractional spacing now: this used to be an integer divide, so
+        // category positions quantised and the rightmost point could drift.
+        return plot.x + ((i as float) * plot.w) / (n - 1) as float;
     }
 
     // -- animation ----------------------------------------------------------
@@ -387,9 +392,9 @@ export class ChartBase extends Widget {
 
         let pad = th.space_4;
         let top = b.y + pad;
-        let bottom = b.y + b.h - pad;
+        let bottom = b.bottom() - pad;
         let left = b.x + pad;
-        let right = b.x + b.w - pad;
+        let right = b.right() - pad;
 
         // title
         if (this.title_txt.len > 0) {
@@ -407,19 +412,19 @@ export class ChartBase extends Widget {
         // scale + gutters
         let sc = this.compute_scale(5);
         this.last_sc = sc;
-        let gl = 0;
-        let gb = 0;
+        let gl = 0.0;
+        let gb = 0.0;
         if (this.show_axes) {
             gl = this.y_gutter(s, th, sc);
             gb = s.font_height() + th.space_1;
         }
         let plot = Rect(left + gl, top, right - (left + gl), bottom - top - gb);
-        if (plot.w < 8 || plot.h < 8) { return; }
+        if (plot.w < 8.0 || plot.h < 8.0) { return; }
         this.last_plot = plot;
 
         if (this.show_axes) { this.draw_axes(s, th, plot, sc); }
 
-        s.clip_push(plot, 0);
+        s.clip_push(plot, 0.0);
         this.draw_plot(s, th, plot, sc);
         s.clip_pop();
 
@@ -428,9 +433,9 @@ export class ChartBase extends Widget {
             let a = this.brush_a; let b = this.brush_b;
             if (a > b) { let t = a; a = b; b = t; }
             if (a < plot.x) { a = plot.x; }
-            if (b > plot.x + plot.w) { b = plot.x + plot.w; }
+            if (b > plot.right()) { b = plot.right(); }
             if (b > a) {
-                s.fill_round(Rect(a, plot.y, b - a, plot.h), 0, with_alpha(th.primary, 45));
+                s.fill_round(Rect(a, plot.y, b - a, plot.h), 0.0, with_alpha(th.primary, 45));
             }
         }
 
@@ -444,8 +449,8 @@ export class ChartBase extends Widget {
     }
 
     // width reserved for y-axis tick labels
-    fn y_gutter(s: Painter, th: Theme, sc: AxisScale): int {
-        let maxw = 0;
+    fn y_gutter(s: Painter, th: Theme, sc: AxisScale): float {
+        let maxw = 0.0;
         if (this.log_y) {
             let e = floor(log10(sc.lo));
             let ehi = ceil(log10(sc.hi));
@@ -479,8 +484,8 @@ export class ChartBase extends Widget {
             let ehi = ceil(log10(sc.hi));
             while (e <= ehi + 0.5) {
                 let val = pow(10.0, e);
-                let y = this.vy(val, plot, sc) as int;
-                if (this.show_grid) { s.line(plot.x, y, plot.x + plot.w, y, th.divider); }
+                let y = this.vy(val, plot, sc);
+                if (this.show_grid) { s.line(plot.x, y, plot.right(), y, th.divider); }
                 let lbl = log_tick_label(val);
                 let ly = y + s.font_ascent() - s.font_height() / 2;
                 s.text(plot.x - th.space_2 - s.text_width(lbl), ly, lbl, th.on_surface_muted);
@@ -490,9 +495,9 @@ export class ChartBase extends Widget {
             let prec = tick_prec(sc.step);
             let v = sc.lo;
             while (v <= sc.hi + sc.step * 0.5) {
-                let y = this.vy(v, plot, sc) as int;
+                let y = this.vy(v, plot, sc);
                 if (this.show_grid) {
-                    s.line(plot.x, y, plot.x + plot.w, y, th.divider);
+                    s.line(plot.x, y, plot.right(), y, th.divider);
                 }
                 let lbl = fixed(v, prec);
                 let ly = y + s.font_ascent() - s.font_height() / 2;
@@ -502,7 +507,7 @@ export class ChartBase extends Widget {
         }
         // x category labels
         if (this.labels.len > 0) {
-            let by = plot.y + plot.h + s.font_ascent() + th.space_1;
+            let by = plot.bottom() + s.font_ascent() + th.space_1;
             let n = this.cat_count();
             for (let i in 0..n) {
                 if (i < this.labels.len) {
@@ -522,7 +527,7 @@ export class ChartBase extends Widget {
     fn draw_legend(s: Painter, th: Theme, area: Rect) {
         let sw = s.font_height() - 2;
         let x = area.x;
-        let cy = area.y + area.h / 2;
+        let cy = area.cy();
         let n = this.legend_count();
         for (let i in 0..n) {
             let name = this.legend_name(i);
@@ -540,7 +545,7 @@ export class ChartBase extends Widget {
 
     override fn hit(px: int, py: int): Widget {
         if (this.bounds.has(px, py)) {
-            this.cursor_px = px;   // for zoom-to-cursor (wheel carries no coords)
+            this.cursor_px = px as float; // for zoom-to-cursor (wheel carries no coords)
             if (this.index_hover()) {
                 let idx = this.nearest_index(px);
                 if (idx != this.hover_idx) { this.hover_idx = idx; this.repaint_now(); }
@@ -575,24 +580,24 @@ export class ChartBase extends Widget {
 
     override fn on_click(x: int, y: int): bool {
         if (!this.interactive_on) { return false; }
-        this.cursor_px = x;
-        if (this.brush_mode) { this.brushing = true; this.brush_a = x; this.brush_b = x; }
+        this.cursor_px = x as float;
+        if (this.brush_mode) { this.brushing = true; this.brush_a = x as float; this.brush_b = x as float; }
         return true;   // grab the drag capture
     }
     override fn on_drag_start(x: int, y: int): bool {
         if (!this.interactive_on) { return false; }
-        if (this.brush_mode) { this.brushing = true; this.brush_a = x; this.brush_b = x; }
+        if (this.brush_mode) { this.brushing = true; this.brush_a = x as float; this.brush_b = x as float; }
         return true;
     }
     override fn on_drag(dx: int, dy: int): bool {
         if (!this.interactive_on) { return false; }
         if (this.brush_mode) {
-            this.brush_b += dx;
+            this.brush_b += dx as float;
             this.repaint_now();
             return true;
         }
         let pw = this.last_plot.w;
-        if (pw <= 0) { return true; }
+        if (pw <= 0.0) { return true; }
         let span = this.view_hi - this.view_lo;
         this.pan_by(-(dx as float) / (pw as float) * span);
         this.repaint_now();
@@ -625,10 +630,10 @@ export class ChartBase extends Widget {
         if (lo + span > 1.0) { lo = 1.0 - span; }
         this.view_lo = lo; this.view_hi = lo + span;
     }
-    fn zoom_at(px: int, factor: float) {
+    fn zoom_at(px: float, factor: float) {
         let plot = this.last_plot;
-        if (plot.w <= 0) { return; }
-        let fc = ((px - plot.x) as float) / (plot.w as float);
+        if (plot.w <= 0.0) { return; }
+        let fc = (px - plot.x) / plot.w;
         if (fc < 0.0) { fc = 0.0; }
         if (fc > 1.0) { fc = 1.0; }
         let span = this.view_hi - this.view_lo;
@@ -644,13 +649,13 @@ export class ChartBase extends Widget {
     }
     fn apply_brush() {
         let plot = this.last_plot;
-        if (plot.w <= 0) { return; }
+        if (plot.w <= 0.0) { return; }
         let a = this.brush_a; let b = this.brush_b;
         if (a > b) { let t = a; a = b; b = t; }
-        if (b - a < 4) { return; }             // ignore accidental taps
+        if (b - a < 4.0) { return; }           // ignore accidental taps
         let span = this.view_hi - this.view_lo;
-        let fa = ((a - plot.x) as float) / (plot.w as float);
-        let fb = ((b - plot.x) as float) / (plot.w as float);
+        let fa = (a - plot.x) / plot.w;
+        let fb = (b - plot.x) / plot.w;
         if (fa < 0.0) { fa = 0.0; }
         if (fb > 1.0) { fb = 1.0; }
         this.view_hi = this.view_lo + fb * span;
@@ -660,11 +665,12 @@ export class ChartBase extends Widget {
     fn nearest_index(px: int): int {
         let n = this.cat_count();
         if (n <= 0) { return -1; }
+        let fx = px as float;
         let best = -1;
-        let bestd = 1000000000;
+        let bestd = 1000000000.0;
         for (let i in 0..n) {
-            let dx = px - this.x_of(i, this.last_plot);
-            if (dx < 0) { dx = -dx; }
+            let dx = fx - this.x_of(i, this.last_plot);
+            if (dx < 0.0) { dx = -dx; }
             if (dx < bestd) { bestd = dx; best = i; }
         }
         return best;
@@ -675,7 +681,7 @@ export class ChartBase extends Widget {
         let i = this.hover_idx;
         if (i < 0 || i >= this.cat_count()) { return; }
         let hx = this.x_of(i, plot);
-        s.line(hx, plot.y, hx, plot.y + plot.h, th.neutral_400);
+        s.line(hx, plot.y, hx, plot.bottom(), th.neutral_400);
 
         // dots + collect lines
         let prec = tick_prec(sc.step);
@@ -686,7 +692,7 @@ export class ChartBase extends Widget {
         for (let si in 0..this.series.len) {
             let vals = this.series[si].values;
             if (i < vals.len) {
-                let py = this.vy(vals[i], plot, sc) as int;
+                let py = this.vy(vals[i], plot, sc);
                 s.circle(hx, py, 3, this.color_of(si, th));
                 let nm = this.series[si].name;
                 if (nm.len == 0) { nm = "series " + str(si + 1); }
@@ -696,13 +702,13 @@ export class ChartBase extends Widget {
         if (lines.len == 0) { return; }
 
         // box geometry
-        let tw = 0;
+        let tw = 0.0;
         for (let ln in lines) { let w = s.text_width(ln); if (w > tw) { tw = w; } }
-        let lh = s.font_height() + 2;
-        let bw = tw + th.space_3 * 2;
-        let bh = lh * lines.len + th.space_2;
+        let lh = s.font_height() + 2.0;
+        let bw = tw + th.space_3 * 2.0;
+        let bh = lh * lines.len as float + th.space_2;
         let bx = hx + th.space_2;
-        if (bx + bw > plot.x + plot.w) { bx = hx - th.space_2 - bw; }
+        if (bx + bw > plot.right()) { bx = hx - th.space_2 - bw; }
         if (bx < plot.x) { bx = plot.x; }
         let by = plot.y + th.space_2;
         s.fill_round(Rect(bx, by, bw, bh), th.radius_md, th.surface);
@@ -741,7 +747,7 @@ export class LineChart extends ChartBase {
             let xs: float[] = [];
             let ys: float[] = [];
             for (let i in 0..vals.len) {
-                xs.push(this.x_of(i, plot) as float);
+                xs.push(this.x_of(i, plot));
                 ys.push(this.vyr(vals[i], plot, sc));
             }
             let path = poly_line_path(xs, ys);
@@ -749,7 +755,7 @@ export class LineChart extends ChartBase {
             s.stroke_path(path, 2, color);
             if (this.markers_on) {
                 for (let i in 0..xs.len) {
-                    s.circle(xs[i] as int, ys[i] as int, 3, color);
+                    s.circle(xs[i], ys[i], 3, color);
                 }
             }
         }
@@ -812,7 +818,7 @@ export class AreaChart extends ChartBase {
 
     override fn draw_plot(s: Painter, th: Theme, plot: Rect, sc: AxisScale) {
         if (this.stacked_on) { this.draw_stacked(s, th, plot, sc); return; }
-        let base = (plot.y + plot.h) as float;
+        let base = plot.bottom();
         for (let si in 0..this.series.len) {
             let vals = this.series[si].values;
             if (vals.len == 0) { continue; }
@@ -820,7 +826,7 @@ export class AreaChart extends ChartBase {
             let xs: float[] = [];
             let ys: float[] = [];
             for (let i in 0..vals.len) {
-                xs.push(this.x_of(i, plot) as float);
+                xs.push(this.x_of(i, plot));
                 ys.push(this.vyr(vals[i], plot, sc));
             }
             if (this.gradient_on) {
@@ -828,7 +834,7 @@ export class AreaChart extends ChartBase {
                 let edge = poly_line_path(xs, ys);
                 if (this.smooth_on) { edge = smooth_path(xs, ys); }
                 let fp = edge.flatten();
-                fill_gradient_under(s, fp.xs, fp.ys, base as int,
+                fill_gradient_under(s, fp.xs, fp.ys, base,
                                     with_alpha(color, 130), with_alpha(color, 8));
             } else {
                 // filled area: top edge, then down to the baseline and back
@@ -864,7 +870,7 @@ export class AreaChart extends ChartBase {
                 if (i < vals.len) { v = vals[i]; }
                 let below = acc[i];
                 let above = below + v;
-                xs.push(this.x_of(i, plot) as float);
+                xs.push(this.x_of(i, plot));
                 boty.push(this.vyr(below, plot, sc));
                 topy.push(this.vyr(above, plot, sc));
                 acc[i] = above;
@@ -903,10 +909,10 @@ export class BarChart extends ChartBase {
     override fn include_zero(): bool { return true; }
 
     // bars sit at slot centers, one slot per category
-    override fn x_of(i: int, plot: Rect): int {
+    override fn x_of(i: int, plot: Rect): float {
         let n = this.cat_count();
         if (n <= 0) { return plot.x; }
-        return plot.x + (((i as float) + 0.5) * (plot.w as float) / (n as float)) as int;
+        return plot.x + ((i as float) + 0.5) * plot.w / (n as float);
     }
 
     override fn draw_plot(s: Painter, th: Theme, plot: Rect, sc: AxisScale) {
@@ -914,12 +920,12 @@ export class BarChart extends ChartBase {
         if (n == 0) { return; }
         let g = this.series.len;
         if (g == 0) { return; }
-        let base = this.vy(0.0, plot, sc) as int;
-        let slot = (plot.w as float) / (n as float);
+        let base = this.vy(0.0, plot, sc);
+        let slot = plot.w / (n as float);
         let radius = th.radius_sm;
 
         for (let i in 0..n) {
-            let cx = (plot.x as float) + ((i as float) + 0.5) * slot;
+            let cx = plot.x + ((i as float) + 0.5) * slot;
             if (this.stacked_on) {
                 let acc = 0.0;
                 for (let si in 0..g) {
@@ -927,12 +933,12 @@ export class BarChart extends ChartBase {
                     if (i >= vals.len) { continue; }
                     let v0 = acc;
                     acc += vals[i];
-                    let y0 = this.vyr(v0, plot, sc) as int;
-                    let y1 = this.vyr(acc, plot, sc) as int;
-                    let bw = (slot * 0.62) as int;
-                    let bx = (cx as int) - bw / 2;
+                    let y0 = this.vyr(v0, plot, sc);
+                    let y1 = this.vyr(acc, plot, sc);
+                    let bw = slot * 0.62;
+                    let bx = cx - bw / 2.0;
                     let ry = y1; let rh = y0 - y1;
-                    if (rh < 0) { ry = y0; rh = y1 - y0; }
+                    if (rh < 0.0) { ry = y0; rh = y1 - y0; }
                     s.fill_round(Rect(bx, ry, bw, rh), radius, this.color_of(si, th));
                 }
             } else {
@@ -942,11 +948,11 @@ export class BarChart extends ChartBase {
                 for (let si in 0..g) {
                     let vals = this.series[si].values;
                     if (i >= vals.len) { continue; }
-                    let y1 = this.vyr(vals[i], plot, sc) as int;
-                    let bx = (gx + (si as float) * bw) as int;
+                    let y1 = this.vyr(vals[i], plot, sc);
+                    let bx = gx + (si as float) * bw;
                     let ry = y1; let rh = base - y1;
-                    if (rh < 0) { ry = base; rh = y1 - base; }
-                    s.fill_round(Rect(bx, ry, (bw as int) - 2, rh), radius, this.color_of(si, th));
+                    if (rh < 0.0) { ry = base; rh = y1 - base; }
+                    s.fill_round(Rect(bx, ry, bw - 2.0, rh), radius, this.color_of(si, th));
                 }
             }
         }
@@ -966,8 +972,8 @@ export class PieChart extends ChartBase {
     cum: float[];        // cumulative sweep boundaries, one per drawn slice + 1
     sidx: int[];         // original value index for each drawn slice
     total: float;
-    hpx: int;            // last hover cursor, for tooltip placement
-    hpy: int;
+    hpx: float;          // last hover cursor, for tooltip placement
+    hpy: float;
 
     fn init(labels: string[], values: float[]) {
         super.init([new Series("", values)], labels);
@@ -1024,8 +1030,8 @@ export class PieChart extends ChartBase {
                 }
             }
         }
-        this.hpx = px;
-        this.hpy = py;
+        this.hpx = px as float;
+        this.hpy = py as float;
         if (idx != this.hover_idx) { this.hover_idx = idx; this.repaint_now(); }
         return this;
     }
@@ -1037,11 +1043,11 @@ export class PieChart extends ChartBase {
         if (total <= 0.0) { return; }
         this.total = total;
 
-        let cx = (plot.x + plot.w / 2) as float;
-        let cy = (plot.y + plot.h / 2) as float;
+        let cx = plot.cx();
+        let cy = plot.cy();
         let rr = plot.w;
         if (plot.h < rr) { rr = plot.h; }
-        let rfull = (rr as float) / 2.0 - 6.0;      // stable radius for hit-testing
+        let rfull = rr / 2.0 - 6.0;                 // stable radius for hit-testing
         if (this.labels_out) { rfull = rfull * 0.68; }  // leave room for outside labels
         if (rfull < 1.0) { return; }
         let r = rfull * this.reveal;                 // radial draw-in
@@ -1082,8 +1088,8 @@ export class PieChart extends ChartBase {
 
         // donut hole
         if (this.donut_frac > 0.0) {
-            let hole = (r * this.donut_frac) as int;
-            if (hole > 0) { s.circle(cx as int, cy as int, hole, th.surface_raised); }
+            let hole = r * this.donut_frac;
+            if (hole > 0.0) { s.circle(cx, cy, hole, th.surface_raised); }
         }
 
         if (this.labels_out) { this.draw_leaders(s, th); }
@@ -1109,14 +1115,14 @@ export class PieChart extends ChartBase {
             let right = cm >= 0.0;
             let x2 = x1 + 16.0;
             if (!right) { x2 = x1 - 16.0; }
-            s.line(x0 as int, y0 as int, x1 as int, y1 as int, th.neutral_400);
-            s.line(x1 as int, y1 as int, x2 as int, y1 as int, th.neutral_400);
+            s.line(x0, y0, x1, y1, th.neutral_400);
+            s.line(x1, y1, x2, y1, th.neutral_400);
             let name = "slice " + str(i + 1);
             if (i < this.labels.len) { name = this.labels[i]; }
             let lbl = name + " " + fixed(pct, 0) + "%";
-            let ty = (y1 as int) + s.font_ascent() - s.font_height() / 2;
-            if (right) { s.text(x2 as int + 4, ty, lbl, th.on_surface_muted); }
-            else { s.text(x2 as int - 4 - s.text_width(lbl), ty, lbl, th.on_surface_muted); }
+            let ty = y1 + s.font_ascent() - s.font_height() / 2.0;
+            if (right) { s.text(x2 + 4.0, ty, lbl, th.on_surface_muted); }
+            else { s.text(x2 - 4.0 - s.text_width(lbl), ty, lbl, th.on_surface_muted); }
         }
     }
 
@@ -1131,13 +1137,13 @@ export class PieChart extends ChartBase {
         let l1 = fixed(v, 0) + "  (" + fixed(pct, 1) + "%)";
         let tw = s.text_width(l0);
         if (s.text_width(l1) > tw) { tw = s.text_width(l1); }
-        let lh = s.font_height() + 2;
-        let bw = tw + th.space_3 * 2;
-        let bh = lh * 2 + th.space_2;
+        let lh = s.font_height() + 2.0;
+        let bw = tw + th.space_3 * 2.0;
+        let bh = lh * 2.0 + th.space_2;
         let bx = this.hpx + th.space_2;
         let by = this.hpy + th.space_2;
-        if (bx + bw > plot.x + plot.w) { bx = plot.x + plot.w - bw; }
-        if (by + bh > plot.y + plot.h) { by = plot.y + plot.h - bh; }
+        if (bx + bw > plot.right()) { bx = plot.right() - bw; }
+        if (by + bh > plot.bottom()) { by = plot.bottom() - bh; }
         if (bx < plot.x) { bx = plot.x; }
         if (by < plot.y) { by = plot.y; }
         s.fill_round(Rect(bx, by, bw, bh), th.radius_md, th.surface);
@@ -1151,13 +1157,13 @@ export class PieChart extends ChartBase {
     fn wedge(s: Painter, cx: float, cy: float, r: float, a0: float, a1: float, color: int) {
         let steps = ((a1 - a0) / (TAU / 64.0)) as int;
         if (steps < 2) { steps = 2; }
-        let xs: i32[] = [];
-        let ys: i32[] = [];
-        xs.push(cx as i32); ys.push(cy as i32);
+        let xs: float[] = [];
+        let ys: float[] = [];
+        xs.push(cx); ys.push(cy);
         for (let k in 0..(steps + 1) ) {
             let a = a0 + (a1 - a0) * (k as float) / (steps as float);
-            xs.push((cx + r * cos(a)) as i32);
-            ys.push((cy + r * sin(a)) as i32);
+            xs.push(cx + r * cos(a));
+            ys.push(cy + r * sin(a));
         }
         s.polygon(xs, ys, color);
     }
@@ -1183,11 +1189,11 @@ export class StepChart extends ChartBase {
             if (vals.len == 0) { continue; }
             let color = this.color_of(si, th);
             let p = new Path();
-            let x0 = this.x_of(0, plot) as float;
+            let x0 = this.x_of(0, plot);
             let y0 = this.vyr(vals[0], plot, sc);
             p.moveTo(x0, y0);
             for (let i in 1..vals.len) {
-                let x = this.x_of(i, plot) as float;
+                let x = this.x_of(i, plot);
                 let yprev = this.vyr(vals[i - 1], plot, sc);
                 let y = this.vyr(vals[i], plot, sc);
                 p.lineTo(x, yprev);   // horizontal run
@@ -1196,7 +1202,7 @@ export class StepChart extends ChartBase {
             s.stroke_path(p, 2, color);
             if (this.markers_on) {
                 for (let i in 0..vals.len) {
-                    s.circle(this.x_of(i, plot), this.vyr(vals[i], plot, sc) as int, 3, color);
+                    s.circle(this.x_of(i, plot), this.vyr(vals[i], plot, sc), 3, color);
                 }
             }
         }
@@ -1290,7 +1296,7 @@ export class Sparkline extends ChartBase {
         for (let v in vals) { lo = fmin(lo, v); hi = fmax(hi, v); }
         if (hi <= lo) { hi = lo + 1.0; }
 
-        let pad = 2;
+        let pad = 2.0;
         let iw = b.w - pad * 2;
         let ih = b.h - pad * 2;
         let n = vals.len;
@@ -1304,10 +1310,10 @@ export class Sparkline extends ChartBase {
             ys.push((b.y + pad) as float + (1.0 - t) * (ih as float));
         }
         if (this.area_on) {
-            let base = (b.y + b.h - pad) as float;
+            let base = (b.bottom() - pad) as float;
             if (this.gradient_on) {
                 let fp = poly_line_path(xs, ys).flatten();
-                fill_gradient_under(s, fp.xs, fp.ys, base as int,
+                fill_gradient_under(s, fp.xs, fp.ys, base,
                                     with_alpha(color, 130), with_alpha(color, 8));
             } else {
                 let fp = poly_line_path(xs, ys);
@@ -1362,9 +1368,9 @@ export class Gauge extends ChartBase {
             top += s.font_height() + th.space_2;
         }
 
-        let area = Rect(b.x + pad, top, b.w - pad * 2, b.y + b.h - pad - top);
-        let cx = area.x + area.w / 2;
-        let cy = area.y + area.h / 2;
+        let area = Rect(b.x + pad, top, b.w - pad * 2, b.bottom() - pad - top);
+        let cx = area.cx();
+        let cy = area.cy();
         let rr = area.w;
         if (area.h < rr) { rr = area.h; }
         let r = rr / 2 - 4;
@@ -1385,7 +1391,7 @@ export class Gauge extends ChartBase {
 
         // 270° track with a gap at the bottom; sweep clockwise from 135°
         s.stroke_arc(cx, cy, r, r, 135, 270, width, th.surface_sunken);
-        let sweep = (270.0 * frac * this.reveal) as int;
+        let sweep = (270.0 * frac * this.reveal);
         if (sweep > 0) { s.stroke_arc(cx, cy, r, r, 135, sweep, width, color); }
 
         // center readout
@@ -1483,16 +1489,16 @@ export class ScatterChart extends ChartBase {
 
     fn sx(v: float, plot: Rect, xsc: AxisScale): float {
         let t = (v - xsc.lo) / (xsc.hi - xsc.lo);
-        return (plot.x as float) + t * (plot.w as float);
+        return plot.x + t * plot.w;
     }
-    fn radius_of(p: Points, k: int): int {
-        if (p.sizes.len == 0) { return 4; }
+    fn radius_of(p: Points, k: int): float {
+        if (p.sizes.len == 0) { return 4.0; }
         let mx = 0.0;
         for (let sv in p.sizes) { mx = fmax(mx, sv); }
-        if (mx <= 0.0) { return 4; }
+        if (mx <= 0.0) { return 4.0; }
         let t = 0.0;
         if (k < p.sizes.len) { t = p.sizes[k] / mx; }
-        return 4 + (12.0 * t) as int;
+        return 4.0 + 12.0 * t;
     }
 
     // draw x gridlines + numeric ticks unclipped (base draws the y axis)
@@ -1500,11 +1506,11 @@ export class ScatterChart extends ChartBase {
         this.draw_yaxis(s, th, plot, sc);
         let xsc = this.compute_xscale(5);
         let prec = tick_prec(xsc.step);
-        let by = plot.y + plot.h + s.font_ascent() + th.space_1;
+        let by = plot.bottom() + s.font_ascent() + th.space_1;
         let v = xsc.lo;
         while (v <= xsc.hi + xsc.step * 0.5) {
-            let x = this.sx(v, plot, xsc) as int;
-            if (this.show_grid) { s.line(x, plot.y, x, plot.y + plot.h, th.divider); }
+            let x = this.sx(v, plot, xsc);
+            if (this.show_grid) { s.line(x, plot.y, x, plot.bottom(), th.divider); }
             let lbl = fixed(v, prec);
             s.text(x - s.text_width(lbl) / 2, by, lbl, th.on_surface_muted);
             v += xsc.step;
@@ -1519,15 +1525,15 @@ export class ScatterChart extends ChartBase {
             let n = p.xs.len;
             for (let k in 0..n) {
                 if (k >= p.ys.len) { continue; }
-                let x = this.sx(p.xs[k], plot, xsc) as int;
+                let x = this.sx(p.xs[k], plot, xsc);
                 let yf = this.vy(p.ys[k], plot, sc);
                 // fade/scale points in with reveal
-                let y = (plot.y + plot.h) as float + (yf - (plot.y + plot.h) as float) * this.reveal;
-                let rad = (this.radius_of(p, k) as float * this.reveal) as int;
+                let y = plot.bottom() + (yf - plot.bottom()) * this.reveal;
+                let rad = (this.radius_of(p, k) as float * this.reveal);
                 if (rad < 1) { rad = 1; }
                 let c = with_alpha(color, 210);
                 if (pi == this.hover_pi && k == this.hover_idx) { c = color; rad += 2; }
-                s.circle(x, y as int, rad, c);
+                s.circle(x, y, rad, c);
             }
         }
         this.draw_point_tooltip(s, th, plot, sc, xsc);
@@ -1538,14 +1544,14 @@ export class ScatterChart extends ChartBase {
         let plot = this.last_plot;
         let sc = this.last_sc;
         let xsc = this.compute_xscale(5);
-        let bpi = -1; let bk = -1; let bestd = 15 * 15;
+        let bpi = -1; let bk = -1; let bestd = 225.0;   // (15px)^2 hit radius
         for (let pi in 0..this.pts.len) {
             let p = this.pts[pi];
             for (let k in 0..p.xs.len) {
                 if (k >= p.ys.len) { continue; }
-                let x = this.sx(p.xs[k], plot, xsc) as int;
-                let y = this.vy(p.ys[k], plot, sc) as int;
-                let dx = px - x; let dy = py - y;
+                let x = this.sx(p.xs[k], plot, xsc);
+                let y = this.vy(p.ys[k], plot, sc);
+                let dx = px as float - x; let dy = py as float - y;
                 let d = dx * dx + dy * dy;
                 if (d < bestd) { bestd = d; bpi = pi; bk = k; }
             }
@@ -1575,14 +1581,14 @@ export class ScatterChart extends ChartBase {
                      + fixed(p.ys[k], tick_prec(sc.step)) + ")";
         let tw = s.text_width(l0);
         if (s.text_width(l1) > tw) { tw = s.text_width(l1); }
-        let lh = s.font_height() + 2;
-        let bw = tw + th.space_3 * 2;
-        let bh = lh * 2 + th.space_2;
-        let ax = this.sx(p.xs[k], plot, xsc) as int;
-        let ay = this.vy(p.ys[k], plot, sc) as int;
+        let lh = s.font_height() + 2.0;
+        let bw = tw + th.space_3 * 2.0;
+        let bh = lh * 2.0 + th.space_2;
+        let ax = this.sx(p.xs[k], plot, xsc);
+        let ay = this.vy(p.ys[k], plot, sc);
         let bx = ax + th.space_2;
         let by = ay - bh - th.space_2;
-        if (bx + bw > plot.x + plot.w) { bx = ax - bw - th.space_2; }
+        if (bx + bw > plot.right()) { bx = ax - bw - th.space_2; }
         if (bx < plot.x) { bx = plot.x; }
         if (by < plot.y) { by = ay + th.space_2; }
         s.fill_round(Rect(bx, by, bw, bh), th.radius_md, th.surface);
@@ -1613,8 +1619,8 @@ export class CandlestickChart extends ChartBase {
     bars: OHLC[];
     up_color: int;       // 0 = theme success
     down_color: int;     // 0 = theme danger
-    hpx: int;
-    hpy: int;
+    hpx: float;
+    hpy: float;
 
     fn init(labels: string[], bars: OHLC[]) {
         // seed the base with the closes so cat_count / x labels work
@@ -1647,10 +1653,10 @@ export class CandlestickChart extends ChartBase {
     }
 
     // bars sit at slot centers, one slot per bar
-    override fn x_of(i: int, plot: Rect): int {
+    override fn x_of(i: int, plot: Rect): float {
         let n = this.bars.len;
         if (n <= 0) { return plot.x; }
-        return plot.x + (((i as float) + 0.5) * (plot.w as float) / (n as float)) as int;
+        return plot.x + ((i as float) + 0.5) * plot.w / (n as float);
     }
 
     fn up_c(th: Theme): int {
@@ -1665,7 +1671,7 @@ export class CandlestickChart extends ChartBase {
     override fn draw_plot(s: Painter, th: Theme, plot: Rect, sc: AxisScale) {
         let n = this.bars.len;
         if (n == 0) { return; }
-        let slot = (plot.w as float) / (n as float);
+        let slot = plot.w / (n as float);
         let bw = slot * 0.6;
         if (bw < 3.0) { bw = 3.0; }
         for (let i in 0..n) {
@@ -1674,17 +1680,17 @@ export class CandlestickChart extends ChartBase {
             let color = this.down_c(th);
             if (b.close >= b.open) { color = this.up_c(th); }
             // high–low wick
-            let yh = this.vyr(b.high, plot, sc) as int;
-            let yl = this.vyr(b.low, plot, sc) as int;
+            let yh = this.vyr(b.high, plot, sc);
+            let yl = this.vyr(b.low, plot, sc);
             s.line(cx, yh, cx, yl, color);
             // open↔close body
-            let yo = this.vyr(b.open, plot, sc) as int;
-            let yc = this.vyr(b.close, plot, sc) as int;
+            let yo = this.vyr(b.open, plot, sc);
+            let yc = this.vyr(b.close, plot, sc);
             let top = yc; let h = yo - yc;
             if (h < 0) { top = yo; h = yc - yo; }
             if (h < 1) { h = 1; }
-            let bx = cx - (bw as int) / 2;
-            s.fill_round(Rect(bx, top, bw as int, h), th.radius_sm, color);
+            let bx = cx - (bw) / 2;
+            s.fill_round(Rect(bx, top, bw, h), th.radius_sm, color);
         }
         this.draw_ohlc_tooltip(s, th, plot, sc);
     }
@@ -1692,13 +1698,13 @@ export class CandlestickChart extends ChartBase {
     override fn hit(px: int, py: int): Widget {
         if (!this.bounds.has(px, py)) { return null; }
         let idx = -1;
-        let bestd = 1000000000;
+        let bestd = 1000000000.0;
         for (let i in 0..this.bars.len) {
-            let dx = px - this.x_of(i, this.last_plot);
-            if (dx < 0) { dx = -dx; }
+            let dx = px as float - this.x_of(i, this.last_plot);
+            if (dx < 0.0) { dx = -dx; }
             if (dx < bestd) { bestd = dx; idx = i; }
         }
-        this.hpx = px; this.hpy = py;
+        this.hpx = px as float; this.hpy = py as float;
         if (idx != this.hover_idx) { this.hover_idx = idx; this.repaint_now(); }
         return this;
     }
@@ -1709,20 +1715,20 @@ export class CandlestickChart extends ChartBase {
         let b = this.bars[i];
         let prec = tick_prec(sc.step);
         let cx = this.x_of(i, plot);
-        s.line(cx, plot.y, cx, plot.y + plot.h, th.neutral_400);
+        s.line(cx, plot.y, cx, plot.bottom(), th.neutral_400);
         let lines: string[] = [];
         if (i < this.labels.len && this.labels[i].len > 0) { lines.push(this.labels[i]); }
         lines.push("O " + fixed(b.open, prec));
         lines.push("H " + fixed(b.high, prec));
         lines.push("L " + fixed(b.low, prec));
         lines.push("C " + fixed(b.close, prec));
-        let tw = 0;
+        let tw = 0.0;
         for (let ln in lines) { let w = s.text_width(ln); if (w > tw) { tw = w; } }
-        let lh = s.font_height() + 2;
-        let bw = tw + th.space_3 * 2;
-        let bh = lh * lines.len + th.space_2;
+        let lh = s.font_height() + 2.0;
+        let bw = tw + th.space_3 * 2.0;
+        let bh = lh * lines.len as float + th.space_2;
         let bx = cx + th.space_2;
-        if (bx + bw > plot.x + plot.w) { bx = cx - th.space_2 - bw; }
+        if (bx + bw > plot.right()) { bx = cx - th.space_2 - bw; }
         if (bx < plot.x) { bx = plot.x; }
         let by = plot.y + th.space_2;
         s.fill_round(Rect(bx, by, bw, bh), th.radius_md, th.surface);
@@ -1826,29 +1832,29 @@ export class BoxPlot extends ChartBase {
         return Range(lo, hi);
     }
 
-    override fn x_of(i: int, plot: Rect): int {
+    override fn x_of(i: int, plot: Rect): float {
         let n = this.stats.len;
         if (n <= 0) { return plot.x; }
-        return plot.x + (((i as float) + 0.5) * (plot.w as float) / (n as float)) as int;
+        return plot.x + ((i as float) + 0.5) * plot.w / (n as float);
     }
 
     override fn draw_plot(s: Painter, th: Theme, plot: Rect, sc: AxisScale) {
         let n = this.stats.len;
         if (n == 0) { return; }
-        let slot = (plot.w as float) / (n as float);
-        let bw = (slot * 0.5) as int;
-        if (bw < 4) { bw = 4; }
+        let slot = plot.w / (n as float);
+        let bw = slot * 0.5;
+        if (bw < 4.0) { bw = 4.0; }
         let cap = bw / 3;
         for (let i in 0..n) {
             let st = this.stats[i];
             let cx = this.x_of(i, plot);
             let color = this.color_of(0, th);
             // whisker line + caps (animated grows from the median)
-            let ylo = this.vyr(st.lo, plot, sc) as int;
-            let yhi = this.vyr(st.hi, plot, sc) as int;
-            let yq1 = this.vyr(st.q1, plot, sc) as int;
-            let yq3 = this.vyr(st.q3, plot, sc) as int;
-            let ymed = this.vyr(st.med, plot, sc) as int;
+            let ylo = this.vyr(st.lo, plot, sc);
+            let yhi = this.vyr(st.hi, plot, sc);
+            let yq1 = this.vyr(st.q1, plot, sc);
+            let yq3 = this.vyr(st.q3, plot, sc);
+            let ymed = this.vyr(st.med, plot, sc);
             s.line(cx, yhi, cx, yq3, th.on_surface_muted);
             s.line(cx, yq1, cx, ylo, th.on_surface_muted);
             s.line(cx - cap, yhi, cx + cap, yhi, th.on_surface_muted);
@@ -1864,7 +1870,7 @@ export class BoxPlot extends ChartBase {
             // outliers
             if (i < this.outliers.len) {
                 for (let v in this.outliers[i]) {
-                    let oy = this.vyr(v, plot, sc) as int;
+                    let oy = this.vyr(v, plot, sc);
                     s.circle(cx, oy, 2, th.on_surface_muted);
                 }
             }
@@ -1906,8 +1912,8 @@ export class RadarChart extends ChartBase {
     override fn draw_plot(s: Painter, th: Theme, plot: Rect, sc: AxisScale) {
         let n = this.axis_count();
         if (n < 3) { return; }
-        let cx = (plot.x + plot.w / 2) as float;
-        let cy = (plot.y + plot.h / 2) as float;
+        let cx = plot.cx();
+        let cy = plot.cy();
         let rr = plot.w;
         if (plot.h < rr) { rr = plot.h; }
         let rmax = (rr as float) / 2.0 - 24.0;   // margin for axis labels
@@ -1919,11 +1925,11 @@ export class RadarChart extends ChartBase {
         let v = sc.lo;
         while (v <= sc.hi + sc.step * 0.5) {
             let t = (v - sc.lo) / span;
-            let rx: i32[] = []; let ry: i32[] = [];
+            let rx: float[] = []; let ry: float[] = [];
             for (let k in 0..n) {
                 let a = this.axis_angle(k, n);
-                rx.push((cx + rmax * t * cos(a)) as i32);
-                ry.push((cy + rmax * t * sin(a)) as i32);
+                rx.push(cx + rmax * t * cos(a));
+                ry.push(cy + rmax * t * sin(a));
             }
             for (let k in 0..n) {
                 let k2 = (k + 1) % n;
@@ -1933,14 +1939,14 @@ export class RadarChart extends ChartBase {
         }
         for (let k in 0..n) {
             let a = this.axis_angle(k, n);
-            let ex = (cx + rmax * cos(a)) as int;
-            let ey = (cy + rmax * sin(a)) as int;
-            s.line(cx as int, cy as int, ex, ey, th.divider);
+            let ex = (cx + rmax * cos(a));
+            let ey = (cy + rmax * sin(a));
+            s.line(cx, cy, ex, ey, th.divider);
             // axis label just outside the vertex
             if (k < this.labels.len) {
                 let lbl = this.labels[k];
-                let lx = (cx + (rmax + 6.0) * cos(a)) as int;
-                let ly = (cy + (rmax + 6.0) * sin(a)) as int + s.font_ascent() - s.font_height() / 2;
+                let lx = (cx + (rmax + 6.0) * cos(a));
+                let ly = cy + (rmax + 6.0) * sin(a) + s.font_ascent() - s.font_height() / 2.0;
                 if (cos(a) < -0.3) { lx -= s.text_width(lbl); }
                 else if (cos(a) < 0.3) { lx -= s.text_width(lbl) / 2; }
                 s.text(lx, ly, lbl, th.on_surface_muted);
@@ -1951,23 +1957,23 @@ export class RadarChart extends ChartBase {
         for (let si in 0..this.series.len) {
             let vals = this.series[si].values;
             let color = this.color_of(si, th);
-            let xs: i32[] = []; let ys: i32[] = [];
+            let xs: float[] = []; let ys: float[] = [];
             for (let k in 0..n) {
                 let val = sc.lo;
                 if (k < vals.len) { val = vals[k]; }
                 let t = (val - sc.lo) / span;
                 let r = rmax * t * this.reveal;
                 let a = this.axis_angle(k, n);
-                xs.push((cx + r * cos(a)) as i32);
-                ys.push((cy + r * sin(a)) as i32);
+                xs.push(cx + r * cos(a));
+                ys.push(cy + r * sin(a));
             }
             if (this.fill_on) { s.polygon(xs, ys, with_alpha(color, 55)); }
             // outline + vertex dots
             for (let k in 0..n) {
                 let k2 = (k + 1) % n;
-                s.line(xs[k] as int, ys[k] as int, xs[k2] as int, ys[k2] as int, color);
+                s.line(xs[k], ys[k], xs[k2], ys[k2], color);
             }
-            for (let k in 0..n) { s.circle(xs[k] as int, ys[k] as int, 2, color); }
+            for (let k in 0..n) { s.circle(xs[k], ys[k], 2, color); }
         }
     }
 }
@@ -2022,6 +2028,10 @@ export class Heatmap extends ChartBase {
     override fn index_hover(): bool { return false; }
 
     fn cell_color(v: float, th: Theme): int {
+        // 0 = "not set" (fall back to the theme). This is only a safe sentinel
+        // because a real color now always carries a non-zero alpha byte —
+        // rgb(0,0,0) used to be literally 0, so pure black was indistinguishable
+        // from unset.
         let c0 = this.cold; if (c0 == 0) { c0 = th.surface_sunken; }
         let c1 = this.hot;  if (c1 == 0) { c1 = th.primary_500; }
         return ramp(c0, c1, (v - this.vmin) / (this.vmax - this.vmin));
@@ -2029,12 +2039,12 @@ export class Heatmap extends ChartBase {
 
     // plot rect split into a label gutter + the cell grid
     fn grid_rect(s: Painter, plot: Rect): Rect {
-        let gl = 0;
+        let gl = 0.0;
         for (let r in this.rows) { let w = s.text_width(r); if (w > gl) { gl = w; } }
         let gt = s.font_height();
-        let x = plot.x + gl + 6;
-        let y = plot.y + gt + 4;
-        return Rect(x, y, plot.x + plot.w - x, plot.y + plot.h - y);
+        let x = plot.x + gl + 6.0;
+        let y = plot.y + gt + 4.0;
+        return Rect(x, y, plot.right() - x, plot.bottom() - y);
     }
 
     override fn draw_plot(s: Painter, th: Theme, plot: Rect, sc: AxisScale) {
@@ -2044,14 +2054,14 @@ export class Heatmap extends ChartBase {
         if (nc < 1) { for (let row in this.grid) { if (row.len > nc) { nc = row.len; } } }
         if (nc == 0) { return; }
         let g = this.grid_rect(s, plot);
-        let cw = (g.w as float) / (nc as float);
-        let ch = (g.h as float) / (nr as float);
+        let cw = g.w / (nc as float);
+        let ch = g.h / (nr as float);
 
         // column labels along the top
         for (let c in 0..nc) {
             if (c < this.cols.len) {
                 let lbl = this.cols[c];
-                let cxp = g.x + (((c as float) + 0.5) * cw) as int;
+                let cxp = g.x + ((c as float) + 0.5) * cw;
                 s.text(cxp - s.text_width(lbl) / 2, plot.y + s.font_ascent(), lbl, th.on_surface_muted);
             }
         }
@@ -2059,16 +2069,16 @@ export class Heatmap extends ChartBase {
             // row label along the left
             if (r < this.rows.len) {
                 let lbl = this.rows[r];
-                let ry = g.y + (((r as float) + 0.5) * ch) as int + s.font_ascent() - s.font_height() / 2;
+                let ry = g.y + ((r as float) + 0.5) * ch + s.font_ascent() - s.font_height() / 2.0;
                 s.text(plot.x, ry, lbl, th.on_surface_muted);
             }
             let row = this.grid[r];
             for (let c in 0..nc) {
                 if (c >= row.len) { continue; }
-                let cx = g.x + ((c as float) * cw) as int;
-                let cy = g.y + ((r as float) * ch) as int;
-                let rw = (cw as int) - 1; if (rw < 1) { rw = 1; }
-                let rh = (ch as int) - 1; if (rh < 1) { rh = 1; }
+                let cx = g.x + (c as float) * cw;
+                let cy = g.y + (r as float) * ch;
+                let rw = cw - 1.0; if (rw < 1.0) { rw = 1.0; }
+                let rh = ch - 1.0; if (rh < 1.0) { rh = 1.0; }
                 // draw-in fade: cells lighten from the cold color
                 let col = this.cell_color(row[c], th);
                 let base = this.cold; if (base == 0) { base = th.surface_sunken; }
@@ -2116,7 +2126,7 @@ export class FunnelChart extends ChartBase {
     fn half_w(v: float, maxv: float, plot: Rect): float {
         let f = 0.0;
         if (maxv > 0.0) { f = v / maxv; }
-        return f * (plot.w as float) * 0.45 * this.reveal;
+        return f * plot.w * 0.45 * this.reveal;
     }
 
     override fn draw_plot(s: Painter, th: Theme, plot: Rect, sc: AxisScale) {
@@ -2127,10 +2137,10 @@ export class FunnelChart extends ChartBase {
         for (let x in v) { if (x > maxv) { maxv = x; } }
         if (maxv <= 0.0) { return; }
 
-        let cx = (plot.x + plot.w / 2) as float;
-        let bandh = (plot.h as float) / (n as float);
+        let cx = plot.cx();
+        let bandh = plot.h / (n as float);
         for (let i in 0..n) {
-            let yTop = (plot.y as float) + (i as float) * bandh;
+            let yTop = plot.y + (i as float) * bandh;
             let yBot = yTop + bandh - 2.0;
             let topHw = this.half_w(v[i], maxv, plot);
             // bottom width follows the next stage (or stays flat for a neck / last)
@@ -2141,12 +2151,12 @@ export class FunnelChart extends ChartBase {
             let color = this.palette(i, th);
             if (i == this.hover_idx) { color = mix(color, rgb(255, 255, 255), 0.18); }
 
-            let xs: i32[] = [];
-            let ys: i32[] = [];
-            xs.push((cx - topHw) as i32); ys.push(yTop as i32);
-            xs.push((cx + topHw) as i32); ys.push(yTop as i32);
-            xs.push((cx + botHw) as i32); ys.push(yBot as i32);
-            xs.push((cx - botHw) as i32); ys.push(yBot as i32);
+            let xs: float[] = [];
+            let ys: float[] = [];
+            xs.push(cx - topHw); ys.push(yTop);
+            xs.push(cx + topHw); ys.push(yTop);
+            xs.push(cx + botHw); ys.push(yBot);
+            xs.push(cx - botHw); ys.push(yBot);
             s.polygon(xs, ys, color);
 
             // stage label + value + % of the top stage, centered
@@ -2154,8 +2164,8 @@ export class FunnelChart extends ChartBase {
             if (i < this.labels.len) { name = this.labels[i]; }
             let pct = v[i] / maxv * 100.0;
             let lbl = name + "  " + fixed(v[i], 0) + " (" + fixed(pct, 0) + "%)";
-            let ly = (yTop + bandh / 2.0) as int + s.font_ascent() - s.font_height() / 2;
-            s.text((cx as int) - s.text_width(lbl) / 2, ly, lbl, th.on_surface);
+            let ly = yTop + bandh / 2.0 + s.font_ascent() - s.font_height() / 2.0;
+            s.text((cx) - s.text_width(lbl) / 2, ly, lbl, th.on_surface);
         }
     }
 
@@ -2164,10 +2174,11 @@ export class FunnelChart extends ChartBase {
         let plot = this.last_plot;
         let n = this.vals().len;
         let idx = -1;
-        if (n > 0 && py >= plot.y && py < plot.y + plot.h) {
-            let band = plot.h / n;
-            if (band > 0) {
-                idx = (py - plot.y) / band;
+        if (n > 0 && py as float >= plot.y && py as float < plot.bottom()) {
+            let band = plot.h / n as float;
+            if (band > 0.0) {
+                // pixel offset -> band index, so it lands back in index space
+                idx = ((py as float - plot.y) / band) as int;
                 if (idx >= n) { idx = n - 1; }
             }
         }
@@ -2243,7 +2254,7 @@ export class MapChart extends ChartBase {
     lat_lo: float; lat_hi: float;
     lon_lo: float; lon_hi: float;
     vmin: float; vmax: float;
-    hpx: int; hpy: int;
+    hpx: float; hpy: float;
 
     fn init(regions: MapRegion[], pts: MapPoint[]) {
         super.init([], []);
@@ -2299,10 +2310,10 @@ export class MapChart extends ChartBase {
 
     // equirectangular projection: lon→x, lat→y (north up)
     fn proj_x(lon: float, plot: Rect): float {
-        return (plot.x as float) + (lon - this.lon_lo) / (this.lon_hi - this.lon_lo) * (plot.w as float);
+        return plot.x + (lon - this.lon_lo) / (this.lon_hi - this.lon_lo) * plot.w;
     }
     fn proj_y(lat: float, plot: Rect): float {
-        return (plot.y as float) + (this.lat_hi - lat) / (this.lat_hi - this.lat_lo) * (plot.h as float);
+        return plot.y + (this.lat_hi - lat) / (this.lat_hi - this.lat_lo) * plot.h;
     }
 
     fn region_color(v: float, th: Theme): int {
@@ -2318,23 +2329,23 @@ export class MapChart extends ChartBase {
         for (let r in this.regions) {
             let np = r.lat.len;
             if (np < 3) { continue; }
-            let xs: i32[] = [];
-            let ys: i32[] = [];
+            let xs: float[] = [];
+            let ys: float[] = [];
             for (let k in 0..np) {
-                xs.push(this.proj_x(r.lon[k], plot) as i32);
-                ys.push(this.proj_y(r.lat[k], plot) as i32);
+                xs.push(this.proj_x(r.lon[k], plot));
+                ys.push(this.proj_y(r.lat[k], plot));
             }
             s.polygon(xs, ys, this.region_color(r.value, th));
             for (let k in 0..np) {
                 let k2 = (k + 1) % np;
-                s.line(xs[k] as int, ys[k] as int, xs[k2] as int, ys[k2] as int, th.border);
+                s.line(xs[k], ys[k], xs[k2], ys[k2], th.border);
             }
         }
         // points on top
         for (let p in this.pts) {
-            let x = this.proj_x(p.lon, plot) as int;
-            let y = this.proj_y(p.lat, plot) as int;
-            let rad = 3 + (5.0 * p.size) as int;
+            let x = this.proj_x(p.lon, plot);
+            let y = this.proj_y(p.lat, plot);
+            let rad = 3.0 + 5.0 * p.size;
             if (rad < 3) { rad = 3; }
             s.circle(x, y, rad, with_alpha(th.warning, 230));
         }
@@ -2346,11 +2357,11 @@ export class MapChart extends ChartBase {
         let plot = this.last_plot;
         let idx = -1;
         // nearest point wins if within its radius, else the region under cursor
-        let bestd = 14 * 14;
+        let bestd = 196.0;   // (14px)^2 hit radius
         for (let pi in 0..this.pts.len) {
             let p = this.pts[pi];
-            let dx = px - (this.proj_x(p.lon, plot) as int);
-            let dy = py - (this.proj_y(p.lat, plot) as int);
+            let dx = px as float - this.proj_x(p.lon, plot);
+            let dy = py as float - this.proj_y(p.lat, plot);
             let d = dx * dx + dy * dy;
             if (d < bestd) { bestd = d; idx = 1000 + pi; }
         }
@@ -2368,7 +2379,7 @@ export class MapChart extends ChartBase {
                 if (point_in_ring(px as float, py as float, xs, ys)) { idx = ri; }
             }
         }
-        this.hpx = px; this.hpy = py;
+        this.hpx = px as float; this.hpy = py as float;
         if (idx != this.hover_idx) { this.hover_idx = idx; this.repaint_now(); }
         return this;
     }
@@ -2395,14 +2406,14 @@ export class MapChart extends ChartBase {
         if (l0.len == 0) { l0 = l1; l1 = ""; }
         let tw = s.text_width(l0);
         if (s.text_width(l1) > tw) { tw = s.text_width(l1); }
-        let lh = s.font_height() + 2;
+        let lh = s.font_height() + 2.0;
         let rows = 1; if (l1.len > 0) { rows = 2; }
-        let bw = tw + th.space_3 * 2;
-        let bh = lh * rows + th.space_2;
+        let bw = tw + th.space_3 * 2.0;
+        let bh = lh * rows as float + th.space_2;
         let bx = this.hpx + th.space_2;
         let by = this.hpy + th.space_2;
-        if (bx + bw > plot.x + plot.w) { bx = plot.x + plot.w - bw; }
-        if (by + bh > plot.y + plot.h) { by = plot.y + plot.h - bh; }
+        if (bx + bw > plot.right()) { bx = plot.right() - bw; }
+        if (by + bh > plot.bottom()) { by = plot.bottom() - bh; }
         if (bx < plot.x) { bx = plot.x; }
         if (by < plot.y) { by = plot.y; }
         s.fill_round(Rect(bx, by, bw, bh), th.radius_md, th.surface);
@@ -2477,7 +2488,7 @@ export class TimeSeriesChart extends ChartBase {
 
     fn sx(t: float, plot: Rect): float {
         let lo = this.vis_lo(); let hi = this.vis_hi();
-        return (plot.x as float) + (t - lo) / (hi - lo) * (plot.w as float);
+        return plot.x + (t - lo) / (hi - lo) * plot.w;
     }
 
     override fn draw_axes(s: Painter, th: Theme, plot: Rect, sc: AxisScale) {
@@ -2485,11 +2496,11 @@ export class TimeSeriesChart extends ChartBase {
         let lo = this.vis_lo(); let hi = this.vis_hi();
         let step = time_nice_step(hi - lo);
         let fmt = time_fmt_for(hi - lo);
-        let by = plot.y + plot.h + s.font_ascent() + th.space_1;
+        let by = plot.bottom() + s.font_ascent() + th.space_1;
         let t = ceil(lo / step) * step;
         while (t <= hi) {
-            let x = this.sx(t, plot) as int;
-            if (this.show_grid) { s.line(x, plot.y, x, plot.y + plot.h, th.divider); }
+            let x = this.sx(t, plot);
+            if (this.show_grid) { s.line(x, plot.y, x, plot.bottom(), th.divider); }
             let lbl = date_format(date_from_unix(t as i64), fmt);
             s.text(x - s.text_width(lbl) / 2, by, lbl, th.on_surface_muted);
             t += step;
@@ -2513,7 +2524,8 @@ export class TimeSeriesChart extends ChartBase {
                 if (t < lo || t > hi) { continue; }   // virtualization: skip off-view
                 let x = this.sx(t, plot);
                 let y = this.vyr(vals[i], plot, sc);
-                if (this.decimate_on && n > plot.w * 2) {
+                if (this.decimate_on && n as float > plot.w * 2.0) {
+                    // the bucket key is a whole device column, so it snaps
                     let bx = x as int;
                     if (bx != bucket) { bucket = bx; xs.push(x); ys.push(y); }
                     else if (ys.len > 0) { ys[ys.len - 1] = fmin(ys[ys.len - 1], y); }
@@ -2523,11 +2535,11 @@ export class TimeSeriesChart extends ChartBase {
             }
             if (xs.len == 0) { continue; }
             if (this.gradient_on) {
-                let base = (plot.y + plot.h) as float;
+                let base = plot.bottom();
                 let edge = poly_line_path(xs, ys);
                 if (this.smooth_on) { edge = smooth_path(xs, ys); }
                 let fp = edge.flatten();
-                fill_gradient_under(s, fp.xs, fp.ys, base as int,
+                fill_gradient_under(s, fp.xs, fp.ys, base,
                                     with_alpha(color, 130), with_alpha(color, 8));
             }
             let line = poly_line_path(xs, ys);

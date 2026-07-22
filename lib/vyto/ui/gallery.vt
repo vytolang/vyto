@@ -18,17 +18,17 @@ export class ImageGallery extends Widget {
     paths: string[];
     handles: rawptr[];   // lazy, parallel to paths
     cols: int;
-    gap: int;
-    thumb: int;          // square thumbnail edge in px
+    gap: float;
+    thumb: float;        // square thumbnail edge in px
     hover_i: int;
     onOpen: fn(int);
 
-    fn init(paths: string[], cols: int, thumb: int) {
+    fn init(paths: string[], cols: int, thumb: float) {
         super.init();
         this.paths = paths;
         this.cols = cols;
         this.thumb = thumb;
-        this.gap = 8;
+        this.gap = 8.0;
         this.hover_i = -1;
         this.handles = [];
         for (let i in 0..paths.len) { this.handles.push(null); }
@@ -40,16 +40,16 @@ export class ImageGallery extends Widget {
     }
 
     override fn measure(s: Painter, th: Theme): Size {
-        let w = this.cols * this.thumb + (this.cols + 1) * this.gap;
-        let h = this.rows() * this.thumb + (this.rows() + 1) * this.gap;
+        let w = (this.cols as float) * this.thumb + (this.cols + 1) as float * this.gap;
+        let h = (this.rows() as float) * this.thumb + (this.rows() + 1) as float * this.gap;
         return Size(w, h);
     }
 
     fn cell_rect(i: int): Rect {
         let c = i % this.cols;
         let r = i / this.cols;
-        let x = this.bounds.x + this.gap + c * (this.thumb + this.gap);
-        let y = this.bounds.y + this.gap + r * (this.thumb + this.gap);
+        let x = this.bounds.x + this.gap + (c as float) * (this.thumb + this.gap);
+        let y = this.bounds.y + this.gap + (r as float) * (this.thumb + this.gap);
         return Rect(x, y, this.thumb, this.thumb);
     }
 
@@ -127,16 +127,16 @@ export class GalleryViewer extends Widget {
     handles: rawptr[];
     index: int;
     zoom: float;
-    pan_x: int;
-    pan_y: int;
+    pan_x: float;
+    pan_y: float;
 
     fn init(paths: string[], index: int) {
         super.init();
         this.paths = paths;
         this.index = index;
         this.zoom = 1.0;
-        this.pan_x = 0;
-        this.pan_y = 0;
+        this.pan_x = 0.0;
+        this.pan_y = 0.0;
         this.modal = true;
         this.handles = [];
         for (let i in 0..paths.len) { this.handles.push(null); }
@@ -146,7 +146,7 @@ export class GalleryViewer extends Widget {
         this.bounds = Rect(0, 0, s.width(), s.height());
     }
 
-    fn reset_view() { this.zoom = 1.0; this.pan_x = 0; this.pan_y = 0; }
+    fn reset_view() { this.zoom = 1.0; this.pan_x = 0.0; this.pan_y = 0.0; }
 
     fn go(delta: int) {
         this.index += delta;
@@ -159,14 +159,14 @@ export class GalleryViewer extends Widget {
     // the destination rect for the current image: a centered fit box grown by
     // zoom and shifted by pan.
     fn image_rect(): Rect {
-        let margin = 48;
-        let bw = this.bounds.w - 2 * margin;
-        let bh = this.bounds.h - 2 * margin;
-        let zw = (bw as float * this.zoom) as int;
-        let zh = (bh as float * this.zoom) as int;
-        let cx = this.bounds.x + this.bounds.w / 2 + this.pan_x;
-        let cy = this.bounds.y + this.bounds.h / 2 + this.pan_y;
-        return Rect(cx - zw / 2, cy - zh / 2, zw, zh);
+        let margin = 48.0;
+        let bw = this.bounds.w - 2.0 * margin;
+        let bh = this.bounds.h - 2.0 * margin;
+        let zw = bw * this.zoom;
+        let zh = bh * this.zoom;
+        let cx = this.bounds.cx() + this.pan_x;
+        let cy = this.bounds.cy() + this.pan_y;
+        return Rect(cx - zw / 2.0, cy - zh / 2.0, zw, zh);
     }
 
     override fn draw(s: Painter, th: Theme) {
@@ -175,27 +175,28 @@ export class GalleryViewer extends Widget {
             this.handles[this.index] = s.load_image(this.paths[this.index]);
         }
         let ir = this.image_rect();
-        s.clip_push(this.bounds, 0);
+        s.clip_push(this.bounds, 0.0);
         s.draw_image(this.handles[this.index], ir);
         s.clip_pop();
         // chevrons
-        let cy = this.bounds.y + this.bounds.h / 2;
+        let cy = this.bounds.cy();
         let lc = this.bounds.x + 24;
         s.line_w(lc + 6, cy - 10, lc - 4, cy, 3, th.surface_raised);
         s.line_w(lc - 4, cy, lc + 6, cy + 10, 3, th.surface_raised);
-        let rc = this.bounds.x + this.bounds.w - 24;
+        let rc = this.bounds.right() - 24;
         s.line_w(rc - 6, cy - 10, rc + 4, cy, 3, th.surface_raised);
         s.line_w(rc + 4, cy, rc - 6, cy + 10, 3, th.surface_raised);
         // counter
         let label = "" + (this.index + 1) + " / " + this.paths.len;
-        s.text_in(Rect(this.bounds.x, this.bounds.y + this.bounds.h - 32,
+        s.text_in(Rect(this.bounds.x, this.bounds.bottom() - 32,
                        this.bounds.w, 24), 0, label, th.surface_raised);
     }
 
     override fn on_click(x: int, y: int): bool {
-        let third = this.bounds.w / 3;
-        if (x < this.bounds.x + third) { this.go(-1); return true; }
-        if (x > this.bounds.x + this.bounds.w - third) { this.go(1); return true; }
+        let fx = x as float;
+        let third = this.bounds.w / 3.0;
+        if (fx < this.bounds.x + third) { this.go(-1); return true; }
+        if (fx > this.bounds.right() - third) { this.go(1); return true; }
         // center tap: close when not zoomed, else reset zoom
         if (this.zoom > 1.01) { this.reset_view(); this.invalidate(); return true; }
         if (this.win != null) { this.win.dismiss_overlay(); }
@@ -205,7 +206,7 @@ export class GalleryViewer extends Widget {
     override fn on_scroll(delta: int): bool {
         // wheel up (negative) zooms in
         this.zoom -= (delta as float) * 0.12;
-        if (this.zoom < 1.0) { this.zoom = 1.0; this.pan_x = 0; this.pan_y = 0; }
+        if (this.zoom < 1.0) { this.zoom = 1.0; this.pan_x = 0.0; this.pan_y = 0.0; }
         if (this.zoom > 5.0) { this.zoom = 5.0; }
         this.invalidate();
         return true;
@@ -215,9 +216,9 @@ export class GalleryViewer extends Widget {
         if (k == KEY_LEFT) { this.go(-1); return true; }
         if (k == KEY_RIGHT) { this.go(1); return true; }
         if (ch == "+" || ch == "=") { this.zoom += 0.25; if (this.zoom > 5.0) { this.zoom = 5.0; } this.invalidate(); return true; }
-        if (ch == "-") { this.zoom -= 0.25; if (this.zoom < 1.0) { this.zoom = 1.0; this.pan_x = 0; this.pan_y = 0; } this.invalidate(); return true; }
+        if (ch == "-") { this.zoom -= 0.25; if (this.zoom < 1.0) { this.zoom = 1.0; this.pan_x = 0.0; this.pan_y = 0.0; } this.invalidate(); return true; }
         if (this.zoom > 1.01) {
-            let step = 40;
+            let step = 40.0;
             if (k == KEY_UP) { this.pan_y += step; this.invalidate(); return true; }
             if (k == KEY_DOWN) { this.pan_y -= step; this.invalidate(); return true; }
         }

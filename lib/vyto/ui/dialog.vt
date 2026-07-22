@@ -38,8 +38,8 @@ export class Dialog extends Widget {
 const FF_LIST: int = 0;
 const FF_PATH: int = 1;
 
-const FP_ROW_H: int = 30;
-const FP_SEP_W: int = 16;          // breadcrumb chevron-separator gap
+const FP_ROW_H: float = 30.0;
+const FP_SEP_W: float = 16.0;          // breadcrumb chevron-separator gap
 const FP_DBLCLICK_MS: int = 400;
 
 // One directory entry: name + type + size (bytes, -1 if unknown) + mtime (unix
@@ -112,7 +112,7 @@ export class FilePicker extends Dialog {
     dir: string;
     entries: FileEntry[];
     selected: int;
-    scroll: int;             // first visible row
+    scroll: int;             // first visible row (an index, not pixels)
     hover_row: int;
     show_hidden: bool;
     save_mode: bool;
@@ -129,8 +129,8 @@ export class FilePicker extends Dialog {
     hidden_rect: Rect;
     crumb_labels: string[];
     crumb_paths: string[];
-    crumb_x: int[];
-    crumb_w: int[];
+    crumb_x: float[];
+    crumb_w: float[];
 
     // double-click emulation (overlays only receive on_click)
     last_click_ms: int;
@@ -305,7 +305,8 @@ export class FilePicker extends Dialog {
     // ------------------------------------------------------- list scrolling
 
     fn visible_rows(): int {
-        let n = (this.list_rect.h - 2) / FP_ROW_H;
+        // a row count, so the divide lands back in index space
+        let n = ((this.list_rect.h - 2.0) / FP_ROW_H) as int;
         if (n < 1) { return 1; }
         return n;
     }
@@ -398,7 +399,7 @@ export class FilePicker extends Dialog {
         this.list_rect = Rect(x + pad, listy, dw - 2 * pad, listh);
 
         this.pathfield.bounds = Rect(x + pad, fieldy, dw - 2 * pad, ctrl);
-        let bw = 96;
+        let bw = 96.0;
         this.cancel.bounds = Rect(x + dw - pad - bw, btny, bw, ctrl);
         this.ok.bounds = Rect(x + dw - pad - 2 * bw - 8, btny, bw, ctrl);
 
@@ -408,11 +409,11 @@ export class FilePicker extends Dialog {
 
     // compute each crumb's x/width; right-align the strip so the deepest
     // segment stays visible when the path overflows (leading crumbs clip away)
-    fn layout_crumbs(s: Painter, x0: int, xmax: int) {
+    fn layout_crumbs(s: Painter, x0: float, xmax: float) {
         this.crumb_x = [];
         this.crumb_w = [];
-        let widths: int[] = [];
-        let total = 0;
+        let widths: float[] = [];
+        let total = 0.0;
         for (let i in 0..this.crumb_labels.len) {
             let w = s.text_width(this.crumb_labels[i]);
             widths.push(w);
@@ -446,17 +447,17 @@ export class FilePicker extends Dialog {
 
         // up-one-level chevron (points up)
         let ur = this.up_rect;
-        let ucx = ur.x + ur.w / 2;
-        let ucy = ur.y + ur.h / 2;
+        let ucx = ur.cx();
+        let ucy = ur.cy();
         s.line_w(ucx - 5, ucy + 2, ucx, ucy - 4, 2, th.on_surface_muted);
         s.line_w(ucx, ucy - 4, ucx + 5, ucy + 2, 2, th.on_surface_muted);
 
         // lay the crumbs out here (painter available) so crumb_x/crumb_w always
         // match the current crumb_labels, even after a redraw with no re-place
-        this.layout_crumbs(s, ur.x + ur.w + 6, this.hidden_rect.x - 8);
+        this.layout_crumbs(s, ur.right() + 6, this.hidden_rect.x - 8);
 
         // path segments (clipped to the strip between up + hidden controls)
-        s.clip_push(Rect(ur.x + ur.w, h.y, this.hidden_rect.x - (ur.x + ur.w), h.h), 0);
+        s.clip_push(Rect(ur.right(), h.y, this.hidden_rect.x - ur.right(), h.h), 0);
         for (let i in 0..this.crumb_labels.len) {
             let cx = this.crumb_x[i];
             let cw = this.crumb_w[i];
@@ -466,7 +467,7 @@ export class FilePicker extends Dialog {
             s.text_in(Rect(cx, h.y, cw + 2, h.h), 0, this.crumb_labels[i], col);
             if (!last) {
                 let gx = cx + cw + FP_SEP_W / 2;
-                let gy = h.y + h.h / 2;
+                let gy = h.cy();
                 s.line_w(gx - 2, gy - 4, gx + 2, gy, 2, th.on_surface_subtle);
                 s.line_w(gx + 2, gy, gx - 2, gy + 4, 2, th.on_surface_subtle);
             }
@@ -477,8 +478,8 @@ export class FilePicker extends Dialog {
         let hr = this.hidden_rect;
         let ecol = th.on_surface_muted;
         if (this.show_hidden) { ecol = th.primary; }
-        let ex = hr.x + hr.w / 2;
-        let ey = hr.y + hr.h / 2;
+        let ex = hr.cx();
+        let ey = hr.cy();
         s.stroke_circle(ex, ey, 6, 2, ecol);
         s.circle(ex, ey, 2, ecol);
     }
@@ -505,7 +506,7 @@ export class FilePicker extends Dialog {
             let idx = this.scroll + i;
             if (idx >= this.entries.len) { break; }
             let e = this.entries[idx];
-            let r = Rect(b.x + 1, b.y + 1 + i * FP_ROW_H, b.w - 2, FP_ROW_H);
+            let r = Rect(b.x + 1, b.y + 1 + (i as float) * FP_ROW_H, b.w - 2, FP_ROW_H);
             if (idx == this.selected) {
                 s.fill_round(Rect(r.x + 3, r.y + 2, r.w - 6, r.h - 4), th.radius_sm, th.selection);
             } else if (idx == this.hover_row) {
@@ -513,8 +514,8 @@ export class FilePicker extends Dialog {
                              mix(th.surface, th.on_surface, 0.05));
             }
 
-            let iconsz = 18;
-            let ir = Rect(r.x + 12, r.y + (FP_ROW_H - iconsz) / 2, iconsz, iconsz);
+            let iconsz = 18.0;
+            let ir = Rect(r.x + 12.0, r.y + (FP_ROW_H - iconsz) / 2.0, iconsz, iconsz);
             let icol = th.on_surface_muted;
             if (e.is_dir) { icol = th.primary; }
             draw_file_glyph(s, ir, e.is_dir, icol, th.surface);
@@ -524,7 +525,7 @@ export class FilePicker extends Dialog {
             let metaw = s.text_width(meta);
 
             let namex = ir.x + iconsz + 12;
-            let namew = r.x + r.w - namex - metaw - 24;
+            let namew = r.right() - namex - metaw - 24;
             if (namew < 40) { namew = 40; }
             s.text_in(Rect(namex, r.y, namew, FP_ROW_H), 0, e.name, th.on_surface);
             s.text_right(Rect(r.x, r.y, r.w - 12, FP_ROW_H), 0, meta, th.on_surface_muted);
@@ -588,7 +589,7 @@ export class FilePicker extends Dialog {
         }
         if (contains(this.list_rect, x, y)) {
             this.focus_field = FF_LIST;
-            let row = (y - this.list_rect.y - 1) / FP_ROW_H;
+            let row = ((y as float - this.list_rect.y - 1.0) / FP_ROW_H) as int;
             let idx = this.scroll + row;
             if (idx >= 0 && idx < this.entries.len) {
                 let now = this.now_ms();
@@ -634,13 +635,13 @@ export class MessageDialog extends Dialog {
     }
 
     override fn place(s: Painter, th: Theme) {
-        let dw = 320;
+        let dw = 320.0;
         let fh = s.font_height();
         let titleh = fh + 10;
         let ctrl = fh + 12;
         // measure wrapped text
         this.msg_text.layout(s, th, new BoxConstraints(0, dw - 32, 0, 400));
-        let msg_h = this.msg_text.cached_count * (fh + 2);
+        let msg_h = (this.msg_text.cached_count as float) * (fh + 2);
         if (msg_h < fh + 10) { msg_h = fh + 10; }
         let dh = titleh + 16 + msg_h + 16 + ctrl + 12;
         let x = (s.width() - dw) / 2;
@@ -710,13 +711,13 @@ export class AlertDialog extends Dialog {
 
     override fn place(s: Painter, th: Theme) {
         this.ensure_btns();
-        let dw = 360;
+        let dw = 360.0;
         let fh = s.font_height();
         let titleh = fh + 10;
         let ctrl = fh + 12;
-        let textx = 60;   // room for the severity glyph on the left
+        let textx = 60.0; // room for the severity glyph on the left
         this.msg_text.layout(s, th, new BoxConstraints(0, dw - textx - 16, 0, 400));
-        let msg_h = this.msg_text.cached_count * (fh + 2);
+        let msg_h = (this.msg_text.cached_count as float) * (fh + 2);
         if (msg_h < fh + 10) { msg_h = fh + 10; }
         let dh = titleh + 16 + msg_h + 16 + ctrl + 12;
         let x = (s.width() - dw) / 2;
@@ -798,14 +799,14 @@ export class ProgressDialog extends Dialog {
     fn set_indeterminate(v: bool) { this.bar.indeterminate = v; }
 
     override fn place(s: Painter, th: Theme) {
-        let dw = 340;
+        let dw = 340.0;
         let fh = s.font_height();
         let titleh = fh + 10;
         let ctrl = fh + 12;
         this.msg_text.layout(s, th, new BoxConstraints(0, dw - 32, 0, 400));
-        let msg_h = this.msg_text.cached_count * (fh + 2);
+        let msg_h = (this.msg_text.cached_count as float) * (fh + 2);
         if (msg_h < fh + 4) { msg_h = fh + 4; }
-        let barh = 8;
+        let barh = 8.0;
         let dh = titleh + 16 + msg_h + 12 + barh + 16;
         if (this.show_cancel) { dh += ctrl + 12; }
         let x = (s.width() - dw) / 2;

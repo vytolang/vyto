@@ -281,6 +281,18 @@ else
     fail=1
 fi
 
+# Start the UI section from a cold cache. These tests are the only ones that
+# assert on lib/vyto/ui behaviour, and a stale object here makes them validate
+# the previous build instead of the current one — observed in practice, with
+# the suite reporting results one edit-generation behind the source on disk.
+# A cold rebuild of the whole ui stack is ~3.5s and only the first test pays
+# it, which is a cheap price for the suite meaning what it says.
+#
+# Cleared once here rather than passing --clean per test: --clean is the
+# equivalent for a single manual run, but using it in the loop below would
+# re-pay the cold build on every one of the ~50 cases.
+rm -rf tests/ui/.vyto-cache
+
 # --- vyto/ui headless golden tests (VS_HEADLESS backend, scripted events) ---
 for src in tests/ui/[0-9]*.vt; do
     name=$(basename "$src" .vt)
@@ -310,9 +322,33 @@ for name in textarea menu gallery; do
     fi
 done
 
+# --- render snapshots: rasterize real widget trees through the rich tier
+#     (blend2d) and assert on a hash of the pixels. The goldens above cover
+#     widget state; these cover what the widgets actually look like.
+#
+#     On failure the frames are dumped as PPMs under tests/tmp/snap so the
+#     change can be inspected — a hash says a frame moved, not how.
+mkdir -p tests/tmp
+for src in tests/ui/snap_*.vt; do
+    [ -e "$src" ] || continue
+    name=$(basename "$src" .vt)
+    got=$(VS_HEADLESS=1 VS_EVENTS="tests/ui/$name.events" ./vytoc run "$src" 2>&1)
+    if [ "$got" = "$(cat "tests/ui/$name.expected")" ]; then
+        echo "PASS ui_$name"
+    else
+        echo "FAIL ui_$name"
+        echo "--- expected ---"; cat "tests/ui/$name.expected"
+        echo "--- got ---"; printf '%s\n' "$got"
+        rm -rf "tests/tmp/snap/$name"; mkdir -p "tests/tmp/snap/$name"
+        VS_HEADLESS=1 VS_EVENTS="tests/ui/$name.events" \
+            VYTO_SNAP_DIR="tests/tmp/snap/$name" ./vytoc run "$src" >/dev/null 2>&1
+        echo "--- frames written to tests/tmp/snap/$name ---"
+        fail=1
+    fi
+done
+
 # --- framebuffer backend, file target: render a known pattern into a raw
 #     XRGB8888 file and verify it byte-for-byte (no display or fb device) ---
-mkdir -p tests/tmp
 rm -f tests/tmp/fb.raw
 render=$(VS_FBDEV=tests/tmp/fb.raw VS_FB_W=4 VS_FB_H=4 \
          ./vytoc run tests/ui/fb_render.vt 2>&1)

@@ -1,0 +1,86 @@
+// vyto/gfx/snapshot — render-snapshot testing for vyto/ui.
+//
+// The existing tests/ui goldens assert widget *state* as stdout text, which
+// covers layout, hit-testing, and event routing but is blind to what the
+// widgets actually look like. This module closes that gap: it renders a real
+// widget tree through the rich tier and reduces the frame to a hash that the
+// same text-golden harness can assert on.
+//
+// It works because a blend2d Canvas is window-independent — GfxPainter takes a
+// Surface only to blit into at present time. Under VS_HEADLESS=1 that blit is a
+// harmless no-op, so the widget tree rasterizes into an in-memory buffer with
+// no display server and no new backend.
+//
+//     fn main() {
+//         let win = new Window("Buttons", 320, 120);
+//         let snap = new Snapshot(win, 15.0);
+//         win.root = new Column([new Button("OK", null)]);
+//         snap.capture("default");
+//         win.run();
+//     }
+//
+// Run it the same way as any other headless UI test:
+//
+//     VS_HEADLESS=1 VS_EVENTS=tests/ui/snap_buttons.events \
+//       ./vytoc run tests/ui/snap_buttons.vt
+//
+// Each capture prints `snap <label> <hash>`; the .expected file holds those
+// lines. On a mismatch, re-run with VYTO_SNAP_DIR=some/dir to also write each
+// frame as a PPM — a hash tells you a frame changed, the image tells you how.
+//
+// FONT PINNING: text rasterization depends on the exact font file, so the
+// hash does too. The font path is pinned here rather than left to the caller,
+// and a missing file is a hard error instead of a silent fallback to blank
+// text — an unnoticed fallback would make every golden agree on the wrong
+// thing. A font package upgrade will legitimately invalidate text-bearing
+// goldens; that is the accepted cost of pixel assertions.
+
+import { Window } from "vyto/ui";
+import { GfxPainter } from "vyto/gfx/painter";
+import { getenv, exit } from "vyto/os";
+import { file_exists } from "vyto/io/file";
+
+// Present on every distro this project targets, and on GitHub's ubuntu runners
+// via fonts-dejavu-core. Kept as a constant so every snapshot test in the tree
+// rasterizes through the same face.
+export const SNAP_FONT: string = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf";
+
+export class Snapshot {
+    win: Window;
+    painter: GfxPainter;
+    dir: string;   // VYTO_SNAP_DIR, or "" when not dumping images
+    n: int;        // capture counter, prefixes dumped filenames so they sort by time
+
+    // Installs a GfxPainter on `win` — call before setting up the widget tree.
+    fn init(win: Window, fontSize: float) {
+        // Loud failure, not a fallback: GfxPainter silently degrades a missing
+        // font to blank text, which would make every golden in the suite agree
+        // on an empty frame and look like a pass.
+        if (!file_exists(SNAP_FONT)) {
+            print("snapshot: pinned font missing: " + SNAP_FONT);
+            print("snapshot: install fonts-dejavu-core (or equivalent) to run snapshot tests");
+            exit(1);
+        }
+        this.win = win;
+        this.painter = new GfxPainter(win.surface(), SNAP_FONT, fontSize);
+        win.use_painter(this.painter);
+        this.dir = getenv("VYTO_SNAP_DIR");
+        this.n = 0;
+    }
+
+    // Force a full repaint, then fingerprint the frame. Prints one golden line.
+    //
+    // redraw() rather than repaint(): a snapshot must not depend on which
+    // region happened to be dirty, or the hash would encode test history
+    // instead of the rendered result.
+    fn capture(label: string) {
+        this.win.redraw();
+        let h = this.painter.canvas.hash();
+        print("snap " + label + " " + h);
+        if (this.dir != "") {
+            let path = this.dir + "/" + this.n + "_" + label + ".ppm";
+            this.painter.canvas.writePPM(path);
+        }
+        this.n += 1;
+    }
+}

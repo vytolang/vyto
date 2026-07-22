@@ -11,10 +11,10 @@ import { Rect, contains, mix, KEY_LEFT, KEY_RIGHT, KEY_UP, KEY_DOWN } from "vyto
 export class TabView extends Widget {
     tab_labels: string[];
     active: int;
-    tab_h: int;
+    tab_h: float;
     onSwitch: fn(int);
-    tab_x: int[];      // cached left edge of each tab
-    tab_w_arr: int[];  // cached width of each tab
+    tab_x: float[];    // cached left edge of each tab
+    tab_w_arr: float[]; // cached width of each tab
 
     fn init(labels: string[]) {
         super.init();
@@ -42,12 +42,12 @@ export class TabView extends Widget {
         }
     }
 
-    fn tab_w(s: Painter, idx: int): int {
-        return s.text_width(this.tab_labels[idx]) + 20;
+    fn tab_w(s: Painter, idx: int): float {
+        return s.text_width(this.tab_labels[idx]) + 20.0;
     }
 
     override fn measure(s: Painter, th: Theme): Size {
-        let tw = 0;
+        let tw = 0.0;
         for (let i in 0..this.tab_labels.len) {
             tw += this.tab_w(s, i);
         }
@@ -64,8 +64,8 @@ export class TabView extends Widget {
     override fn layout(s: Painter, th: Theme, bc: BoxConstraints): Size {
         let sz = bc.constrain(this.measure(s, th));
         // cache tab positions for hit-testing
-        let xs: int[] = [];
-        let ws: int[] = [];
+        let xs: float[] = [];
+        let ws: float[] = [];
         let x = this.bounds.x;
         for (let i in 0..this.tab_labels.len) {
             let tw = this.tab_w(s, i);
@@ -81,8 +81,8 @@ export class TabView extends Widget {
     override fn arrange(s: Painter, th: Theme, r: Rect) {
         this.bounds = r;
         // re-cache tab positions for hit-testing
-        let xs: int[] = [];
-        let ws: int[] = [];
+        let xs: float[] = [];
+        let ws: float[] = [];
         let x = r.x;
         for (let i in 0..this.tab_labels.len) {
             let tw = this.tab_w(s, i);
@@ -112,8 +112,8 @@ export class TabView extends Widget {
     override fn draw_within(s: Painter, th: Theme, d: Rect) {
         // prune if we don't intersect the dirty rect
         let b = this.bounds;
-        if (b.x + b.w <= d.x || d.x + d.w <= b.x ||
-            b.y + b.h <= d.y || d.y + d.h <= b.y) { return; }
+        if (b.right() <= d.x || d.right() <= b.x ||
+            b.bottom() <= d.y || d.bottom() <= b.y) { return; }
         this.draw_chrome(s, th);
         if (this.active < this.children.len) {
             this.children[this.active].draw_within(s, th, d);
@@ -124,8 +124,8 @@ export class TabView extends Widget {
         // tab strip background
         s.fill(Rect(this.bounds.x, this.bounds.y, this.bounds.w, this.tab_h), th.surface);
         let x = this.bounds.x;
-        let xs: int[] = [];
-        let ws: int[] = [];
+        let xs: float[] = [];
+        let ws: float[] = [];
         for (let i in 0..this.tab_labels.len) {
             let tw = this.tab_w(s, i);
             xs.push(x);
@@ -151,7 +151,7 @@ export class TabView extends Widget {
         this.tab_w_arr = ws;
         // separator hairline under the strip
         s.line(this.bounds.x, this.bounds.y + this.tab_h,
-               this.bounds.x + this.bounds.w, this.bounds.y + this.tab_h, th.divider);
+               this.bounds.right(), this.bounds.y + this.tab_h, th.divider);
     }
 
     // Only the active panel participates in hit-testing — inactive panels
@@ -159,7 +159,8 @@ export class TabView extends Widget {
     // would find whichever panel happens to be last in the children array.
     override fn hit(px: int, py: int): Widget {
         // tab strip: the TabView itself is the target
-        if (py >= this.bounds.y && py < this.bounds.y + this.tab_h) {
+        let fy = py as float;
+        if (fy >= this.bounds.y && fy < this.bounds.y + this.tab_h) {
             if (contains(this.bounds, px, py)) { return this; }
             return null;
         }
@@ -171,9 +172,11 @@ export class TabView extends Widget {
     }
 
     override fn on_click(x: int, y: int): bool {
-        if (y < this.bounds.y || y >= this.bounds.y + this.tab_h) { return false; }
+        let fy = y as float;
+        if (fy < this.bounds.y || fy >= this.bounds.y + this.tab_h) { return false; }
+        let fx = x as float;
         for (let i in 0..this.tab_x.len) {
-            if (x >= this.tab_x[i] && x < this.tab_x[i] + this.tab_w_arr[i]) {
+            if (fx >= this.tab_x[i] && fx < this.tab_x[i] + this.tab_w_arr[i]) {
                 this.switch_tab(i);
                 return true;
             }
@@ -212,8 +215,8 @@ export class Accordion extends Widget {
     titles: string[];
     expanded: bool[];
     onToggle: fn(int, bool);
-    cached_hh: int;     // cached header height for click hit-testing
-    cached_child_h: int[]; // cached child heights for click hit-testing
+    cached_hh: float;   // cached header height for click hit-testing
+    cached_child_h: float[]; // cached child heights for click hit-testing
     hover_i: int;       // header row under the cursor (-1 = none), for hover tint
 
     fn init(titles: string[]) {
@@ -248,11 +251,11 @@ export class Accordion extends Widget {
         }
     }
 
-    fn header_h(s: Painter): int { return s.font_height() + 12; }
+    fn header_h(s: Painter): float { return s.font_height() + 12.0; }
 
     override fn measure(s: Painter, th: Theme): Size {
-        let w = 0;
-        let h = 0;
+        let w = 0.0;
+        let h = 0.0;
         let hh = this.header_h(s);
         for (let i in 0..this.titles.len) {
             let tw = s.text_width(this.titles[i]) + 30;
@@ -272,7 +275,7 @@ export class Accordion extends Widget {
         this.cached_hh = this.header_h(s);
         let y = r.y;
         let hh = this.cached_hh;
-        let chs: int[] = [];
+        let chs: float[] = [];
         for (let i in 0..this.titles.len) {
             chs.push(0);
         }
@@ -317,7 +320,7 @@ export class Accordion extends Widget {
             if (this.expanded[i] && i < this.cached_child_h.len) {
                 y += this.cached_child_h[i] + th.spacing;
             }
-            s.line(this.bounds.x, y, this.bounds.x + this.bounds.w, y, th.divider);
+            s.line(this.bounds.x, y, this.bounds.right(), y, th.divider);
         }
     }
 
@@ -333,8 +336,8 @@ export class Accordion extends Widget {
 
     override fn draw_within(s: Painter, th: Theme, d: Rect) {
         let b = this.bounds;
-        if (b.x + b.w <= d.x || d.x + d.w <= b.x ||
-            b.y + b.h <= d.y || d.y + d.h <= b.y) { return; }
+        if (b.right() <= d.x || d.right() <= b.x ||
+            b.bottom() <= d.y || d.bottom() <= b.y) { return; }
         this.draw_chrome(s, th);
         for (let i in 0..this.titles.len) {
             if (this.expanded[i] && i < this.children.len) {
@@ -346,12 +349,13 @@ export class Accordion extends Widget {
     // Header index at local y (-1 when y is over a body or gap). Uses th.spacing
     // so it stays aligned with arrange()/draw_chrome (was a hardcoded +8).
     fn header_at(py: int): int {
+        let fy = py as float;
         let cy = this.bounds.y;
         let hh = this.cached_hh;
-        let gap = 8;
+        let gap = 8.0;
         if (this.win != null) { gap = this.win.theme.spacing; }
         for (let i in 0..this.titles.len) {
-            if (py >= cy && py < cy + hh) { return i; }
+            if (fy >= cy && fy < cy + hh) { return i; }
             cy += hh;
             if (this.expanded[i] && i < this.cached_child_h.len) {
                 cy += this.cached_child_h[i] + gap;
@@ -403,10 +407,10 @@ export class Accordion extends Widget {
 
 // Horizontal action strip of buttons (icon support later).
 export class Toolbar extends Widget {
-    padding: int;
-    spacing: int;
+    padding: float;
+    spacing: float;
 
-    fn init(padding: int, spacing: int, kids: Widget[]) {
+    fn init(padding: float, spacing: float, kids: Widget[]) {
         super.init();
         this.padding = padding;
         this.spacing = spacing;
@@ -415,14 +419,14 @@ export class Toolbar extends Widget {
 
     override fn measure(s: Painter, th: Theme): Size {
         let w = 2 * this.padding;
-        let h = 0;
+        let h = 0.0;
         let n = this.children.len;
         for (let c in this.children) {
             let cs = c.measure(s, th);
             w += cs.w;
             if (cs.h > h) { h = cs.h; }
         }
-        if (n > 1) { w += this.spacing * (n - 1); }
+        if (n > 1) { w += this.spacing * (n - 1) as float; }
         return Size(w, h + 2 * this.padding);
     }
 
@@ -441,7 +445,7 @@ export class Toolbar extends Widget {
     override fn draw(s: Painter, th: Theme) {
         s.fill(this.bounds, th.surface_raised);
         s.line(this.bounds.x, this.bounds.y,
-               this.bounds.x + this.bounds.w, this.bounds.y, th.divider);
+               this.bounds.right(), this.bounds.y, th.divider);
         for (let c in this.children) { c.draw(s, th); }
     }
 }
@@ -459,7 +463,7 @@ export class StatusBar extends Widget {
         this.right_text = right_text;
     }
 
-    fn bar_h(s: Painter): int { return s.font_height() + 8; }
+    fn bar_h(s: Painter): float { return s.font_height() + 8.0; }
 
     override fn measure(s: Painter, th: Theme): Size {
         return Size(200, this.bar_h(s));
@@ -472,11 +476,11 @@ export class StatusBar extends Widget {
     override fn draw(s: Painter, th: Theme) {
         s.fill(this.bounds, th.surface);
         s.line(this.bounds.x, this.bounds.y,
-               this.bounds.x + this.bounds.w, this.bounds.y, th.divider);
+               this.bounds.right(), this.bounds.y, th.divider);
         s.text_in(Rect(this.bounds.x + 8, this.bounds.y,
                        this.bounds.w / 2, this.bounds.h), 0, this.left_text, th.on_surface_muted);
         let rw = s.text_width(this.right_text);
-        s.text_in(Rect(this.bounds.x + this.bounds.w - rw - 8, this.bounds.y,
+        s.text_in(Rect(this.bounds.right() - rw - 8, this.bounds.y,
                        rw + 8, this.bounds.h), 0, this.right_text, th.on_surface_muted);
     }
 }
@@ -490,8 +494,8 @@ export class Breadcrumb extends Widget {
     crumbs: string[];
     onSelect: fn(int);
     hover_i: int;
-    seg_x: int[];   // cached per-crumb hit x-start (set in draw)
-    seg_w: int[];   // cached per-crumb text width
+    seg_x: float[]; // cached per-crumb hit x-start (set in draw)
+    seg_w: float[]; // cached per-crumb text width
 
     fn init(crumbs: string[]) {
         super.init();
@@ -501,10 +505,10 @@ export class Breadcrumb extends Widget {
         this.seg_w = [];
     }
 
-    fn sep_w(): int { return 18; }
+    fn sep_w(): float { return 18.0; }
 
     override fn measure(s: Painter, th: Theme): Size {
-        let w = 8;
+        let w = 8.0;
         let n = this.crumbs.len;
         for (let i in 0..n) {
             w += s.text_width(this.crumbs[i]);
@@ -517,7 +521,7 @@ export class Breadcrumb extends Widget {
         this.seg_x = [];
         this.seg_w = [];
         let x = this.bounds.x + 4;
-        let cy = this.bounds.y + this.bounds.h / 2;
+        let cy = this.bounds.cy();
         let base = s.baseline_in(this.bounds);
         let n = this.crumbs.len;
         for (let i in 0..n) {
@@ -541,8 +545,9 @@ export class Breadcrumb extends Widget {
     }
 
     fn crumb_at(px: int): int {
+        let fx = px as float;
         for (let i in 0..this.seg_x.len) {
-            if (px >= this.seg_x[i] && px < this.seg_x[i] + this.seg_w[i]) { return i; }
+            if (fx >= this.seg_x[i] && fx < this.seg_x[i] + this.seg_w[i]) { return i; }
         }
         return -1;
     }
@@ -579,7 +584,7 @@ export class Breadcrumb extends Widget {
 
 // --------------------------------------------------------------- NavRail / Sidebar
 
-const NAVRAIL_ROW_H: int = 40;
+const NAVRAIL_ROW_H: float = 40.0;
 
 // A vertical navigation list: one selected item (accent bar + pill), hover
 // tint, keyboard Up/Down. Label-only (compose an Icon column in the app if
@@ -589,7 +594,7 @@ export class NavRail extends Widget {
     selected: int;
     onSelect: fn(int);
     hover_i: int;
-    rail_w: int;
+    rail_w: float;
 
     fn init(items: string[]) {
         super.init();
@@ -601,13 +606,13 @@ export class NavRail extends Widget {
     }
 
     override fn measure(s: Painter, th: Theme): Size {
-        return Size(this.rail_w, NAVRAIL_ROW_H * this.items.len + 8);
+        return Size(this.rail_w, NAVRAIL_ROW_H * this.items.len as float + 8);
     }
 
     override fn draw(s: Painter, th: Theme) {
         s.fill(this.bounds, th.surface_raised);
-        s.line(this.bounds.x + this.bounds.w - 1, this.bounds.y,
-               this.bounds.x + this.bounds.w - 1, this.bounds.y + this.bounds.h, th.divider);
+        s.line(this.bounds.right() - 1, this.bounds.y,
+               this.bounds.right() - 1, this.bounds.bottom(), th.divider);
         let y = this.bounds.y + 4;
         for (let i in 0..this.items.len) {
             let rr = Rect(this.bounds.x + 6, y, this.bounds.w - 12, NAVRAIL_ROW_H - 4);
@@ -626,7 +631,9 @@ export class NavRail extends Widget {
     }
 
     fn row_at(py: int): int {
-        let r = (py - this.bounds.y - 4) / NAVRAIL_ROW_H;
+        // pixel offset -> item index: the division lands back in index space,
+        // so it truncates to int here rather than staying geometric.
+        let r = ((py as float - this.bounds.y - 4.0) / NAVRAIL_ROW_H) as int;
         if (r < 0 || r >= this.items.len) { return -1; }
         return r;
     }

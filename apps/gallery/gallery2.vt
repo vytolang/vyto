@@ -51,8 +51,8 @@ fn titled(caption: string, w: Widget): Widget {
     return new Column([lbl, w]).gap(2);
 }
 
-fn mk_box(w: int, h: int, color: int): Widget {
-    return new Container(w, h, 0, color, null);
+fn mk_box(w: float, h: float, color: int): Widget {
+    return new Container(w, h, 0.0, color, null);
 }
 
 // Shared app state: routes every action to the status bar + stdout.
@@ -74,7 +74,7 @@ class GState {
 // Wired to a Text via sel.toolbar_factory — the whole point of the toolbar
 // being an ordinary, subclassable Widget.
 class TintToolbar extends SelectionToolbar {
-    fn init(ax: int, ay: int, actions: SelectionAction[], sel: SelectionModel) {
+    fn init(ax: float, ay: float, actions: SelectionAction[], sel: SelectionModel) {
         super.init(ax, ay, actions, sel);
     }
     override fn draw(s: Painter, th: Theme) {
@@ -102,9 +102,9 @@ class PulseBox extends Widget {
     override fn measure(s: Painter, th: Theme): Size { return Size(110, 110); }
     override fn draw(s: Painter, th: Theme) {
         let cx = this.bounds.x + this.bounds.w / 2;
-        let cy = this.bounds.y + this.bounds.h / 2;
-        let r = 16 + (this.t * 32.0) as int;
-        s.fill_round(Rect(cx - r, cy - r, 2 * r, 2 * r), r,
+        let cy = this.bounds.cy();
+        let r = 16.0 + this.t * 32.0;
+        s.fill_round(Rect(cx - r, cy - r, 2.0 * r, 2.0 * r), r,
                      mix(th.surface, this.tint, 0.3 + this.t * 0.5));
     }
 }
@@ -120,15 +120,17 @@ class PopBar extends Widget {
     override fn measure(s: Painter, th: Theme): Size { return Size(240, 24); }
     override fn draw(s: Painter, th: Theme) {
         s.fill_round(this.bounds, th.radius_md, th.surface_sunken);
-        let w = (this.v * this.bounds.w as float) as int;
-        if (w > 2) {
+        let w = this.v * this.bounds.w;
+        if (w > 2.0) {
             s.fill_round(Rect(this.bounds.x, this.bounds.y, w, this.bounds.h),
                          th.radius_md, th.primary);
         }
     }
     override fn on_click(x: int, y: int): bool {
         let p = this;
-        let target = 0.4 + (this.bounds.x % 5) as float * 0.11;
+        // pseudo-random per-widget target; bounds.x is float now, so the
+        // modulo happens in int space
+        let target = 0.4 + ((this.bounds.x as int) % 5) as float * 0.11;
         this.animate_value(0.0, target, 500, false, EASE_OUT_BACK, (val) => { p.v = val; });
         return true;
     }
@@ -156,9 +158,9 @@ class InteractiveCard extends Widget {
         if (this.hovered) { bg = mix(th.surface_raised, th.primary, 0.12); }
         if (this.pressed) { bg = mix(th.surface_raised, th.primary, 0.24); }
         s.fill_round(this.bounds, th.radius_md, bg);
-        let bw = 1;
+        let bw = 1.0;
         let border = th.border;
-        if (this.focused) { bw = 2; border = th.primary; }
+        if (this.focused) { bw = 2.0; border = th.primary; }
         s.stroke_round(this.bounds, th.radius_md, bw, border);
         let fh = s.font_height();
         s.text_in(Rect(this.bounds.x + 12, this.bounds.y + 10, this.bounds.w - 24, fh + 4),
@@ -232,13 +234,13 @@ class BarChart extends Widget {
     override fn draw(s: Painter, th: Theme) {
         let n = this.values.len;
         if (n == 0) { return; }
-        let gap = 8;
-        let bw = (this.bounds.w - gap * (n - 1)) / n;
-        let base = this.bounds.y + this.bounds.h;
+        let gap = 8.0;
+        let bw = (this.bounds.w - gap * (n - 1) as float) / n as float;
+        let base = this.bounds.bottom();
         for (let i in 0..n) {
-            let full = (this.values[i] * this.bounds.h as float) as int;
-            let h = (full as float * this.prog) as int;
-            let x = this.bounds.x + i * (bw + gap);
+            let full = this.values[i] * this.bounds.h;
+            let h = full * this.prog;
+            let x = this.bounds.x + (i as float) * (bw + gap);
             let bar = Rect(x, base - h, bw, h);
             s.fill_round(bar, th.radius_sm, mix(this.tint, th.on_surface, 0.0));
         }
@@ -258,14 +260,12 @@ class Sparkline extends Widget {
     override fn draw(s: Painter, th: Theme) {
         let n = this.points.len;
         if (n < 2) { return; }
-        let step = this.bounds.w / (n - 1);
+        let step = this.bounds.w / (n - 1) as float;
         let prev_x = this.bounds.x;
-        let prev_y = this.bounds.y + this.bounds.h
-                     - (this.points[0] * this.bounds.h as float) as int;
+        let prev_y = this.bounds.bottom() - this.points[0] * this.bounds.h;
         for (let i in 1..n) {
-            let x = this.bounds.x + i * step;
-            let y = this.bounds.y + this.bounds.h
-                    - (this.points[i] * this.bounds.h as float) as int;
+            let x = this.bounds.x + (i as float) * step;
+            let y = this.bounds.bottom() - this.points[i] * this.bounds.h;
             s.line(prev_x, prev_y, x, y, this.tint);
             prev_x = x;
             prev_y = y;
@@ -282,8 +282,8 @@ class RatingStars extends Widget {
         this.rating = rating;
         this.focusable = true;
     }
-    fn cell(): int { return 30; }
-    override fn measure(s: Painter, th: Theme): Size { return Size(5 * this.cell(), this.cell()); }
+    fn cell(): float { return 30.0; }
+    override fn measure(s: Painter, th: Theme): Size { return Size(5.0 * this.cell(), this.cell()); }
     override fn draw(s: Painter, th: Theme) {
         let c = this.cell();
         let gold = rgb(0xF5, 0xB3, 0x41);
@@ -291,14 +291,14 @@ class RatingStars extends Widget {
             let on = i < this.rating;
             let col = th.surface_sunken;
             if (on) { col = gold; }
-            let pad = 4;
-            let r = Rect(this.bounds.x + i * c + pad, this.bounds.y + pad,
-                         c - 2 * pad, c - 2 * pad);
-            s.fill_round(r, (c - 2 * pad) / 2, col);
+            let pad = 4.0;
+            let r = Rect(this.bounds.x + (i as float) * c + pad, this.bounds.y + pad,
+                         c - 2.0 * pad, c - 2.0 * pad);
+            s.fill_round(r, (c - 2.0 * pad) / 2.0, col);
         }
     }
     override fn on_click(x: int, y: int): bool {
-        let idx = (x - this.bounds.x) / this.cell();
+        let idx = ((x as float - this.bounds.x) / this.cell()) as int;
         if (idx < 0) { idx = 0; }
         if (idx > 4) { idx = 4; }
         this.rating = idx + 1;
@@ -489,10 +489,10 @@ fn fn_cross_rows(): Widget {
     let over = new Label("selfAlign=END");
     over.selfAlign(CROSS_END);
     return new Column([
-        titled("START", new Row([new Container(40, 60, 0, rgb(0x6C, 0x8C, 0xFF), null), new Label("a"), new Label("bb")]).align(CROSS_START)),
-        titled("CENTER", new Row([new Container(40, 60, 0, rgb(0x6C, 0x8C, 0xFF), null), new Label("a"), new Label("bb")]).align(CROSS_CENTER)),
-        titled("END", new Row([new Container(40, 60, 0, rgb(0x6C, 0x8C, 0xFF), null), new Label("a"), new Label("bb")]).align(CROSS_END)),
-        titled("CENTER + one selfAlign=END", new Row([new Container(40, 60, 0, rgb(0x9C, 0x6C, 0xFF), null), new Label("center"), over]).align(CROSS_CENTER)),
+        titled("START", new Row([new Container(40, 60, 0.0, rgb(0x6C, 0x8C, 0xFF), null), new Label("a"), new Label("bb")]).align(CROSS_START)),
+        titled("CENTER", new Row([new Container(40, 60, 0.0, rgb(0x6C, 0x8C, 0xFF), null), new Label("a"), new Label("bb")]).align(CROSS_CENTER)),
+        titled("END", new Row([new Container(40, 60, 0.0, rgb(0x6C, 0x8C, 0xFF), null), new Label("a"), new Label("bb")]).align(CROSS_END)),
+        titled("CENTER + one selfAlign=END", new Row([new Container(40, 60, 0.0, rgb(0x9C, 0x6C, 0xFF), null), new Label("center"), over]).align(CROSS_CENTER)),
     ]).gap(8);
 }
 

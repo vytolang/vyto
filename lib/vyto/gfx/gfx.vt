@@ -4,16 +4,21 @@
 // shaping). blend2d ships as a prebuilt shared lib in native/<platform>/.
 //
 //   let cv = new Canvas(w, h);
-//   cv.clear(0x141821);
-//   cv.fillRoundRect(20.0, 20.0, 200.0, 80.0, 12.0, 0x3C60C0);
+//   cv.clear(0xFF141821);
+//   cv.fillRoundRect(20.0, 20.0, 200.0, 80.0, 12.0, 0xFF3C60C0);
 //   cv.flush();
-//   surface.blitPtr(cv.pixels(), w, h, Rect(0, 0, w, h));
+//   surface.blitPtr(cv.pixels(), w, h, Rect(0, 0, w as float, h as float));
+//
+// Colors are 0xAARRGGBB and alpha means alpha — a bare 0xRRGGBB is fully
+// transparent. Use rgb()/rgba() from vyto/surface, or write the FF yourself.
 
 import { Path } from "vyto/geom/path";
 
 extern "C" {
     fn gfx_canvas_new(w: i32, h: i32): rawptr;
     fn gfx_canvas_free(c: rawptr);
+    fn gfx_hash(c: rawptr): i32;
+    fn gfx_write_ppm(c: rawptr, path: cstring): i32;
     fn gfx_width(c: rawptr): i32;
     fn gfx_height(c: rawptr): i32;
     fn gfx_clear(c: rawptr, rgb: i32);
@@ -199,6 +204,18 @@ export class Canvas {
     fn flush() { gfx_flush(this.handle); }
     fn pixels(): rawptr { return gfx_pixels(this.handle); }
     fn stride(): int { return gfx_stride(this.handle) as int; }
+
+    // --------------------------------------------------------- render snapshots
+    // A stable fingerprint of the visible pixels — stride padding is excluded,
+    // so it depends on the image, not on blend2d's row alignment. Both of these
+    // flush first, so they're safe to call straight after drawing.
+    //
+    // Print hash() to compare a render against a golden; write a PPM alongside
+    // when it differs, since a hash says something changed but not what.
+    // Masked back to unsigned: the C side returns a 32-bit unsigned FNV, and
+    // letting it sign-extend would put minus signs in half the goldens.
+    fn hash(): int { return (gfx_hash(this.handle) as int) & 0xFFFFFFFF; }
+    fn writePPM(path: string): bool { return gfx_write_ppm(this.handle, path.cstr()) != 0; }
 
     // Draw a decoded image (see loadImage below) scaled into x,y,w,h.
     fn drawImage(img: rawptr, x: float, y: float, w: float, h: float) {

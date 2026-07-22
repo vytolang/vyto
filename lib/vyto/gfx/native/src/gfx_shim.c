@@ -3,6 +3,7 @@
 #include "gfx_shim.h"
 
 #include <blend2d/blend2d.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -18,13 +19,11 @@ struct GfxCanvas {
     int w, h;
 };
 
-/* Resolve a 0xAARRGGBB color: alpha byte 0 → opaque (0xFF) for backward
-   compatibility with legacy 0xRRGGBB fills. */
+/* Resolve a 0xAARRGGBB color. Alpha means alpha: 0 is transparent. (This used
+   to remap 0 to opaque so bare 0xRRGGBB literals kept working, which made a
+   fully transparent fill inexpressible — see the model note in surface.vt.) */
 static uint32_t rgba32_of(int color) {
-    uint32_t a = ((uint32_t)color >> 24) & 0xFFu;
-    if (a == 0u) a = 0xFFu;
-    uint32_t rgb = (uint32_t)color & 0xFFFFFFu;
-    return (a << 24) | rgb;
+    return (uint32_t)color;
 }
 
 /* silently keep the legacy `opaque()` helper for any user of the header */
@@ -418,6 +417,56 @@ int gfx_stride(GfxCanvas *c) {
     BLImageData d;
     bl_image_get_data(&c->img, &d);
     return (int)d.stride;
+}
+
+/* ---- render snapshots (see header) ---------------------------------------
+   Both flush first: the context batches, so reading pixel_data without a sync
+   flush can hand back a partially-rendered frame. */
+
+unsigned gfx_hash(GfxCanvas *c) {
+    BLImageData d;
+    gfx_flush(c);
+    bl_image_get_data(&c->img, &d);
+    const unsigned char *p = (const unsigned char *)d.pixel_data;
+    /* FNV-1a over visible pixels only — stride padding is skipped so the hash
+       is a property of the image, not of blend2d's row alignment. */
+    unsigned h = 2166136261u;
+    for (int y = 0; y < c->h; y++) {
+        const unsigned char *row = p + (size_t)y * (size_t)d.stride;
+        for (int i = 0; i < c->w * 4; i++) {
+            h ^= row[i];
+            h *= 16777619u;
+        }
+    }
+    return h;
+}
+
+int gfx_write_ppm(GfxCanvas *c, const char *path) {
+    BLImageData d;
+    FILE *f;
+    unsigned char *row;
+    gfx_flush(c);
+    bl_image_get_data(&c->img, &d);
+    f = fopen(path, "wb");
+    if (!f) return 0;
+    fprintf(f, "P6\n%d %d\n255\n", c->w, c->h);
+    row = (unsigned char *)malloc((size_t)c->w * 3);
+    if (!row) { fclose(f); return 0; }
+    for (int y = 0; y < c->h; y++) {
+        const unsigned char *src = (const unsigned char *)d.pixel_data + (size_t)y * (size_t)d.stride;
+        for (int x = 0; x < c->w; x++) {
+            /* PRGB32 is BGRA in memory on little-endian; PPM wants RGB. The
+               canvas is opaque in practice (cleared before each frame), so the
+               premultiplied channels are already the display values. */
+            row[x * 3 + 0] = src[x * 4 + 2];
+            row[x * 3 + 1] = src[x * 4 + 1];
+            row[x * 3 + 2] = src[x * 4 + 0];
+        }
+        fwrite(row, 1, (size_t)c->w * 3, f);
+    }
+    free(row);
+    fclose(f);
+    return 1;
 }
 
 /* ---- decoded images (PNG/JPEG/BMP/QOI — all built into libblend2d, no

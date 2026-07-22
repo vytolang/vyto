@@ -1,0 +1,73 @@
+// Render-snapshot baseline for the widget catalog across every shipped skin.
+//
+// This is the diff target for the UI polish work: float geometry, real blur,
+// rounded clipping, spring motion, and the flagship skin all change pixels,
+// and this is what says how. A float-conversion pass that is meant to be
+// visually neutral should leave every hash here untouched.
+//
+// Each skin renders the same tree, so the four blocks are directly comparable —
+// if a skin's hash matches the default skin's for some widget, that skin isn't
+// actually restyling it (today only Button, and Field under iOS, are
+// overridden; the rest inherit the default Chrome by design).
+import { Window, Column, Row, Button, Label, TextField, Checkbox, Switch,
+         RadioButton, ProgressBar, Slider, Card, Badge, Chip,
+         skin_ios, theme_ios, skin_material, theme_material,
+         skin_macos, theme_macos } from "vyto/ui";
+import { Snapshot } from "vyto/gfx/snapshot";
+
+// One tree per capture: widgets hold per-instance visual state, so reusing a
+// single tree across skins would let state set by an earlier block leak into a
+// later one and quietly weaken the comparison.
+fn build(): Column {
+    let tf = new TextField("");
+    tf.text = "Edit me";
+
+    let cb = new Checkbox("Checked");
+    cb.checked = true;
+
+    let sw = new Switch(true);
+
+    let rb = new RadioButton("Chosen", 0, null);
+    rb.selected = true;
+
+    return new Column([
+        new Label("Widgets"),
+        new Row([new Button("Primary"), new Button("Second")]),
+        tf,
+        new Row([cb, rb]),
+        sw,
+        new ProgressBar(0.6, -1, -1),
+        new Slider(0.35),
+        new Row([new Badge("9", -1, -1, null), new Chip("Tag", false, -1)]),
+        new Card(12, -1, -1, "Card", null)
+    ]);
+}
+
+fn shoot(win: Window, snap: Snapshot, name: string) {
+    win.root = build();
+    win.layout();
+    // Layout focuses the first focusable widget; clear it so these baselines
+    // capture resting appearance rather than an incidental focus ring.
+    let f = win.focused_widget();
+    if (f != null) { f.focused = false; }
+    snap.capture(name);
+}
+
+fn main() {
+    let win = new Window("Snap", 360, 420);
+    let snap = new Snapshot(win, 15.0);
+
+    shoot(win, snap, "default");
+
+    win.skin = skin_macos();
+    win.theme = theme_macos();
+    shoot(win, snap, "macos");
+
+    win.skin = skin_ios();
+    win.theme = theme_ios();
+    shoot(win, snap, "ios");
+
+    win.skin = skin_material();
+    win.theme = theme_material();
+    shoot(win, snap, "material");
+}

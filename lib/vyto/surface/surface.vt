@@ -75,59 +75,82 @@ fn imin2(a: int, b: int): int { if (a < b) { return a; } return b; }
 fn imax2(a: int, b: int): int { if (a > b) { return a; } return b; }
 
 export struct Rect {
-    x: int;
-    y: int;
-    w: int;
-    h: int;
+    x: float;
+    y: float;
+    w: float;
+    h: float;
 
     // --- edges & center (read-only queries) ---
-    fn right(): int { return this.x + this.w; }
-    fn bottom(): int { return this.y + this.h; }
-    fn cx(): int { return this.x + this.w / 2; }
-    fn cy(): int { return this.y + this.h / 2; }
-    fn is_empty(): bool { return this.w <= 0 || this.h <= 0; }
+    fn right(): float { return this.x + this.w; }
+    fn bottom(): float { return this.y + this.h; }
+    fn cx(): float { return this.x + this.w / 2.0; }
+    fn cy(): float { return this.y + this.h / 2.0; }
+    fn is_empty(): bool { return this.w <= 0.0 || this.h <= 0.0; }
+    // Hit-testing takes integer device pixels: mouse events arrive from the
+    // window system as whole pixels, so the ~70 call sites keep passing ints
+    // and the promotion happens here rather than at each of them.
     fn has(px: int, py: int): bool {
-        return px >= this.x && px < this.x + this.w && py >= this.y && py < this.y + this.h;
+        let fx = px as float;
+        let fy = py as float;
+        return fx >= this.x && fx < this.right() && fy >= this.y && fy < this.bottom();
     }
 
     // --- transforms (return a new Rect; `this` is by value) ---
-    fn inset(d: int): Rect { return Rect(this.x + d, this.y + d, this.w - 2 * d, this.h - 2 * d); }
-    fn inset_xy(dx: int, dy: int): Rect {
-        return Rect(this.x + dx, this.y + dy, this.w - 2 * dx, this.h - 2 * dy);
+    fn inset(d: float): Rect { return Rect(this.x + d, this.y + d, this.w - 2.0 * d, this.h - 2.0 * d); }
+    fn inset_xy(dx: float, dy: float): Rect {
+        return Rect(this.x + dx, this.y + dy, this.w - 2.0 * dx, this.h - 2.0 * dy);
     }
-    fn outset(d: int): Rect { return Rect(this.x - d, this.y - d, this.w + 2 * d, this.h + 2 * d); }
-    fn offset(dx: int, dy: int): Rect { return Rect(this.x + dx, this.y + dy, this.w, this.h); }
-    fn move_to(nx: int, ny: int): Rect { return Rect(nx, ny, this.w, this.h); }
-    fn resize(nw: int, nh: int): Rect { return Rect(this.x, this.y, nw, nh); }
+    fn outset(d: float): Rect { return Rect(this.x - d, this.y - d, this.w + 2.0 * d, this.h + 2.0 * d); }
+    fn offset(dx: float, dy: float): Rect { return Rect(this.x + dx, this.y + dy, this.w, this.h); }
+    fn move_to(nx: float, ny: float): Rect { return Rect(nx, ny, this.w, this.h); }
+    fn resize(nw: float, nh: float): Rect { return Rect(this.x, this.y, nw, nh); }
+
+    // Snap outward to whole device pixels. The paint stack is sub-pixel, but a
+    // few places must hand the window system integer pixels — the present rect
+    // and the X11 clip scissor. Rounding outward (floor origin, ceil extent)
+    // guarantees the snapped rect covers everything the float rect touched, so
+    // a partial repaint can never leave a sliver of the old frame behind.
+    fn round_out(): Rect {
+        let x0 = this.x.floor();
+        let y0 = this.y.floor();
+        return Rect(x0, y0, this.right().ceil() - x0, this.bottom().ceil() - y0);
+    }
 
     // --- slicing: take a band off one edge, leaving `this` conceptually shrunk ---
-    fn take_top(n: int): Rect { return Rect(this.x, this.y, this.w, n); }
-    fn take_bottom(n: int): Rect { return Rect(this.x, this.y + this.h - n, this.w, n); }
-    fn take_left(n: int): Rect { return Rect(this.x, this.y, n, this.h); }
-    fn take_right(n: int): Rect { return Rect(this.x + this.w - n, this.y, n, this.h); }
-    fn drop_top(n: int): Rect { return Rect(this.x, this.y + n, this.w, this.h - n); }
-    fn drop_bottom(n: int): Rect { return Rect(this.x, this.y, this.w, this.h - n); }
-    fn drop_left(n: int): Rect { return Rect(this.x + n, this.y, this.w - n, this.h); }
-    fn drop_right(n: int): Rect { return Rect(this.x, this.y, this.w - n, this.h); }
+    fn take_top(n: float): Rect { return Rect(this.x, this.y, this.w, n); }
+    fn take_bottom(n: float): Rect { return Rect(this.x, this.bottom() - n, this.w, n); }
+    fn take_left(n: float): Rect { return Rect(this.x, this.y, n, this.h); }
+    fn take_right(n: float): Rect { return Rect(this.right() - n, this.y, n, this.h); }
+    fn drop_top(n: float): Rect { return Rect(this.x, this.y + n, this.w, this.h - n); }
+    fn drop_bottom(n: float): Rect { return Rect(this.x, this.y, this.w, this.h - n); }
+    fn drop_left(n: float): Rect { return Rect(this.x + n, this.y, this.w - n, this.h); }
+    fn drop_right(n: float): Rect { return Rect(this.x, this.y, this.w - n, this.h); }
 
     // --- centering a w×h box inside this rect ---
-    fn center_box(bw: int, bh: int): Rect {
-        return Rect(this.x + (this.w - bw) / 2, this.y + (this.h - bh) / 2, bw, bh);
+    fn center_box(bw: float, bh: float): Rect {
+        return Rect(this.center_x(bw), this.center_y(bh), bw, bh);
     }
+    // Single-axis centering: the offset at which a span of length `bw`/`bh` sits
+    // centred inside this rect. By far the most common geometry expression in
+    // the widget code (icon next to a label, knob in a track, glyph in a row),
+    // and the reason it is a helper rather than open-coded arithmetic: the
+    // halving is a rounding decision, and it belongs in one place.
+    fn center_x(bw: float): float { return this.x + (this.w - bw) / 2.0; }
+    fn center_y(bh: float): float { return this.y + (this.h - bh) / 2.0; }
 
     // --- set ops ---
     fn union(o: Rect): Rect {
-        let nx = imin2(this.x, o.x);
-        let ny = imin2(this.y, o.y);
-        let rr = imax2(this.x + this.w, o.x + o.w);
-        let bb = imax2(this.y + this.h, o.y + o.h);
+        let nx = this.x.min(o.x);
+        let ny = this.y.min(o.y);
+        let rr = this.right().max(o.right());
+        let bb = this.bottom().max(o.bottom());
         return Rect(nx, ny, rr - nx, bb - ny);
     }
     fn intersect(o: Rect): Rect {
-        let nx = imax2(this.x, o.x);
-        let ny = imax2(this.y, o.y);
-        let rr = imin2(this.x + this.w, o.x + o.w);
-        let bb = imin2(this.y + this.h, o.y + o.h);
+        let nx = this.x.max(o.x);
+        let ny = this.y.max(o.y);
+        let rr = this.right().min(o.right());
+        let bb = this.bottom().min(o.bottom());
         if (rr <= nx || bb <= ny) { return Rect(0, 0, 0, 0); }
         return Rect(nx, ny, rr - nx, bb - ny);
     }
@@ -137,42 +160,39 @@ export struct Rect {
     }
 }
 
-export fn contains(r: Rect, px: int, py: int): bool {
-    return px >= r.x && px < r.x + r.w && py >= r.y && py < r.y + r.h;
-}
-
-export fn rgb(r: int, g: int, b: int): int {
-    return (r << 16) | (g << 8) | b;
-}
+export fn contains(r: Rect, px: int, py: int): bool { return r.has(px, py); }
 
 // ---- alpha/RGBA color model --------------------------------------------
-// Colors are packed 0xAARRGGBB. By convention the legacy opaque 0xRRGGBB
-// values (alpha byte 0) stay OPAQUE across the paint stack — the rich tier
-// (blend2d) treats alpha 0 as opaque, and the lean tier can't alpha-blend so
-// it falls back to opaque/mixed colors. Set a non-zero alpha byte to express
-// translucency: the rich tier composites, the lean tier approximates by
-// `mix`ing against the known background instead.
+// Colors are packed 0xAARRGGBB, with alpha meaning what it says: 0 is fully
+// transparent, 255 is opaque.
+//
+// This used to be inverted — alpha 0 was treated as OPAQUE so that bare
+// 0xRRGGBB literals kept working — which made full transparency impossible to
+// express and forced a 0-to-255 fixup into four separate functions here plus
+// the blend2d shim. A bare 0xRRGGBB literal is now transparent, so write
+// rgb()/rgba() (or an explicit 0xFFRRGGBB) for an opaque color.
+//
+// The rich tier (blend2d) composites translucent colors properly; the lean
+// tier can't alpha-blend, so it approximates by `mix`ing against the known
+// background instead.
 
-// a in 0..255. a==0 is stored as 0xFF (opaque) to keep the "alpha 0 = opaque"
-// rule, so callers that want "fully transparent" should pass a=1.
+export fn rgb(r: int, g: int, b: int): int {
+    return 0xFF000000 | ((r & 0xFF) << 16) | ((g & 0xFF) << 8) | (b & 0xFF);
+}
+
+// a in 0..255; 0 is fully transparent.
 export fn rgba(r: int, g: int, b: int, a: int): int {
-    let aa = a & 0xFF;
-    if (aa == 0) { aa = 0xFF; }
-    return (aa << 24) | ((r & 0xFF) << 16) | ((g & 0xFF) << 8) | (b & 0xFF);
+    return ((a & 0xFF) << 24) | ((r & 0xFF) << 16) | ((g & 0xFF) << 8) | (b & 0xFF);
 }
 
-// overlay a fresh alpha on any color (opaque or packed). a in 0..255.
+// overlay a fresh alpha on any color. a in 0..255.
 export fn with_alpha(color: int, a: int): int {
-    let aa = a & 0xFF;
-    if (aa == 0) { aa = 0xFF; }
-    return (aa << 24) | (color & 0xFFFFFF);
+    return ((a & 0xFF) << 24) | (color & 0xFFFFFF);
 }
 
-// the alpha byte of a packed color (0..255), or 255 for an opaque 0xRRGGBB.
+// the alpha byte of a packed color (0..255).
 export fn alpha_of(color: int): int {
-    let a = (color >> 24) & 0xFF;
-    if (a == 0) { return 0xFF; }
-    return a;
+    return (color >> 24) & 0xFF;
 }
 
 // opaque RGB triple of a color.
@@ -194,9 +214,7 @@ export fn mix(c0: int, c1: int, t: float): int {
     let g = ((g0 as float) + (g1 - g0) as float * t + 0.5) as int;
     let b = ((b0 as float) + (b1 - b0) as float * t + 0.5) as int;
     let a = ((a0 as float) + (a1 - a0) as float * t + 0.5) as int;
-    let aa = a & 0xFF;
-    if (aa == 0) { aa = 0xFF; }
-    return (aa << 24) | ((r & 0xFF) << 16) | ((g & 0xFF) << 8) | (b & 0xFF);
+    return ((a & 0xFF) << 24) | ((r & 0xFF) << 16) | ((g & 0xFF) << 8) | (b & 0xFF);
 }
 
 export class Surface {
@@ -213,11 +231,16 @@ export class Surface {
     fn height(): int { return vs_height(this.h); }
     fn set_title(t: string) { vs_set_title(this.h, t.cstr()); }
 
+    // The X11 backend is integer-only, so every Rect snaps here rather than at
+    // the ~560 call sites above. round_out (not truncation) so a fill still
+    // covers every pixel the float rect touched.
     fn fill(r: Rect, color: int) {
-        vs_fill_rect(this.h, r.x as i32, r.y as i32, r.w as i32, r.h as i32, color as i32);
+        let d = r.round_out();
+        vs_fill_rect(this.h, d.x as i32, d.y as i32, d.w as i32, d.h as i32, color as i32);
     }
     fn frame(r: Rect, color: int) {
-        vs_draw_rect(this.h, r.x as i32, r.y as i32, r.w as i32, r.h as i32, color as i32);
+        let d = r.round_out();
+        vs_draw_rect(this.h, d.x as i32, d.y as i32, d.w as i32, d.h as i32, color as i32);
     }
     fn line(x0: int, y0: int, x1: int, y1: int, color: int) {
         vs_draw_line(this.h, x0 as i32, y0 as i32, x1 as i32, y1 as i32, color as i32);
@@ -227,8 +250,8 @@ export class Surface {
     }
     // vertically centered inside r with a left padding
     fn text_in(r: Rect, pad: int, s: string, color: int) {
-        let baseline = r.y + (r.h + this.font_ascent()) / 2 - 1;
-        this.text(r.x + pad, baseline, s, color);
+        let baseline = r.y + (r.h + this.font_ascent() as float) / 2.0 - 1.0;
+        this.text((r.x + pad as float) as int, baseline as int, s, color);
     }
 
     fn text_width(s: string): int { return vs_text_width(this.h, s.cstr()); }
@@ -262,13 +285,15 @@ export class Surface {
     fn present() { vs_present(this.h); }
     // present only this backbuffer rect — cheaper for dirty-region repaints
     fn present_rect(r: Rect) {
-        vs_present_rect(this.h, r.x as i32, r.y as i32, r.w as i32, r.h as i32);
+        let d = r.round_out();
+        vs_present_rect(this.h, d.x as i32, d.y as i32, d.w as i32, d.h as i32);
     }
 
     // Rectangular clip for the draw calls (fill/frame/line/text); replaces
     // any previous clip. blit/present ignore it. clip_clear removes it.
     fn clip_set(r: Rect) {
-        vs_clip_set(this.h, r.x as i32, r.y as i32, r.w as i32, r.h as i32);
+        let d = r.round_out();
+        vs_clip_set(this.h, d.x as i32, d.y as i32, d.w as i32, d.h as i32);
     }
     fn clip_clear() { vs_clip_clear(this.h); }
 

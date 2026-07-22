@@ -111,6 +111,23 @@ void gfx_flush(GfxCanvas *c);
 void *gfx_pixels(GfxCanvas *c); /* 0xAARRGGBB per pixel (opaque when bg cleared opaque) */
 int gfx_stride(GfxCanvas *c);   /* bytes per row */
 
+/* ---- render snapshots (test support) --------------------------------------
+   The canvas is window-independent, so a headless Surface + GfxPainter renders
+   a full widget tree into this buffer with no display server. These two turn
+   that buffer into something a test can assert on.
+
+   gfx_hash is the assertion: an FNV-1a over the visible pixels only (the row
+   padding inside `stride` is skipped, so the value doesn't depend on how
+   blend2d chose to align rows). Printed to stdout, it plugs straight into the
+   existing text-golden harness.
+
+   gfx_write_ppm is the debugging aid — a hash tells you something changed but
+   not what, so on mismatch a test writes both actual and expected as viewable
+   images. PPM (binary P6) is used rather than PNG because blend2d's C core
+   exposes decoding only; PPM needs no codec and every image tool reads it. */
+unsigned gfx_hash(GfxCanvas *c);
+int gfx_write_ppm(GfxCanvas *c, const char *path); /* 1 ok, 0 fail */
+
 /* decoded images — PNG/JPEG/BMP/QOI, all built into libblend2d already (no
    extra codec dependency). Load-once opaque handle, same lifecycle shape as
    the font weights above: load, use every frame, free when the widget dies.
