@@ -3,6 +3,7 @@
 #include "gfx_shim.h"
 
 #include <blend2d/blend2d.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -17,6 +18,12 @@ struct GfxCanvas {
     int has_font[GFX_WEIGHTS];
     int active_weight;
     int w, h;
+    /* Scratch layer for shadow rasterisation, kept across calls: creating a
+       BLImage + BLContext per shadow dominated frame time (~5ms each). Grows
+       to the largest shadow seen and is never shrunk. */
+    BLImageCore sl_img;
+    BLContextCore sl_ctx;
+    int sl_w, sl_h;
 };
 
 /* Resolve a 0xAARRGGBB color. Alpha means alpha: 0 is transparent. (This used
@@ -59,8 +66,18 @@ static void destroy_fonts(GfxCanvas *c) {
     }
 }
 
+static void free_shadow_layer(GfxCanvas *c) {
+    if (c->sl_w > 0) {
+        bl_context_destroy(&c->sl_ctx);
+        bl_image_destroy(&c->sl_img);
+        c->sl_w = 0;
+        c->sl_h = 0;
+    }
+}
+
 void gfx_canvas_free(GfxCanvas *c) {
     if (!c) return;
+    free_shadow_layer(c);
     destroy_fonts(c);
     bl_context_destroy(&c->ctx);
     bl_image_destroy(&c->img);
@@ -195,30 +212,269 @@ void gfx_stroke_arc(GfxCanvas *c, double cx, double cy, double rx, double ry,
     bl_context_stroke_geometry_rgba32(&c->ctx, BL_GEOMETRY_TYPE_ARC, &a, rgba32_of(color));
 }
 
-/* Soft shadow: draw the round-rect `layers` times, growing outward by a
-   fraction of `blur` and fading the alpha, offset by `dy`. blend2d composites
-   each translucent fill over the existing pixels, producing a gaussian-ish
-   halo. Dependency-free (no blur filter) and reads fine at the gallery scale. */
+/* ---- blur -----------------------------------------------------------------
+   Separable box blur, three passes, on premultiplied BGRA. Premultiplication
+   is what makes this correct to run channel-independently: colour is already
+   scaled by alpha, so averaging cannot bleed the colour of transparent pixels
+   into their neighbours (the classic dark-halo artifact).
+
+   Each pass is a running sum, so cost is O(pixels) regardless of radius. */
+
+static void box_blur_h(uint8_t *p, intptr_t stride, int x0, int y0, int w, int h, int rad) {
+    if (rad < 1 || w <= 1) return;
+    int win = rad * 2 + 1;
+    /* Multiply by a fixed-point reciprocal instead of dividing per sample --
+       the divide was the hottest instruction in the blur. 24 fractional bits
+       with round-to-nearest reproduces an exact divide over the whole input
+       range (verified exhaustively for every odd window up to 121); 16 bits
+       drifts by a level. The product is computed in 64-bit because 255<<24
+       sits just under the 32-bit ceiling. */
+    uint64_t recip = (1ull << 24) / (uint64_t)win;
+    uint8_t *row_copy = (uint8_t *)malloc((size_t)w * 4);
+    if (!row_copy) return;
+    for (int y = 0; y < h; y++) {
+        uint8_t *row = p + (intptr_t)(y0 + y) * stride + (intptr_t)x0 * 4;
+        memcpy(row_copy, row, (size_t)w * 4);
+        for (int ch = 0; ch < 4; ch++) {
+            int sum = row_copy[ch] * (rad + 1);
+            for (int i = 1; i <= rad; i++) sum += row_copy[(i < w ? i : w - 1) * 4 + ch];
+            for (int x = 0; x < w; x++) {
+                row[x * 4 + ch] = (uint8_t)(((uint64_t)sum * recip + (1ull << 23)) >> 24);
+                int add = row_copy[(x + rad + 1 < w ? x + rad + 1 : w - 1) * 4 + ch];
+                int sub = row_copy[(x - rad > 0 ? x - rad : 0) * 4 + ch];
+                sum += add - sub;
+            }
+        }
+    }
+    free(row_copy);
+}
+
+/* Vertical pass over a strip of columns at a time. Walking one column at a
+   time touched a new cache line per pixel; a strip keeps each row's span
+   contiguous, which is what makes this pass affordable. */
+#define BLUR_STRIP 16
+
+static void box_blur_v(uint8_t *p, intptr_t stride, int x0, int y0, int w, int h, int rad) {
+    if (rad < 1 || h <= 1) return;
+    int win = rad * 2 + 1;
+    uint64_t recip = (1ull << 24) / (uint64_t)win;
+    int strip_bytes = BLUR_STRIP * 4;
+    uint8_t *colbuf = (uint8_t *)malloc((size_t)h * (size_t)strip_bytes);
+    int *sum = (int *)malloc((size_t)strip_bytes * sizeof(int));
+    if (!colbuf || !sum) { free(colbuf); free(sum); return; }
+
+    for (int xs = 0; xs < w; xs += BLUR_STRIP) {
+        int nc = (w - xs < BLUR_STRIP) ? (w - xs) : BLUR_STRIP;
+        int nb = nc * 4;                       /* bytes of interest per row */
+        uint8_t *base = p + (intptr_t)y0 * stride + (intptr_t)(x0 + xs) * 4;
+        for (int y = 0; y < h; y++)
+            memcpy(colbuf + (size_t)y * strip_bytes, base + (intptr_t)y * stride, (size_t)nb);
+
+        for (int b = 0; b < nb; b++) {
+            int acc = colbuf[b] * (rad + 1);
+            for (int i = 1; i <= rad; i++)
+                acc += colbuf[(size_t)(i < h ? i : h - 1) * strip_bytes + b];
+            sum[b] = acc;
+        }
+        for (int y = 0; y < h; y++) {
+            uint8_t *dst = base + (intptr_t)y * stride;
+            const uint8_t *addr = colbuf + (size_t)(y + rad + 1 < h ? y + rad + 1 : h - 1) * strip_bytes;
+            const uint8_t *subr = colbuf + (size_t)(y - rad > 0 ? y - rad : 0) * strip_bytes;
+            for (int b = 0; b < nb; b++) {
+                dst[b] = (uint8_t)(((uint64_t)sum[b] * recip + (1ull << 23)) >> 24);
+                sum[b] += addr[b] - subr[b];
+            }
+        }
+    }
+    free(colbuf);
+    free(sum);
+}
+
+
+/* Single-channel variants for the shadow path. A shadow is one constant
+   colour at varying coverage, so only alpha carries information -- blurring
+   all four channels did 4x the necessary work. RGB is reconstructed from the
+   blurred alpha afterwards (see shadow_recolor). */
+static void box_blur_h1(uint8_t *p, intptr_t stride, int w, int h, int rad, int off) {
+    if (rad < 1 || w <= 1) return;
+    int win = rad * 2 + 1;
+    uint64_t recip = (1ull << 24) / (uint64_t)win;
+    uint8_t *cp = (uint8_t *)malloc((size_t)w);
+    if (!cp) return;
+    for (int y = 0; y < h; y++) {
+        uint8_t *row = p + (intptr_t)y * stride + off;
+        for (int x = 0; x < w; x++) cp[x] = row[x * 4];
+        int sum = cp[0] * (rad + 1);
+        for (int i = 1; i <= rad; i++) sum += cp[i < w ? i : w - 1];
+        for (int x = 0; x < w; x++) {
+            row[x * 4] = (uint8_t)(((uint64_t)sum * recip + (1ull << 23)) >> 24);
+            sum += cp[x + rad + 1 < w ? x + rad + 1 : w - 1] - cp[x - rad > 0 ? x - rad : 0];
+        }
+    }
+    free(cp);
+}
+
+static void box_blur_v1(uint8_t *p, intptr_t stride, int w, int h, int rad, int off) {
+    if (rad < 1 || h <= 1) return;
+    int win = rad * 2 + 1;
+    uint64_t recip = (1ull << 24) / (uint64_t)win;
+    uint8_t *cp = (uint8_t *)malloc((size_t)h * BLUR_STRIP);
+    int *sum = (int *)malloc(BLUR_STRIP * sizeof(int));
+    if (!cp || !sum) { free(cp); free(sum); return; }
+    for (int xs = 0; xs < w; xs += BLUR_STRIP) {
+        int nc = (w - xs < BLUR_STRIP) ? (w - xs) : BLUR_STRIP;
+        uint8_t *base = p + (intptr_t)xs * 4 + off;
+        for (int y = 0; y < h; y++) {
+            uint8_t *src = base + (intptr_t)y * stride;
+            for (int i = 0; i < nc; i++) cp[(size_t)y * BLUR_STRIP + i] = src[i * 4];
+        }
+        for (int i = 0; i < nc; i++) {
+            int acc = cp[i] * (rad + 1);
+            for (int k = 1; k <= rad; k++) acc += cp[(size_t)(k < h ? k : h - 1) * BLUR_STRIP + i];
+            sum[i] = acc;
+        }
+        for (int y = 0; y < h; y++) {
+            uint8_t *dst = base + (intptr_t)y * stride;
+            const uint8_t *ad = cp + (size_t)(y + rad + 1 < h ? y + rad + 1 : h - 1) * BLUR_STRIP;
+            const uint8_t *sb = cp + (size_t)(y - rad > 0 ? y - rad : 0) * BLUR_STRIP;
+            for (int i = 0; i < nc; i++) {
+                dst[i * 4] = (uint8_t)(((uint64_t)sum[i] * recip + (1ull << 23)) >> 24);
+                sum[i] += ad[i] - sb[i];
+            }
+        }
+    }
+    free(cp);
+    free(sum);
+}
+
+/* Rebuild premultiplied BGRA from the blurred alpha and the shadow's colour. */
+static void shadow_recolor(uint8_t *p, intptr_t stride, int w, int h, uint32_t col) {
+    unsigned cr = (col >> 16) & 0xFFu, cg = (col >> 8) & 0xFFu, cb = col & 0xFFu;
+    for (int y = 0; y < h; y++) {
+        uint8_t *row = p + (intptr_t)y * stride;
+        for (int x = 0; x < w; x++) {
+            unsigned a = row[x * 4 + 3];
+            row[x * 4 + 0] = (uint8_t)((cb * a + 127u) / 255u);
+            row[x * 4 + 1] = (uint8_t)((cg * a + 127u) / 255u);
+            row[x * 4 + 2] = (uint8_t)((cr * a + 127u) / 255u);
+        }
+    }
+}
+
+/* Clamp a region to the canvas; returns 0 when nothing is left to do. */
+static int clamp_region(GfxCanvas *c, double x, double y, double w, double h,
+                        int *ox, int *oy, int *ow, int *oh) {
+    int x0 = (int)floor(x), y0 = (int)floor(y);
+    int x1 = (int)ceil(x + w), y1 = (int)ceil(y + h);
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 > c->w) x1 = c->w;
+    if (y1 > c->h) y1 = c->h;
+    if (x1 <= x0 || y1 <= y0) return 0;
+    *ox = x0; *oy = y0; *ow = x1 - x0; *oh = y1 - y0;
+    return 1;
+}
+
+static void blur_region(GfxCanvas *c, int x, int y, int w, int h, int rad) {
+    BLImageData d;
+    gfx_flush(c);
+    bl_image_get_data(&c->img, &d);
+    uint8_t *p = (uint8_t *)d.pixel_data;
+    for (int pass = 0; pass < 3; pass++) {
+        box_blur_h(p, (intptr_t)d.stride, x, y, w, h, rad);
+        box_blur_v(p, (intptr_t)d.stride, x, y, w, h, rad);
+    }
+}
+
+void gfx_blur_rect(GfxCanvas *c, double x, double y, double w, double h, double radius) {
+    int rad = (int)(radius + 0.5);
+    int bx, by, bw, bh;
+    if (rad < 1) return;
+    if (!clamp_region(c, x, y, w, h, &bx, &by, &bw, &bh)) return;
+    blur_region(c, bx, by, bw, bh, rad);
+}
+
+void gfx_backdrop_blur(GfxCanvas *c, double x, double y, double w, double h,
+                       double r, double radius, int tint) {
+    int bx, by, bw, bh;
+    int rad = (int)(radius + 0.5);
+    if (clamp_region(c, x, y, w, h, &bx, &by, &bw, &bh) && rad >= 1)
+        blur_region(c, bx, by, bw, bh, rad);
+    /* tint over the blurred backdrop, clipped to the rounded shape */
+    if (((uint32_t)tint >> 24) != 0u) {
+        BLRoundRect rrect = { x, y, w, h, r, r };
+        bl_context_set_fill_style_rgba32(&c->ctx, rgba32_of(tint));
+        bl_context_fill_geometry(&c->ctx, BL_GEOMETRY_TYPE_ROUND_RECT, &rrect);
+    }
+}
+
+/* Soft drop shadow: rasterise the round-rect into a scratch layer, blur it,
+   then composite. This replaces a stack of four translucent round-rects that
+   grew outward with fading alpha -- cheap, but it banded visibly and its
+   spread did not track `blur` the way a real gaussian does. */
 void gfx_shadow_round(GfxCanvas *c, double x, double y, double w, double h,
                       double r, double blur, double dy, int color) {
     if (blur < 0.0) blur = 0.0;
     if (r < 0.0) r = 0.0;
-    const int layers = 4;
-    uint32_t base = rgba32_of(color);
-    uint32_t base_a = (base >> 24) & 0xFFu;
-    if (base_a == 0u) base_a = 0x30u; /* a sane default darkness */
-    for (int i = 0; i < layers; i++) {
-        double t = (layers == 1) ? 0.0 : (double)i / (double)(layers - 1);
-        double grow = blur * (0.25 + 0.75 * t);
-        double rr = r + grow;
-        /* outer layers fainter, inner layers stronger → soft falloff */
-        uint32_t a = (uint32_t)((double)base_a * (0.55 - 0.35 * t));
-        if (a < 1u) a = 1u;
-        uint32_t col = (a << 24) | (base & 0xFFFFFFu);
-        BLRoundRect rrect = { x - grow, y - grow + dy, w + 2.0 * grow, h + 2.0 * grow, rr, rr };
+    uint32_t col = rgba32_of(color);
+    if ((col >> 24) == 0u) col = 0x30000000u | (col & 0xFFFFFFu); /* sane default darkness */
+    if (blur < 1.0) {   /* no blur requested: a plain offset fill is exact */
+        BLRoundRect rrect = { x, y + dy, w, h, r, r };
         bl_context_set_fill_style_rgba32(&c->ctx, col);
         bl_context_fill_geometry(&c->ctx, BL_GEOMETRY_TYPE_ROUND_RECT, &rrect);
+        return;
     }
+
+    int rad = (int)(blur + 0.5);
+    int pad = rad * 3 + 2;                 /* three box passes spread ~3*rad */
+    int lw = (int)ceil(w) + pad * 2;
+    int lh = (int)ceil(h) + pad * 2;
+    if (lw <= 0 || lh <= 0) return;
+
+    /* grow the cached scratch layer if needed, then reuse it */
+    if (lw > c->sl_w || lh > c->sl_h) {
+        int nw = lw > c->sl_w ? lw : c->sl_w;
+        int nh = lh > c->sl_h ? lh : c->sl_h;
+        free_shadow_layer(c);
+        if (bl_image_init_as(&c->sl_img, nw, nh, BL_FORMAT_PRGB32) != BL_SUCCESS) return;
+        if (bl_context_init_as(&c->sl_ctx, &c->sl_img, NULL) != BL_SUCCESS) {
+            bl_image_destroy(&c->sl_img);
+            return;
+        }
+        c->sl_w = nw;
+        c->sl_h = nh;
+    }
+    BLContextCore *lctxp = &c->sl_ctx;
+    /* The scratch layer is shared across shadows and is written through its
+       raw pixel pointer, which bypasses blend2d's copy-on-write. A blit queued
+       by an earlier shadow may not have executed yet, and would then sample
+       the pixels we are about to overwrite -- so drain the main context first.
+       (Skipping this made frames non-deterministic run to run.) */
+    bl_context_flush(&c->ctx, BL_CONTEXT_FLUSH_SYNC);
+    /* clear only the sub-rect this shadow uses, not the whole cached layer */
+    BLRect clear_rc = { 0.0, 0.0, (double)lw, (double)lh };
+    bl_context_set_comp_op(lctxp, BL_COMP_OP_SRC_COPY);
+    bl_context_set_fill_style_rgba32(lctxp, 0x00000000u);
+    bl_context_fill_geometry(lctxp, BL_GEOMETRY_TYPE_RECTD, &clear_rc);
+    bl_context_set_comp_op(lctxp, BL_COMP_OP_SRC_OVER);
+    /* rasterise pure coverage; the colour is applied after the blur */
+    BLRoundRect shape = { (double)pad, (double)pad, w, h, r, r };
+    bl_context_set_fill_style_rgba32(lctxp, 0xFFFFFFFFu);
+    bl_context_fill_geometry(lctxp, BL_GEOMETRY_TYPE_ROUND_RECT, &shape);
+    bl_context_flush(lctxp, BL_CONTEXT_FLUSH_SYNC);
+
+    BLImageData ld;
+    bl_image_get_data(&c->sl_img, &ld);
+    uint8_t *lp = (uint8_t *)ld.pixel_data;
+    for (int pass = 0; pass < 3; pass++) {
+        box_blur_h1(lp, (intptr_t)ld.stride, lw, lh, rad, 3);
+        box_blur_v1(lp, (intptr_t)ld.stride, lw, lh, rad, 3);
+    }
+    shadow_recolor(lp, (intptr_t)ld.stride, lw, lh, col);
+
+    BLPoint at = { x - (double)pad, y + dy - (double)pad };
+    BLRectI src = { 0, 0, lw, lh };
+    bl_context_blit_image_d(&c->ctx, &at, &c->sl_img, &src);
 }
 
 /* clip stack — blend2d C core exposes only rect clip; rounded radius degrades

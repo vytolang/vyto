@@ -17,6 +17,8 @@ import { Path } from "vyto/geom/path";
 extern "C" {
     fn gfx_canvas_new(w: i32, h: i32): rawptr;
     fn gfx_canvas_free(c: rawptr);
+    fn gfx_blur_rect(c: rawptr, x: f64, y: f64, w: f64, h: f64, radius: f64);
+    fn gfx_backdrop_blur(c: rawptr, x: f64, y: f64, w: f64, h: f64, r: f64, radius: f64, tint: i32);
     fn gfx_hash(c: rawptr): i32;
     fn gfx_write_ppm(c: rawptr, path: cstring): i32;
     fn gfx_width(c: rawptr): i32;
@@ -72,9 +74,9 @@ extern "C" {
                        width: f64, rgb: i32);
 }
 
-// A drawable canvas. Colors are packed 0xAARRGGBB (alpha byte 0 = opaque for
-// backward compatibility). Coordinates are pixels; float arguments map to
-// blend2d's sub-pixel double geometry.
+// A drawable canvas. Colors are packed 0xAARRGGBB and alpha means alpha (0 is
+// transparent). Coordinates are pixels; float arguments map to blend2d's
+// sub-pixel double geometry.
 export class Canvas {
     handle: rawptr;
 
@@ -204,6 +206,18 @@ export class Canvas {
     fn flush() { gfx_flush(this.handle); }
     fn pixels(): rawptr { return gfx_pixels(this.handle); }
     fn stride(): int { return gfx_stride(this.handle) as int; }
+
+    // ------------------------------------------------------------------- blur
+    // A real separable blur over the pixels, not a stack of translucent shapes.
+    // Cost is independent of radius (running-sum box passes).
+    fn blurRect(x: float, y: float, w: float, h: float, radius: float) {
+        gfx_blur_rect(this.handle, x, y, w, h, radius);
+    }
+    // Blur what is already behind this region, then tint it — the frosted
+    // material behind sheets and popovers. tint alpha 0 = pure blur.
+    fn backdropBlur(x: float, y: float, w: float, h: float, r: float, radius: float, tint: int) {
+        gfx_backdrop_blur(this.handle, x, y, w, h, r, radius, tint as i32);
+    }
 
     // --------------------------------------------------------- render snapshots
     // A stable fingerprint of the visible pixels — stride padding is excluded,

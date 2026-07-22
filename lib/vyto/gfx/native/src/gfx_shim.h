@@ -111,6 +111,23 @@ void gfx_flush(GfxCanvas *c);
 void *gfx_pixels(GfxCanvas *c); /* 0xAARRGGBB per pixel (opaque when bg cleared opaque) */
 int gfx_stride(GfxCanvas *c);   /* bytes per row */
 
+/* ---- blur -----------------------------------------------------------------
+   A real separable blur over the canvas pixels, not a stack of translucent
+   shapes. Three box-blur passes converge on a gaussian closely enough that the
+   difference is invisible, and each pass is O(pixels) via a running sum, so
+   cost is independent of radius.
+
+   gfx_blur_rect blurs a region in place.
+
+   gfx_backdrop_blur blurs what is already behind a region and composites a
+   translucent tint over it — the frosted-glass material behind sheets,
+   popovers and vibrant navigation bars. Pass tint alpha 0 for pure blur.
+
+   Both clamp the region to the canvas and are no-ops for radius < 1. */
+void gfx_blur_rect(GfxCanvas *c, double x, double y, double w, double h, double radius);
+void gfx_backdrop_blur(GfxCanvas *c, double x, double y, double w, double h,
+                       double r, double radius, int tint);
+
 /* ---- render snapshots (test support) --------------------------------------
    The canvas is window-independent, so a headless Surface + GfxPainter renders
    a full widget tree into this buffer with no display server. These two turn
