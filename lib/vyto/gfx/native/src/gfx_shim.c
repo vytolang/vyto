@@ -394,12 +394,70 @@ void gfx_blur_rect(GfxCanvas *c, double x, double y, double w, double h, double 
     blur_region(c, bx, by, bw, bh, rad);
 }
 
+/* Signed distance to a rounded-rect boundary; negative inside. */
+static double rrect_sd(double px, double py, double x, double y,
+                       double w, double h, double r) {
+    double hw = w * 0.5, hh = h * 0.5;
+    if (r > hw) r = hw;
+    if (r > hh) r = hh;
+    double dx = fabs(px - (x + hw)) - (hw - r);
+    double dy = fabs(py - (y + hh)) - (hh - r);
+    double ax = dx > 0.0 ? dx : 0.0;
+    double ay = dy > 0.0 ? dy : 0.0;
+    double outside = sqrt(ax * ax + ay * ay);
+    double inside = (dx > dy ? dx : dy);
+    if (inside > 0.0) inside = 0.0;
+    return outside + inside - r;
+}
+
 void gfx_backdrop_blur(GfxCanvas *c, double x, double y, double w, double h,
                        double r, double radius, int tint) {
     int bx, by, bw, bh;
     int rad = (int)(radius + 0.5);
-    if (clamp_region(c, x, y, w, h, &bx, &by, &bw, &bh) && rad >= 1)
+    if (r < 0.0) r = 0.0;
+
+    if (clamp_region(c, x, y, w, h, &bx, &by, &bw, &bh) && rad >= 1) {
+        BLImageData d;
+        gfx_flush(c);
+        bl_image_get_data(&c->img, &d);
+        uint8_t *p = (uint8_t *)d.pixel_data;
+        intptr_t stride = (intptr_t)d.stride;
+
+        /* Blur is rectangular, but a frosted panel is rounded: keep a copy of
+           the region so the corners outside the shape can be put back. Without
+           this the blur visibly bleeds past the panel's rounded edge. */
+        size_t rowbytes = (size_t)bw * 4;
+        uint8_t *saved = (uint8_t *)malloc(rowbytes * (size_t)bh);
+        if (!saved) return;
+        for (int yy = 0; yy < bh; yy++)
+            memcpy(saved + (size_t)yy * rowbytes,
+                   p + (intptr_t)(by + yy) * stride + (intptr_t)bx * 4, rowbytes);
+
         blur_region(c, bx, by, bw, bh, rad);
+
+        /* restore outside the rounded shape, with a 1px antialiased edge */
+        for (int yy = 0; yy < bh; yy++) {
+            uint8_t *row = p + (intptr_t)(by + yy) * stride + (intptr_t)bx * 4;
+            const uint8_t *src = saved + (size_t)yy * rowbytes;
+            for (int xx = 0; xx < bw; xx++) {
+                double sd = rrect_sd((double)(bx + xx) + 0.5, (double)(by + yy) + 0.5,
+                                     x, y, w, h, r);
+                double cov = 0.5 - sd;          /* 1 inside, 0 outside, ramp across a pixel */
+                if (cov >= 1.0) continue;       /* fully inside: keep the blur */
+                if (cov <= 0.0) {               /* fully outside: restore */
+                    memcpy(row + xx * 4, src + xx * 4, 4);
+                    continue;
+                }
+                unsigned a = (unsigned)(cov * 255.0 + 0.5);
+                for (int ch = 0; ch < 4; ch++) {
+                    unsigned nb = row[xx * 4 + ch], ob = src[xx * 4 + ch];
+                    row[xx * 4 + ch] = (uint8_t)((nb * a + ob * (255u - a) + 127u) / 255u);
+                }
+            }
+        }
+        free(saved);
+    }
+
     /* tint over the blurred backdrop, clipped to the rounded shape */
     if (((uint32_t)tint >> 24) != 0u) {
         BLRoundRect rrect = { x, y, w, h, r, r };
@@ -471,6 +529,24 @@ void gfx_shadow_round(GfxCanvas *c, double x, double y, double w, double h,
         box_blur_v1(lp, (intptr_t)ld.stride, lw, lh, rad, 3);
     }
     shadow_recolor(lp, (intptr_t)ld.stride, lw, lh, col);
+
+    /* Knock the caster's own shape out of the shadow, the way CSS box-shadow
+       does. It is invisible under an opaque panel, but a translucent one would
+       otherwise blur and show its own shadow as a dark patch behind the glass. */
+    for (int yy = 0; yy < lh; yy++) {
+        uint8_t *row = lp + (intptr_t)yy * ld.stride;
+        for (int xx = 0; xx < lw; xx++) {
+            double sd = rrect_sd((double)xx + 0.5, (double)yy + 0.5,
+                                 (double)pad, (double)pad - dy, w, h, r);
+            double cov = 0.5 - sd;               /* 1 inside the caster */
+            if (cov <= 0.0) continue;
+            if (cov >= 1.0) { row[xx * 4 + 0] = 0; row[xx * 4 + 1] = 0;
+                              row[xx * 4 + 2] = 0; row[xx * 4 + 3] = 0; continue; }
+            unsigned keep = (unsigned)((1.0 - cov) * 255.0 + 0.5);
+            for (int ch = 0; ch < 4; ch++)
+                row[xx * 4 + ch] = (uint8_t)((row[xx * 4 + ch] * keep + 127u) / 255u);
+        }
+    }
 
     BLPoint at = { x - (double)pad, y + dy - (double)pad };
     BLRectI src = { 0, 0, lw, lh };

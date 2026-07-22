@@ -1,0 +1,169 @@
+// glass — an Aero/iOS translucency showcase for vyto/gfx's blur and shadows.
+//
+// Everything here is a real effect on real pixels: the panels genuinely blur
+// whatever is behind them (including each other), and the shadows are true
+// gaussians, not stacked translucent rectangles.
+//
+//     ./vytoc run apps/glass/glass.vt
+//     GLASS_SHOT=out.ppm ./vytoc run apps/glass/glass.vt   # render once, exit
+//
+// Drawn against a raw Canvas rather than the widget toolkit because blur is
+// not yet exposed through Painter -- that wiring is the next step.
+
+import { Canvas } from "vyto/gfx";
+import { Surface, Rect, rgb, rgba, mix,
+         EV_CLOSE, EV_KEY, EV_EXPOSE, KEY_ESC } from "vyto/surface";
+import { getenv } from "vyto/os";
+
+const W: int = 900;
+const H: int = 600;
+const FONT: string = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf";
+
+// ---------------------------------------------------------------- wallpaper
+// Blur only shows itself over busy content, so the backdrop is a saturated
+// gradient with soft colour blobs rather than a flat fill.
+fn wallpaper(cv: Canvas) {
+    let top = rgb(28, 30, 62);
+    let bot = rgb(96, 44, 110);
+    cv.linearGradientRect(0.0, 0.0, W as float, H as float,
+                          0.0, 0.0, 0.0, H as float, top, bot);
+
+    let blobs: float[] = [
+        0.10, 0.22, 150.0,  0.34, 0.74, 190.0,  0.62, 0.18, 165.0,
+        0.86, 0.58, 210.0,  0.48, 0.42, 120.0,  0.14, 0.88, 140.0
+    ];
+    let tints: i32[] = [
+        rgba(90, 150, 255, 130) as i32, rgba(255, 110, 180, 120) as i32,
+        rgba(80, 220, 200, 110) as i32, rgba(255, 170, 90, 120) as i32,
+        rgba(150, 110, 255, 120) as i32, rgba(70, 200, 255, 100) as i32
+    ];
+    for (let i in 0..6) {
+        cv.fillCircle(blobs[i * 3] * W as float, blobs[i * 3 + 1] * H as float,
+                      blobs[i * 3 + 2], tints[i] as int);
+    }
+    // a few hard edges so the blur has high-frequency detail to soften
+    for (let i in 0..7) {
+        let f = i as float;
+        cv.fillRect(60.0 + f * 118.0, 470.0 + (i % 3) as float * 26.0,
+                    58.0, 14.0, rgba(255, 255, 255, 38));
+    }
+}
+
+// ------------------------------------------------------------- Aero window
+// Windows 7 glass: a frosted body, a brighter frosted caption band, a hairline
+// inner highlight along the top, and a soft drop shadow.
+fn aero_window(cv: Canvas, x: float, y: float, w: float, h: float, title: string) {
+    let r = 8.0;
+    let cap = 38.0;
+
+    cv.shadowRound(x, y, w, h, r, 26.0, 12.0, rgba(0, 0, 0, 165));
+
+    // Body glass. Tint stays light: a heavy tint over a blur averages toward
+    // grey and the pane stops reading as glass. Aero's colour comes from what
+    // is behind it, so let that through.
+    cv.backdropBlur(x, y, w, h, r, 11.0, rgba(190, 214, 244, 40));
+    // caption reads lighter than the body, as Aero's does
+    cv.backdropBlur(x, y, w, cap, r, 14.0, rgba(232, 243, 255, 42));
+
+    // glossy sweep across the caption: bright at the top, gone by the middle
+    cv.linearGradientRect(x + 1.0, y + 1.0, w - 2.0, cap * 0.62,
+                          x, y, x, y + cap * 0.62,
+                          rgba(255, 255, 255, 92), rgba(255, 255, 255, 0));
+    // a fainter one down the body keeps it from looking like flat plastic
+    cv.linearGradientRect(x + 1.0, y + cap, w - 2.0, h - cap - 1.0,
+                          x, y + cap, x, y + h,
+                          rgba(255, 255, 255, 30), rgba(255, 255, 255, 0));
+
+    // 1px inner highlight along the top edge sells the "pane of glass"
+    cv.fillRect(x + r, y + 1.0, w - 2.0 * r, 1.0, rgba(255, 255, 255, 170));
+    cv.strokeRoundRect(x, y, w, h, r, 1.0, rgba(255, 255, 255, 90));
+    cv.strokeRoundRect(x + 1.0, y + 1.0, w - 2.0, h - 2.0, r - 1.0, 1.0,
+                       rgba(120, 150, 190, 70));
+    cv.strokeLine(x + 1.0, y + cap, x + w - 1.0, y + cap, 1.0, rgba(255, 255, 255, 55));
+
+    cv.setWeight(2);
+    cv.text(x + 16.0, y + 25.0, title, rgba(255, 255, 255, 240));
+    cv.setWeight(0);
+
+    // caption buttons
+    let bx = x + w - 96.0;
+    for (let i in 0..3) {
+        let f = i as float;
+        let col = rgba(255, 255, 255, 40);
+        if (i == 2) { col = rgba(232, 80, 74, 200); }
+        cv.fillRoundRect(bx + f * 28.0, y + 12.0, 20.0, 14.0, 3.0, col);
+    }
+}
+
+// ------------------------------------------------------------ iOS-style card
+// Heavier blur, dark tint, hairline border -- the Control Centre look.
+fn ios_panel(cv: Canvas, x: float, y: float, w: float, h: float) {
+    let r = 26.0;
+    cv.shadowRound(x, y, w, h, r, 30.0, 14.0, rgba(0, 0, 0, 150));
+    cv.backdropBlur(x, y, w, h, r, 22.0, rgba(18, 20, 30, 168));
+    cv.strokeRoundRect(x, y, w, h, r, 1.0, rgba(255, 255, 255, 55));
+
+    cv.setWeight(2);
+    cv.text(x + 22.0, y + 34.0, "Now Playing", rgba(255, 255, 255, 235));
+    cv.setWeight(0);
+    cv.text(x + 22.0, y + 58.0, "Ambient / Sequence 04", rgba(255, 255, 255, 150));
+
+    // progress track
+    cv.fillRoundRect(x + 22.0, y + 76.0, w - 44.0, 4.0, 2.0, rgba(255, 255, 255, 55));
+    cv.fillRoundRect(x + 22.0, y + 76.0, (w - 44.0) * 0.42, 4.0, 2.0, rgba(255, 255, 255, 220));
+
+    // round toggles
+    for (let i in 0..4) {
+        let f = i as float;
+        let cx = x + 46.0 + f * 62.0;
+        let cy = y + 126.0;
+        let on = i == 0 || i == 2;
+        let fill = rgba(255, 255, 255, 40);
+        if (on) { fill = rgba(255, 255, 255, 215); }
+        cv.fillCircle(cx, cy, 22.0, fill);
+        let ink = rgba(255, 255, 255, 190);
+        if (on) { ink = rgba(30, 32, 44, 230); }
+        cv.fillRoundRect(cx - 7.0, cy - 7.0, 14.0, 14.0, 4.0, ink);
+    }
+}
+
+fn render(cv: Canvas) {
+    wallpaper(cv);
+    // overlapping so the upper pane visibly blurs the lower one, not just the
+    // wallpaper -- that is the part a fake blur cannot do
+    aero_window(cv, 70.0, 90.0, 430.0, 260.0, "Documents");
+    aero_window(cv, 300.0, 210.0, 430.0, 260.0, "Photos");
+    ios_panel(cv, 545.0, 78.0, 300.0, 190.0);
+    cv.flush();
+}
+
+fn main() {
+    let shot = getenv("GLASS_SHOT");
+    let cv = new Canvas(W, H);
+    if (!cv.loadFontWeight(FONT, 15.0, 0)) {
+        print("glass: cannot load " + FONT);
+        return;
+    }
+    cv.loadFontWeight(FONT, 15.0, 2);   // bold slot falls back to regular
+
+    if (shot != "") {
+        render(cv);
+        cv.writePPM(shot);
+        print("wrote " + shot);
+        return;
+    }
+
+    let s = new Surface("Glass — vyto/gfx translucency", W, H);
+    render(cv);
+    s.blitPtr(cv.pixels(), W, H, Rect(0, 0, W as float, H as float));
+    s.present();
+    while (true) {
+        let ev = s.wait();
+        if (ev == EV_CLOSE) { break; }
+        if (ev == EV_KEY && s.key() == KEY_ESC) { break; }
+        if (ev == EV_EXPOSE) {
+            s.blitPtr(cv.pixels(), W, H, Rect(0, 0, W as float, H as float));
+            s.present();
+        }
+    }
+}
