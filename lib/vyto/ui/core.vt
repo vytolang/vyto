@@ -126,11 +126,15 @@ export fn ease_apply(id: int, t: float): float {
     return ease_linear(t); // EASE_LINEAR
 }
 
-// Scale a px metric by the UI scale factor, rounded, flooring at 1 for
-// nonzero inputs (a 1px hairline must survive downscaling).
+// Scale a px metric by the UI scale factor. Stays fractional (A5): the
+// geometry is float end to end and glyphs/edges rasterise from a fractional
+// coordinate cleanly, so rounding here only threw away sub-pixel accuracy —
+// and a rounded ramp can collapse, e.g. at 1.1 a radius_sm/md pair of 4/5 both
+// land on 5. Values scale >= 1 in practice (HiDPI); a positive metric is
+// floored just above zero so a hairline cannot vanish under a downscale.
 export fn scale_px(v: float, f: float): float {
-    let r = (v * f + 0.5).floor();
-    if (r < 1.0 && v > 0.0) { r = 1.0; }
+    let r = v * f;
+    if (r < 0.5 && v > 0.0) { r = 0.5; }
     return r;
 }
 
@@ -503,8 +507,14 @@ export class Painter {
     // Horizontally-centred / right-aligned text within a rect, vertically
     // centred. Concrete helpers over the metrics above, so a custom draw()
     // never open-codes the centering arithmetic.
+    // The baseline y is snapped to a whole device pixel. Everything else the
+    // geometry does is sub-pixel, but a glyph run straddling a pixel row loses
+    // real crispness at body sizes — the stem hinting has nothing to grip — for
+    // no positional gain the eye can use. x stays fractional: horizontal
+    // sub-pixel placement keeps centring exact and costs no sharpness, since
+    // the AA there is along the stroke, not across it.
     fn baseline_in(r: Rect): float {
-        return r.center_y(this.font_height()) + this.font_ascent();
+        return (r.center_y(this.font_height()) + this.font_ascent()).round();
     }
     fn text_center(r: Rect, s: string, color: int) {
         this.text(r.center_x(this.text_width(s)), this.baseline_in(r), s, color);

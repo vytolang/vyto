@@ -1,0 +1,54 @@
+// HiDPI scale (A5). apply_scale used to round every metric to a whole pixel;
+// it now keeps them fractional, so a scale factor that lands between pixels is
+// preserved instead of snapped. Nothing else in the suite runs at a non-1.0
+// scale, so without this the rounding change is untested in both directions.
+
+import { Theme } from "vyto/ui";
+
+fn near(a: float, b: float): bool {
+    let d = a - b;
+    if (d < 0.0) { d = -d; }
+    return d < 0.001;
+}
+
+fn check(label: string, cond: bool) {
+    let mark = "FAIL";
+    if (cond) { mark = "ok"; }
+    print(mark + " " + label);
+}
+
+fn main() {
+    // 1.1 is chosen so every product is fractional: rounding would have been
+    // visible as a whole number, fractional survival as the exact product.
+    let th = new Theme();
+    let r_sm = th.radius_sm;   // 4
+    let r_md = th.radius_md;   // 5? -> actually 8
+    let sp2 = th.space_2;      // 8
+    let tmd = th.text_md;      // 15
+    th.apply_scale(1.1);
+
+    check("radius_sm stays fractional", near(th.radius_sm, r_sm * 1.1));
+    check("radius_md stays fractional", near(th.radius_md, r_md * 1.1));
+    check("space_2 stays fractional", near(th.space_2, sp2 * 1.1));
+    check("text_md stays fractional", near(th.text_md, tmd * 1.1));
+
+    // a rounded ramp collapses; a fractional one keeps its steps distinct
+    check("radius ramp stays ordered", th.radius_sm < th.radius_md);
+    check("type ramp stays ordered", th.text_sm < th.text_md && th.text_md < th.text_lg);
+
+    // idempotent: a second apply is a no-op, not a second multiply
+    let after = th.radius_md;
+    th.apply_scale(1.1);
+    check("apply_scale is idempotent", near(th.radius_md, after));
+
+    // scale 1.0 is an exact identity (early-out path)
+    let one = new Theme();
+    let base = one.radius_md;
+    one.apply_scale(1.0);
+    check("scale 1.0 is identity", near(one.radius_md, base));
+
+    // downscale must not collapse a positive metric to zero
+    let dn = new Theme();
+    dn.apply_scale(0.01);
+    check("downscale keeps metrics positive", dn.radius_sm > 0.0);
+}
