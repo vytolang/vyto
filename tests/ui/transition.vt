@@ -1,0 +1,84 @@
+// D2: insert/remove transitions. An inserted widget animates in; a removed one
+// is retained and drawn (with its exit transform) until the spring settles,
+// then pruned. No global alpha, so the transforms are geometric (scale/slide).
+
+import { Window, Column, Button, Card, Theme,
+         TRANSITION_SCALE, TRANSITION_SLIDE } from "vyto/ui";
+import { GfxPainter } from "vyto/gfx/painter";
+import { Rect, rgb } from "vyto/surface";
+
+const FONT: string = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf";
+
+fn check(label: string, cond: bool) {
+    let mark = "FAIL";
+    if (cond) { mark = "ok"; }
+    print(mark + " " + label);
+}
+
+fn main() {
+    let win = new Window("T", 240, 300);
+    let col = new Column([new Button("a"), new Button("b")]);
+    win.root = col;
+    win.layout();
+
+    // startup widgets do not animate in (window not live at first layout)
+    check("startup child has no enter spring", col.children[0].t_enter == null);
+
+    // make the window live, then insert a widget with a scale-in transition
+    win.live = true;
+    let fresh = new Button("c").transition_in(TRANSITION_SCALE);
+    col.add(fresh);
+    win.layout();                       // propagate_win reaches fresh -> begin_enter
+    check("inserted child got an enter spring", fresh.t_enter != null);
+    check("enter starts fully transformed", fresh.transition_progress() < 0.2);
+    fresh.t_enter.advance(16);
+    fresh.t_enter.advance(16);
+    check("enter is progressing", fresh.transition_progress() > 0.0 && fresh.transition_progress() < 1.0);
+    let g = 0;
+    while (fresh.t_enter.advance(16) && g < 2000) { g += 1; }
+    check("enter settles fully present", fresh.transition_progress() == 1.0);
+
+    // remove a child with an exit transition: retained in `exiting`, not dropped
+    let victim = col.children[0];
+    victim.exit_kind = TRANSITION_SCALE;   // opt out-transition on directly
+    let started = col.remove_child(victim);
+    check("remove started an exit animation", started);
+    check("victim left the children list", col.children.len == 2);
+    check("victim retained in exiting", col.exiting != null && col.exiting.len == 1);
+    check("exit starts fully present", victim.transition_progress() > 0.9);
+
+    // drive it out; base render() prunes settled exiters when it draws
+    let h = 0;
+    while (victim.t_exit.advance(16) && h < 2000) { h += 1; }
+    check("exit settled at 0", victim.transition_progress() <= 0.001);
+    col.render(new GfxPainter(win.surface(), FONT, 15.0), new Theme());  // triggers prune
+    check("settled exiter was pruned", col.exiting.len == 0);
+
+    // --- pixels: a mid-enter card draws smaller than its bounds (scale) ---
+    let w2 = new Window("P", 200, 160);
+    let p = new GfxPainter(w2.surface(), FONT, 15.0);
+    let th = new Theme();
+    w2.root = new Column([]);
+    w2.layout();
+    w2.live = true;
+    let card = new Card(8, rgb(30, 170, 90), -1, "", null).transition_in(TRANSITION_SCALE);
+    // give it a known box and mount it
+    card.propagate_win(w2);              // begin_enter fires (win live)
+    card.bounds = Rect(60.0, 50.0, 80.0, 60.0);
+    for (let i in 0..2) { card.t_enter.advance(16); }   // partway: scaled down
+
+    p.fill(Rect(0.0, 0.0, 200.0, 160.0), rgb(250, 250, 250));
+    card.draw(p, th);
+    p.canvas.flush();
+    // center is green (drawn), but a point near the corner inside bounds is NOT
+    // yet covered because the card is scaled down about its center
+    check("scaled card covers its center", is_green(p.canvas.pixelAt(100, 80)));
+    check("scaled card leaves its corner uncovered", !is_green(p.canvas.pixelAt(63, 53)));
+}
+
+fn is_green(px: int): bool {
+    let r = (px >> 16) & 0xFF;
+    let g = (px >> 8) & 0xFF;
+    let b = px & 0xFF;
+    return g > 130 && r < 130 && b < 150;
+}

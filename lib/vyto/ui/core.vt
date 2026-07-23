@@ -836,6 +836,16 @@ export const UI_SPRING_DAMPING: float = 1.0;
 export const LAYOUT_SPRING_RESPONSE: float = 0.34;
 export const LAYOUT_SPRING_DAMPING: float = 0.82;
 
+// Insert/remove transitions (D2). A widget added to a live tree can animate in,
+// and one removed can animate out while the parent keeps drawing it until the
+// exit finishes. No global-alpha in Painter, so the kinds are geometric —
+// scale (a zoom from 0.6) and slide — degrading to instant on the lean tier.
+export const TRANSITION_NONE: int = 0;
+export const TRANSITION_SCALE: int = 1;
+export const TRANSITION_SLIDE: int = 2;
+const ENTER_SPRING_RESPONSE: float = 0.36;
+const ENTER_SPRING_DAMPING: float = 0.78;
+
 // Discrete state, for a resting endpoint or a widget whose springs have not
 // been created yet. b2f keeps the bool->0/1 conversion in one place.
 export fn b2f(b: bool): float { if (b) { return 1.0; } return 0.0; }
@@ -1040,6 +1050,14 @@ export class Skin {
 // relation than as a method on one of the two rects.
 fn rect_overlaps(a: Rect, b: Rect): bool { return a.overlaps(b); }
 
+// Array without one element (filter-rebuild; there is no removeAt). Used for
+// child removal, which is rare enough that the copy is not worth avoiding.
+fn without(xs: Widget[], drop: Widget): Widget[] {
+    let keep: Widget[] = [];
+    for (let x in xs) { if (x != drop) { keep.push(x); } }
+    return keep;
+}
+
 // ---------------------------------------------------------------- Widget
 
 export class Widget {
@@ -1067,6 +1085,15 @@ export class Widget {
     laid_out: bool;
     vb_x: AnimatedFloat;
     vb_y: AnimatedFloat;
+    // D2 insert/remove. enter_kind/exit_kind are TRANSITION_*; t_enter runs 0->1
+    // on insert into a live tree, t_exit runs 1->0 on removal while the parent
+    // keeps the widget in `exiting` and draws it until the spring settles.
+    enter_kind: int;
+    exit_kind: int;
+    enter_played: bool;
+    t_enter: AnimatedFloat;
+    t_exit: AnimatedFloat;
+    exiting: Widget[];
     grow: int;          // flex factor inside Column/Row; 0 = natural size
     alignSelf: int;     // cross-axis override inside Column/Row; -1 = inherit
     modal: bool;        // overlay traps events; outside clicks don't dismiss
@@ -1121,6 +1148,12 @@ export class Widget {
     // slides it to the new position instead of snapping. Off by default because
     // most relayouts (scrolling, typing) should be instant.
     builder fn animate_layout(on: bool) { this.animate_layout_on = on; return this; }
+
+    // Opt into insert/remove transitions (D2). transition_in plays when the
+    // widget is added to a live window; transition_out plays when it is passed
+    // to parent.remove_child. Kinds are TRANSITION_SCALE / TRANSITION_SLIDE.
+    builder fn transition_in(kind: int) { this.enter_kind = kind; return this; }
+    builder fn transition_out(kind: int) { this.exit_kind = kind; return this; }
 
     // The rect this widget paints at right now — its animated position while a
     // layout transition is in flight, its layout bounds otherwise. The draw()
@@ -1403,34 +1436,122 @@ export class Widget {
     // tier snaps to the final layout rather than sliding — the usual graceful
     // degradation. Hit-testing stays on the layout bounds (you click where a
     // widget is going), which is why bounds and visual_bounds are separate.
-    fn draw(s: Painter, th: Theme) {
+    // Transition progress and kind: 1.0 = fully present (no transform). An exit
+    // dominates an enter (a widget removed mid-enter animates straight out).
+    fn transition_progress(): float {
+        if (this.t_exit != null) { return this.t_exit.value(); }
+        if (this.t_enter != null) { return this.t_enter.value(); }
+        return 1.0;
+    }
+    fn transition_kind(): int {
+        if (this.t_exit != null) { return this.exit_kind; }
+        return this.enter_kind;
+    }
+
+    // Bracket the paint bodies with the layout-transform translate AND any
+    // insert/remove transition transform, returning whether a save() was
+    // pushed. Shared by draw() and draw_within() so both honour both effects.
+    fn begin_paint(s: Painter): bool {
         let dx = 0.0; let dy = 0.0;
         if (this.vb_x != null) {
             dx = this.vb_x.value() - this.bounds.x;
             dy = this.vb_y.value() - this.bounds.y;
         }
-        let shift = dx != 0.0 || dy != 0.0;
-        if (shift) { s.save(); s.translate(dx, dy); }
+        let pr = this.transition_progress();
+        if (dx == 0.0 && dy == 0.0 && pr >= 1.0) { return false; }
+        s.save();
+        if (dx != 0.0 || dy != 0.0) { s.translate(dx, dy); }
+        if (pr < 1.0) {
+            let kind = this.transition_kind();
+            if (kind == TRANSITION_SCALE) {
+                let sc = 0.6 + 0.4 * pr;           // zoom from 60% (no alpha to fade)
+                let cx = this.bounds.cx();
+                let cy = this.bounds.cy();
+                s.translate(cx, cy);
+                s.scale(sc, sc);
+                s.translate(0.0 - cx, 0.0 - cy);
+            } else if (kind == TRANSITION_SLIDE) {
+                s.translate(0.0, (1.0 - pr) * 14.0);   // rise into place
+            }
+        }
+        return true;
+    }
+
+    fn draw(s: Painter, th: Theme) {
+        let saved = this.begin_paint(s);
         this.render(s, th);
-        if (shift) { s.restore(); }
+        if (saved) { s.restore(); }
     }
 
     fn draw_within(s: Painter, th: Theme, d: Rect) {
-        let dx = 0.0; let dy = 0.0;
-        if (this.vb_x != null) {
-            dx = this.vb_x.value() - this.bounds.x;
-            dy = this.vb_y.value() - this.bounds.y;
-        }
-        let shift = dx != 0.0 || dy != 0.0;
-        if (shift) { s.save(); s.translate(dx, dy); }
+        let saved = this.begin_paint(s);
         this.render_within(s, th, d);
-        if (shift) { s.restore(); }
+        if (saved) { s.restore(); }
+    }
+
+    // Insert transition: begin animating this widget in. Called by add() when
+    // the parent is already live; a no-op at construction (no enter_kind, or
+    // win not yet known). Idempotent — plays once.
+    fn begin_enter() {
+        if (this.enter_kind == 0 || this.enter_played || this.win == null) { return; }
+        this.enter_played = true;
+        this.t_enter = new AnimatedFloat(0.0, ENTER_SPRING_RESPONSE, ENTER_SPRING_DAMPING);
+        this.t_enter.track_bounds = false;   // transitions repaint the whole frame
+        this.wake_spring(this.t_enter, 1.0);
+    }
+
+    // Remove a child. With an exit transition and a live window it moves to the
+    // parent's `exiting` list and animates out, pruned once settled; otherwise
+    // it is dropped at once. Returns true if an exit animation started.
+    fn remove_child(c: Widget): bool {
+        if (c.exit_kind == 0 || this.win == null) {
+            this.drop_child(c);
+            return false;
+        }
+        this.children = without(this.children, c);
+        if (this.exiting == null) { this.exiting = []; }
+        this.exiting.push(c);
+        c.t_exit = new AnimatedFloat(1.0, ENTER_SPRING_RESPONSE, ENTER_SPRING_DAMPING);
+        c.t_exit.track_bounds = false;
+        c.wake_spring(c.t_exit, 0.0);
+        return true;
+    }
+
+    fn drop_child(c: Widget) {
+        this.children = without(this.children, c);
+        c.release_all();
+    }
+
+    // Drop exiting children whose exit spring has settled at 0.
+    fn prune_exiting() {
+        if (this.exiting == null) { return; }
+        let keep: Widget[] = [];
+        for (let e in this.exiting) {
+            if (e.t_exit != null && e.t_exit.at_rest() && e.t_exit.value() <= 0.001) {
+                e.release_all();
+            } else {
+                keep.push(e);
+            }
+        }
+        this.exiting = keep;
     }
 
     virtual fn render(s: Painter, th: Theme) {
         for (let c in this.children) {
             c.draw(s, th);
         }
+        // Exiting children (D2) are no longer in `children` but keep painting,
+        // with their exit transform, until their spring settles. Containers with
+        // a custom render() that want exit transitions call draw_exiting()
+        // themselves; the common base-render containers (Column/Row/…) get it
+        // here for free.
+        this.draw_exiting(s, th);
+    }
+
+    fn draw_exiting(s: Painter, th: Theme) {
+        if (this.exiting == null) { return; }
+        this.prune_exiting();
+        for (let e in this.exiting) { e.draw(s, th); }
     }
 
     // A container's own painting (background, borders) — separate from its
@@ -1592,6 +1713,10 @@ export class Widget {
             }
             this.pending_anims = [];
         }
+        // A widget with an enter transition, mounted into an already-live window
+        // (i.e. inserted at runtime, not present at first layout), animates in.
+        // Idempotent, so re-mounting an existing widget doesn't replay it.
+        if (w != null && w.live) { this.begin_enter(); }
         for (let c in this.children) {
             c.propagate_win(w);
         }
@@ -1646,6 +1771,10 @@ export class Window {
     focusables: Widget[];
     focus_i: int;
     running: bool;
+    // True once the first frame has been laid out and drawn. Enter transitions
+    // (D2) fire only for widgets mounted AFTER this, so a tree present at
+    // startup appears in place rather than every widget animating in at once.
+    live: bool;
     close_on_esc: bool;
     dirty: Rect;        // accumulated repaint region (valid when has_dirty)
     has_dirty: bool;
@@ -1875,6 +2004,9 @@ export class Window {
             t.draw(this.painter, this.theme);
         }
         this.painter.present();
+        // After the first frame the window is live, so anything mounted from
+        // here on (an inserted widget) animates in rather than popping.
+        this.live = true;
     }
 
     // Union a rect into the pending dirty region for the next repaint().
