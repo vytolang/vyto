@@ -824,9 +824,16 @@ export struct WidgetState {
     disabled: float;
 }
 
+// Interaction-spring feel: snappy and critically damped (no overshoot on a
+// hover/press/toggle, which would read as a wobble rather than a response).
+// A knob or a fill can carry a touch of overshoot per-widget by making its own
+// spring; this is the shared default the central driver uses.
+export const UI_SPRING_RESPONSE: float = 0.22;
+export const UI_SPRING_DAMPING: float = 1.0;
+
 // Discrete state, for a resting endpoint or a widget whose springs have not
 // been created yet. b2f keeps the bool->0/1 conversion in one place.
-fn b2f(b: bool): float { if (b) { return 1.0; } return 0.0; }
+export fn b2f(b: bool): float { if (b) { return 1.0; } return 0.0; }
 export fn ws(hover: bool, press: bool, focus: bool, on: bool, disabled: bool): WidgetState {
     return WidgetState(b2f(hover), b2f(press), b2f(focus), b2f(on), b2f(disabled));
 }
@@ -1045,6 +1052,7 @@ export class Widget {
     anim_hover: AnimatedFloat;
     anim_press: AnimatedFloat;
     anim_focus: AnimatedFloat;
+    anim_on: AnimatedFloat;    // checked/selected/switch-on, driven by the widget
     grow: int;          // flex factor inside Column/Row; 0 = natural size
     alignSelf: int;     // cross-axis override inside Column/Row; -1 = inherit
     modal: bool;        // overlay traps events; outside clicks don't dismiss
@@ -1099,10 +1107,58 @@ export class Widget {
         let h = b2f(this.hovered);
         let p = b2f(this.pressed);
         let f = b2f(this.focused);
+        let o = b2f(on);
         if (this.anim_hover != null) { h = this.anim_hover.value(); }
         if (this.anim_press != null) { p = this.anim_press.value(); }
         if (this.anim_focus != null) { f = this.anim_focus.value(); }
-        return WidgetState(h, p, f, b2f(on), b2f(this.disabled));
+        if (this.anim_on != null) { o = this.anim_on.value(); }
+        return WidgetState(h, p, f, o, b2f(this.disabled));
+    }
+
+    // Retarget an interaction spring, keeping its velocity, and (re)register it
+    // with the Window clock when a resting one wakes. The bool state stays
+    // authoritative for logic; these springs are purely what the Chrome paints.
+    // A spring drops off the clock when it settles (Animator.retain), so waking
+    // it later must re-add it — animate_to reports exactly that.
+    fn wake_spring(af: AnimatedFloat, target: float) {
+        let woke = af.animate_to(target);
+        af.bounds = this.bounds;
+        if (woke && this.win != null) { this.win.add_animation(af); }
+    }
+    // hover/press springs are created only on the first ENTER/DOWN (target 1);
+    // a leave/up cannot precede one, so 0 is always the correct resting start.
+    // Seeding at 0 rather than at the just-flipped bool is what makes the first
+    // transition actually animate instead of being born already arrived.
+    fn drive_hover(target: float) {
+        if (this.anim_hover == null) {
+            this.anim_hover = new AnimatedFloat(0.0, UI_SPRING_RESPONSE, UI_SPRING_DAMPING);
+        }
+        this.wake_spring(this.anim_hover, target);
+    }
+    fn drive_press(target: float) {
+        if (this.anim_press == null) {
+            this.anim_press = new AnimatedFloat(0.0, UI_SPRING_RESPONSE, UI_SPRING_DAMPING);
+        }
+        this.wake_spring(this.anim_press, target);
+    }
+    // Focus is intentionally NOT spring-driven: the ring is an on/off cue in
+    // every Chrome (`st.focus > 0`), so interpolating it would only change when
+    // it pops, not how it looks — while adding a spring whose value goes stale
+    // the moment any code sets `.focused` directly. ui_state still reads
+    // anim_focus if some skin ever creates one, but nothing does today.
+
+    // For a widget's own logical on/off (checkbox tick, switch knob). `from` is
+    // the pre-change amount, so the spring is born where the widget was and
+    // slides to `to`. The initial on-state can be either 0 or 1 (a Switch(true)
+    // toggled off starts at 1), so unlike hover/press the start can't be assumed
+    // 0 and must be passed. Only an actual animated toggle calls this — a widget
+    // whose on-state is set directly leaves anim_on null, and ui_state falls back
+    // to the bool, so direct mutation never desyncs against a stale spring.
+    fn drive_on(src: float, dst: float) {
+        if (this.anim_on == null) {
+            this.anim_on = new AnimatedFloat(src, UI_SPRING_RESPONSE, UI_SPRING_DAMPING);
+        }
+        this.wake_spring(this.anim_on, dst);
     }
 
     // The active modifier chord (MOD_* bits) at the current event. Window
@@ -2017,11 +2073,13 @@ export class Window {
         this.hover_w = w;
         if (old != null) {
             old.hovered = false;
+            old.drive_hover(0.0);
             old.on_hover_leave();
             this.mark_dirty(old.bounds);
         }
         if (w != null) {
             w.hovered = true;
+            w.drive_hover(1.0);
             w.on_hover_enter();
             this.mark_dirty(w.bounds);
         }
@@ -2029,9 +2087,15 @@ export class Window {
     }
 
     fn set_press(w: Widget) {
-        if (this.press_w != null) { this.press_w.pressed = false; }
+        if (this.press_w != null) {
+            this.press_w.pressed = false;
+            this.press_w.drive_press(0.0);
+        }
         this.press_w = w;
-        if (w != null) { w.pressed = true; }
+        if (w != null) {
+            w.pressed = true;
+            w.drive_press(1.0);
+        }
     }
 
     // Mouse wheel: walk from the deepest widget under the cursor up the

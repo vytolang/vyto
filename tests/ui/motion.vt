@@ -1,0 +1,63 @@
+// C4: interaction state is spring-driven centrally. A toggle retargets the
+// widget's `on` spring; hover/press retarget theirs. Asserted at the widget
+// level (advancing the spring by hand) since a full windowed event loop is not
+// reproducible headless.
+
+import { Switch, Checkbox, Button, Widget } from "vyto/ui";
+import { rgb } from "vyto/surface";
+
+fn check(label: string, cond: bool) {
+    let mark = "FAIL";
+    if (cond) { mark = "ok"; }
+    print(mark + " " + label);
+}
+
+fn settle(w: Widget) {
+    let g = 0;
+    while (w.anim_on != null && w.anim_on.advance(16) && g < 2000) { g += 1; }
+}
+
+fn main() {
+    // Switch: no spring until toggled (direct/initial state stays on the bool
+    // path so it can't desync); toggling slides the knob rather than snapping.
+    let sw = new Switch(false);
+    check("switch has no spring until toggled", sw.anim_on == null);
+    check("off knob amount is 0", sw.ui_state(sw.on).on == 0.0);
+
+    sw.toggle();                       // on -> true
+    check("toggle woke the spring", !sw.anim_on.at_rest());
+    sw.anim_on.advance(16);
+    sw.anim_on.advance(16);
+    let mid = sw.ui_state(sw.on).on;
+    check("knob is mid-slide, not snapped", mid > 0.0 && mid < 1.0);
+    settle(sw);
+    check("knob settles fully on", sw.ui_state(sw.on).on == 1.0);
+
+    // Toggling back preserves the spring and slides the other way.
+    sw.toggle();
+    check("toggling back wakes it again", !sw.anim_on.at_rest());
+    settle(sw);
+    check("knob settles fully off", sw.ui_state(sw.on).on == 0.0);
+
+    // Checkbox: the tick fades via the same on-spring, created on first toggle.
+    let cb = new Checkbox("x");
+    check("checkbox has no spring until toggled", cb.anim_on == null);
+    cb.toggle();
+    check("first toggle created the spring", cb.anim_on != null && !cb.anim_on.at_rest());
+    settle(cb);
+    check("tick fully in after settle", cb.ui_state(cb.checked).on == 1.0);
+
+    // Hover: the central driver retargets a lazily-made hover spring, and a
+    // retarget mid-flight keeps velocity (no snap back to a standstill).
+    let b = new Button("Go");
+    check("button has no hover spring at rest", b.anim_hover == null);
+    b.drive_hover(1.0);
+    check("hover created + woke the spring", b.anim_hover != null && !b.anim_hover.at_rest());
+    b.anim_hover.advance(16);
+    b.anim_hover.advance(16);
+    let hv = b.ui_state(false).hover;
+    check("hover amount is partway", hv > 0.0 && hv < 1.0);
+    let vel = b.anim_hover.spring.velocity;
+    b.drive_hover(0.0);                // reverse mid-flight
+    check("reversing kept the momentum", b.anim_hover.spring.velocity == vel);
+}
