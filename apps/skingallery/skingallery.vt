@@ -1,0 +1,119 @@
+// skingallery — every widget across all five skins, switchable live, in light
+// and dark. The eyeball + motion check for the polish work: hover a button to
+// watch its shadow lift and fill spring, toggle a switch to watch the knob
+// slide, flip skins to compare, flip the theme to see each skin's dark pair.
+//
+//     ./vytoc run apps/skingallery/skingallery.vt
+//     SKIN_SHOT=out.ppm ./vytoc run apps/skingallery/skingallery.vt   # render, exit
+//
+// Drawn through the widget toolkit (GfxPainter rich tier), not a raw Canvas.
+
+import { Window, Column, Row, Button, Label, TextField, Checkbox, Switch,
+         RadioButton, RadioGroup, Slider, ProgressBar, Card, Badge, Chip,
+         SegmentedControl, Skin, Theme, Widget, Painter,
+         skin_ios, theme_ios, theme_ios_dark,
+         skin_material, theme_material, theme_material_dark,
+         skin_macos, theme_macos, theme_macos_dark,
+         skin_vyto, theme_vyto, theme_vyto_dark,
+         theme_light, theme_dark } from "vyto/ui";
+import { GfxPainter } from "vyto/gfx/painter";
+import { Surface, Rect, rgb, EV_CLOSE, EV_KEY, KEY_ESC } from "vyto/surface";
+import { getenv } from "vyto/os";
+
+const W: int = 720;
+const H: int = 560;
+const FONT: string = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf";
+
+// The catalogue: one of every interactive + display widget, fresh each build so
+// no per-instance state leaks between rebuilds when the skin changes.
+fn catalogue(): Widget {
+    let tf = new TextField("");
+    tf.text = "Type here";
+    let cb1 = new Checkbox("Wi-Fi"); cb1.checked = true;
+    let cb2 = new Checkbox("Bluetooth");
+    let disabled = new Button("Disabled").enabled(false);
+
+    return new Column([
+        new Label("Controls"),
+        new Row([new Button("Primary"), new Button("Secondary"), disabled]),
+        tf,
+        new Row([cb1, cb2]),
+        new Row([new Switch(true), new Switch(false)]),
+        new Slider(0.55),
+        new ProgressBar(0.4, -1, -1),
+        new Row([new Badge("12", -1, -1, null), new Chip("Tag", false, -1),
+                 new Chip("Active", true, -1)]),
+        new Card(14, -1, -1, "A card surface", new Label("Elevated, rounded, soft shadow."))
+    ]).gap(14.0).pad(18.0);
+}
+
+// --- skin registry -------------------------------------------------------
+const N_SKINS: int = 5;
+
+fn skin_at(i: int): Skin {
+    if (i == 1) { return skin_macos(); }
+    if (i == 2) { return skin_ios(); }
+    if (i == 3) { return skin_material(); }
+    if (i == 4) { return skin_vyto(); }
+    return new Skin();   // default
+}
+fn theme_at(i: int, dark: bool): Theme {
+    if (i == 1) { if (dark) { return theme_macos_dark(); } return theme_macos(); }
+    if (i == 2) { if (dark) { return theme_ios_dark(); } return theme_ios(); }
+    if (i == 3) { if (dark) { return theme_material_dark(); } return theme_material(); }
+    if (i == 4) { if (dark) { return theme_vyto_dark(); } return theme_vyto(); }
+    if (dark) { return theme_dark(); }
+    return theme_light();
+}
+fn skin_name(i: int): string {
+    if (i == 1) { return "macOS"; }
+    if (i == 2) { return "iOS"; }
+    if (i == 3) { return "Material"; }
+    if (i == 4) { return "Vyto"; }
+    return "Default";
+}
+
+// Mutable selection, captured by the header callbacks. A tiny class rather than
+// loose globals so the two closures share one instance.
+class State { skin_i: int; dark: bool; fn init() { this.skin_i = 4; this.dark = false; } }
+
+// (Re)build the whole tree for the current selection and install it as the
+// window root — a fresh tree each time, so no per-instance widget state carries
+// across a skin change. A header (segmented skin picker + dark switch) sits over
+// the catalogue; both callbacks re-apply the skin/theme and rebuild live.
+fn build_ui(win: Window, st: State) {
+    win.skin = skin_at(st.skin_i);
+    win.theme = theme_at(st.skin_i, st.dark);
+
+    let names: string[] = [];
+    for (let i in 0..N_SKINS) { names.push(skin_name(i)); }
+    let picker = new SegmentedControl(names);
+    picker.selected = st.skin_i;
+    picker.onSelect = (i) => { st.skin_i = i; build_ui(win, st); win.layout(); win.redraw(); };
+
+    let darkSw = new Switch(st.dark);
+    darkSw.onToggle = (on) => { st.dark = on; build_ui(win, st); win.layout(); win.redraw(); };
+
+    win.root = new Column([
+        new Row([picker, new Label("Dark"), darkSw]).gap(12.0),
+        catalogue()
+    ]).gap(16.0).pad(16.0);
+}
+
+fn main() {
+    let st = new State();
+    let win = new Window("Vyto — skin gallery", W, H);
+    let p = new GfxPainter(win.surface(), FONT, 15.0);
+    win.use_painter(p);
+    build_ui(win, st);
+
+    let shot = getenv("SKIN_SHOT");
+    if (shot != "") {
+        win.layout();
+        win.redraw();
+        p.canvas.writePPM(shot);
+        print("wrote " + shot);
+        return;
+    }
+    win.run();
+}

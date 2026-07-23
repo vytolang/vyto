@@ -459,6 +459,17 @@ if [ -f /usr/include/X11/Xlib.h ]; then
         echo "FAIL app_gallery2_builds"
         fail=1
     fi
+    # skin gallery: every widget across all five skins (E4). Headless render must
+    # emit a frame, exercising skin_vyto + the flagship path end to end.
+    sg_bin=apps/skingallery/.vyto-cache/skingallery_test
+    if ./vytoc build apps/skingallery/skingallery.vt -o "$sg_bin" >/dev/null 2>&1 &&
+       [ "$(SKIN_SHOT=tests/tmp/skin.ppm VS_HEADLESS=1 "$sg_bin" 2>&1)" = "wrote tests/tmp/skin.ppm" ] &&
+       [ -s tests/tmp/skin.ppm ]; then
+        echo "PASS app_skingallery_renders"
+    else
+        echo "FAIL app_skingallery_renders"
+        fail=1
+    fi
     # datagrid: DataTable over the native columnar engine (synthetic 200k rows)
     dg_bin=apps/datagrid/.vyto-cache/datagrid_test
     if ./vytoc build apps/datagrid/datagrid.vt -o "$dg_bin" >/dev/null 2>&1; then
