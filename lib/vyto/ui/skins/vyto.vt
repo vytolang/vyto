@@ -1,0 +1,133 @@
+// vyto/ui/skins/vyto — the flagship Vyto skin: the house style that spends
+// every capability the toolkit gained. Rounded, softly-elevated surfaces; a
+// gradient button with a top sheen and a spring-driven state-responsive shadow;
+// a soft focus halo; frosted panels; and a type scale wired through the roles.
+//
+//     win.skin = skin_vyto();
+//     win.theme = theme_vyto();        // or theme_vyto_dark()
+//
+// A skin is shape + color; the typeface comes from the GfxPainter the app
+// builds, same as every other skin. The type scale (sizes) lives on the Theme,
+// so it is font-independent.
+
+import { theme_dark } from "vyto/ui/core";
+import { Painter, Theme, Skin, WidgetState, resolve_state_fill, dim, lerpf,
+         ButtonChrome, FieldChrome, ToggleChrome, PanelChrome, FocusChrome,
+         WEIGHT_REG, WEIGHT_MED, WEIGHT_BOLD,
+         rgb, rgba, mix } from "vyto/ui/core";
+import { Rect } from "vyto/surface";
+
+// A big soft focus halo instead of the default 2px ring — the SwiftUI look.
+class VytoFocusChrome extends FocusChrome {
+    override fn paint(s: Painter, th: Theme, r: Rect, radius: float) {
+        // outer soft glow, then a crisp 1.5px inner ring
+        s.stroke_round(rect_out(r, 3.0), radius + 3.0, 3.0, with_a(th.primary, 46));
+        s.stroke_round(rect_out(r, 1.0), radius + 1.0, 1.5, with_a(th.primary, 200));
+    }
+}
+
+class VytoButtonChrome extends ButtonChrome {
+    override fn paint(s: Painter, th: Theme, r: Rect, label: string,
+                      st: WidgetState, skin: Skin) {
+        let radius = th.radius_lg;
+        // state-responsive depth (D3): rises on hover, sinks on press
+        let el = this.elevation_for(th, st, 2);
+        s.shadow(r, radius, el[0], el[1], th.shadow_color);
+
+        // vertical gradient from a state-resolved top to a darker foot
+        let top = resolve_state_fill(th.primary, st, th.primary_hover, th.primary_press);
+        s.gradient_v(r, radius, dim(top, th.disabled, st), dim(th.primary_700, th.disabled, st));
+
+        // a 1px inner top highlight sells the raised, glossy surface
+        if (st.disabled < 0.5) {
+            let hl = Rect(r.x + radius, r.y + 1.0, r.w - 2.0 * radius, 1.0);
+            s.fill_round(hl, 0.5, with_a(rgb(255, 255, 255), 60));
+        }
+        if (st.focus > 0.0) { skin.focus.paint(s, th, r, radius); }
+        this.draw_label(s, r, label, dim(th.on_primary, th.disabled_fg, st), WEIGHT_BOLD);
+    }
+}
+
+// Soft filled input (no hard border): a sunken fill that lifts to a primary
+// ring on focus. Rounded large, like the buttons.
+class VytoFieldChrome extends FieldChrome {
+    override fn radius(th: Theme): float { return th.radius_lg; }
+    override fn paint_box(s: Painter, th: Theme, r: Rect, st: WidgetState, skin: Skin) {
+        let radius = this.radius(th);
+        // fill lifts slightly on hover, more on focus
+        let base = th.surface_sunken;
+        let fill = mix(base, th.surface_raised, st.hover * 0.5 + st.focus * 0.5);
+        s.fill_round(r, radius, dim(fill, th.disabled, st));
+        // hairline, thickening to a primary ring on focus
+        let border = mix(th.border, th.primary, st.focus);
+        s.stroke_round(r, radius, lerpf(1.0, 1.5, st.focus), dim(border, th.disabled, st));
+        if (st.focus > 0.0) { skin.focus.paint(s, th, r, radius); }
+    }
+}
+
+// Rounded, softly-elevated panels. Inherits PanelChrome (which already has the
+// frosted paint_material variant B1/B2 unlocked) but rounds harder and lifts
+// the resting shadow a touch for the house feel.
+class VytoPanelChrome extends PanelChrome {
+    override fn paint(s: Painter, th: Theme, r: Rect, radius: float, fill: int, border: int, elevation: int) {
+        let rad = radius;
+        if (rad < th.radius_lg) { rad = th.radius_lg; }
+        if (elevation > 0) {
+            let blur = th.elevation2_blur;
+            let dy = th.elevation2_dy;
+            if (elevation >= 3) { blur = th.elevation3_blur; dy = th.elevation3_dy; }
+            s.shadow(r, rad, blur, dy, th.shadow_color);
+        }
+        s.fill_round(r, rad, fill);
+        s.stroke_round(r, rad, 1, border);
+    }
+}
+
+export fn theme_vyto(): Theme {
+    let th = new Theme();
+    // an indigo/violet house accent
+    th.primary        = rgb(99, 91, 255);
+    th.on_primary     = rgb(255, 255, 255);
+    th.primary_hover  = mix(th.primary, rgb(255, 255, 255), 0.10);
+    th.primary_press  = mix(th.primary, rgb(0, 0, 0), 0.16);
+    th.primary_500    = th.primary;
+    th.primary_300    = mix(th.primary, th.on_primary, 0.45);
+    th.primary_700    = mix(th.primary, rgb(0, 0, 0), 0.32);
+    th.focus_ring     = rgba(99, 91, 255, 140);
+    th.selection      = mix(th.surface, th.primary, 0.22);
+    // rounder than the default
+    th.radius_sm      = 6.0;
+    th.radius_md      = 12.0;
+    th.radius_lg      = 18.0;
+    return th;
+}
+
+export fn theme_vyto_dark(): Theme {
+    let th = theme_dark();
+    th.primary        = rgb(129, 120, 255);
+    th.on_primary     = rgb(20, 18, 40);
+    th.primary_hover  = mix(th.primary, rgb(255, 255, 255), 0.10);
+    th.primary_press  = mix(th.primary, rgb(0, 0, 0), 0.16);
+    th.primary_500    = th.primary;
+    th.primary_300    = mix(th.primary, th.on_primary, 0.45);
+    th.primary_700    = mix(th.primary, rgb(0, 0, 0), 0.32);
+    th.focus_ring     = rgba(129, 120, 255, 150);
+    th.selection      = mix(th.surface, th.primary, 0.30);
+    th.radius_sm      = 6.0;
+    th.radius_md      = 12.0;
+    th.radius_lg      = 18.0;
+    return th;
+}
+
+export fn skin_vyto(): Skin {
+    let sk = new Skin();
+    sk.button = new VytoButtonChrome();
+    sk.field  = new VytoFieldChrome();
+    sk.panel  = new VytoPanelChrome();
+    sk.focus  = new VytoFocusChrome();
+    return sk;
+}
+
+// local helpers (kept file-private so they don't widen the core surface)
+fn with_a(color: int, a: int): int { return (color & 0xFFFFFF) | (a << 24); }
+fn rect_out(r: Rect, by: float): Rect { return Rect(r.x - by, r.y - by, r.w + 2.0 * by, r.h + 2.0 * by); }
