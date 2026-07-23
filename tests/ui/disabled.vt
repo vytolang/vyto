@@ -1,0 +1,71 @@
+// C5: a disabled widget is inert (no hit, no focus) and paints dimmed.
+// Behaviour is asserted directly on the widgets; the dim through pixelAt.
+
+import { Window, Button, Column, Widget, Theme, WidgetState, ws } from "vyto/ui";
+import { GfxPainter } from "vyto/gfx/painter";
+import { Rect } from "vyto/surface";
+
+const FONT: string = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf";
+
+fn check(label: string, cond: bool) {
+    let mark = "FAIL";
+    if (cond) { mark = "ok"; }
+    print(mark + " " + label);
+}
+
+fn main() {
+    // --- inertness: hit-testing and focus order both skip a disabled widget ---
+    let live = new Button("Live");
+    let dead = new Button("Dead").enabled(false);
+    live.bounds = Rect(0.0, 0.0, 100.0, 40.0);
+    dead.bounds = Rect(0.0, 40.0, 100.0, 40.0);
+
+    check("enabled widget is hit", live.hit(50, 20) == live);
+    check("disabled widget is not hit", dead.hit(50, 60) == null);
+
+    let order: Widget[] = [];
+    live.collect_focus(order);
+    dead.collect_focus(order);
+    check("only the enabled widget is focusable", order.len == 1 && order[0] == live);
+
+    // enabled(true) restores it
+    dead.enabled(true);
+    check("re-enabling restores hit", dead.hit(50, 60) == dead);
+    dead.enabled(false);
+
+    // --- dim: a disabled button paints muted vs an enabled one ---
+    let win = new Window("Disabled", 160, 120);
+    let p = new GfxPainter(win.surface(), FONT, 15.0);
+    let th = new Theme();
+
+    let r = Rect(20.0, 20.0, 120.0, 40.0);
+    p.fill(Rect(0.0, 0.0, 160.0, 120.0), th.surface);
+    win.skin.button.paint(p, th, r, "On", ui_on(), win.skin);
+    let enabled_px = p.canvas.pixelAt(80, 40);
+
+    p.fill(Rect(0.0, 0.0, 160.0, 120.0), th.surface);
+    win.skin.button.paint(p, th, r, "Off", ui_off(), win.skin);
+    let disabled_px = p.canvas.pixelAt(80, 40);
+
+    check("disabled button paints differently", enabled_px != disabled_px);
+    // dim pulls the primary fill toward the grey disabled color: the disabled
+    // sample must be less saturated (closer to its own grey mid).
+    check("disabled fill is muted", muted_toward_grey(enabled_px, disabled_px));
+}
+
+// a WidgetState literal isn't constructible here without importing the struct;
+// use the exported ws() helper via a tiny wrapper instead.
+fn ui_on(): WidgetState { return ws(false, false, false, false, false); }
+fn ui_off(): WidgetState { return ws(false, false, false, false, true); }
+
+fn chan(px: int, sh: int): int { return (px >> sh) & 0xFF; }
+// grey = low spread between channels; disabled should reduce the spread
+fn spread(px: int): int {
+    let r = chan(px, 16); let g = chan(px, 8); let b = chan(px, 0);
+    let hi = r; if (g > hi) { hi = g; } if (b > hi) { hi = b; }
+    let lo = r; if (g < lo) { lo = g; } if (b < lo) { lo = b; }
+    return hi - lo;
+}
+fn muted_toward_grey(enabled: int, disabled: int): bool {
+    return spread(disabled) < spread(enabled);
+}

@@ -810,20 +810,51 @@ export class SurfacePainter extends Painter {
 // inside the Chrome method to preserve that ordering, not bolted on
 // afterward by the widget.
 
+// The interaction state a Chrome paints, every field a 0..1 amount rather than
+// a bool. A bool can only cut between two looks; a fraction lets a knob sit
+// half-slid or a fill be part-tinted, which is what the spring-driven
+// transitions (C4) put on the wire. At a resting endpoint every field is
+// exactly 0 or 1, so a Chrome written against these reproduces the old bool
+// branches byte for byte (mix() returns its endpoints exactly at 0 and 1).
+export struct WidgetState {
+    hover: float;
+    press: float;
+    focus: float;
+    on: float;        // checked / selected / switched-on
+    disabled: float;
+}
+
+// Discrete state, for a resting endpoint or a widget whose springs have not
+// been created yet. b2f keeps the bool->0/1 conversion in one place.
+fn b2f(b: bool): float { if (b) { return 1.0; } return 0.0; }
+export fn ws(hover: bool, press: bool, focus: bool, on: bool, disabled: bool): WidgetState {
+    return WidgetState(b2f(hover), b2f(press), b2f(focus), b2f(on), b2f(disabled));
+}
+
+// Fade a color toward a muted target by the disabled amount. Partial (0.55) so
+// a disabled control still reads as itself, just greyed — a full fade to the
+// theme's disabled color loses the shape's identity. At amount 0 (every
+// currently-live widget) it returns the color untouched, so nothing dims until
+// something is actually disabled.
+export fn dim(color: int, muted: int, st: WidgetState): int {
+    return mix(color, muted, st.disabled * 0.55);
+}
+
 export class ButtonChrome {
     virtual fn paint(s: Painter, th: Theme, r: Rect, label: string,
-                     hovered: bool, pressed: bool, focused: bool, skin: Skin) {
+                     st: WidgetState, skin: Skin) {
         let radius = th.radius_md;
         s.shadow(r, radius, th.elevation1_blur, th.elevation1_dy, th.shadow_color);
-        let top = th.primary;
-        if (hovered) { top = th.primary_hover; }
-        if (pressed) { top = th.primary_press; }
-        s.gradient_v(r, radius, top, th.primary_700);
-        if (focused) { skin.focus.paint(s, th, r, radius); }
+        // hover then press, each layered by its own amount; press wins when both
+        // are up because it is applied last (mix to press over the hover result).
+        let top = mix(th.primary, th.primary_hover, st.hover);
+        top = mix(top, th.primary_press, st.press);
+        s.gradient_v(r, radius, dim(top, th.disabled, st), dim(th.primary_700, th.disabled, st));
+        if (st.focus > 0.0) { skin.focus.paint(s, th, r, radius); }
         s.set_weight(WEIGHT_BOLD);
         let tw = s.text_width(label);
         let pad = (r.w - tw) / 2;
-        s.text_in(r, pad, label, th.on_primary);
+        s.text_in(r, pad, label, dim(th.on_primary, th.disabled_fg, st));
         s.set_weight(WEIGHT_REG);
     }
 }
@@ -835,71 +866,64 @@ export class ButtonChrome {
 export class FieldChrome {
     virtual fn radius(th: Theme): float { return th.radius_md; }
 
-    virtual fn paint_box(s: Painter, th: Theme, r: Rect, focused: bool, hovered: bool, skin: Skin) {
+    virtual fn paint_box(s: Painter, th: Theme, r: Rect, st: WidgetState, skin: Skin) {
         let radius = this.radius(th);
-        let bg = th.surface_raised;
-        if (hovered && !focused) { bg = mix(th.surface_raised, th.on_surface, 0.04); }
+        // hover tint only shows when not focused (focus takes over the border),
+        // so gate the hover amount by (1 - focus).
+        let bg = mix(th.surface_raised, mix(th.surface_raised, th.on_surface, 0.04),
+                     st.hover * (1.0 - st.focus));
         s.fill_round(r, radius, bg);
-        let border = th.border;
-        if (focused) {
-            border = th.primary;
-        } else if (hovered) {
-            border = mix(th.border, th.on_surface, 0.20);
-        }
-        s.stroke_round(r, radius, 1, border);
-        if (focused) { skin.focus.paint(s, th, r, radius); }
+        // border: hover lifts it toward on_surface, focus overrides to primary.
+        let hov_border = mix(th.border, mix(th.border, th.on_surface, 0.20), st.hover);
+        let border = mix(hov_border, th.primary, st.focus);
+        s.stroke_round(r, radius, 1, dim(border, th.disabled, st));
+        if (st.focus > 0.0) { skin.focus.paint(s, th, r, radius); }
     }
 }
 
 // Checkbox/RadioButton/Switch — bundled as one family since real skins
 // always restyle these three together as a set.
 export class ToggleChrome {
-    virtual fn paint_checkbox(s: Painter, th: Theme, r: Rect, checked: bool,
-                              hovered: bool, focused: bool, skin: Skin) {
+    virtual fn paint_checkbox(s: Painter, th: Theme, r: Rect, st: WidgetState, skin: Skin) {
         let radius = th.radius_sm;
-        let bg = th.surface_raised;
-        if (checked) { bg = th.primary; }
-        else if (hovered) { bg = mix(th.surface_raised, th.on_surface, 0.05); }
-        s.fill_round(r, radius, bg);
-        let border = th.border;
-        if (checked) { border = th.primary; }
-        else if (hovered) { border = mix(th.border, th.on_surface, 0.20); }
-        s.stroke_round(r, radius, 1, border);
-        if (checked) {
-            // filled check mark (a small rounded inner square approximating a tick)
-            s.fill_round(r.inset(4), radius, th.on_primary);
+        // hover tint, then the checked fill layered over it by st.on
+        let hov_bg = mix(th.surface_raised, mix(th.surface_raised, th.on_surface, 0.05), st.hover);
+        s.fill_round(r, radius, dim(mix(hov_bg, th.primary, st.on), th.disabled, st));
+        let hov_bd = mix(th.border, mix(th.border, th.on_surface, 0.20), st.hover);
+        s.stroke_round(r, radius, 1, dim(mix(hov_bd, th.primary, st.on), th.disabled, st));
+        // the tick fades in with st.on — at on=1 a solid inner square, at on=0
+        // absent, so the resting look is unchanged either way
+        if (st.on > 0.0) {
+            s.fill_round(r.inset(4), radius, with_alpha(th.on_primary, (255.0 * st.on).round() as int));
         }
-        if (focused) { skin.focus.paint(s, th, r, radius); }
+        if (st.focus > 0.0) { skin.focus.paint(s, th, r, radius); }
     }
 
-    virtual fn paint_radio(s: Painter, th: Theme, r: Rect, selected: bool,
-                           hovered: bool, focused: bool, skin: Skin) {
+    virtual fn paint_radio(s: Painter, th: Theme, r: Rect, st: WidgetState, skin: Skin) {
         let cx = r.cx();
         let cy = r.cy();
         let radius = r.w / 2;
-        let ring_col = th.border;
-        if (selected) { ring_col = th.primary; }
-        else if (hovered) { ring_col = mix(th.border, th.on_surface, 0.20); }
-        s.stroke_circle(cx, cy, radius - 1, 2, ring_col);
-        if (selected) { s.circle(cx, cy, 4, th.primary); }
-        if (focused) { skin.focus.paint(s, th, r, radius); }
+        let hov_ring = mix(th.border, mix(th.border, th.on_surface, 0.20), st.hover);
+        s.stroke_circle(cx, cy, radius - 1, 2, dim(mix(hov_ring, th.primary, st.on), th.disabled, st));
+        // the dot grows from the centre with st.on (radius 4 when full, gone at 0)
+        if (st.on > 0.0) { s.circle(cx, cy, 4.0 * st.on, dim(th.primary, th.disabled, st)); }
+        if (st.focus > 0.0) { skin.focus.paint(s, th, r, radius); }
     }
 
-    virtual fn paint_switch(s: Painter, th: Theme, r: Rect, on: bool,
-                            hovered: bool, pressed: bool, focused: bool, skin: Skin) {
+    virtual fn paint_switch(s: Painter, th: Theme, r: Rect, st: WidgetState, skin: Skin) {
         let radius = r.h / 2;   // a true pill
-        let track = th.neutral_300;
-        if (on) { track = th.primary; }
-        else if (hovered) { track = mix(th.neutral_300, th.on_surface, 0.18); }
-        if (on && pressed) { track = th.primary_press; }
-        s.fill_round(r, radius, track);
+        let hov = mix(th.neutral_300, mix(th.neutral_300, th.on_surface, 0.18), st.hover);
+        let track = mix(hov, th.primary, st.on);
+        track = mix(track, th.primary_press, st.on * st.press);
+        s.fill_round(r, radius, dim(track, th.disabled, st));
         let kw = r.h - 4;
-        let kx = r.x + 2 + kw / 2;
-        if (on) { kx = r.right() - 2 - kw / 2; }
+        let kx0 = r.x + 2 + kw / 2;             // knob home (off)
+        let kx1 = r.right() - 2 - kw / 2;       // knob end (on)
+        let kx = kx0 + (kx1 - kx0) * st.on;     // slides with st.on — the headline motion
         let ky = r.cy();
         s.circle(kx, ky, kw / 2, th.surface_raised);
         s.stroke_circle(kx, ky, kw / 2, 1, th.border);
-        if (focused) { skin.focus.paint(s, th, r, radius); }
+        if (st.focus > 0.0) { skin.focus.paint(s, th, r, radius); }
     }
 }
 
@@ -1014,6 +1038,13 @@ export class Widget {
     focused: bool;
     hovered: bool;     // WS6: cursor is over this widget
     pressed: bool;     // WS6: a button is held down over this widget
+    disabled: bool;    // C5: inert + dimmed; event dispatch skips it
+    // Spring-backed hover/press/focus amounts (C4). Null until the first
+    // transition creates them, so a static tree of thousands of widgets pays
+    // nothing. state() reads these when present and falls back to the bools.
+    anim_hover: AnimatedFloat;
+    anim_press: AnimatedFloat;
+    anim_focus: AnimatedFloat;
     grow: int;          // flex factor inside Column/Row; 0 = natural size
     alignSelf: int;     // cross-axis override inside Column/Row; -1 = inherit
     modal: bool;        // overlay traps events; outside clicks don't dismiss
@@ -1058,6 +1089,20 @@ export class Widget {
     // Window.layout() having propagated `win` to the whole tree.
     fn invalidate() {
         if (this.win != null) { this.win.mark_dirty(this.bounds); }
+    }
+
+    // The interaction state to hand a Chrome. Reads the spring amounts when
+    // they exist (mid-transition) and the plain bools otherwise (resting, or
+    // before any transition created a spring). `on` is the widget's own logical
+    // state — checked/selected/switch-on — which the widget passes in.
+    fn ui_state(on: bool): WidgetState {
+        let h = b2f(this.hovered);
+        let p = b2f(this.pressed);
+        let f = b2f(this.focused);
+        if (this.anim_hover != null) { h = this.anim_hover.value(); }
+        if (this.anim_press != null) { p = this.anim_press.value(); }
+        if (this.anim_focus != null) { f = this.anim_focus.value(); }
+        return WidgetState(h, p, f, b2f(on), b2f(this.disabled));
     }
 
     // The active modifier chord (MOD_* bits) at the current event. Window
@@ -1418,6 +1463,9 @@ export class Widget {
 
     // deepest widget under the point; later siblings win (drawn on top)
     virtual fn hit(px: int, py: int): Widget {
+        // A disabled widget is inert: it and its subtree are transparent to
+        // hit-testing, so hover/press/click fall through to whatever is behind.
+        if (this.disabled) { return null; }
         let n = this.children.len;
         for (let i in 0..n) {
             let c = this.children[n - 1 - i];
@@ -1429,11 +1477,16 @@ export class Widget {
     }
 
     virtual fn collect_focus(out: Widget[]) {
+        if (this.disabled) { return; }   // disabled → not in the tab order
         if (this.focusable) { out.push(this); }
         for (let c in this.children) {
             c.collect_focus(out);
         }
     }
+
+    // Fluent enable/disable. Disabled widgets paint dimmed (via WidgetState)
+    // and take no events. Returns this for chaining.
+    builder fn enabled(on: bool) { this.disabled = !on; return this; }
 }
 
 // ---------------------------------------------------------------- Window
