@@ -1,0 +1,41 @@
+// SPI full-duplex transfer — vyto/hw/spi, the sibling of hw/i2c (docs/HARDWARE.md).
+//
+//   vytoc run examples/65_spi.vt                       # list spidev nodes
+//   vytoc run examples/65_spi.vt -- /dev/spidev0.0     # JEDEC-ID read demo
+//
+// (Needs an SPI bus + `spi`-group permission, and no easy kernel mock — a MISO->MOSI
+// loopback jumper echoes tx back. No golden .expected — the runner SKIPs it.)
+
+import { spi_open_bus } from "vyto/hw/spi";
+
+fn main() {
+    let av = args();
+    if (av.len < 1) {
+        print("spi buses:");
+        let found = 0;
+        let b = 0;
+        while (b < 4) {
+            let c = 0;
+            while (c < 4) {
+                let path = "/dev/spidev" + b + "." + c;
+                let bus = spi_open_bus(path, 0, 500000);
+                if (bus != null) { print("  " + path); found += 1; }
+                c += 1;
+            }
+            b += 1;
+        }
+        if (found == 0) { print("  (none)"); }
+        print("(pass a spidev path to run a transfer)");
+        return;
+    }
+
+    let spi = spi_open_bus(av[0], 0, 500000);   // mode 0, 500 kHz
+    if (spi == null) { print("cannot open " + av[0] + " (missing, or not in the spi group)"); return; }
+
+    // Clock out 3 bytes (e.g. a SPI-flash JEDEC-ID command) and read 3 back full-duplex.
+    let tx = bytes(3);
+    tx[0] = 0x9F as byte;
+    let rx = spi.transfer(tx);
+    if (rx.len == 0) { print("transfer failed"); return; }
+    print("tx " + tx.len + " bytes -> rx " + rx[0] + " " + rx[1] + " " + rx[2] + " (loopback echoes tx)");
+}

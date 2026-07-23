@@ -1,0 +1,43 @@
+// Kernel device events — vyto/hw/uevent. The push source hw/power and net/link lack:
+// AC unplugged, battery changed, cable pulled, USB attached — all on one poll-able fd
+// (docs/HARDWARE.md). Try plugging/unplugging AC power or a USB device while it runs.
+//
+//   vytoc run examples/69_uevent.vt
+//
+// (Live events depend on what you do to the machine, so no golden .expected — the
+// runner SKIPs it.) First proves the parser on a canned event, then watches live for
+// 10s.
+
+import { PollSet, POLL_READ } from "vyto/net/socket";
+import { uevent_open_monitor, parse_uevent } from "vyto/hw/uevent";
+
+fn main() {
+    // Parser check on a canned power_supply "change" event (no hardware needed):
+    let canned = "change@/devices/LNXSYSTM:00/.../power_supply/AC\n"
+        + "ACTION=change\n"
+        + "DEVPATH=/devices/LNXSYSTM:00/.../power_supply/AC\n"
+        + "SUBSYSTEM=power_supply\n"
+        + "POWER_SUPPLY_NAME=AC\n"
+        + "POWER_SUPPLY_ONLINE=0";
+    let e = parse_uevent(canned);
+    print("parsed: " + e.action + " " + e.subsystem + "/" + e.name() + " online=" + e.get("POWER_SUPPLY_ONLINE"));
+
+    // Live monitor:
+    let mon = uevent_open_monitor();
+    if (mon == null) { print("cannot open uevent monitor"); return; }
+    print("watching kernel events for 10s (unplug AC / plug a USB device)...");
+
+    let ps = new PollSet();
+    ps.addFd(mon.pollFd(), POLL_READ);
+
+    let elapsed = 0;
+    while (elapsed < 10000) {
+        let n = ps.wait(2000);
+        if (n <= 0) { elapsed += 2000; continue; }   // idle tick
+        let ev = mon.next();
+        if (ev != null) {
+            print("  " + ev.action + "  " + ev.subsystem + "/" + ev.name());
+        }
+    }
+    print("done.");
+}

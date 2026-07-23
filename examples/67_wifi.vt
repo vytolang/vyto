@@ -1,0 +1,70 @@
+// WiFi scan/connect — vyto/net/wifi over the wpa_supplicant control socket. The
+// control plane (managing the radio), distinct from the data path in net/socket
+// (docs/HARDWARE.md). This is the onboarding flow: scan, pick, connect.
+//
+//   vytoc run examples/67_wifi.vt                 # parse a canned scan (no hardware)
+//   vytoc run examples/67_wifi.vt -- wlan0        # live scan (needs wpa_supplicant)
+//
+// (Live output varies and the canned path needs no device, so no golden .expected —
+// the runner SKIPs it.)
+
+import { PollSet, POLL_READ } from "vyto/net/socket";
+import { wifi_open, wifi_monitor, parse_scan_results, parse_wifi_event, WifiNetwork } from "vyto/net/wifi";
+
+fn show(nets: WifiNetwork[]) {
+    for (let n in nets) {
+        let sec = "open";
+        if (n.isSecured()) { sec = "secured"; }
+        let name = n.ssid;
+        if (name == "") { name = "<hidden>"; }
+        print("  " + n.signal + "dBm  " + n.freq + "MHz  " + sec + "  " + name + "  (" + n.bssid + ")");
+    }
+}
+
+fn main() {
+    let av = args();
+
+    // "monitor <iface>": watch for connect/disconnect events as they happen (push, not
+    // poll) — the real answer to "how does my app know WiFi dropped".
+    if (av.len >= 2 && av[0] == "monitor") {
+        let mon = wifi_monitor(av[1]);
+        if (mon == null) { print("cannot attach monitor for " + av[1]); return; }
+        print("watching " + av[1] + " for events (toggle WiFi to see them)...");
+        let ps = new PollSet();
+        ps.addFd(mon.pollFd(), POLL_READ);
+        while (true) {
+            if (ps.wait(-1) > 0) {
+                let e = mon.next();
+                if (e != null) {
+                    let tag = "";
+                    if (e.isDisconnect()) { tag = "  <-- DISCONNECTED"; }
+                    if (e.isConnect()) { tag = "  <-- CONNECTED"; }
+                    print("  " + e.name + tag);
+                }
+            }
+        }
+    }
+
+    if (av.len >= 1) {
+        let w = wifi_open(av[0]);
+        if (w == null) { print("no wpa_supplicant control socket for " + av[0] + " (need the netdev group / root?)"); return; }
+        print("scanning " + av[0] + " ...");
+        w.scan();
+        show(w.scanResults());
+        return;
+    }
+
+    // No interface given: prove the parser on a canned SCAN_RESULTS block (the exact
+    // tab-separated format wpa_supplicant returns).
+    let canned = "bssid / frequency / signal level / flags / ssid\n"
+        + "00:11:22:33:44:55\t2412\t-42\t[WPA2-PSK-CCMP][ESS]\tHomeNet\n"
+        + "66:77:88:99:aa:bb\t5180\t-67\t[WPA3-SAE-CCMP][ESS]\tCafe 5G\n"
+        + "cc:dd:ee:ff:00:11\t2437\t-71\t[ESS]\tOpenGuest";
+    print("parsed scan (sample):");
+    show(parse_scan_results(canned));
+
+    // Event parser check (the push-event format wpa_supplicant sends):
+    let ev = parse_wifi_event("<3>CTRL-EVENT-DISCONNECTED bssid=00:11:22:33:44:55 reason=3");
+    print("parsed event: " + ev.name + "  disconnect=" + ev.isDisconnect());
+    print("(run with '-- monitor <iface>' to watch live connect/disconnect events)");
+}

@@ -1,0 +1,78 @@
+// vyto/hw/spi — SPI bus master over /dev/spidev*, the Vyto-way (docs/HARDWARE.md): the
+// handle / byte-transfer half, sibling of vyto/hw/i2c. SPI is full-duplex — every
+// transfer clocks bytes out AND in at once, so transfer() returns the bytes read while
+// your bytes are written. Mode / bits / clock are set at open.
+//
+//     let spi = spi_open_bus("/dev/spidev0.0", 0, 500000);   // mode 0, 500 kHz
+//     if (spi == null) { print("no bus / no permission"); return; }
+//
+//     let tx = bytes(2); tx[0] = 0x9F as byte;               // e.g. a flash JEDEC-ID read
+//     let rx = spi.transfer(tx);                             // rx.len == tx.len
+//     print("id byte = " + rx[1]);
+//
+// Bus access needs the `spi` group or root; a denied open is soft (null). The bus fd
+// lives in SpiBus and is closed by deinit. Linux; other platforms return null.
+
+extern "C" {
+    fn spi_open(path: cstring): i32;
+    fn spi_configure(fd: i32, mode: i32, bits: i32, speed_hz: i32): i32;
+    fn spi_transfer(fd: i32, tx: cstring, rx: cstring, len: i64, speed_hz: i32, bits: i32): i64;
+    fn spi_close(fd: i32);
+}
+
+// An open SPI bus. Address transfers full-duplex; the fd is closed by deinit.
+export class SpiBus {
+    fd: i32;
+    speed: int;
+    bits: int;
+
+    fn init(fd: i32, speed: int, bits: int) { this.fd = fd; this.speed = speed; this.bits = bits; }
+
+    fn ensure() { if ((this.fd as int) < 0) { panic("vyto/hw/spi: operation on a closed bus"); } }
+    fn isValid(): bool { return (this.fd as int) >= 0; }
+
+    // Full-duplex transfer: clock out `tx`, return the bytes clocked in (same length).
+    // Empty on error.
+    fn transfer(tx: byte[]): byte[] {
+        this.ensure();
+        if (tx.len <= 0) { return bytes(0); }
+        let rx = bytes(tx.len);
+        let r = spi_transfer(this.fd, tx as cstring, rx as cstring, tx.len as i64,
+                             this.speed as i32, this.bits as i32) as int;
+        if (r < 0) { return bytes(0); }
+        return rx;
+    }
+    // Write-only: clock out `tx`, ignore what comes back. True on success.
+    fn write(tx: byte[]): bool {
+        this.ensure();
+        if (tx.len <= 0) { return true; }
+        let rx = bytes(tx.len);
+        return spi_transfer(this.fd, tx as cstring, rx as cstring, tx.len as i64,
+                            this.speed as i32, this.bits as i32) as int >= 0;
+    }
+
+    // Re-set the clock / mode / word size on the fly. True on success.
+    fn configure(mode: int, bits: int, speedHz: int): bool {
+        this.ensure();
+        this.speed = speedHz;
+        this.bits = bits;
+        return spi_configure(this.fd, mode as i32, bits as i32, speedHz as i32) as int == 0;
+    }
+
+    fn close() {
+        if ((this.fd as int) >= 0) { spi_close(this.fd); this.fd = -1 as i32; }
+    }
+    deinit { this.close(); }
+}
+
+// Open an SPI device (e.g. "/dev/spidev0.0") in `mode` (0..3) at `speedHz`, 8 bits per
+// word. Null on failure (missing device, or no permission — usually the `spi` group).
+export fn spi_open_bus(path: string, mode: int, speedHz: int): SpiBus {
+    let fd = spi_open(path.cstr()) as int;
+    if (fd < 0) { return null; }
+    if (spi_configure(fd as i32, mode as i32, 8 as i32, speedHz as i32) as int != 0) {
+        spi_close(fd as i32);
+        return null;
+    }
+    return new SpiBus(fd as i32, speedHz, 8);
+}

@@ -1,0 +1,90 @@
+// vyto/hw/power — battery, AC adapter, and thermal status, the Vyto-way
+// (docs/HARDWARE.md). Pure sysfs reads (/sys/class/power_supply, /sys/class/thermal),
+// soft: a missing attribute reads as empty / 0. Read-only status (laptop battery %,
+// charging state, temperatures) — exactly what a status bar or a thermal-aware daemon
+// needs.
+//
+//     for (let s in power_supplies()) {
+//         if (s.isBattery()) { print(s.name + ": " + s.capacity() + "% " + s.status()); }
+//         if (s.isMains())   { print(s.name + ": online=" + s.online()); }
+//     }
+//     for (let z in thermal_zones()) { print(z.kind() + ": " + z.tempC() + "C"); }
+//
+// Linux; other platforms return empty lists.
+
+extern "C" {
+    fn sysfs_read(path: cstring): cstring;
+}
+
+fn ps_attr(name: string, attr: string): string {
+    return str(sysfs_read(("/sys/class/power_supply/" + name + "/" + attr).cstr()));
+}
+fn ps_int(name: string, attr: string, fallback: int): int {
+    let s = ps_attr(name, attr);
+    if (s == "") { return fallback; }
+    return s.to_int();
+}
+
+// A power supply: a battery, or a mains/USB adapter. Each accessor re-reads sysfs.
+export class PowerSupply {
+    name: string;               // "BAT0", "AC", "USB", ...
+
+    fn init(name: string) { this.name = name; }
+
+    // "Battery", "Mains", "USB", "UPS", ...
+    fn kind(): string { return ps_attr(this.name, "type"); }
+    fn isBattery(): bool { return this.kind() == "Battery"; }
+    fn isMains(): bool { return this.kind() == "Mains"; }
+
+    // Mains/USB: is the adapter plugged in and supplying power.
+    fn online(): bool { return ps_int(this.name, "online", 0) == 1; }
+
+    // Battery: charge level 0..100, or -1 if not a battery.
+    fn capacity(): int { return ps_int(this.name, "capacity", -1); }
+    // Battery: "Charging", "Discharging", "Full", "Not charging", "Unknown".
+    fn status(): string { return ps_attr(this.name, "status"); }
+    // Battery: terminal voltage in volts (from voltage_now microvolts), 0 if absent.
+    fn voltage(): float {
+        let uv = ps_int(this.name, "voltage_now", 0);
+        return (uv as float) / 1000000.0;
+    }
+}
+
+// A thermal zone (a temperature sensor the kernel exposes for cooling policy).
+export class ThermalZone {
+    index: int;
+
+    fn init(index: int) { this.index = index; }
+
+    fn dir(): string { return "/sys/class/thermal/thermal_zone" + this.index; }
+    // The zone's role, e.g. "x86_pkg_temp", "acpitz".
+    fn kind(): string { return str(sysfs_read((this.dir() + "/type").cstr())); }
+    // Temperature in degrees Celsius (from millidegrees), 0.0 if unreadable.
+    fn tempC(): float {
+        let s = str(sysfs_read((this.dir() + "/temp").cstr()));
+        if (s == "") { return 0.0; }
+        return (s.to_int() as float) / 1000.0;
+    }
+}
+
+// Every power supply (batteries + adapters). Empty when there is no sysfs.
+export fn power_supplies(): PowerSupply[] {
+    let out: PowerSupply[] = [];
+    if (!isdir("/sys/class/power_supply")) { return out; }
+    for (let name in listdir("/sys/class/power_supply")) {
+        if (name.starts_with(".")) { continue; }
+        out.push(new PowerSupply(name));
+    }
+    return out;
+}
+
+// Every thermal zone, in index order. Empty when there is no sysfs.
+export fn thermal_zones(): ThermalZone[] {
+    let out: ThermalZone[] = [];
+    if (!isdir("/sys/class/thermal")) { return out; }
+    for (let name in listdir("/sys/class/thermal")) {
+        if (!name.starts_with("thermal_zone")) { continue; }
+        out.push(new ThermalZone(name.slice(12, name.len).to_int()));
+    }
+    return out;
+}

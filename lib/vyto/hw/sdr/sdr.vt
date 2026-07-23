@@ -1,0 +1,70 @@
+// vyto/hw/sdr — software-defined radio, the Vyto-way (docs/HARDWARE.md). An SDR is a
+// USB device streaming IQ samples, so this package builds on vyto/hw/usb: no new shim,
+// it enumerates the bus and recognises known SDR front-ends (RTL-SDR, HackRF, Airspy,
+// bladeRF, SDRplay). Pure Vyto — reuse over rebuild.
+//
+//     for (let d in sdr_devices()) {
+//         print(d.model + "  " + d.id() + "  (bus " + d.bus + " dev " + d.addr + ")");
+//     }
+//
+// This is device DETECTION today. Streaming IQ samples means configuring the tuner and
+// pulling bulk transfers — for RTL-SDR that is a stack of register writes best handled
+// by librtlsdr (or SoapySDR), an opt-in dependency; a raw path over vyto/hw/usb bulk
+// transfers is the next increment. Detection needs no permission; opening for transfers
+// would need the usb device-node access vyto/hw/usb documents. Linux (via hw/usb).
+
+import { usb_devices } from "vyto/hw/usb";
+
+// A recognised SDR device on the USB bus (a snapshot, copied from vyto/hw/usb).
+export class SdrDevice {
+    vid: int;
+    pid: int;
+    bus: int;
+    addr: int;
+    model: string;      // human name, e.g. "RTL-SDR (RTL2832U)"
+    fn init(vid: int, pid: int, bus: int, addr: int, model: string) {
+        this.vid = vid; this.pid = pid; this.bus = bus; this.addr = addr; this.model = model;
+    }
+    // "vvvv:pppp" — the USB vendor:product identifier.
+    fn id(): string { return hex4(this.vid) + ":" + hex4(this.pid); }
+}
+
+// Match a vid/pid against the known-SDR table; "" when it is not an SDR front-end.
+// (FTDI-based SDRs like some LimeSDRs share the generic 0403:6010/601f ids, so they are
+// deliberately omitted to avoid flagging every FTDI serial adapter as a radio.)
+fn sdr_model(vid: int, pid: int): string {
+    if (vid == 0x0bda && (pid == 0x2838 || pid == 0x2832)) { return "RTL-SDR (RTL2832U)"; }
+    if (vid == 0x1d50 && pid == 0x6089) { return "HackRF One"; }
+    if (vid == 0x1d50 && pid == 0x604b) { return "HackRF Jawbreaker"; }
+    if (vid == 0x1d50 && pid == 0xcc15) { return "rad1o"; }
+    if (vid == 0x1d50 && pid == 0x60a1) { return "Airspy"; }
+    if (vid == 0x03eb && pid == 0x800c) { return "Airspy HF+"; }
+    if (vid == 0x2cf0 && (pid == 0x5246 || pid == 0x5250)) { return "bladeRF"; }
+    if (vid == 0x1df7) { return "SDRplay"; }   // 0x2500 / 0x3000 / 0x3010 ...
+    return "";
+}
+
+// Every recognised SDR currently attached. Empty when none are present (or no USB).
+export fn sdr_devices(): SdrDevice[] {
+    let out: SdrDevice[] = [];
+    for (let d in usb_devices()) {
+        let model = sdr_model(d.vid, d.pid);
+        if (model != "") {
+            out.push(new SdrDevice(d.vid, d.pid, d.bus, d.addr, model));
+        }
+    }
+    return out;
+}
+
+// Lowercase 4-digit hex (USB ids are 16-bit).
+fn hex4(v: int): string {
+    let digits = "0123456789abcdef";
+    let out = "";
+    let shift = 12;
+    while (shift >= 0) {
+        let nib = (v >> shift) & 0xF;
+        out = out + digits.slice(nib, nib + 1);
+        shift -= 4;
+    }
+    return out;
+}

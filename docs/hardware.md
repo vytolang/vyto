@@ -346,7 +346,135 @@ for one-off control calls, or as the foundation for a new pure-Vyto device modul
 Its one limit: `ioctl` can't `mmap`, so devices needing a mapped ring (V4L2
 `/dev/video*`) still want a typed package like `hw/camera`.
 
-## 12. Runnable examples
+## 12. SPI — `vyto/hw/spi`
+
+SPI master over `/dev/spidev*`, the sibling of I2C. SPI is **full-duplex** — every
+transfer clocks bytes out and in at the same time, so `transfer()` returns what was
+read while your bytes were written.
+
+```js
+import { spi_open_bus } from "vyto/hw/spi";
+
+let spi = spi_open_bus("/dev/spidev0.0", 0, 500000);   // mode 0, 500 kHz
+if (spi == null) { print("no bus / not in spi group"); return; }
+
+let tx = bytes(2); tx[0] = 0x9F as byte;               // e.g. flash JEDEC-ID read
+let rx = spi.transfer(tx);                             // rx.len == tx.len
+```
+
+`write()` sends without keeping the reply; `configure(mode, bits, speedHz)` changes the
+clock on the fly. No easy kernel mock — a MISO→MOSI jumper loops `tx` back to test.
+
+## 13. Power & thermal — `vyto/hw/power`
+
+Battery, AC adapter, and temperatures — pure sysfs reads, exactly what a status bar or
+a thermal-aware daemon needs.
+
+```js
+import { power_supplies, thermal_zones } from "vyto/hw/power";
+
+for (let s in power_supplies()) {
+    if (s.isBattery()) { print(s.name + ": " + s.capacity() + "% " + s.status()); }
+    if (s.isMains())   { print(s.name + ": plugged in = " + s.online()); }
+}
+for (let z in thermal_zones()) { print(z.kind() + ": " + z.tempC() + "C"); }
+```
+
+No permission needed (world-readable). `PowerSupply` also gives `voltage()`;
+`ThermalZone` gives `tempC()` as a float.
+
+## 14. Networking control plane — `vyto/net/link`, `net/wifi`, `net/raw`
+
+Sending data is `vyto/net/socket` (the kernel abstracts ethernet/WiFi away). These
+packages manage the *interfaces themselves* — a different job, so they live under
+`net/`, not `hw/`.
+
+**Interface status** (`net/link`) — up/down, MAC, speed, carrier, byte counters, via
+sysfs:
+```js
+import { link_interfaces } from "vyto/net/link";
+for (let n in link_interfaces()) {
+    print(n.name + "  " + n.operstate() + "  " + n.mac() + "  rx=" + n.rxBytes());
+}
+```
+
+**WiFi scan/connect** (`net/wifi`) — the onboarding flow, over the wpa_supplicant
+control socket (same channel as `wpa_cli`, far less code than raw nl80211):
+```js
+import { wifi_open } from "vyto/net/wifi";
+let w = wifi_open("wlan0");                 // null without the netdev group / daemon
+if (w != null) {
+    w.scan();
+    for (let ap in w.scanResults()) { print(ap.ssid + "  " + ap.signal + "dBm"); }
+    w.connect("MyNetwork", "hunter2");       // "" psk for an open network
+}
+```
+
+**Raw frames** (`net/raw`) — sniff/inject whole Ethernet frames below IP, via
+`AF_PACKET` (needs `CAP_NET_RAW`/root). Folds into a `PollSet`; `dstMac`/`srcMac`/
+`etherType` helpers decode the header.
+
+## 15. Software-defined radio — `vyto/hw/sdr`
+
+Detects RTL-SDR / HackRF / Airspy / bladeRF / SDRplay front-ends on the USB bus (built
+on `vyto/hw/usb`, no new shim):
+```js
+import { sdr_devices } from "vyto/hw/sdr";
+for (let d in sdr_devices()) { print(d.model + "  " + d.id()); }
+```
+Detection today; **IQ streaming** (tuner config + bulk transfers) is a later increment —
+via librtlsdr/SoapySDR, or raw `hw/usb` bulk. LoRa/nRF-style radios instead sit on
+`hw/spi` + `hw/gpio`; a cellular modem is `hw/serial` (AT commands).
+
+## 16. Events — knowing when something *changes*
+
+Most status packages (`hw/power`, `net/link`) are snapshots — you read them. To learn
+the moment something changes there are two paths:
+
+**Thresholds are always your code.** There is no kernel "battery below 20%" or "rate
+below Y" event — you sample (on a timer or an event) and compare. `PollSet.wait(ms)`
+already returns on timeout, so a sample loop needs nothing new:
+
+```js
+let ps = new PollSet();
+while (true) {
+    ps.wait(1000);                              // wake each second (or on any fd)
+    for (let s in power_supplies()) {
+        if (s.isBattery() && s.capacity() < 20) { print("battery low!"); }
+    }
+}
+```
+
+**State changes are push events** on a poll-able fd — fold into the same `PollSet`:
+
+- **`hw/uevent`** — one netlink fd for *every* kernel device change: AC unplugged,
+  battery level changed, cable pulled, USB attached. Unprivileged.
+  ```js
+  import { uevent_open_monitor } from "vyto/hw/uevent";
+  let mon = uevent_open_monitor();
+  ps.addFd(mon.pollFd(), POLL_READ);
+  // on wake:
+  let e = mon.next();
+  if (e != null && e.subsystem() == "power_supply") {
+      print(e.action() + " " + e.name() + " online=" + e.get("POWER_SUPPLY_ONLINE"));
+  }
+  ```
+- **`net/wifi` monitor** — wpa_supplicant *pushes* `CTRL-EVENT-DISCONNECTED` /
+  `-CONNECTED` the instant the link changes — the right answer to "how does my app know
+  WiFi dropped," far better than polling `operstate`:
+  ```js
+  import { wifi_monitor } from "vyto/net/wifi";
+  let m = wifi_monitor("wlan0");
+  ps.addFd(m.pollFd(), POLL_READ);
+  let ev = m.next();
+  if (ev != null && ev.isDisconnect()) { print("WiFi dropped!"); }
+  ```
+- **`net/raw`** is already push (each frame is an event).
+
+All three are just more fds in your one `PollSet.wait()` — hardware changes, WiFi
+state, packets, sockets, camera frames, and GUI input arrive in a single loop.
+
+## 17. Runnable examples
 
 Each package ships a working example. They print machine-specific output, so run
 them directly:
@@ -362,9 +490,15 @@ them directly:
 ./vytoc run examples/60_device.vt           # read /dev/urandom bytes
 ./vytoc run examples/61_ioctl.vt            # generic ioctl (kernel entropy count)
 ./vytoc run examples/62_camera.vt           # capture webcam frames
+./vytoc run examples/63_netlink.vt          # network interface status
+./vytoc run examples/64_power.vt            # battery / AC / thermal
+./vytoc run examples/65_spi.vt              # list spidev buses
+./vytoc run examples/67_wifi.vt             # parse a WiFi scan (+ event)
+./vytoc run examples/68_sdr.vt              # detect SDR dongles
+./vytoc run examples/69_uevent.vt           # watch kernel device events
 ```
 
-## 13. Platform support
+## 18. Platform support
 
 Everything above is **Linux-first and verified there**. Current state elsewhere:
 
@@ -375,7 +509,7 @@ Everything above is **Linux-first and verified there**. Current state elsewhere:
 - **Displays / external monitors** are *not* part of `hw/*` — that is the
   `vyto/surface` layer (windowing), and multi-monitor support is not yet built.
 
-## 14. Where to go next
+## 19. Where to go next
 
 - [Getting started](getting-started.md) — build the compiler, run your first app.
 - Each package's source under `lib/vyto/hw/` documents its full API in the header

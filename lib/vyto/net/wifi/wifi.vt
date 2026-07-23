@@ -1,0 +1,189 @@
+// vyto/net/wifi — WiFi control: scan for networks and connect, the Vyto-way
+// (docs/HARDWARE.md). This is the control plane (managing the radio), distinct from the
+// data path in vyto/net/socket. It drives the wpa_supplicant daemon over its control
+// socket — the same channel wpa_cli uses — so it is mostly pure Vyto over a thin
+// transport, no nl80211 hand-rolling.
+//
+//     let w = wifi_open("wlan0");
+//     if (w == null) { print("no wpa_supplicant / no permission"); return; }
+//     w.scan();                                   // trigger a scan, then read results
+//     for (let n in w.scanResults()) {
+//         print(n.ssid + "  " + n.signal + "dBm  " + n.flags);
+//     }
+//     w.connect("MyNetwork", "hunter2");          // join (WPA-PSK), or "" for open
+//
+// Reaching the control socket needs the `netdev` group or root; a denied open is soft
+// (null). This is the classic onboarding/kiosk flow: scan, pick, connect. Linux; other
+// platforms return null.
+
+extern "C" {
+    fn wpa_open(ctrl_path: cstring): i32;
+    fn wpa_cmd(fd: i32, cmd: cstring, reply: cstring, cap: i64): i64;
+    fn wpa_attach(ctrl_path: cstring): i32;
+    fn wpa_event_read(fd: i32, buf: cstring, cap: i64): i64;
+    fn wpa_close(fd: i32);
+}
+
+// One scanned access point.
+export class WifiNetwork {
+    bssid: string;      // AP MAC
+    freq: int;          // MHz
+    signal: int;        // dBm (more negative = weaker)
+    flags: string;      // "[WPA2-PSK-CCMP][ESS]" etc.
+    ssid: string;       // network name ("" = hidden)
+    fn init(bssid: string, freq: int, signal: int, flags: string, ssid: string) {
+        this.bssid = bssid; this.freq = freq; this.signal = signal; this.flags = flags; this.ssid = ssid;
+    }
+    // Does the AP advertise any encryption (WPA/WPA2/WPA3/WEP)?
+    fn isSecured(): bool {
+        return this.flags.contains("WPA") || this.flags.contains("WEP");
+    }
+}
+
+// Parse wpa_supplicant SCAN_RESULTS output: a header line, then tab-separated rows of
+// `bssid  frequency  signal  flags  ssid`. Exposed (and pure) so it is testable without
+// a live daemon.
+export fn parse_scan_results(text: string): WifiNetwork[] {
+    let out: WifiNetwork[] = [];
+    let lines = text.split("\n");
+    let i = 1;                                  // skip the header row
+    while (i < lines.len) {
+        let line = lines[i];
+        i += 1;
+        if (line == "") { continue; }
+        let c = line.split("\t");
+        if (c.len < 4) { continue; }
+        let ssid = "";
+        if (c.len >= 5) { ssid = c[4]; }        // ssid may be empty (hidden) or absent
+        out.push(new WifiNetwork(c[0], c[1].to_int(), c[2].to_int(), c[3], ssid));
+    }
+    return out;
+}
+
+// A connection to wpa_supplicant for one interface.
+export class WifiControl {
+    fd: i32;
+
+    fn init(fd: i32) { this.fd = fd; }
+
+    fn ensure() { if ((this.fd as int) < 0) { panic("vyto/net/wifi: operation on a closed control socket"); } }
+    fn isValid(): bool { return (this.fd as int) >= 0; }
+
+    // Send a raw wpa_supplicant command, return its text reply (empty on error).
+    fn cmd(c: string): string {
+        this.ensure();
+        let buf = bytes(8192);
+        let n = wpa_cmd(this.fd, c.cstr(), buf as cstring, 8192 as i64) as int;
+        if (n < 0) { return ""; }
+        return str(buf as cstring);
+    }
+
+    // Trigger a scan. True if the daemon accepted it (results arrive shortly after —
+    // poll scanResults()).
+    fn scan(): bool { return this.cmd("SCAN").contains("OK"); }
+    // The most recent scan results.
+    fn scanResults(): WifiNetwork[] { return parse_scan_results(this.cmd("SCAN_RESULTS")); }
+    // The daemon's status block (wpa_state, ssid, ip_address, ...).
+    fn status(): string { return this.cmd("STATUS"); }
+
+    // Join `ssid` with WPA-PSK `psk` (pass "" for an open network). Configures a new
+    // network block and selects it. True if the daemon accepted the selection.
+    fn connect(ssid: string, psk: string): bool {
+        this.ensure();
+        let id = this.cmd("ADD_NETWORK").trim();
+        if (id == "" || id.contains("FAIL")) { return false; }
+        this.cmd("SET_NETWORK " + id + " ssid \"" + ssid + "\"");
+        if (psk == "") {
+            this.cmd("SET_NETWORK " + id + " key_mgmt NONE");
+        } else {
+            this.cmd("SET_NETWORK " + id + " psk \"" + psk + "\"");
+        }
+        this.cmd("ENABLE_NETWORK " + id);
+        return this.cmd("SELECT_NETWORK " + id).contains("OK");
+    }
+
+    fn close() {
+        if ((this.fd as int) >= 0) { wpa_close(this.fd); this.fd = -1 as i32; }
+    }
+    deinit { this.close(); }
+}
+
+// Open a control connection for interface `iface` (e.g. "wlan0"), using the default
+// wpa_supplicant control directory. Null on failure (no daemon, or no permission).
+export fn wifi_open(iface: string): WifiControl {
+    let fd = wpa_open(("/run/wpa_supplicant/" + iface).cstr()) as int;
+    if (fd < 0) {
+        // older systems use /var/run
+        fd = wpa_open(("/var/run/wpa_supplicant/" + iface).cstr()) as int;
+    }
+    if (fd < 0) { return null; }
+    return new WifiControl(fd as i32);
+}
+
+// --- Event monitor (push, not poll) ---
+
+// A pushed WiFi event, e.g. "CTRL-EVENT-DISCONNECTED", "CTRL-EVENT-CONNECTED".
+// wpa_supplicant prefixes a "<priority>" tag and appends key=value details; this holds
+// the cleaned event name plus the raw line.
+export class WifiEvent {
+    name: string;       // "CTRL-EVENT-DISCONNECTED", "CTRL-EVENT-CONNECTED", ...
+    raw: string;        // the full line, with details (bssid=, reason=, ssid=, ...)
+    fn init(name: string, raw: string) { this.name = name; this.raw = raw; }
+    fn isDisconnect(): bool { return this.name.contains("DISCONNECTED"); }
+    fn isConnect(): bool { return this.name.contains("CONNECTED") && !this.name.contains("DISCONNECTED"); }
+}
+
+// Parse one wpa_supplicant event line ("<3>CTRL-EVENT-DISCONNECTED bssid=.. reason=3").
+// Pure/testable: strips the "<N>" priority tag and splits off the event name.
+export fn parse_wifi_event(line: string): WifiEvent {
+    let s = line;
+    if (s.starts_with("<")) {
+        let gt = s.index_of(">");
+        if (gt >= 0) { s = s.slice(gt + 1, s.len); }
+    }
+    let sp = s.index_of(" ");
+    let name = s;
+    if (sp >= 0) { name = s.slice(0, sp); }
+    return new WifiEvent(name, s);
+}
+
+// A push-event monitor for one interface: wpa_supplicant sends connect/disconnect/scan
+// events as they happen, no polling. The fd folds into a PollSet like everything else.
+export class WifiMonitor {
+    fd: i32;
+
+    fn init(fd: i32) { this.fd = fd; }
+
+    fn ensure() { if ((this.fd as int) < 0) { panic("vyto/net/wifi: read on a closed monitor"); } }
+    fn isValid(): bool { return (this.fd as int) >= 0; }
+
+    // The fd to register in a PollSet (POLL_READ).
+    fn pollFd(): int { return this.fd as int; }
+
+    // The next pushed event, or null when none is ready. Read after the PollSet reports
+    // the fd readable.
+    fn next(): WifiEvent {
+        this.ensure();
+        let buf = bytes(2048);
+        let n = wpa_event_read(this.fd, buf as cstring, 2048 as i64) as int;
+        if (n <= 0) { return null; }
+        return parse_wifi_event(str(buf as cstring));
+    }
+
+    fn close() {
+        if ((this.fd as int) >= 0) { wpa_close(this.fd); this.fd = -1 as i32; }
+    }
+    deinit { this.close(); }
+}
+
+// Open a push-event monitor for `iface` (ATTACHes to wpa_supplicant). Null on failure.
+// Register pollFd() in a PollSet to learn of disconnects the instant they happen.
+export fn wifi_monitor(iface: string): WifiMonitor {
+    let fd = wpa_attach(("/run/wpa_supplicant/" + iface).cstr()) as int;
+    if (fd < 0) {
+        fd = wpa_attach(("/var/run/wpa_supplicant/" + iface).cstr()) as int;
+    }
+    if (fd < 0) { return null; }
+    return new WifiMonitor(fd as i32);
+}
+

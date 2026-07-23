@@ -1,0 +1,102 @@
+// vyto/net/raw — link-layer (Ethernet) frames over AF_PACKET raw sockets, the Vyto-way
+// (docs/HARDWARE.md). Below IP: capture and inject whole frames on an interface — the
+// packet-sniffer / custom-L2 layer. The fd folds into a PollSet like a socket; frames
+// are byte[]. This is a socket type, so it lives under net/ (not hw/).
+//
+//     let r = raw_open("eth0");
+//     if (r == null) { print("need CAP_NET_RAW (root)"); return; }
+//     let ps = new PollSet();
+//     ps.addFd(r.pollFd(), POLL_READ);
+//     if (ps.wait(-1) > 0) {
+//         let f = r.recv(2048);
+//         print(dstMac(f) + " <- " + srcMac(f) + "  type=0x" + hex4(etherType(f)));
+//     }
+//
+// Opening a raw socket needs CAP_NET_RAW (root or the capability); a denied open is
+// soft (null). The fd lives in RawSocket and is closed by deinit. Linux; other
+// platforms return null.
+
+extern "C" {
+    fn raw_open(iface: cstring): i32;
+    fn raw_recv(fd: i32, buf: cstring, cap: i64): i64;
+    fn raw_send(fd: i32, buf: cstring, n: i64): i64;
+    fn raw_close(fd: i32);
+}
+
+fn take(buf: byte[], n: int): byte[] {
+    if (n <= 0) { return bytes(0); }
+    if (n == buf.len) { return buf; }
+    let out = bytes(n);
+    let i = 0;
+    while (i < n) { out[i] = buf[i]; i += 1; }
+    return out;
+}
+
+// A raw packet socket on one interface. Reads/writes whole Ethernet frames.
+export class RawSocket {
+    fd: i32;
+
+    fn init(fd: i32) { this.fd = fd; }
+
+    fn ensure() { if ((this.fd as int) < 0) { panic("vyto/net/raw: operation on a closed socket"); } }
+    fn isValid(): bool { return (this.fd as int) >= 0; }
+
+    // The fd to register in a PollSet (POLL_READ) — frames join the shared loop.
+    fn pollFd(): int { return this.fd as int; }
+
+    // Receive one frame (up to `n` bytes). Empty on would-block / error. Read after the
+    // PollSet reports the fd readable. A standard Ethernet MTU frame fits in ~1518;
+    // 2048 is a safe capacity.
+    fn recv(n: int): byte[] {
+        this.ensure();
+        if (n <= 0) { return bytes(0); }
+        let buf = bytes(n);
+        let got = raw_recv(this.fd, buf as cstring, n as i64) as int;
+        if (got <= 0) { return bytes(0); }
+        return take(buf, got);
+    }
+
+    // Inject a complete frame (it must carry its own 14-byte Ethernet header). Bytes
+    // sent (>=0), or a negative encoded status (-1 would-block, -2 error).
+    fn send(frame: byte[]): int {
+        this.ensure();
+        return raw_send(this.fd, frame as cstring, frame.len as i64) as int;
+    }
+
+    fn close() {
+        if ((this.fd as int) >= 0) { raw_close(this.fd); this.fd = -1 as i32; }
+    }
+    deinit { this.close(); }
+}
+
+// Open a raw socket on `iface` (e.g. "eth0"). Null on failure (no CAP_NET_RAW, or the
+// interface does not exist).
+export fn raw_open_iface(iface: string): RawSocket {
+    let fd = raw_open(iface.cstr()) as int;
+    if (fd < 0) { return null; }
+    return new RawSocket(fd as i32);
+}
+
+// --- Ethernet header helpers (a frame is dst[6] src[6] type[2] payload...) ---
+
+fn mac(frame: byte[], off: int): string {
+    if (frame.len < off + 6) { return ""; }
+    let digits = "0123456789abcdef";
+    let out = "";
+    let i = 0;
+    while (i < 6) {
+        let b = frame[off + i] as int;
+        out = out + digits.slice((b >> 4) & 0xF, ((b >> 4) & 0xF) + 1) + digits.slice(b & 0xF, (b & 0xF) + 1);
+        if (i < 5) { out = out + ":"; }
+        i += 1;
+    }
+    return out;
+}
+// Destination / source MAC of a captured frame ("aa:bb:cc:dd:ee:ff").
+export fn dstMac(frame: byte[]): string { return mac(frame, 0); }
+export fn srcMac(frame: byte[]): string { return mac(frame, 6); }
+// EtherType / length field (bytes 12-13, big-endian): 0x0800 IPv4, 0x0806 ARP, 0x86DD IPv6.
+export fn etherType(frame: byte[]): int {
+    if (frame.len < 14) { return 0; }
+    return ((frame[12] as int) << 8) | (frame[13] as int);
+}

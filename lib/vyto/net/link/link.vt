@@ -1,0 +1,67 @@
+// vyto/net/link — network-interface status and control-plane info, the Vyto-way
+// (docs/HARDWARE.md). This is NOT the data path (that's vyto/net/socket) — it is the
+// interface itself: which links exist, are they up, their MAC / speed / carrier /
+// byte counters. Pure sysfs reads (/sys/class/net), soft: a missing attribute reads
+// as empty / 0, never a panic.
+//
+//     for (let n in link_interfaces()) {
+//         print(n.name + "  " + n.operstate() + "  " + n.mac() + "  " + n.speed() + "Mbps");
+//     }
+//
+// Read-only status today (up/down toggling and IP assignment are rtnetlink, a later
+// step). Linux; other platforms return an empty list.
+
+extern "C" {
+    fn sysfs_read(path: cstring): cstring;
+}
+
+// Read a /sys/class/net/<iface>/<attr> value as text ("" if absent).
+fn attr(iface: string, name: string): string {
+    return str(sysfs_read(("/sys/class/net/" + iface + "/" + name).cstr()));
+}
+// Same, parsed as an int with a fallback for empty/non-numeric values.
+fn attrInt(iface: string, name: string, fallback: int): int {
+    let s = attr(iface, name);
+    if (s == "" || s == "-1") { return fallback; }
+    return s.to_int();
+}
+
+// One network interface (a live view — each accessor re-reads sysfs).
+export class NetIface {
+    name: string;               // "eth0", "wlan0", "lo"
+
+    fn init(name: string) { this.name = name; }
+
+    // Kernel operational state: "up", "down", "unknown", "dormant", ...
+    fn operstate(): string { return attr(this.name, "operstate"); }
+    fn isUp(): bool { return this.operstate() == "up"; }
+    // Physical-link carrier (a cable/association is present). sysfs errors when the
+    // interface is administratively down, so treat absent as false.
+    fn carrier(): bool { return attr(this.name, "carrier") == "1"; }
+
+    fn mac(): string { return attr(this.name, "address"); }
+    // Negotiated link speed in Mbit/s, or -1 when unknown (common for wifi/down links).
+    fn speed(): int { return attrInt(this.name, "speed", -1); }
+    fn mtu(): int { return attrInt(this.name, "mtu", 0); }
+
+    // Cumulative byte counters since boot.
+    fn rxBytes(): int { return attrInt(this.name, "statistics/rx_bytes", 0); }
+    fn txBytes(): int { return attrInt(this.name, "statistics/tx_bytes", 0); }
+
+    // True for the loopback interface (ARPHRD_LOOPBACK == 772).
+    fn isLoopback(): bool { return attrInt(this.name, "type", 0) == 772; }
+}
+
+// Every network interface the kernel knows about. Empty when there is no sysfs.
+export fn link_interfaces(): NetIface[] {
+    let out: NetIface[] = [];
+    if (!isdir("/sys/class/net")) { return out; }
+    for (let name in listdir("/sys/class/net")) {
+        if (name.starts_with(".")) { continue; }   // skip "." and ".."
+        out.push(new NetIface(name));
+    }
+    return out;
+}
+
+// A single interface by name (no existence check — its accessors just read empty).
+export fn link_interface(name: string): NetIface { return new NetIface(name); }

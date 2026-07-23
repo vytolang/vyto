@@ -1,0 +1,124 @@
+// vyto/hw/uevent — kernel device events (the push source hw/power and net/link lack),
+// the Vyto-way (docs/HARDWARE.md). The kernel broadcasts a uevent on every device
+// change — AC unplugged, battery level changed, cable pulled, USB device added — over
+// one poll-able netlink fd that folds into a PollSet alongside sockets, camera, serial.
+// One wait() then covers every hardware change in the system.
+//
+//     let mon = uevent_open_monitor();
+//     if (mon == null) { print("cannot open uevent monitor"); return; }
+//     let ps = new PollSet();
+//     ps.addFd(mon.pollFd(), POLL_READ);
+//     while (true) {
+//         if (ps.wait(-1) > 0) {
+//             let e = mon.next();
+//             if (e != null && e.subsystem() == "power_supply") {
+//                 print(e.action() + " " + e.name() + " online=" + e.get("POWER_SUPPLY_ONLINE"));
+//             }
+//         }
+//     }
+//
+// Thresholds (battery < 20%, link down) are applied in your handler on each event — the
+// kernel has no "below 20%" event, it just tells you something changed; you read the
+// value and compare. Receiving kernel uevents is normally unprivileged. Linux only.
+
+extern "C" {
+    fn uevent_open(): i32;
+    fn uevent_read(fd: i32, buf: cstring, cap: i64): i64;
+    fn uevent_close(fd: i32);
+}
+
+// One decoded kernel event. `action` is "add" / "remove" / "change" / "move" / "bind"
+// / "unbind"; `subsystem` groups it ("power_supply", "net", "usb", "input", ...); the
+// remaining KEY=VALUE pairs are looked up with get().
+export class UEvent {
+    action: string;
+    subsystem: string;
+    devpath: string;
+    keys: string[];
+    vals: string[];
+
+    fn init() { this.action = ""; this.subsystem = ""; this.devpath = ""; this.keys = []; this.vals = []; }
+
+    // A raw uevent field, or "" if absent (e.g. "POWER_SUPPLY_ONLINE", "INTERFACE").
+    fn get(key: string): string {
+        let i = 0;
+        while (i < this.keys.len) {
+            if (this.keys[i] == key) { return this.vals[i]; }
+            i += 1;
+        }
+        return "";
+    }
+    // The device's short name: the last path component, or a subsystem-specific field.
+    fn name(): string {
+        if (this.get("INTERFACE") != "") { return this.get("INTERFACE"); }
+        if (this.get("POWER_SUPPLY_NAME") != "") { return this.get("POWER_SUPPLY_NAME"); }
+        let slash = this.devpath.last_index_of("/");
+        if (slash >= 0) { return this.devpath.slice(slash + 1, this.devpath.len); }
+        return this.devpath;
+    }
+}
+
+// Parse a uevent message (header line "action@devpath", then KEY=VALUE lines). Exposed
+// and pure, so it is testable without live kernel events.
+export fn parse_uevent(msg: string): UEvent {
+    let e = new UEvent();
+    let lines = msg.split("\n");
+    if (lines.len == 0) { return e; }
+    let head = lines[0];
+    let at = head.index_of("@");
+    if (at >= 0) {
+        e.action = head.slice(0, at);
+        e.devpath = head.slice(at + 1, head.len);
+    }
+    let i = 1;
+    while (i < lines.len) {
+        let line = lines[i];
+        i += 1;
+        if (line == "") { continue; }
+        let eq = line.index_of("=");
+        if (eq < 0) { continue; }
+        let k = line.slice(0, eq);
+        let v = line.slice(eq + 1, line.len);
+        e.keys.push(k);
+        e.vals.push(v);
+        if (k == "SUBSYSTEM") { e.subsystem = v; }
+        if (k == "ACTION" && e.action == "") { e.action = v; }
+        if (k == "DEVPATH" && e.devpath == "") { e.devpath = v; }
+    }
+    return e;
+}
+
+// A live kernel-event monitor (one netlink fd for the whole system).
+export class UEventMonitor {
+    fd: i32;
+
+    fn init(fd: i32) { this.fd = fd; }
+
+    fn ensure() { if ((this.fd as int) < 0) { panic("vyto/hw/uevent: read on a closed monitor"); } }
+    fn isValid(): bool { return (this.fd as int) >= 0; }
+
+    // The fd to register in a PollSet (POLL_READ).
+    fn pollFd(): int { return this.fd as int; }
+
+    // The next buffered event, or null when none is ready. Read after the PollSet
+    // reports the fd readable.
+    fn next(): UEvent {
+        this.ensure();
+        let buf = bytes(4096);
+        let n = uevent_read(this.fd, buf as cstring, 4096 as i64) as int;
+        if (n <= 0) { return null; }
+        return parse_uevent(str(buf as cstring));
+    }
+
+    fn close() {
+        if ((this.fd as int) >= 0) { uevent_close(this.fd); this.fd = -1 as i32; }
+    }
+    deinit { this.close(); }
+}
+
+// Open the kernel uevent monitor. Null on failure. Fold pollFd() into a PollSet.
+export fn uevent_open_monitor(): UEventMonitor {
+    let fd = uevent_open() as int;
+    if (fd < 0) { return null; }
+    return new UEventMonitor(fd as i32);
+}

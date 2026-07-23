@@ -1,0 +1,40 @@
+// Sniff Ethernet frames — vyto/net/raw over AF_PACKET. Below IP: whole frames, headers
+// included, driven from a PollSet like any socket (docs/HARDWARE.md).
+//
+//   sudo ./vytoc run examples/66_raw.vt -- wlp3s0     # needs CAP_NET_RAW
+//
+// (Needs root and a real interface, so no golden .expected — the runner SKIPs it.)
+// Prints the header of a few captured frames.
+
+import { PollSet, POLL_READ } from "vyto/net/socket";
+import { raw_open_iface, dstMac, srcMac, etherType } from "vyto/net/raw";
+
+fn typeName(t: int): string {
+    if (t == 0x0800) { return "IPv4"; }
+    if (t == 0x0806) { return "ARP"; }
+    if (t == 0x86DD) { return "IPv6"; }
+    return "0x" + t;
+}
+
+fn main() {
+    let av = args();
+    if (av.len < 1) { print("usage: 66_raw <iface>   (needs root / CAP_NET_RAW)"); return; }
+
+    let r = raw_open_iface(av[0]);
+    if (r == null) { print("cannot open raw socket on " + av[0] + " (need CAP_NET_RAW / root?)"); return; }
+    print("sniffing " + av[0] + " (5 frames)...");
+
+    let ps = new PollSet();
+    ps.addFd(r.pollFd(), POLL_READ);
+
+    let got = 0;
+    while (got < 5) {
+        let n = ps.wait(5000);
+        if (n <= 0) { print("[no frame in 5s]"); return; }
+        let f = r.recv(2048);
+        if (f.len > 0) {
+            got += 1;
+            print("  " + f.len + "B  " + srcMac(f) + " -> " + dstMac(f) + "  " + typeName(etherType(f)));
+        }
+    }
+}
