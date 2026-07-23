@@ -12,7 +12,7 @@ import { Surface, Rect, contains, rgb, rgba, with_alpha, alpha_of, mix,
           EV_EXPOSE, EV_KEY, EV_KEY_UP, EV_MOUSE_DOWN, EV_MOUSE_UP, EV_MOUSE_MOVE, EV_MOUSE_WHEEL, EV_MOUSE_RDOWN,
           EV_RESIZE, EV_CLOSE, EV_TIMER, MOD_SHIFT,
           KEY_ESC, KEY_TAB } from "vyto/surface";
-import { Tween } from "vyto/ui/anim";
+import { Animator, Tween, AnimatedFloat } from "vyto/ui/anim";
 import { Scrollbar, SIDE_TOP, SIDE_RIGHT, SIDE_BOTTOM, SIDE_LEFT } from "vyto/ui/scrollbar";
 import { ease_linear, ease_in_quad, ease_out_quad, ease_in_out_quad,
          ease_in_cubic, ease_out_cubic, ease_in_out_cubic,
@@ -1021,7 +1021,7 @@ export class Widget {
     // Animations declared via this.animate(...) before the widget is attached
     // to a Window (e.g. in init) are stashed here and flushed into the Window's
     // clock by propagate_win once `win` is known. Null until first used.
-    pending_anims: Tween[];
+    pending_anims: Animator[];
     // Reusable scrollbars (vyto/ui/scrollbar). Null until add_scrollbar; each
     // snaps to its edge and shows only while content overflows. scroll_x/scroll_y
     // are the content offsets the default bars read/write; scroll_active is the
@@ -1072,7 +1072,7 @@ export class Widget {
     // Register a Tween with the frame clock. If the widget is already mounted
     // (win set) it goes straight onto the Window's animation list; otherwise it
     // is stashed and flushed by propagate_win when the widget is attached.
-    fn register_anim(tw: Tween) {
+    fn register_anim(tw: Animator) {
         if (this.win != null) {
             this.win.add_animation(tw);
         } else {
@@ -1478,7 +1478,7 @@ export class Window {
     last_click_x: int;
     last_click_y: int;
     last_click_w: weak Widget;
-    animations: Tween[]; // WS9c: active Tweens; run() ticks the wait clock only while non-empty
+    animations: Animator[]; // WS9c: active animators; run() ticks the wait clock only while non-empty
     mods: int;           // MOD_* bitmask at the event being dispatched — widgets
                          // read it via Widget.mods() in on_key/on_click/on_drag
     scale: float;        // UI scale factor (1.0 = 96dpi); themes are scaled by
@@ -1513,19 +1513,20 @@ export class Window {
     // Register a Tween to be advanced on the ~60fps clock; call from a
     // widget's own draw() the first time it needs animating (this.win is
     // guaranteed non-null there, unlike at construction time).
-    fn add_animation(t: Tween) {
+    fn add_animation(t: Animator) {
         this.animations.push(t);
     }
 
-    // Advance every active Tween by dt_ms and drop completed/cancelled ones.
-    // Tweens that track their widget's bounds trigger a dirty-region repaint;
-    // any untracked ticking Tween falls back to one full redraw.
+    // Advance every active Animator by dt_ms and drop the ones that no longer
+    // want to run. Animators tracking their widget's bounds trigger a dirty-
+    // region repaint; any untracked ticking one falls back to a full redraw.
     fn tick(dt_ms: int) {
-        let alive: Tween[] = [];
+        let alive: Animator[] = [];
         let full = false;
         let partial = false;
         for (let t in this.animations) {
-            if (t.advance(dt_ms)) {
+            let moved = t.advance(dt_ms);
+            if (moved) {
                 if (t.track_bounds) {
                     this.mark_dirty(t.bounds);
                     partial = true;
@@ -1533,8 +1534,10 @@ export class Window {
                     full = true;
                 }
             }
-            if (!t.done) { alive.push(t); }
-            else { t.on_tick = null; }  // break the on_tick closure's RC cycle (captures tween+widget)
+            // retain() decides per animator: a Tween drops when done, a settling
+            // AnimatedFloat drops the frame it stops moving.
+            if (t.retain(moved)) { alive.push(t); }
+            else { t.release(); }  // break the closure/spring RC cycle
         }
         this.animations = alive;
         if (full) {

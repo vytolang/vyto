@@ -130,6 +130,105 @@ export class Anim {
     fn finished(): bool { return this.done; }
 }
 
+// ---- Spring: a damped harmonic oscillator carrying velocity ----------------
+//
+// A Tween interpolates a fixed path over a fixed duration; interrupt it and the
+// value keeps moving but its VELOCITY jumps, because the replacement tween
+// starts from rest. A spring carries (value, velocity) as real state, so a
+// retarget mid-flight keeps the momentum it already had — which is what makes
+// spring-driven UI feel physical rather than scripted.
+//
+// Parameterised the way SwiftUI's is, by feel rather than by raw coefficients:
+//   response          — roughly the settling period in seconds; smaller = snappier
+//   damping_fraction  — 1.0 critically damped (no overshoot), <1 overshoots and
+//                       rings, >1 sluggish with no overshoot
+//
+// This lives in the standalone module (not vyto/ui) so a raw Canvas/Surface
+// loop can spring a value with no Window, the same way it can drive an Anim.
+export class Spring {
+    stiffness: float;
+    damping: float;
+    value: float;
+    velocity: float;
+    target: float;
+    resting: bool;
+
+    fn init(response: float, damping_fraction: float) {
+        this.set_feel(response, damping_fraction);
+        this.value = 0.0;
+        this.velocity = 0.0;
+        this.target = 0.0;
+        this.resting = true;
+    }
+
+    // Translate (response, damping_fraction) into the oscillator's raw
+    // coefficients. stiffness = omega^2, damping = 2*zeta*omega, with
+    // omega = 2*pi/response. Can be re-called live to change feel mid-flight.
+    fn set_feel(response: float, damping_fraction: float) {
+        let r = response;
+        if (r < 0.0001) { r = 0.0001; }
+        let omega = 2.0 * PI / r;
+        this.stiffness = omega * omega;
+        this.damping = 2.0 * damping_fraction * omega;
+    }
+
+    // Jump to v with no motion — initial state, or a hard reset with no
+    // animation (e.g. a value set while the widget is off-screen).
+    fn reset(v: float) {
+        this.value = v;
+        this.target = v;
+        this.velocity = 0.0;
+        this.resting = true;
+    }
+
+    // Aim at a new target, keeping the current velocity. Idempotent while
+    // resting so re-asserting the same target does not wake the spring.
+    fn retarget(t: float) {
+        if (this.resting && t == this.target) { return; }
+        this.target = t;
+        this.resting = false;
+    }
+
+    // Advance by dt_ms; returns true on any frame the value moved (including
+    // the final settling frame), false once at rest.
+    //
+    // Integrated with semi-implicit Euler, which is only conditionally stable —
+    // a snappy spring at a 16ms frame can sit near the stability edge — so the
+    // step is sub-divided to ~4ms, keeping it comfortably inside the bound at
+    // any frame rate. A long stall is clamped so a hitched frame does not fling
+    // the value.
+    fn step(dt_ms: int): bool {
+        if (this.resting) { return false; }
+        let dt = dt_ms as float / 1000.0;
+        if (dt > 0.064) { dt = 0.064; }
+        let steps = (dt / 0.004).ceil() as int;
+        if (steps < 1) { steps = 1; }
+        let h = dt / steps as float;
+        for (let i in 0..steps) {
+            let a = 0.0 - this.stiffness * (this.value - this.target) - this.damping * this.velocity;
+            this.velocity += a * h;
+            this.value += this.velocity * h;
+        }
+        // Settle: a spring approaches asymptotically and never exactly arrives,
+        // so without a snap the value would jitter in the last ULPs forever and
+        // resting frames would hash differently run to run — poison for the
+        // snapshot goldens. Once near the target and nearly stopped, snap and
+        // report one final frame.
+        let dx = this.value - this.target;
+        if (dx < 0.0) { dx = 0.0 - dx; }
+        let dv = this.velocity;
+        if (dv < 0.0) { dv = 0.0 - dv; }
+        if (dx < 0.001 && dv < 0.001) {
+            this.value = this.target;
+            this.velocity = 0.0;
+            this.resting = true;
+        }
+        return true;
+    }
+
+    fn at_rest(): bool { return this.resting; }
+}
+
 // ---- Clock: advances a set of Anims off a monotonic ms source --------------
 
 export class Clock {

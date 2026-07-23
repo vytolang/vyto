@@ -1,0 +1,100 @@
+// Spring + AnimatedFloat (C1/C2). Two properties carry the design:
+//   - it settles exactly, so resting frames are reproducible (goldens);
+//   - a retarget mid-flight keeps velocity, which cancel-and-restart cannot.
+// Everything else is bookkeeping, so these are what the test pins.
+
+import { Spring } from "vyto/anim";
+import { AnimatedFloat } from "vyto/ui/anim";
+
+fn near(a: float, b: float, eps: float): bool {
+    let d = a - b;
+    if (d < 0.0) { d = 0.0 - d; }
+    return d < eps;
+}
+
+fn check(label: string, cond: bool) {
+    let mark = "FAIL";
+    if (cond) { mark = "ok"; }
+    print(mark + " " + label);
+}
+
+fn main() {
+    // Settles at the target and stops. Critically damped: no overshoot.
+    let s = new Spring(0.3, 1.0);
+    s.reset(0.0);
+    s.retarget(1.0);
+    let overshot = false;
+    let frames = 0;
+    while (s.step(16) && frames < 2000) {
+        if (s.value > 1.0001) { overshot = true; }
+        frames += 1;
+    }
+    check("critically-damped spring settles", s.at_rest());
+    check("settled exactly on target", s.value == 1.0);
+    check("velocity zero at rest", s.velocity == 0.0);
+    check("critical damping did not overshoot", !overshot);
+    check("settled in a sane number of frames", frames > 3 && frames < 400);
+
+    // Determinism: same inputs, same trajectory to the ULP.
+    let a = new Spring(0.25, 0.7);
+    let b = new Spring(0.25, 0.7);
+    a.reset(0.0); b.reset(0.0);
+    a.retarget(10.0); b.retarget(10.0);
+    let diverged = false;
+    for (let i in 0..60) {
+        a.step(16); b.step(16);
+        if (a.value != b.value) { diverged = true; }
+    }
+    check("two identical springs stay identical", !diverged);
+
+    // Underdamped springs DO overshoot — proves damping_fraction bites.
+    let u = new Spring(0.3, 0.4);
+    u.reset(0.0);
+    u.retarget(1.0);
+    let peak = 0.0;
+    let f2 = 0;
+    while (u.step(16) && f2 < 2000) {
+        if (u.value > peak) { peak = u.value; }
+        f2 += 1;
+    }
+    check("underdamped overshoots", peak > 1.02);
+    check("underdamped still settles exactly", u.at_rest() && u.value == 1.0);
+
+    // Velocity preservation: retarget a moving spring, and the frame right
+    // after must continue in the direction it was already going, not lurch.
+    // A cancel-and-restart (velocity 0) would step toward the new target from
+    // a standstill; carrying momentum, it briefly keeps rising past where a
+    // cold start could reach in one frame.
+    let m = new Spring(0.4, 0.8);
+    m.reset(0.0);
+    m.retarget(1.0);
+    for (let i in 0..8) { m.step(16); }   // get it moving upward
+    let v_before = m.velocity;
+    let x_before = m.value;
+    check("spring is in motion before retarget", v_before > 0.0);
+    m.retarget(1.2);                       // aim higher, mid-flight
+    check("retarget kept the velocity", near(m.velocity, v_before, 0.0001));
+    m.step(16);
+    // cold start from x_before toward 1.2 in one 16ms step reaches at most
+    // roughly stiffness*(1.2-x_before)*dt^2 -- far less than a moving spring
+    let moved = m.value - x_before;
+    check("carried momentum keeps it moving", moved > v_before * 0.010);
+
+    // retarget while resting to the SAME value is a no-op (does not wake it)
+    let r = new Spring(0.3, 1.0);
+    r.reset(5.0);
+    r.retarget(5.0);
+    check("resting retarget to same value stays at rest", r.at_rest());
+    check("resting spring reports no motion", !r.step(16));
+
+    // AnimatedFloat wraps it and reports when a retarget wakes a resting spring
+    let af = new AnimatedFloat(0.0, 0.3, 1.0);
+    check("fresh AnimatedFloat is at rest", af.at_rest());
+    check("animate_to wakes it and signals", af.animate_to(1.0));
+    check("second animate_to while moving does not re-signal", !af.animate_to(1.1));
+    let g = 0;
+    while (af.advance(16) && g < 2000) { g += 1; }
+    check("AnimatedFloat settles on target", af.value() == 1.1);
+    af.set(3.0);
+    check("set() jumps without motion", af.at_rest() && af.value() == 3.0);
+}

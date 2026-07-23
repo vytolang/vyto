@@ -10,21 +10,50 @@
 // The easing functions now live in the standalone vyto/anim module (the full
 // set — quad/cubic/back/bounce/sine). Re-exported here so existing call sites
 // (`import { ease_linear, ... } from "vyto/ui"`) keep working unchanged.
-import { ease_linear, ease_out_cubic } from "vyto/anim";
+import { ease_linear, ease_out_cubic, Spring } from "vyto/anim";
 
 import { Rect } from "vyto/surface";
 
-export class Tween {
+// Anything the Window frame clock can advance. Window.tick() calls advance()
+// on each and keeps it while retain() is true, so the loop is agnostic to
+// whether a given animator is a duration Tween or a settling Spring.
+//
+// track_bounds/bounds carry the dirty-region contract: when track_bounds is
+// set, tick repaints only `bounds` instead of the whole window, and whoever
+// owns the animator keeps `bounds` current.
+export class Animator {
+    done: bool;
+    bounds: Rect;
+    track_bounds: bool;
+
+    // Step by dt_ms; return true on any frame that changed pixels (so tick
+    // marks the region dirty). Base is inert.
+    virtual fn advance(dt_ms: int): bool { return false; }
+
+    // Keep this animator on the list for another frame? `moved` is what
+    // advance just returned. The default keeps anything not explicitly done —
+    // right for a Tween (a finished one sets done); a Spring overrides to drop
+    // itself once it stops moving, since it never becomes "done".
+    virtual fn retain(moved: bool): bool { return !this.done; }
+
+    // Drop references that would otherwise keep a reference cycle alive (the
+    // on_tick closure captures both the animator and its widget). Called by
+    // tick when the animator leaves the list, and by cancel().
+    virtual fn release() { }
+
+    // Stop permanently; tick drops it next pass, returning the loop to the
+    // blocking wait when none remain.
+    fn cancel() {
+        this.done = true;
+        this.release();
+    }
+}
+
+export class Tween extends Animator {
     duration_ms: int;
     elapsed_ms: int;
     loop: bool;          // true: ping-pong 0->1->0 forever instead of stopping at 1
-    done: bool;
     on_tick: fn(float);
-    // Dirty-region animation: when track_bounds is set, Window.tick repaints
-    // only `bounds` instead of the whole window. The widget's on_tick closure
-    // keeps `bounds` current (it already captures the widget).
-    bounds: Rect;
-    track_bounds: bool;
 
     fn init(duration_ms: int, loop: bool) {
         this.duration_ms = duration_ms;
@@ -34,17 +63,12 @@ export class Tween {
         this.done = false;
     }
 
-    // Stop permanently: Window.tick drops cancelled Tweens on its next pass,
-    // returning the event loop to the blocking wait when none remain.
-    fn cancel() {
-        this.done = true;
-        this.on_tick = null;
-    }
+    override fn release() { this.on_tick = null; }
 
     // Advance by dt_ms, call on_tick with the new raw progress, and return
     // true if the widget holding this Tween should redraw. Non-looping
     // Tweens report done=true once they reach 1.0 and stop ticking.
-    fn advance(dt_ms: int): bool {
+    override fn advance(dt_ms: int): bool {
         if (this.done) { return false; }
         this.elapsed_ms += dt_ms;
         let t = 0.0;
@@ -63,4 +87,42 @@ export class Tween {
         if (this.on_tick != null) { this.on_tick(t); }
         return true;
     }
+}
+
+// A single float value driven by a Spring, packaged as an Animator so the
+// Window clock advances it like any other. This is the unit of animated state:
+// a WidgetState holds one per interactive dimension (hover, press, focus, …),
+// and a retarget preserves velocity, so a press that interrupts a release does
+// not restart from a standstill.
+//
+// It never becomes `done` — it lives as long as its widget — so it retains
+// itself only while the spring is moving, and drops off the clock the frame it
+// settles. Re-register it (Window.add_animation) when a fresh retarget wakes it.
+export class AnimatedFloat extends Animator {
+    spring: Spring;
+
+    fn init(value: float, response: float, damping_fraction: float) {
+        this.spring = new Spring(response, damping_fraction);
+        this.spring.reset(value);
+        this.done = false;
+        this.track_bounds = true;
+    }
+
+    fn value(): float { return this.spring.value; }
+    fn target(): float { return this.spring.target; }
+    fn at_rest(): bool { return this.spring.at_rest(); }
+
+    // Aim at v, keeping velocity. Returns true if it woke a resting spring, so
+    // the caller knows it must (re)register with the Window clock.
+    fn animate_to(v: float): bool {
+        let was_resting = this.spring.at_rest();
+        this.spring.retarget(v);
+        return was_resting && !this.spring.at_rest();
+    }
+
+    // Jump with no motion — off-screen state changes, or an initial value.
+    fn set(v: float) { this.spring.reset(v); }
+
+    override fn advance(dt_ms: int): bool { return this.spring.step(dt_ms); }
+    override fn retain(moved: bool): bool { return moved; }
 }
