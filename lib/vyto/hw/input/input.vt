@@ -1,0 +1,167 @@
+// vyto/hw/input — input devices (keyboard / gamepad / mouse / touch) over Linux
+// evdev, the Vyto-way (docs/HARDWARE.md). A device is a non-blocking fd, so it folds
+// into a PollSet event loop alongside sockets, windows, serial ports, and workers —
+// one wait() covers the network AND the gamepad. Events arrive as plain {type, code,
+// value} triples (the input_event struct is parsed in C so nothing arch-specific
+// crosses the boundary).
+//
+//     for (let d in input_devices()) { print(d.path + "  " + d.name); }
+//
+//     let dev = input_open("/dev/input/event3");
+//     if (dev == null) { print("no device / no permission"); return; }
+//     let ps = new PollSet();
+//     ps.addFd(dev.pollFd(), POLL_READ);
+//     while (true) {
+//         if (ps.wait(-1) > 0) {
+//             for (let e in dev.drain()) {
+//                 if (e.type == EV_KEY) { print("key " + e.code + " = " + e.value); }
+//             }
+//         }
+//     }
+//
+// Reads are non-blocking: drain() returns whatever events are buffered (empty when
+// nothing is ready), so read only after the PollSet reports the fd readable. The fd
+// lives in InputDevice and is closed by deinit. Opening event nodes usually needs the
+// `input` group; a denied open is soft (null). Linux today; other platforms return an
+// empty list and null opens.
+
+extern "C" {
+    fn input_enumerate(): rawptr;
+    fn input_count(h: rawptr): i32;
+    fn input_path(h: rawptr, i: i32): cstring;
+    fn input_name(h: rawptr, i: i32): cstring;
+    fn input_vendor(h: rawptr, i: i32): i32;
+    fn input_product(h: rawptr, i: i32): i32;
+    fn input_free(h: rawptr);
+
+    fn evdev_open(path: cstring): i32;
+    fn evdev_next(fd: i32): i32;   // 1 got, 0 would-block/EOF, -1 error
+    fn evdev_type(): i32;
+    fn evdev_code(): i32;
+    fn evdev_value(): i32;
+    fn evdev_close(fd: i32);
+}
+
+// evdev event types (linux/input-event-codes.h). EV_KEY covers keyboard keys and
+// gamepad/mouse buttons; EV_REL is relative motion (mouse); EV_ABS is absolute axes
+// (joystick / touch); EV_SYN separates event packets.
+export const EV_SYN: int = 0x00;
+export const EV_KEY: int = 0x01;
+export const EV_REL: int = 0x02;
+export const EV_ABS: int = 0x03;
+
+// A few common codes, enough to read a mouse/gamepad without a full table.
+export const BTN_LEFT:   int = 0x110;
+export const BTN_RIGHT:  int = 0x111;
+export const BTN_MIDDLE: int = 0x112;
+export const BTN_SOUTH:  int = 0x130;   // gamepad "A"
+export const BTN_EAST:   int = 0x131;   // gamepad "B"
+export const REL_X: int = 0x00;
+export const REL_Y: int = 0x01;
+export const ABS_X: int = 0x00;
+export const ABS_Y: int = 0x01;
+
+// One decoded input event. `value` is press(1)/release(0)/autorepeat(2) for EV_KEY,
+// a delta for EV_REL, or an absolute position for EV_ABS.
+export class InputEvent {
+    type: int;
+    code: int;
+    value: int;
+    fn init(type: int, code: int, value: int) { this.type = type; this.code = code; this.value = value; }
+}
+
+// A connected input device (a snapshot; fields are copied, nothing aliases the native
+// buffer once input_devices returns).
+export class InputInfo {
+    path: string;       // "/dev/input/event3"
+    name: string;       // e.g. "Logitech USB Keyboard"
+    vendor: int;
+    product: int;
+    fn init(path: string, name: string, vendor: int, product: int) {
+        this.path = path;
+        this.name = name;
+        this.vendor = vendor;
+        this.product = product;
+    }
+    // "vvvv:pppp" — vendor:product (lowercase hex), matching lsusb/evtest style.
+    fn id(): string { return hex4(this.vendor) + ":" + hex4(this.product); }
+}
+
+// An open evdev device. The fd folds into a PollSet; deinit closes it (RC lifecycle:
+// dropping the object releases the descriptor deterministically).
+export class InputDevice {
+    fd: i32;
+
+    fn init(fd: i32) { this.fd = fd; }
+
+    fn ensure() { if ((this.fd as int) < 0) { panic("vyto/hw/input: operation on a closed device"); } }
+    fn isValid(): bool { return (this.fd as int) >= 0; }
+
+    // The fd to register in a PollSet (POLL_READ) — the device joins the shared loop.
+    fn pollFd(): int { return this.fd as int; }
+
+    // One buffered event, or null when none is ready (would-block / EOF / error).
+    // Read after the PollSet reports the fd readable.
+    fn poll(): InputEvent {
+        this.ensure();
+        if (evdev_next(this.fd) as int != 1) { return null; }
+        return new InputEvent(evdev_type() as int, evdev_code() as int, evdev_value() as int);
+    }
+
+    // Every event currently buffered, drained until would-block. Typical use: call
+    // once each time the PollSet reports the fd readable.
+    fn drain(): InputEvent[] {
+        this.ensure();
+        let out: InputEvent[] = [];
+        while (evdev_next(this.fd) as int == 1) {
+            out.push(new InputEvent(evdev_type() as int, evdev_code() as int, evdev_value() as int));
+        }
+        return out;
+    }
+
+    fn close() {
+        if ((this.fd as int) >= 0) { evdev_close(this.fd); this.fd = -1 as i32; }
+    }
+    deinit { this.close(); }
+}
+
+// Snapshot every input device under /dev/input. Empty (never null) when there is no
+// input subsystem or none are readable.
+export fn input_devices(): InputInfo[] {
+    let out: InputInfo[] = [];
+    let h = input_enumerate();
+    if (h == null) { return out; }
+    let n = input_count(h) as int;
+    let i = 0;
+    while (i < n) {
+        out.push(new InputInfo(
+            str(input_path(h, i as i32)),
+            str(input_name(h, i as i32)),
+            input_vendor(h, i as i32) as int,
+            input_product(h, i as i32) as int));
+        i += 1;
+    }
+    input_free(h);
+    return out;
+}
+
+// Open an event node (e.g. "/dev/input/event3") for reading. Null on failure (missing
+// device, or no permission — event nodes usually require the `input` group).
+export fn input_open(path: string): InputDevice {
+    let fd = evdev_open(path.cstr()) as int;
+    if (fd < 0) { return null; }
+    return new InputDevice(fd as i32);
+}
+
+// Lowercase 4-digit hex (evdev ids are 16-bit).
+fn hex4(v: int): string {
+    let digits = "0123456789abcdef";
+    let out = "";
+    let shift = 12;
+    while (shift >= 0) {
+        let nib = (v >> shift) & 0xF;
+        out = out + digits.slice(nib, nib + 1);
+        shift -= 4;
+    }
+    return out;
+}

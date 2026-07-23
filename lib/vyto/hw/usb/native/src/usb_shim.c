@@ -25,6 +25,17 @@ typedef struct {
     int n, cap;
 } UsbList;
 
+/* Append a device to the growable list (shared by every platform's enumerator). */
+static void list_push(UsbList *l, const UsbDev *d) {
+    if (l->n == l->cap) {
+        int want = l->cap ? l->cap * 2 : 16;
+        UsbDev *nv = (UsbDev *)realloc(l->v, (size_t)want * sizeof *nv);
+        if (!nv) return;
+        l->v = nv; l->cap = want;
+    }
+    l->v[l->n++] = *d;
+}
+
 #ifdef __linux__
 #include <dirent.h>
 
@@ -52,16 +63,6 @@ static int read_dec(const char *dir, const char *name) {
     char b[32];
     if (!read_attr(dir, name, b, sizeof b)) return -1;
     return (int)strtol(b, NULL, 10);
-}
-
-static void list_push(UsbList *l, const UsbDev *d) {
-    if (l->n == l->cap) {
-        int want = l->cap ? l->cap * 2 : 16;
-        UsbDev *nv = (UsbDev *)realloc(l->v, (size_t)want * sizeof *nv);
-        if (!nv) return;
-        l->v = nv; l->cap = want;
-    }
-    l->v[l->n++] = *d;
 }
 
 UsbList *usb_enumerate(void) {
@@ -95,7 +96,78 @@ UsbList *usb_enumerate(void) {
     return l;
 }
 
-#else /* non-Linux: empty list (macOS would enumerate via IOKit) */
+#elif defined(__APPLE__) && defined(VYTO_USB_IOKIT)
+/* macOS IOKit enumeration.
+
+   UNTESTED — written from the IOKit/CoreFoundation spec, never run (no macOS here).
+   Gated behind -DVYTO_USB_IOKIT because it needs frameworks the Vyto #link path can't
+   express (`-framework IOKit -framework CoreFoundation`, not `-l`): without the macro
+   a macOS build keeps the working empty-list below, so this never breaks a mac build.
+   To use: compile the package with
+     -DVYTO_USB_IOKIT -framework IOKit -framework CoreFoundation
+   and validate on real hardware before trusting it. */
+
+#include <IOKit/IOKitLib.h>
+#include <IOKit/usb/IOUSBLib.h>
+#include <CoreFoundation/CoreFoundation.h>
+
+/* Read an integer USB property (e.g. CFSTR("idVendor")) into an int, or -1. */
+static int io_int(io_service_t dev, CFStringRef key) {
+    CFTypeRef ref = IORegistryEntryCreateCFProperty(dev, key, kCFAllocatorDefault, 0);
+    if (!ref) return -1;
+    int out = -1;
+    if (CFGetTypeID(ref) == CFNumberGetTypeID())
+        CFNumberGetValue((CFNumberRef)ref, kCFNumberIntType, &out);
+    CFRelease(ref);
+    return out;
+}
+
+/* Read a string USB property into buf (empty on absence). */
+static void io_str(io_service_t dev, CFStringRef key, char *buf, size_t cap) {
+    buf[0] = 0;
+    CFTypeRef ref = IORegistryEntryCreateCFProperty(dev, key, kCFAllocatorDefault, 0);
+    if (!ref) return;
+    if (CFGetTypeID(ref) == CFStringGetTypeID())
+        CFStringGetCString((CFStringRef)ref, buf, (CFIndex)cap, kCFStringEncodingUTF8);
+    CFRelease(ref);
+}
+
+UsbList *usb_enumerate(void) {
+    UsbList *l = (UsbList *)calloc(1, sizeof *l);
+    if (!l) return NULL;
+    CFMutableDictionaryRef match = IOServiceMatching(kIOUSBDeviceClassName);
+    if (!match) return l;
+    io_iterator_t it = 0;
+    if (IOServiceGetMatchingServices(kIOMasterPortDefault, match, &it) != KERN_SUCCESS)
+        return l;
+    io_service_t dev;
+    while ((dev = IOIteratorNext(it))) {
+        UsbDev d;
+        memset(&d, 0, sizeof d);
+        d.vid = io_int(dev, CFSTR("idVendor"));
+        d.pid = io_int(dev, CFSTR("idProduct"));
+        d.cls = io_int(dev, CFSTR("bDeviceClass"));
+        d.addr = io_int(dev, CFSTR("USB Address"));
+        int loc = io_int(dev, CFSTR("locationID"));
+        d.bus = loc >= 0 ? ((loc >> 24) & 0xFF) : -1;   /* top byte of locationID ~ bus */
+        io_str(dev, CFSTR("USB Vendor Name"), d.mfr, sizeof d.mfr);
+        io_str(dev, CFSTR("USB Product Name"), d.product, sizeof d.product);
+        io_str(dev, CFSTR("USB Serial Number"), d.serial, sizeof d.serial);
+        {
+            int mbps = io_int(dev, CFSTR("Device Speed")); /* 0 low,1 full,2 high,3 super */
+            const char *s = "";
+            if (mbps == 0) s = "1.5"; else if (mbps == 1) s = "12";
+            else if (mbps == 2) s = "480"; else if (mbps == 3) s = "5000";
+            snprintf(d.speed, sizeof d.speed, "%s", s);
+        }
+        if (d.vid >= 0) list_push(l, &d);
+        IOObjectRelease(dev);
+    }
+    IOObjectRelease(it);
+    return l;
+}
+
+#else /* other non-Linux (incl. default macOS): empty list */
 
 UsbList *usb_enumerate(void) { return (UsbList *)calloc(1, sizeof(UsbList)); }
 
@@ -122,3 +194,64 @@ void usb_free(UsbList *l) {
     free(l->v);
     free(l);
 }
+
+/* --- Transfers: open a device node and move bytes over usbfs -----------------
+
+   The doc's stated "next step" on the same pattern: an opaque per-device handle
+   (here a plain fd into /dev/bus/usb/BBB/DDD) with a byte[] transfer call and a
+   deinit that closes it, exactly like Socket. Bulk/interrupt transfers go through
+   the usbfs USBDEVFS_* ioctls — no libusb, no #link. Opening a device node needs
+   write access (usually a udev rule or root), so a denied open is soft (-1). */
+
+#ifdef __linux__
+#include <fcntl.h>
+#include <unistd.h>
+#include <errno.h>
+#include <sys/ioctl.h>
+#include <linux/usbdevice_fs.h>
+
+/* Open /dev/bus/usb/<bus>/<addr> read-write. Returns the fd, or -1 (missing node or
+   no permission). bus/addr are the busnum/devnum the enumeration already reports. */
+int usb_open(int bus, int addr) {
+    char path[64];
+    snprintf(path, sizeof path, "/dev/bus/usb/%03d/%03d", bus, addr);
+    return open(path, O_RDWR);
+}
+
+/* Claim/release an interface so the kernel lets us talk to its endpoints. 0 ok, -1. */
+int usb_claim(int fd, int iface) {
+    unsigned int n = (unsigned int)iface;
+    return ioctl(fd, USBDEVFS_CLAIMINTERFACE, &n) == 0 ? 0 : -1;
+}
+int usb_release(int fd, int iface) {
+    unsigned int n = (unsigned int)iface;
+    return ioctl(fd, USBDEVFS_RELEASEINTERFACE, &n) == 0 ? 0 : -1;
+}
+
+/* One bulk/interrupt transfer on endpoint `ep` (direction is the ep's 0x80 bit).
+   >=0 bytes transferred, -1 timeout / would-block, -2 error. */
+long usb_bulk(int fd, int ep, char *buf, long len, int timeout_ms) {
+    struct usbdevfs_bulktransfer bt;
+    bt.ep = (unsigned int)ep;
+    bt.len = (unsigned int)len;
+    bt.timeout = (unsigned int)timeout_ms;
+    bt.data = buf;
+    int r = ioctl(fd, USBDEVFS_BULK, &bt);
+    if (r >= 0) return (long)r;
+    if (errno == ETIMEDOUT || errno == EAGAIN) return -1;
+    return -2;
+}
+
+void usb_dev_close(int fd) { if (fd >= 0) close(fd); }
+
+#else /* non-Linux: transfers unavailable */
+
+int  usb_open(int bus, int addr) { (void)bus; (void)addr; return -1; }
+int  usb_claim(int fd, int iface) { (void)fd; (void)iface; return -1; }
+int  usb_release(int fd, int iface) { (void)fd; (void)iface; return -1; }
+long usb_bulk(int fd, int ep, char *buf, long len, int timeout_ms) {
+    (void)fd; (void)ep; (void)buf; (void)len; (void)timeout_ms; return -2;
+}
+void usb_dev_close(int fd) { (void)fd; }
+
+#endif

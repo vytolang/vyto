@@ -1,0 +1,39 @@
+// Drive and watch a GPIO line — vyto/hw/gpio over the Linux gpiochip v2 uAPI. Shows
+// both halves of the Vyto-way pattern: a line handle for get/set, and an edge-
+// triggered input folded into a PollSet (docs/HARDWARE.md).
+//
+//   vytoc run examples/57_gpio.vt                       # list chips
+//   vytoc run examples/57_gpio.vt -- /dev/gpiochip0 17  # blink line 17
+//
+// (Needs a gpiochip + `gpio`-group permission; testable without wiring via the
+// gpio-sim module. No golden .expected — the runner SKIPs it.)
+
+import { gpio_open_chip } from "vyto/hw/gpio";
+
+fn main() {
+    let av = args();
+    if (av.len < 2) {
+        // enumerate chips 0..7 so the demo shows something without arguments
+        print("gpio chips:");
+        let i = 0;
+        while (i < 8) {
+            let chip = gpio_open_chip("/dev/gpiochip" + i);
+            if (chip != null) { print("  /dev/gpiochip" + i + "  " + chip.name() + "  " + chip.lines() + " lines"); }
+            i += 1;
+        }
+        print("(pass <chip> <line> to drive an output)");
+        return;
+    }
+
+    let chip = gpio_open_chip(av[0]);
+    if (chip == null) { print("cannot open " + av[0] + " (missing, or not in the gpio group)"); return; }
+    let line = av[1].to_int();
+
+    let out = chip.requestOutput(line, 0);
+    if (out == null) { print("cannot request line " + line + " as output"); return; }
+    print("driving " + av[0] + " line " + line + ": 0 -> 1 -> 0");
+    out.set(1);
+    print("  level now " + out.get());
+    out.set(0);
+    print("  level now " + out.get());
+}

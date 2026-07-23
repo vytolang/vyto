@@ -1,0 +1,51 @@
+// Read a register over I2C — vyto/hw/i2c, the handle / byte-transfer half of the
+// Vyto-way hardware pattern (docs/HARDWARE.md). Combined write-then-read is one atomic
+// transaction, the standard sensor register-read.
+//
+//   vytoc run examples/58_i2c.vt                          # list buses
+//   vytoc run examples/58_i2c.vt -- /dev/i2c-1 0x68 0x75  # read reg 0x75 at 0x68
+//
+// (Needs an I2C bus + `i2c`-group permission; testable without wiring via the i2c-stub
+// module. No golden .expected — the runner SKIPs it.)
+
+import { i2c_open_bus } from "vyto/hw/i2c";
+
+// Parse a decimal or "0x"-prefixed hex integer (I2C addresses are written in hex).
+fn toNum(s: string): int {
+    if (s.starts_with("0x") || s.starts_with("0X")) {
+        let digits = "0123456789abcdef";
+        let v = 0;
+        let i = 2;
+        while (i < s.len) {
+            let c = s.slice(i, i + 1).to_lower();
+            v = v * 16 + digits.index_of(c);
+            i += 1;
+        }
+        return v;
+    }
+    return s.to_int();
+}
+
+fn main() {
+    let av = args();
+    if (av.len < 3) {
+        print("i2c buses:");
+        let i = 0;
+        while (i < 8) {
+            let bus = i2c_open_bus("/dev/i2c-" + i);
+            if (bus != null) { print("  /dev/i2c-" + i); }
+            i += 1;
+        }
+        print("(pass <bus> <addr> <reg> to read a register, hex ok)");
+        return;
+    }
+
+    let bus = i2c_open_bus(av[0]);
+    if (bus == null) { print("cannot open " + av[0] + " (missing, or not in the i2c group)"); return; }
+    let addr = toNum(av[1]);
+    let reg = toNum(av[2]);
+
+    let v = bus.readReg(addr, reg, 1);
+    if (v.len == 0) { print("no ACK from device (nothing at that address?)"); return; }
+    print("reg " + reg + " @ " + addr + " = " + v[0]);
+}

@@ -1,8 +1,10 @@
 // vyto/hw/usb — enumerate connected USB devices, the Vyto-way (docs/HARDWARE.md):
 // a thin sysfs shim, an opaque native snapshot owned and freed here, fields
 // copied out into plain Vyto objects. Read-only and root-free; no external
-// library, no #link. Linux today (macOS returns an empty list until an IOKit
-// backend lands).
+// library, no #link. Linux today. A macOS IOKit enumerator exists in the shim but is
+// UNTESTED and opt-in (-DVYTO_USB_IOKIT plus -framework IOKit -framework
+// CoreFoundation, which the plain #link path can't express); without it macOS returns
+// an empty list.
 //
 //     for (let d in usb_devices()) {
 //         print(d.id() + "  " + d.name());   // "1d6b:0003  Linux Foundation 3.0 root hub"
@@ -25,6 +27,62 @@ extern "C" {
     fn usb_serial(h: rawptr, i: i32): cstring;
     fn usb_speed(h: rawptr, i: i32): cstring;
     fn usb_free(h: rawptr);
+
+    // transfers (open a device node and move bytes over usbfs)
+    fn usb_open(bus: i32, addr: i32): i32;
+    fn usb_claim(fd: i32, iface: i32): i32;
+    fn usb_release(fd: i32, iface: i32): i32;
+    fn usb_bulk(fd: i32, ep: i32, buf: cstring, len: i64, timeout_ms: i32): i64;
+    fn usb_dev_close(fd: i32);
+}
+
+// Copy the first `n` bytes of `buf` into a right-sized array (transfers give back
+// however many bytes actually moved).
+fn take(buf: byte[], n: int): byte[] {
+    if (n <= 0) { return bytes(0); }
+    if (n == buf.len) { return buf; }
+    let out = bytes(n);
+    let i = 0;
+    while (i < n) { out[i] = buf[i]; i += 1; }
+    return out;
+}
+
+// An open USB device — the streaming/transfer half of the pattern. A plain fd into
+// /dev/bus/usb, owned here and closed by deinit (RC lifecycle: dropping the handle
+// releases the device). Claim an interface, then bulkIn/bulkOut its endpoints.
+export class UsbHandle {
+    fd: i32;
+
+    fn init(fd: i32) { this.fd = fd; }
+
+    fn ensure() { if ((this.fd as int) < 0) { panic("vyto/hw/usb: operation on a closed device"); } }
+    fn isValid(): bool { return (this.fd as int) >= 0; }
+
+    // Claim/release an interface so the kernel routes its endpoints to us. True on ok.
+    fn claim(iface: int): bool { this.ensure(); return usb_claim(this.fd, iface as i32) as int == 0; }
+    fn release(iface: int): bool { this.ensure(); return usb_release(this.fd, iface as i32) as int == 0; }
+
+    // Bulk/interrupt IN transfer of up to `n` bytes on IN endpoint `ep` (its 0x80 bit
+    // set). Result length is what actually arrived; empty on timeout/would-block/error.
+    fn bulkIn(ep: int, n: int, timeoutMs: int): byte[] {
+        this.ensure();
+        if (n <= 0) { return bytes(0); }
+        let buf = bytes(n);
+        let got = usb_bulk(this.fd, ep as i32, buf as cstring, n as i64, timeoutMs as i32) as int;
+        if (got <= 0) { return bytes(0); } // timeout, would-block, or error
+        return take(buf, got);
+    }
+    // Bulk/interrupt OUT transfer on OUT endpoint `ep`. Bytes written (>=0), or a
+    // negative encoded status (-1 timeout/would-block, -2 error).
+    fn bulkOut(ep: int, data: byte[], timeoutMs: int): int {
+        this.ensure();
+        return usb_bulk(this.fd, ep as i32, data as cstring, data.len as i64, timeoutMs as i32) as int;
+    }
+
+    fn close() {
+        if ((this.fd as int) >= 0) { usb_dev_close(this.fd); this.fd = -1 as i32; }
+    }
+    deinit { this.close(); }
 }
 
 // A connected USB device (a snapshot; fields are copied, nothing aliases the
@@ -63,6 +121,14 @@ export class UsbDevice {
             return this.product;
         }
         return this.id();
+    }
+
+    // Open this device for transfers (bulk/interrupt over usbfs). Null on failure —
+    // opening a device node needs write access (usually a udev rule or root).
+    fn open(): UsbHandle {
+        let fd = usb_open(this.bus as i32, this.addr as i32) as int;
+        if (fd < 0) { return null; }
+        return new UsbHandle(fd as i32);
     }
 }
 

@@ -1,0 +1,92 @@
+// vyto/hw/i2c — I2C bus master over /dev/i2c-*, the Vyto-way (docs/HARDWARE.md): the
+// handle / byte-transfer half of the pattern. Open a bus, move bytes to/from a 7-bit
+// device address. Every transfer carries its address explicitly (I2C_RDWR), so there
+// is no per-fd slave binding and writeRead() is one atomic register read.
+//
+//     let bus = i2c_open_bus("/dev/i2c-1");
+//     if (bus == null) { print("no bus / no permission"); return; }
+//
+//     let reg = bytes(1); reg[0] = 0xD0 as byte;         // WHO_AM_I register
+//     let id = bus.writeRead(0x68, reg, 1);              // MPU-6050 at 0x68
+//     print("id = " + id[0]);
+//
+// Bus access needs the `i2c` group or root; a denied open is soft (null). The bus fd
+// lives in I2cBus and is closed by deinit. Testable without wiring via the i2c-stub
+// module. Linux today; other platforms return null.
+
+extern "C" {
+    fn i2c_open(path: cstring): i32;
+    fn i2c_write(fd: i32, addr: i32, buf: cstring, len: i64): i64;
+    fn i2c_read(fd: i32, addr: i32, buf: cstring, len: i64): i64;
+    fn i2c_write_read(fd: i32, addr: i32, wbuf: cstring, wlen: i64, rbuf: cstring, rlen: i64): i64;
+    fn i2c_close(fd: i32);
+}
+
+// Copy the first `n` bytes of `buf` into a right-sized array.
+fn take(buf: byte[], n: int): byte[] {
+    if (n <= 0) { return bytes(0); }
+    if (n == buf.len) { return buf; }
+    let out = bytes(n);
+    let i = 0;
+    while (i < n) { out[i] = buf[i]; i += 1; }
+    return out;
+}
+
+// An open I2C bus. Address every transfer to a 7-bit device address; the fd is closed
+// by deinit (RC: dropping the bus releases the descriptor).
+export class I2cBus {
+    fd: i32;
+
+    fn init(fd: i32) { this.fd = fd; }
+
+    fn ensure() { if ((this.fd as int) < 0) { panic("vyto/hw/i2c: operation on a closed bus"); } }
+    fn isValid(): bool { return (this.fd as int) >= 0; }
+
+    // Write bytes to device `addr`. True on success.
+    fn write(addr: int, data: byte[]): bool {
+        this.ensure();
+        return i2c_write(this.fd, addr as i32, data as cstring, data.len as i64) as int >= 0;
+    }
+
+    // Read `n` bytes from device `addr`. Empty on error.
+    fn read(addr: int, n: int): byte[] {
+        this.ensure();
+        if (n <= 0) { return bytes(0); }
+        let buf = bytes(n);
+        let got = i2c_read(this.fd, addr as i32, buf as cstring, n as i64) as int;
+        if (got < 0) { return bytes(0); }
+        return take(buf, got);
+    }
+
+    // Atomic write-then-read: send `wdata`, then read `n` bytes without releasing the
+    // bus — the standard register-read idiom. Empty on error.
+    fn writeRead(addr: int, wdata: byte[], n: int): byte[] {
+        this.ensure();
+        if (n <= 0) { return bytes(0); }
+        let rbuf = bytes(n);
+        let got = i2c_write_read(this.fd, addr as i32, wdata as cstring, wdata.len as i64,
+                                 rbuf as cstring, n as i64) as int;
+        if (got < 0) { return bytes(0); }
+        return take(rbuf, got);
+    }
+
+    // Convenience: read `n` bytes from an 8-bit register `reg` of device `addr`.
+    fn readReg(addr: int, reg: int, n: int): byte[] {
+        let w = bytes(1);
+        w[0] = reg as byte;
+        return this.writeRead(addr, w, n);
+    }
+
+    fn close() {
+        if ((this.fd as int) >= 0) { i2c_close(this.fd); this.fd = -1 as i32; }
+    }
+    deinit { this.close(); }
+}
+
+// Open an I2C bus (e.g. "/dev/i2c-1"). Null on failure (missing bus, or no permission
+// — bus access usually needs the `i2c` group).
+export fn i2c_open_bus(path: string): I2cBus {
+    let fd = i2c_open(path.cstr()) as int;
+    if (fd < 0) { return null; }
+    return new I2cBus(fd as i32);
+}

@@ -1,0 +1,161 @@
+// vyto/hw/sensors — IIO sensors (accelerometer, gyro, magnetometer, light, temp,
+// pressure, ADC …) over Linux sysfs, the Vyto-way (docs/HARDWARE.md). This is the
+// request/response half of the pattern (like vyto/hw/usb enumeration): a thin sysfs
+// shim hands back an opaque snapshot the library owns and frees, and samples are read
+// on demand. Read-only, root-free, no external library, no #link.
+//
+//     for (let dev in iio_devices()) {
+//         print(dev.name);
+//         for (let ch in dev.channels()) {
+//             print("  " + ch + " = " + dev.value(ch));   // scaled reading
+//         }
+//     }
+//
+// Each device exposes scalar channels (e.g. "accel_x", "temp", "illuminance"). A
+// channel's processed value is the kernel convention (raw + offset) * scale; raw()
+// gives the unscaled integer. Missing device/permission is soft — an empty list, a 0
+// reading. Buffered streaming (an /dev/iio:deviceN fd folded into a PollSet via a
+// hardware trigger) is a later increment; this reads one sample at a time. Linux
+// today; other platforms return an empty list.
+
+extern "C" {
+    fn iio_enumerate(): rawptr;
+    fn iio_count(h: rawptr): i32;
+    fn iio_index(h: rawptr, i: i32): i32;
+    fn iio_name(h: rawptr, i: i32): cstring;
+    fn iio_channels(h: rawptr, i: i32): cstring;   // "\n"-joined channel bases
+    fn iio_free(h: rawptr);
+
+    fn iio_read_attr(index: i32, attr: cstring): cstring;
+
+    // buffered streaming (the fd half)
+    fn iio_write_attr(index: i32, attr: cstring, val: cstring): i32;
+    fn iio_buffer_open(index: i32): i32;
+    fn iio_buffer_read(fd: i32, buf: cstring, cap: i64): i64;
+    fn iio_buffer_close(fd: i32);
+}
+
+// Copy the first `n` bytes of `buf` into a right-sized array.
+fn take(buf: byte[], n: int): byte[] {
+    if (n <= 0) { return bytes(0); }
+    if (n == buf.len) { return buf; }
+    let out = bytes(n);
+    let i = 0;
+    while (i < n) { out[i] = buf[i]; i += 1; }
+    return out;
+}
+
+// A live IIO buffer — /dev/iio:deviceN as a poll-able fd delivering packed scan
+// records once a trigger and the buffer are enabled. Folds into a PollSet like serial
+// or evdev. The record layout (which channels, their byte width and endianness) is
+// per-device, described by the device's scan_elements/*; this hands back the raw bytes
+// ("own the samples") for the app to decode. The fd is closed by deinit.
+export class IioStream {
+    fd: i32;
+
+    fn init(fd: i32) { this.fd = fd; }
+
+    fn ensure() { if ((this.fd as int) < 0) { panic("vyto/hw/sensors: read on a closed buffer"); } }
+    fn isValid(): bool { return (this.fd as int) >= 0; }
+
+    // The fd to register in a PollSet (POLL_READ) — the buffer joins the shared loop.
+    fn pollFd(): int { return this.fd as int; }
+
+    // Non-blocking read of up to `n` bytes of packed scan data (empty when nothing is
+    // ready). Read after the PollSet reports the fd readable.
+    fn read(n: int): byte[] {
+        this.ensure();
+        if (n <= 0) { return bytes(0); }
+        let buf = bytes(n);
+        let got = iio_buffer_read(this.fd, buf as cstring, n as i64) as int;
+        if (got <= 0) { return bytes(0); } // would-block, EOF, or error
+        return take(buf, got);
+    }
+
+    fn close() {
+        if ((this.fd as int) >= 0) { iio_buffer_close(this.fd); this.fd = -1 as i32; }
+    }
+    deinit { this.close(); }
+}
+
+// One IIO device — a snapshot holding its sysfs index (N in iio:deviceN) and name.
+// Channel reads go straight back to sysfs by index, so no native handle is held open.
+export class IioDevice {
+    index: int;
+    name: string;       // e.g. "bmi160", "als", "cros-ec-accel"
+    channels_: string[];
+
+    fn init(index: int, name: string, channels: string[]) {
+        this.index = index;
+        this.name = name;
+        this.channels_ = channels;
+    }
+
+    // The readable channel bases, e.g. ["accel_x", "accel_y", "accel_z"].
+    fn channels(): string[] { return this.channels_; }
+
+    // Read a numeric sysfs attribute of this device (e.g. "in_accel_x_raw"), with a
+    // fallback when the file is absent.
+    fn attr(name: string, fallback: float): float {
+        let s = str(iio_read_attr(this.index as i32, name.cstr()));
+        if (s == "") { return fallback; }
+        return s.to_float();
+    }
+
+    // The raw (unscaled) integer reading of a channel.
+    fn raw(chan: string): float { return this.attr("in_" + chan + "_raw", 0.0); }
+    // The channel's scale factor (defaults to 1.0 when the device has none).
+    fn scale(chan: string): float { return this.attr("in_" + chan + "_scale", 1.0); }
+    // The channel's offset (defaults to 0.0).
+    fn offset(chan: string): float { return this.attr("in_" + chan + "_offset", 0.0); }
+
+    // The processed reading in the sensor's real units: (raw + offset) * scale, the
+    // standard IIO conversion. A shared _scale/_offset (no per-channel file) is used
+    // automatically because attr() falls back through the same names.
+    fn value(chan: string): float { return (this.raw(chan) + this.offset(chan)) * this.scale(chan); }
+
+    // --- Buffered streaming (the fd half) ---
+
+    // Write a sysfs attribute (e.g. enableChannel is the common case; also
+    // "trigger/current_trigger", "buffer/length", "buffer/enable"). True on success.
+    fn writeAttr(attr: string, val: string): bool {
+        return iio_write_attr(this.index as i32, attr.cstr(), val.cstr()) as int == 0;
+    }
+    // Enable/disable a scan channel in the buffered record (in_<chan>_en).
+    fn enableChannel(chan: string, on: bool): bool {
+        return this.writeAttr("scan_elements/in_" + chan + "_en", ternary(on, "1", "0"));
+    }
+    // Assign the device's trigger by name, then turn the kernel buffer on/off. Enable
+    // the desired channels first. True on success.
+    fn setTrigger(name: string): bool { return this.writeAttr("trigger/current_trigger", name); }
+    fn enableBuffer(on: bool): bool { return this.writeAttr("buffer/enable", ternary(on, "1", "0")); }
+
+    // Open the live buffer as a poll-able stream (enable channels + trigger + buffer
+    // first). Null on failure (no buffer support, or no permission).
+    fn stream(): IioStream {
+        let fd = iio_buffer_open(this.index as i32) as int;
+        if (fd < 0) { return null; }
+        return new IioStream(fd as i32);
+    }
+}
+
+// Small string picker (Vyto has no ?: on strings here).
+fn ternary(c: bool, a: string, b: string): string { if (c) { return a; } return b; }
+
+// Snapshot every IIO device. Empty (never null) when there is no IIO subsystem.
+export fn iio_devices(): IioDevice[] {
+    let out: IioDevice[] = [];
+    let h = iio_enumerate();
+    if (h == null) { return out; }
+    let n = iio_count(h) as int;
+    let i = 0;
+    while (i < n) {
+        let joined = str(iio_channels(h, i as i32));
+        let chans: string[] = [];
+        if (joined != "") { chans = joined.split("\n"); }
+        out.push(new IioDevice(iio_index(h, i as i32) as int, str(iio_name(h, i as i32)), chans));
+        i += 1;
+    }
+    iio_free(h);
+    return out;
+}

@@ -1,0 +1,145 @@
+// vyto/hw/location — GPS / location, the Vyto-way (docs/HARDWARE.md). Location is not
+// a new device shape: a GPS is already a socket (gpsd on tcp/2947) or a serial NMEA
+// stream (vyto/hw/serial), so this package is pure Vyto on top of primitives that
+// already exist — no native shim, no #link. Two sources, one Fix:
+//
+//   - gpsd: connect the daemon, WATCH it, and parse its line-delimited TPV JSON.
+//       let gps = gpsd_connect("localhost", 2947);
+//       gps.start();
+//       let fix = gps.poll();          // Fix or null
+//       if (fix != null && fix.valid) { print(fix.lat + ", " + fix.lon); }
+//
+//   - NMEA: parse a sentence read from a serial port (or anywhere) with nmea_parse().
+//       let fix = nmea_parse("$GPGGA,123519,4807.038,N,01131.000,E,1,08,0.9,545.4,M,,,*47");
+//
+// On mobile the OS owns the permission prompt and pushes fixes through a callback; the
+// same C-catches-the-callback trick as Win32 WndProc would add a tiny shim there
+// (location_request()/location_poll()). Desktop needs none of that.
+
+import { Socket, socket_connect } from "vyto/net/socket";
+import { json_parse, JsonValue } from "vyto/util/json";
+
+// A single position fix. Angles in degrees (negative = S / W), altitude in metres,
+// speed in metres per second. `valid` is false for a parse failure or a no-fix report.
+export class Fix {
+    lat: float;
+    lon: float;
+    alt: float;         // metres above the ellipsoid/geoid (source-dependent)
+    speed: float;       // metres per second
+    valid: bool;
+    source: string;     // "gpsd" or "nmea"
+
+    fn init() { this.lat = 0.0; this.lon = 0.0; this.alt = 0.0; this.speed = 0.0; this.valid = false; this.source = ""; }
+}
+
+// --- NMEA 0183 -----------------------------------------------------------------
+
+// Convert an NMEA "ddmm.mmmm" / "dddmm.mmmm" coordinate + hemisphere to signed
+// decimal degrees. Empty field -> 0.
+fn nmea_coord(field: string, hemi: string): float {
+    if (field == "") { return 0.0; }
+    let v = field.to_float();
+    let deg = (v / 100.0) as int;                 // integer degrees
+    let minutes = v - (deg as float) * 100.0;     // remaining minutes
+    let dec = (deg as float) + minutes / 60.0;
+    if (hemi == "S" || hemi == "W") { return 0.0 - dec; }
+    return dec;
+}
+
+// Parse one NMEA sentence into a Fix. Understands GGA (position + altitude) and RMC
+// (position + ground speed); any other sentence returns an invalid Fix. Knots are
+// converted to m/s. The trailing "*hh" checksum is ignored (soft parsing).
+export fn nmea_parse(sentence: string): Fix {
+    let f = new Fix();
+    f.source = "nmea";
+    if (sentence.len < 6) { return f; }
+    // strip a trailing checksum, then split on commas
+    let body = sentence;
+    let star = sentence.index_of("*");
+    if (star >= 0) { body = sentence.slice(0, star); }
+    let p = body.split(",");
+    if (p.len < 1) { return f; }
+    let tag = p[0];
+    // tolerate the talker id: match the last 3 chars (GGA / RMC)
+    if (tag.ends_with("GGA")) {
+        if (p.len < 10) { return f; }
+        let quality = 0;
+        if (p[6] != "") { quality = p[6].to_int(); }
+        if (quality == 0) { return f; }            // no fix
+        f.lat = nmea_coord(p[2], p[3]);
+        f.lon = nmea_coord(p[4], p[5]);
+        if (p[9] != "") { f.alt = p[9].to_float(); }
+        f.valid = true;
+        return f;
+    }
+    if (tag.ends_with("RMC")) {
+        if (p.len < 8) { return f; }
+        if (p[2] != "A") { return f; }             // 'V' = void
+        f.lat = nmea_coord(p[3], p[4]);
+        f.lon = nmea_coord(p[5], p[6]);
+        if (p[7] != "") { f.speed = p[7].to_float() * 0.514444; } // knots -> m/s
+        f.valid = true;
+        return f;
+    }
+    return f;
+}
+
+// --- gpsd ----------------------------------------------------------------------
+
+// A connection to the gpsd daemon. Reuses Socket; poll() accumulates the line-oriented
+// JSON stream and returns the next TPV (time-position-velocity) report as a Fix.
+export class Gpsd {
+    sock: Socket;
+    buf: string;
+
+    fn init(sock: Socket) { this.sock = sock; this.buf = ""; }
+
+    // Ask gpsd to stream JSON reports. True on success.
+    fn start(): bool {
+        return this.sock.sendText("?WATCH={\"enable\":true,\"json\":true}\n") > 0;
+    }
+
+    // Pull the next position report. Reads whatever is available, parses complete
+    // lines, and returns the first TPV as a Fix — or null when no TPV arrived yet.
+    // Blocking; set a socket timeout to bound the wait.
+    fn poll(): Fix {
+        let chunk = this.sock.recvText(4096);
+        if (chunk.len > 0) { this.buf = this.buf + chunk; }
+        while (true) {
+            let nl = this.buf.index_of("\n");
+            if (nl < 0) { return null; }
+            let line = this.buf.slice(0, nl);
+            this.buf = this.buf.slice(nl + 1, this.buf.len);
+            let fix = gpsd_line(line);
+            if (fix != null) { return fix; }
+        }
+        return null;
+    }
+}
+
+// Parse one gpsd JSON line; a TPV with a 2D/3D fix becomes a Fix, anything else null.
+fn gpsd_line(line: string): Fix {
+    if (line.index_of("\"class\"") < 0) { return null; }
+    let j = json_parse(line);
+    if (j.get("class").asString() != "TPV") { return null; }
+    let f = new Fix();
+    f.source = "gpsd";
+    let mode = 0;
+    if (j.has("mode")) { mode = j.get("mode").asInt(); }
+    if (mode < 2) { return f; }                    // 0/1 = no fix
+    if (j.has("lat")) { f.lat = j.get("lat").asFloat(); }
+    if (j.has("lon")) { f.lon = j.get("lon").asFloat(); }
+    if (j.has("altHAE")) { f.alt = j.get("altHAE").asFloat(); }
+    else { if (j.has("alt")) { f.alt = j.get("alt").asFloat(); } }
+    if (j.has("speed")) { f.speed = j.get("speed").asFloat(); }
+    f.valid = true;
+    return f;
+}
+
+// Connect to a gpsd daemon (default host "localhost", port 2947). Null on failure
+// (daemon not running / unreachable).
+export fn gpsd_connect(host: string, port: int): Gpsd {
+    let s = socket_connect(host, port);
+    if (s == null) { return null; }
+    return new Gpsd(s);
+}

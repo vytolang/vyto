@@ -90,14 +90,115 @@ int ser_flush(int fd) { return tcflush(fd, TCIOFLUSH); }
 
 void ser_close(int fd) { if (fd >= 0) close(fd); }
 
-#else /* _WIN32: COM-port backend not yet implemented */
+#else /* _WIN32: COM-port backend.
 
-int  ser_open(const char *path, int baud) { (void)path; (void)baud; return -1; }
-int  ser_configure(int fd, int baud) { (void)fd; (void)baud; return -1; }
-long ser_read(int fd, char *buf, long cap) { (void)fd; (void)buf; (void)cap; return -2; }
-long ser_write(int fd, const char *buf, long n) { (void)fd; (void)buf; (void)n; return -2; }
-int  ser_drain(int fd) { (void)fd; return -1; }
-int  ser_flush(int fd) { (void)fd; return -1; }
-void ser_close(int fd) { (void)fd; }
+   UNTESTED — written from the Win32 API spec, never run (this repo has no Windows or
+   mingw toolchain). Compiles as reference; validate on real hardware before trusting.
+
+   Two Windows realities shape it:
+     - A serial port is a HANDLE, not a small int, and a HANDLE does not fit in the
+       int fd the Vyto API passes around (it would truncate on 64-bit). So HANDLEs live
+       in a small table and the "fd" is a table slot — the same trick the byte-level
+       API needs anyway.
+     - Windows readiness is IOCP/overlapped, not epoll, so this backend gives byte-
+       level read/write with immediate-return timeouts (the encoded -1 would-block still
+       works) but does NOT fold into the epoll-based PollSet. Loop integration on
+       Windows waits on a Windows PollSet backend (out of scope). */
+
+#include <windows.h>
+#include <stdio.h>
+
+#define SER_MAXH 64
+static HANDLE ser_handles[SER_MAXH];
+
+static int ser_alloc(HANDLE h) {
+    for (int i = 0; i < SER_MAXH; i++) {
+        if (ser_handles[i] == NULL || ser_handles[i] == INVALID_HANDLE_VALUE) {
+            ser_handles[i] = h;
+            return i;
+        }
+    }
+    return -1;
+}
+static HANDLE ser_h(int fd) {
+    if (fd < 0 || fd >= SER_MAXH) return INVALID_HANDLE_VALUE;
+    return ser_handles[fd];
+}
+
+/* Configure a slot's port as raw 8N1 at `baud` with immediate-return read timeouts. */
+int ser_configure(int fd, int baud) {
+    HANDLE h = ser_h(fd);
+    if (h == INVALID_HANDLE_VALUE) return -1;
+    DCB dcb;
+    memset(&dcb, 0, sizeof dcb);
+    dcb.DCBlength = sizeof dcb;
+    if (!GetCommState(h, &dcb)) return -1;
+    dcb.BaudRate = (DWORD)baud;
+    dcb.ByteSize = 8;
+    dcb.Parity   = NOPARITY;
+    dcb.StopBits = ONESTOPBIT;
+    dcb.fBinary  = TRUE;
+    dcb.fParity  = FALSE;
+    dcb.fOutxCtsFlow = FALSE;
+    dcb.fOutxDsrFlow = FALSE;
+    dcb.fDtrControl  = DTR_CONTROL_DISABLE;
+    dcb.fRtsControl  = RTS_CONTROL_DISABLE;
+    if (!SetCommState(h, &dcb)) return -1;
+    COMMTIMEOUTS to;
+    memset(&to, 0, sizeof to);
+    to.ReadIntervalTimeout = MAXDWORD;      /* return immediately with whatever's buffered */
+    to.ReadTotalTimeoutConstant = 0;
+    to.ReadTotalTimeoutMultiplier = 0;
+    to.WriteTotalTimeoutConstant = 0;
+    to.WriteTotalTimeoutMultiplier = 0;
+    if (!SetCommTimeouts(h, &to)) return -1;
+    return 0;
+}
+
+/* Open a COM port. `path` may be "COM3" (the "\\.\ " prefix is added so COM10+ work).*/
+int ser_open(const char *path, int baud) {
+    char name[64];
+    snprintf(name, sizeof name, "\\\\.\\%s", path);
+    HANDLE h = CreateFileA(name, GENERIC_READ | GENERIC_WRITE, 0, NULL,
+                           OPEN_EXISTING, 0, NULL);
+    if (h == INVALID_HANDLE_VALUE) return -1;
+    int fd = ser_alloc(h);
+    if (fd < 0) { CloseHandle(h); return -1; }
+    if (ser_configure(fd, baud) != 0) { CloseHandle(h); ser_handles[fd] = NULL; return -1; }
+    return fd;
+}
+
+/* >0 bytes, -1 would-block (nothing buffered), -2 error. */
+long ser_read(int fd, char *buf, long cap) {
+    HANDLE h = ser_h(fd);
+    if (h == INVALID_HANDLE_VALUE) return -2;
+    DWORD got = 0;
+    if (!ReadFile(h, buf, (DWORD)cap, &got, NULL)) return -2;
+    return got > 0 ? (long)got : -1;
+}
+
+/* >=0 bytes written, -2 error. */
+long ser_write(int fd, const char *buf, long n) {
+    HANDLE h = ser_h(fd);
+    if (h == INVALID_HANDLE_VALUE) return -2;
+    DWORD put = 0;
+    if (!WriteFile(h, buf, (DWORD)n, &put, NULL)) return -2;
+    return (long)put;
+}
+
+int ser_drain(int fd) {
+    HANDLE h = ser_h(fd);
+    if (h == INVALID_HANDLE_VALUE) return -1;
+    return FlushFileBuffers(h) ? 0 : -1;
+}
+int ser_flush(int fd) {
+    HANDLE h = ser_h(fd);
+    if (h == INVALID_HANDLE_VALUE) return -1;
+    return PurgeComm(h, PURGE_RXCLEAR | PURGE_TXCLEAR) ? 0 : -1;
+}
+void ser_close(int fd) {
+    HANDLE h = ser_h(fd);
+    if (h != INVALID_HANDLE_VALUE && h != NULL) { CloseHandle(h); ser_handles[fd] = NULL; }
+}
 
 #endif

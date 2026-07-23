@@ -1,0 +1,39 @@
+// Open a USB device and move bytes — the transfer half of vyto/hw/usb (the
+// enumeration half is 51_usb.vt). Same Vyto-way pattern as Socket: an opaque handle
+// with a byte[] transfer call and a deinit that closes the device.
+//
+//   vytoc run examples/55_usb_transfer.vt -- 1d6b:0002 [ep] [iface]
+//
+// Finds the first device matching vid:pid, opens it, claims an interface, and does one
+// bulk IN read. Needs write access to the device node (a udev rule or root), so no
+// golden .expected — the runner SKIPs it. A claim without error already proves the
+// transfer path; a hub endpoint will simply time out (empty read).
+
+import { usb_devices, UsbDevice } from "vyto/hw/usb";
+
+fn main() {
+    let av = args();
+    if (av.len < 1) { print("usage: 55_usb_transfer <vid:pid> [epHex] [iface]"); return; }
+    let want = av[0];
+    let ep = 0x81;                          // default: IN endpoint 1
+    if (av.len >= 2) { ep = av[1].to_int(); }
+    let iface = 0;
+    if (av.len >= 3) { iface = av[2].to_int(); }
+
+    let dev: UsbDevice = null;
+    for (let d in usb_devices()) {
+        if (d.id() == want) { dev = d; }
+    }
+    if (dev == null) { print("no device " + want + " (see 51_usb for the list)"); return; }
+    print("found " + dev.id() + "  " + dev.name() + "  (bus " + dev.bus + " dev " + dev.addr + ")");
+
+    let h = dev.open();
+    if (h == null) { print("cannot open device (needs a udev rule or root)"); return; }
+
+    if (!h.claim(iface)) { print("cannot claim interface " + iface); return; }
+    print("claimed interface " + iface + "; reading endpoint " + ep + " ...");
+
+    let data = h.bulkIn(ep, 64, 500);
+    print("bulk IN: " + data.len + " byte(s)");
+    h.release(iface);
+}

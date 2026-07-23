@@ -1,0 +1,38 @@
+// Parse GPS fixes — vyto/hw/location. Location is not a new device shape: a GPS is a
+// socket (gpsd) or a serial NMEA stream, so this is pure Vyto on existing primitives
+// (docs/HARDWARE.md). This demo parses canned NMEA sentences (no hardware needed); pass
+// "gpsd" to instead stream live fixes from a running gpsd daemon.
+//
+//   vytoc run examples/59_location.vt                 # parse sample sentences
+//   vytoc run examples/59_location.vt -- gpsd         # live, needs gpsd on :2947
+//
+// (Live output varies and the sample path needs no device, so no golden .expected —
+// the runner SKIPs it.)
+
+import { nmea_parse, gpsd_connect, Fix } from "vyto/hw/location";
+
+fn show(f: Fix) {
+    if (!f.valid) { print("  (no fix)"); return; }
+    print("  " + f.source + ": lat=" + f.lat + " lon=" + f.lon + " alt=" + f.alt + "m speed=" + f.speed + "m/s");
+}
+
+fn main() {
+    let av = args();
+    if (av.len >= 1 && av[0] == "gpsd") {
+        let gps = gpsd_connect("localhost", 2947);
+        if (gps == null) { print("no gpsd on localhost:2947"); return; }
+        gps.start();
+        print("streaming gpsd (Ctrl-C to stop)...");
+        let seen = 0;
+        while (seen < 5) {
+            let f = gps.poll();
+            if (f != null) { show(f); seen += 1; }
+        }
+        return;
+    }
+
+    print("NMEA sample fixes:");
+    show(nmea_parse("$GPGGA,123519,4807.038,N,01131.000,E,1,08,0.9,545.4,M,46.9,M,,*47"));
+    show(nmea_parse("$GPRMC,123519,A,4807.038,N,01131.000,E,022.4,084.4,230394,003.1,W*6A"));
+    show(nmea_parse("$GPRMC,123519,V,,,,,,,230394,,*4A"));   // void -> no fix
+}

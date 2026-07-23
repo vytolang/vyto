@@ -1,0 +1,110 @@
+// vyto/hw/gpio — GPIO lines over the Linux gpiochip character device (v2 uAPI), the
+// Vyto-way (docs/HARDWARE.md). Both halves of the pattern: a line handle for
+// get/set (request/response), and an edge-triggered input line as a poll-able fd that
+// folds into a PollSet alongside sockets, serial, and input devices.
+//
+//     let chip = gpio_open_chip("/dev/gpiochip0");
+//     if (chip == null) { print("no chip / no permission"); return; }
+//
+//     let led = chip.requestOutput(17, 0);   // drive line 17
+//     led.set(1);
+//
+//     let btn = chip.requestInput(27, EDGE_BOTH);   // watch line 27 for edges
+//     let ps = new PollSet();
+//     ps.addFd(btn.pollFd(), POLL_READ);
+//     if (ps.wait(-1) > 0) { print("edge " + btn.readEvent()); }
+//
+// Line access needs the `gpio` group or root; a denied request is soft (null). The
+// chip fd and each line fd live in their objects and are closed by deinit (RC:
+// dropping a line releases it). Testable without wiring via the `gpio-sim` module.
+// Linux today; other platforms return null.
+
+import { PollSet, POLL_READ } from "vyto/net/socket";
+
+extern "C" {
+    fn gpio_open(path: cstring): i32;
+    fn gpio_chip_lines(fd: i32): i32;
+    fn gpio_chip_name(fd: i32): cstring;
+    fn gpio_request_output(chipfd: i32, offset: i32, value: i32): i32;
+    fn gpio_request_input(chipfd: i32, offset: i32, edge: i32): i32;
+    fn gpio_get(linefd: i32): i32;
+    fn gpio_set(linefd: i32, value: i32): i32;
+    fn gpio_event_read(linefd: i32): i32;
+    fn gpio_close(fd: i32);
+}
+
+// Edge selection for an input line. A non-NONE edge makes readEvent()/pollFd() live.
+export const EDGE_NONE:    int = 0;
+export const EDGE_RISING:  int = 1;
+export const EDGE_FALLING: int = 2;
+export const EDGE_BOTH:    int = 3;
+
+// A requested GPIO line — an output to drive, or an input to read / watch for edges.
+// The line fd is owned here and closed by deinit.
+export class GpioLine {
+    fd: i32;
+
+    fn init(fd: i32) { this.fd = fd; }
+
+    fn ensure() { if ((this.fd as int) < 0) { panic("vyto/hw/gpio: operation on a released line"); } }
+    fn isValid(): bool { return (this.fd as int) >= 0; }
+
+    // Current level (0/1); -1 on error.
+    fn get(): int { this.ensure(); return gpio_get(this.fd) as int; }
+    // Drive an output line (0/1). True on success.
+    fn set(value: int): bool { this.ensure(); return gpio_set(this.fd, value as i32) as int == 0; }
+
+    // The fd to register in a PollSet (POLL_READ) for an edge-configured input line.
+    fn pollFd(): int { return this.fd as int; }
+    // One buffered edge event: 1 rising, 2 falling, 0 none-ready, -1 error. Read after
+    // the PollSet reports the fd readable.
+    fn readEvent(): int { this.ensure(); return gpio_event_read(this.fd) as int; }
+
+    fn close() {
+        if ((this.fd as int) >= 0) { gpio_close(this.fd); this.fd = -1 as i32; }
+    }
+    deinit { this.close(); }
+}
+
+// An open gpiochip. Lines are requested from it; the chip fd is closed by deinit.
+export class GpioChip {
+    fd: i32;
+
+    fn init(fd: i32) { this.fd = fd; }
+
+    fn ensure() { if ((this.fd as int) < 0) { panic("vyto/hw/gpio: operation on a closed chip"); } }
+    fn isValid(): bool { return (this.fd as int) >= 0; }
+
+    // Number of lines on the chip; the chip's label.
+    fn lines(): int { this.ensure(); return gpio_chip_lines(this.fd) as int; }
+    fn name(): string { this.ensure(); return str(gpio_chip_name(this.fd)); }
+
+    // Request line `offset` as an output seeded to `value` (0/1). Null on failure.
+    fn requestOutput(offset: int, value: int): GpioLine {
+        this.ensure();
+        let fd = gpio_request_output(this.fd, offset as i32, value as i32) as int;
+        if (fd < 0) { return null; }
+        return new GpioLine(fd as i32);
+    }
+    // Request line `offset` as an input; pass an EDGE_* to receive edge events on
+    // pollFd()/readEvent(). Null on failure.
+    fn requestInput(offset: int, edge: int): GpioLine {
+        this.ensure();
+        let fd = gpio_request_input(this.fd, offset as i32, edge as i32) as int;
+        if (fd < 0) { return null; }
+        return new GpioLine(fd as i32);
+    }
+
+    fn close() {
+        if ((this.fd as int) >= 0) { gpio_close(this.fd); this.fd = -1 as i32; }
+    }
+    deinit { this.close(); }
+}
+
+// Open a gpiochip (e.g. "/dev/gpiochip0"). Null on failure (missing chip, or no
+// permission — line access usually needs the `gpio` group).
+export fn gpio_open_chip(path: string): GpioChip {
+    let fd = gpio_open(path.cstr()) as int;
+    if (fd < 0) { return null; }
+    return new GpioChip(fd as i32);
+}

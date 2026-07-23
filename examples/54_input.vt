@@ -1,0 +1,42 @@
+// Read an input device through a PollSet — the Vyto-way streaming hardware shape
+// (docs/HARDWARE.md). An evdev fd joins the same wait() loop everything else uses, so
+// a keyboard/mouse/gamepad is driven exactly like a socket, window, or serial port.
+//
+//   vytoc run examples/54_input.vt              # just list devices
+//   vytoc run examples/54_input.vt -- /dev/input/event3
+//
+// (Needs a real device + `input`-group permission, so no golden .expected — the
+// runner SKIPs it.) Prints decoded events; exits after 5s of silence.
+
+import { PollSet, POLL_READ } from "vyto/net/socket";
+import { input_devices, input_open, InputDevice, EV_KEY, EV_REL, EV_ABS } from "vyto/hw/input";
+
+fn main() {
+    let devs = input_devices();
+    print("input: " + devs.len + " device(s)");
+    for (let d in devs) {
+        print("  " + d.path + "  " + d.id() + "  " + d.name);
+    }
+
+    let av = args();
+    if (av.len < 1) { print("(pass a /dev/input/eventN to stream it)"); return; }
+
+    let dev = input_open(av[0]);
+    if (dev == null) { print("cannot open " + av[0] + " (missing, or not in the input group)"); return; }
+    print("reading " + av[0] + " (5s idle to quit)");
+
+    let ps = new PollSet();
+    ps.addFd(dev.pollFd(), POLL_READ);
+
+    while (true) {
+        let n = ps.wait(5000);
+        if (n <= 0) { print("[idle]"); return; } // timeout or error
+        for (let e in dev.drain()) {
+            let kind = "ev" + e.type;
+            if (e.type == EV_KEY) { kind = "key"; }
+            if (e.type == EV_REL) { kind = "rel"; }
+            if (e.type == EV_ABS) { kind = "abs"; }
+            print(kind + " code=" + e.code + " value=" + e.value);
+        }
+    }
+}
