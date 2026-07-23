@@ -862,11 +862,44 @@ export fn dim(color: int, muted: int, st: WidgetState): int {
     return mix(color, muted, st.disabled * 0.55);
 }
 
+// Scalar lerp — the float twin of mix(), for interpolating metrics (shadow
+// blur/offset, sizes) the way mix() interpolates colors. Clamped like mix().
+export fn lerpf(a: float, b: float, t: float): float {
+    let u = t;
+    if (u < 0.0) { u = 0.0; }
+    if (u > 1.0) { u = 1.0; }
+    return a + (b - a) * u;
+}
+
 export class ButtonChrome {
+    // State-responsive elevation (D3): a resting button sits at `rest`, rises
+    // toward `rest+1` under hover, and sinks toward the surface when pressed —
+    // the depth cue that sells a press. rest is 1 for the plain button, 2 for
+    // Material's raised one. At hover=press=0 it returns exactly the rest
+    // elevation, so a resting button's shadow is unchanged. Writes blur into
+    // out[0] and dy into out[1].
+    fn elevation_for(th: Theme, st: WidgetState, rest: int): float[] {
+        let blur = th.elevation1_blur;
+        let dy = th.elevation1_dy;
+        if (rest >= 2) { blur = th.elevation2_blur; dy = th.elevation2_dy; }
+        // hover lifts one level higher
+        let hi_blur = th.elevation2_blur;
+        let hi_dy = th.elevation2_dy;
+        if (rest >= 2) { hi_blur = th.elevation3_blur; hi_dy = th.elevation3_dy; }
+        let lift = st.hover * (1.0 - st.press);
+        blur = lerpf(blur, hi_blur, lift);
+        dy = lerpf(dy, hi_dy, lift);
+        // press sinks toward a tight, close shadow
+        blur = lerpf(blur, blur * 0.45, st.press);
+        dy = lerpf(dy, dy * 0.45, st.press);
+        return [blur, dy];
+    }
+
     virtual fn paint(s: Painter, th: Theme, r: Rect, label: string,
                      st: WidgetState, skin: Skin) {
         let radius = th.radius_md;
-        s.shadow(r, radius, th.elevation1_blur, th.elevation1_dy, th.shadow_color);
+        let el = this.elevation_for(th, st, 1);
+        s.shadow(r, radius, el[0], el[1], th.shadow_color);
         // hover then press, each layered by its own amount; press wins when both
         // are up because it is applied last (mix to press over the hover result).
         let top = mix(th.primary, th.primary_hover, st.hover);
