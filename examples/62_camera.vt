@@ -1,0 +1,42 @@
+// Capture webcam frames — vyto/hw/camera over V4L2. The full Vyto-way hardware shape:
+// a poll-able fd for frame-ready plus a byte[] frame, driven from a PollSet exactly
+// like a socket or serial port (docs/HARDWARE.md).
+//
+//   vytoc run examples/62_camera.vt
+//   vytoc run examples/62_camera.vt -- /dev/video0 640 480
+//
+// (Needs a camera + `video`-group permission; testable without a webcam via the
+// `vivid` kernel module. No golden .expected — the runner SKIPs it.) Grabs a few
+// frames and reports size; grabRgba() would hand blit-ready pixels to a Surface.
+
+import { camera_open } from "vyto/hw/camera";
+
+fn main() {
+    let av = args();
+    let path = "/dev/video0";
+    let w = 640;
+    let h = 480;
+    if (av.len >= 1) { path = av[0]; }
+    if (av.len >= 3) { 
+        w = av[1].to_int(); 
+        h = av[2].to_int(); 
+    }
+
+    let cam = camera_open(path, w, h);
+    if (cam == null) { 
+        print("cannot open " + path + " (no camera, or not in the video group)"); 
+        return; 
+    }
+    print("capturing " + cam.width() + "x" + cam.height() + " " + cam.format());
+
+    // Continuous stream: capture() drives its own PollSet and calls the handler with
+    // each frame. Return false to stop — here after 5 frames.
+    let got: int[] = [0];               // box the counter (closures capture by value)
+    cam.capture((frame) => {
+        got[0] += 1;
+        print("frame " + got[0] + ": " + frame.len + " bytes");
+        return got[0] < 5;              // keep streaming until we have 5
+    }, 2000);                            // 2s idle ends the stream
+
+    print("streamed " + got[0] + " frames; grabRgba() -> " + (cam.width() * cam.height() * 4) + " bytes RGBA for blit");
+}

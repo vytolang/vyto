@@ -1,0 +1,43 @@
+// Generic ioctl — vyto/hw/ioctl. Reaches ioctl-driven devices from Vyto with an fd, a
+// request number (built arch-correctly by io/ior/iow/iowr), and a byte[] mirroring the
+// C struct. Composes with vyto/hw/device for the fd.
+//
+//   vytoc run examples/61_ioctl.vt
+//
+// Two checks, both unprivileged: verify the request-number builder against a known
+// constant, then make a real live ioctl (read the kernel entropy count).
+// (No golden .expected — the runner SKIPs it.)
+
+import { device_open, READ } from "vyto/hw/device";
+import { ioctl, ior, leInt } from "vyto/hw/ioctl";
+
+fn hex8(v: int): string {
+    let digits = "0123456789abcdef";
+    let out = "";
+    let shift = 28;
+    while (shift >= 0) {
+        let nib = (v >> shift) & 0xF;
+        out = out + digits.slice(nib, nib + 1);
+        shift -= 4;
+    }
+    return out;
+}
+
+fn main() {
+    // 1) Builder check: EVIOCGVERSION is _IOR('E', 0x01, int). On x86_64 that is the
+    //    well-known constant 0x80044501 — proves the _IOC math is arch-correct.
+    let eviocgversion = ior(0x45, 0x01, 4);           // 'E' = 0x45, sizeof(int) = 4
+    print("EVIOCGVERSION = 0x" + hex8(eviocgversion) + "  (expect 0x80044501 on x86_64)");
+
+    // 2) Live ioctl: RNDGETENTCNT is _IOR('R', 0x00, int); returns the entropy pool's
+    //    current bit count. Unprivileged, and a genuine ioctl round-trip.
+    let d = device_open("/dev/random", READ, false);
+    if (d == null) { print("cannot open /dev/random"); return; }
+    let rndgetentcnt = ior(0x52, 0x00, 4);            // 'R' = 0x52
+    let buf = bytes(4);
+    if (ioctl(d.rawFd(), rndgetentcnt, buf) >= 0) {
+        print("kernel entropy: " + leInt(buf) + " bits available");
+    } else {
+        print("RNDGETENTCNT failed");
+    }
+}

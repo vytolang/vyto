@@ -1,0 +1,193 @@
+// vyto/hw/camera — webcam capture over V4L2, the Vyto-way (docs/HARDWARE.md). A camera
+// is both a poll-able fd (frame-ready) and a byte[] producer (the frame), so it folds
+// into a PollSet like serial/input while handing back pixels to draw.
+//
+//     let cam = camera_open("/dev/video0", 640, 480);
+//     if (cam == null) { print("no camera"); return; }
+//     print("capturing " + cam.width() + "x" + cam.height() + " " + cam.format());
+//
+//     let ps = new PollSet();
+//     ps.addFd(cam.pollFd(), POLL_READ);
+//     while (true) {
+//         if (ps.wait(-1) > 0) {
+//             let rgba = cam.grabRgba();          // w*h*4, ready to blit to a Surface
+//             if (rgba.len > 0) { render(rgba); }
+//         }
+//     }
+//
+// Captures uncompressed YUYV (the common webcam format) and converts to RGBA on demand;
+// a device that only offers MJPEG reports its fourcc via format() so you can tell.
+// The device handle lives in Camera and deinit STREAMOFFs + unmaps + closes it (RC:
+// dropping the object turns the camera light off). Needs the `video` group. Linux only;
+// other platforms return null.
+
+import { PollSet, POLL_READ } from "vyto/net/socket";
+import { device_open, CREATE } from "vyto/hw/device";
+
+extern "C" {
+    fn cam_open(path: cstring, w: i32, h: i32): rawptr;
+    fn cam_fd(h: rawptr): i32;
+    fn cam_width(h: rawptr): i32;
+    fn cam_height(h: rawptr): i32;
+    fn cam_fourcc(h: rawptr): i32;
+    fn cam_frame_size(h: rawptr): i64;
+    fn cam_grab(h: rawptr, dst: cstring, cap: i64): i64;
+    fn cam_yuyv_to_rgba(src: cstring, w: i32, h: i32, dst: cstring);
+    fn cam_close(h: rawptr);
+}
+
+// The one pixel format captured directly (YUYV / YUY2, fourcc 'YUYV').
+export const FOURCC_YUYV: int = 0x56595559;   // 'Y''U''Y''V' little-endian
+
+// Copy the first `n` bytes of `buf` into a right-sized array.
+fn take(buf: byte[], n: int): byte[] {
+    if (n <= 0) { return bytes(0); }
+    if (n == buf.len) { return buf; }
+    let out = bytes(n);
+    let i = 0;
+    while (i < n) { out[i] = buf[i]; i += 1; }
+    return out;
+}
+
+// A four-character-code as its text (e.g. "YUYV", "MJPG").
+fn fourcc_str(v: int): string {
+    let out = "";
+    let i = 0;
+    while (i < 4) {
+        let c = (v >> (i * 8)) & 0xFF;
+        let one = bytes(1);
+        one[0] = c as byte;
+        out = out + str(one as cstring);
+        i += 1;
+    }
+    return out;
+}
+
+// An open camera streaming frames. The handle owns the V4L2 fd + mmap ring; deinit
+// releases them.
+export class Camera {
+    h: rawptr;
+
+    fn init(h: rawptr) { this.h = h; }
+
+    fn ensure() { if (this.h == null) { panic("vyto/hw/camera: operation on a closed camera"); } }
+    fn isValid(): bool { return this.h != null; }
+
+    // The negotiated capture geometry and pixel format (may differ from the request).
+    fn width(): int { this.ensure(); return cam_width(this.h) as int; }
+    fn height(): int { this.ensure(); return cam_height(this.h) as int; }
+    fn fourcc(): int { this.ensure(); return cam_fourcc(this.h) as int; }
+    fn format(): string { return fourcc_str(this.fourcc()); }
+
+    // The fd to register in a PollSet (POLL_READ) — the camera joins the shared loop.
+    fn pollFd(): int { this.ensure(); return cam_fd(this.h) as int; }
+
+    // Grab one raw frame in the device's native format (YUYV bytes). Empty on
+    // would-block / error. Call after the PollSet reports the fd readable.
+    fn grab(): byte[] {
+        this.ensure();
+        let cap = cam_frame_size(this.h) as int;
+        if (cap <= 0) { return bytes(0); }
+        let buf = bytes(cap);
+        let got = cam_grab(this.h, buf as cstring, cap as i64) as int;
+        if (got <= 0) { return bytes(0); }
+        return take(buf, got);
+    }
+
+    // Grab one frame converted to RGBA (width*height*4), ready to blit to a Surface.
+    // Empty if no frame is ready, or if the device isn't YUYV (check format()).
+    fn grabRgba(): byte[] {
+        this.ensure();
+        if (this.fourcc() != FOURCC_YUYV) { return bytes(0); }
+        let raw = this.grab();
+        if (raw.len == 0) { return bytes(0); }
+        let w = this.width();
+        let h = this.height();
+        let rgba = bytes(w * h * 4);
+        cam_yuyv_to_rgba(raw as cstring, w as i32, h as i32, rgba as cstring);
+        return rgba;
+    }
+
+    // Continuously capture frames, driving an internal PollSet and invoking `handler`
+    // with each raw frame (native format) as it arrives. Blocks; returns when `handler`
+    // returns false (stop) or a frame wait times out / errors. `timeoutMs` bounds each
+    // wait between frames (-1 = block until the next frame; a positive value ends the
+    // stream after that much idle). This is the whole streaming loop in one call:
+    //
+    //     cam.capture((frame) => {
+    //         process(frame);
+    //         return keepGoing;        // false to stop the stream
+    //     }, -1);
+    //
+    // The handler captures by value, so mutate shared state through a boxed array
+    // (e.g. `let n: int[] = [0]; ... n[0] += 1;`) rather than a plain local.
+    fn capture(handler: fn(byte[]): bool, timeoutMs: int) {
+        this.ensure();
+        let ps = new PollSet();
+        ps.addFd(this.pollFd(), POLL_READ);
+        while (true) {
+            let n = ps.wait(timeoutMs);
+            if (n <= 0) { return; }              // timeout or error — stop
+            let frame = this.grab();
+            if (frame.len > 0) {
+                if (!handler(frame)) { return; } // handler asked to stop
+            }
+        }
+    }
+
+    // Continuously capture frames converted to RGBA (width*height*4, blit-ready),
+    // invoking `handler` with each. Same loop and stop semantics as capture(); frames
+    // are skipped (not passed) if the device isn't YUYV — check format() up front.
+    fn captureRgba(handler: fn(byte[]): bool, timeoutMs: int) {
+        this.ensure();
+        let ps = new PollSet();
+        ps.addFd(this.pollFd(), POLL_READ);
+        while (true) {
+            let n = ps.wait(timeoutMs);
+            if (n <= 0) { return; }
+            let rgba = this.grabRgba();
+            if (rgba.len > 0) {
+                if (!handler(rgba)) { return; }
+            }
+        }
+    }
+
+    // Record `frames` raw frames to `path` as a flat stream of the native pixel format
+    // (YUYV), then stop. Returns the number of frames actually written (0 on failure to
+    // create the file). The result is a headerless .yuv you can mux/convert with ffmpeg:
+    //
+    //     let n = cam.record("out.yuv", 150);   // ~5s at 30fps
+    //     // ffmpeg -f rawvideo -pix_fmt yuyv422 -s WxH -i out.yuv out.mp4
+    //
+    // No encoding/compression — one uncompressed frame after another, so files are big
+    // (width*height*2 bytes each). For a playable container you supply the format/size
+    // to ffmpeg (see width()/height()/format()). `timeoutMs` bounds each frame wait
+    // (-1 = block); the recording ends early if the camera goes idle that long.
+    fn record(path: string, frames: int): int {
+        this.ensure();
+        let out = device_open(path, CREATE, false);
+        if (out == null) { return 0; }
+        let n: int[] = [0];
+        this.capture((frame) => {
+            out.write(frame);
+            n[0] += 1;
+            return n[0] < frames;
+        }, 2000);
+        out.close();
+        return n[0];
+    }
+
+    fn close() {
+        if (this.h != null) { cam_close(this.h); this.h = null; }
+    }
+    deinit { this.close(); }
+}
+
+// Open a camera at (roughly) width x height. The driver may pick a nearby supported
+// size — read it back with width()/height(). Null on failure (missing device, no
+// permission, or not a streaming capture device).
+export fn camera_open(path: string, width: int, height: int): Camera {
+    let h = cam_open(path.cstr(), width as i32, height as i32);
+    if (h == null) { return null; }
+    return new Camera(h);
+}

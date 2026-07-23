@@ -1,0 +1,107 @@
+// vyto/hw/device — generic character-device byte I/O, the Vyto-way (docs/HARDWARE.md).
+// The escape hatch: open ANY device node whose contract is read()/write() and move
+// bytes, non-blocking, folding into a PollSet like every other streaming device.
+// Covers hidraw, tty, /dev/random, /dev/cec*, pipes, and friends.
+//
+//     let d = device_open("/dev/urandom", READ, false);
+//     let seed = d.read(16);                      // 16 random bytes
+//
+//     let hid = device_open("/dev/hidraw0", RDWR, true);   // non-blocking
+//     let ps = new PollSet();
+//     ps.addFd(hid.pollFd(), POLL_READ);
+//     if (ps.wait(-1) > 0) { handle(hid.read(64)); }
+//
+// This does NOT understand ioctl-driven devices (V4L2 /dev/video*, gpiochip, i2c) —
+// those need vyto/hw/ioctl or a typed package (vyto/hw/camera, vyto/hw/gpio, ...).
+// The fd lives in Device and is closed by deinit. Linux + macOS; Windows is a later
+// backend.
+
+extern "C" {
+    fn dev_open(path: cstring, mode: i32, nonblock: i32): i32;
+    fn dev_read(fd: i32, buf: cstring, cap: i64): i64;
+    fn dev_write(fd: i32, buf: cstring, n: i64): i64;
+    fn dev_seek(fd: i32, off: i64, whence: i32): i64;
+    fn dev_close(fd: i32);
+}
+
+// Open modes.
+export const READ:   int = 0;
+export const WRITE:  int = 1;
+export const RDWR:   int = 2;
+export const CREATE: int = 3;   // write, creating/truncating the file (0644) — for sinks
+// seek() whence values.
+export const SEEK_SET: int = 0;
+export const SEEK_CUR: int = 1;
+export const SEEK_END: int = 2;
+
+// Copy the first `n` bytes of `buf` into a right-sized array.
+fn take(buf: byte[], n: int): byte[] {
+    if (n <= 0) { return bytes(0); }
+    if (n == buf.len) { return buf; }
+    let out = bytes(n);
+    let i = 0;
+    while (i < n) { out[i] = buf[i]; i += 1; }
+    return out;
+}
+
+// An open device node. Reads/writes are non-blocking when opened with nonblock=true
+// (empty read means nothing ready). The fd is closed by deinit (RC: dropping the
+// object releases the descriptor).
+export class Device {
+    fd: i32;
+
+    fn init(fd: i32) { this.fd = fd; }
+
+    fn ensure() { if ((this.fd as int) < 0) { panic("vyto/hw/device: operation on a closed device"); } }
+    fn isValid(): bool { return (this.fd as int) >= 0; }
+
+    // The fd to register in a PollSet (POLL_READ / POLL_WRITE). Also the fd to pass to
+    // vyto/hw/ioctl for device-specific control calls.
+    fn pollFd(): int { return this.fd as int; }
+    fn rawFd(): int { return this.fd as int; }
+
+    // Read up to `n` bytes; result length is what was available (empty on would-block /
+    // EOF / error). Read after a PollSet reports the fd readable for streaming nodes.
+    fn read(n: int): byte[] {
+        this.ensure();
+        if (n <= 0) { return bytes(0); }
+        let buf = bytes(n);
+        let got = dev_read(this.fd, buf as cstring, n as i64) as int;
+        if (got <= 0) { return bytes(0); }
+        return take(buf, got);
+    }
+    fn readText(n: int): string { return str(this.read(n) as cstring); }
+
+    // Write bytes; count written (>=0), or a negative encoded status (-1 would-block,
+    // -2 error).
+    fn write(data: byte[]): int {
+        this.ensure();
+        return dev_write(this.fd, data as cstring, data.len as i64) as int;
+    }
+    fn writeText(s: string): int {
+        this.ensure();
+        return dev_write(this.fd, s.cstr(), s.len as i64) as int;
+    }
+
+    // Reposition a seekable node (e.g. a sysfs/EDID file). New offset, or -1.
+    fn seek(off: int, whence: int): int {
+        this.ensure();
+        return dev_seek(this.fd, off as i64, whence as i32) as int;
+    }
+
+    fn close() {
+        if ((this.fd as int) >= 0) { dev_close(this.fd); this.fd = -1 as i32; }
+    }
+    deinit { this.close(); }
+}
+
+// Open a device node. `mode` is READ / WRITE / RDWR; `nonblock` opens O_NONBLOCK (for
+// streaming nodes driven through a PollSet). Null on failure (missing node, no
+// permission).
+export fn device_open(path: string, mode: int, nonblock: bool): Device {
+    let nb = 0;
+    if (nonblock) { nb = 1; }
+    let fd = dev_open(path.cstr(), mode as i32, nb as i32) as int;
+    if (fd < 0) { return null; }
+    return new Device(fd as i32);
+}

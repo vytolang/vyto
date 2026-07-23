@@ -1,0 +1,65 @@
+// vyto/hw/ioctl — the generic ioctl escape hatch, the Vyto-way (docs/HARDWARE.md).
+// Most device nodes are driven by ioctl() with device-specific request numbers and C
+// structs, not read()/write(). This reaches ANY of them from Vyto: an fd, a request
+// number, and a byte[] that mirrors the C struct.
+//
+//     import { device_open, RDWR } from "vyto/hw/device";
+//     import { ioctl, ior } from "vyto/hw/ioctl";
+//
+//     let d = device_open("/dev/random", RDWR, false);
+//     let buf = bytes(4);                              // an int the kernel fills in
+//     let RNDGETENTCNT = ior(0x52, 0x00, 4);          // _IOR('R', 0, int)
+//     if (ioctl(d.rawFd(), RNDGETENTCNT, buf) >= 0) {
+//         print("entropy bits: " + leInt(buf));       // decode the little-endian int
+//     }
+//
+// Build request numbers with io/ior/iow/iowr (they call the kernel's own _IOC macro, so
+// they are correct on every architecture) rather than hardcoding magic constants. This
+// is the foundation a future pure-Vyto device module can build on instead of writing a
+// C shim; the typed packages (hw/gpio, hw/i2c) are this pattern, encapsulated.
+//
+// ioctl can't map memory, so devices needing an mmap ring (V4L2 /dev/video*) still want
+// a typed package (vyto/hw/camera). Linux/POSIX.
+
+extern "C" {
+    fn vt_ioctl_buf(fd: i32, req: i64, buf: cstring): i64;
+    fn vt_ioctl_int(fd: i32, req: i64, val: i64): i64;
+    fn vt_ioc(dir: i32, type: i32, nr: i32, size: i32): i64;
+    fn vt_ioc_none(): i32;
+    fn vt_ioc_read(): i32;
+    fn vt_ioc_write(): i32;
+}
+
+// ioctl with a byte[] argument (the struct-pointer form). Read-direction requests fill
+// `arg` in place. Returns the driver's result (>=0), or -1 on error.
+export fn ioctl(fd: int, req: int, arg: byte[]): int {
+    return vt_ioctl_buf(fd as i32, req as i64, arg as cstring) as int;
+}
+
+// ioctl with a scalar argument passed by value (the _IO form). Result (>=0), or -1.
+export fn ioctlInt(fd: int, req: int, val: int): int {
+    return vt_ioctl_int(fd as i32, req as i64, val as i64) as int;
+}
+
+// Request-number builders — the _IO / _IOR / _IOW / _IOWR macros, arch-correct. `type`
+// is the ioctl group's ASCII code (e.g. 0x52 for 'R'); `size` is sizeof the arg struct.
+export fn io(type: int, nr: int): int {
+    return vt_ioc(vt_ioc_none() as i32, type as i32, nr as i32, 0 as i32) as int;
+}
+export fn ior(type: int, nr: int, size: int): int {
+    return vt_ioc(vt_ioc_read() as i32, type as i32, nr as i32, size as i32) as int;
+}
+export fn iow(type: int, nr: int, size: int): int {
+    return vt_ioc(vt_ioc_write() as i32, type as i32, nr as i32, size as i32) as int;
+}
+export fn iowr(type: int, nr: int, size: int): int {
+    let dir = (vt_ioc_read() as int) | (vt_ioc_write() as int);
+    return vt_ioc(dir as i32, type as i32, nr as i32, size as i32) as int;
+}
+
+// Decode a little-endian 32-bit signed int from the first 4 bytes of a buffer — the
+// common shape of a value an ioctl writes back.
+export fn leInt(buf: byte[]): int {
+    if (buf.len < 4) { return 0; }
+    return (buf[0] as int) | ((buf[1] as int) << 8) | ((buf[2] as int) << 16) | ((buf[3] as int) << 24);
+}
