@@ -1,5 +1,6 @@
 /* Vyto embedded-asset registry — see vyto_vfs.h. */
 #include "vyto_vfs.h"
+#include "vyto_host.h"   /* vt_host_realloc: freestanding-safe (no bare libc realloc) */
 #include <stdlib.h>
 #include <string.h>
 
@@ -15,7 +16,7 @@ static int g_vfs_n, g_vfs_cap;
 void vt_vfs_register(const char *logical, const unsigned char *data, long len) {
     if (g_vfs_n == g_vfs_cap) {
         int cap = g_vfs_cap ? g_vfs_cap * 2 : 16;
-        VtVfsEntry *n = (VtVfsEntry *)realloc(g_vfs, (size_t)cap * sizeof *n);
+        VtVfsEntry *n = (VtVfsEntry *)vt_host_realloc(g_vfs, (size_t)cap * sizeof *n);
         if (!n) return; /* drop silently: a missing asset falls through to disk */
         g_vfs = n;
         g_vfs_cap = cap;
