@@ -145,15 +145,15 @@ export fn paint_focus_ring(s: Painter, th: Theme, r: Rect, radius: float) {
     s.stroke_round(ring, radius + 2.0, 2.0, th.focus_ring);
 }
 
-// Resolve the visible fill of a control given its hover/press state. Uses
-// opaque mix() so the lean tier (no alpha) renders the same tint as the rich
-// tier — alpha compositing is reserved for true overlays the widget code may
-// add on top. `base` is the resting fill; hover/press are opaque tint colors.
-export fn resolve_state_fill(base: int, hovered: bool, pressed: bool,
-                             hover_tint: int, press_tint: int): int {
-    if (pressed) { return mix(base, press_tint, 0.5); }
-    if (hovered) { return mix(base, hover_tint, 0.5); }
-    return base;
+// Resolve the visible fill of a control from its interaction state: the resting
+// `base`, layered toward `hover_col` by st.hover and then `press_col` by
+// st.press (press applied last, so it wins when both are up). Fractional, so it
+// tracks the spring amounts mid-transition; at an endpoint mix() is exact, so a
+// resting control is unchanged. Opaque throughout, so the lean tier (no alpha)
+// renders the same color as the rich tier.
+export fn resolve_state_fill(base: int, st: WidgetState, hover_col: int, press_col: int): int {
+    let c = mix(base, hover_col, st.hover);
+    return mix(c, press_col, st.press);
 }
 
 // ----------------------------------------------------------------- Theme
@@ -895,22 +895,26 @@ export class ButtonChrome {
         return [blur, dy];
     }
 
+    // Centered button label at a given weight, dimmed by disabled state. Every
+    // skin's button drew this same block by hand; it lives here now so a skin
+    // only chooses the weight.
+    fn draw_label(s: Painter, r: Rect, label: string, color: int, weight: int) {
+        s.set_weight(weight);
+        let tw = s.text_width(label);
+        let pad = (r.w - tw) / 2.0;
+        s.text_in(r, pad, label, color);
+        s.set_weight(WEIGHT_REG);
+    }
+
     virtual fn paint(s: Painter, th: Theme, r: Rect, label: string,
                      st: WidgetState, skin: Skin) {
         let radius = th.radius_md;
         let el = this.elevation_for(th, st, 1);
         s.shadow(r, radius, el[0], el[1], th.shadow_color);
-        // hover then press, each layered by its own amount; press wins when both
-        // are up because it is applied last (mix to press over the hover result).
-        let top = mix(th.primary, th.primary_hover, st.hover);
-        top = mix(top, th.primary_press, st.press);
+        let top = resolve_state_fill(th.primary, st, th.primary_hover, th.primary_press);
         s.gradient_v(r, radius, dim(top, th.disabled, st), dim(th.primary_700, th.disabled, st));
         if (st.focus > 0.0) { skin.focus.paint(s, th, r, radius); }
-        s.set_weight(WEIGHT_BOLD);
-        let tw = s.text_width(label);
-        let pad = (r.w - tw) / 2;
-        s.text_in(r, pad, label, dim(th.on_primary, th.disabled_fg, st));
-        s.set_weight(WEIGHT_REG);
+        this.draw_label(s, r, label, dim(th.on_primary, th.disabled_fg, st), WEIGHT_BOLD);
     }
 }
 
