@@ -957,6 +957,45 @@ static int face_index(GfxCanvas *c, const char *path) {
     return c->nfaces++;
 }
 
+/* Same as face_index but parses the face from an in-memory TTF buffer instead
+   of a file. Used for fonts embedded via --with-assets. The cache is keyed by a
+   synthetic "@bytes:<ptr>" string so repeated loads of the same buffer dedup.
+   blend2d does not copy the data — the caller (the asset registry) owns bytes
+   that live for the process, so no destroy callback is needed. */
+static int face_index_bytes(GfxCanvas *c, const void *data, int len) {
+    char key[40];
+    snprintf(key, sizeof key, "@bytes:%p", data);
+    for (int i = 0; i < c->nfaces; i++)
+        if (strcmp(c->faces[i].path, key) == 0) return i;
+
+    if (c->nfaces == c->faces_cap) {
+        int cap = c->faces_cap ? c->faces_cap * 2 : 4;
+        GfxFace *n = (GfxFace *)realloc(c->faces, (size_t)cap * sizeof *n);
+        if (!n) return -1;
+        c->faces = n;
+        c->faces_cap = cap;
+    }
+    GfxFace *f = &c->faces[c->nfaces];
+    BLFontDataCore fd;
+    bl_font_data_init(&fd);
+    if (bl_font_data_create_from_data(&fd, data, (size_t)len, NULL, NULL) != BL_SUCCESS) {
+        bl_font_data_destroy(&fd);
+        return -1;
+    }
+    bl_font_face_init(&f->face);
+    if (bl_font_face_create_from_data(&f->face, &fd, 0) != BL_SUCCESS) {
+        bl_font_face_destroy(&f->face);
+        bl_font_data_destroy(&fd);
+        return -1;
+    }
+    bl_font_data_destroy(&fd); /* the face retains its own reference */
+    size_t klen = strlen(key) + 1;
+    f->path = (char *)malloc(klen);
+    if (!f->path) { bl_font_face_destroy(&f->face); return -1; }
+    memcpy(f->path, key, klen);
+    return c->nfaces++;
+}
+
 /* Returns a pointer INTO the cache array, so it is invalidated by the next
    font_for that grows it. Every caller uses it and drops it within the same
    call, which is what makes that safe — do not hold one across another lookup.
@@ -997,6 +1036,20 @@ int gfx_load_font_weight(GfxCanvas *c, const char *ttf_path, double size, int we
     /* Realise it now rather than at first draw, so a face that parses but
        cannot be sized still reports failure from the load call — callers pick
        their fallback TTF off this return value. */
+    if (!font_for(c, fi, size)) return 0;
+
+    c->face_of[weight] = fi;
+    c->base_size = size;
+    if (c->cur_size <= 0.0) c->cur_size = size;
+    if (c->face_of[c->active_weight] < 0) c->active_weight = weight;
+    return 1;
+}
+
+int gfx_load_font_bytes(GfxCanvas *c, const void *data, int len, double size, int weight) {
+    if (weight < 0 || weight >= GFX_WEIGHTS) weight = 0;
+    if (!data || len <= 0) return 0;
+    int fi = face_index_bytes(c, data, len);
+    if (fi < 0) return 0;
     if (!font_for(c, fi, size)) return 0;
 
     c->face_of[weight] = fi;

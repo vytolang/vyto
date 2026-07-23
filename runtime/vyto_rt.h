@@ -21,6 +21,7 @@ int strncmp(const char *a, const char *b, size_t n);
 #endif
 
 #include "vyto_host.h"
+#include "vyto_vfs.h"
 
 /* extern "C" declarations are emitted under private identifiers aliased to the
    real symbol with __asm__, so they can never conflict with system headers.

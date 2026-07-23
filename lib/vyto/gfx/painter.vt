@@ -13,6 +13,12 @@ import { Canvas, loadImage, freeImage } from "vyto/gfx";
 import { Surface, Rect, rgb } from "vyto/surface";
 import { Path } from "vyto/geom/path";
 
+extern "C" {
+    // embedded-asset registry (runtime); null/-1 on miss
+    fn vt_vfs_ptr(key: cstring): rawptr;
+    fn vt_vfs_size(key: cstring): i64;
+}
+
 // Build a candidate bold/medium face path from a regular TTF path by inserting
 // "Bold"/"Medium" before the extension — works for the DejaVu family shipped
 // with most distros. Returns the empty string when no candidate is derivable.
@@ -35,6 +41,11 @@ export class GfxPainter extends Painter {
     base_font_size: float;   // size the faces were loaded at (the scale's 1.0)
     size_stack: float[];     // push_font/pop_font, saved (size, weight) pairs
     weight_stack: int[];
+    // Optional per-weight in-memory TTF buffers (e.g. a font embedded via
+    // --with-assets). Empty for the disk-path case; when set, a weight loads
+    // from its buffer instead of font_path. Kept for canvas re-creation.
+    font_bytes: rawptr[];
+    font_bytes_len: int[];
 
     fn init(surf: Surface, fontPath: string, fontSize: float) {
         this.surf = surf;
@@ -42,24 +53,57 @@ export class GfxPainter extends Painter {
         this.base_font_size = fontSize;
         this.size_stack = [];
         this.weight_stack = [];
+        this.font_bytes = [];
+        this.font_bytes_len = [];
         this.weight = WEIGHT_REG;
         this.make_canvas(surf.width(), surf.height());
+    }
+
+    // Load the font from in-memory buffers instead of a disk path. Pass a null
+    // buffer (len 0) for a weight you don't have; it reuses the regular buffer
+    // so text never blanks. Reloads the current canvas. Buffers must outlive it.
+    fn useFontBytes(reg: rawptr, regLen: int, med: rawptr, medLen: int,
+                    bold: rawptr, boldLen: int) {
+        this.font_bytes = [reg, med, bold];
+        this.font_bytes_len = [regLen, medLen, boldLen];
+        this.make_canvas(this.canvas.width(), this.canvas.height());
+    }
+
+    // Load one weight slot: prefer this weight's embedded buffer, else the
+    // regular buffer (bytes mode), else the disk path.
+    fn load_weight(w: int, path: string): bool {
+        if (this.font_bytes.len > w && this.font_bytes_len[w] > 0) {
+            return this.canvas.loadFontBytes(this.font_bytes[w], this.font_bytes_len[w],
+                                             this.base_font_size, w);
+        }
+        if (this.font_bytes.len > WEIGHT_REG && this.font_bytes_len[WEIGHT_REG] > 0) {
+            // bytes mode, this weight not supplied: reuse regular so it renders
+            return this.canvas.loadFontBytes(this.font_bytes[WEIGHT_REG],
+                                             this.font_bytes_len[WEIGHT_REG],
+                                             this.base_font_size, w);
+        }
+        // embedded asset (--with-assets): a font referenced by its relative path
+        // loads from the binary; the derived -Medium/-Bold siblings resolve too.
+        let vp = vt_vfs_ptr(path.cstr());
+        if (vp != null) {
+            return this.canvas.loadFontBytes(vp, vt_vfs_size(path.cstr()) as int,
+                                             this.base_font_size, w);
+        }
+        return this.canvas.loadFontWeight(path, this.base_font_size, w);
     }
 
     fn make_canvas(w: int, h: int) {
         this.canvas = new Canvas(w, h);
         // regular weight always loads; medium/bold are best-effort — widgets
-        // fall back to regular if a variant TTF isn't on disk.
-        this.canvas.loadFontWeight(this.font_path, this.base_font_size, WEIGHT_REG);
-        if (!this.canvas.loadFontWeight(derive_variant_path(this.font_path, "-Medium"),
-                                        this.base_font_size, WEIGHT_MED)) {
+        // fall back to regular if a variant TTF isn't on disk (or not supplied
+        // as bytes). load_weight handles the bytes-vs-path choice per weight.
+        this.load_weight(WEIGHT_REG, this.font_path);
+        if (!this.load_weight(WEIGHT_MED, derive_variant_path(this.font_path, "-Medium"))) {
             // reuse regular for medium so set_weight(med) never blanks text
-            this.canvas.loadFontWeight(this.font_path, this.base_font_size, WEIGHT_MED);
+            this.load_weight(WEIGHT_MED, this.font_path);
         }
-        if (!this.canvas.loadFontWeight(derive_variant_path(this.font_path, "-Bold"),
-                                        this.base_font_size, WEIGHT_BOLD)) {
-            this.canvas.loadFontWeight(derive_variant_path(this.font_path, "Bold"),
-                                       this.base_font_size, WEIGHT_BOLD);
+        if (!this.load_weight(WEIGHT_BOLD, derive_variant_path(this.font_path, "-Bold"))) {
+            this.load_weight(WEIGHT_BOLD, derive_variant_path(this.font_path, "Bold"));
         }
         this.canvas.setWeight(this.weight);
     }

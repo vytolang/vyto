@@ -623,6 +623,14 @@ static FILE *file_open(VtString *path, const char *mode, const char *file, int l
 }
 
 VtString *vt_file_read(VtString *path, const char *file, int line) {
+    /* Embedded asset (--with-assets) shadows disk: readfile/readlines and any
+       config/JSON built on them resolve from the binary when a key matches. */
+    const unsigned char *ad; long alen;
+    if (vt_vfs_get(vt_str_cstr(path), &ad, &alen)) {
+        VtString *s = str_alloc((int64_t)alen);
+        memcpy(s->data, ad, (size_t)alen);
+        return s;
+    }
     FILE *f = file_open(path, "rb", file, line);
     /* Read to EOF into a growing buffer rather than trusting the stat size:
        /proc and /sys files report size 0, and pipes aren't seekable. */
@@ -979,3 +987,4 @@ VtClosure *vt_closure_new(void *fn, VtObj *env) {
 #include "vyto_rt_str.c"
 #include "vyto_rt_arr.c"
 #include "vyto_rt_map.c"
+#include "vyto_vfs.c"

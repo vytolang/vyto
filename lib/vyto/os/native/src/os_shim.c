@@ -16,6 +16,42 @@
 #include <sys/wait.h>
 
 const char *os_getenv(const char *k) { return getenv(k); }
+
+/* Resolved stdlib directory, for locating vendored assets (e.g. fonts) at
+   runtime. Runtime VYTO_HOME wins; otherwise the compiler bakes the path it
+   resolved via -DVYTO_LIBDIR. Empty string when neither is available. */
+const char *os_lib_dir(void) {
+    static char buf[4096];
+    static int cached = 0;
+    if (cached) return buf;
+    cached = 1;
+    const char *e = getenv("VYTO_HOME");
+    if (e && *e) { snprintf(buf, sizeof buf, "%s/lib", e); return buf; }
+#ifdef VYTO_LIBDIR
+    snprintf(buf, sizeof buf, "%s", VYTO_LIBDIR);
+#else
+    buf[0] = 0;
+#endif
+    return buf;
+}
+
+/* The app's own directory (entry file's dir), for locating its assets/conf/
+   storage at runtime. Runtime VYTO_APP_DIR wins; otherwise the compiler bakes
+   the path via -DVYTO_APPDIR. Empty string when neither is available. */
+const char *os_app_dir(void) {
+    static char buf[4096];
+    static int cached = 0;
+    if (cached) return buf;
+    cached = 1;
+    const char *e = getenv("VYTO_APP_DIR");
+    if (e && *e) { snprintf(buf, sizeof buf, "%s", e); return buf; }
+#ifdef VYTO_APPDIR
+    snprintf(buf, sizeof buf, "%s", VYTO_APPDIR);
+#else
+    buf[0] = 0;
+#endif
+    return buf;
+}
 int os_setenv(const char *k, const char *v) { return setenv(k, v, 1); }
 int os_unsetenv(const char *k) { return unsetenv(k); }
 int os_chdir(const char *p) { return chdir(p); }

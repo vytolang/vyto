@@ -47,6 +47,7 @@ extern "C" {
                       startDeg: f64, sweepDeg: f64, width: f64, rgb: i32);
     fn gfx_load_font(c: rawptr, path: cstring, size: f64): i32;
     fn gfx_load_font_weight(c: rawptr, path: cstring, size: f64, weight: i32): i32;
+    fn gfx_load_font_bytes(c: rawptr, data: rawptr, len: i32, size: f64, weight: i32): i32;
     fn gfx_set_font_weight(c: rawptr, weight: i32);
     fn gfx_set_font_size(c: rawptr, size: f64);
     fn gfx_get_font_size(c: rawptr): f64;
@@ -59,6 +60,9 @@ extern "C" {
     fn gfx_stride(c: rawptr): i32;
     fn gfx_image_load_file(path: cstring): rawptr;
     fn gfx_image_load_bytes(data: rawptr, len: i32): rawptr;
+    // embedded-asset registry (runtime); null/-1 on miss
+    fn vt_vfs_ptr(key: cstring): rawptr;
+    fn vt_vfs_size(key: cstring): i64;
     fn gfx_image_free(img: rawptr);
     fn gfx_image_width(img: rawptr): i32;
     fn gfx_image_height(img: rawptr): i32;
@@ -195,6 +199,12 @@ export class Canvas {
     fn loadFontWeight(path: string, size: float, weight: int): bool {
         return gfx_load_font_weight(this.handle, path.cstr(), size, weight as i32) != 0;
     }
+    // Load a weight slot from an in-memory TTF buffer (e.g. a font embedded via
+    // --with-assets) instead of a disk path. `data` must stay alive for the
+    // canvas lifetime — blend2d does not copy it.
+    fn loadFontBytes(data: rawptr, len: int, size: float, weight: int): bool {
+        return gfx_load_font_bytes(this.handle, data, len as i32, size, weight as i32) != 0;
+    }
     fn setWeight(weight: int) {
         gfx_set_font_weight(this.handle, weight as i32);
     }
@@ -265,6 +275,12 @@ export class Canvas {
 // what's actually confirmed and a regeneration recipe that's verified to
 // work). Watch for this if a known-good file mysteriously loads null.
 export fn loadImage(path: string): rawptr {
+    // Embedded asset (--with-assets) shadows disk: an app that references its
+    // images by the same relative path works bundled or from disk unchanged.
+    let p = vt_vfs_ptr(path.cstr());
+    if (p != null) {
+        return gfx_image_load_bytes(p, vt_vfs_size(path.cstr()) as i32);
+    }
     return gfx_image_load_file(path.cstr());
 }
 // Same decode as loadImage, but from an in-memory buffer (e.g. HTTP-fetched
