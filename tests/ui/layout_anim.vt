@@ -1,0 +1,80 @@
+// D1/D4: a widget that opts into layout animation slides to its new bounds.
+// bounds (layout/hit truth) jumps immediately; visual_bounds() interpolates,
+// and the draw() wrapper translates the actual pixels to the visual position.
+
+import { Window, Button, Card, Theme } from "vyto/ui";
+import { GfxPainter } from "vyto/gfx/painter";
+import { Rect, rgb } from "vyto/surface";
+
+const FONT: string = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf";
+
+fn check(label: string, cond: bool) {
+    let mark = "FAIL";
+    if (cond) { mark = "ok"; }
+    print(mark + " " + label);
+}
+
+fn main() {
+    // --- the numerics ---
+    let win = new Window("L", 240, 200);
+    let b = new Button("x").animate_layout(true);
+    win.root = b;
+    win.layout();                       // first placement: no spring, no slide
+    let start = b.bounds;
+    check("no position spring before a move", b.vb_x == null);
+
+    b.layout_to(Rect(140.0, 110.0, start.w, start.h));
+    check("bounds jumps to the target immediately", b.bounds.x == 140.0);
+    check("a move created the springs", b.vb_x != null);
+    check("visual has not jumped with it", b.visual_bounds().x != 140.0);
+
+    b.vb_x.advance(16); b.vb_y.advance(16);
+    b.vb_x.advance(16); b.vb_y.advance(16);
+    let mid = b.visual_bounds().x;
+    check("visual is sliding", mid != start.x && mid != 140.0);
+
+    let g = 0;
+    while ((b.vb_x.advance(16) || b.vb_y.advance(16)) && g < 3000) { g += 1; }
+    check("visual settles exactly on target", b.visual_bounds().x == 140.0 && b.visual_bounds().y == 110.0);
+
+    // a widget that did NOT opt in snaps: bounds move, no spring, visual==bounds
+    let plain = new Button("y");
+    win.root = plain;
+    win.layout();
+    plain.layout_to(Rect(50.0, 50.0, 20.0, 20.0));
+    check("opt-out widget has no spring", plain.vb_x == null);
+    check("opt-out visual equals bounds", plain.visual_bounds().x == 50.0);
+
+    // --- the pixels: draw() must translate the subtree to the visual pos ---
+    let w2 = new Window("P", 220, 160);
+    let p = new GfxPainter(w2.surface(), FONT, 15.0);
+    let th = new Theme();
+    let card = new Card(10, rgb(220, 40, 40), -1, "", null).animate_layout(true);
+    w2.root = card;
+    w2.layout();
+    card.layout_to(Rect(20.0, 20.0, 80.0, 60.0));     // first real placement target
+    // settle so it sits at 20,20
+    while (card.vb_x != null && (card.vb_x.advance(16) || card.vb_y.advance(16))) { }
+
+    // now move it far right and advance only partway
+    card.layout_to(Rect(140.0, 20.0, 80.0, 60.0));
+    for (let i in 0..3) { card.vb_x.advance(16); card.vb_y.advance(16); }
+    let vx = card.visual_bounds().x;
+    check("card is mid-slide", vx > 25.0 && vx < 135.0);
+
+    p.fill(Rect(0.0, 0.0, 220.0, 160.0), rgb(250, 250, 250));
+    card.draw(p, th);
+    p.canvas.flush();
+    // the red fill must be at the VISUAL x, not the layout x (140) nor start (20)
+    let at_visual = p.canvas.pixelAt((vx + 40.0) as int, 45);
+    let at_layout = p.canvas.pixelAt(180, 45);   // where bounds says it is
+    check("pixels drew at the visual position", is_reddish(at_visual));
+    check("pixels are NOT at the layout position", !is_reddish(at_layout));
+}
+
+fn is_reddish(px: int): bool {
+    let r = (px >> 16) & 0xFF;
+    let g = (px >> 8) & 0xFF;
+    let b = px & 0xFF;
+    return r > 150 && g < 120 && b < 120;
+}

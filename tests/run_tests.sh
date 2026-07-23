@@ -310,7 +310,7 @@ for src in tests/ui/[0-9]*.vt; do
 done
 
 # --- vyto/ui named golden tests: TextArea + menus (no env needed) ---
-for name in textarea menu gallery scale spring disabled motion; do
+for name in textarea menu gallery scale spring disabled motion layout_anim; do
     got=$(VS_HEADLESS=1 VS_EVENTS="tests/ui/$name.events" ./vytoc run "tests/ui/$name.vt" 2>&1)
     if [ "$got" = "$(cat "tests/ui/$name.expected")" ]; then
         echo "PASS ui_$name"

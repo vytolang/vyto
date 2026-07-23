@@ -831,6 +831,11 @@ export struct WidgetState {
 export const UI_SPRING_RESPONSE: float = 0.22;
 export const UI_SPRING_DAMPING: float = 1.0;
 
+// Layout moves want a slightly slower, softer settle than a hover flick — a
+// touch of overshoot reads as "snappy" rather than "mechanical" on a position.
+export const LAYOUT_SPRING_RESPONSE: float = 0.34;
+export const LAYOUT_SPRING_DAMPING: float = 0.82;
+
 // Discrete state, for a resting endpoint or a widget whose springs have not
 // been created yet. b2f keeps the bool->0/1 conversion in one place.
 export fn b2f(b: bool): float { if (b) { return 1.0; } return 0.0; }
@@ -1053,6 +1058,15 @@ export class Widget {
     anim_press: AnimatedFloat;
     anim_focus: AnimatedFloat;
     anim_on: AnimatedFloat;    // checked/selected/switch-on, driven by the widget
+    // D1 implicit layout animation. Off by default; animate_layout(true) opts a
+    // widget into sliding to its new bounds when a relayout moves it. vb_x/y are
+    // the spring-interpolated position the draw() wrapper translates to; null
+    // until the first move, and laid_out guards the initial placement so a
+    // freshly-added widget appears in place instead of flying in from 0,0.
+    animate_layout_on: bool;
+    laid_out: bool;
+    vb_x: AnimatedFloat;
+    vb_y: AnimatedFloat;
     grow: int;          // flex factor inside Column/Row; 0 = natural size
     alignSelf: int;     // cross-axis override inside Column/Row; -1 = inherit
     modal: bool;        // overlay traps events; outside clicks don't dismiss
@@ -1103,6 +1117,36 @@ export class Widget {
     // they exist (mid-transition) and the plain bools otherwise (resting, or
     // before any transition created a spring). `on` is the widget's own logical
     // state — checked/selected/switch-on — which the widget passes in.
+    // Opt into implicit layout animation: a relayout that moves this widget
+    // slides it to the new position instead of snapping. Off by default because
+    // most relayouts (scrolling, typing) should be instant.
+    builder fn animate_layout(on: bool) { this.animate_layout_on = on; return this; }
+
+    // The rect this widget paints at right now — its animated position while a
+    // layout transition is in flight, its layout bounds otherwise. The draw()
+    // wrapper reads it; hit-testing deliberately does not (see draw()).
+    fn visual_bounds(): Rect {
+        if (this.vb_x == null) { return this.bounds; }
+        return Rect(this.vb_x.value(), this.vb_y.value(), this.bounds.w, this.bounds.h);
+    }
+
+    // Called by arrange() in place of `this.bounds = r`. Records the new layout
+    // rect and, when animating, retargets the position springs from where the
+    // widget currently appears — so an interrupted move keeps its momentum
+    // rather than snapping to the new path.
+    fn layout_to(r: Rect) {
+        if (this.animate_layout_on && this.laid_out && this.win != null) {
+            if (this.vb_x == null) {
+                this.vb_x = new AnimatedFloat(this.bounds.x, LAYOUT_SPRING_RESPONSE, LAYOUT_SPRING_DAMPING);
+                this.vb_y = new AnimatedFloat(this.bounds.y, LAYOUT_SPRING_RESPONSE, LAYOUT_SPRING_DAMPING);
+            }
+            this.wake_spring(this.vb_x, r.x);
+            this.wake_spring(this.vb_y, r.y);
+        }
+        this.bounds = r;
+        this.laid_out = true;
+    }
+
     fn ui_state(on: bool): WidgetState {
         let h = b2f(this.hovered);
         let p = b2f(this.pressed);
@@ -1337,7 +1381,7 @@ export class Widget {
     // assign absolute bounds, top-down. The base class keeps children at
     // their manually set bounds — the absolute-placement escape hatch.
     virtual fn arrange(s: Painter, th: Theme, r: Rect) {
-        this.bounds = r;
+        this.layout_to(r);
         for (let c in this.children) {
             c.arrange(s, th, c.bounds);
         }
@@ -1347,7 +1391,43 @@ export class Widget {
     // normal widgets are placed by their parent's arrange() instead.
     virtual fn place(s: Painter, th: Theme) { }
 
-    virtual fn draw(s: Painter, th: Theme) {
+    // draw()/draw_within() are the non-virtual entry points every parent calls;
+    // render()/render_within() are the overridable paint bodies. The wrapper
+    // brackets the paint in a layout-transform translate, so a widget animating
+    // its position (see layout_to / visual_bounds, D1) slides its whole subtree
+    // as one unit with no per-widget code — the translate carries the children
+    // drawn inside render(). With nothing animating, the delta is zero and the
+    // translate is skipped, so this is transparent to every existing widget.
+    //
+    // The shift is rich-tier only: SurfacePainter has no translate, so the lean
+    // tier snaps to the final layout rather than sliding — the usual graceful
+    // degradation. Hit-testing stays on the layout bounds (you click where a
+    // widget is going), which is why bounds and visual_bounds are separate.
+    fn draw(s: Painter, th: Theme) {
+        let dx = 0.0; let dy = 0.0;
+        if (this.vb_x != null) {
+            dx = this.vb_x.value() - this.bounds.x;
+            dy = this.vb_y.value() - this.bounds.y;
+        }
+        let shift = dx != 0.0 || dy != 0.0;
+        if (shift) { s.save(); s.translate(dx, dy); }
+        this.render(s, th);
+        if (shift) { s.restore(); }
+    }
+
+    fn draw_within(s: Painter, th: Theme, d: Rect) {
+        let dx = 0.0; let dy = 0.0;
+        if (this.vb_x != null) {
+            dx = this.vb_x.value() - this.bounds.x;
+            dy = this.vb_y.value() - this.bounds.y;
+        }
+        let shift = dx != 0.0 || dy != 0.0;
+        if (shift) { s.save(); s.translate(dx, dy); }
+        this.render_within(s, th, d);
+        if (shift) { s.restore(); }
+    }
+
+    virtual fn render(s: Painter, th: Theme) {
         for (let c in this.children) {
             c.draw(s, th);
         }
@@ -1355,7 +1435,7 @@ export class Widget {
 
     // A container's own painting (background, borders) — separate from its
     // children so a partial repaint can redraw the container chrome without
-    // wholesale-redrawing every child. Leaf widgets paint in draw() instead.
+    // wholesale-redrawing every child. Leaf widgets paint in render() instead.
     virtual fn draw_chrome(s: Painter, th: Theme) { }
 
     // Partial-repaint walk: draw only the widgets that intersect the dirty
@@ -1363,7 +1443,7 @@ export class Widget {
     // itself; a container paints its chrome and recurses per child (each child
     // re-tests against d). The persistent back buffer keeps everything outside
     // d from the previous frame, so only the changed region is repainted.
-    virtual fn draw_within(s: Painter, th: Theme, d: Rect) {
+    virtual fn render_within(s: Painter, th: Theme, d: Rect) {
         if (!rect_overlaps(this.bounds, d)) { return; }
         if (this.children.len == 0) {
             this.draw(s, th);
