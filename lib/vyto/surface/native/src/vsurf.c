@@ -6,6 +6,16 @@
  */
 #define _POSIX_C_SOURCE 200809L /* clock_gettime */
 
+/* Windows API level, and it has to be set before ANY include: mingw's _mingw.h
+   (reached via <stdio.h>) defaults it to the XP-era value, which hides
+   GetTickCount64 (Vista+). Left implicitly declared, that call returns int and
+   the top 32 bits of the tick count are lost, so vs_now_ms jumps backwards once
+   the host has been up 24.9 days. Vista is the floor for the Win32 backend.
+   Inert on non-Windows builds. */
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0600
+#endif
+
 #include "vsurf.h"
 
 #include <stdint.h>

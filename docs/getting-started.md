@@ -150,7 +150,127 @@ Apps that use a prebuilt native library (e.g. `vyto/gfx`, which links blend2d)
 ship the executable plus that `.so` beside it by default; add `--bundle` to
 statically link everything into one file.
 
-## 8. Where to go next
+## 8. Cross-compiling for Windows
+
+`windows-x64` builds are produced on Linux with the mingw-w64 toolchain:
+
+```sh
+sudo apt-get install -y gcc-mingw-w64-x86-64      # provides x86_64-w64-mingw32-gcc
+./vytoc build app.vt --release --target windows-x64 -o app.exe
+```
+
+`vytoc` picks `x86_64-w64-mingw32-gcc` for that triple automatically. Add
+`-static-libgcc` if the `.exe` has to run on a machine with no mingw runtime
+DLLs:
+
+```sh
+./vytoc build app.vt --target windows-x64 --cc "x86_64-w64-mingw32-gcc -static-libgcc"
+```
+
+### What is portable today
+
+The **core language, the runtime, and the stdlib packages with no POSIX
+dependency**: `vyto/math`, `vyto/reactive`, `vyto/util/*` (fmt, json, sort, text,
+time, date), `vyto/io/file`, `vyto/data/frame`, `vyto/os/os`, `vyto/anim`,
+`vyto/geom/*`, plus FFI, native packages with in-tree C, and prebuilt
+`native/windows-x64/*.dll` packages.
+
+**GUI and graphics**: `vyto/surface` (the Win32 GDI backend), `vyto/ui`, and
+`vyto/gfx` all build for `windows-x64` — see the next section for the one
+prerequisite `vyto/gfx` has.
+
+**Not portable**, and excluded from the Windows suite: `vyto/net/*` (libcurl and
+BSD sockets), `vyto/os/worker` (pthreads), all of `vyto/hw/*` (Linux device
+interfaces), and `vyto/intl` (ICU).
+
+Two Windows-specific behaviours worth knowing: `vyto/os`'s `run()` and
+`capture()` go through `cmd.exe`, not a POSIX shell, so shell built-ins differ;
+and `vyto/util/date`'s `parse()` runs on a strptime written for this port
+(Windows ships none), covering the conversions `format()` can round-trip —
+anything else returns the invalid-date sentinel rather than guessing.
+
+### Graphics apps: blend2d and fonts
+
+`vyto/gfx` is the one stdlib package backed by a **prebuilt** library rather than
+in-tree C, so it needs a `windows-x64` build of blend2d before anything importing
+it will link. blend2d is C++, so this needs the mingw C++ compiler too:
+
+```sh
+sudo apt-get install -y g++-mingw-w64-x86-64
+./lib/vyto/gfx/native/build-blend2d.sh --dry-run windows-x64   # confirm the plan
+./lib/vyto/gfx/native/build-blend2d.sh windows-x64
+```
+
+Every triple is built from **one** clone at **one** revision, stamped in
+`native/blend2d.commit`. The headers in `native/src/blend2d/` are
+shared by all platforms, so adding a triple checks that exact commit out rather
+than taking current master — otherwise the headers would describe a newer
+blend2d than the libraries already on disk were compiled from. `--refresh` is
+the deliberate way to move the revision forward, and it rebuilds every triple.
+
+Forgetting this step is not mysterious; `vytoc` says so:
+
+```
+package 'vyto_gfx' ships prebuilt native libraries, but none for windows-x64
+  (has: linux-x64) — build one with lib/vyto/gfx/native/build-blend2d.sh windows-x64
+```
+
+**Fonts.** A graphics app that hardcodes a system font path will not find one on
+Windows. Vendor the typeface into the app instead and embed it with
+`--with-assets` — `apps/charts` and `apps/motiondemo` both do this:
+
+```vyto
+import { appDir } from "vyto/os";
+
+fn font_path(): string {
+    return appDir() + "/assets/Inter-Regular.ttf";
+}
+```
+
+```sh
+./vytoc build apps/charts/charts.vt --release --with-assets \
+    --target windows-x64 -o charts.exe
+```
+
+One path serves both cases. Unbundled, `appDir()` makes it absolute so it
+resolves from any working directory; bundled, the runtime VFS matches it by
+suffix and the font comes out of the binary. `Canvas.loadFont` and
+`GfxPainter` both consult the VFS before the disk. If you use `GfxPainter`,
+ship the `-Medium` and `-Bold` siblings alongside the regular face — it derives
+their paths from it.
+
+By default the app ships as an exe plus `libblend2d.dll`, which `vytoc` copies
+next to it. Adding `--bundle` links blend2d statically instead, for a single
+file with nothing beside it — combine it with `--with-assets` and the whole app,
+fonts included, is one exe that depends only on system DLLs.
+
+### Testing on Windows
+
+There is no Windows CI and no emulator in the loop — the binaries are checked on
+a real machine:
+
+```sh
+make test-win        # cross-builds and stages tests/tmp/win-x64/
+```
+
+That stages one `.exe` per portable example and fixture, each with its golden, a
+`manifest.txt`, and a generated `run.ps1`. It also runs one host-side test:
+`tests/win/strptime_test.c` compiles `date_shim.c`'s `_WIN32` branch natively so
+the hand-written strptime is verified without a Windows box.
+
+Copy `tests/tmp/win-x64/` (or the `vyto-win-x64.zip` beside it) to a Windows
+machine and run:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File run.ps1
+```
+
+Then copy `results.txt` back. Goldens are resolved as
+`<name>.expected.windows-x64` when present, falling back to `<name>.expected` —
+that is how a program whose correct output genuinely differs per platform (such
+as `examples/45_os.vt`) is handled.
+
+## 9. Where to go next
 
 - **[examples/](../examples/)** — `01_hello` … `53_datatable`, a guided tour of
   the language and stdlib (structs, classes, closures, FFI, generics, reactive
@@ -161,4 +281,5 @@ statically link everything into one file.
 - **[README](../README.md)** — language highlights, why it's fast, the standard
   library, native packages, and platform status.
 - **Run the tests** — `make test` builds every example and checks it against
-  golden output.
+  golden output; `make test-win` stages the Windows-portable slice for a real
+  Windows machine (see section 8).

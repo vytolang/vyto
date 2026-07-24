@@ -2,6 +2,17 @@
    vytoc; links against the prebuilt libblend2d in native/<platform>/. */
 #include "gfx_shim.h"
 
+#ifdef _WIN32
+/* blend2d declares BL_API as __declspec(dllimport) unless BL_STATIC is set, and
+   the resulting __imp_bl_* references resolve only against a DLL — so a
+   `vytoc build --bundle` (which links libblend2d.a) fails at link with every
+   blend2d symbol undefined. Declaring them static is correct for BOTH modes
+   here: for the shared build ld synthesizes the import thunks itself, and the
+   exe still comes out with libblend2d.dll in its import table. Verified both
+   ways. Must precede the blend2d.h include. */
+#define BL_STATIC
+#endif
+
 #include <blend2d/blend2d.h>
 #include <math.h>
 #include <stdio.h>

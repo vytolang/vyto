@@ -10,10 +10,20 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#ifdef _WIN32
+/* Win32 has none of the POSIX process/user headers. Everything below is served
+   by kernel32 (auto-linked) or the CRT, so vyto/os needs no #link entries. */
+#include <windows.h>
+#include <direct.h>
+#include <process.h>
+#define popen  _popen
+#define pclose _pclose
+#else
 #include <unistd.h>
 #include <pwd.h>
 #include <sys/utsname.h>
 #include <sys/wait.h>
+#endif
 
 const char *os_getenv(const char *k) { return getenv(k); }
 
@@ -52,6 +62,50 @@ const char *os_app_dir(void) {
 #endif
     return buf;
 }
+#ifdef _WIN32
+/* _putenv_s with an empty value both sets-to-empty and removes on Windows —
+   the CRT drops the variable entirely, which is what unsetenv means. */
+int os_setenv(const char *k, const char *v) { return _putenv_s(k, v) == 0 ? 0 : -1; }
+int os_unsetenv(const char *k) { return _putenv_s(k, "") == 0 ? 0 : -1; }
+int os_chdir(const char *p) { return _chdir(p); }
+
+int os_getcwd(char *buf, int cap) {
+    if (!_getcwd(buf, cap)) { if (cap > 0) buf[0] = 0; return 0; }
+    return (int)strlen(buf);
+}
+int os_pid(void) { return (int)_getpid(); }
+
+/* GetComputerNameA rather than gethostname: the latter would drag in winsock
+   (-lws2_32) and require WSAStartup for one string. */
+int os_gethostname(char *buf, int cap) {
+    DWORD n = (DWORD)cap;
+    if (cap <= 0) return 0;
+    if (!GetComputerNameA(buf, &n)) { buf[0] = 0; return 0; }
+    buf[cap - 1] = 0;
+    return (int)strlen(buf);
+}
+
+/* The environment, not GetUserNameA/SHGetFolderPath — keeps advapi32/shell32
+   off the link line. Both variables are set for every interactive session. */
+const char *os_username(void) {
+    const char *u = getenv("USERNAME");
+    return u ? u : "";
+}
+const char *os_homedir(void) {
+    const char *h = getenv("USERPROFILE");
+    if (h && *h) return h;
+    /* pre-USERPROFILE fallback: HOMEDRIVE + HOMEPATH, joined once into a static */
+    static char buf[4096];
+    const char *d = getenv("HOMEDRIVE"), *p = getenv("HOMEPATH");
+    if (d && p) { snprintf(buf, sizeof buf, "%s%s", d, p); return buf; }
+    return "";
+}
+int os_cpucount(void) {
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    return si.dwNumberOfProcessors > 0 ? (int)si.dwNumberOfProcessors : 1;
+}
+#else
 int os_setenv(const char *k, const char *v) { return setenv(k, v, 1); }
 int os_unsetenv(const char *k) { return unsetenv(k); }
 int os_chdir(const char *p) { return chdir(p); }
@@ -82,6 +136,7 @@ int os_cpucount(void) {
     long n = sysconf(_SC_NPROCESSORS_ONLN);
     return n > 0 ? (int)n : 1;
 }
+#endif
 void os_exit(int code) { exit(code); }
 
 const char *os_platform(void) {
@@ -96,9 +151,27 @@ const char *os_platform(void) {
 #endif
 }
 int os_arch(char *buf, int cap) {
+    if (cap <= 0) return 0;
+#ifdef _WIN32
+    /* GetNativeSystemInfo, not GetSystemInfo: under WOW64 the latter reports the
+       emulated x86 architecture. Names are normalized to the uname(2) spellings
+       so `arch()` reads the same on every platform. */
+    SYSTEM_INFO si;
+    GetNativeSystemInfo(&si);
+    const char *m;
+    switch (si.wProcessorArchitecture) {
+    case PROCESSOR_ARCHITECTURE_AMD64: m = "x86_64"; break;
+    case PROCESSOR_ARCHITECTURE_ARM64: m = "aarch64"; break;
+    case PROCESSOR_ARCHITECTURE_ARM:   m = "arm"; break;
+    case PROCESSOR_ARCHITECTURE_INTEL: m = "i686"; break;
+    default:                           m = "unknown"; break;
+    }
+    strncpy(buf, m, (size_t)cap - 1);
+#else
     struct utsname u;
-    if (uname(&u) != 0) { if (cap > 0) buf[0] = 0; return 0; }
+    if (uname(&u) != 0) { buf[0] = 0; return 0; }
     strncpy(buf, u.machine, (size_t)cap - 1);
+#endif
     buf[cap - 1] = 0;
     return (int)strlen(buf);
 }
@@ -108,7 +181,13 @@ int os_arch(char *buf, int cap) {
 int os_run(const char *cmd) {
     int st = system(cmd);
     if (st == -1) return -1;
+#ifdef _WIN32
+    /* The MSVCRT system() returns the child's exit code directly — there is no
+       wait(2) status word to unpack, and no WIFEXITED to unpack it with. */
+    return st;
+#else
     return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+#endif
 }
 
 typedef struct {
@@ -140,7 +219,11 @@ OsCap *os_capture(const char *cmd) {
     int st = pclose(p);
     c->data = buf;
     c->len = (long)len;
+#ifdef _WIN32
+    c->code = st; /* _pclose returns the exit code directly — see os_run */
+#else
     c->code = WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+#endif
     return c;
 }
 const char *os_capture_data(OsCap *c) { return c ? c->data : ""; }

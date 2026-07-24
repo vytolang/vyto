@@ -61,4 +61,11 @@ int vfile_is_file(const char *path) {
 }
 int vfile_remove(const char *path) { return remove(path); }
 int vfile_rename(const char *a, const char *b) { return rename(a, b); }
+/* The MSVC runtime's mkdir takes no mode — Windows has no POSIX permission
+   bits to apply, so the directory inherits the parent's ACL either way. */
+#ifdef _WIN32
+#include <direct.h>
+int vfile_mkdir(const char *path) { return _mkdir(path); }
+#else
 int vfile_mkdir(const char *path) { return mkdir(path, 0777); }
+#endif

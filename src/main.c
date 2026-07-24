@@ -43,6 +43,11 @@ static bool file_exists(const char *path) {
     return stat(path, &st) == 0;
 }
 
+static bool dir_exists(const char *path) {
+    struct stat st;
+    return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
+}
+
 /* Locate the stdlib directory: $VYTO_HOME/lib, else lib/ next to the vytoc
    executable (or one level up, matching the runtime search). Cached; NULL
    when no lib directory exists. Canonicalized for prefix checks. */
@@ -214,7 +219,12 @@ static void emit_asset_dir(const char *abs, const char *logical,
             "  \"vt_asset_%d_start:\\n\"\n"
             "  \".incbin \\\"%s\\\"\\n\"\n"
             "  \"vt_asset_%d_end:\\n\"\n"
-            "  \".previous\\n\"\n"
+            /* .text, not .previous: .previous (and .pushsection/.popsection)
+               are ELF-only pseudo-ops that mingw's COFF assembler rejects
+               outright. This block is at file scope and gcc emits its own
+               .section directive ahead of whatever follows, so unconditionally
+               returning to .text is equivalent on both formats. */
+            "  \".text\\n\"\n"
             ");\n"
             "extern const unsigned char vt_asset_%d_start[];\n"
             "extern const unsigned char vt_asset_%d_end[];\n",
@@ -321,6 +331,33 @@ static long file_mtime(const char *path) {
 static bool has_suffix(const char *s, const char *suf) {
     size_t ls = strlen(s), lf = strlen(suf);
     return ls >= lf && strcmp(s + ls - lf, suf) == 0;
+}
+
+/* Which triples does a package ship prebuilt libraries for? A package's native/
+   dir holds `src` (in-tree C, compiled every build) plus one directory per
+   triple, and optionally a build-*.sh that produces them. Fills `out` with a
+   comma-separated list of those triples and returns how many there were; also
+   reports the build script's name via *script (NULL if there is none), so the
+   caller can say how to produce the missing one. */
+static int prebuilt_triples(const char *ndir, SBuf *out, const char **script) {
+    *script = NULL;
+    DIR *dp = opendir(ndir);
+    if (!dp) return 0;
+    int n = 0;
+    struct dirent *de;
+    while ((de = readdir(dp))) {
+        if (de->d_name[0] == '.') continue;
+        if (strcmp(de->d_name, "src") == 0) continue;
+        if (!dir_exists(arena_printf(&g_arena, "%s/%s", ndir, de->d_name))) {
+            if (strncmp(de->d_name, "build-", 6) == 0 && has_suffix(de->d_name, ".sh"))
+                *script = arena_strdup(&g_arena, de->d_name);
+            continue;
+        }
+        sb_printf(out, "%s%s", n ? ", " : "", de->d_name);
+        n++;
+    }
+    closedir(dp);
+    return n;
 }
 
 static void usage(void) {
@@ -615,9 +652,25 @@ int main(int argc, char **argv) {
             if (!any) fatal(bundle
                 ? "package '%s' has no static library (.a) in native/%s for --bundle"
                 : "package '%s' has native/%s/ but no shared library in it", m->name, triple);
-        } else if (file_exists(arena_printf(&g_arena, "%s/native", mdir)) && !file_exists(nsrc)) {
-            fatal("package '%s' ships native binaries but none for this platform (native/%s)",
-                  m->name, triple);
+        } else {
+            /* No native/<triple>/ for this build. That is only an error if the
+               package ships prebuilts for some OTHER triple — most of the
+               stdlib is src-only and legitimately has no per-triple dirs at
+               all. Keying off the absence of native/src instead (as this once
+               did) misses any package with both, such as vyto/gfx, and leaves
+               the build to die on an unreadable undefined-reference instead. */
+            const char *ndir = arena_printf(&g_arena, "%s/native", mdir);
+            SBuf have;
+            sb_init(&have);
+            const char *script = NULL;
+            if (prebuilt_triples(ndir, &have, &script) > 0)
+                fatal("package '%s' ships prebuilt native libraries, but none for %s\n"
+                      "  (has: %s)%s%s%s",
+                      m->name, triple, have.data,
+                      script ? " — build one with " : "",
+                      script ? arena_printf(&g_arena, "%s/%s", ndir, script) : "",
+                      script ? arena_printf(&g_arena, " %s", triple) : "");
+            sb_free(&have);
         }
     }
 

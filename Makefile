@@ -11,10 +11,17 @@ vytoc: $(SRC) $(HDR)
 vytobind: src/vytobind.c src/util.c src/util.h
 	$(CC) $(CFLAGS) -o $@ src/vytobind.c src/util.c
 
-.PHONY: all test clean clean-cache
+.PHONY: all test test-win clean clean-cache
 
 test: vytoc vytobind
 	./tests/run_tests.sh
+
+# Cross-build the Windows-portable slice for windows-x64 and stage it, with its
+# goldens and a self-checking run.ps1, into tests/tmp/win-x64/. Runs nothing —
+# copy the staging dir to a Windows machine to actually execute it.
+# Needs: sudo apt-get install -y gcc-mingw-w64-x86-64
+test-win: vytoc
+	./tests/run_tests_win.sh
 
 # Every .vyto-cache in the tree, including apps/* which `clean` does not cover.
 # Run this before regenerating any golden — a stale cache validates the previous
