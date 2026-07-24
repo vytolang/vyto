@@ -1566,6 +1566,17 @@ static Type *check_call(Ctx *c, Expr *e, Type *expected) {
                 e->ref = REF_BUILTIN; e->builtin = B_STR_TO_FLOAT;
                 return e->type = ty_float();
             }
+            /* to_float_at(lo, hi): parse a float from the byte range [lo, hi)
+               in place, no substring allocation. */
+            if (n == intern("to_float_at")) {
+                if (e->nargs != 2) fatal_at(e->loc, "to_float_at takes 2 arguments");
+                check_expr(c, e->args[0], ty_int());
+                want(c, e->args[0], ty_int(), "to_float_at argument");
+                check_expr(c, e->args[1], ty_int());
+                want(c, e->args[1], ty_int(), "to_float_at argument");
+                e->ref = REF_BUILTIN; e->builtin = B_STR_TO_FLOAT_AT;
+                return e->type = ty_float();
+            }
             if (n == intern("lines")) {
                 if (e->nargs != 0) fatal_at(e->loc, "lines takes no arguments");
                 e->ref = REF_BUILTIN; e->builtin = B_STR_LINES;

@@ -260,6 +260,7 @@ VtArray *vt_str_split(VtString *s, VtString *sep);
 VtArray *vt_str_lines(VtString *s);
 int64_t vt_str_to_int(VtString *s, const char *file, int line);
 double vt_str_to_float(VtString *s, const char *file, int line);
+double vt_str_to_float_at(VtString *s, int64_t lo, int64_t hi, const char *file, int line); /* parse [lo,hi), no alloc */
 
 /* ---- array builtin-method helpers (runtime/vyto_rt_arr.c) ---- */
 /* element-equality kind, set by the checker (floats compare by value so

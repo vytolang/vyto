@@ -208,35 +208,48 @@ int64_t vt_str_to_int(VtString *s, const char *file, int line) {
     return (int64_t)v;
 }
 
-double vt_str_to_float(VtString *s, const char *file, int line) {
-    int64_t i = 0, n = s->len;
-    while (i < n && str_is_space(s->data[i])) i++;
+/* Core float parser over data[i, n). Shared by vt_str_to_float (whole string)
+   and vt_str_to_float_at (byte range) — the latter avoids a substring alloc
+   when a caller (e.g. the JSON number parser) already knows the bounds. */
+static double str_to_float_core(const char *data, int64_t i, int64_t n,
+                                const char *file, int line) {
+    while (i < n && str_is_space(data[i])) i++;
     bool neg = false;
-    if (i < n && (s->data[i] == '+' || s->data[i] == '-')) { neg = s->data[i] == '-'; i++; }
+    if (i < n && (data[i] == '+' || data[i] == '-')) { neg = data[i] == '-'; i++; }
     bool any = false;
     double v = 0.0;
-    while (i < n && s->data[i] >= '0' && s->data[i] <= '9') { v = v * 10.0 + (s->data[i++] - '0'); any = true; }
-    if (i < n && s->data[i] == '.') {
+    while (i < n && data[i] >= '0' && data[i] <= '9') { v = v * 10.0 + (data[i++] - '0'); any = true; }
+    if (i < n && data[i] == '.') {
         i++;
         double scale = 0.1;
-        while (i < n && s->data[i] >= '0' && s->data[i] <= '9') {
-            v += (s->data[i++] - '0') * scale; scale *= 0.1; any = true;
+        while (i < n && data[i] >= '0' && data[i] <= '9') {
+            v += (data[i++] - '0') * scale; scale *= 0.1; any = true;
         }
     }
     if (!any) vt_panic_c(file, line, "to_float: not a number");
-    if (i < n && (s->data[i] == 'e' || s->data[i] == 'E')) {
+    if (i < n && (data[i] == 'e' || data[i] == 'E')) {
         i++;
         bool eneg = false;
-        if (i < n && (s->data[i] == '+' || s->data[i] == '-')) { eneg = s->data[i] == '-'; i++; }
-        if (i >= n || s->data[i] < '0' || s->data[i] > '9')
+        if (i < n && (data[i] == '+' || data[i] == '-')) { eneg = data[i] == '-'; i++; }
+        if (i >= n || data[i] < '0' || data[i] > '9')
             vt_panic_c(file, line, "to_float: bad exponent");
         int exp = 0;
-        while (i < n && s->data[i] >= '0' && s->data[i] <= '9') exp = exp * 10 + (s->data[i++] - '0');
+        while (i < n && data[i] >= '0' && data[i] <= '9') exp = exp * 10 + (data[i++] - '0');
         double p10 = 1.0;
         for (int k = 0; k < exp; k++) p10 *= 10.0;
         v = eneg ? v / p10 : v * p10;
     }
-    while (i < n && str_is_space(s->data[i])) i++;
+    while (i < n && str_is_space(data[i])) i++;
     if (i != n) vt_panic_c(file, line, "to_float: trailing characters");
     return neg ? -v : v;
+}
+
+double vt_str_to_float(VtString *s, const char *file, int line) {
+    return str_to_float_core(s->data, 0, s->len, file, line);
+}
+
+double vt_str_to_float_at(VtString *s, int64_t lo, int64_t hi, const char *file, int line) {
+    if (!s) vt_panic_c(file, line, "to_float_at on null string");
+    if (lo < 0 || hi < lo || hi > s->len) vt_panic_c(file, line, "to_float_at range out of bounds");
+    return str_to_float_core(s->data, lo, hi, file, line);
 }

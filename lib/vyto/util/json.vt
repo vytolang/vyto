@@ -223,8 +223,8 @@ class Parser {
             while (this.pos < this.n && this.s[this.pos] >= 48 && this.s[this.pos] <= 57) { this.pos += 1; }
             if (this.pos == expStart) { return this.fail("invalid number"); }
         }
-        let tok = this.s.slice(start, this.pos);
-        return jnum(tok.to_float());
+        // parse the float directly from the source range — no substring alloc
+        return jnum(this.s.to_float_at(start, this.pos));
     }
 
     // Parse a JSON string literal starting at the opening quote.
@@ -243,6 +243,14 @@ class Parser {
         while (this.pos < this.n) {
             let c = this.s[this.pos];
             if (c == 34) { // closing quote
+                // common case: no escape seen yet, so the run *is* the whole
+                // string — return the slice directly, skipping the "" + slice
+                // concat (one alloc per key/string value).
+                if (out == "") {
+                    let r = this.s.slice(runStart, this.pos);
+                    this.pos += 1;
+                    return r;
+                }
                 out = out + this.s.slice(runStart, this.pos);
                 this.pos += 1;
                 return out;

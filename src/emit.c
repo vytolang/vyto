@@ -722,6 +722,10 @@ static char *emit_call(Em *em, Expr *e, bool *fresh) {
         case B_STR_TO_FLOAT:
             return arena_printf(&g_arena, "vt_str_to_float(%s, \"%s\", %d)", ex_b(em, recv),
                                 c_escape(e->loc.file, strlen(e->loc.file)), e->loc.line);
+        case B_STR_TO_FLOAT_AT:
+            return arena_printf(&g_arena, "vt_str_to_float_at(%s, %s, %s, \"%s\", %d)",
+                                ex_b(em, recv), ex_v(em, e->args[0], NULL), ex_v(em, e->args[1], NULL),
+                                c_escape(e->loc.file, strlen(e->loc.file)), e->loc.line);
         /* ---- array methods ---- */
         case B_ARR_FIRST:
         case B_ARR_LAST:
