@@ -178,6 +178,29 @@ class Parser {
         }
     }
 
+    // Scalar-array decode helpers (jsonToInts/Floats/Strings). Consume the '['
+    // opener; report the empty-array close; and after each element consume a
+    // ',' (continue) or ']' (stop). Soft: any unexpected byte just stops.
+    fn openArray(): bool {
+        this.ws();
+        if (this.pos >= this.n || this.s[this.pos] != 91) { return false; } // '['
+        this.pos += 1;
+        return true;
+    }
+    fn closeEmpty(): bool {
+        this.ws();
+        if (this.pos < this.n && this.s[this.pos] == 93) { this.pos += 1; return true; } // ']'
+        return false;
+    }
+    fn afterElement(): bool {
+        this.ws();
+        if (this.pos >= this.n) { return false; }
+        let c = this.s[this.pos];
+        if (c == 44) { this.pos += 1; return true; }  // ',' → continue
+        if (c == 93) { this.pos += 1; return false; } // ']' → done
+        return false;                                 // malformed → stop
+    }
+
     fn value(): JsonValue {
         this.depth += 1;
         if (this.depth > JSON_MAX_DEPTH) {
@@ -210,30 +233,39 @@ class Parser {
         return v;
     }
 
-    // Strict number scan (sign, int, .frac, exponent). to_float PANICS on a
+    // Strict number scan (sign, int, .frac, exponent). to_float_at PANICS on a
     // malformed token, so the shape must be fully validated here — the
-    // "json_parse never panics" contract depends on it.
-    fn number(): JsonValue {
+    // "json_parse never panics" contract depends on it. Returns the value, or
+    // sets this.err (via fail) and returns 0 on a malformed token. Shared by
+    // number() and the scalar-array decoders, so neither allocates a JsonValue
+    // node just to read a number.
+    fn scan_number(): float {
         let start = this.pos;
         if (this.pos < this.n && this.s[this.pos] == 45) { this.pos += 1; } // '-'
         let intStart = this.pos;
         while (this.pos < this.n && this.s[this.pos] >= 48 && this.s[this.pos] <= 57) { this.pos += 1; }
-        if (this.pos == intStart) { return this.fail("invalid number"); }
+        if (this.pos == intStart) { this.fail("invalid number"); return 0.0; }
         if (this.pos < this.n && this.s[this.pos] == 46) {                  // '.'
             this.pos += 1;
             let fracStart = this.pos;
             while (this.pos < this.n && this.s[this.pos] >= 48 && this.s[this.pos] <= 57) { this.pos += 1; }
-            if (this.pos == fracStart) { return this.fail("invalid number"); }
+            if (this.pos == fracStart) { this.fail("invalid number"); return 0.0; }
         }
         if (this.pos < this.n && (this.s[this.pos] == 101 || this.s[this.pos] == 69)) { // e E
             this.pos += 1;
             if (this.pos < this.n && (this.s[this.pos] == 43 || this.s[this.pos] == 45)) { this.pos += 1; }
             let expStart = this.pos;
             while (this.pos < this.n && this.s[this.pos] >= 48 && this.s[this.pos] <= 57) { this.pos += 1; }
-            if (this.pos == expStart) { return this.fail("invalid number"); }
+            if (this.pos == expStart) { this.fail("invalid number"); return 0.0; }
         }
         // parse the float directly from the source range — no substring alloc
-        return jnum(this.s.to_float_at(start, this.pos));
+        return this.s.to_float_at(start, this.pos);
+    }
+
+    fn number(): JsonValue {
+        let x = this.scan_number();
+        if (this.err != "") { return this.fail("invalid number"); }
+        return jnum(x);
     }
 
     // Parse a JSON string literal starting at the opening quote.
@@ -441,6 +473,140 @@ export fn json_encode(v: JsonValue): string { return v.stringify(); }
 // Encode with 2-space indentation.
 export fn json_encode_pretty(v: JsonValue): string { return v.stringifyPretty(); }
 
+// ---- direct array <-> JSON (no JsonValue DOM) ----------------------------
+//
+// Encoding a native array through the DOM allocates one JsonValue node per
+// element (jarr + append(jint(x))…) just to throw it away in stringify. These
+// helpers serialize a native array straight into a StringBuilder in one pass —
+// O(n), zero intermediate nodes. Their decoders parse a flat JSON array of
+// scalars straight into a native array, likewise skipping the tree.
+//
+// Decoders soft-fail like json_parse/json_each: on malformed input they stop
+// and return the elements decoded so far (non-arrays yield an empty array).
+
+// int[] -> "[1,2,3]"
+export fn jsonInts(xs: int[]): string {
+    let sb = new StringBuilder(xs.len * 8 + 2);
+    sb.append("[");
+    let i = 0;
+    while (i < xs.len) {
+        if (i > 0) { sb.append(","); }
+        sb.appendInt(xs[i]);
+        i += 1;
+    }
+    sb.append("]");
+    return sb.toString();
+}
+
+// float[] -> "[1,2.5,3]"
+export fn jsonFloats(xs: float[]): string {
+    let sb = new StringBuilder(xs.len * 8 + 2);
+    sb.append("[");
+    let i = 0;
+    while (i < xs.len) {
+        if (i > 0) { sb.append(","); }
+        append_num(sb, xs[i]);
+        i += 1;
+    }
+    sb.append("]");
+    return sb.toString();
+}
+
+// string[] -> "[\"a\",\"b\"]" (each element JSON-escaped)
+export fn jsonStrings(xs: string[]): string {
+    let sb = new StringBuilder(xs.len * 8 + 2);
+    sb.append("[");
+    let i = 0;
+    while (i < xs.len) {
+        if (i > 0) { sb.append(","); }
+        quote_into(sb, xs[i]);
+        i += 1;
+    }
+    sb.append("]");
+    return sb.toString();
+}
+
+// Generic array encoder: `emit(sb, elem)` appends one element's JSON. Callers
+// that need a type the typed helpers above don't cover supply their own emit —
+// e.g. jsonArray(rows, (sb, r) => quote_into(sb, r.name)). No DOM nodes.
+export fn jsonArray<T>(xs: T[], emit: fn(StringBuilder, T)): string {
+    let sb = new StringBuilder(xs.len * 8 + 2);
+    sb.append("[");
+    let i = 0;
+    while (i < xs.len) {
+        if (i > 0) { sb.append(","); }
+        emit(sb, xs[i]);
+        i += 1;
+    }
+    sb.append("]");
+    return sb.toString();
+}
+
+// "[1,2,3]" -> int[]. Truncates fractional values (like asInt).
+export fn jsonToInts(text: string): int[] {
+    let out: int[] = [];
+    let p = new Parser(text);
+    if (!p.openArray()) { return out; }
+    if (p.closeEmpty()) { return out; }
+    while (true) {
+        p.ws();
+        if (p.pos >= p.n) { return out; }
+        let c = p.s[p.pos];
+        if (c != 45 && (c < 48 || c > 57)) { return out; }
+        let x = p.scan_number();
+        if (p.err != "") { return out; }
+        out.push(x as int);
+        if (!p.afterElement()) { return out; }
+    }
+    return out;
+}
+
+// "[1,2.5]" -> float[].
+export fn jsonToFloats(text: string): float[] {
+    let out: float[] = [];
+    let p = new Parser(text);
+    if (!p.openArray()) { return out; }
+    if (p.closeEmpty()) { return out; }
+    while (true) {
+        p.ws();
+        if (p.pos >= p.n) { return out; }
+        let c = p.s[p.pos];
+        if (c != 45 && (c < 48 || c > 57)) { return out; }
+        let x = p.scan_number();
+        if (p.err != "") { return out; }
+        out.push(x);
+        if (!p.afterElement()) { return out; }
+    }
+    return out;
+}
+
+// "[\"a\",\"b\"]" -> string[] (unescaped).
+export fn jsonToStrings(text: string): string[] {
+    let out: string[] = [];
+    let p = new Parser(text);
+    if (!p.openArray()) { return out; }
+    if (p.closeEmpty()) { return out; }
+    while (true) {
+        p.ws();
+        if (p.pos >= p.n || p.s[p.pos] != 34) { return out; } // expect '"'
+        let sv = p.raw_string();
+        if (p.err != "") { return out; }
+        out.push(sv);
+        if (!p.afterElement()) { return out; }
+    }
+    return out;
+}
+
+// Append `x` as a JSON number: integral values in the exactly-representable
+// range print without a decimal point (via appendInt, no intermediate string).
+fn append_num(sb: StringBuilder, x: float) {
+    if (x >= -9.0e15 && x <= 9.0e15) {
+        let t = x as int;
+        if ((t as float) == x) { sb.appendInt(t); return; }
+    }
+    sb.append(str(x));
+}
+
 // ---- serializer ----------------------------------------------------------
 
 // Append v's serialization into `sb`. Appending into a growable builder makes
@@ -452,16 +618,7 @@ fn write_sb(v: JsonValue, sb: StringBuilder, pretty: bool, depth: int) {
     if (depth > JSON_MAX_DEPTH) { panic("json: stringify nesting deeper than 1024 levels"); }
     if (v.kind == JS_NULL) { sb.append("null"); return; }
     if (v.kind == JS_BOOL) { if (v.bval) { sb.append("true"); } else { sb.append("false"); } return; }
-    if (v.kind == JS_NUM) {
-        // integral values in the exactly-representable range print without a
-        // decimal point (and via appendInt, no intermediate string).
-        if (v.num >= -9.0e15 && v.num <= 9.0e15) {
-            let t = v.num as int;
-            if ((t as float) == v.num) { sb.appendInt(t); return; }
-        }
-        sb.append(str(v.num));
-        return;
-    }
+    if (v.kind == JS_NUM) { append_num(sb, v.num); return; }
     if (v.kind == JS_STR) { quote_into(sb, v.bstr); return; }
     if (v.kind == JS_ARR) {
         sb.append("[");
