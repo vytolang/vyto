@@ -561,6 +561,28 @@ export fn jsonToInts(text: string): int[] {
     return out;
 }
 
+// "[1,2,3]" decoded into a caller-owned array, reused across calls. Clears
+// `out` (keeping its capacity) and fills it; returns the element count. Lets a
+// per-line loop decode 1M lines with one buffer instead of allocating a fresh
+// int[] each call — the difference between O(lines) allocations and O(1).
+export fn jsonToIntsInto(text: string, out: int[]): int {
+    out.clear();
+    let p = new Parser(text);
+    if (!p.openArray()) { return 0; }
+    if (p.closeEmpty()) { return 0; }
+    while (true) {
+        p.ws();
+        if (p.pos >= p.n) { return out.len; }
+        let c = p.s[p.pos];
+        if (c != 45 && (c < 48 || c > 57)) { return out.len; }
+        let x = p.scan_number();
+        if (p.err != "") { return out.len; }
+        out.push(x as int);
+        if (!p.afterElement()) { return out.len; }
+    }
+    return out.len;
+}
+
 // "[1,2.5]" -> float[].
 export fn jsonToFloats(text: string): float[] {
     let out: float[] = [];
