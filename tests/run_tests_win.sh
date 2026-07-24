@@ -113,6 +113,11 @@ tests/fixtures/anim_clock.vt|anim_clock|eq|
 tests/fixtures/condlink_win.vt|condlink_win|eq|
 tests/fixtures/listdir.vt|listdir|eq|
 tests/fixtures/overflow_trap.vt|overflow_trap|contains|
+examples/46_socket.vt|46_socket|eq|
+examples/47_http.vt|47_http|eq|
+examples/48_websocket.vt|48_websocket|eq|
+examples/49_poll_server.vt|49_poll_server|eq|
+examples/50_worker_pool.vt|50_worker_pool|eq|
 apps/motiondemo/motiondemo.vt|motiondemo|contains||VS_HEADLESS=1 VS_EVENTS=motiondemo.events|--with-assets
 EOF
 )

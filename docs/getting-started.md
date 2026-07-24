@@ -179,15 +179,22 @@ time, date), `vyto/io/file`, `vyto/data/frame`, `vyto/os/os`, `vyto/anim`,
 `vyto/gfx` all build for `windows-x64` — see the next section for the one
 prerequisite `vyto/gfx` has.
 
-**Not portable**, and excluded from the Windows suite: `vyto/net/*` (libcurl and
-BSD sockets), `vyto/os/worker` (pthreads), all of `vyto/hw/*` (Linux device
-interfaces), and `vyto/intl` (ICU).
+**Networking**: `vyto/net/socket` builds on Winsock2 (`ws2_32`, linked
+conditionally), covering TCP, UDP and `PollSet`.
 
-Two Windows-specific behaviours worth knowing: `vyto/os`'s `run()` and
+**Not portable**, and excluded from the Windows suite: `vyto/net/http` and
+`vyto/net/websocket` (libcurl), `vyto/net/link`, `wifi` and `raw` (Linux
+netlink/AF_PACKET), `vyto/os/worker` (`fork` + `socketpair`), all of `vyto/hw/*`
+(Linux device interfaces), and `vyto/intl` (ICU).
+
+Three Windows-specific behaviours worth knowing: `vyto/os`'s `run()` and
 `capture()` go through `cmd.exe`, not a POSIX shell, so shell built-ins differ;
-and `vyto/util/date`'s `parse()` runs on a strptime written for this port
-(Windows ships none), covering the conversions `format()` can round-trip —
-anything else returns the invalid-date sentinel rather than guessing.
+`vyto/util/date`'s `parse()` runs on a strptime written for this port (Windows
+ships none), covering the conversions `format()` can round-trip — anything else
+returns the invalid-date sentinel rather than guessing; and `PollSet` uses
+`WSAPoll`, which never reports a *failed* non-blocking connect, so a refused
+`connectAsync` stays un-ready instead of surfacing an error. Put your own
+timeout around it there.
 
 ### Graphics apps: blend2d and fonts
 

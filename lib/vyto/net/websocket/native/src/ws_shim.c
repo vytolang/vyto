@@ -15,8 +15,17 @@
 
 #if defined(__linux__)
 #include <sys/random.h>
+#elif defined(_WIN32)
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0600
+#endif
+#include <windows.h>
+#include <bcrypt.h>
 #endif
 
+/* RFC 6455 requires the masking key to be unpredictable, so this must reach a
+   real CSPRNG on every platform. The rand() tail below is a last resort that
+   should never be hit: seeded from the clock, it would make keys guessable. */
 void ws_random(char *out, int n) {
     if (n <= 0) return;
     size_t got = 0;
@@ -26,6 +35,12 @@ void ws_random(char *out, int n) {
         if (r <= 0) break;
         got += (size_t)r;
     }
+#elif defined(_WIN32)
+    /* Windows has neither getrandom nor /dev/urandom, so without this the
+       fallback chain below lands straight on rand(). */
+    if (BCRYPT_SUCCESS(BCryptGenRandom(NULL, (PUCHAR)out, (ULONG)n,
+                                       BCRYPT_USE_SYSTEM_PREFERRED_RNG)))
+        got = (size_t)n;
 #endif
     if (got < (size_t)n) {
         FILE *f = fopen("/dev/urandom", "rb");

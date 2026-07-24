@@ -16,16 +16,30 @@
 //     let r = pool.onReady(fd);           // finished Result (dispatches next queued job)
 //     pool.submit(job);                   // queue work anytime
 //
-// Suits coarse jobs (a whole image, request, or file): the fork + serialize
+// Suits coarse jobs (a whole image, request, or file): the spawn + serialize
 // cost is paid per job, so sub-millisecond work loses. No shared state, so no
-// locks and no data races. Linux + macOS (needs fork()).
+// locks and no data races.
+//
+// Linux and macOS fork, so a worker inherits the job closure directly. Windows
+// has no fork: workers are this same executable re-launched, which re-runs main
+// until it reaches this constructor and then serves jobs instead of building
+// its own pool. Same trade as Python's multiprocessing "spawn" method, and the
+// same caveat — **anything main() does before constructing the pool runs once
+// per worker too**, so keep side effects (printing, writing files, opening
+// listeners) after the WorkerPool is built, and keep the job closure's captured
+// state reconstructible.
 
 import { PollSet, POLL_READ } from "vyto/net/socket";
 
+// Worker processes are spawned by re-launching this executable on Windows, and
+// they connect back over a loopback socket.
+#link "ws2_32" if "windows"
+#link "bcrypt" if "windows"
+
 extern "C" {
-    fn w_socketpair(): i32;
-    fn w_last_child_fd(): i32;
-    fn w_fork(): i32;
+    fn w_spawn(slot: i32): i32;
+    fn w_last_pid(): i32;
+    fn w_worker_channel(): i32;
     fn w_close(fd: i32);
     fn w_exit(code: i32);
     fn w_write_frame(fd: i32, buf: cstring, n: i32): i32;
@@ -61,29 +75,29 @@ export class WorkerPool {
         this.nextTicket = 0;
         this.ps = new PollSet();
 
+        // A re-launched worker process (Windows) arrives here holding an
+        // identically-constructed `job`: it serves that instead of building a
+        // pool of its own, and never returns. On fork platforms the channel is
+        // only set in the child after w_spawn, so this is a no-op there.
+        let ch = w_worker_channel() as int;
+        if (ch >= 0) { runChild(ch, job); }
+
         let i = 0;
         while (i < n) {
-            let pfd = w_socketpair() as int;
-            if (pfd < 0) { i += 1; continue; } // socketpair failed — skip
-            let cfd = w_last_child_fd() as int;
-            let pid = w_fork() as int;
-            if (pid == 0) {
-                // child: keep only the child end, serve jobs forever.
-                w_close(pfd as i32);
-                runChild(cfd, job);
+            let pfd = w_spawn(i as i32) as int;
+            if (pfd == 0) {
+                // fork platforms: this is the child. Serve jobs forever.
+                runChild(w_worker_channel() as int, job);
                 // runChild never returns (it _exits), so control never reaches here.
             }
-            // parent: keep only the parent end.
-            w_close(cfd as i32);
-            if (pid > 0) {
+            if (pfd > 0) {
                 this.fds.push(pfd);
-                this.pids.push(pid);
+                this.pids.push(w_last_pid() as int);
                 this.busy.push(false);
                 this.ticketOf.push(-1);
                 this.ps.addFd(pfd, POLL_READ);
-            } else {
-                w_close(pfd as i32); // fork failed — drop this worker
             }
+            // pfd < 0: spawn failed — drop this worker and carry on
             i += 1;
         }
     }

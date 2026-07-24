@@ -584,6 +584,12 @@ int main(int argc, char **argv) {
             }
             closedir(ndp);
         }
+        /* Re-provisioning native/<triple>/include has to invalidate the objects
+           too, or a header swap is served from a stale .o. */
+        {
+            long t = file_mtime(arena_printf(&g_arena, "%s/native/%s/include", mdir, triple));
+            if (t > nsrc_newest) nsrc_newest = t;
+        }
         /* Bake the resolved stdlib dir into native shims so vyto_lib_dir() can
            return it at runtime (used to locate vendored assets like fonts).
            Single-quoted so the shell keeps the inner quotes and the C
@@ -597,6 +603,16 @@ int main(int argc, char **argv) {
         const char *app_dir = dir_of(entry->path);
         const char *appdef = app_dir
             ? arena_printf(&g_arena, " -DVYTO_APPDIR='\"%s\"'", app_dir) : "";
+        /* Headers that belong to one target only. native/src is shared by every
+           triple, so a package vendoring headers there imposes them on all of
+           them — vyto/intl hit exactly that: ICU headers vendored for Windows
+           made the Linux build compile against ICU 74's version-suffixed
+           symbols and link against the system ICU 70, so every call came out
+           undefined. A per-triple dir searched first keeps the two apart. */
+        const char *ninc = arena_printf(&g_arena, "%s/native/%s/include", mdir, triple);
+        const char *incflag = dir_exists(ninc)
+            ? arena_printf(&g_arena, " -I%s", ninc) : "";
+
         DIR *dp = opendir(nsrc);
         if (dp) {
             struct dirent *de;
@@ -606,9 +622,9 @@ int main(int argc, char **argv) {
                 const char *obj = arena_printf(&g_arena, "%s/native_%s_%s%s%s.o", cache, m->name,
                                                stem_of(de->d_name), release ? "_rel" : "", prof);
                 if (!file_exists(obj) || nsrc_newest > file_mtime(obj)) {
-                    char *cl = arena_printf(&g_arena, "%s %s%s%s%s -w -I%s -c -o %s %s", cc,
+                    char *cl = arena_printf(&g_arena, "%s %s%s%s%s -w%s -I%s -c -o %s %s", cc,
                                             release ? "-O2" : opt, fsflags, libdef, appdef,
-                                            nsrc, obj, csrc);
+                                            incflag, nsrc, obj, csrc);
                     if (run_cmd(cl, verbose) != 0)
                         fatal("native source of package '%s' failed to compile", m->name);
                     relink = true;
@@ -658,12 +674,26 @@ int main(int argc, char **argv) {
                stdlib is src-only and legitimately has no per-triple dirs at
                all. Keying off the absence of native/src instead (as this once
                did) misses any package with both, such as vyto/gfx, and leaves
-               the build to die on an unreadable undefined-reference instead. */
+               the build to die on an unreadable undefined-reference instead.
+
+               Shipping prebuilts elsewhere still is not proof that this target
+               needs one, though: a package may carry a bundled library for a
+               platform that has none installed and link the system copy on the
+               rest. vyto/net does exactly that — a libcurl DLL for Windows,
+               `#link "curl" if "linux"` everywhere else. So a platform-
+               applicable #link on the package counts as satisfying it. */
+            bool linked_here = false;
+            for (int di = 0; di < m->ndecls && !linked_here; di++) {
+                Decl *d = m->decls[di];
+                if (d->kind != D_LINK) continue;
+                if (!d->link_cond || strncmp(triple, d->link_cond, strlen(d->link_cond)) == 0)
+                    linked_here = true;
+            }
             const char *ndir = arena_printf(&g_arena, "%s/native", mdir);
             SBuf have;
             sb_init(&have);
             const char *script = NULL;
-            if (prebuilt_triples(ndir, &have, &script) > 0)
+            if (!linked_here && prebuilt_triples(ndir, &have, &script) > 0)
                 fatal("package '%s' ships prebuilt native libraries, but none for %s\n"
                       "  (has: %s)%s%s%s",
                       m->name, triple, have.data,

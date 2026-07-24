@@ -6,6 +6,16 @@
    bytes(cap); the actual count is returned so Vyto never reads uninitialised
    tail bytes. */
 
+#ifdef _WIN32
+/* Before any include: mingw's _mingw.h (reached via <stdio.h>) defaults
+   _WIN32_WINNT to the XP-era value, which hides WSAPoll and inet_pton. Both are
+   Vista+, which is this port's floor. */
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0600
+#endif
+#include <winsock2.h>   /* must precede windows.h */
+#include <ws2tcpip.h>
+#else
 #define _GNU_SOURCE
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -13,10 +23,6 @@
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <unistd.h>
-#include <string.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <stdint.h>
 #include <sys/time.h>
 #include <fcntl.h>
 #include <errno.h>
@@ -25,12 +31,87 @@
 #else
 #include <poll.h>
 #endif
+#endif
+
+#include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
 
 #ifndef MSG_NOSIGNAL
 #define MSG_NOSIGNAL 0
 #endif
 
+/* ---- platform compatibility ------------------------------------------------
+
+   Winsock is BSD sockets with different spellings, so the bodies below stay
+   shared and only the vocabulary is switched here.
+
+   The exported API keeps passing descriptors as plain int, which is what Vyto
+   sees. On Win64 a SOCKET is a UINT_PTR, but Microsoft guarantees socket
+   handles fit in 32 bits ("Windows Sockets handles... can safely be cast to a
+   32-bit value"), so the round trip is lossless. It is also convenient that
+   (int)INVALID_SOCKET == -1, which keeps every `fd < 0` failure test below
+   working unchanged on both platforms. */
+
+#ifdef _WIN32
+
+typedef SOCKET vsock_t;
+#define VS_FD(fd)        ((vsock_t)(intptr_t)(fd))   /* int -> SOCKET */
+#define VS_INT(s)        ((int)(intptr_t)(s))        /* SOCKET -> int */
+#define vs_closesocket   closesocket
+#define vs_lasterr()     WSAGetLastError()
+#define VS_EWOULDBLOCK   WSAEWOULDBLOCK
+/* A non-blocking connect that has not finished reports WSAEWOULDBLOCK, where
+   POSIX reports EINPROGRESS. */
+#define VS_EINPROGRESS   WSAEWOULDBLOCK
+#define VS_OPTVAL(p)     ((const char *)(p))
+#define VS_OPTVAL_MUT(p) ((char *)(p))
+typedef int vs_socklen_t;
+typedef int vs_iolen_t;                              /* send/recv take int */
+
+/* Winsock needs an explicit per-process init, and getaddrinfo counts. Called at
+   the top of every entry point that can be the first socket call in a program.
+   Not guarded for concurrency: Vyto has no threads. */
+static int vs_startup(void) {
+    static int done = 0;
+    if (done) return 0;
+    WSADATA wsa;
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) return -1;
+    done = 1;
+    return 0;
+}
+
+#else
+
+typedef int vsock_t;
+#define VS_FD(fd)        (fd)
+#define VS_INT(s)        (s)
+#define vs_closesocket   close
+#define vs_lasterr()     errno
+#define VS_EWOULDBLOCK   EWOULDBLOCK
+#define VS_EINPROGRESS   EINPROGRESS
+#define VS_OPTVAL(p)     (p)
+#define VS_OPTVAL_MUT(p) (p)
+typedef socklen_t vs_socklen_t;
+typedef size_t vs_iolen_t;
+
+static int vs_startup(void) { return 0; }
+
+#endif
+
+/* EAGAIN and EWOULDBLOCK are the same value on Linux but not required to be, so
+   test both there; Winsock has only the one. */
+static int vs_would_block(int e) {
+#ifdef _WIN32
+    return e == VS_EWOULDBLOCK;
+#else
+    return e == EAGAIN || e == EWOULDBLOCK;
+#endif
+}
+
 int vsock_connect(const char *host, int port) {
+    if (vs_startup() != 0) return -1;
     struct addrinfo hints, *res, *rp;
     memset(&hints, 0, sizeof hints);
     hints.ai_family = AF_UNSPEC;
@@ -38,62 +119,70 @@ int vsock_connect(const char *host, int port) {
     char portstr[16];
     snprintf(portstr, sizeof portstr, "%d", port);
     if (getaddrinfo(host, portstr, &hints, &res) != 0) return -1;
-    int fd = -1;
+    vsock_t s = VS_FD(-1);
     for (rp = res; rp; rp = rp->ai_next) {
-        fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
-        if (fd < 0) continue;
-        if (connect(fd, rp->ai_addr, rp->ai_addrlen) == 0) break;
-        close(fd);
-        fd = -1;
+        s = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+        if (VS_INT(s) < 0) continue;
+        if (connect(s, rp->ai_addr, (vs_socklen_t)rp->ai_addrlen) == 0) break;
+        vs_closesocket(s);
+        s = VS_FD(-1);
     }
     freeaddrinfo(res);
-    return fd;
+    return VS_INT(s);
 }
 
 int vsock_listen(const char *host, int port, int backlog) {
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) return -1;
+    if (vs_startup() != 0) return -1;
+    vsock_t s = socket(AF_INET, SOCK_STREAM, 0);
+    if (VS_INT(s) < 0) return -1;
     int yes = 1;
-    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof yes);
+    setsockopt(s, SOL_SOCKET, SO_REUSEADDR, VS_OPTVAL(&yes), sizeof yes);
     struct sockaddr_in a;
     memset(&a, 0, sizeof a);
     a.sin_family = AF_INET;
     a.sin_port = htons((unsigned short)port);
     if (!host || !*host || inet_pton(AF_INET, host, &a.sin_addr) != 1)
         a.sin_addr.s_addr = INADDR_ANY;
-    if (bind(fd, (struct sockaddr *)&a, sizeof a) != 0) { close(fd); return -1; }
-    if (listen(fd, backlog) != 0) { close(fd); return -1; }
-    return fd;
+    if (bind(s, (struct sockaddr *)&a, sizeof a) != 0) { vs_closesocket(s); return -1; }
+    if (listen(s, backlog) != 0) { vs_closesocket(s); return -1; }
+    return VS_INT(s);
 }
 
-int vsock_accept(int fd) { return accept(fd, NULL, NULL); }
+int vsock_accept(int fd) { return VS_INT(accept(VS_FD(fd), NULL, NULL)); }
 
 int vsock_local_port(int fd) {
     struct sockaddr_in a;
-    socklen_t l = sizeof a;
-    if (getsockname(fd, (struct sockaddr *)&a, &l) != 0) return -1;
+    vs_socklen_t l = sizeof a;
+    if (getsockname(VS_FD(fd), (struct sockaddr *)&a, &l) != 0) return -1;
     return ntohs(a.sin_port);
 }
 
 long vsock_send(int fd, const char *buf, long n) {
-    return (long)send(fd, buf, (size_t)n, MSG_NOSIGNAL);
+    return (long)send(VS_FD(fd), buf, (vs_iolen_t)n, MSG_NOSIGNAL);
 }
 long vsock_recv(int fd, char *buf, long cap) {
-    return (long)recv(fd, buf, (size_t)cap, 0);
+    return (long)recv(VS_FD(fd), buf, (vs_iolen_t)cap, 0);
 }
 
 int vsock_set_timeout(int fd, int ms) {
+    /* SO_RCVTIMEO/SO_SNDTIMEO take a DWORD of milliseconds on Winsock, not the
+       struct timeval POSIX wants — passing a timeval here silently sets a
+       nonsense timeout. */
+#ifdef _WIN32
+    DWORD tv = (DWORD)ms;
+#else
     struct timeval tv;
     tv.tv_sec = ms / 1000;
     tv.tv_usec = (ms % 1000) * 1000;
-    int a = setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
-    int b = setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+#endif
+    int a = setsockopt(VS_FD(fd), SOL_SOCKET, SO_RCVTIMEO, VS_OPTVAL(&tv), sizeof tv);
+    int b = setsockopt(VS_FD(fd), SOL_SOCKET, SO_SNDTIMEO, VS_OPTVAL(&tv), sizeof tv);
     return (a == 0 && b == 0) ? 0 : -1;
 }
 int vsock_set_nodelay(int fd, int on) {
-    return setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &on, sizeof on);
+    return setsockopt(VS_FD(fd), IPPROTO_TCP, TCP_NODELAY, VS_OPTVAL(&on), sizeof on);
 }
-void vsock_close(int fd) { if (fd >= 0) close(fd); }
+void vsock_close(int fd) { if (fd >= 0) vs_closesocket(VS_FD(fd)); }
 
 /* ---- non-blocking (async) --------------------------------------------------
 
@@ -102,39 +191,47 @@ void vsock_close(int fd) { if (fd >= 0) close(fd); }
    the outcome so a poll-driven event loop can tell "come back later" from a
    dead peer. The blocking path is left untouched. */
 
-/* Toggle O_NONBLOCK on an fd. 0 on success, -1 on error. */
+/* Toggle non-blocking mode on an fd. 0 on success, -1 on error. */
 int vsock_set_nonblocking(int fd, int on) {
+#ifdef _WIN32
+    /* Winsock has no fcntl; FIONBIO is the only way, and it is write-only —
+       there is no way to read the current mode back. */
+    u_long mode = on ? 1 : 0;
+    return ioctlsocket(VS_FD(fd), FIONBIO, &mode) == 0 ? 0 : -1;
+#else
     int fl = fcntl(fd, F_GETFL, 0);
     if (fl < 0) return -1;
     fl = on ? (fl | O_NONBLOCK) : (fl & ~O_NONBLOCK);
     return fcntl(fd, F_SETFL, fl);
+#endif
 }
 
 /* >0 = bytes read, 0 = peer closed (EOF), -1 = would-block, -2 = error. */
 long vsock_try_recv(int fd, char *buf, long cap) {
-    long r = (long)recv(fd, buf, (size_t)cap, 0);
+    long r = (long)recv(VS_FD(fd), buf, (vs_iolen_t)cap, 0);
     if (r >= 0) return r;
-    return (errno == EAGAIN || errno == EWOULDBLOCK) ? -1 : -2;
+    return vs_would_block(vs_lasterr()) ? -1 : -2;
 }
 
 /* >=0 = bytes sent, -1 = would-block, -2 = error. */
 long vsock_try_send(int fd, const char *buf, long n) {
-    long r = (long)send(fd, buf, (size_t)n, MSG_NOSIGNAL);
+    long r = (long)send(VS_FD(fd), buf, (vs_iolen_t)n, MSG_NOSIGNAL);
     if (r >= 0) return r;
-    return (errno == EAGAIN || errno == EWOULDBLOCK) ? -1 : -2;
+    return vs_would_block(vs_lasterr()) ? -1 : -2;
 }
 
-/* >=0 = new fd (set O_NONBLOCK), -1 = would-block, -2 = error. */
+/* >=0 = new fd (set non-blocking), -1 = would-block, -2 = error. */
 int vsock_try_accept(int fd) {
-    int c = accept(fd, NULL, NULL);
+    int c = VS_INT(accept(VS_FD(fd), NULL, NULL));
     if (c >= 0) { vsock_set_nonblocking(c, 1); return c; }
-    return (errno == EAGAIN || errno == EWOULDBLOCK) ? -1 : -2;
+    return vs_would_block(vs_lasterr()) ? -1 : -2;
 }
 
 /* Start a non-blocking connect. Returns an O_NONBLOCK fd immediately (connect
    in progress); poll it for POLL_WRITE, then call vsock_conn_result. -1 on
    setup failure. */
 int vsock_connect_async(const char *host, int port) {
+    if (vs_startup() != 0) return -1;
     struct addrinfo hints, *res, *rp;
     memset(&hints, 0, sizeof hints);
     hints.ai_family = AF_UNSPEC;
@@ -142,26 +239,27 @@ int vsock_connect_async(const char *host, int port) {
     char portstr[16];
     snprintf(portstr, sizeof portstr, "%d", port);
     if (getaddrinfo(host, portstr, &hints, &res) != 0) return -1;
-    int fd = -1;
+    vsock_t s = VS_FD(-1);
     for (rp = res; rp; rp = rp->ai_next) {
-        fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
-        if (fd < 0) continue;
-        vsock_set_nonblocking(fd, 1);
-        int rc = connect(fd, rp->ai_addr, rp->ai_addrlen);
-        if (rc == 0 || errno == EINPROGRESS) break; /* connected or pending */
-        close(fd);
-        fd = -1;
+        s = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+        if (VS_INT(s) < 0) continue;
+        vsock_set_nonblocking(VS_INT(s), 1);
+        int rc = connect(s, rp->ai_addr, (vs_socklen_t)rp->ai_addrlen);
+        if (rc == 0 || vs_lasterr() == VS_EINPROGRESS) break; /* connected or pending */
+        vs_closesocket(s);
+        s = VS_FD(-1);
     }
     freeaddrinfo(res);
-    return fd;
+    return VS_INT(s);
 }
 
 /* Result of an async connect once the fd is writable: 0 = connected,
-   >0 = errno (failed), -1 = getsockopt error. */
+   >0 = error code (failed), -1 = getsockopt error. The non-zero value is an
+   errno on POSIX and a WSA error on Windows — callers only test it against 0. */
 int vsock_conn_result(int fd) {
     int err = 0;
-    socklen_t l = sizeof err;
-    if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &l) != 0) return -1;
+    vs_socklen_t l = sizeof err;
+    if (getsockopt(VS_FD(fd), SOL_SOCKET, SO_ERROR, VS_OPTVAL_MUT(&err), &l) != 0) return -1;
     return err;
 }
 
@@ -253,10 +351,32 @@ void vpoll_free(struct PollSet *ps) {
     free(ps);
 }
 
-#else  /* poll(2) fallback (macOS, BSD) */
+#else  /* poll(2) fallback (macOS, BSD) — and WSAPoll on Windows */
+
+/* WSAPoll is WSAPOLLFD-shaped exactly like struct pollfd and takes the same
+   (array, count, timeout_ms) arguments, so Windows rides this branch rather
+   than needing a third implementation.
+
+   Two Windows caveats worth knowing, neither fixable here:
+   - WSAPoll rejects a zero-length set with WSAEINVAL where poll(2) just sleeps;
+     vpoll_wait special-cases that below.
+   - WSAPoll does not report a *failed* non-blocking connect: the socket never
+     becomes ready rather than signalling POLLERR. A vsock_connect_async to a
+     refused port therefore hangs until the caller's own timeout instead of
+     surfacing through vsock_conn_result. Microsoft has acknowledged this and
+     not fixed it. */
+#ifdef _WIN32
+typedef WSAPOLLFD vs_pollfd;
+typedef ULONG vs_nfds;
+#define vs_poll WSAPoll
+#else
+typedef struct pollfd vs_pollfd;
+typedef nfds_t vs_nfds;
+#define vs_poll poll
+#endif
 
 struct PollSet {
-    struct pollfd *fds;
+    vs_pollfd *fds;
     int nfds, cap;
     int *ready;      /* indices into fds[] with non-zero revents */
     int nready, rcap;
@@ -266,8 +386,10 @@ struct PollSet *vpoll_new(void) {
     return (struct PollSet *)calloc(1, sizeof(struct PollSet));
 }
 
+int vpoll_mod(struct PollSet *ps, int fd, int events); /* used by vpoll_add below */
+
 static int pollset_find(struct PollSet *ps, int fd) {
-    for (int i = 0; i < ps->nfds; i++) if (ps->fds[i].fd == fd) return i;
+    for (int i = 0; i < ps->nfds; i++) if (ps->fds[i].fd == VS_FD(fd)) return i;
     return -1;
 }
 static short vp_to_poll(int events) {
@@ -281,11 +403,11 @@ int vpoll_add(struct PollSet *ps, int fd, int events) {
     if (pollset_find(ps, fd) >= 0) return vpoll_mod(ps, fd, events);
     if (ps->nfds == ps->cap) {
         int want = ps->cap ? ps->cap * 2 : 16;
-        struct pollfd *nf = (struct pollfd *)realloc(ps->fds, (size_t)want * sizeof *nf);
+        vs_pollfd *nf = (vs_pollfd *)realloc(ps->fds, (size_t)want * sizeof *nf);
         if (!nf) return -1;
         ps->fds = nf; ps->cap = want;
     }
-    ps->fds[ps->nfds].fd = fd;
+    ps->fds[ps->nfds].fd = VS_FD(fd);
     ps->fds[ps->nfds].events = vp_to_poll(events);
     ps->fds[ps->nfds].revents = 0;
     ps->nfds++;
@@ -306,8 +428,16 @@ int vpoll_del(struct PollSet *ps, int fd) {
 }
 
 int vpoll_wait(struct PollSet *ps, int timeout_ms) {
-    int n = poll(ps->fds, (nfds_t)ps->nfds, timeout_ms);
     ps->nready = 0;
+#ifdef _WIN32
+    /* WSAPoll fails with WSAEINVAL on an empty set instead of sleeping, which
+       would turn an idle event loop into a busy spin returning -1. */
+    if (ps->nfds == 0) {
+        if (timeout_ms > 0) Sleep((DWORD)timeout_ms);
+        return 0;
+    }
+#endif
+    int n = vs_poll(ps->fds, (vs_nfds)ps->nfds, timeout_ms);
     if (n <= 0) return n;
     if (ps->rcap < ps->nfds) {
         int *nr = (int *)realloc(ps->ready, (size_t)ps->nfds * sizeof *nr);
@@ -321,7 +451,7 @@ int vpoll_wait(struct PollSet *ps, int timeout_ms) {
 
 int vpoll_ready_fd(struct PollSet *ps, int i) {
     if (i < 0 || i >= ps->nready) return -1;
-    return ps->fds[ps->ready[i]].fd;
+    return VS_INT(ps->fds[ps->ready[i]].fd);
 }
 int vpoll_ready_events(struct PollSet *ps, int i) {
     if (i < 0 || i >= ps->nready) return 0;
@@ -344,16 +474,17 @@ void vpoll_free(struct PollSet *ps) {
 
 /* ---- UDP ---- */
 int vsock_udp_bind(const char *host, int port) {
-    int fd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (fd < 0) return -1;
+    if (vs_startup() != 0) return -1;
+    vsock_t s = socket(AF_INET, SOCK_DGRAM, 0);
+    if (VS_INT(s) < 0) return -1;
     struct sockaddr_in a;
     memset(&a, 0, sizeof a);
     a.sin_family = AF_INET;
     a.sin_port = htons((unsigned short)port);
     if (!host || !*host || inet_pton(AF_INET, host, &a.sin_addr) != 1)
         a.sin_addr.s_addr = INADDR_ANY;
-    if (bind(fd, (struct sockaddr *)&a, sizeof a) != 0) { close(fd); return -1; }
-    return fd;
+    if (bind(s, (struct sockaddr *)&a, sizeof a) != 0) { vs_closesocket(s); return -1; }
+    return VS_INT(s);
 }
 long vsock_sendto(int fd, const char *host, int port, const char *buf, long n) {
     struct sockaddr_in a;
@@ -361,8 +492,8 @@ long vsock_sendto(int fd, const char *host, int port, const char *buf, long n) {
     a.sin_family = AF_INET;
     a.sin_port = htons((unsigned short)port);
     if (inet_pton(AF_INET, host, &a.sin_addr) != 1) return -1;
-    return (long)sendto(fd, buf, (size_t)n, 0, (struct sockaddr *)&a, sizeof a);
+    return (long)sendto(VS_FD(fd), buf, (vs_iolen_t)n, 0, (struct sockaddr *)&a, sizeof a);
 }
 long vsock_recvfrom(int fd, char *buf, long cap) {
-    return (long)recvfrom(fd, buf, (size_t)cap, 0, NULL, NULL);
+    return (long)recvfrom(VS_FD(fd), buf, (vs_iolen_t)cap, 0, NULL, NULL);
 }
