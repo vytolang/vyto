@@ -20,6 +20,7 @@
 // round-trips exactly.
 
 import { fmt, fs, fi } from "vyto/util/fmt";
+import { StringBuilder } from "vyto/util/text";
 
 export const JS_NULL:  int = 0;
 export const JS_BOOL:  int = 1;
@@ -125,8 +126,16 @@ export class JsonValue {
         this.arr.push(v);
     }
 
-    fn stringify(): string { return write_value(this, "", false, 0); }
-    fn stringifyPretty(): string { return write_value(this, "", true, 0); }
+    fn stringify(): string {
+        let sb = new StringBuilder(64);
+        write_sb(this, sb, false, 0);
+        return sb.toString();
+    }
+    fn stringifyPretty(): string {
+        let sb = new StringBuilder(64);
+        write_sb(this, sb, true, 0);
+        return sb.toString();
+    }
 }
 
 // ---- constructors --------------------------------------------------------
@@ -434,61 +443,61 @@ export fn json_encode_pretty(v: JsonValue): string { return v.stringifyPretty();
 
 // ---- serializer ----------------------------------------------------------
 
-fn write_value(v: JsonValue, out: string, pretty: bool, depth: int): string {
-    // out is passed by value (captured strings snapshot); return the extended
-    // string and let the caller reassign. Kept simple over a builder object.
-    // A parse can't exceed JSON_MAX_DEPTH, so only a hand-built cyclic/deep
-    // tree trips this — a programmer error, so panic (not sentinel).
+// Append v's serialization into `sb`. Appending into a growable builder makes
+// stringify O(total output) instead of the O(n²) of threading and re-copying a
+// string at every node.
+// A parse can't exceed JSON_MAX_DEPTH, so only a hand-built cyclic/deep tree
+// trips this — a programmer error, so panic (not sentinel).
+fn write_sb(v: JsonValue, sb: StringBuilder, pretty: bool, depth: int) {
     if (depth > JSON_MAX_DEPTH) { panic("json: stringify nesting deeper than 1024 levels"); }
-    if (v.kind == JS_NULL) { return out + "null"; }
-    if (v.kind == JS_BOOL) { if (v.bval) { return out + "true"; } return out + "false"; }
-    if (v.kind == JS_NUM) { return out + num_str(v.num); }
-    if (v.kind == JS_STR) { return out + quote(v.bstr); }
+    if (v.kind == JS_NULL) { sb.append("null"); return; }
+    if (v.kind == JS_BOOL) { if (v.bval) { sb.append("true"); } else { sb.append("false"); } return; }
+    if (v.kind == JS_NUM) {
+        // integral values in the exactly-representable range print without a
+        // decimal point (and via appendInt, no intermediate string).
+        if (v.num >= -9.0e15 && v.num <= 9.0e15) {
+            let t = v.num as int;
+            if ((t as float) == v.num) { sb.appendInt(t); return; }
+        }
+        sb.append(str(v.num));
+        return;
+    }
+    if (v.kind == JS_STR) { quote_into(sb, v.bstr); return; }
     if (v.kind == JS_ARR) {
-        let s = out + "[";
+        sb.append("[");
         let i = 0;
         while (i < v.arr.len) {
-            if (i > 0) { s = s + ","; }
-            if (pretty) { s = s + "\n" + indent(depth + 1); }
-            s = write_value(v.arr[i], s, pretty, depth + 1);
+            if (i > 0) { sb.append(","); }
+            if (pretty) { sb.append("\n"); sb.append(indent(depth + 1)); }
+            write_sb(v.arr[i], sb, pretty, depth + 1);
             i += 1;
         }
-        if (pretty && v.arr.len > 0) { s = s + "\n" + indent(depth); }
-        return s + "]";
+        if (pretty && v.arr.len > 0) { sb.append("\n"); sb.append(indent(depth)); }
+        sb.append("]");
+        return;
     }
     // object
-    let s = out + "{";
+    sb.append("{");
     let i = 0;
     while (i < v.keys.len) {
-        let k = v.keys[i];
-        if (i > 0) { s = s + ","; }
-        if (pretty) { s = s + "\n" + indent(depth + 1); }
-        s = s + quote(k) + ":";
-        if (pretty) { s = s + " "; }
-        s = write_value(v.vals[i], s, pretty, depth + 1);
+        if (i > 0) { sb.append(","); }
+        if (pretty) { sb.append("\n"); sb.append(indent(depth + 1)); }
+        quote_into(sb, v.keys[i]);
+        sb.append(":");
+        if (pretty) { sb.append(" "); }
+        write_sb(v.vals[i], sb, pretty, depth + 1);
         i += 1;
     }
-    if (pretty && v.keys.len > 0) { s = s + "\n" + indent(depth); }
-    return s + "}";
+    if (pretty && v.keys.len > 0) { sb.append("\n"); sb.append(indent(depth)); }
+    sb.append("}");
 }
 
 fn indent(depth: int): string { return "  ".repeat(depth); }
 
-// A JSON number: integral values print without a decimal point, others via
-// fmt's %g-equivalent through str().
-fn num_str(x: float): string {
-    // Only take the integer path inside the exactly-representable range, so a
-    // huge value never overflows `as int` (which would panic in debug builds).
-    if (x >= -9.0e15 && x <= 9.0e15) {
-        let t = x as int;
-        if ((t as float) == x) { return str(t); }
-    }
-    return str(x);
-}
-
-// Escape a string as a JSON string literal (with surrounding quotes).
-fn quote(s: string): string {
-    let out = "\"";
+// Append `s` as a JSON string literal (with surrounding quotes) into `sb`,
+// escaping runs directly into the builder — no intermediate O(n²) string.
+fn quote_into(sb: StringBuilder, s: string) {
+    sb.append("\"");
     let runStart = 0;
     let i = 0;
     while (i < s.len) {
@@ -503,13 +512,14 @@ fn quote(s: string): string {
         else if (c == 12) { esc = "\\f"; }
         else if (c < 0x20) { esc = fmt("\\u%04x", [fi(c)]); }
         if (esc != "") {
-            out = out + s.slice(runStart, i) + esc;
+            if (i > runStart) { sb.append(s.slice(runStart, i)); }
+            sb.append(esc);
             runStart = i + 1;
         }
         i += 1;
     }
-    out = out + s.slice(runStart, s.len) + "\"";
-    return out;
+    if (s.len > runStart) { sb.append(s.slice(runStart, s.len)); }
+    sb.append("\"");
 }
 
 // ---- byte helpers --------------------------------------------------------
