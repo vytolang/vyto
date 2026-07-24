@@ -572,6 +572,18 @@ VtString *vt_str_from_int(int64_t v) {
     return vt_str_new(buf, n);
 }
 
+/* Fused string + int concat: one allocation instead of vt_str_from_int (alloc)
+   then vt_str_concat (alloc). Same result as concat(a, from_int(v)). */
+VtString *vt_str_concat_int(VtString *a, int64_t v) {
+    char buf[32];
+    int n = vt_snprintf(buf, sizeof buf, "%lld", (long long)v);
+    int64_t la = a ? a->len : 0;
+    VtString *s = str_alloc(la + n);
+    if (a) memcpy(s->data, a->data, (size_t)la);
+    memcpy(s->data + la, buf, (size_t)n);
+    return s;
+}
+
 VtString *vt_str_from_float(double v) {
     char buf[40];
     int n = vt_snprintf(buf, sizeof buf, "%g", v);

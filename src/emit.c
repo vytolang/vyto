@@ -1017,6 +1017,12 @@ static char *ex(Em *em, Expr *e, bool *fresh) {
         Type *lt = e->lhs->type, *rt = e->rhs->type;
         if (e->op == T_PLUS && e->type->kind == TY_STRING) {
             *fresh = true;
+            /* string + int: fuse the to-string and the concat into one alloc
+               (vt_str_concat_int) instead of vt_str_concat(a, vt_str_from_int(v)). */
+            if (lt->kind == TY_STRING && e->rhs->kind == EX_STRCONV &&
+                type_is_int(e->rhs->lhs->type))
+                return arena_printf(&g_arena, "vt_str_concat_int(%s, (int64_t)(%s))",
+                                    ex_b(em, e->lhs), ex_v(em, e->rhs->lhs, NULL));
             return arena_printf(&g_arena, "vt_str_concat(%s, %s)", ex_b(em, e->lhs),
                                 ex_b(em, e->rhs));
         }
@@ -1380,7 +1386,13 @@ static void emit_assign(Em *em, Expr *e) {
         }
     }
     ind(em);
-    sb_printf(em->out, "vt_arr_set(%s, %s, &%s, %s);\n", ta, ti, tv, fl);
+    if (!type_is_ref(et))
+        /* non-ref element: no retain/release, so store inline through the
+           inlined bounds-checked slot — lets the C compiler hoist/vectorize
+           instead of emitting an out-of-line vt_arr_set call per element. */
+        sb_printf(em->out, "*(%s*)vt_arr_at(%s, %s, %s) = %s;\n", c_type(et), ta, ti, fl, tv);
+    else
+        sb_printf(em->out, "vt_arr_set(%s, %s, &%s, %s);\n", ta, ti, tv, fl);
     if (str_append) {
         ind(em);
         sb_printf(em->out, "VT_RELEASE(%s);\n", tv); /* concat result was +1; set retained it */
