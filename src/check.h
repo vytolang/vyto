@@ -10,6 +10,7 @@ struct Local {
     bool is_param;
     bool is_this;
     bool assigned; /* body assigns to it; ref-typed params need a defensive retain */
+    int region;    /* arena the binding was declared in: 0 = heap/fn scope, else arena id */
     struct Local *next_in_fn;
 };
 

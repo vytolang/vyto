@@ -1093,6 +1093,10 @@ static char *ex(Em *em, Expr *e, bool *fresh) {
             return arena_printf(&g_arena, "vt_map_new(%s)",
                                 type_is_ref(e->type->elem) ? "true" : "false");
         ClassDecl *cd = e->cls;
+        if (e->region_local) /* arena alloc: bump from the region, no ctor (arena
+                                classes have none), rc sentinel makes RC a no-op */
+            return arena_printf(&g_arena, "((%s*)vt_ralloc(&_rgn%d, sizeof(%s), &%s__type))",
+                                class_cname(cd), e->region, class_cname(cd), class_cname(cd));
         FnDecl *ctor = NULL;
         for (ClassDecl *k = cd; k && !ctor; k = k->parent) ctor = k->ctor;
         return arena_printf(&g_arena, "%s__new(%s)", class_cname(cd),
@@ -1595,6 +1599,24 @@ static void emit_stmt(Em *em, Stmt *s) {
         epush(em, false);
         emit_stmts(em, s->body, s->nbody);
         epop(em);
+        em->indent--;
+        ind(em);
+        sb_puts(em->out, "}\n");
+        break;
+    case ST_ARENA:
+        /* open a region at block entry, bulk-free it at the single fall-through
+           exit (return/break/continue out of an arena are rejected by the
+           checker, so there is no other exit path to clean up). */
+        ind(em);
+        sb_puts(em->out, "{\n");
+        em->indent++;
+        ind(em);
+        sb_printf(em->out, "VtRegion _rgn%d; vt_region_open(&_rgn%d);\n", s->region, s->region);
+        epush(em, false);
+        emit_stmts(em, s->body, s->nbody);
+        epop(em);
+        ind(em);
+        sb_printf(em->out, "vt_region_close(&_rgn%d);\n", s->region);
         em->indent--;
         ind(em);
         sb_puts(em->out, "}\n");

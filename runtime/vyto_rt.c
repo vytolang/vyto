@@ -396,6 +396,11 @@ void vt_region_close(VtRegion *r) {
     VtRegionChunk *c = r->chunks;
     while (c) {
         VtRegionChunk *n = c->next;
+#ifdef VT_REGION_POISON
+        /* debug: scribble freed arena bytes so a mistaken use-after-close reads
+           garbage loudly instead of stale-but-plausible data */
+        memset(c, 0xDE, sizeof *c);
+#endif
         vt_host_free(c);
         c = n;
     }

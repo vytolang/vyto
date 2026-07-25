@@ -387,6 +387,7 @@ typedef struct Scope {
     struct Scope *parent;
 } Scope;
 
+#define MAX_REGIONS 256
 typedef struct Ctx {
     Module *mod;
     FnDecl *fn;          /* function whose body is being checked */
@@ -396,7 +397,65 @@ typedef struct Ctx {
     struct Ctx *outer;   /* enclosing fn ctx (arrows) */
     int loop_depth;
     int local_counter;
+    /* arena regions (--arena). cur_region = innermost active arena (0 = heap).
+       region_parent[id] gives the lexically-enclosing region, so outlives() can
+       walk the ancestry. rstack is the active enclosing arenas, for resolving a
+       `new@name` and reporting. Reset per function body. */
+    int cur_region;
+    int region_counter;                 /* monotonic id source within the fn */
+    int region_parent[MAX_REGIONS];
+    int rstack_id[MAX_REGIONS];
+    const char *rstack_name[MAX_REGIONS];
+    int rstack_loopdepth[MAX_REGIONS]; /* loop_depth when this arena was entered */
+    int rstack_n;
 } Ctx;
+
+/* region `a` outlives region `b` iff a is the heap (0), equals b, or lexically
+   encloses b (an ancestor in the region tree). A pointer from a location in
+   region b to a value in region a is safe exactly when a outlives b. */
+static bool region_outlives(Ctx *c, int a, int b) {
+    if (a == 0) return true;            /* heap outlives every arena */
+    for (int r = b; r != 0; r = c->region_parent[r])
+        if (r == a) return true;
+    return false;
+}
+
+/* Region an expression's value lives in (0 = heap). A ref-typed field/element
+   read inherits its base's region (an interior pointer is conservatively no
+   longer-lived than its container — safe: it under-estimates the lifetime). */
+static int region_of(Expr *e) {
+    switch (e->kind) {
+    case EX_NEW:   return e->region;
+    case EX_IDENT: return e->local ? e->local->region : 0;
+    case EX_MEMBER:
+    case EX_INDEX:
+    case EX_AS:    return region_of(e->lhs);
+    default:       return 0; /* this / calls / literals / array & map literals = heap */
+    }
+}
+
+/* Dangling check: storing `rhs` into a location in `loc_region` requires the
+   value to outlive the location. Used for every ref store (let, assign, field,
+   element, ...). Scalars copy and are always fine. */
+static void region_check_store(Ctx *c, int loc_region, Expr *rhs, const char *what) {
+    if (!type_is_ref(rhs->type)) return;
+    if (!region_outlives(c, region_of(rhs), loc_region))
+        fatal_at(rhs->loc,
+                 "arena value would outlive its arena via %s "
+                 "(it is freed when its arena block ends)", what);
+}
+
+/* Leak check: an arena *object* field/element is bulk-freed with no per-object
+   release, so it must not hold a heap RC ref. Applies only when the container
+   lives in an arena (region > 0). */
+static void region_check_object_store(Ctx *c, int obj_region, Expr *rhs, const char *what) {
+    (void)c;
+    if (rhs->kind == EX_NULL) return; /* null holds no reference — never leaks */
+    if (obj_region != 0 && type_is_ref(rhs->type) && region_of(rhs) == 0)
+        fatal_at(rhs->loc,
+                 "cannot store a heap reference into an arena object via %s "
+                 "(it would leak when the arena is freed)", what);
+}
 
 static Scope *scope_push(Ctx *c) {
     Scope *s = NEW(Scope);
@@ -424,6 +483,7 @@ static Local *define_local(Ctx *c, const char *name, Type *type, bool is_param, 
     l->name = name;
     l->type = type;
     l->is_param = is_param;
+    l->region = 0; /* value-region; ST_LET refines ref locals from their initializer */
     l->cname = is_param ? arena_printf(&g_arena, "p_%s", name)
                         : arena_printf(&g_arena, "l_%s_%d", name, ++c->local_counter);
     l->next_in_fn = c->fn->locals;
@@ -573,6 +633,13 @@ static void check_args_against(Ctx *c, Expr *e, Param *params, int nparams, cons
     for (int i = 0; i < nparams; i++) {
         check_expr(c, e->args[i], params[i].type);
         want(c, e->args[i], params[i].type, "argument");
+        /* Conservative arena rule: passing an arena value to a function could let
+           it be stored somewhere longer-lived. Rejected (safe) until per-fn
+           escape summaries permit provably non-storing callees. */
+        if (type_is_ref(e->args[i]->type) && region_of(e->args[i]) > 0)
+            fatal_at(e->args[i]->loc,
+                     "cannot pass an arena value to '%s' yet "
+                     "(consume it inside the arena block)", name);
     }
 }
 
@@ -1089,6 +1156,9 @@ static Local *lookup_value(Ctx *c, Expr *e, const char *name) {
         l = scope_find(c->outer_scope, name);
         if (l) {
             if (l->is_this) fatal_at(e->loc, "closures cannot capture 'this' in v0.1");
+            if (l->region > 0)
+                fatal_at(e->loc, "cannot capture arena value '%s' in a closure "
+                                 "(the closure may outlive the arena)", name);
             FnDecl *fd = c->fn;
             for (int i = 0; i < fd->ncaptures; i++)
                 if (fd->captures[i].src == l) { e->ref = REF_CAPTURE; e->local = l; return l; }
@@ -1308,6 +1378,7 @@ static Type *check_call(Ctx *c, Expr *e, Type *expected) {
                 if (e->nargs != 1) fatal_at(e->loc, "push takes 1 argument");
                 check_expr(c, e->args[0], recv->elem);
                 want(c, e->args[0], recv->elem, "push");
+                region_check_store(c, region_of(callee->lhs), e->args[0], "an array push");
                 e->ref = REF_BUILTIN; e->builtin = B_PUSH;
                 return e->type = ty_void();
             }
@@ -1364,6 +1435,7 @@ static Type *check_call(Ctx *c, Expr *e, Type *expected) {
                 want(c, e->args[0], ty_int(), "insert index");
                 check_expr(c, e->args[1], recv->elem);
                 want(c, e->args[1], recv->elem, "insert element");
+                region_check_store(c, region_of(callee->lhs), e->args[1], "an array insert");
                 e->ref = REF_BUILTIN; e->builtin = B_ARR_INSERT;
                 return e->type = ty_void();
             }
@@ -1396,6 +1468,7 @@ static Type *check_call(Ctx *c, Expr *e, Type *expected) {
                 if (e->nargs != 1) fatal_at(e->loc, "fill takes 1 argument");
                 check_expr(c, e->args[0], recv->elem);
                 want(c, e->args[0], recv->elem, "fill element");
+                region_check_store(c, region_of(callee->lhs), e->args[0], "an array fill");
                 e->ref = REF_BUILTIN; e->builtin = B_ARR_FILL;
                 return e->type = ty_void();
             }
@@ -1471,6 +1544,7 @@ static Type *check_call(Ctx *c, Expr *e, Type *expected) {
                 want(c, e->args[0], ty_string(), "map key");
                 check_expr(c, e->args[1], recv->elem);
                 want(c, e->args[1], recv->elem, "map value");
+                region_check_store(c, region_of(callee->lhs), e->args[1], "a map insert");
                 e->ref = REF_BUILTIN; e->builtin = B_MAP_SET;
                 return e->type = ty_void();
             }
@@ -1715,6 +1789,12 @@ static Type *check_call(Ctx *c, Expr *e, Type *expected) {
             if (n == intern("init")) fatal_at(e->loc, "init is called via 'new' or 'super.init'");
             FnDecl *m = class_find_method(recv->cdecl, n);
             if (m) {
+                /* Conservative arena rule (step B): a method could store `this`,
+                   so calling a method on an arena receiver is rejected until
+                   escape summaries prove `this` non-escaping. */
+                if (region_of(callee->lhs) > 0)
+                    fatal_at(e->loc, "cannot call method '%s' on an arena value yet "
+                                     "(read its fields directly inside the block)", n);
                 e->ref = REF_METHOD;
                 e->method = m;
                 e->cls = m->owner;
@@ -2026,6 +2106,18 @@ static Type *check_expr(Ctx *c, Expr *e, Type *expected) {
             want(c, e->rhs, lt, "assignment");
             if (e->op == T_PERCENTEQ && type_is_float(lt)) fatal_at(e->loc, "'%%=' is integer-only");
         }
+        /* arena escape checks on the store target */
+        if (e->op == T_ASSIGN && type_is_ref(lt)) {
+            if (lhs->kind == EX_IDENT && lhs->local)
+                region_check_store(c, lhs->local->region, e->rhs, "assignment");
+            else if (lhs->kind == EX_MEMBER) {
+                region_check_store(c, region_of(lhs->lhs), e->rhs, "a field store");
+                region_check_object_store(c, region_of(lhs->lhs), e->rhs, "a field store");
+            } else if (lhs->kind == EX_INDEX) {
+                region_check_store(c, region_of(lhs->lhs), e->rhs, "an array store");
+                region_check_object_store(c, region_of(lhs->lhs), e->rhs, "an array store");
+            }
+        }
         return e->type = ty_void();
     }
     case EX_CALL: return check_call(c, e, expected);
@@ -2057,6 +2149,36 @@ static Type *check_expr(Ctx *c, Expr *e, Type *expected) {
             check_args_against(c, e, ctor->params, ctor->nparams, e->name);
         } else if (e->nargs != 0) {
             fatal_at(e->loc, "class %s has no init taking arguments", e->name);
+        }
+        /* resolve the arena this `new` targets: `new@name` → a named enclosing
+           arena; bare `new` → the innermost active arena (0 = heap). */
+        int region = 0;
+        if (e->region_name) {
+            for (int i = c->rstack_n - 1; i >= 0; i--)
+                if (c->rstack_name[i] == e->region_name) { region = c->rstack_id[i]; break; }
+            if (!region)
+                fatal_at(e->loc, "no enclosing arena named '%s' in scope", e->region_name);
+        } else {
+            region = c->cur_region;
+        }
+        if (region > 0) {
+            /* MVP arena-safety: an arena object is bulk-freed with no per-object
+               deinit, so it must hold no heap-managed refs and run no custom init
+               that could store one. Scalar + class-ref fields only; class refs
+               are store-checked to stay in-region. */
+            if (ctor)
+                fatal_at(e->loc, "arena class '%s' cannot have a custom init yet", e->name);
+            for (ClassDecl *k = cd; k; k = k->parent)
+                for (int fi = 0; fi < k->nfields; fi++) {
+                    Type *ft = k->fields[fi].type;
+                    if (ft->kind == TY_STRING || ft->kind == TY_ARRAY ||
+                        ft->kind == TY_MAP || ft->kind == TY_FN)
+                        fatal_at(e->loc,
+                                 "arena class '%s' has a heap-managed field '%s'; "
+                                 "not arena-safe yet", e->name, k->fields[fi].name);
+                }
+            e->region = region;
+            e->region_local = true;
         }
         Type *t = mk_type(TY_CLASS);
         t->cdecl = cd;
@@ -2123,6 +2245,12 @@ static void check_stmt(Ctx *c, Stmt *s) {
         if (t->kind == TY_VOID) fatal_at(s->loc, "cannot store void");
         if (t->kind == TY_NULL) fatal_at(s->loc, "cannot infer type from null; annotate the let");
         s->local = define_local(c, s->name, t, false, s->loc);
+        /* value-region of the binding: where the object it holds actually lives.
+           null is region-polymorphic — a null accumulator declared in an arena
+           takes that arena (so it can later hold arena values); at heap scope it
+           stays heap. Non-ref locals keep region 0 (irrelevant). */
+        if (type_is_ref(t))
+            s->local->region = (s->init->kind == EX_NULL) ? c->cur_region : region_of(s->init);
         return;
     }
     case ST_EXPR:
@@ -2173,6 +2301,9 @@ static void check_stmt(Ctx *c, Stmt *s) {
         return;
     }
     case ST_RETURN:
+        if (c->cur_region > 0)
+            fatal_at(s->loc, "return inside an arena block is not supported yet; "
+                             "compute a result and return after the block");
         if (c->fn->is_builder) {
             if (!s->expr || s->expr->kind != EX_THIS)
                 fatal_at(s->loc, "a builder method may only 'return this;'");
@@ -2183,18 +2314,50 @@ static void check_stmt(Ctx *c, Stmt *s) {
             if (c->fn->ret->kind == TY_VOID) fatal_at(s->loc, "void function returns a value");
             check_expr(c, s->expr, c->fn->ret);
             want(c, s->expr, c->fn->ret, "return");
+            if (type_is_ref(s->expr->type) && region_of(s->expr) != 0)
+                fatal_at(s->loc, "cannot return an arena value (it is freed when its "
+                                 "arena block ends); copy it out instead");
         } else if (c->fn->ret->kind != TY_VOID) {
             fatal_at(s->loc, "missing return value");
         }
         return;
     case ST_BREAK: case ST_CONTINUE:
         if (!c->loop_depth) fatal_at(s->loc, "break/continue outside a loop");
+        /* a break/continue that would jump out of an arena block (the loop it
+           targets encloses the arena) isn't wired for region cleanup yet */
+        if (c->rstack_n > 0 && c->loop_depth <= c->rstack_loopdepth[c->rstack_n - 1])
+            fatal_at(s->loc, "break/continue out of an arena block is not supported yet");
         return;
     case ST_BLOCK:
         scope_push(c);
         check_block(c, s->body, s->nbody);
         scope_pop(c);
         return;
+    case ST_ARENA: {
+        if (c->region_counter + 1 >= MAX_REGIONS)
+            fatal_at(s->loc, "too many nested/sequential arenas in one function");
+        int id = ++c->region_counter;
+        c->region_parent[id] = c->cur_region;
+        /* an arena name must be unique among the enclosing arenas (so `new@name`
+           is unambiguous) */
+        if (s->name)
+            for (int i = 0; i < c->rstack_n; i++)
+                if (c->rstack_name[i] == s->name)
+                    fatal_at(s->loc, "arena name '%s' shadows an enclosing arena", s->name);
+        c->rstack_id[c->rstack_n] = id;
+        c->rstack_name[c->rstack_n] = s->name; /* may be NULL */
+        c->rstack_loopdepth[c->rstack_n] = c->loop_depth;
+        c->rstack_n++;
+        s->region = id; /* emitter names the region local _rgn<id> */
+        int saved = c->cur_region;
+        c->cur_region = id;
+        scope_push(c);
+        check_block(c, s->body, s->nbody);
+        scope_pop(c);
+        c->cur_region = saved;
+        c->rstack_n--;
+        return;
+    }
     }
 }
 
@@ -2217,6 +2380,7 @@ static bool block_has_break(Stmt **body, int n) {
             if (s->els && block_has_break(s->els, s->nels)) return true;
             break;
         case ST_BLOCK:
+        case ST_ARENA:
             if (block_has_break(s->body, s->nbody)) return true;
             break;
         default: break; /* nested loops own their breaks */
@@ -2235,6 +2399,7 @@ static bool stmt_returns(Stmt *s) {
     case ST_IF:
         return s->els && stmts_return(s->body, s->nbody) && stmts_return(s->els, s->nels);
     case ST_BLOCK:
+    case ST_ARENA:
         return stmts_return(s->body, s->nbody);
     case ST_WHILE: /* while(true) with no break never falls through */
         return s->expr->kind == EX_BOOL && s->expr->ival &&

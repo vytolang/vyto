@@ -386,6 +386,8 @@ static Expr *parse_primary(Parser *p) {
     case T_NEW: {
         e = new_expr(p, EX_NEW);
         advance(p);
+        if (accept(p, T_AT)) /* new@region Name(...) — target a named arena */
+            e->region_name = expect_ident(p);
         if (cur(p) == T_MAP) {
             e->cast_type = parse_type(p); /* Map<string,T> */
             int n;
@@ -622,6 +624,12 @@ static Stmt *parse_stmt(Parser *p) {
         return s;
     case T_LBRACE:
         s = new_stmt(p, ST_BLOCK);
+        s->body = parse_block(p, &s->nbody);
+        return s;
+    case T_ARENA:
+        s = new_stmt(p, ST_ARENA);
+        advance(p);
+        if (cur(p) == T_IDENT) s->name = expect_ident(p); /* optional region name */
         s->body = parse_block(p, &s->nbody);
         return s;
     default:

@@ -1,0 +1,39 @@
+// arena { } — a lexical region. Objects `new`'d inside are bump-allocated and
+// the whole block is freed in one shot at the end (no per-object refcount
+// teardown). Escaping an arena value is a compile error, so it stays safe.
+
+class Node { value: int; next: Node; }
+
+fn main() {
+    // Build a list inside the arena, consume it inside, let only a scalar out.
+    let sum = 0;
+    arena {
+        let head: Node = null;
+        let i = 0;
+        while (i < 1000) {
+            let n = new Node();      // bump-allocated in this arena
+            n.value = i;
+            n.next = head;           // interior ref to a sibling: fine
+            head = n;
+            i += 1;
+        }
+        let cur = head;
+        while (cur != null) { sum += cur.value; cur = cur.next; }
+    }                                // arena freed here
+    print("sum = " + sum);
+
+    // Named + nested arenas: `new@outer` targets an enclosing region.
+    let picked = 0;
+    arena outer {
+        let keep = new@outer Node();
+        keep.value = 42;
+        arena {
+            let tmp = new Node();    // inner arena
+            tmp.value = 7;
+            keep.next = null;
+            picked = keep.value + tmp.value;
+        }                            // inner freed; `keep` (outer) still valid
+        picked += keep.value;
+    }
+    print("picked = " + picked);
+}

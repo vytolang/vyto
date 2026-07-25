@@ -11,7 +11,7 @@ static const struct { const char *name; TokKind kind; } keywords[] = {
     {"while", T_WHILE}, {"for", T_FOR}, {"in", T_IN}, {"return", T_RETURN},
     {"break", T_BREAK}, {"continue", T_CONTINUE}, {"true", T_TRUE},
     {"false", T_FALSE}, {"null", T_NULL}, {"this", T_THIS}, {"as", T_AS},
-    {"super", T_SUPER}, {"Map", T_MAP}, {"builder", T_BUILDER},
+    {"super", T_SUPER}, {"Map", T_MAP}, {"builder", T_BUILDER}, {"arena", T_ARENA},
 };
 
 void lex_init(Lexer *lx, const char *file, const char *src) {
@@ -178,6 +178,7 @@ static void scan(Lexer *lx, Token *t) {
     case ';': t->kind = T_SEMI; return;
     case ':': t->kind = T_COLON; return;
     case '#': t->kind = T_HASH; return;
+    case '@': t->kind = T_AT; return;
     case '.':
         if (lx_look(lx) == '.') { lx_getc(lx); t->kind = T_DOTDOT; return; }
         t->kind = T_DOT; return;

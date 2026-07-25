@@ -115,6 +115,9 @@ struct Expr {
     FnDecl *method;         /* REF_METHOD target */
     int builtin;            /* BuiltinKind for REF_BUILTIN */
     bool is_super_call;     /* super.init(...) */
+    bool region_local;      /* EX_NEW resolved to arena allocation (region > 0) */
+    const char *region_name; /* EX_NEW `new@name`: target arena name (interned); NULL = innermost */
+    int region;             /* region id an expression's value lives in: 0 = heap, else arena id */
     FnDecl *fn_lit;         /* EX_ARROW body as a synthetic FnDecl */
     Type **type_args;       /* explicit f<T,...>(...) / New<T>(...) type args */
     int ntype_args;
@@ -165,6 +168,7 @@ typedef enum BuiltinKind {
 typedef enum StmtKind {
     ST_LET, ST_EXPR, ST_IF, ST_WHILE, ST_FOR_RANGE, ST_FOR_EACH,
     ST_RETURN, ST_BREAK, ST_CONTINUE, ST_BLOCK,
+    ST_ARENA,   /* arena [name] { body } — lexical region (uses Stmt.name/body) */
 } StmtKind;
 
 struct Stmt {
@@ -184,6 +188,7 @@ struct Stmt {
     /* for */
     Expr *range_lo, *range_hi; /* ST_FOR_RANGE */
     Expr *iter;                /* ST_FOR_EACH: array expr */
+    int region;                /* ST_ARENA: region id assigned by checker (names _rgn<id>) */
 };
 
 /* ---------------- declarations ---------------- */
@@ -218,6 +223,14 @@ struct FnDecl {
     /* checker outputs */
     Local *locals;          /* linked list of all locals incl. params */
     int ntemps;
+    /* escape summary (--regions): esc_param[i] true if param i may escape this
+       fn (returned / stored into a heap object, array, map or global / captured
+       / passed to an escaping position). esc_this likewise for a method's `this`.
+       Conservative: unknown/indirect/virtual callees escape their args. */
+    bool *esc_param;        /* length nparams; NULL until computed */
+    bool esc_this;
+    bool esc_computed;      /* summary fixpoint has run */
+    bool has_region;        /* body contains >=1 region_local allocation */
     /* closures */
     Capture *captures;
     int ncaptures;
