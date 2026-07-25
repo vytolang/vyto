@@ -50,6 +50,20 @@ void *vt_alloc(size_t size, const VtType *type); /* zeroed, rc = 1 */
 void vt_release(void *p);
 void vt_free_now(void *p);
 
+/* ---- regions: bump arena for escape-proven-local objects (Phase 2) --------
+   Objects allocated from a region carry a negative rc sentinel, so vt_retain /
+   vt_release treat them as immortal (no-op) and never free them individually;
+   the whole arena is dropped in one vt_region_close. Only emitted when the
+   compiler proves an allocation cannot escape its scope (the --regions path) —
+   default codegen never references these. MVP restriction: region objects hold
+   no external (RC) references, so close needs no per-object deinit walk. */
+#define VT_RC_REGION (-2) /* distinct from immortal (-1); still < 0 => RC no-op */
+typedef struct VtRegionChunk VtRegionChunk;
+typedef struct VtRegion { char *bump, *end; VtRegionChunk *chunks; } VtRegion;
+void vt_region_open(VtRegion *r);
+void *vt_ralloc(VtRegion *r, size_t size, const VtType *type); /* zeroed, rc sentinel */
+void vt_region_close(VtRegion *r); /* frees the whole arena; no per-object deinit */
+
 static inline void *vt_retain(void *p) {
     if (p) {
         VtObj *o = (VtObj *)p;

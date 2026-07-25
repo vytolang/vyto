@@ -365,6 +365,45 @@ void *vt_alloc(size_t size, const VtType *type) {
     return o;
 }
 
+/* ---- regions (Phase 2) ---- */
+#define VT_REGION_CHUNK (64u * 1024u)
+struct VtRegionChunk { VtRegionChunk *next; }; /* header; object bytes follow */
+
+void vt_region_open(VtRegion *r) { r->bump = NULL; r->end = NULL; r->chunks = NULL; }
+
+static void region_grow(VtRegion *r, size_t need) {
+    size_t csz = VT_REGION_CHUNK;
+    if (need + sizeof(VtRegionChunk) > csz) csz = need + sizeof(VtRegionChunk);
+    VtRegionChunk *c = vt_host_alloc(csz); /* zeroed */
+    if (!c) vt_oom();
+    c->next = r->chunks;
+    r->chunks = c;
+    r->bump = (char *)c + sizeof(VtRegionChunk);
+    r->end = (char *)c + csz;
+}
+
+void *vt_ralloc(VtRegion *r, size_t size, const VtType *type) {
+    size = (size + 7u) & ~(size_t)7u; /* 8-align the next slot */
+    if (r->bump + size > r->end) region_grow(r, size);
+    VtObj *o = (VtObj *)r->bump;
+    r->bump += size;
+    o->rc = VT_RC_REGION; /* negative => retain/release no-op, never freed alone */
+    o->type = type;
+    return o; /* remaining bytes already zero (chunk came zeroed) */
+}
+
+void vt_region_close(VtRegion *r) {
+    VtRegionChunk *c = r->chunks;
+    while (c) {
+        VtRegionChunk *n = c->next;
+        vt_host_free(c);
+        c = n;
+    }
+    r->bump = NULL;
+    r->end = NULL;
+    r->chunks = NULL;
+}
+
 /* ---- auto-zeroing weak references ----
    A `weak` field stores a raw, non-owning T*. We record the address of every
    such slot in a side table keyed by the target object; when the target is
