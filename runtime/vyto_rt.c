@@ -16,9 +16,125 @@
 #ifndef VT_NO_LIBC
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+
+/* ---- transparent size-class pool allocator (VT_POOL) --------------------
+ *
+ * Vyto allocates one small, refcounted object per node/string/array/map-entry
+ * and frees each individually. Under a raw calloc/free that is the dominant
+ * cost on allocation-heavy workloads. This pool sits under the host hooks so
+ * EVERY runtime allocation benefits with no caller or semantic change: small
+ * requests are served from per-size-class slabs carved out of 64 KiB chunks
+ * (bump on first use, freelist on reuse); large requests fall through to libc.
+ *
+ * Layout: every allocation carries an 8-byte header word. Small: the word is
+ * the class index (< VT_NCLASS). Large: low byte 0xFF, high 56 bits the size.
+ * free()/realloc() read the header to route. Pools are thread-local (__thread)
+ * so alloc/free are lock-free; a cross-thread free just migrates a same-size
+ * slot onto the freeing thread's freelist (each object is freed exactly once).
+ * Chunks are never returned to the OS (reused via freelists) — MVP simple.
+ *
+ * The 8-byte header trades a little per-object memory for a portable, robust
+ * pointer->class lookup; a later pass can move to aligned spans to reclaim it.
+ * Disable with -DVT_NO_POOL (then the hooks are plain calloc/realloc/free). */
+#if !defined(VT_NO_POOL)
+#define VT_POOL 1
+#endif
+
+#ifdef VT_POOL
+#define VT_HDR       8u
+#define VT_CHUNK     (64u * 1024u)
+#define VT_LARGE_TAG 0xFFu
+static const unsigned pool_slot[] = {16, 32, 48, 64, 96, 128, 192, 256, 384, 512};
+#define VT_NCLASS ((int)(sizeof pool_slot / sizeof pool_slot[0]))
+#define VT_POOL_MAX 512u
+
+typedef struct { void *freelist; char *bump, *end; } PoolClass;
+static __thread PoolClass g_pool[VT_NCLASS];
+
+static int pool_class_of(size_t total) { /* total includes VT_HDR */
+    for (int i = 0; i < VT_NCLASS; i++)
+        if (total <= pool_slot[i]) return i;
+    return -1;
+}
+
+static void *vt_host_alloc(size_t n) {
+    if (!n) n = 1;
+    size_t total = n + VT_HDR;
+    int c = (total <= VT_POOL_MAX) ? pool_class_of(total) : -1;
+    if (c < 0) { /* large: calloc keeps the OS lazy-zero-page win for big
+                    buffers (malloc+memset would eagerly fault every page).
+                    Header carries the size for realloc/copy. */
+        uint64_t *h = (uint64_t *)calloc(1, n + VT_HDR);
+        if (!h) return NULL;
+        h[0] = ((uint64_t)n << 8) | VT_LARGE_TAG;
+        return (char *)h + VT_HDR;
+    }
+    PoolClass *pc = &g_pool[c];
+    char *slot;
+    if (pc->freelist) {
+        slot = (char *)pc->freelist;
+        pc->freelist = *(void **)slot;
+        memset(slot, 0, pool_slot[c]); /* reused slot is dirty */
+    } else {
+        if (pc->bump + pool_slot[c] > pc->end) {
+            char *chunk = (char *)calloc(1, VT_CHUNK); /* zeroed once */
+            if (!chunk) return NULL;
+            pc->bump = chunk;
+            pc->end = chunk + VT_CHUNK;
+        }
+        slot = pc->bump;
+        pc->bump += pool_slot[c]; /* fresh chunk bytes are already zero */
+    }
+    *(uint64_t *)slot = (uint64_t)c;
+    return slot + VT_HDR;
+}
+
+static void vt_host_free(void *p) {
+    if (!p) return;
+    uint64_t *h = (uint64_t *)((char *)p - VT_HDR);
+    uint64_t hv = *h;
+    if ((hv & 0xFF) == VT_LARGE_TAG) { free(h); return; }
+    int c = (int)hv;
+    *(void **)h = g_pool[c].freelist; /* intrusive freelist, next at slot start */
+    g_pool[c].freelist = h;
+}
+
+static void *vt_host_realloc(void *p, size_t n) {
+    if (!p) return vt_host_alloc(n);
+    if (!n) { vt_host_free(p); return NULL; }
+    uint64_t *h = (uint64_t *)((char *)p - VT_HDR);
+    uint64_t hv = *h;
+    int newc = (n + VT_HDR <= VT_POOL_MAX) ? pool_class_of(n + VT_HDR) : -1;
+    if ((hv & 0xFF) == VT_LARGE_TAG) {
+        size_t oldn = (size_t)(hv >> 8);
+        if (newc < 0) { /* large -> large: libc realloc, refresh header */
+            uint64_t *nh = (uint64_t *)realloc(h, n + VT_HDR);
+            if (!nh) return NULL;
+            nh[0] = ((uint64_t)n << 8) | VT_LARGE_TAG;
+            return (char *)nh + VT_HDR;
+        }
+        void *np = vt_host_alloc(n); /* large -> small */
+        if (!np) return NULL;
+        memcpy(np, p, oldn < n ? oldn : n);
+        vt_host_free(p);
+        return np;
+    }
+    int c = (int)hv;
+    if (newc == c) return p; /* same class, fits in place */
+    void *np = vt_host_alloc(n);
+    if (!np) return NULL;
+    size_t oldpayload = pool_slot[c] - VT_HDR;
+    memcpy(np, p, oldpayload < n ? oldpayload : n);
+    vt_host_free(p);
+    return np;
+}
+#else
 static void *vt_host_alloc(size_t n) { return calloc(1, n ? n : 1); }
 static void *vt_host_realloc(void *p, size_t n) { return realloc(p, n); }
 static void vt_host_free(void *p) { free(p); }
+#endif
+
 static void vt_host_write(const char *buf, size_t len) { fwrite(buf, 1, len, stdout); }
 static void vt_host_write_err(const char *buf, size_t len) { fwrite(buf, 1, len, stderr); }
 VT_NORETURN static void vt_host_abort(void) { exit(101); }
