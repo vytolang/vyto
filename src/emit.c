@@ -616,6 +616,10 @@ static char *emit_call(Em *em, Expr *e, bool *fresh) {
         case B_BYTES:
             *fresh = true;
             return arena_printf(&g_arena, "vt_arr_bytes(%s)", ex_b(em, a[0]));
+        case B_STRBYTES:
+            *fresh = true;
+            return arena_printf(&g_arena, "vt_str_new((const char*)vt_arr_data(%s), %s)",
+                                ex_b(em, a[0]), ex_v(em, a[1], NULL));
         /* ---- int methods ---- */
         case B_INT_ABS:
             return arena_printf(&g_arena, "vt_int_abs(%s, \"%s\", %d)", ex_b(em, recv),

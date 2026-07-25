@@ -109,22 +109,50 @@ export class File {
         this.ensure();
         let cap = 65536;
         if (this.lb == null) { this.lb = bytes(cap); } // one buffer per File, reused
-        let out = "";
+        let n = vfile_readline(this.h, this.lb as cstring, cap as i64) as int;
+        if (n <= 0) { return ""; }
+        // fast path (the common case): the whole line fit in one read, so build
+        // the trimmed string once straight from the buffer — no strlen, no
+        // concat, no slice (was 3 allocations per line).
+        if ((this.lb[n - 1] as int) == 10) {
+            let e = n - 1;                                       // drop '\n'
+            if (e > 0 && (this.lb[e - 1] as int) == 13) { e -= 1; } // drop '\r'
+            return strbytes(this.lb, e);
+        }
+        // slow path: a line longer than the buffer (no newline yet) — stitch.
+        let out = strbytes(this.lb, n);
         while (true) {
-            let n = vfile_readline(this.h, this.lb as cstring, cap as i64) as int;
-            if (n <= 0) { break; }
-            let chunk = str(this.lb as cstring);
-            if (chunk.len > 0 && chunk[chunk.len - 1] == 10) { // '\n': line done
-                out = out + chunk;
-                break;
-            }
-            out = out + chunk; // no newline yet: a >64 KiB line, or EOF next call
+            let m = vfile_readline(this.h, this.lb as cstring, cap as i64) as int;
+            if (m <= 0) { break; }
+            if ((this.lb[m - 1] as int) == 10) { out = out + strbytes(this.lb, m); break; }
+            out = out + strbytes(this.lb, m);
         }
         let e = out.len;
         if (e > 0 && out[e - 1] == 10) { e -= 1; }
         if (e > 0 && out[e - 1] == 13) { e -= 1; }
         return out.slice(0, e);
     }
+
+    // Zero-allocation line read: fill the reused line buffer and return the
+    // number of bytes (trailing \n/\r stripped), or -1 at EOF. The bytes live in
+    // `lineBuf()` until the next call — parse them in place (no string is made).
+    // For parse-heavy streaming this removes the per-line string entirely.
+    fn readLineBytes(): int {
+        this.ensure();
+        let cap = 65536;
+        if (this.lb == null) { this.lb = bytes(cap); }
+        let n = vfile_readline(this.h, this.lb as cstring, cap as i64) as int;
+        if (n <= 0) { return -1; }
+        // (a >64 KiB line is truncated to the buffer here — readLine handles the
+        // stitched case when a full string is actually needed.)
+        if ((this.lb[n - 1] as int) == 10) {
+            n -= 1;
+            if (n > 0 && (this.lb[n - 1] as int) == 13) { n -= 1; }
+        }
+        return n;
+    }
+    // The reused line buffer backing readLineBytes.
+    fn lineBuf(): byte[] { this.ensure(); return this.lb; }
 
     // Write raw bytes; returns the count written (-1 on error).
     fn writeBytes(b: byte[]): int {
@@ -236,6 +264,9 @@ export class BufReader {
 
     // Next line without its trailing newline; "" at EOF (pair with eof()).
     fn readLine(): string { return this.f.readLine(); }
+    // Zero-alloc line read: byte count in lineBuf(), or -1 at EOF. Parse in place.
+    fn readLineBytes(): int { return this.f.readLineBytes(); }
+    fn lineBuf(): byte[] { return this.f.lineBuf(); }
     // Up to `n` raw bytes (binary-safe); length is what was actually read.
     fn read(n: int): byte[] { return this.f.read(n); }
     fn eof(): bool { return this.f.eof(); }

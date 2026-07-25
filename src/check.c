@@ -1312,6 +1312,20 @@ static Type *check_call(Ctx *c, Expr *e, Type *expected) {
             t->elem = mk_type(TY_BYTE);
             return e->type = t;
         }
+        /* strbytes(b, n): make a string from the first n bytes of a byte[], with
+           no strlen scan — a length-aware alternative to str(b as cstring). */
+        if (n == intern("strbytes")) {
+            if (e->nargs != 2) fatal_at(e->loc, "strbytes takes 2 arguments");
+            check_expr(c, e->args[0], NULL);
+            if (e->args[0]->type->kind != TY_ARRAY ||
+                norm_kind(e->args[0]->type->elem->kind) != TY_BYTE)
+                fatal_at(e->loc, "strbytes expects a byte[] as its first argument");
+            check_expr(c, e->args[1], ty_int());
+            want(c, e->args[1], ty_int(), "length");
+            e->ref = REF_BUILTIN;
+            e->builtin = B_STRBYTES;
+            return e->type = ty_string();
+        }
         /* local closure variable? */
         Local *l = lookup_value(c, callee, n);
         if (l) {
