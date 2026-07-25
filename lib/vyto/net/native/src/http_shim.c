@@ -79,6 +79,40 @@ static void ensure_global_init(void) {
     if (!inited) { curl_global_init(CURL_GLOBAL_DEFAULT); inited = 1; }
 }
 
+/* Address family to resolve with, applied to every request this process makes.
+
+   Process-global rather than a per-request argument on purpose: which families
+   resolve usefully is a property of the network the process is running on, not
+   of any individual call, and it has to apply to every request equally — a
+   per-request flag would mean every call site opting in, and would have meant
+   changing the http_perform / http_multi_add signatures that callers (and
+   apps binding these symbols directly) already depend on.
+
+   Use it when a network only carries one family and connections to the other
+   waste time failing, or when a server's records for one family are broken.
+
+   What it is NOT a reliable cure for: slow COLD DNS lookups on a host whose
+   resolver stalls resolving both families at once. That failure looks like an
+   obvious candidate, and on the machine this was written on `getent ahosts`
+   (A+AAAA) took ~5.1s against ~0.02s for `getent ahostsv4` — but forcing V4
+   here measured no better than the default over repeated cold-host trials
+   (~5.5-7.6s either way). The stall in that case lives in glibc's AF_UNSPEC
+   getaddrinfo path rather than anywhere libcurl can be steered away from; the
+   fix for it is resolver configuration (e.g. `options single-request-reopen`),
+   not this option. Measure before assuming this helps.
+
+   Default is CURL_IPRESOLVE_WHATEVER, so behaviour is unchanged unless an app
+   asks for something else. */
+static long g_ip_resolve = CURL_IPRESOLVE_WHATEVER;
+
+/* mode: 0 = whatever (default), 4 = IPv4 only, 6 = IPv6 only. Anything else is
+   treated as 0. Affects requests started after the call. */
+void http_ipresolve_set(int mode) {
+    if (mode == 4)      g_ip_resolve = CURL_IPRESOLVE_V4;
+    else if (mode == 6) g_ip_resolve = CURL_IPRESOLVE_V6;
+    else                g_ip_resolve = CURL_IPRESOLVE_WHATEVER;
+}
+
 /* Configure a fresh easy handle to write into `r`. Stashes the header slist in
    r->hl so it outlives the transfer (needed for the multi path) and is freed by
    http_free. */
@@ -93,6 +127,7 @@ static void configure_easy(CURL *curl, const char *method, const char *url,
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(curl, CURLOPT_USERAGENT, "vyto-http/0.1");
+    curl_easy_setopt(curl, CURLOPT_IPRESOLVE, g_ip_resolve);
     if (timeout_ms > 0) {
         curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, timeout_ms);
     } else {
@@ -207,6 +242,7 @@ long http_stream(const char *method, const char *url, const char *header_lines,
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(curl, CURLOPT_USERAGENT, "vyto-http/0.1");
+    curl_easy_setopt(curl, CURLOPT_IPRESOLVE, g_ip_resolve);
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
     if (timeout_ms > 0) curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, timeout_ms);
 

@@ -38,6 +38,7 @@ extern "C" {
     fn http_multi_perform(h: rawptr, timeout_ms: i32): i32;
     fn http_multi_next_done(h: rawptr): rawptr;
     fn http_multi_free(h: rawptr);
+    fn http_ipresolve_set(mode: i32);
 }
 
 // A completed HTTP response. Owns the native buffer; freed on teardown.
@@ -250,6 +251,28 @@ export fn http_chunk_bytes(chunk: cstring, len: int): byte[] {
     http_chunk_copy(chunk, b as cstring, len as i32);
     return b;
 }
+
+// ---- address-family selection -------------------------------------------
+//
+// Which IP families requests may resolve to. Process-wide and applies to every
+// later request (blocking, pooled and streaming alike), because this is a
+// property of the network the process is on rather than of any one call.
+//
+// The reason to reach for it: on a host with no working IPv6, every COLD DNS
+// lookup waits out the full resolver timeout on the AAAA query before falling
+// back to A — ~5s on a stock systemd-resolved, paid once per hostname, and it
+// lands on the first request an app makes. IP_V4 skips the AAAA lookup
+// entirely. Measured on such a host, cold names: A-only 0.03s, A+AAAA 5.3s.
+//
+// Leave it alone unless you have that problem; forcing a family is wrong on a
+// network where only the other one works.
+//
+//     if (!ipv6Usable()) { http_set_ip_resolve(IP_V4); }
+export const IP_ANY: int = 0;   // default: whatever resolves
+export const IP_V4: int = 4;
+export const IP_V6: int = 6;
+
+export fn http_set_ip_resolve(mode: int) { http_ipresolve_set(mode as i32); }
 
 export fn http_request(method: string, url: string): Request { return new Request(method, url); }
 export fn http_get(url: string): Request { return new Request("GET", url); }
