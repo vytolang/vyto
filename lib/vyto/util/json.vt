@@ -583,6 +583,45 @@ export fn jsonToIntsInto(text: string, out: int[]): int {
     return out.len;
 }
 
+// Decode a JSON array of integers straight from a byte buffer range into a
+// reused array — no string is created (the byte twin of jsonToIntsInto). Pairs
+// with File.readLineBytes() for a fully allocation-free streaming parse loop:
+//
+//     while (!r.eof()) {
+//         let n = r.readLineBytes(); if (n < 0) { break; }
+//         jsonBytesToInts(r.lineBuf(), n, row);   // row reused each line
+//         sum += row[1];
+//     }
+//
+// Soft-fail like the other decoders: stops and returns what was decoded.
+export fn jsonBytesToInts(b: byte[], len: int, out: int[]): int {
+    out.clear();
+    let i = 0;
+    while (i < len && (b[i] as int) <= 32) { i += 1; }           // ws
+    if (i >= len || (b[i] as int) != 91) { return 0; }           // '['
+    i += 1;
+    while (i < len) {
+        while (i < len && (b[i] as int) <= 32) { i += 1; }
+        if (i < len && (b[i] as int) == 93) { i += 1; return out.len; } // ']'
+        let neg = false;
+        if (i < len && (b[i] as int) == 45) { neg = true; i += 1; }     // '-'
+        let start = i;
+        let v = 0;
+        while (i < len && (b[i] as int) >= 48 && (b[i] as int) <= 57) {
+            v = v * 10 + ((b[i] as int) - 48);
+            i += 1;
+        }
+        if (i == start) { return out.len; }                       // not a number
+        if (neg) { v = -v; }
+        out.push(v);
+        while (i < len && (b[i] as int) <= 32) { i += 1; }
+        if (i < len && (b[i] as int) == 44) { i += 1; }           // ',' → continue
+        else if (i < len && (b[i] as int) == 93) { i += 1; return out.len; } // ']'
+        else { return out.len; }
+    }
+    return out.len;
+}
+
 // "[1,2.5]" -> float[].
 export fn jsonToFloats(text: string): float[] {
     let out: float[] = [];
