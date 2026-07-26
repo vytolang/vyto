@@ -476,6 +476,18 @@ export class Positioned extends Box {
     top: float;
     w: float;
     h: float;
+    // Offsets from the far edges of the enclosing Stack, for chrome that has
+    // to sit against the right or bottom (a zoom control, a status pill, a
+    // close button). Negative means "not anchored on this axis", so left/top
+    // keep their meaning and existing code is unaffected; when set, the far
+    // edge takes precedence over left/top on that axis.
+    //
+    // These need the Stack's size, which arrange()'s own rect does not carry
+    // (Stack hands each child a rect sized to that child), so they are
+    // resolved against parent.bounds -- valid by the time a child is
+    // arranged, since Stack sets its own bounds first.
+    right: float;
+    bottom: float;
 
     fn init(left: float, top: float, w: float, h: float, child: Widget) {
         super.init();
@@ -483,7 +495,18 @@ export class Positioned extends Box {
         this.top = top;
         this.w = w;
         this.h = h;
+        this.right = -1.0;
+        this.bottom = -1.0;
         if (child != null) { this.add(child); }
+    }
+
+    // Anchor to the right and/or bottom edge; negative leaves that axis on
+    // left/top. `new Positioned(0,0,-1,-1,child).anchor(12, 12)` pins a
+    // natural-size child 12px in from the bottom-right corner.
+    builder fn anchor(right: float, bottom: float) {
+        this.right = right;
+        this.bottom = bottom;
+        return this;
     }
 
     override fn measure(s: Painter, th: Theme): Size {
@@ -499,7 +522,18 @@ export class Positioned extends Box {
         let c = this.child();
         if (cw < 0.0 && c != null) { cw = c.measure(s, th).w; }
         if (ch < 0.0 && c != null) { ch = c.measure(s, th).h; }
-        let pr = Rect(r.x + this.left, r.y + this.top, cw, ch);
+        let x = r.x + this.left;
+        let y = r.y + this.top;
+        // far-edge anchoring, measured against the Stack rather than `r`
+        if (this.parent != null) {
+            if (this.right >= 0.0) {
+                x = r.x + this.parent.bounds.w - cw - this.right;
+            }
+            if (this.bottom >= 0.0) {
+                y = r.y + this.parent.bounds.h - ch - this.bottom;
+            }
+        }
+        let pr = Rect(x, y, cw, ch);
         this.bounds = pr; // cover the child for hit-testing
         if (c != null) { c.arrange(s, th, pr); }
     }

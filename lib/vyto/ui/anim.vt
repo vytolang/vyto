@@ -25,6 +25,21 @@ export class Animator {
     done: bool;
     bounds: Rect;
     track_bounds: bool;
+    // True only while this animator's own advance() is running its callback.
+    // cancel() consults it so that stopping an animator from inside its own
+    // callback — the natural way to write "keep polling until the work is
+    // done" — does not free the closure that is still executing. See cancel().
+    ticking: bool;
+    // Set when this animator drives no pixels of its own — a timer, not an
+    // animation. Window.tick then advances it without marking anything dirty.
+    //
+    // Without this every looping Tween costs a full repaint on every frame,
+    // because advance() reports "moved" unconditionally and has no way to say
+    // "I ran, nothing changed". Using a Tween purely to poll therefore pinned
+    // a core at ~60fps on a completely idle window. Callbacks that DO change
+    // something call invalidate() themselves, exactly as event handlers do.
+    // Default false, so existing animators behave as before.
+    passive: bool;
 
     // Step by dt_ms; return true on any frame that changed pixels (so tick
     // marks the region dirty). Base is inert.
@@ -43,9 +58,18 @@ export class Animator {
 
     // Stop permanently; tick drops it next pass, returning the loop to the
     // blocking wait when none remain.
+    //
+    // Safe to call from inside this animator's own callback, which is where
+    // you naturally write it ("poll until the response lands, then stop").
+    // Releasing there would free the on_tick closure while it is still on the
+    // stack — and Widget.animate()'s wrapper touches the tween again after the
+    // user callback returns, so the free is a use-after-free that segfaults.
+    // When cancelled mid-tick, leave the release to Window.tick, whose
+    // `if (retain()) ... else release()` already runs at the safe moment, just
+    // after advance() has returned.
     fn cancel() {
         this.done = true;
-        this.release();
+        if (!this.ticking) { this.release(); }
     }
 }
 
@@ -84,7 +108,13 @@ export class Tween extends Animator {
             t = this.elapsed_ms as float / this.duration_ms as float;
             if (t >= 1.0) { t = 1.0; this.done = true; }
         }
-        if (this.on_tick != null) { this.on_tick(t); }
+        // `ticking` brackets the callback so cancel() called from inside it
+        // defers the release to Window.tick — see Animator.cancel.
+        if (this.on_tick != null) {
+            this.ticking = true;
+            this.on_tick(t);
+            this.ticking = false;
+        }
         return true;
     }
 }

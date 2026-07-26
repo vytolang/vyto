@@ -523,6 +523,11 @@ export class ListBox extends Widget {
     scroll: int;                // first visible row
     onToggle: fn(int);
     onDelete: fn(int);
+    // Fires whenever the selected row changes -- by click or by keyboard.
+    // Distinct from onToggle, which reports the checkbox flipping: a list used
+    // as a picker cares which row is current, not whether it is ticked. Without
+    // this the only way to observe a selection was to poll `selected`.
+    onSelect: fn(int);
 
     fn init() {
         super.init();
@@ -535,6 +540,12 @@ export class ListBox extends Widget {
     fn set_items(items: string[], checked: bool[]) {
         this.items = items;
         this.checked = checked;
+        // Pad the checked flags out to match the items. Passing an empty array
+        // is the natural way to say "no checkboxes here" -- a list used purely
+        // as a picker, which is what onSelect is for -- but on_click indexes
+        // this array unguarded, so a short one made the first click panic with
+        // an out-of-bounds rather than doing anything sensible.
+        while (this.checked.len < items.len) { this.checked.push(false); }
         if (this.selected >= items.len) { this.selected = items.len - 1; }
         if (this.selected < 0 && items.len > 0) { this.selected = 0; }
         if (this.scroll > 0 && this.scroll >= items.len) { this.scroll = items.len - 1; }
@@ -560,8 +571,16 @@ export class ListBox extends Widget {
         let s = this.selected + delta;
         if (s < 0) { s = 0; }
         if (s >= this.items.len) { s = this.items.len - 1; }
-        this.selected = s;
+        this.set_selected(s);
         this.scroll_into_view();
+    }
+
+    // Single place selection changes, so onSelect can't be missed by a future
+    // caller. Only fires on an actual change.
+    fn set_selected(i: int) {
+        if (i == this.selected) { return; }
+        this.selected = i;
+        if (this.onSelect != null) { this.onSelect(i); }
     }
 
     override fn measure(s: Painter, th: Theme): Size {
@@ -611,7 +630,7 @@ export class ListBox extends Widget {
         if (idx < 0 || idx >= this.items.len) { return false; }
         // toggle the checked state and fire the callback on every click
         this.checked[idx] = !this.checked[idx];
-        this.selected = idx;
+        this.set_selected(idx);
         if (this.onToggle != null) { this.onToggle(idx); }
         return true;
     }
@@ -645,6 +664,7 @@ export class ListBox extends Widget {
     override fn drop_handlers() {
         this.onToggle = null;
         this.onDelete = null;
+        this.onSelect = null;
     }
 }
 
@@ -1854,6 +1874,10 @@ export class Slider extends Widget {
     fine: float;         // Shift-held increment (default 0.01)
     dragging: bool;      // thumb held (larger thumb while true)
     onChange: fn(float);
+    // Run bottom-to-top instead of left-to-right. 1.0 sits at the TOP, which
+    // is what a vertical control means everywhere it appears (volume, zoom),
+    // so the value axis is inverted against screen y.
+    vertical: bool;
 
     fn init(value: float) {
         super.init();
@@ -1862,6 +1886,10 @@ export class Slider extends Widget {
         this.fine = 0.01;
         this.focusable = true;
     }
+
+    // `new Slider(0.5).vert()` — orientation is a builder rather than a
+    // constructor arg so existing call sites are untouched.
+    builder fn vert() { this.vertical = true; return this; }
 
     fn clamp01(v: float): float {
         if (v < 0.0) { return 0.0; }
@@ -1880,43 +1908,66 @@ export class Slider extends Widget {
     // horizontal travel available to the thumb centre (track minus thumb radius
     // on each end).
     fn thumb_r(): float {
-        let r = this.bounds.h / 2.0;
+        let across = this.bounds.h;          // thickness across the track
+        if (this.vertical) { across = this.bounds.w; }
+        let r = across / 2.0;
         if (r < 6.0) { r = 6.0; }
         return r;
     }
     fn travel(): float {
-        let t = this.bounds.w - 2.0 * this.thumb_r();
+        let along = this.bounds.w;           // length along the track
+        if (this.vertical) { along = this.bounds.h; }
+        let t = along - 2.0 * this.thumb_r();
         if (t < 1.0) { t = 1.0; }
         return t;
     }
 
     override fn measure(s: Painter, th: Theme): Size {
-        return Size(160.0, s.font_height() + 8.0);
+        let thick = s.font_height() + 8.0;
+        if (this.vertical) { return Size(thick, 160.0); }
+        return Size(160.0, thick);
     }
 
-    // map an absolute x to a value along the track.
-    fn value_at(x: int): float {
+    // map an absolute position to a value along the track. Vertical inverts,
+    // so the top of the track is 1.0.
+    fn value_at(x: int): float { return this.value_at_xy(x, 0); }
+    fn value_at_xy(x: int, y: int): float {
+        if (this.vertical) {
+            let relv = this.bounds.bottom() - this.thumb_r() - (y as float);
+            return this.clamp01(relv / this.travel());
+        }
         let rel = x as float - this.bounds.x - this.thumb_r();
         return this.clamp01(rel / this.travel());
     }
 
     override fn render(s: Painter, th: Theme) {
         let r = this.thumb_r();
-        let cy = this.bounds.cy();
-        // groove: a thin rounded track centred vertically
         let gh = 4.0;
-        let groove = Rect(this.bounds.x + r, cy - gh / 2.0, this.travel(), gh);
+        let along = this.value * this.travel();
+        let cx = 0.0;
+        let cy = 0.0;
+        let groove = Rect(0.0, 0.0, 0.0, 0.0);
+        let fr = Rect(0.0, 0.0, 0.0, 0.0);
+        if (this.vertical) {
+            cx = this.bounds.cx();
+            // value grows upward, so the thumb runs from the bottom
+            cy = this.bounds.bottom() - r - along;
+            groove = Rect(cx - gh / 2.0, this.bounds.y + r, gh, this.travel());
+            // fill from the thumb down to the foot of the track
+            fr = Rect(groove.x, cy, gh, groove.bottom() - cy);
+        } else {
+            cy = this.bounds.cy();
+            cx = this.bounds.x + r + along;
+            groove = Rect(this.bounds.x + r, cy - gh / 2.0, this.travel(), gh);
+            fr = Rect(groove.x, groove.y, along, gh);
+        }
         this.win.skin.track.paint_track(s, th, groove, gh / 2.0, th.surface_sunken);
-        // filled portion up to the thumb
-        let fx = this.value * this.travel();
-        if (fx > 0.0) {
-            let fr = Rect(groove.x, groove.y, fx, gh);
+        if (fr.w > 0.0 && fr.h > 0.0) {
             this.win.skin.track.paint_fill(s, th, fr, gh / 2.0, th.primary, th.primary_700);
         }
         // thumb
         let tr = r;
         if (this.dragging) { tr = r + 1.0; }
-        let cx = this.bounds.x + r + fx;
         let tb = Rect(cx - tr, cy - tr, 2.0 * tr, 2.0 * tr);
         let ink = th.primary;
         if (this.focused || this.dragging) { ink = th.primary_700; }
@@ -1925,7 +1976,7 @@ export class Slider extends Widget {
     }
 
     override fn on_click(x: int, y: int): bool {
-        this.set_value(this.value_at(x));
+        this.set_value(this.value_at_xy(x, y));
         return true;
     }
 
@@ -1935,9 +1986,11 @@ export class Slider extends Widget {
     }
 
     override fn on_drag(dx: int, dy: int): bool {
-        // move proportionally to the horizontal delta; Shift = fine control.
+        // move proportionally along the track; Shift = fine control. Vertical
+        // negates because screen y grows downward while value grows upward.
         let span = this.travel();
         let d = dx as float / span;
+        if (this.vertical) { d = -(dy as float) / span; }
         if ((this.mods() & MOD_SHIFT) != 0) { d = d / 4.0; }
         this.set_value(this.value + d);
         return true;

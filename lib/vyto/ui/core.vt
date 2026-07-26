@@ -1132,6 +1132,12 @@ export class Widget {
     t_exit: AnimatedFloat;
     exiting: Widget[];
     grow: int;          // flex factor inside Column/Row; 0 = natural size
+    // Set by a widget that has children AND paints content of its own in
+    // render(). Makes the dirty-rect path draw this whole subtree rather than
+    // just chrome + children, which would drop that content. See
+    // render_within. Costs the pruning of partial repaints for this subtree,
+    // so only set it where it is actually needed.
+    custom_paint: bool;
     alignSelf: int;     // cross-axis override inside Column/Row; -1 = inherit
     modal: bool;        // overlay traps events; outside clicks don't dismiss
     win: weak Window;   // set on overlays/menubar so they can drive the Window
@@ -1312,6 +1318,26 @@ export class Widget {
             apply(ease_apply(ease_id, t));
             tw.bounds = w.bounds;
         };
+        this.register_anim(tw);
+        return tw;
+    }
+
+    // A repeating timer, not an animation: calls `apply` every frame until it
+    // is cancelled, without repainting anything by itself. For work that needs
+    // a periodic nudge — polling a socket, advancing a queue — where most ticks
+    // change nothing on screen.
+    //
+    // Use this rather than a looping animate(): that repaints the widget every
+    // frame whether or not the callback did anything, which is enough to pin a
+    // core on an idle window. If a tick does change something visible, call
+    // invalidate() from inside `apply`.
+    //
+    // Cancel it via the returned Tween — including from inside `apply`, which
+    // Animator.cancel handles safely.
+    fn ticker(period_ms: int, apply: fn()): Tween {
+        let tw = new Tween(period_ms, true);
+        tw.passive = true;
+        tw.on_tick = (t) => { apply(); };
         this.register_anim(tw);
         return tw;
     }
@@ -1603,7 +1629,14 @@ export class Widget {
     // d from the previous frame, so only the changed region is repainted.
     virtual fn render_within(s: Painter, th: Theme, d: Rect) {
         if (!rect_overlaps(this.bounds, d)) { return; }
-        if (this.children.len == 0) {
+        // A leaf paints itself. A container paints its chrome and lets each
+        // child re-test against the dirty rect, which is what makes partial
+        // repaints cheap -- but that path never calls render(), so a widget
+        // that has children AND paints content of its own in render() would
+        // silently lose that content on every partial repaint (it would appear
+        // on full redraws only). custom_paint opts such a widget into a full
+        // draw of its subtree instead.
+        if (this.children.len == 0 || this.custom_paint) {
             this.draw(s, th);
         } else {
             this.draw_chrome(s, th);
@@ -1881,7 +1914,10 @@ export class Window {
         let partial = false;
         for (let t in this.animations) {
             let moved = t.advance(dt_ms);
-            if (moved) {
+            // A passive animator is a timer, not an animation: advance it, but
+            // never repaint on its account. Its callback calls invalidate()
+            // if it actually changed something. See Animator.passive.
+            if (moved && !t.passive) {
                 if (t.track_bounds) {
                     this.mark_dirty(t.bounds);
                     partial = true;

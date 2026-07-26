@@ -162,46 +162,106 @@ export class Request {
 // not the sum.
 //
 //     let pool = new HttpPool();
-//     pool.add(http_get("https://a/1"));
-//     pool.add(http_get("https://a/2"));
-//     for (let r in pool.runAll(30000)) { print(r.status()); }
+//     let a = pool.add(http_get("https://a/1"));
+//     let b = pool.add(http_get("https://a/2"));
+//     for (let p in pool.runAll(30000)) {
+//         // p.id says which request this was — completions arrive in finish
+//         // order, so the response for `a` is not necessarily first
+//         print(p.id + " " + p.url + " -> " + p.resp.status());
+//     }
 //
 // Each Response owns its native buffer (freed on teardown), exactly like a
 // Response from Request.send.
+// One finished transfer: the response plus enough to tell WHICH request it
+// belongs to. Completions arrive in finish order, not submission order, so a
+// bare Response is not identifiable -- see HttpPool.add.
+export class PooledResponse {
+    id: int;         // the token add() returned
+    url: string;     // the request's final URL, handy for logging and keying
+    resp: Response;
+
+    fn init(id: int, url: string, resp: Response) {
+        this.id = id;
+        this.url = url;
+        this.resp = resp;
+    }
+}
+
 export class HttpPool {
     h: rawptr;
     pending: int;
-    fn init() { this.h = http_multi_new(); this.pending = 0; }
+    next_id: int;
+    ids: int[];        // parallel arrays, one entry per in-flight request
+    urls: string[];
+    handles: rawptr[]; // the HttpResp* add() got back -- the correlation key
 
-    // Queue a built request. Its per-request timeout (timeoutMs) still applies.
-    fn add(req: Request) {
+    fn init() {
+        this.h = http_multi_new();
+        this.pending = 0;
+        this.next_id = 0;
+        this.ids = [];
+        this.urls = [];
+        this.handles = [];
+    }
+
+    // Queue a built request; returns a token identifying it. Its per-request
+    // timeout (timeoutMs) still applies.
+    //
+    // The token matters: transfers complete in whatever order the network
+    // delivers them, so without it a batch of Responses cannot be matched back
+    // to the requests that produced them. Match on PooledResponse.id (or .url).
+    fn add(req: Request): int {
         let blen = 0;
         if (req.hasBody) { blen = req.payload.len; }
-        http_multi_add(this.h, req.method.cstr(), req.url.cstr(), req.hdrs.cstr(),
-                       req.payload.cstr(), blen as i64, req.timeout as i64);
+        let handle = http_multi_add(this.h, req.method.cstr(), req.url.cstr(), req.hdrs.cstr(),
+                                    req.payload.cstr(), blen as i64, req.timeout as i64);
+        if (handle == null) { return -1; }   // out of memory; nothing queued
+        let id = this.next_id;
+        this.next_id += 1;
+        this.ids.push(id);
+        this.urls.push(req.url);
+        this.handles.push(handle);
         this.pending += 1;
+        return id;
     }
 
     // Drive one round: block up to timeoutMs waiting on activity, then return
-    // every Response that finished this round (empty if none yet). For building
-    // your own event loop; most callers want runAll.
-    fn poll(timeoutMs: int): Response[] {
-        let done: Response[] = [];
+    // every transfer that finished this round (empty if none yet). For building
+    // your own event loop; most callers want runAll. Pass 0 to poll without
+    // blocking, e.g. from a UI frame tick.
+    fn poll(timeoutMs: int): PooledResponse[] {
+        let done: PooledResponse[] = [];
         if (this.pending <= 0) { return done; }
         http_multi_perform(this.h, timeoutMs as i32);
         while (true) {
             let r = http_multi_next_done(this.h);
             if (r == null) { break; }
-            done.push(new Response(r));
+            let idx = -1;
+            for (let i in 0..this.handles.len) {
+                if (this.handles[i] == r) { idx = i; }
+            }
+            let id = -1;
+            let url = "";
+            if (idx >= 0) {
+                id = this.ids[idx];
+                url = this.urls[idx];
+                this.ids.remove_at(idx);
+                this.urls.remove_at(idx);
+                this.handles.remove_at(idx);
+            }
+            // Wrap unconditionally, even an unrecognised handle: Response.deinit
+            // is what frees the native buffer, so dropping the bare pointer
+            // would leak it.
+            done.push(new PooledResponse(id, url, new Response(r)));
             this.pending -= 1;
         }
         return done;
     }
 
     // Block, driving all queued transfers concurrently, until every one
-    // finishes; return the Responses in completion order.
-    fn runAll(timeoutMs: int): Response[] {
-        let out: Response[] = [];
+    // finishes; return them in completion order.
+    fn runAll(timeoutMs: int): PooledResponse[] {
+        let out: PooledResponse[] = [];
         while (this.pending > 0) {
             let batch = this.poll(timeoutMs);
             for (let r in batch) { out.push(r); }
