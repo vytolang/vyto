@@ -209,6 +209,17 @@ else
     fail=1
 fi
 
+# --- vyto/geo: Geometry, area/length, point-in-polygon, simplify (pure Vyto) ---
+got=$(./vytoc run tests/fixtures/geo_shape.vt 2>&1)
+if [ "$got" = "$(cat tests/fixtures/geo_shape.expected)" ]; then
+    echo "PASS geo_shape"
+else
+    echo "FAIL geo_shape"
+    echo "--- expected ---"; cat tests/fixtures/geo_shape.expected
+    echo "--- got ---"; printf '%s\n' "$got"
+    fail=1
+fi
+
 # --- vyto/gfx: blend2d Canvas -> blitPtr (gated on the prebuilt lib) ---
 if [ -f lib/vyto/gfx/native/linux-x64/libblend2d.so ]; then
     gfx_bin=apps/gfxdemo/.vyto-cache/gfxdemo_test

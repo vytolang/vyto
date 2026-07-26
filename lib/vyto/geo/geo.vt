@@ -562,3 +562,331 @@ export fn bboxOfCoords(lons: float[], lats: float[], start: int, count: int): BB
     }
     return BBox(w, s, e, n);
 }
+
+// ---------------------------------------------------------------------------
+// Geometry
+//
+// Coordinates are held flat, in parallel arrays, with a separate table of part
+// offsets. Nested arrays are awkward in Vyto, a draw loop wants a flat run, and
+// this way one ring of a multi-part shape can be measured or tested without
+// allocating a slice for it. Every bulk function below therefore takes
+// (lons, lats, start, count) rather than an array of rings.
+// ---------------------------------------------------------------------------
+
+export const GEOM_POINT: int = 0;
+export const GEOM_LINE: int = 1;
+export const GEOM_POLYGON: int = 2;
+
+// A class rather than a struct: it holds arrays, and a Vyto struct cannot.
+export class Geometry {
+    kind: int;
+    lons: float[];
+    lats: float[];
+    // Altitude per point, metres above the ellipsoid, and always the same
+    // length as lons/lats. GeoJSON's optional third position element lands
+    // here; where a source has no altitude it is 0.0. Terrain, flight paths
+    // and satellite tracks are the obvious spatial apps and altitude is the
+    // whole point of them, so it is not discarded on the way in.
+    alts: float[];
+
+    partStart: int[];
+    partLen: int[];
+    // Whether each part is an exterior ring rather than a hole. Start/length
+    // alone cannot distinguish a MultiPolygon's second *exterior* ring from a
+    // *hole* in its first, which is exactly how holes end up drawn as
+    // outlines. Meaningless for points and lines, where it stays true.
+    partOuter: bool[];
+
+    fn init(kind: int) {
+        this.kind = kind;
+        this.lons = [];
+        this.lats = [];
+        this.alts = [];
+        this.partStart = [];
+        this.partLen = [];
+        this.partOuter = [];
+    }
+
+    fn partCount(): int { return this.partStart.len; }
+    fn pointCount(): int { return this.lons.len; }
+    fn isEmpty(): bool { return this.lons.len == 0; }
+
+    // Append a part. Altitudes default to zero; addPart3 carries them.
+    fn addPart(lons: float[], lats: float[], outer: bool) {
+        let zeros: float[] = [];
+        let i = 0;
+        while (i < lons.len) { zeros.push(0.0); i = i + 1; }
+        this.addPart3(lons, lats, zeros, outer);
+    }
+
+    fn addPart3(lons: float[], lats: float[], alts: float[], outer: bool) {
+        let n = lons.len;
+        if (lats.len < n) { n = lats.len; }
+        if (alts.len < n) { n = alts.len; }
+        this.partStart.push(this.lons.len);
+        this.partLen.push(n);
+        this.partOuter.push(outer);
+        let i = 0;
+        while (i < n) {
+            this.lons.push(lons[i]);
+            this.lats.push(lats[i]);
+            this.alts.push(alts[i]);
+            i = i + 1;
+        }
+    }
+
+    fn partPoint(part: int, i: int): LatLon {
+        let at = this.partStart[part] + i;
+        return LatLon(this.lons[at], this.lats[at]);
+    }
+
+    fn partPointAlt(part: int, i: int): LatLonAlt {
+        let at = this.partStart[part] + i;
+        return LatLonAlt(this.lons[at], this.lats[at], this.alts[at]);
+    }
+
+    fn partBBox(part: int): BBox {
+        return bboxOfCoords(this.lons, this.lats, this.partStart[part], this.partLen[part]);
+    }
+
+    fn partLengthM(part: int): float {
+        return polylineLengthM(this.lons, this.lats, this.partStart[part], this.partLen[part]);
+    }
+
+    fn partAreaM2(part: int): float {
+        return polygonAreaM2(this.lons, this.lats, this.partStart[part], this.partLen[part]);
+    }
+
+    fn bbox(): BBox {
+        let b = bboxEmpty();
+        let i = 0;
+        while (i < this.partCount()) { b = b.union(this.partBBox(i)); i = i + 1; }
+        return b;
+    }
+
+    // Total length of every part. For a polygon this is the perimeter.
+    fn lengthM(): float {
+        let total = 0.0;
+        let i = 0;
+        while (i < this.partCount()) { total = total + this.partLengthM(i); i = i + 1; }
+        return total;
+    }
+
+    // Area of the exterior rings less the area of the holes.
+    fn areaM2(): float {
+        let total = 0.0;
+        let i = 0;
+        while (i < this.partCount()) {
+            if (this.partOuter[i]) { total = total + this.partAreaM2(i); }
+            else { total = total - this.partAreaM2(i); }
+            i = i + 1;
+        }
+        if (total < 0.0) { return 0.0; }
+        return total;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Bulk algorithms
+// ---------------------------------------------------------------------------
+
+// Great-circle length of a coordinate run, metres. An open path: no closing
+// edge is added, so a ring must repeat its first point to be measured whole.
+export fn polylineLengthM(lons: float[], lats: float[], start: int, count: int): float {
+    if (count < 2) { return 0.0; }
+    let total = 0.0;
+    let i = start + 1;
+    let end = start + count;
+    while (i < end) {
+        total = total + distanceM(LatLon(lons[i - 1], lats[i - 1]), LatLon(lons[i], lats[i]));
+        i = i + 1;
+    }
+    return total;
+}
+
+// Area of a ring on the sphere, square metres, always positive. The ring is
+// closed implicitly, so a repeated final point is allowed but not required.
+//
+// Spherical excess, not a planar shoelace: a planar formula in degrees is
+// wrong by whatever cos(latitude) does across the shape. Each longitude step
+// is wrapped into [-PI, PI] first — without that a ring crossing the
+// antimeridian accumulates a ~360 degree step and reports a near-whole-earth
+// area. distanceM needs no such wrap, but this does; the two are not the same
+// situation.
+export fn polygonAreaM2(lons: float[], lats: float[], start: int, count: int): float {
+    if (count < 3) { return 0.0; }
+    let total = 0.0;
+    let end = start + count;
+    let j = end - 1;
+    let i = start;
+    while (i < end) {
+        let dLon = (lons[i] - lons[j]) * DEG2RAD;
+        // wrap into [-PI, PI]
+        if (dLon > PI) { dLon = dLon - 2.0 * PI; }
+        if (dLon < -PI) { dLon = dLon + 2.0 * PI; }
+        total = total + dLon * (2.0 + sin(lats[j] * DEG2RAD) + sin(lats[i] * DEG2RAD));
+        j = i;
+        i = i + 1;
+    }
+    total = total * EARTH_MEAN_RADIUS_M * EARTH_MEAN_RADIUS_M * 0.5;
+    return fabs(total);
+}
+
+// Winding direction of a ring, by the planar shoelace sign. GeoJSON's
+// right-hand rule wants exterior rings counter-clockwise and holes clockwise,
+// and renderers that fill by winding care which way a ring runs.
+//
+// Planar, so it is wrong for a ring that crosses the antimeridian — see the
+// note on pointInRing.
+export fn ringIsClockwise(lons: float[], lats: float[], start: int, count: int): bool {
+    if (count < 3) { return false; }
+    let sum = 0.0;
+    let end = start + count;
+    let j = end - 1;
+    let i = start;
+    while (i < end) {
+        sum = sum + (lons[i] - lons[j]) * (lats[i] + lats[j]);
+        j = i;
+        i = i + 1;
+    }
+    return sum > 0.0;
+}
+
+// Crossing-number point-in-polygon against a single ring. The ring is closed
+// implicitly. A point exactly on an edge may land either way — that is
+// inherent to the test, not a bug to file.
+//
+// This is a planar ray cast, so it breaks for a ring crossing the
+// antimeridian. Callers with such data pre-shift the ring and the query point
+// by +360 degrees; the fix does not belong in here, because only the caller
+// knows which side of the world the query is meant to be on.
+export fn pointInRing(lon: float, lat: float, lons: float[], lats: float[],
+                      start: int, count: int): bool {
+    if (count < 3) { return false; }
+    let inside = false;
+    let end = start + count;
+    let j = end - 1;
+    let i = start;
+    while (i < end) {
+        let yi = lats[i];
+        let yj = lats[j];
+        if ((yi > lat) != (yj > lat)) {
+            let x = (lons[j] - lons[i]) * (lat - yi) / (yj - yi) + lons[i];
+            if (lon < x) { inside = !inside; }
+        }
+        j = i;
+        i = i + 1;
+    }
+    return inside;
+}
+
+// Point-in-polygon across every part of a geometry, honouring holes.
+//
+// Inside means: within at least one exterior ring, and within no hole. That is
+// exact for well-formed data, where holes lie inside their own polygon and
+// polygons do not overlap. It is not a general boolean over arbitrary
+// overlapping rings, which needs ring-to-polygon grouping GeoJSON does not
+// carry. Non-polygon geometries are always outside.
+export fn pointInGeometry(g: Geometry, lon: float, lat: float): bool {
+    if (g.kind != GEOM_POLYGON) { return false; }
+    let inOuter = false;
+    let i = 0;
+    while (i < g.partCount()) {
+        if (pointInRing(lon, lat, g.lons, g.lats, g.partStart[i], g.partLen[i])) {
+            if (g.partOuter[i]) { inOuter = true; } else { return false; }
+        }
+        i = i + 1;
+    }
+    return inOuter;
+}
+
+// Ramer-Douglas-Peucker, with the tolerance in **metres**.
+//
+// A tolerance in degrees is unpickable: it means a different distance at every
+// latitude. Longitude is scaled by cos(midLat) so the working plane is locally
+// metric, which is accurate over the span any single simplified feature covers.
+//
+// Returns absolute indices into lons/lats, ascending, always including the
+// first and last point of the run. The recursion is an explicit stack: the
+// worst case is O(n) deep and Vyto has no tail calls.
+export fn simplifyIndicesM(lons: float[], lats: float[], start: int, count: int,
+                           toleranceM: float): int[] {
+    let out: int[] = [];
+    if (count <= 0) { return out; }
+    if (count < 3 || toleranceM <= 0.0) {
+        let k = 0;
+        while (k < count) { out.push(start + k); k = k + 1; }
+        return out;
+    }
+
+    // Local metric frame: degrees to metres, longitude foreshortened by the
+    // latitude at the middle of the run.
+    let b = bboxOfCoords(lons, lats, start, count);
+    let mx = DEG2RAD * EARTH_MEAN_RADIUS_M * cos(b.center().lat * DEG2RAD);
+    let my = DEG2RAD * EARTH_MEAN_RADIUS_M;
+    let tol2 = toleranceM * toleranceM;
+
+    let keep: bool[] = [];
+    let k = 0;
+    while (k < count) { keep.push(false); k = k + 1; }
+    keep[0] = true;
+    keep[count - 1] = true;
+
+    let stack: int[] = [];
+    stack.push(0);
+    stack.push(count - 1);
+
+    while (stack.len >= 2) {
+        let last = stack.pop();
+        let first = stack.pop();
+        if (last <= first + 1) { continue; }
+
+        let ax = lons[start + first] * mx;
+        let ay = lats[start + first] * my;
+        let bx = lons[start + last] * mx;
+        let by = lats[start + last] * my;
+        let dx = bx - ax;
+        let dy = by - ay;
+        let seg2 = dx * dx + dy * dy;
+
+        let bestI = -1;
+        let best2 = tol2;
+        let i = first + 1;
+        while (i < last) {
+            let px = lons[start + i] * mx;
+            let py = lats[start + i] * my;
+            // Squared distance from the point to the segment. A degenerate
+            // segment (both endpoints equal) falls back to point distance.
+            let d2 = 0.0;
+            if (seg2 == 0.0) {
+                let ex = px - ax;
+                let ey = py - ay;
+                d2 = ex * ex + ey * ey;
+            } else {
+                let t = ((px - ax) * dx + (py - ay) * dy) / seg2;
+                if (t < 0.0) { t = 0.0; }
+                if (t > 1.0) { t = 1.0; }
+                let ex = px - (ax + t * dx);
+                let ey = py - (ay + t * dy);
+                d2 = ex * ex + ey * ey;
+            }
+            if (d2 > best2) { best2 = d2; bestI = i; }
+            i = i + 1;
+        }
+
+        if (bestI >= 0) {
+            keep[bestI] = true;
+            stack.push(first);
+            stack.push(bestI);
+            stack.push(bestI);
+            stack.push(last);
+        }
+    }
+
+    let j = 0;
+    while (j < count) {
+        if (keep[j]) { out.push(start + j); }
+        j = j + 1;
+    }
+    return out;
+}
