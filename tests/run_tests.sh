@@ -176,6 +176,17 @@ else
     fail=1
 fi
 
+# --- vyto/geom: Vec2/Vec3/Vec4 value types (pure Vyto — always runs) ---
+got=$(./vytoc run tests/fixtures/geom_vec.vt 2>&1)
+if [ "$got" = "$(cat tests/fixtures/geom_vec.expected)" ]; then
+    echo "PASS geom_vec"
+else
+    echo "FAIL geom_vec"
+    echo "--- expected ---"; cat tests/fixtures/geom_vec.expected
+    echo "--- got ---"; printf '%s\n' "$got"
+    fail=1
+fi
+
 # --- vyto/gfx: blend2d Canvas -> blitPtr (gated on the prebuilt lib) ---
 if [ -f lib/vyto/gfx/native/linux-x64/libblend2d.so ]; then
     gfx_bin=apps/gfxdemo/.vyto-cache/gfxdemo_test

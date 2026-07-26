@@ -1,9 +1,14 @@
 // vyto/geom — value-type geometry helpers built on struct methods.
 //
-// Vec2 is a stack-allocated value type: methods return new Vec2s and never
-// allocate, so vector math in a hot loop costs nothing the RC has to track.
-// Rect's own methods live in vyto/surface (inset/offset/take_*/union/…) since
-// that is where Rect is declared and every widget already imports it.
+// Vec2/Vec3/Vec4 are stack-allocated value types: methods return new vectors
+// and never allocate, so vector math in a hot loop costs nothing the RC has to
+// track. Rect's own methods live in vyto/surface (inset/offset/take_*/union/…)
+// since that is where Rect is declared and every widget already imports it.
+//
+// Vec3 is 3D space — orientation, surface normals, and the Cartesian side of
+// vyto/geo's geodesy. Vec4 is the homogeneous coordinate a 4x4 transform
+// consumes: a model-view-projection pipeline is Vec4 in, perspective divide,
+// Vec3 out. It doubles as an RGBA carrier.
 
 import { sqrt } from "vyto/math";
 
@@ -28,4 +33,76 @@ export struct Vec2 {
         return Vec2(this.x / l, this.y / l);
     }
     fn perp(): Vec2 { return Vec2(-this.y, this.x); }
+}
+
+export struct Vec3 {
+    x: float;
+    y: float;
+    z: float;
+
+    fn add(o: Vec3): Vec3 { return Vec3(this.x + o.x, this.y + o.y, this.z + o.z); }
+    fn sub(o: Vec3): Vec3 { return Vec3(this.x - o.x, this.y - o.y, this.z - o.z); }
+    fn scale(s: float): Vec3 { return Vec3(this.x * s, this.y * s, this.z * s); }
+    fn neg(): Vec3 { return Vec3(-this.x, -this.y, -this.z); }
+    fn dot(o: Vec3): float { return this.x * o.x + this.y * o.y + this.z * o.z; }
+    // The operation Vec2 has no analogue for: a vector perpendicular to both,
+    // with length |a||b|sin(theta). Surface normals and orientation need it.
+    fn cross(o: Vec3): Vec3 {
+        return Vec3(this.y * o.z - this.z * o.y,
+                    this.z * o.x - this.x * o.z,
+                    this.x * o.y - this.y * o.x);
+    }
+    fn len2(): float { return this.x * this.x + this.y * this.y + this.z * this.z; }
+    fn len(): float { return sqrt(this.len2()); }
+    fn dist(o: Vec3): float { return this.sub(o).len(); }
+    fn lerp(o: Vec3, t: float): Vec3 {
+        return Vec3(this.x + (o.x - this.x) * t,
+                    this.y + (o.y - this.y) * t,
+                    this.z + (o.z - this.z) * t);
+    }
+    fn normalized(): Vec3 {
+        let l = this.len();
+        if (l == 0.0) { return Vec3(0.0, 0.0, 0.0); }
+        return Vec3(this.x / l, this.y / l, this.z / l);
+    }
+    fn xy(): Vec2 { return Vec2(this.x, this.y); }
+}
+
+// No cross product: it is not defined in 4D.
+export struct Vec4 {
+    x: float;
+    y: float;
+    z: float;
+    w: float;
+
+    fn add(o: Vec4): Vec4 { return Vec4(this.x + o.x, this.y + o.y, this.z + o.z, this.w + o.w); }
+    fn sub(o: Vec4): Vec4 { return Vec4(this.x - o.x, this.y - o.y, this.z - o.z, this.w - o.w); }
+    fn scale(s: float): Vec4 { return Vec4(this.x * s, this.y * s, this.z * s, this.w * s); }
+    fn neg(): Vec4 { return Vec4(-this.x, -this.y, -this.z, -this.w); }
+    fn dot(o: Vec4): float {
+        return this.x * o.x + this.y * o.y + this.z * o.z + this.w * o.w;
+    }
+    fn len2(): float {
+        return this.x * this.x + this.y * this.y + this.z * this.z + this.w * this.w;
+    }
+    fn len(): float { return sqrt(this.len2()); }
+    fn lerp(o: Vec4, t: float): Vec4 {
+        return Vec4(this.x + (o.x - this.x) * t,
+                    this.y + (o.y - this.y) * t,
+                    this.z + (o.z - this.z) * t,
+                    this.w + (o.w - this.w) * t);
+    }
+    fn normalized(): Vec4 {
+        let l = this.len();
+        if (l == 0.0) { return Vec4(0.0, 0.0, 0.0, 0.0); }
+        return Vec4(this.x / l, this.y / l, this.z / l, this.w / l);
+    }
+    // Drop w. Use after homogenized() to land back in 3D space.
+    fn xyz(): Vec3 { return Vec3(this.x, this.y, this.z); }
+    // The perspective divide. w == 0 is a point at infinity (a direction, not
+    // a position) and is returned unchanged rather than producing infinities.
+    fn homogenized(): Vec4 {
+        if (this.w == 0.0) { return this; }
+        return Vec4(this.x / this.w, this.y / this.w, this.z / this.w, 1.0);
+    }
 }
