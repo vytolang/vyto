@@ -187,6 +187,17 @@ else
     fail=1
 fi
 
+# --- vyto/geo: coords, datums, spherical measures, BBox (pure Vyto) ---
+got=$(./vytoc run tests/fixtures/geo_math.vt 2>&1)
+if [ "$got" = "$(cat tests/fixtures/geo_math.expected)" ]; then
+    echo "PASS geo_math"
+else
+    echo "FAIL geo_math"
+    echo "--- expected ---"; cat tests/fixtures/geo_math.expected
+    echo "--- got ---"; printf '%s\n' "$got"
+    fail=1
+fi
+
 # --- vyto/gfx: blend2d Canvas -> blitPtr (gated on the prebuilt lib) ---
 if [ -f lib/vyto/gfx/native/linux-x64/libblend2d.so ]; then
     gfx_bin=apps/gfxdemo/.vyto-cache/gfxdemo_test

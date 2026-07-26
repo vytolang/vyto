@@ -1,0 +1,180 @@
+// Pure-Vyto coverage for vyto/geo's core: coordinates, datums, angle
+// housekeeping, spherical measures and BBox. No I/O, no gfx, so this runs on
+// every host.
+//
+// Floats are never printed bare: the runtime prints %g at 6 significant digits
+// and the freestanding path uses a hand-rolled %g that is explicitly not
+// shortest-round-trip. Every line below prints an int or a bool. Absolutes go
+// through round() rather than truncation, since truncation flips on a 1-ULP
+// wobble and `as int` truncates toward zero, which is the wrong direction for
+// negative latitudes.
+import { LatLon, BBox, Datum, datumWgs84, datumSphere, datumUnitSphere,
+         datumEarthSphere, normalizeLon, normalizeBearing, lonDelta,
+         clampMercatorLat, clampLat, angularSeparation, distanceM, distanceOnM,
+         distanceEquirectM, initialBearing, finalBearing, destination,
+         destinationOn, interpolateLonLat, midpoint, bboxEmpty, bboxWorld,
+         bboxOfPoint, bboxOfCoords, EARTH_MEAN_RADIUS_M, MAX_MERCATOR_LAT
+       } from "vyto/geo";
+import { PI, round, fabs } from "vyto/math";
+
+fn near(a: float, b: float, eps: float): bool { return fabs(a - b) < eps; }
+
+fn q(x: float, scale: float): int { return round(x * scale) as int; }
+
+fn main() {
+    // ---- Datum ----
+    let wgs = datumWgs84();
+    print("wgs84a=" + (wgs.a as int));
+    print("wgs84b=" + q(wgs.b(), 1000.0));          // semi-minor, mm
+    print("wgs84e2=" + q(wgs.e2(), 1e12));
+    print("wgs84mean=" + q(wgs.meanRadius(), 1000.0));
+    print("wgs84sphere=" + wgs.isSphere());
+
+    let unit = datumUnitSphere();
+    print("unitsphere=" + unit.isSphere() + "," + (unit.a as int) + "," + (unit.b() as int));
+    print("unite2=" + (unit.e2() as int));
+    let mars = datumSphere(3389500.0);              // a body that is not Earth
+    print("mars=" + (mars.meanRadius() as int));
+    print("earthsphere=" + q(datumEarthSphere().a, 10.0));
+
+    // ---- Angle housekeeping ----
+    print("nlon190=" + q(normalizeLon(190.0), 1.0));
+    print("nlon-190=" + q(normalizeLon(-190.0), 1.0));
+    print("nlon180=" + q(normalizeLon(180.0), 1.0));     // half-open: -180
+    print("nlon-180=" + q(normalizeLon(-180.0), 1.0));
+    print("nlon720=" + q(normalizeLon(720.5), 10.0));
+    print("nbear=" + q(normalizeBearing(-90.0), 1.0) + "," + q(normalizeBearing(450.0), 1.0));
+    // the antimeridian short way, both directions
+    print("dlon=" + q(lonDelta(179.0, -179.0), 1.0) + "," + q(lonDelta(-179.0, 179.0), 1.0));
+    print("dlon180=" + q(lonDelta(0.0, 180.0), 1.0));
+    print("clampmerc=" + q(clampMercatorLat(90.0), 1e6));
+    print("clampmercneg=" + q(clampMercatorLat(-90.0), 1e6));
+    print("clampmercid=" + near(clampMercatorLat(45.0), 45.0, 1e-15));
+    print("clamplat=" + q(clampLat(120.0), 1.0) + "," + q(clampLat(-120.0), 1.0));
+    print("maxmerc=" + q(MAX_MERCATOR_LAT, 1e6));
+
+    // ---- Spherical measures ----
+    let sf = LatLon(-122.4194, 37.7749);
+    let ny = LatLon(-74.0060, 40.7128);
+    print("sfny=" + (round(distanceM(sf, ny)) as int));
+    print("sfnybear=" + q(initialBearing(sf, ny), 1000.0));
+    print("sfnyfinal=" + q(finalBearing(sf, ny), 1000.0));
+    // symmetric
+    print("distsym=" + near(distanceM(sf, ny), distanceM(ny, sf), 1e-9));
+    print("distself=" + (distanceM(sf, sf) as int));
+
+    // The strongest single test: walking the measured distance along the
+    // measured bearing has to land on the destination.
+    let back = destination(sf, initialBearing(sf, ny), distanceM(sf, ny));
+    print("roundtrip=" + (near(back.lon, ny.lon, 1e-9) && near(back.lat, ny.lat, 1e-9)));
+
+    // A quarter turn of the equator, on a unit sphere and on Earth.
+    print("quarter=" + near(angularSeparation(LatLon(0.0, 0.0), LatLon(90.0, 0.0)),
+                            PI * 0.5, 1e-15));
+    print("antipodal=" + near(angularSeparation(LatLon(0.0, 0.0), LatLon(180.0, 0.0)),
+                              PI, 1e-12));
+    print("pole2pole=" + near(angularSeparation(LatLon(0.0, -90.0), LatLon(0.0, 90.0)),
+                              PI, 1e-12));
+    print("unitdist=" + near(distanceOnM(LatLon(0.0, 0.0), LatLon(90.0, 0.0), 1.0),
+                             PI * 0.5, 1e-15));
+    // one degree of latitude on the mean sphere
+    print("onedeg=" + (round(distanceM(LatLon(0.0, 0.0), LatLon(0.0, 1.0))) as int));
+
+    // Antimeridian: haversine already takes the short way. If this ever breaks,
+    // someone "fixed" the missing longitude wrap in angularSeparation.
+    print("antimerid=" + near(distanceM(LatLon(179.5, 0.0), LatLon(-179.5, 0.0)),
+                              distanceM(LatLon(-0.5, 0.0), LatLon(0.5, 0.0)), 1e-9));
+
+    // Equirect approximation: within 0.01% of haversine over ~150 km. The
+    // bound is loose on purpose — this is the cheap one, and tightening it to
+    // where it currently sits (2e-5) would turn a libm wobble into a failure.
+    let p1 = LatLon(-122.4194, 37.7749);
+    let p2 = LatLon(-121.0, 38.5);
+    let dh = distanceM(p1, p2);
+    let de = distanceEquirectM(p1, p2);
+    print("equirect=" + (fabs(dh - de) / dh < 1e-4));
+    print("equirectself=" + (distanceEquirectM(p1, p1) as int));
+
+    // destination on an explicit radius: a quarter turn due east from (0,0)
+    // must land on (90, 0).
+    let east = destinationOn(LatLon(0.0, 0.0), 90.0, PI * 0.5, 1.0);
+    print("east90=" + (near(east.lon, 90.0, 1e-9) && near(east.lat, 0.0, 1e-9)));
+    // Due north keeps the meridian it started on.
+    let north = destination(LatLon(10.0, 0.0), 0.0, 1000000.0);
+    print("north=" + (near(north.lon, 10.0, 1e-12)
+                      && near(north.lat, 1000000.0 / EARTH_MEAN_RADIUS_M * 180.0 / PI, 1e-9)));
+    // Landing on the pole: latitude exact, longitude undefined and not
+    // asserted. cos(d) lands at -1.6e-17 there and flips lon by half a turn.
+    let pole = destination(LatLon(10.0, 0.0), 0.0, EARTH_MEAN_RADIUS_M * PI * 0.5);
+    print("pole=" + near(pole.lat, 90.0, 1e-6));
+
+    // ---- Interpolation ----
+    let mid = midpoint(LatLon(0.0, 0.0), LatLon(90.0, 0.0));
+    print("mid=" + (near(mid.lon, 45.0, 1e-9) && near(mid.lat, 0.0, 1e-9)));
+    // across the antimeridian the great-circle path stays short
+    let midAm = midpoint(LatLon(170.0, 0.0), LatLon(-170.0, 0.0));
+    print("midam=" + q(midAm.lon, 1000.0));
+    print("lerp0=" + near(interpolateLonLat(LatLon(0.0, 0.0), LatLon(90.0, 0.0), 0.0).lon,
+                          0.0, 1e-12));
+    print("lerp1=" + near(interpolateLonLat(LatLon(0.0, 0.0), LatLon(90.0, 0.0), 1.0).lon,
+                          90.0, 1e-9));
+    // degenerate: identical endpoints must not divide by sin(0)
+    let same = interpolateLonLat(sf, sf, 0.5);
+    print("lerpsame=" + (near(same.lon, sf.lon, 1e-12) && near(same.lat, sf.lat, 1e-12)));
+
+    // ---- BBox ----
+    let b = BBox(-10.0, -5.0, 10.0, 5.0);
+    print("span=" + q(b.lonSpan(), 1.0) + "," + q(b.latSpan(), 1.0));
+    print("center=" + q(b.center().lon, 1.0) + "," + q(b.center().lat, 1.0));
+    print("sw=" + q(b.southWest().lon, 1.0) + "," + q(b.southWest().lat, 1.0));
+    print("ne=" + q(b.northEast().lon, 1.0) + "," + q(b.northEast().lat, 1.0));
+    print("empty=" + b.isEmpty() + "," + bboxEmpty().isEmpty());
+    print("world=" + q(bboxWorld().lonSpan(), 1.0) + "," + q(bboxWorld().latSpan(), 1.0));
+    print("in=" + b.containsLonLat(0.0, 0.0) + "," + b.containsLonLat(20.0, 0.0)
+          + "," + b.containsLonLat(0.0, 20.0));
+    print("edge=" + b.containsLonLat(10.0, 5.0) + "," + b.containsLonLat(-10.0, -5.0));
+    print("inpt=" + b.containsPoint(LatLon(5.0, 1.0)));
+    print("emptyhas=" + bboxEmpty().containsLonLat(0.0, 0.0));
+    print("contains=" + b.contains(BBox(-1.0, -1.0, 1.0, 1.0))
+          + "," + b.contains(BBox(-20.0, -1.0, 1.0, 1.0)));
+    print("isect=" + b.intersects(BBox(5.0, 0.0, 20.0, 10.0))
+          + "," + b.intersects(BBox(20.0, 0.0, 30.0, 10.0))
+          + "," + b.intersects(BBox(-1.0, 20.0, 1.0, 30.0)));
+
+    let u = b.union(BBox(20.0, 10.0, 30.0, 20.0));
+    print("union=" + q(u.west, 1.0) + "," + q(u.south, 1.0) + ","
+          + q(u.east, 1.0) + "," + q(u.north, 1.0));
+    // bboxEmpty is the identity for union
+    print("unionid=" + q(bboxEmpty().union(b).west, 1.0) + ","
+          + q(b.union(bboxEmpty()).east, 1.0));
+
+    let g = b.grow(1.0, 1.0);
+    print("grow=" + q(g.west, 1.0) + "," + q(g.north, 1.0));
+    // growing past the pole clamps latitude but not longitude
+    let gp = BBox(-10.0, -89.0, 10.0, 89.0).grow(0.0, 5.0);
+    print("growclamp=" + q(gp.south, 1.0) + "," + q(gp.north, 1.0));
+
+    // A box that wraps the antimeridian is a real extent, not an error.
+    let am = BBox(170.0, -10.0, -170.0, 10.0);
+    print("wraps=" + am.crossesAntimeridian() + "," + am.isEmpty());
+    print("wrapspan=" + q(am.lonSpan(), 1.0));
+    // The centre is the antimeridian itself, reported as -180 by the half-open
+    // convention rather than +180. Same meridian.
+    print("wrapcenter=" + q(am.center().lon, 1.0));
+    print("wrapin=" + am.containsLonLat(175.0, 0.0) + "," + am.containsLonLat(-175.0, 0.0)
+          + "," + am.containsLonLat(0.0, 0.0));
+    print("wrapisect=" + am.intersects(BBox(175.0, 0.0, 179.0, 5.0))
+          + "," + am.intersects(BBox(0.0, 0.0, 10.0, 5.0)));
+    print("wrapcontains=" + am.contains(BBox(175.0, -1.0, 179.0, 1.0))
+          + "," + am.contains(BBox(0.0, -1.0, 10.0, 1.0)));
+
+    // ---- bboxOfCoords ----
+    let lons = [1.0, -3.0, 7.0, 2.0, 100.0];
+    let lats = [4.0, 9.0, -2.0, 0.0, 50.0];
+    let c = bboxOfCoords(lons, lats, 0, 4);           // ignores the 5th
+    print("ofcoords=" + q(c.west, 1.0) + "," + q(c.south, 1.0) + ","
+          + q(c.east, 1.0) + "," + q(c.north, 1.0));
+    let c1 = bboxOfCoords(lons, lats, 2, 1);          // a single point
+    print("ofcoords1=" + q(c1.west, 1.0) + "," + q(c1.north, 1.0));
+    print("ofcoords0=" + bboxOfCoords(lons, lats, 0, 0).isEmpty());
+}
