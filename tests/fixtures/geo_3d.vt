@@ -1,0 +1,219 @@
+// Pure-Vyto coverage for vyto/geo's 3D layer: ECEF conversion, the local
+// east/north/up basis, slerp and ray-vs-body intersection. No I/O, no gfx.
+//
+// Same golden rule as the rest: ints and bools only, never a bare float, and
+// absolutes go through round() rather than truncation.
+import { LatLon, LatLonAlt, Datum, datumWgs84, datumSphere, datumUnitSphere,
+         toUnitVector, fromUnitVector, surfaceNormal, toEcef, fromEcef,
+         enuBasis, enuOffsetToEcef, slerp, rayHitsSphere, rayHitsEllipsoid,
+         geodeticToGeocentricLat, geocentricToGeodeticLat,
+         EARTH_RADIUS_M } from "vyto/geo";
+import { Vec3 } from "vyto/geom";
+import { PI, round, fabs } from "vyto/math";
+
+fn near(a: float, b: float, eps: float): bool { return fabs(a - b) < eps; }
+fn q(x: float, scale: float): int { return round(x * scale) as int; }
+
+fn vnear(a: Vec3, b: Vec3, eps: float): bool { return a.dist(b) < eps; }
+
+fn main() {
+    let wgs = datumWgs84();
+    let unit = datumUnitSphere();
+
+    // ---- Unit vectors ----
+    // (0,0) is the +x axis, (90E,0) is +y, the north pole is +z. Every other
+    // function in the module depends on this frame.
+    print("uv00=" + vnear(toUnitVector(LatLon(0.0, 0.0)), Vec3(1.0, 0.0, 0.0), 1e-15));
+    print("uv90=" + vnear(toUnitVector(LatLon(90.0, 0.0)), Vec3(0.0, 1.0, 0.0), 1e-15));
+    print("uvpole=" + vnear(toUnitVector(LatLon(0.0, 90.0)), Vec3(0.0, 0.0, 1.0), 1e-15));
+    print("uvspole=" + vnear(toUnitVector(LatLon(123.0, -90.0)), Vec3(0.0, 0.0, -1.0), 1e-15));
+    print("uvlen=" + near(toUnitVector(LatLon(-122.4194, 37.7749)).len(), 1.0, 1e-15));
+    // geodetic up is bit-for-bit the same vector, by definition of geodetic
+    // latitude — not merely close
+    print("normal=" + (surfaceNormal(LatLon(30.0, 45.0))
+                       .dist(toUnitVector(LatLon(30.0, 45.0))) == 0.0));
+
+    let sf = LatLon(-122.4194, 37.7749);
+    let uvBack = fromUnitVector(toUnitVector(sf));
+    print("uvround=" + (near(uvBack.lon, sf.lon, 1e-12) && near(uvBack.lat, sf.lat, 1e-12)));
+    // direction only: magnitude is ignored
+    print("uvscale=" + near(fromUnitVector(toUnitVector(sf).scale(7.5)).lat, sf.lat, 1e-12));
+    print("uvzero=" + q(fromUnitVector(Vec3(0.0, 0.0, 0.0)).lat, 1.0));
+
+    // ---- ECEF ----
+    // On the equator at zero altitude the position is the semi-major axis.
+    let eq = toEcef(LatLonAlt(0.0, 0.0, 0.0), wgs);
+    print("ecefeq=" + q(eq.x, 1000.0) + "," + q(eq.y, 1000.0) + "," + q(eq.z, 1000.0));
+    // At the pole it is the semi-minor axis. This is the one that catches a
+    // wrong e2 or a missing (1 - e2) factor.
+    let pole = toEcef(LatLonAlt(0.0, 90.0, 0.0), wgs);
+    print("ecefpole=" + q(pole.x, 1000.0) + "," + q(pole.z, 1000.0));
+    print("ecefpoleb=" + near(pole.z, wgs.b(), 1e-6));
+    // 90E on the equator is the +y axis
+    let e90 = toEcef(LatLonAlt(90.0, 0.0, 0.0), wgs);
+    print("ecef90=" + q(e90.x, 1000.0) + "," + q(e90.y, 1000.0));
+    // altitude adds along the surface normal, so on the equator it is radial
+    print("ecefalt=" + q(toEcef(LatLonAlt(0.0, 0.0, 1000.0), wgs).x - EARTH_RADIUS_M, 1000.0));
+
+    // Round trip, altitude included, at a spread of latitudes -- the strongest
+    // single test of the pair. Bowring's form is exact enough that 1e-6 m is a
+    // wide margin.
+    let ok = true;
+    let lats = [-89.9, -60.0, -44.9, -0.001, 0.0, 12.5, 45.1, 78.0, 89.999];
+    let i = 0;
+    while (i < 9) {
+        let p = LatLonAlt(-30.25, lats[i], 1234.5);
+        let back = fromEcef(toEcef(p, wgs), wgs);
+        if (!near(back.lon, p.lon, 1e-9)) { ok = false; }
+        if (!near(back.lat, p.lat, 1e-9)) { ok = false; }
+        if (!near(back.alt, p.alt, 1e-6)) { ok = false; }
+        i = i + 1;
+    }
+    print("ecefround=" + ok);
+    // The altitude branch switches at 45 degrees; both sides must agree.
+    let below = fromEcef(toEcef(LatLonAlt(10.0, 44.999999, 500.0), wgs), wgs);
+    let above = fromEcef(toEcef(LatLonAlt(10.0, 45.000001, 500.0), wgs), wgs);
+    print("ecefbranch=" + (near(below.alt, 500.0, 1e-6) && near(above.alt, 500.0, 1e-6)));
+    // Orbital altitudes, where Bowring's closed form stops being exact. The
+    // tolerances are the measured error, not an aspiration: sub-millimetre at
+    // low orbit, sub-metre at geostationary.
+    let leo = fromEcef(toEcef(LatLonAlt(45.0, 45.0, 400000.0), wgs), wgs);
+    print("ecefleo=" + near(leo.alt, 400000.0, 1e-2));
+    let sat = fromEcef(toEcef(LatLonAlt(45.0, 45.0, 35786000.0), wgs), wgs);
+    print("ecefsat=" + near(sat.alt, 35786000.0, 1.0));
+    // Negative altitude (below the ellipsoid) round-trips too.
+    let deep = fromEcef(toEcef(LatLonAlt(45.0, 45.0, -400.0), wgs), wgs);
+    print("ecefdeep=" + near(deep.alt, -400.0, 1e-6));
+
+    // On the polar axis longitude is undefined; reported as 0, latitude exact.
+    let axis = fromEcef(Vec3(0.0, 0.0, wgs.b() + 100.0), wgs);
+    print("ecefaxis=" + q(axis.lon, 1.0) + "," + q(axis.lat, 1.0) + "," + q(axis.alt, 1.0));
+    let axisS = fromEcef(Vec3(0.0, 0.0, -(wgs.b() + 100.0)), wgs);
+    print("ecefaxisS=" + q(axisS.lat, 1.0) + "," + q(axisS.alt, 1.0));
+
+    // On a sphere ECEF degenerates to radius * unit vector.
+    let sph = datumSphere(1000.0);
+    print("ecefsphere=" + vnear(toEcef(LatLonAlt(33.0, 21.0, 0.0), sph),
+                                toUnitVector(LatLon(33.0, 21.0)).scale(1000.0), 1e-9));
+
+    // ---- ENU basis ----
+    // At (0,0): east is +y, north is +z, up is +x.
+    let b0 = enuBasis(LatLon(0.0, 0.0));
+    print("enu00=" + vnear(b0[0], Vec3(0.0, 1.0, 0.0), 1e-15)
+          + "," + vnear(b0[1], Vec3(0.0, 0.0, 1.0), 1e-15)
+          + "," + vnear(b0[2], Vec3(1.0, 0.0, 0.0), 1e-15));
+    // Orthonormal everywhere, including at a pole where east and north are
+    // arbitrary but must not collapse.
+    let bp = enuBasis(LatLon(0.0, 90.0));
+    print("enuorth=" + (near(bp[0].dot(bp[1]), 0.0, 1e-15)
+                        && near(bp[1].dot(bp[2]), 0.0, 1e-15)
+                        && near(bp[0].dot(bp[2]), 0.0, 1e-15)));
+    print("enuunit=" + (near(bp[0].len(), 1.0, 1e-15) && near(bp[1].len(), 1.0, 1e-15)
+                        && near(bp[2].len(), 1.0, 1e-15)));
+    // Right-handed: east cross north == up.
+    let b1 = enuBasis(LatLon(-122.0, 37.0));
+    print("enuhand=" + vnear(b1[0].cross(b1[1]), b1[2], 1e-14));
+    // Up at a position is that position's surface normal.
+    print("enuup=" + vnear(b1[2], surfaceNormal(LatLon(-122.0, 37.0)), 1e-15));
+
+    // A pure "up" offset is the same as raising altitude.
+    let ground = toEcef(LatLonAlt(10.0, 20.0, 0.0), wgs);
+    let raised = ground.add(enuOffsetToEcef(LatLon(10.0, 20.0), 0.0, 0.0, 250.0));
+    print("enuoffset=" + near(fromEcef(raised, wgs).alt, 250.0, 1e-6));
+    // 1000 m east moves longitude the right way and barely touches latitude.
+    // The offset is a straight line in ECEF, not a path along the surface, so
+    // it ends up d^2 / 2R = 78 mm above the ellipsoid. That is the tangent
+    // chord behaving correctly, not drift.
+    let eastp = fromEcef(ground.add(enuOffsetToEcef(LatLon(10.0, 20.0), 1000.0, 0.0, 0.0)), wgs);
+    print("enueast=" + (eastp.lon > 10.0 && near(eastp.lat, 20.0, 1e-6)));
+    print("enuchord=" + q(eastp.alt, 1000.0));
+
+    // ---- slerp ----
+    let ex = Vec3(1.0, 0.0, 0.0);
+    let ey = Vec3(0.0, 1.0, 0.0);
+    print("slerp0=" + vnear(slerp(ex, ey, 0.0), ex, 1e-15));
+    print("slerp1=" + vnear(slerp(ex, ey, 1.0), ey, 1e-15));
+    // Halfway between two perpendicular axes is the 45 degree diagonal.
+    print("slerpmid=" + vnear(slerp(ex, ey, 0.5), Vec3(0.7071067811865476,
+                                                       0.7071067811865476, 0.0), 1e-12));
+    print("slerpunit=" + near(slerp(ex, ey, 0.37).len(), 1.0, 1e-15));
+    // Inputs are normalized first, so magnitude does not matter.
+    print("slerpscale=" + vnear(slerp(ex.scale(9.0), ey.scale(0.1), 0.5),
+                                slerp(ex, ey, 0.5), 1e-15));
+    // Degenerate: identical and antipodal must not divide by sin(0).
+    print("slerpsame=" + vnear(slerp(ex, ex, 0.5), ex, 1e-15));
+    print("slerpanti=" + near(slerp(ex, ex.neg(), 0.5).len(), 1.0, 1e-15));
+    // Extrapolation stays on the great circle: t == 2 over a 90 degree arc is
+    // a half turn, landing on -ex.
+    print("slerpext=" + vnear(slerp(ex, ey, 2.0), ex.neg(), 1e-12));
+
+    // slerp agrees with the lon/lat great-circle path.
+    let a = LatLon(0.0, 0.0);
+    let bb = LatLon(90.0, 0.0);
+    let mid3 = fromUnitVector(slerp(toUnitVector(a), toUnitVector(bb), 0.5));
+    print("slerpgeo=" + (near(mid3.lon, 45.0, 1e-12) && near(mid3.lat, 0.0, 1e-12)));
+
+    // ---- Ray intersection ----
+    // Straight at the centre from 2R out: the near hit is at R.
+    print("raycentre=" + near(rayHitsSphere(Vec3(2.0, 0.0, 0.0), Vec3(-1.0, 0.0, 0.0), 1.0),
+                              1.0, 1e-15));
+    // Pointing away: the sphere is behind, so a miss.
+    print("rayaway=" + q(rayHitsSphere(Vec3(2.0, 0.0, 0.0), Vec3(1.0, 0.0, 0.0), 1.0), 1.0));
+    // Clean miss.
+    print("raymiss=" + q(rayHitsSphere(Vec3(2.0, 5.0, 0.0), Vec3(-1.0, 0.0, 0.0), 1.0), 1.0));
+    // Tangent: a single grazing hit at t == 2, not a miss.
+    print("raytangent=" + near(rayHitsSphere(Vec3(2.0, 1.0, 0.0), Vec3(-1.0, 0.0, 0.0), 1.0),
+                               2.0, 1e-9));
+    // From inside: the only non-negative root is the exit, ahead of the origin.
+    print("rayinside=" + near(rayHitsSphere(Vec3(0.0, 0.0, 0.0), Vec3(1.0, 0.0, 0.0), 1.0),
+                              1.0, 1e-15));
+    // A zero direction cannot hit anything.
+    print("rayzero=" + q(rayHitsSphere(Vec3(2.0, 0.0, 0.0), Vec3(0.0, 0.0, 0.0), 1.0), 1.0));
+    // t is in units of |dir|, so an unnormalized ray halves it.
+    print("rayscale=" + near(rayHitsSphere(Vec3(2.0, 0.0, 0.0), Vec3(-2.0, 0.0, 0.0), 1.0),
+                             0.5, 1e-15));
+
+    // Ellipsoid: down the polar axis the hit is at the semi-minor axis, and
+    // along the equator at the semi-major. A sphere would get one of them wrong.
+    let tPole = rayHitsEllipsoid(Vec3(0.0, 0.0, 3.0 * EARTH_RADIUS_M),
+                                 Vec3(0.0, 0.0, -1.0), wgs);
+    let hitPole = 3.0 * EARTH_RADIUS_M - tPole;
+    print("rayellpole=" + near(hitPole, wgs.b(), 1e-6));
+    let tEq = rayHitsEllipsoid(Vec3(3.0 * EARTH_RADIUS_M, 0.0, 0.0),
+                               Vec3(-1.0, 0.0, 0.0), wgs);
+    print("rayelleq=" + near(3.0 * EARTH_RADIUS_M - tEq, wgs.a, 1e-6));
+    print("rayellmiss=" + q(rayHitsEllipsoid(Vec3(0.0, 3.0 * EARTH_RADIUS_M, 0.0),
+                                             Vec3(0.0, 0.0, 1.0), wgs), 1.0));
+    // On a unit sphere datum the ellipsoid form must match the sphere form.
+    print("rayellsphere=" + near(rayHitsEllipsoid(Vec3(0.0, 4.0, 0.0), Vec3(0.0, -1.0, 0.0), unit),
+                                 rayHitsSphere(Vec3(0.0, 4.0, 0.0), Vec3(0.0, -1.0, 0.0), 1.0),
+                                 1e-15));
+
+    // The globe click: a camera ray hits, and the hit point maps back to the
+    // coordinate that was aimed at.
+    let target = LatLon(-122.4194, 37.7749);
+    let surf = toEcef(target.withAlt(0.0), wgs);
+    let cam = surf.scale(4.0);                    // straight out along the normal-ish
+    let dir = surf.sub(cam).normalized();
+    let t = rayHitsEllipsoid(cam, dir, wgs);
+    let hit = fromEcef(cam.add(dir.scale(t)), wgs);
+    print("globeclick=" + (t > 0.0 && near(hit.lon, target.lon, 1e-6)
+                           && near(hit.lat, target.lat, 1e-6)));
+
+    // ---- Geocentric vs geodetic latitude ----
+    // They differ by up to ~0.19 degrees on WGS84, peaking near 45.
+    print("gcmax=" + q(45.0 - geodeticToGeocentricLat(45.0, wgs), 1000.0));
+    print("gcround=" + near(geocentricToGeodeticLat(geodeticToGeocentricLat(37.5, wgs), wgs),
+                            37.5, 1e-12));
+    // Fixed points: equator and poles are the same in both.
+    print("gcfixed=" + q(geodeticToGeocentricLat(0.0, wgs), 1.0)
+          + "," + q(geodeticToGeocentricLat(90.0, wgs), 1.0)
+          + "," + q(geodeticToGeocentricLat(-90.0, wgs), 1.0));
+    // On a sphere the two are identical.
+    print("gcsphere=" + near(geodeticToGeocentricLat(37.5, datumSphere(1.0)), 37.5, 1e-15));
+    // Geocentric latitude is the one that agrees with the direction of the
+    // ECEF position vector, which is what makes it worth having.
+    let pos = toEcef(LatLonAlt(0.0, 45.0, 0.0), wgs);
+    print("gcvector=" + near(fromUnitVector(pos).lat,
+                             geodeticToGeocentricLat(45.0, wgs), 1e-12));
+}

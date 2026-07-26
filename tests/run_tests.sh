@@ -198,6 +198,17 @@ else
     fail=1
 fi
 
+# --- vyto/geo: ECEF, ENU basis, slerp, ray intersection (pure Vyto) ---
+got=$(./vytoc run tests/fixtures/geo_3d.vt 2>&1)
+if [ "$got" = "$(cat tests/fixtures/geo_3d.expected)" ]; then
+    echo "PASS geo_3d"
+else
+    echo "FAIL geo_3d"
+    echo "--- expected ---"; cat tests/fixtures/geo_3d.expected
+    echo "--- got ---"; printf '%s\n' "$got"
+    fail=1
+fi
+
 # --- vyto/gfx: blend2d Canvas -> blitPtr (gated on the prebuilt lib) ---
 if [ -f lib/vyto/gfx/native/linux-x64/libblend2d.so ]; then
     gfx_bin=apps/gfxdemo/.vyto-cache/gfxdemo_test
