@@ -11,26 +11,35 @@ unknown values silently falling back to a default, mistyped numbers killing the
 process through `to_int`'s panic, and no usage text.
 
 ```vyto
-import { Cli } from "vyto/cli";
+import { cli } from "vyto/cli";
 import { exit } from "vyto/os";
 
-let cli = new Cli("httpd", "a static file server");
-cli.intOption("port", "port to listen on").short("p").dfltInt(8080);
-cli.flag("quiet", "suppress the request log").short("q");
-cli.option("screen", "screen to open at start")
+let app = cli("httpd", "a static file server");
+app.intOption("port", "port to listen on").short("p").dfltInt(8080);
+app.flag("quiet", "suppress the request log").short("q");
+app.option("screen", "screen to open at start")
    .choices(["home", "settings", "photos"]).dflt("home");
-cli.option("tag", "extra tag, may repeat").many();
-cli.positional("root", "directory to serve").dflt(".");
+app.option("tag", "extra tag, may repeat").many();
+app.positional("root", "directory to serve").dflt(".");
 
-if (!cli.parse(args())) { print(cli.report()); exit(cli.exitCode()); }
+if (!app.parse(args())) { print(app.report()); exit(app.exitCode()); }
 
-cli.getInt("port")        // 9000   from  --port 9000 | --port=9000 | -p 9000
-cli.on("quiet")           // true   from  --quiet | -q | --quiet=yes
-cli.get("screen")         // "settings"      --screen=bogus is an ERROR
-cli.all("tag")            // ["a", "b"]      --tag a --tag=b
-cli.get("root")           // "/srv"  first operand, or "." if absent
-cli.extra()               // ["-x"]  everything after a bare  --
+app.getInt("port")        // 9000   from  --port 9000 | --port=9000 | -p 9000
+app.on("quiet")           // true   from  --quiet | -q | --quiet=yes
+app.get("screen")         // "settings"      --screen=bogus is an ERROR
+app.all("tag")            // ["a", "b"]      --tag a --tag=b
+app.get("root")           // "/srv"  first operand, or "." if absent
+app.extra()               // ["-x"]  everything after a bare  --
 ```
+
+`cli(name, about)` is shorthand for `new Cli(name, about)`, the way
+`stringBuilder` stands in for `new StringBuilder`; `about` may be omitted for a
+throwaway parser. Either spelling works — `new Cli` reads better where the
+variable is called `cli`.
+
+> **Do not name the variable `cli` if you import the function.** `let cli =
+> cli("grid", "...")` shadows the function it is calling. The migrated apps in
+> this repo use `new Cli(...)` and keep the variable name.
 
 `parse` returns `false` for **both** a bad command line and `--help`;
 `report()` and `exitCode()` tell them apart. Those four lines are the whole
@@ -40,7 +49,7 @@ idiom, and they are the only ones an app needs to get right.
 
 | Module | What it gives you |
 |--------|-------------------|
-| `vyto/cli` | `Cli`, `Flag`, the `CLI_*` kind constants, and the standalone `parse_int` / `parse_float` / `parse_bool` |
+| `vyto/cli` | `Cli` and its `cli()` shorthand, `Flag`, the `CLI_*` kind constants, and the standalone `parse_int` / `parse_float` / `parse_bool` |
 
 ## Declaring
 
