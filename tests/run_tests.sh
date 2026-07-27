@@ -220,6 +220,17 @@ else
     fail=1
 fi
 
+# --- vyto/geo: projections and the slippy-map tile scheme (pure Vyto) ---
+got=$(./vytoc run tests/fixtures/geo_tiles.vt 2>&1)
+if [ "$got" = "$(cat tests/fixtures/geo_tiles.expected)" ]; then
+    echo "PASS geo_tiles"
+else
+    echo "FAIL geo_tiles"
+    echo "--- expected ---"; cat tests/fixtures/geo_tiles.expected
+    echo "--- got ---"; printf '%s\n' "$got"
+    fail=1
+fi
+
 # --- vyto/gfx: blend2d Canvas -> blitPtr (gated on the prebuilt lib) ---
 if [ -f lib/vyto/gfx/native/linux-x64/libblend2d.so ]; then
     gfx_bin=apps/gfxdemo/.vyto-cache/gfxdemo_test

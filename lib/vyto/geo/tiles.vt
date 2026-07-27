@@ -1,0 +1,214 @@
+// vyto/geo/tiles — the slippy-map tile scheme.
+//
+//   import { lonLatToTile, tileBounds, bboxToTileRange } from "vyto/geo/tiles";
+//
+// Deliberately a layer on top of Mercator rather than part of the core: this is
+// one raster tiling convention, and a globe or a non-Mercator map has no use
+// for it. Nothing in vyto/geo depends on this file.
+//
+// The scheme is the usual one — the world is a square of 256 px at zoom 0,
+// doubling each level, with x increasing east from -180 and y increasing
+// *south* from the top. Row 0 at the top is the part people trip over; the
+// TMS convention numbers it the other way.
+
+import { PI, sin, cos, atan, exp, log, log2, floor, fmin } from "vyto/math";
+import { LatLon, BBox, DEG2RAD, RAD2DEG, EARTH_CIRCUMFERENCE_M,
+         clampMercatorLat } from "vyto/geo";
+
+export const TILE_SIZE: int = 256;
+
+// A tile address. z is carried alongside x and y because an x/y pair means
+// nothing without it, and every bug in this area is a pair that got separated
+// from its zoom.
+export struct TileXY {
+    x: int;
+    y: int;
+    z: int;
+}
+
+// A position in whole-world pixel space at a given zoom: the projection plane
+// scaled so the world is worldSize(z) pixels square, origin at the top-left
+// (north-west) corner.
+export struct WorldPx {
+    x: float;
+    y: float;
+    z: int;
+}
+
+// An inclusive rectangle of tiles.
+export struct TileRange {
+    minX: int;
+    minY: int;
+    maxX: int;
+    maxY: int;
+    z: int;
+
+    fn width(): int { return this.maxX - this.minX + 1; }
+    fn height(): int { return this.maxY - this.minY + 1; }
+    fn count(): int { return this.width() * this.height(); }
+    fn contains(t: TileXY): bool {
+        return t.z == this.z && t.x >= this.minX && t.x <= this.maxX
+               && t.y >= this.minY && t.y <= this.maxY;
+    }
+}
+
+// Number of tiles across the world at a zoom level: 2^z.
+export fn tilesAcross(z: int): int {
+    if (z <= 0) { return 1; }
+    return 1 << z;
+}
+
+// Width of the world in pixels at a zoom level.
+export fn worldSize(z: int): float {
+    return (TILE_SIZE as float) * (tilesAcross(z) as float);
+}
+
+// Longitude/latitude to whole-world pixels. Fractional, so it is also the
+// answer for a camera position rather than only for a tile corner.
+//
+// Longitude is *not* wrapped: a map panning east past the antimeridian needs x
+// to keep increasing, and clamping or wrapping here would snap it back. Use
+// wrapTileX at the point where a tile is actually fetched.
+export fn lonLatToWorldPx(ll: LatLon, z: int): WorldPx {
+    let size = worldSize(z);
+    let lat = clampMercatorLat(ll.lat) * DEG2RAD;
+    let sy = sin(lat);
+    return WorldPx(size * (ll.lon / 360.0 + 0.5),
+                   size * (0.5 - log((1.0 + sy) / (1.0 - sy)) / (4.0 * PI)),
+                   z);
+}
+
+export fn worldPxToLonLat(p: WorldPx): LatLon {
+    let size = worldSize(p.z);
+    let n = PI - 2.0 * PI * p.y / size;
+    return LatLon((p.x / size - 0.5) * 360.0,
+                  RAD2DEG * atan(0.5 * (exp(n) - exp(-n))));
+}
+
+// The tile a world-pixel position falls in. floor, not truncation: at negative
+// x — which is where a westward pan past the antimeridian lives — truncation
+// rounds toward zero and puts the position in the tile next door.
+export fn tileForWorldPx(p: WorldPx): TileXY {
+    return TileXY(floor(p.x / (TILE_SIZE as float)) as int,
+                  floor(p.y / (TILE_SIZE as float)) as int,
+                  p.z);
+}
+
+export fn lonLatToTile(ll: LatLon, z: int): TileXY {
+    return tileForWorldPx(lonLatToWorldPx(ll, z));
+}
+
+// North-west corner of a tile — the origin its image is drawn from.
+export fn tileNW(t: TileXY): LatLon {
+    return worldPxToLonLat(WorldPx((t.x * TILE_SIZE) as float,
+                                   (t.y * TILE_SIZE) as float, t.z));
+}
+
+// The geographic extent a tile covers. north/south come from the NW corners of
+// this tile and the next one down, so adjacent tiles share an edge exactly.
+export fn tileBounds(t: TileXY): BBox {
+    let nw = tileNW(t);
+    let se = tileNW(TileXY(t.x + 1, t.y + 1, t.z));
+    return BBox(nw.lon, se.lat, se.lon, nw.lat);
+}
+
+export fn tileCentre(t: TileXY): LatLon {
+    let b = tileBounds(t);
+    return b.center();
+}
+
+// Wrap a tile x into [0, 2^z) so an unwrapped pan can still address real tiles.
+//
+// Vyto's % is C's: the sign follows the dividend, so a plain x % n is negative
+// for a negative x. The double-modulo is the fix and is not redundant.
+export fn wrapTileX(x: int, z: int): int {
+    let n = tilesAcross(z);
+    return ((x % n) + n) % n;
+}
+
+// Whether a tile's y is on the map at all. Unlike x, y does not wrap: there is
+// nothing above the north edge.
+export fn tileYValid(t: TileXY): bool {
+    return t.y >= 0 && t.y < tilesAcross(t.z);
+}
+
+// The tiles covering an extent, inclusive. Handles a bbox that crosses the
+// antimeridian by returning a range whose minX is greater than the wrapped
+// maxX would be — the caller iterates minX..maxX and passes each through
+// wrapTileX, which is the same loop either way.
+export fn bboxToTileRange(b: BBox, z: int): TileRange {
+    let n = tilesAcross(z);
+    let nw = lonLatToWorldPx(LatLon(b.west, b.north), z);
+    let se = lonLatToWorldPx(LatLon(b.east, b.south), z);
+    let minX = floor(nw.x / (TILE_SIZE as float)) as int;
+    let maxX = floor(se.x / (TILE_SIZE as float)) as int;
+    let minY = floor(nw.y / (TILE_SIZE as float)) as int;
+    let maxY = floor(se.y / (TILE_SIZE as float)) as int;
+    // A wrapping extent projects to a west edge east of its east edge; carry
+    // the east edge around the world so the range stays a simple interval.
+    if (maxX < minX) { maxX = maxX + n; }
+    // An extent whose east edge lands exactly on a tile boundary picks up the
+    // column beyond it, which for the whole world means asking for n + 1
+    // columns and fetching column 0 twice. Covering more than the world is
+    // never right, so cap the span.
+    if (maxX - minX + 1 > n) { maxX = minX + n - 1; }
+    if (minY < 0) { minY = 0; }
+    if (maxY > n - 1) { maxY = n - 1; }
+    return TileRange(minX, minY, maxX, maxY, z);
+}
+
+// Ground resolution at a latitude and zoom, metres per pixel. The reason the
+// semi-major axis rather than the mean radius is used throughout this file:
+// this has to come out at 156543.034 at zoom 0, which is the number every
+// scale bar and every other tile library agrees on.
+export fn metersPerPixel(lat: float, z: int): float {
+    return EARTH_CIRCUMFERENCE_M * cos(clampMercatorLat(lat) * DEG2RAD) / worldSize(z);
+}
+
+// Metres per pixel at the equator — the canonical scale of a zoom level.
+export fn zoomResolution(z: int): float { return metersPerPixel(0.0, z); }
+
+// The zoom at which an extent fills a viewport of the given pixel size.
+//
+// Fractional and unclamped on purpose: minimum and maximum zoom are app policy,
+// and a layer's maxZoom is a property of the tile server, not of the maths. A
+// degenerate single-point extent returns 22.0 rather than an infinity, since a
+// caller that clamps would get an undefined `as int` out of the alternative.
+export fn zoomForBBox(b: BBox, widthPx: float, heightPx: float): float {
+    if (widthPx <= 0.0 || heightPx <= 0.0) { return 0.0; }
+    let nw = lonLatToWorldPx(LatLon(b.west, b.north), 0);
+    let se = lonLatToWorldPx(LatLon(b.east, b.south), 0);
+    let dx = se.x - nw.x;
+    // Keyed on the flag, not on the sign of dx: a degenerate single-point
+    // extent also has dx == 0, and treating that as a wrap would hand back a
+    // whole-world zoom instead of the maximum.
+    if (b.crossesAntimeridian()) { dx = dx + worldSize(0); }
+    let dy = se.y - nw.y;
+    let zx = 22.0;
+    let zy = 22.0;
+    if (dx > 0.0) { zx = log2(widthPx / dx); }
+    if (dy > 0.0) { zy = log2(heightPx / dy); }
+    return fmin(22.0, fmin(zx, zy));
+}
+
+// The parent of a tile, one zoom level out. Below zoom 0 there is no parent, so
+// zoom 0 is its own.
+export fn tileParent(t: TileXY): TileXY {
+    if (t.z <= 0) { return t; }
+    return TileXY(t.x >> 1, t.y >> 1, t.z - 1);
+}
+
+// The four children of a tile, in [NW, NE, SW, SE] order.
+export fn tileChildren(t: TileXY): TileXY[] {
+    let x = t.x * 2;
+    let y = t.y * 2;
+    let z = t.z + 1;
+    return [TileXY(x, y, z), TileXY(x + 1, y, z),
+            TileXY(x, y + 1, z), TileXY(x + 1, y + 1, z)];
+}
+
+// A stable cache key for a tile. Cheaper to compare than three ints and it is
+// what a disk cache path wants anyway.
+export fn tileKey(t: TileXY): string {
+    return t.z + "/" + t.x + "/" + t.y;
+}

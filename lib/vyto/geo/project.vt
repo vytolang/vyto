@@ -1,0 +1,233 @@
+// vyto/geo/project — map projections.
+//
+//   import { mercatorProject, OrthographicProjection } from "vyto/geo/project";
+//
+// Every projection here maps a LatLon to a Vec2 in metres on the projection
+// plane, using the semi-major axis as the sphere radius. That is the EPSG:3857
+// convention and it is what makes the tile layer's scale come out on the
+// universal 156543.034 m/px at zoom 0.
+//
+// Two ways in, on purpose:
+//
+//   - Free functions (mercatorProject, orthographicProject, …) for hot paths.
+//     A per-vertex loop should not pay for virtual dispatch.
+//   - A Projection class, so library and app code can accept *a* projection
+//     rather than hard-coding one. An app can subclass it with its own.
+//
+// The set is chosen to cover the shapes of app that exist rather than to be
+// exhaustive: Mercator for slippy maps, equirectangular for whole-world plate
+// carrée rasters, orthographic for a globe, gnomonic for anything reasoning
+// about great circles.
+
+import { PI, sin, cos, tan, asin, atan, atan2, hypot, exp, log, fabs } from "vyto/math";
+import { Vec2 } from "vyto/geom";
+import { LatLon, DEG2RAD, RAD2DEG, EARTH_RADIUS_M, clampMercatorLat,
+         normalizeLon, lonDelta } from "vyto/geo";
+
+// ---------------------------------------------------------------------------
+// Web Mercator (EPSG:3857)
+// ---------------------------------------------------------------------------
+
+// Spherical Mercator, metres. Conformal — angles and therefore local shapes
+// survive — which is why every slippy map uses it, and area does not, which is
+// why Greenland looks the way it does.
+//
+// Latitude is clamped here rather than at the call site. tan(PI/2) is infinite
+// and an `as int` on an infinite float is undefined behaviour in C, so an
+// unclamped pole would turn a data error into a crash a long way from home.
+export fn mercatorProject(ll: LatLon): Vec2 {
+    let lat = clampMercatorLat(ll.lat) * DEG2RAD;
+    return Vec2(EARTH_RADIUS_M * ll.lon * DEG2RAD,
+                EARTH_RADIUS_M * log(tan(PI * 0.25 + lat * 0.5)));
+}
+
+export fn mercatorUnproject(v: Vec2): LatLon {
+    return LatLon(v.x / EARTH_RADIUS_M * RAD2DEG,
+                  (2.0 * atan(exp(v.y / EARTH_RADIUS_M)) - PI * 0.5) * RAD2DEG);
+}
+
+// ---------------------------------------------------------------------------
+// Equirectangular (plate carrée)
+// ---------------------------------------------------------------------------
+
+// Longitude and latitude scaled straight onto the plane. Neither conformal nor
+// equal-area, but it is the native grid of most whole-world raster datasets and
+// the cheapest projection there is.
+//
+// `standardLat` is the parallel along which scale is true; 0 gives plate
+// carrée. Pass the middle of the area being drawn to keep a regional map from
+// looking stretched.
+export fn equirectProjectAt(ll: LatLon, standardLat: float): Vec2 {
+    return Vec2(EARTH_RADIUS_M * ll.lon * DEG2RAD * cos(standardLat * DEG2RAD),
+                EARTH_RADIUS_M * ll.lat * DEG2RAD);
+}
+
+export fn equirectUnprojectAt(v: Vec2, standardLat: float): LatLon {
+    let c = cos(standardLat * DEG2RAD);
+    // Guarded on an epsilon, not on zero: cos(90 degrees) evaluates to 6.1e-17
+    // rather than 0, so an exact test never fires and longitude comes back
+    // scaled by 1e17 instead of being reported as degenerate.
+    if (fabs(c) < 1e-12) { return LatLon(0.0, v.y / EARTH_RADIUS_M * RAD2DEG); }
+    return LatLon(v.x / (EARTH_RADIUS_M * c) * RAD2DEG,
+                  v.y / EARTH_RADIUS_M * RAD2DEG);
+}
+
+export fn equirectProject(ll: LatLon): Vec2 { return equirectProjectAt(ll, 0.0); }
+export fn equirectUnproject(v: Vec2): LatLon { return equirectUnprojectAt(v, 0.0); }
+
+// ---------------------------------------------------------------------------
+// Orthographic — the globe view
+// ---------------------------------------------------------------------------
+
+// The view from infinitely far away: what a globe actually looks like. Exactly
+// half the world is visible at once, and the far hemisphere projects onto the
+// same disc as the near one — so a renderer that does not cull it draws the
+// far side of the planet over the near side.
+//
+// orthographicVisible is that cull test, and it is the single thing every
+// hand-rolled globe gets wrong.
+export fn orthographicProjectAt(ll: LatLon, centre: LatLon): Vec2 {
+    let lat = ll.lat * DEG2RAD;
+    let lat0 = centre.lat * DEG2RAD;
+    let dLon = lonDelta(centre.lon, ll.lon) * DEG2RAD;
+    return Vec2(EARTH_RADIUS_M * cos(lat) * sin(dLon),
+                EARTH_RADIUS_M * (cos(lat0) * sin(lat)
+                                  - sin(lat0) * cos(lat) * cos(dLon)));
+}
+
+// Whether a position is on the near hemisphere, i.e. the cosine of the angular
+// distance from the centre is non-negative. Points exactly on the silhouette
+// count as visible.
+export fn orthographicVisible(ll: LatLon, centre: LatLon): bool {
+    let lat = ll.lat * DEG2RAD;
+    let lat0 = centre.lat * DEG2RAD;
+    let dLon = lonDelta(centre.lon, ll.lon) * DEG2RAD;
+    return sin(lat0) * sin(lat) + cos(lat0) * cos(lat) * cos(dLon) >= 0.0;
+}
+
+// Inverse. Always returns a position on the *near* hemisphere, since that is
+// the only one the forward map is invertible over. A point outside the disc has
+// no preimage at all; it is clamped to the silhouette rather than returning a
+// NaN that would propagate silently.
+export fn orthographicUnprojectAt(v: Vec2, centre: LatLon): LatLon {
+    let x = v.x / EARTH_RADIUS_M;
+    let y = v.y / EARTH_RADIUS_M;
+    let rho = hypot(x, y);
+    if (rho == 0.0) { return centre; }
+    if (rho > 1.0) {
+        // Outside the disc: project back onto the rim.
+        x = x / rho;
+        y = y / rho;
+        rho = 1.0;
+    }
+    let c = asin(rho);                     // angular distance from the centre
+    let lat0 = centre.lat * DEG2RAD;
+    let lat = asin(cos(c) * sin(lat0) + y * sin(c) * cos(lat0) / rho);
+    let lon = centre.lon * DEG2RAD
+              + atan2(x * sin(c), rho * cos(c) * cos(lat0) - y * sin(c) * sin(lat0));
+    return LatLon(normalizeLon(lon * RAD2DEG), lat * RAD2DEG);
+}
+
+// ---------------------------------------------------------------------------
+// Gnomonic
+// ---------------------------------------------------------------------------
+
+// The projection from the centre of the sphere onto a tangent plane. Its one
+// property, and the reason it is worth carrying: every great circle maps to a
+// straight line. Route planning and visibility problems become straight-edge
+// geometry.
+//
+// Less than a hemisphere is representable and distortion runs away towards the
+// rim, so it is a tool, not a basemap. A point on or beyond the horizon has no
+// image; gnomonicVisible reports that, and the forward function returns the
+// zero vector there rather than an infinity.
+export fn gnomonicVisible(ll: LatLon, centre: LatLon): bool {
+    let lat = ll.lat * DEG2RAD;
+    let lat0 = centre.lat * DEG2RAD;
+    let dLon = lonDelta(centre.lon, ll.lon) * DEG2RAD;
+    return sin(lat0) * sin(lat) + cos(lat0) * cos(lat) * cos(dLon) > 0.0;
+}
+
+export fn gnomonicProjectAt(ll: LatLon, centre: LatLon): Vec2 {
+    let lat = ll.lat * DEG2RAD;
+    let lat0 = centre.lat * DEG2RAD;
+    let dLon = lonDelta(centre.lon, ll.lon) * DEG2RAD;
+    let cosc = sin(lat0) * sin(lat) + cos(lat0) * cos(lat) * cos(dLon);
+    if (cosc <= 0.0) { return Vec2(0.0, 0.0); }
+    return Vec2(EARTH_RADIUS_M * cos(lat) * sin(dLon) / cosc,
+                EARTH_RADIUS_M * (cos(lat0) * sin(lat)
+                                  - sin(lat0) * cos(lat) * cos(dLon)) / cosc);
+}
+
+export fn gnomonicUnprojectAt(v: Vec2, centre: LatLon): LatLon {
+    let x = v.x / EARTH_RADIUS_M;
+    let y = v.y / EARTH_RADIUS_M;
+    let rho = hypot(x, y);
+    if (rho == 0.0) { return centre; }
+    let c = atan(rho);
+    let lat0 = centre.lat * DEG2RAD;
+    let lat = asin(cos(c) * sin(lat0) + y * sin(c) * cos(lat0) / rho);
+    let lon = centre.lon * DEG2RAD
+              + atan2(x * sin(c), rho * cos(c) * cos(lat0) - y * sin(c) * sin(lat0));
+    return LatLon(normalizeLon(lon * RAD2DEG), lat * RAD2DEG);
+}
+
+// ---------------------------------------------------------------------------
+// The Projection interface
+// ---------------------------------------------------------------------------
+
+// A projection as an object, so code can be written against "a projection"
+// instead of one specific formula. Subclass it to add your own; nothing in this
+// module inspects the concrete type.
+//
+// The base is the identity on degrees, which is useless as a map but makes the
+// class concrete and gives a subclass that only overrides one direction
+// something defined to fall back on.
+export class Projection {
+    virtual fn project(ll: LatLon): Vec2 { return Vec2(ll.lon, ll.lat); }
+    virtual fn unproject(v: Vec2): LatLon { return LatLon(v.x, v.y); }
+    virtual fn name(): string { return "identity"; }
+    // Whether a position has an image at all. Only the azimuthal projections
+    // answer false, but asking is always valid — that is the point of putting
+    // it on the base rather than on two of the four subclasses.
+    virtual fn isVisible(ll: LatLon): bool { return true; }
+}
+
+export class MercatorProjection extends Projection {
+    fn init() { }
+    override fn project(ll: LatLon): Vec2 { return mercatorProject(ll); }
+    override fn unproject(v: Vec2): LatLon { return mercatorUnproject(v); }
+    override fn name(): string { return "mercator"; }
+}
+
+export class EquirectProjection extends Projection {
+    standardLat: float;
+
+    fn init(standardLat: float) { this.standardLat = standardLat; }
+    override fn project(ll: LatLon): Vec2 { return equirectProjectAt(ll, this.standardLat); }
+    override fn unproject(v: Vec2): LatLon { return equirectUnprojectAt(v, this.standardLat); }
+    override fn name(): string { return "equirectangular"; }
+}
+
+export class OrthographicProjection extends Projection {
+    centre: LatLon;
+
+    fn init(centre: LatLon) { this.centre = centre; }
+    // Spinning a globe is moving this point; nothing else needs rebuilding.
+    fn setCentre(centre: LatLon) { this.centre = centre; }
+    override fn project(ll: LatLon): Vec2 { return orthographicProjectAt(ll, this.centre); }
+    override fn unproject(v: Vec2): LatLon { return orthographicUnprojectAt(v, this.centre); }
+    override fn isVisible(ll: LatLon): bool { return orthographicVisible(ll, this.centre); }
+    override fn name(): string { return "orthographic"; }
+}
+
+export class GnomonicProjection extends Projection {
+    centre: LatLon;
+
+    fn init(centre: LatLon) { this.centre = centre; }
+    fn setCentre(centre: LatLon) { this.centre = centre; }
+    override fn project(ll: LatLon): Vec2 { return gnomonicProjectAt(ll, this.centre); }
+    override fn unproject(v: Vec2): LatLon { return gnomonicUnprojectAt(v, this.centre); }
+    override fn isVisible(ll: LatLon): bool { return gnomonicVisible(ll, this.centre); }
+    override fn name(): string { return "gnomonic"; }
+}

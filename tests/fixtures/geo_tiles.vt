@@ -1,0 +1,277 @@
+// Pure-Vyto coverage for vyto/geo/project and vyto/geo/tiles: the four
+// projections, the Projection interface, and the slippy-map tile scheme.
+//
+// Same golden rule as the rest of vyto/geo: ints and bools only, never a bare
+// float, and absolutes go through round() rather than truncation.
+import { LatLon, BBox, MAX_MERCATOR_LAT, EARTH_RADIUS_M, bboxEmpty } from "vyto/geo";
+import { mercatorProject, mercatorUnproject, equirectProject, equirectUnproject,
+         equirectProjectAt, equirectUnprojectAt, orthographicProjectAt,
+         orthographicUnprojectAt, orthographicVisible, gnomonicProjectAt,
+         gnomonicUnprojectAt, gnomonicVisible, Projection, MercatorProjection,
+         EquirectProjection, OrthographicProjection, GnomonicProjection
+       } from "vyto/geo/project";
+import { TILE_SIZE, TileXY, WorldPx, TileRange, tilesAcross, worldSize,
+         lonLatToWorldPx, worldPxToLonLat, tileForWorldPx, lonLatToTile,
+         tileNW, tileBounds, tileCentre, wrapTileX, tileYValid, bboxToTileRange,
+         metersPerPixel, zoomResolution, zoomForBBox, tileParent, tileChildren,
+         tileKey } from "vyto/geo/tiles";
+import { Vec2 } from "vyto/geom";
+import { PI, round, fabs } from "vyto/math";
+
+fn near(a: float, b: float, eps: float): bool { return fabs(a - b) < eps; }
+fn q(x: float, scale: float): int { return round(x * scale) as int; }
+fn llnear(a: LatLon, b: LatLon, eps: float): bool {
+    return near(a.lon, b.lon, eps) && near(a.lat, b.lat, eps);
+}
+
+fn main() {
+    // ---- Mercator ----
+    let origin = mercatorProject(LatLon(0.0, 0.0));
+    print("merc00=" + q(origin.x, 1.0) + "," + q(origin.y, 1.0));
+    // The world is square: at the Mercator latitude limit y is exactly half the
+    // circumference, PI * R. That squareness is the whole reason for the limit.
+    let top = mercatorProject(LatLon(180.0, MAX_MERCATOR_LAT));
+    print("mercsquare=" + near(top.y, PI * EARTH_RADIUS_M, 1e-6)
+          + "," + near(top.x, PI * EARTH_RADIUS_M, 1e-9));
+    print("mercedge=" + (round(top.x) as int));
+    // Latitude is clamped inside the projection, so a pole is finite.
+    print("mercpole=" + near(mercatorProject(LatLon(0.0, 90.0)).y, top.y, 1e-6)
+          + "," + near(mercatorProject(LatLon(0.0, -90.0)).y, -top.y, 1e-6));
+    let sf = LatLon(-122.4194, 37.7749);
+    print("mercround=" + llnear(mercatorUnproject(mercatorProject(sf)), sf, 1e-9));
+    // Symmetric about the equator.
+    print("mercsym=" + near(mercatorProject(LatLon(10.0, 45.0)).y,
+                            -mercatorProject(LatLon(10.0, -45.0)).y, 1e-9));
+
+    // ---- Equirectangular ----
+    print("eq00=" + q(equirectProject(LatLon(0.0, 0.0)).x, 1.0));
+    print("eqround=" + llnear(equirectUnproject(equirectProject(sf)), sf, 1e-9));
+    // Plate carree: x and y scale identically, so a square in degrees stays
+    // square in metres.
+    print("eqsquare=" + near(equirectProject(LatLon(10.0, 0.0)).x,
+                             equirectProject(LatLon(0.0, 10.0)).y, 1e-9));
+    // A standard parallel foreshortens longitude by cos(lat) and nothing else.
+    let at60 = equirectProjectAt(LatLon(10.0, 20.0), 60.0);
+    print("eqstd=" + near(at60.x, equirectProject(LatLon(10.0, 20.0)).x * 0.5, 1e-6)
+          + "," + near(at60.y, equirectProject(LatLon(10.0, 20.0)).y, 1e-12));
+    print("eqstdround=" + llnear(equirectUnprojectAt(at60, 60.0), LatLon(10.0, 20.0), 1e-9));
+    // A standard parallel at the pole collapses x; documented, and it must not
+    // divide by zero.
+    print("eqstdpole=" + q(equirectUnprojectAt(Vec2(5.0, 0.0), 90.0).lon, 1.0));
+
+    // ---- Orthographic: the globe ----
+    let centre = LatLon(0.0, 0.0);
+    print("ortho0=" + q(orthographicProjectAt(centre, centre).x, 1.0)
+          + "," + q(orthographicProjectAt(centre, centre).y, 1.0));
+    // The near hemisphere is visible, the far one is not. This is the cull
+    // test a globe renderer lives or dies by.
+    print("orthovis=" + orthographicVisible(LatLon(45.0, 0.0), centre)
+          + "," + orthographicVisible(LatLon(135.0, 0.0), centre)
+          + "," + orthographicVisible(LatLon(180.0, 0.0), centre));
+    // Exactly on the silhouette counts as visible.
+    print("orthorim=" + orthographicVisible(LatLon(90.0, 0.0), centre));
+    // The silhouette is the disc of radius R.
+    print("orthodisc=" + near(orthographicProjectAt(LatLon(90.0, 0.0), centre).len(),
+                              EARTH_RADIUS_M, 1e-6));
+    // North is up when the centre is on the equator.
+    print("orthonorth=" + (orthographicProjectAt(LatLon(0.0, 45.0), centre).y > 0.0));
+    let op = LatLon(20.0, 30.0);
+    print("orthoround=" + llnear(orthographicUnprojectAt(orthographicProjectAt(op, centre),
+                                                         centre), op, 1e-9));
+    // An off-equator centre round-trips too.
+    let c2 = LatLon(-75.0, 40.0);
+    let op2 = LatLon(-70.0, 45.0);
+    print("orthoround2=" + llnear(orthographicUnprojectAt(orthographicProjectAt(op2, c2), c2),
+                                  op2, 1e-9));
+    // Outside the disc is clamped to the rim, not returned as a NaN.
+    let outside = orthographicUnprojectAt(Vec2(3.0 * EARTH_RADIUS_M, 0.0), centre);
+    print("orthooutside=" + (outside.lon == outside.lon) + "," + q(outside.lon, 1.0));
+
+    // ---- Gnomonic ----
+    print("gnom0=" + q(gnomonicProjectAt(centre, centre).x, 1.0));
+    print("gnomvis=" + gnomonicVisible(LatLon(45.0, 0.0), centre)
+          + "," + gnomonicVisible(LatLon(90.0, 0.0), centre)     // horizon: no image
+          + "," + gnomonicVisible(LatLon(135.0, 0.0), centre));
+    // Beyond the horizon returns zero rather than an infinity.
+    print("gnomhorizon=" + q(gnomonicProjectAt(LatLon(135.0, 0.0), centre).len(), 1.0));
+    let gp = LatLon(20.0, 30.0);
+    print("gnomround=" + llnear(gnomonicUnprojectAt(gnomonicProjectAt(gp, centre), centre),
+                                gp, 1e-9));
+    // THE gnomonic property: a great circle maps to a straight line. The
+    // equator is a great circle, so three points on it must be collinear --
+    // here trivially, all at y == 0.
+    print("gnomequator=" + (q(gnomonicProjectAt(LatLon(10.0, 0.0), centre).y, 1.0)
+                            + "," + q(gnomonicProjectAt(LatLon(40.0, 0.0), centre).y, 1.0)));
+    // A non-trivial great circle: the meridian pair through 0 and 180 seen from
+    // a centre on the equator projects to a vertical line, x == 0 throughout.
+    print("gnommeridian=" + q(gnomonicProjectAt(LatLon(0.0, 30.0), centre).x, 1.0)
+          + "," + q(gnomonicProjectAt(LatLon(0.0, 60.0), centre).x, 1.0));
+    // The real test: three points on an *inclined* great circle -- not the
+    // equator, not a meridian -- must still land on one straight line.
+    // (-30,-20), (0,0) and (30,20) lie on a common great circle, since the
+    // first is the second's reflection of the third through the centre plane.
+    // Collinearity is the cross product of the two edge vectors; normalise by
+    // R^2 so the threshold means something.
+    let c3 = LatLon(0.0, 0.0);
+    let g1 = gnomonicProjectAt(LatLon(-30.0, -20.0), c3);
+    let g2 = gnomonicProjectAt(LatLon(0.0, 0.0), c3);
+    let g3 = gnomonicProjectAt(LatLon(30.0, 20.0), c3);
+    let cross = ((g2.x - g1.x) * (g3.y - g1.y) - (g2.y - g1.y) * (g3.x - g1.x))
+                / (EARTH_RADIUS_M * EARTH_RADIUS_M);
+    print("gnomgreatcircle=" + near(cross, 0.0, 1e-12));
+    // Guard against a vacuous test: three points NOT on a common great circle
+    // must not be collinear.
+    let h3 = gnomonicProjectAt(LatLon(60.0, 5.0), c3);
+    let cross2 = ((g2.x - g1.x) * (h3.y - g1.y) - (g2.y - g1.y) * (h3.x - g1.x))
+                 / (EARTH_RADIUS_M * EARTH_RADIUS_M);
+    print("gnomnotline=" + (fabs(cross2) > 1e-3));
+
+    // ---- The Projection interface ----
+    let merc: Projection = new MercatorProjection();
+    let eqr: Projection = new EquirectProjection(0.0);
+    let orth: Projection = new OrthographicProjection(centre);
+    let gnom: Projection = new GnomonicProjection(centre);
+    print("names=" + merc.name() + "," + eqr.name() + "," + orth.name()
+          + "," + gnom.name());
+    // Virtual dispatch has to agree with the free function exactly.
+    print("dispatch=" + (merc.project(sf).x == mercatorProject(sf).x)
+          + "," + (eqr.project(sf).y == equirectProject(sf).y));
+    print("dispatchround=" + llnear(merc.unproject(merc.project(sf)), sf, 1e-9));
+    // isVisible is on the base so asking is always valid; only the azimuthal
+    // ones ever answer false.
+    print("vis=" + merc.isVisible(LatLon(179.0, 0.0)) + "," + eqr.isVisible(LatLon(179.0, 0.0))
+          + "," + orth.isVisible(LatLon(179.0, 0.0)) + "," + gnom.isVisible(LatLon(179.0, 0.0)));
+    // The base class is a concrete identity, so a partial subclass has
+    // something defined to fall back on.
+    let base = new Projection();
+    print("base=" + base.name() + "," + q(base.project(LatLon(3.0, 4.0)).y, 1.0)
+          + "," + q(base.unproject(Vec2(3.0, 4.0)).lon, 1.0));
+    // A globe spins by moving one point.
+    let spin = new OrthographicProjection(LatLon(0.0, 0.0));
+    print("spinbefore=" + spin.isVisible(LatLon(170.0, 0.0)));
+    spin.setCentre(LatLon(180.0, 0.0));
+    print("spinafter=" + spin.isVisible(LatLon(170.0, 0.0)));
+
+    // ---- Tiles: the grid ----
+    print("tilesize=" + TILE_SIZE);
+    print("across=" + tilesAcross(0) + "," + tilesAcross(1) + "," + tilesAcross(12)
+          + "," + tilesAcross(-3));
+    print("worldsize=" + q(worldSize(0), 1.0) + "," + q(worldSize(2), 1.0));
+
+    // The canonical scale of zoom 0. Every scale bar and every other tile
+    // library agrees on this number.
+    print("mpp0=" + q(metersPerPixel(0.0, 0), 1000.0));
+    print("mpp=" + near(metersPerPixel(0.0, 1), metersPerPixel(0.0, 0) * 0.5, 1e-9));
+    // Ground resolution shrinks with cos(latitude).
+    print("mpplat=" + near(metersPerPixel(60.0, 0), metersPerPixel(0.0, 0) * 0.5, 1e-3));
+    print("mppclamp=" + (metersPerPixel(90.0, 0) > 0.0));
+    print("zoomres=" + (zoomResolution(5) == metersPerPixel(0.0, 5)));
+
+    // ---- World pixels ----
+    // (0,0) sits at the centre of the world square.
+    let wp0 = lonLatToWorldPx(LatLon(0.0, 0.0), 0);
+    print("wpx0=" + q(wp0.x, 1.0) + "," + q(wp0.y, 1.0));
+    // The north-west corner of the world is the origin.
+    let wpnw = lonLatToWorldPx(LatLon(-180.0, MAX_MERCATOR_LAT), 0);
+    print("wpxnw=" + q(wpnw.x, 1.0) + "," + q(wpnw.y, 1000.0));
+    print("wpxround=" + llnear(worldPxToLonLat(lonLatToWorldPx(sf, 14)), sf, 1e-9));
+    // Longitude is NOT wrapped: panning east past 180 keeps x increasing, which
+    // is what makes a continuous world pan possible.
+    print("wpxunwrapped=" + (lonLatToWorldPx(LatLon(190.0, 0.0), 0).x > worldSize(0)));
+
+    // ---- Tile addressing ----
+    // The Golden Gate Bridge at zoom 12.
+    let gg = lonLatToTile(LatLon(-122.4783, 37.8199), 12);
+    print("ggtile=" + gg.x + "," + gg.y + "," + gg.z);
+    print("ggkey=" + tileKey(gg));
+    // Zoom 0 is a single tile holding the whole world.
+    print("z0tile=" + tileKey(lonLatToTile(sf, 0)));
+    // floor, not truncation: just west of the antimeridian is tile -1, not 0.
+    print("negtile=" + tileForWorldPx(WorldPx(-1.0, 10.0, 4)).x
+          + "," + tileForWorldPx(WorldPx(1.0, 10.0, 4)).x);
+
+    // A tile's NW corner is where its image is drawn from, and its bounds join
+    // its neighbour's exactly.
+    let t = TileXY(654, 1582, 12);
+    print("nwbounds=" + (tileNW(t).lon == tileBounds(t).west)
+          + "," + (tileNW(t).lat == tileBounds(t).north));
+    let east = TileXY(655, 1582, 12);
+    print("adjacent=" + (tileBounds(t).east == tileBounds(east).west));
+    let south = TileXY(654, 1583, 12);
+    print("adjacentY=" + (tileBounds(t).south == tileBounds(south).north));
+    // The centre of a tile is inside it.
+    print("centreself=" + (tileKey(lonLatToTile(tileCentre(t), 12)) == tileKey(t)));
+    // Tile 0 at zoom 0 covers the whole Mercator world.
+    let whole = tileBounds(TileXY(0, 0, 0));
+    print("z0bounds=" + q(whole.west, 1.0) + "," + q(whole.east, 1.0)
+          + "," + q(whole.north, 1000.0) + "," + q(whole.south, 1000.0));
+
+    // ---- wrapTileX ----
+    // C's % takes the sign of the dividend, so the double modulo is required,
+    // not redundant.
+    print("wrap=" + wrapTileX(-1, 4) + "," + wrapTileX(16, 4) + "," + wrapTileX(0, 4)
+          + "," + wrapTileX(15, 4));
+    print("wrapfar=" + wrapTileX(-17, 4) + "," + wrapTileX(33, 4));
+    print("wrapz0=" + wrapTileX(-5, 0));
+    // y does not wrap: there is nothing above the north edge.
+    print("yvalid=" + tileYValid(TileXY(0, 0, 4)) + "," + tileYValid(TileXY(0, 15, 4))
+          + "," + tileYValid(TileXY(0, -1, 4)) + "," + tileYValid(TileXY(0, 16, 4)));
+
+    // ---- Tile ranges ----
+    let r = bboxToTileRange(BBox(-10.0, -10.0, 10.0, 10.0), 4);
+    print("range=" + r.minX + "," + r.minY + "," + r.maxX + "," + r.maxY);
+    print("rangesize=" + r.width() + "," + r.height() + "," + r.count());
+    print("rangehas=" + r.contains(TileXY(r.minX, r.minY, 4))
+          + "," + r.contains(TileXY(r.minX, r.minY, 5))       // wrong zoom
+          + "," + r.contains(TileXY(r.maxX + 1, r.minY, 4)));
+    // The whole world at zoom 2 is 16 tiles.
+    let world = bboxToTileRange(BBox(-180.0, -85.0, 180.0, 85.0), 2);
+    print("rangeworld=" + world.count());
+    // A wrapping extent stays a simple interval: minX..maxX runs past the edge
+    // and the caller wraps each x as it fetches.
+    let wrapR = bboxToTileRange(BBox(170.0, -10.0, -170.0, 10.0), 4);
+    print("rangewrap=" + (wrapR.maxX >= wrapR.minX) + "," + (wrapR.maxX >= 16));
+    print("rangewrapx=" + wrapTileX(wrapR.maxX, 4));
+    // Latitude beyond the Mercator limit clamps into the grid rather than
+    // producing an out-of-range row.
+    let polar = bboxToTileRange(BBox(-10.0, -90.0, 10.0, 90.0), 3);
+    print("rangepolar=" + (polar.minY >= 0) + "," + (polar.maxY <= 7));
+
+    // ---- Zoom fitting ----
+    // Half the world wide in a 256 px viewport is zoom 1.
+    print("fit=" + q(zoomForBBox(BBox(-90.0, -1.0, 90.0, 1.0), 256.0, 10000.0), 1000.0));
+    // The whole world in 256 px is zoom 0.
+    print("fitworld=" + q(zoomForBBox(BBox(-180.0, -85.05112877980659,
+                                           180.0, 85.05112877980659), 256.0, 256.0), 1000.0));
+    // Fractional and unclamped -- min/max zoom is app policy, not maths. A
+    // 2-degree extent in 800x600 fits at 8.72, limited by height rather than
+    // width, so the smaller of the two axes is the one that wins.
+    let frac = zoomForBBox(BBox(-1.0, -1.0, 1.0, 1.0), 800.0, 600.0);
+    print("fitfrac=" + (frac > 8.0 && frac < 9.0));
+    print("fitaxis=" + (frac < zoomForBBox(BBox(-1.0, -1.0, 1.0, 1.0), 800.0, 8000.0)));
+    // A degenerate single-point extent returns the cap, not an infinity.
+    print("fitpoint=" + q(zoomForBBox(BBox(5.0, 5.0, 5.0, 5.0), 800.0, 600.0), 1.0));
+    print("fitempty=" + q(zoomForBBox(bboxEmpty(), 0.0, 600.0), 1.0));
+    // A wrapping extent fits by its real width, not by the long way round.
+    let wrapFit = zoomForBBox(BBox(170.0, -5.0, -170.0, 5.0), 256.0, 10000.0);
+    let sameFit = zoomForBBox(BBox(-10.0, -5.0, 10.0, 5.0), 256.0, 10000.0);
+    print("fitwrap=" + near(wrapFit, sameFit, 1e-12));
+
+    // ---- Pyramid ----
+    let p = tileParent(TileXY(655, 1583, 12));
+    print("parent=" + tileKey(p));
+    print("parentz0=" + tileKey(tileParent(TileXY(0, 0, 0))));
+    let kids = tileChildren(TileXY(327, 791, 11));
+    print("children=" + tileKey(kids[0]) + " " + tileKey(kids[1]) + " "
+          + tileKey(kids[2]) + " " + tileKey(kids[3]));
+    // Every child's parent is the tile it came from.
+    let roundOk = true;
+    let i = 0;
+    while (i < 4) {
+        if (tileKey(tileParent(kids[i])) != tileKey(TileXY(327, 791, 11))) { roundOk = false; }
+        i = i + 1;
+    }
+    print("pyramid=" + roundOk);
+    // A child covers a quarter of its parent, and shares its NW corner.
+    print("childnw=" + llnear(tileNW(kids[0]), tileNW(TileXY(327, 791, 11)), 1e-12));
+}
