@@ -16,16 +16,20 @@
 // Jump straight to a screen for a screenshot/demo pass:
 //   ./vytoc run apps/iphone/iphone.vt -- --screen=settings
 //   (home | settings | contacts | photos)
+//
+// VOLTPHONE_TRACE=1 prints one "screen <name>" line per navigation; the
+// headless test (apps/iphone/iphone.events) asserts on that sequence.
 
 import { Window, Widget, Painter, Theme, Size, Column, Row, Spacer, Label, Card,
-         Container, Center, SizedBox, Padding, Grid, Icon, Avatar, Image,
+         Container, Center, SizedBox, Padding, Expanded, Grid, Icon, Avatar, Image,
          ICON_CHEVRON_LEFT, ICON_SIGNAL, ICON_WIFI, ICON_BATTERY, ICON_GEAR,
          ICON_BELL, ICON_PERSON, ICON_CAMERA,
          ICON_MAIL, ICON_MESSAGE, ICON_PHOTO, ICON_MUSIC, ICON_MAP_PIN,
-         ICON_HEART, ICON_STAR, ICON_HOME, ICON_SEARCH,
-         ICON_CHEVRON_RIGHT, skin_ios, theme_ios, Skin } from "vyto/ui";
+         ICON_HEART, ICON_STAR, ICON_SEARCH,
+         ICON_CHEVRON_RIGHT, skin_ios, theme_ios } from "vyto/ui";
 import { GfxPainter } from "vyto/gfx/painter";
-import { Rect, rgb, mix, contains } from "vyto/surface";
+import { Rect, rgb, contains } from "vyto/surface";
+import { getenv } from "vyto/os";
 
 fn font_path(): string {
     return "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf";
@@ -33,14 +37,6 @@ fn font_path(): string {
 
 fn asset(name: string): string {
     return "apps/iphone/assets/" + name;
-}
-
-fn rect_overlaps(a: Rect, b: Rect): bool {
-    if (a.x + a.w <= b.x) { return false; }
-    if (b.x + b.w <= a.x) { return false; }
-    if (a.y + a.h <= b.y) { return false; }
-    if (b.y + b.h <= a.y) { return false; }
-    return true;
 }
 
 // ------------------------------------------------------- DeviceFrame
@@ -59,6 +55,12 @@ class DeviceFrame extends Widget {
         this.screenBg = screenBg;
         this.bezelColor = bezelColor;
         if (child != null) { this.add(child); }
+        // This widget paints the bezel and screen itself in render(), outside
+        // any child. Without this the dirty-rect path takes the container
+        // branch (chrome + children only) and drops them, so any partial
+        // repaint — hover, press, focus — clears them to the window background
+        // and they flicker away.
+        this.custom_paint = true;
     }
 
     fn child(): Widget {
@@ -74,33 +76,21 @@ class DeviceFrame extends Widget {
         this.bounds = r;
         let c = this.child();
         if (c == null) { return; }
-        let pad = 14;
-        let inner = Rect(r.x + pad, r.y + pad, r.w - 2 * pad, r.h - 2 * pad);
+        let pad = 14.0;
+        let inner = Rect(r.x + pad, r.y + pad, r.w - 2.0 * pad, r.h - 2.0 * pad);
         c.arrange(s, th, inner);
     }
 
     override fn render(s: Painter, th: Theme) {
         this.win.skin.panel.paint(s, th, this.bounds, 48, this.bezelColor, this.bezelColor, 3);
-        let pad = 14;
+        let pad = 14.0;
         let inner = Rect(this.bounds.x + pad, this.bounds.y + pad,
-                         this.bounds.w - 2 * pad, this.bounds.h - 2 * pad);
+                         this.bounds.w - 2.0 * pad, this.bounds.h - 2.0 * pad);
         s.fill_round(inner, 36, this.screenBg);
         s.clip_push(inner, 36);
         let c = this.child();
         if (c != null) { c.draw(s, th); }
         s.clip_pop();
-    }
-
-    // Widget.draw_within's container branch paints draw_chrome() then
-    // recurses into children directly, bypassing the bezel/screen fill and
-    // clip that live in draw() above — those only run on a full draw(). Any
-    // partial repaint touching this widget (hover, press, focus…) would
-    // clear its dirty rect to window bg and never restore the bezel/screen,
-    // making them flicker away. Force every partial repaint that overlaps
-    // this widget to fall back to the full draw() instead.
-    override fn render_within(s: Painter, th: Theme, d: Rect) {
-        if (!rect_overlaps(this.bounds, d)) { return; }
-        this.draw(s, th);
     }
 }
 
@@ -116,7 +106,7 @@ class AppTile extends Widget {
     icon: Icon;
     caption: Label;
 
-    fn init(iconId: int, text: string, bg: int, iconSize: int) {
+    fn init(iconId: int, text: string, bg: int, iconSize: float) {
         super.init();
         this.icon = new Icon(iconId, iconSize);
         this.icon.bg = bg;
@@ -129,27 +119,39 @@ class AppTile extends Widget {
         this.focusable = true;
     }
 
+    // An empty caption is a real case — dock tiles and the nav-bar back
+    // chevron are icon-only. A Label still measures a full line box when its
+    // text is "", so counting it would reserve a line of dead height under
+    // every one of those and inflate the dock panel around nothing.
+    fn captioned(): bool { return this.caption.text != ""; }
+
     override fn measure(s: Painter, th: Theme): Size {
         let is = this.icon.measure(s, th);
+        if (!this.captioned()) { return is; }
         let ls = this.caption.measure(s, th);
         let w = is.w;
         if (ls.w > w) { w = ls.w; }
-        return Size(w, is.h + 4 + ls.h);
+        return Size(w, is.h + 4.0 + ls.h);
     }
 
     override fn arrange(s: Painter, th: Theme, r: Rect) {
         this.bounds = r;
         let is = this.icon.measure(s, th);
-        let ix = r.x + (r.w - is.w) / 2;
-        this.icon.arrange(s, th, Rect(ix, r.y, is.w, is.h));
+        let ix = r.x + (r.w - is.w) / 2.0;
+        let iy = r.y;
+        // Icon-only tiles centre in the box they were given; captioned ones
+        // stack from the top so the caption sits directly under the glyph.
+        if (!this.captioned()) { iy = r.y + (r.h - is.h) / 2.0; }
+        this.icon.arrange(s, th, Rect(ix, iy, is.w, is.h));
+        if (!this.captioned()) { return; }
         let ls = this.caption.measure(s, th);
-        let lx = r.x + (r.w - ls.w) / 2;
-        this.caption.arrange(s, th, Rect(lx, r.y + is.h + 4, ls.w, ls.h));
+        let lx = r.x + (r.w - ls.w) / 2.0;
+        this.caption.arrange(s, th, Rect(lx, r.y + is.h + 4.0, ls.w, ls.h));
     }
 
     override fn render(s: Painter, th: Theme) {
         this.icon.draw(s, th);
-        this.caption.draw(s, th);
+        if (this.captioned()) { this.caption.draw(s, th); }
     }
 
     override fn on_click(x: int, y: int): bool {
@@ -190,22 +192,28 @@ fn home_indicator(): Widget {
 }
 
 // Nav bar for a pushed screen: back chevron + title.
+//
+// The glyph is sized to fit the box that holds it: the tap target is the
+// AppTile's own bounds, so a glyph larger than its box paints outside the
+// region that actually responds — a chevron you can see but not reliably
+// press. 44px box inside a 56px bar (Padding 6 => 32px of row height, and
+// the box takes the row's cross size), 28px glyph centred in it.
 fn nav_bar(title: string, onBack: fn()): Widget {
-    let back = new AppTile(ICON_CHEVRON_LEFT, "", -1, 56);
+    let back = new AppTile(ICON_CHEVRON_LEFT, "", -1, 28);
     back.icon.color = rgb(0, 122, 255);
     back.icon.bg = -1;
     back.onTap = onBack;
     let row = new Row([]);
-    row.add(new SizedBox(40, 40, back));
+    row.add(new SizedBox(44, 44, back));
     row.add(new SizedBox(8, 0, null));
     let t = new Label(title);
     row.add(t);
-    return new SizedBox(-1, 44, new Padding(10, row));
+    return new SizedBox(-1, 56, new Padding(6, row));
 }
 
 // ------------------------------------------------------- screens
 
-fn build_home_screen(showScreen: fn(Widget, bool)): Widget {
+fn build_home_screen(showScreen: fn(string, Widget)): Widget {
     let col = new Column([]);
     col.spacing = 18;
     col.padding = 20;
@@ -247,13 +255,17 @@ fn build_home_screen(showScreen: fn(Widget, bool)): Widget {
     let root = new Column([]);
     root.add(status_bar());
     root.add(new SizedBox(-1, 8, null));
-    let scroller = new Padding(0, col);
-    root.add(scroller);
+    // Expanded, not a bare add: `col` ends in a Spacer that pushes the dock to
+    // the bottom, and a Spacer only has room to push inside a child that was
+    // given the leftover height. Laid out at its natural height instead, the
+    // dock and the home indicator both bunch up under the app grid with the
+    // bottom third of the screen left empty.
+    root.add(new Expanded(col));
     root.add(home_indicator());
 
-    settingsTile.onTap = () => { showScreen(build_settings_screen(showScreen), false); };
-    contactsTile.onTap = () => { showScreen(build_contacts_screen(showScreen), false); };
-    photosTile.onTap = () => { showScreen(build_photos_screen(showScreen), false); };
+    settingsTile.onTap = () => { showScreen("settings", build_settings_screen(showScreen)); };
+    contactsTile.onTap = () => { showScreen("contacts", build_contacts_screen(showScreen)); };
+    photosTile.onTap = () => { showScreen("photos", build_photos_screen(showScreen)); };
 
     return root;
 }
@@ -284,17 +296,17 @@ fn settings_rows(): Widget {
     return inner;
 }
 
-fn build_settings_screen(showScreen: fn(Widget, bool)): Widget {
+fn build_settings_screen(showScreen: fn(string, Widget)): Widget {
     let root = new Column([]);
     root.add(status_bar());
-    root.add(nav_bar("Settings", () => { showScreen(build_home_screen(showScreen), true); }));
+    root.add(nav_bar("Settings", () => { showScreen("home", build_home_screen(showScreen)); }));
 
     let list = new Column([]);
     list.padding = 12;
     list.spacing = 2;
     let card = new Card(4, rgb(255, 255, 255), -1, "", settings_rows());
     list.add(card);
-    root.add(new Padding(0, list));
+    root.add(list);
     root.add(new Spacer());
     root.add(home_indicator());
     return root;
@@ -328,29 +340,29 @@ fn contact_rows(): Widget {
     return inner;
 }
 
-fn build_contacts_screen(showScreen: fn(Widget, bool)): Widget {
+fn build_contacts_screen(showScreen: fn(string, Widget)): Widget {
     let root = new Column([]);
     root.add(status_bar());
-    root.add(nav_bar("Contacts", () => { showScreen(build_home_screen(showScreen), true); }));
+    root.add(nav_bar("Contacts", () => { showScreen("home", build_home_screen(showScreen)); }));
 
     let list = new Column([]);
     list.padding = 12;
     list.spacing = 2;
     let card = new Card(4, rgb(255, 255, 255), -1, "", contact_rows());
     list.add(card);
-    root.add(new Padding(0, list));
+    root.add(list);
     root.add(new Spacer());
     root.add(home_indicator());
     return root;
 }
 
-fn build_photos_screen(showScreen: fn(Widget, bool)): Widget {
+fn build_photos_screen(showScreen: fn(string, Widget)): Widget {
     let root = new Column([]);
     root.add(status_bar());
-    root.add(nav_bar("Photos", () => { showScreen(build_home_screen(showScreen), true); }));
+    root.add(nav_bar("Photos", () => { showScreen("home", build_home_screen(showScreen)); }));
 
     let grid = new Grid(3, 6, []);
-    let radii: int[] = [0, 12, 0, 12, 0, 12, 0, 12];
+    let radii: float[] = [0.0, 12.0, 0.0, 12.0, 0.0, 12.0, 0.0, 12.0];
     let names: string[] = ["sunset.png", "ocean.png", "forest.png", "desert.png",
         "sunset.png", "ocean.png", "forest.png", "desert.png"];
     let i = 0;
@@ -386,11 +398,17 @@ fn main() {
     win.skin = skin_ios();
     win.theme = theme_ios();
 
+    let trace = getenv("VOLTPHONE_TRACE") == "1";
     let deviceBezel = rgb(28, 28, 30);
     let screenBg = rgb(242, 242, 247);
 
-    let showScreen: fn(Widget, bool) = null;
-    showScreen = (content, isHome) => {
+    let showScreen: fn(string, Widget) = null;
+    showScreen = (name, content) => {
+        // VOLTPHONE_TRACE=1 prints the navigation the taps actually produced,
+        // which is what the headless test asserts on: a tap that misses its
+        // target leaves the app running happily on the screen it was already
+        // showing, so only the trace can tell that apart from a working tap.
+        if (trace) { print("screen " + name); }
         let frame = new DeviceFrame(screenBg, deviceBezel, content);
         win.root = new Center(frame);
         win.layout();
@@ -403,6 +421,10 @@ fn main() {
     else if (startScreen == "photos") { initial = build_photos_screen(showScreen); }
     else { initial = build_home_screen(showScreen); }
 
-    showScreen(initial, startScreen == "home");
+    showScreen(startScreen, initial);
     win.run();
+    // Marker the headless test asserts on: reaching it means the whole
+    // scripted run — every screen built, tapped into and backed out of —
+    // completed without a panic.
+    print("voltphone closed");
 }

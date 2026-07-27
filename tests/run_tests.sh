@@ -298,6 +298,34 @@ if [ -f lib/vyto/gfx/native/linux-x64/libblend2d.so ]; then
         echo "FAIL motion_demo (build failed)"
         fail=1
     fi
+    # VoltPhone: the iOS-skin shell over Icon/Avatar/Image. Nothing covered it
+    # before, and it silently rotted out of compiling as Rect/Size went
+    # sub-pixel. The scripted events tap into all three screens and back out
+    # again, and VOLTPHONE_TRACE makes the app name each screen it shows — a
+    # tap that misses leaves the app happily on the screen it was already
+    # showing, which an exit-status check cannot tell from a working tap.
+    iphone_bin=apps/iphone/.vyto-cache/iphone_test
+    if ./vytoc build apps/iphone/iphone.vt -o "$iphone_bin" >/dev/null 2>&1; then
+        got=$(VOLTPHONE_TRACE=1 VS_HEADLESS=1 VS_EVENTS=apps/iphone/iphone.events \
+              "$iphone_bin" 2>&1)
+        want="screen home
+screen settings
+screen home
+screen contacts
+screen home
+screen photos
+screen home
+voltphone closed"
+        if [ "$got" = "$want" ]; then
+            echo "PASS app_iphone_runs"
+        else
+            echo "FAIL app_iphone_runs (got: $got)"
+            fail=1
+        fi
+    else
+        echo "FAIL app_iphone_runs (build failed)"
+        fail=1
+    fi
     # --bundle: one self-contained exe, no libblend2d.so/libstdc++ alongside
     if [ -f lib/vyto/gfx/native/linux-x64/libblend2d.a ]; then
         bnd_bin=apps/uigfx/.vyto-cache/uigfx_bundled
