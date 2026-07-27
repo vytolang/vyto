@@ -253,6 +253,40 @@ else
     fail=1
 fi
 
+# --- vyto/cli: accepted flag/option/operand/subcommand syntax (pure Vyto) ---
+got=$(./vytoc run tests/fixtures/cli_parse.vt 2>&1)
+if [ "$got" = "$(cat tests/fixtures/cli_parse.expected)" ]; then
+    echo "PASS cli_parse"
+else
+    echo "FAIL cli_parse"
+    echo "--- expected ---"; cat tests/fixtures/cli_parse.expected
+    echo "--- got ---"; printf '%s\n' "$got"
+    fail=1
+fi
+
+# --- vyto/cli: every rejection path. Reaching the end is the assertion — the
+#     same inputs through to_int/to_float abort the process (pure Vyto) ---
+got=$(./vytoc run tests/fixtures/cli_errors.vt 2>&1)
+if [ "$got" = "$(cat tests/fixtures/cli_errors.expected)" ]; then
+    echo "PASS cli_errors"
+else
+    echo "FAIL cli_errors"
+    echo "--- expected ---"; cat tests/fixtures/cli_errors.expected
+    echo "--- got ---"; printf '%s\n' "$got"
+    fail=1
+fi
+
+# --- vyto/cli: generated --help, byte for byte (pure Vyto) ---
+got=$(./vytoc run tests/fixtures/cli_help.vt 2>&1)
+if [ "$got" = "$(cat tests/fixtures/cli_help.expected)" ]; then
+    echo "PASS cli_help"
+else
+    echo "FAIL cli_help"
+    echo "--- expected ---"; cat tests/fixtures/cli_help.expected
+    echo "--- got ---"; printf '%s\n' "$got"
+    fail=1
+fi
+
 # --- vyto/gfx: blend2d Canvas -> blitPtr (gated on the prebuilt lib) ---
 if [ -f lib/vyto/gfx/native/linux-x64/libblend2d.so ]; then
     gfx_bin=apps/gfxdemo/.vyto-cache/gfxdemo_test

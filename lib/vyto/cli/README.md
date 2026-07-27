@@ -152,8 +152,10 @@ else { scanOnce(); }
 
 > **A separated value may not look like a flag.** `--out --verbose` is an error
 > (`--out needs a value`) rather than quietly setting `out` to `"--verbose"` —
-> the mistake is far more common than the intent. A bare `-` is accepted (the
-> stdin convention); for anything else, use the inline form: `--out=-x`.
+> the mistake is far more common than the intent. Three things are still
+> accepted: a bare `-` (the stdin convention), and a negative number for an
+> `intOption`/`floatOption`, so `--rows -5` works. For anything else, use the
+> inline form: `--out=-x`.
 
 ## Deliberately out of scope
 

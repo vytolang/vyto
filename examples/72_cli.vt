@@ -1,0 +1,95 @@
+// vyto/cli — command-line flags, options, operands and subcommands.
+//
+// A real program passes args() to parse(). This example passes hand-built
+// string[]s instead, so it prints the same thing every run and can be
+// golden-checked — which is also why parse() takes argv explicitly rather than
+// reading args() itself.
+//
+// The four-line idiom a real program uses:
+//
+//     if (!cli.parse(args())) { print(cli.report()); exit(cli.exitCode()); }
+//
+// parse() returns false for both a bad command line and --help; report() and
+// exitCode() tell them apart.
+
+import { Cli, parse_int } from "vyto/cli";
+
+// Declared fresh per run: a Cli holds the parsed values, so reusing one across
+// two command lines would mix them.
+fn serveCli(): Cli {
+    let c = new Cli("serve", "a static file server");
+    c.intOption("port", "port to listen on").short("p").dfltInt(8080);
+    c.flag("quiet", "suppress the request log").short("q");
+    c.option("host", "address to bind").choices(["localhost", "0.0.0.0"]).dflt("localhost");
+    c.positional("root", "directory to serve").dflt(".");
+    return c;
+}
+
+fn run(av: string[]) {
+    let c = serveCli();
+    let ok = c.parse(av);
+    if (!ok) { print("  -> " + c.report().replace("\n", " | ")); return; }
+    print("  -> host=" + c.get("host") + " port=" + c.getInt("port") +
+          " quiet=" + c.on("quiet") + " root=" + c.get("root"));
+}
+
+fn main() {
+    // ---- the accepted spellings all mean the same thing ----
+    print("serve --port 9000 /srv");
+    run(["--port", "9000", "/srv"]);
+    print("serve --port=9000 /srv");
+    run(["--port=9000", "/srv"]);
+    print("serve -p 9000 /srv");
+    run(["-p", "9000", "/srv"]);
+    print("serve /srv -q");                    // operands and flags interleave
+    run(["/srv", "-q"]);
+    print("serve");                            // everything defaulted
+    run([]);
+
+    // ---- what a hand-rolled args() loop gets wrong ----
+    print("");
+    print("serve --prot 9000        (a typo, silently ignored by a hand loop)");
+    run(["--prot", "9000"]);
+    print("serve --port 80a0        (a panic inside to_int for a hand loop)");
+    run(["--port", "80a0"]);
+    print("serve --host 127.0.0.1   (an unlisted value, silently accepted)");
+    run(["--host", "127.0.0.1"]);
+    print("serve --port             (a missing value)");
+    run(["--port"]);
+
+    // ---- generated help ----
+    print("");
+    print("serve --help");
+    let h = serveCli();
+    let hok = h.parse(["--help"]);
+    print("  parse returned " + hok + ", exit code " + h.exitCode());
+    print(h.usage());
+
+    // ---- subcommands ----
+    print("");
+    let g = new Cli("git", "a tiny version control system");
+    g.flag("verbose", "explain what is happening").short("v");
+    let commit = g.command("commit", "record changes to the repository");
+    commit.option("message", "commit message").short("m").need();
+    commit.flag("amend", "replace the previous commit");
+    g.command("clone", "copy a repository").positional("url", "what to clone").need();
+
+    print("git commit -m 'fix the parser' --amend");
+    let gok = g.parse(["commit", "-m", "fix the parser", "--amend"]);
+    print("  -> ok=" + gok + " command=" + g.chosen() +
+          " message='" + g.sub().get("message") + "' amend=" + g.sub().on("amend"));
+
+    let g2 = new Cli("git", "a tiny version control system");
+    g2.command("commit", "record changes").option("message", "commit message").short("m").need();
+    print("git commit                (the required option is missing)");
+    let g2ok = g2.parse(["commit"]);
+    print("  -> ok=" + g2ok + " err=" + g2.error());
+
+    // ---- the validators are useful on their own ----
+    print("");
+    let out: int[] = [0];
+    let big = parse_int("9223372036854775808", out);
+    print("parse_int overflows cleanly: " + big + "   (to_int would abort here)");
+    let good = parse_int("-42", out);
+    print("parse_int(\"-42\") = " + good + ", " + out[0]);
+}

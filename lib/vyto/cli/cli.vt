@@ -377,11 +377,16 @@ export class Cli {
         if (!hasInline) {
             // A separated value must exist and must not look like another flag,
             // so `--out --verbose` is an error rather than out="--verbose".
-            // A bare "-" is a legal value (the stdin convention); for anything
-            // else that starts with a dash, use --out=-x.
+            // Three things are still legal: a bare "-" (the stdin convention), a
+            // negative number for a numeric option (`--rows -5`, which is why
+            // the guard consults the kind rather than the leading byte alone),
+            // and the inline form `--out=-x` for anything else.
             if (i + 1 >= argv.len) { this.fail(shown + " needs a value"); return i + 1; }
             let cand = argv[i + 1];
-            if (cand.len > 1 && cand.starts_with("-")) { this.fail(shown + " needs a value"); return i + 1; }
+            if (cand.len > 1 && cand.starts_with("-") && !numericFor(f, cand)) {
+                this.fail(shown + " needs a value");
+                return i + 1;
+            }
             value = cand;
             next = i + 2;
         }
@@ -570,6 +575,17 @@ export class Cli {
         if (w > 28) { w = 28; }
         return w;
     }
+}
+
+// Would `text` be a plausible value for `f` despite its leading dash? Only a
+// numeric option can say yes, and only for text shaped like a number — so
+// `--rows -5` works while `--out --verbose` is still caught. A negative value
+// that does not parse is deliberately let through here so the error names the
+// bad number rather than claiming the option had no value at all.
+fn numericFor(f: Flag, text: string): bool {
+    if (f.kind != CLI_INT && f.kind != CLI_FLOAT) { return false; }
+    if (text.len < 2 || text[0] != 45) { return false; }        // '-'
+    return text[1] >= 48 && text[1] <= 57;                      // '-' then a digit
 }
 
 // Everything from index `at` on. Vyto arrays have no slice builtin, and this is

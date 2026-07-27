@@ -1,0 +1,78 @@
+// Byte-for-byte coverage of vyto/cli's generated help. Pure Vyto, runs on every
+// host, golden-checked — which is the whole reason the output carries no colour
+// and does no terminal-width detection.
+//
+// No flag here takes a float default: a default is echoed into the help text,
+// and a float would render through %g at 6 significant digits (not
+// shortest-round-trip on the freestanding path), which is not something to pin
+// in a golden.
+import { Cli } from "vyto/cli";
+
+fn main() {
+    // ---- a command with operands, choices, defaults and a required option ----
+    let c = new Cli("datagrid", "a spreadsheet-grade data table demo");
+    c.flag("surface", "draw through the raw surface painter, not gfx").short("s");
+    c.option("screen", "screen to open at start")
+     .choices(["home", "settings", "photos"]).dflt("home");
+    c.intOption("rows", "how many rows to synthesize").short("r").dfltInt(200000);
+    c.option("out", "where to write the export").short("o").meta("PATH").need();
+    c.option("tag", "extra tag, may repeat").many();
+    c.positional("path", "CSV file to load");
+    print(c.usage());
+
+    print("");
+    print("========");
+    print("");
+
+    // ---- a command with subcommands, and no operands of its own ----
+    let w = new Cli("wifi", "scan and watch wireless interfaces");
+    w.flag("verbose", "print the raw control-socket replies").short("v");
+    let mon = w.command("monitor", "watch connect/disconnect events live");
+    mon.positional("iface", "interface to watch").need();
+    mon.flag("once", "stop after the first event");
+    w.command("scan", "one-shot scan of visible networks");
+    print(w.usage());
+
+    print("");
+    print("========");
+    print("");
+
+    // A subcommand documents itself: `wifi monitor --help` routes here.
+    print(mon.usage());
+
+    print("");
+    print("========");
+    print("");
+
+    // ---- report() picks help over an error message ----
+    let h = new Cli("tiny", "");
+    h.flag("loud", "be loud");
+    let hok = h.parse(["--help"]);
+    let wanted = h.helpWanted();
+    print("parsed=" + hok + " help=" + wanted + " exit=" + h.exitCode());
+    print(h.report());
+
+    print("");
+    print("========");
+    print("");
+
+    // `prog <sub> --help` documents the subcommand, not the program.
+    let s = new Cli("wifi", "scan and watch wireless interfaces");
+    s.command("scan", "one-shot scan of visible networks")
+     .option("iface", "interface to scan").dflt("wlan0");
+    let sok = s.parse(["scan", "--help"]);
+    let swanted = s.helpWanted();
+    print("parsed=" + sok + " help=" + swanted);
+    print(s.report());
+
+    print("");
+    print("========");
+    print("");
+
+    // ---- a usageLine() override, and a label too wide for the column ----
+    let o = new Cli("mktool", "build things");
+    o.usageLine("mktool [options] <target>...");
+    o.option("configuration-directory", "where the configs live").meta("DIR");
+    o.rest("target", "targets to build");
+    print(o.usage());
+}

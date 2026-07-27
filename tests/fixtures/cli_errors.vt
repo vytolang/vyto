@@ -1,0 +1,91 @@
+// Pure-Vyto coverage for every way vyto/cli rejects a command line. Pure, so
+// this runs on every host. Deterministic, golden-checked.
+//
+// The point of the fixture is that NONE of these lines kills the process. The
+// same inputs through a hand-rolled args() loop either panic inside to_int or
+// are silently accepted as something else, which is what the module exists to
+// fix — so a golden that merely printed messages would miss the regression that
+// matters. Reaching the last line at all is the assertion.
+import { Cli } from "vyto/cli";
+
+fn build(): Cli {
+    let c = new Cli("grid", "a table demo");
+    c.flag("surface", "use the lean painter").short("s");
+    c.option("screen", "screen to open").choices(["home", "settings", "photos"]).dflt("home");
+    c.intOption("rows", "rows to synthesize").short("r").dfltInt(200);
+    c.floatOption("scale", "ui scale");
+    c.option("out", "where to write").short("o").need();
+    c.positional("path", "file to load");
+    return c;
+}
+
+// Parse `av` against a fresh Cli and print what the user would be told.
+fn check(label: string, av: string[]) {
+    let c = build();
+    let ok = c.parse(av);
+    print(label + ": ok=" + ok + " exit=" + c.exitCode() + " err=" + c.error());
+}
+
+fn main() {
+    // ---- unknown names ----
+    check("unknownLong", ["--serface"]);
+    check("unknownShort", ["-z"]);
+    check("bundledShort", ["-so"]);          // no bundling: this is one name
+
+    // ---- missing or flag-shaped values ----
+    check("missingValue", ["--screen"]);
+    check("swallowGuard", ["--out", "--surface"]);
+    check("shortMissing", ["-o"]);
+
+    // ---- bad value text: each of these panics through to_int/to_float ----
+    check("notInt", ["-o", "x", "--rows", "80a0"]);
+    check("intOverflow", ["-o", "x", "--rows", "9223372036854775808"]);
+    check("intUnderflow", ["-o", "x", "--rows", "-9223372036854775809"]);
+    check("intBound", ["-o", "x", "--rows", "9223372036854775807"]);   // accepted
+    check("intHex", ["-o", "x", "--rows", "0x10"]);
+    check("intSpace", ["-o", "x", "--rows=  8"]);
+    check("notFloat", ["-o", "x", "--scale", "1.2.3"]);
+    check("notBool", ["-o", "x", "--surface=maybe"]);
+
+    // ---- constrained and required ----
+    check("badChoice", ["-o", "x", "--screen=bogus"]);
+    check("missingRequired", ["--surface"]);
+    check("extraOperand", ["-o", "x", "a.csv", "b.csv"]);
+
+    // ---- required operands ----
+    let r = new Cli("open", "open a file");
+    r.positional("path", "file to open").need();
+    let rok = r.parse([]);
+    print("missingOperand: ok=" + rok + " exit=" + r.exitCode() + " err=" + r.error());
+
+    // ---- subcommands ----
+    let s = new Cli("wifi", "wireless tools");
+    s.command("scan", "one-shot scan");
+    let sok = s.parse(["scn"]);
+    print("unknownCommand: ok=" + sok + " exit=" + s.exitCode() + " err=" + s.error());
+
+    let t = new Cli("wifi", "wireless tools");
+    t.command("scan", "one-shot scan");
+    t.needCommand();
+    let tok = t.parse([]);
+    print("commandRequired: ok=" + tok + " exit=" + t.exitCode() + " err=" + t.error());
+
+    // A subcommand's own error surfaces on the root, so one report() is enough.
+    let u = new Cli("wifi", "wireless tools");
+    u.command("monitor", "watch events").positional("iface", "interface").need();
+    let uok = u.parse(["monitor"]);
+    print("subError: ok=" + uok + " exit=" + u.exitCode() + " err=" + u.error());
+
+    // ---- what the user actually sees ----
+    let v = build();
+    v.parse(["--rows", "80a0"]);
+    print("--- report ---");
+    print(v.report());
+
+    // ---- the first error wins; later ones are usually its consequence ----
+    let w = build();
+    w.parse(["--nope", "--alsonope"]);
+    print("firstWins=" + w.error());
+
+    print("survived");
+}

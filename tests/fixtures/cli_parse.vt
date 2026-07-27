@@ -1,0 +1,166 @@
+// Pure-Vyto coverage for vyto/cli's accepted syntax. No display, no native
+// dependency, so this runs on every host. Deterministic, golden-checked.
+//
+// Every case feeds a hand-built string[] rather than args(): the parser takes
+// argv explicitly, which is what makes it testable at all.
+//
+// Floats are never printed bare — the runtime renders %g at 6 significant
+// digits and the freestanding path is explicitly not shortest-round-trip — so
+// the float option is checked as a scaled int and through its raw text.
+//
+// Note: Vyto evaluates binary operands right-to-left, so a parse() call and a
+// read of its result must not share one expression.
+import { Cli, parse_int, parse_float, parse_bool } from "vyto/cli";
+
+fn build(): Cli {
+    let c = new Cli("grid", "a table demo");
+    c.flag("surface", "use the lean painter").short("s");
+    c.option("screen", "screen to open").choices(["home", "settings", "photos"]).dflt("home");
+    c.intOption("rows", "rows to synthesize").short("r").dfltInt(200);
+    c.floatOption("scale", "ui scale").dfltFloat(1.0);
+    c.option("tag", "extra tag, may repeat").many();
+    c.positional("path", "file to load").dflt("-");
+    return c;
+}
+
+fn main() {
+    // ---- long forms, inline and separated ----
+    let a = build();
+    let aok = a.parse(["--surface", "--screen=settings", "--rows", "7", "data.csv"]);
+    print("a.ok=" + aok);
+    print("a.surface=" + a.on("surface"));
+    print("a.screen=" + a.get("screen"));
+    print("a.rows=" + a.getInt("rows"));
+    print("a.path=" + a.get("path"));
+
+    // ---- short forms: bare, separated, inline ----
+    let b = build();
+    let bok = b.parse(["-s", "-r", "9"]);
+    print("b.ok=" + bok);
+    print("b.surface=" + b.on("surface"));
+    print("b.rows=" + b.getInt("rows"));
+    let c = build();
+    let cok = c.parse(["-r=11"]);
+    print("c.ok=" + cok);
+    print("c.rows=" + c.getInt("rows"));
+
+    // ---- defaults vs. explicitly given ----
+    let d = build();
+    let dok = d.parse([]);
+    print("d.ok=" + dok);
+    print("d.screen=" + d.get("screen"));
+    print("d.rows=" + d.getInt("rows"));
+    print("d.path=" + d.get("path"));
+    print("d.seenRows=" + d.seen("rows"));
+    print("d.seenSurface=" + d.on("surface"));
+
+    // ---- a bool flag can be spelled out ----
+    let e = build();
+    let eok = e.parse(["--surface=no"]);
+    print("e.ok=" + eok);
+    print("e.surface=" + e.on("surface"));
+    print("e.seenSurface=" + e.seen("surface"));
+
+    // ---- repeated option ----
+    let f = build();
+    let fok = f.parse(["--tag", "alpha", "--tag=beta", "--tag", "gamma"]);
+    print("f.ok=" + fok);
+    print("f.tags=" + f.all("tag").join("+"));
+    print("f.lastTag=" + f.get("tag"));
+
+    // ---- float, never printed bare ----
+    let g = build();
+    let gok = g.parse(["--scale=1.25"]);
+    print("g.ok=" + gok);
+    print("g.scale1000=" + ((g.getFloat("scale") * 1000.0) as int));
+    print("g.scaleText=" + g.get("scale"));
+
+    // ---- in-program "--", and values that look like flags ----
+    let h = build();
+    let hok = h.parse(["--screen=photos", "in.csv", "--", "-x", "--y", "z"]);
+    print("h.ok=" + hok);
+    print("h.path=" + h.get("path"));
+    print("h.extra=" + h.extra().join(","));
+    let i = build();
+    let iok = i.parse(["--tag", "-"]);          // a bare "-" is a legal value
+    print("i.ok=" + iok);
+    print("i.tagIsDash=" + (i.get("tag") == "-"));
+    let i2 = build();
+    let i2ok = i2.parse(["--rows", "-5"]);      // so is a negative number
+    print("i2.ok=" + i2ok);
+    print("i2.rows=" + i2.getInt("rows"));
+
+    // ---- flags and operands interleave freely ----
+    let j = build();
+    let jok = j.parse(["out.csv", "-s"]);
+    print("j.ok=" + jok);
+    print("j.path=" + j.get("path"));
+    print("j.surface=" + j.on("surface"));
+
+    // ---- a variadic tail operand ----
+    let k = new Cli("cat", "concatenate files");
+    k.flag("number", "number the lines").short("n");
+    k.rest("files", "files to read");
+    let kok = k.parse(["-n", "a.txt", "b.txt", "c.txt"]);
+    print("k.ok=" + kok);
+    print("k.number=" + k.on("number"));
+    print("k.files=" + k.all("files").join(","));
+
+    // ---- subcommands ----
+    let m = new Cli("wifi", "wireless tools");
+    m.flag("verbose", "print raw replies").short("v");
+    let mon = m.command("monitor", "watch events live");
+    mon.positional("iface", "interface to watch").need();
+    mon.flag("once", "stop after the first event");
+    m.command("scan", "one-shot scan").option("iface", "interface to scan").dflt("wlan0");
+    let mok = m.parse(["monitor", "wlan1", "--once"]);
+    print("m.ok=" + mok);
+    print("m.chosen=" + m.chosen());
+    print("m.iface=" + m.sub().get("iface"));
+    print("m.once=" + m.sub().on("once"));
+
+    // A subcommand is optional unless needCommand(), so a bare run still works.
+    let n = new Cli("wifi", "wireless tools");
+    n.command("scan", "one-shot scan");
+    let nok = n.parse([]);
+    print("n.ok=" + nok);
+    print("n.chosen='" + n.chosen() + "'");
+    print("n.sub=" + (n.sub() == null));
+
+    // ---- the exported validators, standalone ----
+    // Each call gets its own statement: operands evaluate right-to-left, so
+    // printing the out-array in the same expression would read it first.
+    showInt("int.max", "9223372036854775807");
+    showInt("int.over", "9223372036854775808");
+    showInt("int.min", "-9223372036854775808");
+    showInt("int.under", "-9223372036854775809");
+    showInt("int.zeros", "0009223372036854775807");
+    showInt("int.signed", "+42");
+    showInt("int.space", " 8");
+    showInt("int.hex", "0x10");
+    showInt("int.exp", "1e3");
+    showFloat("float.exp", "1.5e3");
+    showFloat("float.trailingDot", "1.");
+    showFloat("float.leadingDot", ".5");
+    showBool("bool.upper", "TRUE");
+    showBool("bool.off", "off");
+    showBool("bool.two", "2");
+}
+
+fn showInt(label: string, text: string) {
+    let out: int[] = [0];
+    let ok = parse_int(text, out);
+    if (ok) { print(label + "=true," + out[0]); } else { print(label + "=false"); }
+}
+
+fn showFloat(label: string, text: string) {
+    let out: float[] = [0.0];
+    let ok = parse_float(text, out);
+    if (ok) { print(label + "=true," + (out[0] as int)); } else { print(label + "=false"); }
+}
+
+fn showBool(label: string, text: string) {
+    let out: bool[] = [false];
+    let ok = parse_bool(text, out);
+    if (ok) { print(label + "=true," + out[0]); } else { print(label + "=false"); }
+}
