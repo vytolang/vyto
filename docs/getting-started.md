@@ -171,7 +171,7 @@ DLLs:
 
 The **core language, the runtime, and the stdlib packages with no POSIX
 dependency**: `vyto/math`, `vyto/reactive`, `vyto/util/*` (fmt, json, sort, text,
-time, date), `vyto/io/file`, `vyto/data/frame`, `vyto/os/os`, `vyto/anim`,
+time, date), `vyto/io/file`, `vyto/data/frame`, `vyto/os/os`, `vyto/anim`, `vyto/cli`,
 `vyto/geom/*`, `vyto/geo/*`, plus FFI, native packages with in-tree C, and prebuilt
 `native/windows-x64/*.dll` packages.
 

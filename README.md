@@ -539,6 +539,7 @@ everything else is pure Vyto.
 | `vyto/math` ⚙ | libm math (`sin`, `sqrt`, `pow`, …) |
 | `vyto/io/file` ⚙ | files & paths (`File`, read/write, `file_exists`, `mkdirs`, …) |
 | `vyto/os` ⚙ | environment, args, process helpers |
+| `vyto/cli` | flags, options, operands and subcommands, generated `--help`, and non-panicking `parse_int`/`parse_float`/`parse_bool` |
 | `vyto/os/worker` ⚙ | `fork()`-based `WorkerPool` — CPU parallelism, no shared state |
 
 **Internationalization** — `vyto/intl` ⚙ (ICU-backed)

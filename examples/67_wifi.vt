@@ -2,14 +2,23 @@
 // control plane (managing the radio), distinct from the data path in net/socket
 // (docs/HARDWARE.md). This is the onboarding flow: scan, pick, connect.
 //
-//   vytoc run examples/67_wifi.vt                 # parse a canned scan (no hardware)
-//   vytoc run examples/67_wifi.vt -- wlan0        # live scan (needs wpa_supplicant)
+//   vytoc run examples/67_wifi.vt                      # canned scan (no hardware)
+//   vytoc run examples/67_wifi.vt -- scan wlan0        # live scan (needs wpa_supplicant)
+//   vytoc run examples/67_wifi.vt -- monitor wlan0     # watch events as they happen
+//   vytoc run examples/67_wifi.vt -- --help
+//
+// Argument handling is vyto/cli. The interface used to be a bare operand and
+// "monitor" a magic first word, which meant `monitor` alone was silently read as
+// an interface name; both are subcommands now. A subcommand is optional unless
+// declared otherwise, so a bare run still reaches the canned demo below.
 //
 // (Live output varies and the canned path needs no device, so no golden .expected —
 // the runner SKIPs it.)
 
 import { PollSet, POLL_READ } from "vyto/net/socket";
 import { wifi_open, wifi_monitor, parse_scan_results, parse_wifi_event, WifiNetwork } from "vyto/net/wifi";
+import { Cli } from "vyto/cli";
+import { exit } from "vyto/os";
 
 fn show(nets: WifiNetwork[]) {
     for (let n in nets) {
@@ -22,14 +31,20 @@ fn show(nets: WifiNetwork[]) {
 }
 
 fn main() {
-    let av = args();
+    let cli = new Cli("67_wifi", "scan and watch wireless interfaces");
+    cli.command("scan", "one-shot scan of visible networks")
+       .positional("iface", "interface to scan").need();
+    cli.command("monitor", "watch connect/disconnect events live")
+       .positional("iface", "interface to watch").need();
+    if (!cli.parse(args())) { print(cli.report()); exit(cli.exitCode()); }
 
     // "monitor <iface>": watch for connect/disconnect events as they happen (push, not
     // poll) — the real answer to "how does my app know WiFi dropped".
-    if (av.len >= 2 && av[0] == "monitor") {
-        let mon = wifi_monitor(av[1]);
-        if (mon == null) { print("cannot attach monitor for " + av[1]); return; }
-        print("watching " + av[1] + " for events (toggle WiFi to see them)...");
+    if (cli.chosen() == "monitor") {
+        let iface = cli.sub().get("iface");
+        let mon = wifi_monitor(iface);
+        if (mon == null) { print("cannot attach monitor for " + iface); return; }
+        print("watching " + iface + " for events (toggle WiFi to see them)...");
         let ps = new PollSet();
         ps.addFd(mon.pollFd(), POLL_READ);
         while (true) {
@@ -45,10 +60,11 @@ fn main() {
         }
     }
 
-    if (av.len >= 1) {
-        let w = wifi_open(av[0]);
-        if (w == null) { print("no wpa_supplicant control socket for " + av[0] + " (need the netdev group / root?)"); return; }
-        print("scanning " + av[0] + " ...");
+    if (cli.chosen() == "scan") {
+        let iface = cli.sub().get("iface");
+        let w = wifi_open(iface);
+        if (w == null) { print("no wpa_supplicant control socket for " + iface + " (need the netdev group / root?)"); return; }
+        print("scanning " + iface + " ...");
         w.scan();
         show(w.scanResults());
         return;
