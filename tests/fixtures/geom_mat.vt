@@ -1,0 +1,243 @@
+// Pure-Vyto coverage for vyto/geom's Mat4: the transform constructors, the
+// multiplication and composition conventions, the inverse, and the projection
+// matrices. No gfx, so this runs on every host.
+//
+// Floats are never printed bare: the runtime prints %g at 6 significant digits
+// and the freestanding path uses a hand-rolled %g that is explicitly not
+// shortest-round-trip. Every line below prints an int or a bool.
+import { Vec3, Vec4, Mat4, mat4Zero, mat4Identity, mat4FromRows, mat4FromColumns,
+         mat4Translation, mat4Scaling, mat4ScalingUniform, mat4RotationX,
+         mat4RotationY, mat4RotationZ, mat4RotationAxis, mat4LookAt,
+         mat4Perspective, mat4Ortho } from "vyto/geom";
+import { PI, round, fabs } from "vyto/math";
+
+fn near(a: float, b: float, eps: float): bool { return fabs(a - b) < eps; }
+fn vnear(a: Vec3, b: Vec3, eps: float): bool { return a.dist(b) < eps; }
+fn q(x: float, scale: float): int { return round(x * scale) as int; }
+
+fn main() {
+    let I = mat4Identity();
+    let ex = Vec3(1.0, 0.0, 0.0);
+    let ey = Vec3(0.0, 1.0, 0.0);
+    let ez = Vec3(0.0, 0.0, 1.0);
+    let p = Vec3(1.0, 2.0, 3.0);
+
+    // ---- Identity ----
+    print("ident=" + q(I.m00, 1.0) + "," + q(I.m11, 1.0) + "," + q(I.m22, 1.0)
+          + "," + q(I.m33, 1.0) + "," + q(I.m01, 1.0));
+    print("identpt=" + vnear(I.transformPoint(p), p, 1e-15));
+    print("identmul=" + I.mul(I).approxEquals(I, 1e-15));
+    print("zero=" + q(mat4Zero().m00, 1.0) + "," + q(mat4Zero().m33, 1.0));
+
+    // ---- Row/column accessors, and the storage convention ----
+    let r = mat4FromRows(Vec4(1.0, 2.0, 3.0, 4.0), Vec4(5.0, 6.0, 7.0, 8.0),
+                         Vec4(9.0, 10.0, 11.0, 12.0), Vec4(13.0, 14.0, 15.0, 16.0));
+    // mRC is row R, column C, so the first row is 1,2,3,4.
+    print("rows=" + q(r.m00, 1.0) + "," + q(r.m01, 1.0) + "," + q(r.m03, 1.0));
+    print("row1=" + q(r.row(1).x, 1.0) + "," + q(r.row(1).w, 1.0));
+    print("col1=" + q(r.col(1).x, 1.0) + "," + q(r.col(1).w, 1.0));
+    // Building from columns is the transpose of building from the same rows.
+    let c = mat4FromColumns(Vec4(1.0, 2.0, 3.0, 4.0), Vec4(5.0, 6.0, 7.0, 8.0),
+                            Vec4(9.0, 10.0, 11.0, 12.0), Vec4(13.0, 14.0, 15.0, 16.0));
+    print("fromcols=" + c.approxEquals(r.transposed(), 1e-15));
+    // toArray is row-major; columnMajorArray is what OpenGL wants.
+    print("toarray=" + q(r.toArray()[1], 1.0) + "," + q(r.columnMajorArray()[1], 1.0));
+    print("arraylen=" + r.toArray().len + "," + r.columnMajorArray().len);
+
+    // ---- Translation ----
+    let t = mat4Translation(Vec3(10.0, 20.0, 30.0));
+    // Vectors are columns, so translation lives in the FOURTH COLUMN.
+    print("translcol=" + q(t.m03, 1.0) + "," + q(t.m13, 1.0) + "," + q(t.m23, 1.0));
+    print("translrow=" + q(t.m30, 1.0) + "," + q(t.m31, 1.0) + "," + q(t.m33, 1.0));
+    print("translpt=" + vnear(t.transformPoint(p), Vec3(11.0, 22.0, 33.0), 1e-12));
+    // A direction has w = 0, so translation must not touch it.
+    print("transldir=" + vnear(t.transformDirection(ex), ex, 1e-15));
+
+    // ---- Scaling ----
+    let s = mat4Scaling(Vec3(2.0, 3.0, 4.0));
+    print("scalept=" + vnear(s.transformPoint(p), Vec3(2.0, 6.0, 12.0), 1e-12));
+    print("scaledir=" + vnear(s.transformDirection(ex), Vec3(2.0, 0.0, 0.0), 1e-15));
+    print("scaleuniform=" + mat4ScalingUniform(3.0).approxEquals(
+              mat4Scaling(Vec3(3.0, 3.0, 3.0)), 1e-15));
+
+    // ---- Rotations: right-handed, positive angle turns counter-clockwise ----
+    let quarter = PI * 0.5;
+    print("rotz=" + vnear(mat4RotationZ(quarter).transformPoint(ex), ey, 1e-12));
+    print("rotx=" + vnear(mat4RotationX(quarter).transformPoint(ey), ez, 1e-12));
+    print("roty=" + vnear(mat4RotationY(quarter).transformPoint(ez), ex, 1e-12));
+    // A full turn is the identity.
+    print("rotfull=" + mat4RotationZ(2.0 * PI).approxEquals(I, 1e-12));
+    // Rotation preserves length -- the property that catches a transposed sign.
+    print("rotlen=" + near(mat4RotationAxis(Vec3(1.0, 2.0, 3.0), 0.7)
+                           .transformPoint(p).len(), p.len(), 1e-12));
+    // Rotation about an axis matches the named rotation about that axis.
+    print("rotaxisz=" + mat4RotationAxis(ez, 0.7).approxEquals(mat4RotationZ(0.7), 1e-12));
+    print("rotaxisx=" + mat4RotationAxis(ex, 0.7).approxEquals(mat4RotationX(0.7), 1e-12));
+    print("rotaxisy=" + mat4RotationAxis(ey, 0.7).approxEquals(mat4RotationY(0.7), 1e-12));
+    // The axis is normalized internally, so its magnitude is irrelevant.
+    print("rotaxisscale=" + mat4RotationAxis(ez.scale(9.0), 0.7)
+                            .approxEquals(mat4RotationZ(0.7), 1e-12));
+    // A zero axis yields the identity, not a NaN.
+    print("rotaxiszero=" + mat4RotationAxis(Vec3(0.0, 0.0, 0.0), 0.7)
+                           .approxEquals(I, 0.0 + 1e-15));
+    // A point on the axis does not move.
+    print("rotaxisfixed=" + vnear(mat4RotationAxis(ez, 1.1).transformPoint(ez), ez, 1e-12));
+
+    // ---- Composition order: a.mul(b) applies b FIRST ----
+    // Rotate then translate is not the same as translate then rotate.
+    let tr = t.mul(mat4RotationZ(quarter));      // rotate, then translate
+    let rt = mat4RotationZ(quarter).mul(t);      // translate, then rotate
+    print("ordermatters=" + !tr.approxEquals(rt, 1e-9));
+    // Applying the composed matrix must equal applying the parts in that order.
+    print("composeorder=" + vnear(tr.transformPoint(ex),
+                                  t.transformPoint(mat4RotationZ(quarter).transformPoint(ex)),
+                                  1e-12));
+    print("composeorder2=" + vnear(rt.transformPoint(ex),
+                                   mat4RotationZ(quarter).transformPoint(t.transformPoint(ex)),
+                                   1e-12));
+    // Concretely: rotate ex to ey, then translate by (10,20,30).
+    print("composept=" + vnear(tr.transformPoint(ex), Vec3(10.0, 21.0, 30.0), 1e-12));
+    // Identity is the unit on both sides.
+    print("mulident=" + t.mul(I).approxEquals(t, 1e-15) + "," + I.mul(t).approxEquals(t, 1e-15));
+    // Associativity.
+    let a = mat4RotationX(0.3);
+    let b = mat4Scaling(Vec3(1.0, 2.0, 3.0));
+    print("assoc=" + a.mul(b).mul(t).approxEquals(a.mul(b.mul(t)), 1e-12));
+
+    // ---- Transpose ----
+    print("transpose2=" + r.transposed().transposed().approxEquals(r, 1e-15));
+    print("transposeident=" + I.transposed().approxEquals(I, 1e-15));
+    // (AB)^T == B^T A^T
+    print("transposemul=" + a.mul(b).transposed()
+                            .approxEquals(b.transposed().mul(a.transposed()), 1e-12));
+
+    // ---- Determinant ----
+    print("detident=" + q(I.determinant(), 1.0));
+    print("detscale=" + q(mat4Scaling(Vec3(2.0, 3.0, 4.0)).determinant(), 1.0));
+    // A rotation preserves volume, so its determinant is 1.
+    print("detrot=" + near(mat4RotationAxis(Vec3(1.0, 1.0, 1.0), 0.9).determinant(),
+                           1.0, 1e-12));
+    print("dettransl=" + near(t.determinant(), 1.0, 1e-12));
+    print("detzero=" + q(mat4Zero().determinant(), 1.0));
+
+    // ---- Inverse ----
+    // M * M^-1 == I is the check that catches any transcription slip in the
+    // cofactor expansion, so it is run against every kind of matrix here.
+    print("invtransl=" + t.mul(t.inverted()).approxEquals(I, 1e-12));
+    print("invscale=" + s.mul(s.inverted()).approxEquals(I, 1e-12));
+    print("invrot=" + a.mul(a.inverted()).approxEquals(I, 1e-12));
+    print("invcompose=" + tr.mul(tr.inverted()).approxEquals(I, 1e-12));
+    print("invboth=" + tr.inverted().mul(tr).approxEquals(I, 1e-12));
+    let gen = mat4FromRows(Vec4(2.0, 1.0, 0.0, 3.0), Vec4(0.0, 4.0, 1.0, 1.0),
+                           Vec4(5.0, 0.0, 2.0, 0.0), Vec4(1.0, 1.0, 1.0, 2.0));
+    print("invgeneral=" + gen.mul(gen.inverted()).approxEquals(I, 1e-9));
+    // A rotation's inverse is its transpose.
+    print("invrotisT=" + a.inverted().approxEquals(a.transposed(), 1e-12));
+    // Translation inverts by negation.
+    print("invtranslneg=" + t.inverted().approxEquals(
+              mat4Translation(Vec3(-10.0, -20.0, -30.0)), 1e-12));
+    // Singular: reported as such, and returns the identity rather than NaNs.
+    print("singular=" + mat4Zero().isInvertible() + "," + gen.isInvertible());
+    print("singularinv=" + mat4Zero().inverted().approxEquals(I, 1e-15));
+    // A projection with a collapsed axis is singular too.
+    print("singularscale=" + mat4Scaling(Vec3(1.0, 0.0, 1.0)).isInvertible());
+
+    // ---- normalMatrix ----
+    // Under non-uniform scale a normal transformed by M stops being
+    // perpendicular; transformed by the normal matrix it stays perpendicular.
+    let squash = mat4Scaling(Vec3(1.0, 4.0, 1.0));
+    let tangent = Vec3(1.0, 1.0, 0.0);
+    let normal = Vec3(1.0, -1.0, 0.0);           // perpendicular to tangent
+    print("perpbefore=" + near(tangent.dot(normal), 0.0, 1e-15));
+    let tPrime = squash.transformDirection(tangent);
+    print("naivebroken=" + (fabs(tPrime.dot(squash.transformDirection(normal))) > 0.1));
+    print("normalmat=" + near(tPrime.dot(squash.normalMatrix().transformDirection(normal)),
+                              0.0, 1e-12));
+    // For a rigid motion the normal matrix is the matrix itself.
+    print("normalrigid=" + a.normalMatrix().approxEquals(a, 1e-12));
+
+    // ---- mulVec4 and the perspective divide ----
+    // The raw product keeps w; transformPoint divides by it.
+    let v4 = Vec4(1.0, 2.0, 3.0, 1.0);
+    print("mulvec4=" + q(t.mulVec4(v4).x, 1.0) + "," + q(t.mulVec4(v4).w, 1.0));
+    // w = 0 is a direction: translation drops out of the raw product too.
+    print("mulvec4dir=" + q(t.mulVec4(Vec4(1.0, 0.0, 0.0, 0.0)).x, 1.0));
+
+    // ---- Perspective ----
+    // Right-handed, looking down -z, clip depth in [-1, 1].
+    let proj = mat4Perspective(PI * 0.5, 2.0, 1.0, 100.0);
+    // The fourth row copies -z into w. That is what drives the divide.
+    print("perspw=" + q(proj.m32, 1.0) + "," + q(proj.m33, 1.0));
+    // A point on the near plane lands on -1 in depth; the far plane on +1.
+    print("perspnear=" + near(proj.transformPoint(Vec3(0.0, 0.0, -1.0)).z, -1.0, 1e-12));
+    print("perspfar=" + near(proj.transformPoint(Vec3(0.0, 0.0, -100.0)).z, 1.0, 1e-12));
+    // At 90 degrees vertical FOV the near plane is 1 unit tall either side.
+    print("perspfov=" + near(proj.transformPoint(Vec3(0.0, 1.0, -1.0)).y, 1.0, 1e-12));
+    // Aspect 2 means the horizontal extent is twice the vertical.
+    print("perspaspect=" + near(proj.transformPoint(Vec3(2.0, 0.0, -1.0)).x, 1.0, 1e-12));
+    // Things further away appear smaller -- the whole point of the divide.
+    print("perspshrink=" + (proj.transformPoint(Vec3(1.0, 1.0, -10.0)).y
+                            < proj.transformPoint(Vec3(1.0, 1.0, -2.0)).y));
+    print("perspinv=" + proj.mul(proj.inverted()).approxEquals(I, 1e-9));
+
+    // ---- Ortho ----
+    // No divide, so parallel lines stay parallel and depth is linear.
+    let ortho = mat4Ortho(-2.0, 2.0, -1.0, 1.0, 1.0, 10.0);
+    print("orthox=" + near(ortho.transformPoint(Vec3(2.0, 0.0, -1.0)).x, 1.0, 1e-12));
+    print("orthoy=" + near(ortho.transformPoint(Vec3(0.0, 1.0, -1.0)).y, 1.0, 1e-12));
+    print("orthonear=" + near(ortho.transformPoint(Vec3(0.0, 0.0, -1.0)).z, -1.0, 1e-12));
+    print("orthofar=" + near(ortho.transformPoint(Vec3(0.0, 0.0, -10.0)).z, 1.0, 1e-12));
+    print("orthocentre=" + vnear(ortho.transformPoint(Vec3(0.0, 0.0, -5.5)),
+                                 Vec3(0.0, 0.0, 0.0), 1e-12));
+    // Distance does not change apparent size.
+    print("orthonoshrink=" + near(ortho.transformPoint(Vec3(1.0, 1.0, -2.0)).y,
+                                  ortho.transformPoint(Vec3(1.0, 1.0, -9.0)).y, 1e-12));
+    print("orthoinv=" + ortho.mul(ortho.inverted()).approxEquals(I, 1e-9));
+    print("orthow=" + q(ortho.m33, 1.0) + "," + q(ortho.m32, 1.0));
+
+    // ---- LookAt ----
+    // A camera 5 units up the +z axis, looking at the origin.
+    let view = mat4LookAt(Vec3(0.0, 0.0, 5.0), Vec3(0.0, 0.0, 0.0), ey);
+    // The eye lands on the origin, and the target lands 5 units down -z.
+    print("lookeye=" + vnear(view.transformPoint(Vec3(0.0, 0.0, 5.0)),
+                             Vec3(0.0, 0.0, 0.0), 1e-12));
+    print("looktarget=" + vnear(view.transformPoint(Vec3(0.0, 0.0, 0.0)),
+                                Vec3(0.0, 0.0, -5.0), 1e-12));
+    // With +y up, world +x stays screen right and world +y stays screen up.
+    print("lookright=" + vnear(view.transformDirection(ex), ex, 1e-12));
+    print("lookup=" + vnear(view.transformDirection(ey), ey, 1e-12));
+    // A view matrix is rigid, so it preserves distance.
+    print("lookrigid=" + near(view.transformPoint(Vec3(1.0, 2.0, 3.0))
+                              .dist(view.transformPoint(Vec3(4.0, 5.0, 6.0))),
+                              Vec3(1.0, 2.0, 3.0).dist(Vec3(4.0, 5.0, 6.0)), 1e-12));
+    print("lookinv=" + view.mul(view.inverted()).approxEquals(I, 1e-12));
+    // `up` need only be roughly up. A 0.02 tilt perturbs the basis by about
+    // 0.02 -- small, but not nothing, so it is bounded from both sides rather
+    // than asserted equal.
+    let sloppy = mat4LookAt(Vec3(0.0, 0.0, 5.0), Vec3(0.0, 0.0, 0.0),
+                            Vec3(0.02, 1.0, 0.0));
+    print("looksloppy=" + sloppy.approxEquals(view, 0.05)
+          + "," + !sloppy.approxEquals(view, 1e-6));
+    // Degenerate: up parallel to the view direction, and a zero-length view.
+    print("lookdegen=" + mat4LookAt(Vec3(0.0, 0.0, 5.0), Vec3(0.0, 0.0, 0.0), ez)
+                         .approxEquals(I, 1e-15)
+          + "," + mat4LookAt(ez, ez, ey).approxEquals(I, 1e-15));
+
+    // ---- A full model-view-projection chain ----
+    // Written in the order the maths is: proj * view * model.
+    let model = mat4Translation(Vec3(0.0, 0.0, -2.0)).mul(mat4RotationY(0.4));
+    let mvp = proj.mul(view).mul(model);
+    print("mvp=" + mvp.isInvertible());
+    // The chain must agree with applying each stage in turn.
+    let stepwise = proj.transformPoint(view.transformPoint(model.transformPoint(ex)));
+    print("mvpsteps=" + vnear(mvp.transformPoint(ex), stepwise, 1e-9));
+    // Unprojecting with the inverse recovers the original point.
+    print("mvpunproject=" + vnear(mvp.inverted().transformPoint(mvp.transformPoint(ex)),
+                                  ex, 1e-9));
+
+    // ---- approxEquals ----
+    print("approx=" + I.approxEquals(I, 1e-15) + "," + I.approxEquals(t, 1e-15));
+    // A difference just inside the tolerance still compares equal.
+    let nudged = mat4Translation(Vec3(1e-9, 0.0, 0.0));
+    print("approxeps=" + nudged.approxEquals(I, 1e-6) + "," + nudged.approxEquals(I, 1e-12));
+}

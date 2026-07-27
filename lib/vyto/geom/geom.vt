@@ -9,8 +9,14 @@
 // vyto/geo's geodesy. Vec4 is the homogeneous coordinate a 4x4 transform
 // consumes: a model-view-projection pipeline is Vec4 in, perspective divide,
 // Vec3 out. It doubles as an RGBA carrier.
+//
+// Mat4 is that 4x4 transform. It is a value struct too — sixteen floats, 128
+// bytes, copied rather than referenced — so building a model-view-projection
+// chain allocates nothing. See the Mat4 header for the storage and
+// multiplication conventions, which are the one thing worth reading before
+// using it.
 
-import { sqrt } from "vyto/math";
+import { sqrt, sin, cos, tan, fabs } from "vyto/math";
 
 export struct Vec2 {
     x: float;
@@ -105,4 +111,359 @@ export struct Vec4 {
         if (this.w == 0.0) { return this; }
         return Vec4(this.x / this.w, this.y / this.w, this.z / this.w, 1.0);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Mat4
+//
+// The conventions, stated once because every 4x4 bug is a convention mismatch:
+//
+//   * Field mRC is row R, column C — ordinary mathematical subscript order.
+//   * Storage is therefore ROW-MAJOR: m00, m01, m02, m03 is the first row.
+//   * Vectors are COLUMN vectors: a point is transformed as v' = M * v, so
+//     translation lives in the fourth COLUMN (m03, m13, m23).
+//   * a.mul(b) applies b FIRST, then a — the same order the maths is written
+//     in. A model-view-projection chain is proj.mul(view).mul(model).
+//
+// OpenGL wants column-major memory, so uploading a Mat4 means either
+// columnMajorArray() or glUniformMatrix4fv(..., transpose = GL_TRUE, ...).
+// Getting that wrong transposes the world, which looks like a rotation bug and
+// gets debugged as one.
+//
+// Projection matrices here are right-handed, looking down -z, producing clip
+// depth in [-1, 1] — the OpenGL convention rather than Direct3D's [0, 1].
+// ---------------------------------------------------------------------------
+
+export struct Mat4 {
+    m00: float; m01: float; m02: float; m03: float;
+    m10: float; m11: float; m12: float; m13: float;
+    m20: float; m21: float; m22: float; m23: float;
+    m30: float; m31: float; m32: float; m33: float;
+
+    fn row(i: int): Vec4 {
+        if (i == 0) { return Vec4(this.m00, this.m01, this.m02, this.m03); }
+        if (i == 1) { return Vec4(this.m10, this.m11, this.m12, this.m13); }
+        if (i == 2) { return Vec4(this.m20, this.m21, this.m22, this.m23); }
+        return Vec4(this.m30, this.m31, this.m32, this.m33);
+    }
+
+    fn col(i: int): Vec4 {
+        if (i == 0) { return Vec4(this.m00, this.m10, this.m20, this.m30); }
+        if (i == 1) { return Vec4(this.m01, this.m11, this.m21, this.m31); }
+        if (i == 2) { return Vec4(this.m02, this.m12, this.m22, this.m32); }
+        return Vec4(this.m03, this.m13, this.m23, this.m33);
+    }
+
+    fn add(o: Mat4): Mat4 {
+        return Mat4(this.m00 + o.m00, this.m01 + o.m01, this.m02 + o.m02, this.m03 + o.m03,
+                    this.m10 + o.m10, this.m11 + o.m11, this.m12 + o.m12, this.m13 + o.m13,
+                    this.m20 + o.m20, this.m21 + o.m21, this.m22 + o.m22, this.m23 + o.m23,
+                    this.m30 + o.m30, this.m31 + o.m31, this.m32 + o.m32, this.m33 + o.m33);
+    }
+
+    fn sub(o: Mat4): Mat4 {
+        return Mat4(this.m00 - o.m00, this.m01 - o.m01, this.m02 - o.m02, this.m03 - o.m03,
+                    this.m10 - o.m10, this.m11 - o.m11, this.m12 - o.m12, this.m13 - o.m13,
+                    this.m20 - o.m20, this.m21 - o.m21, this.m22 - o.m22, this.m23 - o.m23,
+                    this.m30 - o.m30, this.m31 - o.m31, this.m32 - o.m32, this.m33 - o.m33);
+    }
+
+    fn scale(s: float): Mat4 {
+        return Mat4(this.m00 * s, this.m01 * s, this.m02 * s, this.m03 * s,
+                    this.m10 * s, this.m11 * s, this.m12 * s, this.m13 * s,
+                    this.m20 * s, this.m21 * s, this.m22 * s, this.m23 * s,
+                    this.m30 * s, this.m31 * s, this.m32 * s, this.m33 * s);
+    }
+
+    // Matrix product. `o` is applied FIRST: this.mul(o) means "do o, then this".
+    fn mul(o: Mat4): Mat4 {
+        return Mat4(
+            this.m00 * o.m00 + this.m01 * o.m10 + this.m02 * o.m20 + this.m03 * o.m30,
+            this.m00 * o.m01 + this.m01 * o.m11 + this.m02 * o.m21 + this.m03 * o.m31,
+            this.m00 * o.m02 + this.m01 * o.m12 + this.m02 * o.m22 + this.m03 * o.m32,
+            this.m00 * o.m03 + this.m01 * o.m13 + this.m02 * o.m23 + this.m03 * o.m33,
+
+            this.m10 * o.m00 + this.m11 * o.m10 + this.m12 * o.m20 + this.m13 * o.m30,
+            this.m10 * o.m01 + this.m11 * o.m11 + this.m12 * o.m21 + this.m13 * o.m31,
+            this.m10 * o.m02 + this.m11 * o.m12 + this.m12 * o.m22 + this.m13 * o.m32,
+            this.m10 * o.m03 + this.m11 * o.m13 + this.m12 * o.m23 + this.m13 * o.m33,
+
+            this.m20 * o.m00 + this.m21 * o.m10 + this.m22 * o.m20 + this.m23 * o.m30,
+            this.m20 * o.m01 + this.m21 * o.m11 + this.m22 * o.m21 + this.m23 * o.m31,
+            this.m20 * o.m02 + this.m21 * o.m12 + this.m22 * o.m22 + this.m23 * o.m32,
+            this.m20 * o.m03 + this.m21 * o.m13 + this.m22 * o.m23 + this.m23 * o.m33,
+
+            this.m30 * o.m00 + this.m31 * o.m10 + this.m32 * o.m20 + this.m33 * o.m30,
+            this.m30 * o.m01 + this.m31 * o.m11 + this.m32 * o.m21 + this.m33 * o.m31,
+            this.m30 * o.m02 + this.m31 * o.m12 + this.m32 * o.m22 + this.m33 * o.m32,
+            this.m30 * o.m03 + this.m31 * o.m13 + this.m32 * o.m23 + this.m33 * o.m33);
+    }
+
+    // The raw homogeneous product, no divide. Use when w matters — a clip-space
+    // position, or a plane.
+    fn mulVec4(v: Vec4): Vec4 {
+        return Vec4(this.m00 * v.x + this.m01 * v.y + this.m02 * v.z + this.m03 * v.w,
+                    this.m10 * v.x + this.m11 * v.y + this.m12 * v.z + this.m13 * v.w,
+                    this.m20 * v.x + this.m21 * v.y + this.m22 * v.z + this.m23 * v.w,
+                    this.m30 * v.x + this.m31 * v.y + this.m32 * v.z + this.m33 * v.w);
+    }
+
+    // Transform a position: w = 1 going in, perspective divide coming out. This
+    // is the one to reach for when a point on a model needs to land on screen.
+    fn transformPoint(v: Vec3): Vec3 {
+        return this.mulVec4(Vec4(v.x, v.y, v.z, 1.0)).homogenized().xyz();
+    }
+
+    // Transform a direction: w = 0, so translation is ignored and no divide
+    // happens. Velocities and axes want this; normals do NOT — a non-uniform
+    // scale needs the inverse transpose, which is inverted().transposed().
+    fn transformDirection(v: Vec3): Vec3 {
+        return this.mulVec4(Vec4(v.x, v.y, v.z, 0.0)).xyz();
+    }
+
+    fn transposed(): Mat4 {
+        return Mat4(this.m00, this.m10, this.m20, this.m30,
+                    this.m01, this.m11, this.m21, this.m31,
+                    this.m02, this.m12, this.m22, this.m32,
+                    this.m03, this.m13, this.m23, this.m33);
+    }
+
+    fn determinant(): float {
+        let s0 = this.m00 * this.m11 - this.m10 * this.m01;
+        let s1 = this.m00 * this.m12 - this.m10 * this.m02;
+        let s2 = this.m00 * this.m13 - this.m10 * this.m03;
+        let s3 = this.m01 * this.m12 - this.m11 * this.m02;
+        let s4 = this.m01 * this.m13 - this.m11 * this.m03;
+        let s5 = this.m02 * this.m13 - this.m12 * this.m03;
+
+        let c5 = this.m22 * this.m33 - this.m32 * this.m23;
+        let c4 = this.m21 * this.m33 - this.m31 * this.m23;
+        let c3 = this.m21 * this.m32 - this.m31 * this.m22;
+        let c2 = this.m20 * this.m33 - this.m30 * this.m23;
+        let c1 = this.m20 * this.m32 - this.m30 * this.m22;
+        let c0 = this.m20 * this.m31 - this.m30 * this.m21;
+
+        return s0 * c5 - s1 * c4 + s2 * c3 + s3 * c2 - s4 * c1 + s5 * c0;
+    }
+
+    fn isInvertible(): bool { return fabs(this.determinant()) > 1e-300; }
+
+    // Full inverse, by Laplace expansion over 2x2 complementary minors.
+    //
+    // A singular matrix has no inverse, and there is no error channel on a
+    // value type, so this returns the identity — the same choice Vec's
+    // normalized() makes in returning a zero vector rather than a NaN. Call
+    // isInvertible() first when a wrong answer would be worse than a loud one.
+    fn inverted(): Mat4 {
+        let s0 = this.m00 * this.m11 - this.m10 * this.m01;
+        let s1 = this.m00 * this.m12 - this.m10 * this.m02;
+        let s2 = this.m00 * this.m13 - this.m10 * this.m03;
+        let s3 = this.m01 * this.m12 - this.m11 * this.m02;
+        let s4 = this.m01 * this.m13 - this.m11 * this.m03;
+        let s5 = this.m02 * this.m13 - this.m12 * this.m03;
+
+        let c5 = this.m22 * this.m33 - this.m32 * this.m23;
+        let c4 = this.m21 * this.m33 - this.m31 * this.m23;
+        let c3 = this.m21 * this.m32 - this.m31 * this.m22;
+        let c2 = this.m20 * this.m33 - this.m30 * this.m23;
+        let c1 = this.m20 * this.m32 - this.m30 * this.m22;
+        let c0 = this.m20 * this.m31 - this.m30 * this.m21;
+
+        let det = s0 * c5 - s1 * c4 + s2 * c3 + s3 * c2 - s4 * c1 + s5 * c0;
+        if (fabs(det) <= 1e-300) { return mat4Identity(); }
+        let d = 1.0 / det;
+
+        return Mat4(
+            ( this.m11 * c5 - this.m12 * c4 + this.m13 * c3) * d,
+            (-this.m01 * c5 + this.m02 * c4 - this.m03 * c3) * d,
+            ( this.m31 * s5 - this.m32 * s4 + this.m33 * s3) * d,
+            (-this.m21 * s5 + this.m22 * s4 - this.m23 * s3) * d,
+
+            (-this.m10 * c5 + this.m12 * c2 - this.m13 * c1) * d,
+            ( this.m00 * c5 - this.m02 * c2 + this.m03 * c1) * d,
+            (-this.m30 * s5 + this.m32 * s2 - this.m33 * s1) * d,
+            ( this.m20 * s5 - this.m22 * s2 + this.m23 * s1) * d,
+
+            ( this.m10 * c4 - this.m11 * c2 + this.m13 * c0) * d,
+            (-this.m00 * c4 + this.m01 * c2 - this.m03 * c0) * d,
+            ( this.m30 * s4 - this.m31 * s2 + this.m33 * s0) * d,
+            (-this.m20 * s4 + this.m21 * s2 - this.m23 * s0) * d,
+
+            (-this.m10 * c3 + this.m11 * c1 - this.m12 * c0) * d,
+            ( this.m00 * c3 - this.m01 * c1 + this.m02 * c0) * d,
+            (-this.m30 * s3 + this.m31 * s1 - this.m32 * s0) * d,
+            ( this.m20 * s3 - this.m21 * s1 + this.m22 * s0) * d);
+    }
+
+    // The matrix that transforms normals under this transform. For a rigid
+    // motion it equals the matrix itself, but under non-uniform scale a normal
+    // transformed by M stops being perpendicular to its surface.
+    fn normalMatrix(): Mat4 { return this.inverted().transposed(); }
+
+    fn approxEquals(o: Mat4, eps: float): bool {
+        return fabs(this.m00 - o.m00) < eps && fabs(this.m01 - o.m01) < eps
+            && fabs(this.m02 - o.m02) < eps && fabs(this.m03 - o.m03) < eps
+            && fabs(this.m10 - o.m10) < eps && fabs(this.m11 - o.m11) < eps
+            && fabs(this.m12 - o.m12) < eps && fabs(this.m13 - o.m13) < eps
+            && fabs(this.m20 - o.m20) < eps && fabs(this.m21 - o.m21) < eps
+            && fabs(this.m22 - o.m22) < eps && fabs(this.m23 - o.m23) < eps
+            && fabs(this.m30 - o.m30) < eps && fabs(this.m31 - o.m31) < eps
+            && fabs(this.m32 - o.m32) < eps && fabs(this.m33 - o.m33) < eps;
+    }
+
+    // Row-major, the same order the fields are declared in.
+    fn toArray(): float[] {
+        return [this.m00, this.m01, this.m02, this.m03,
+                this.m10, this.m11, this.m12, this.m13,
+                this.m20, this.m21, this.m22, this.m23,
+                this.m30, this.m31, this.m32, this.m33];
+    }
+
+    // Column-major — what OpenGL and GLSL expect. Upload this, or upload
+    // toArray() with transpose set.
+    fn columnMajorArray(): float[] {
+        return [this.m00, this.m10, this.m20, this.m30,
+                this.m01, this.m11, this.m21, this.m31,
+                this.m02, this.m12, this.m22, this.m32,
+                this.m03, this.m13, this.m23, this.m33];
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Mat4 constructors
+//
+// Free functions rather than a 16-argument literal, because nobody should have
+// to count commas to build a rotation.
+// ---------------------------------------------------------------------------
+
+export fn mat4Zero(): Mat4 {
+    return Mat4(0.0, 0.0, 0.0, 0.0,  0.0, 0.0, 0.0, 0.0,
+                0.0, 0.0, 0.0, 0.0,  0.0, 0.0, 0.0, 0.0);
+}
+
+export fn mat4Identity(): Mat4 {
+    return Mat4(1.0, 0.0, 0.0, 0.0,  0.0, 1.0, 0.0, 0.0,
+                0.0, 0.0, 1.0, 0.0,  0.0, 0.0, 0.0, 1.0);
+}
+
+// Rows, not columns — matching the field order and the way a matrix is written
+// on paper.
+export fn mat4FromRows(r0: Vec4, r1: Vec4, r2: Vec4, r3: Vec4): Mat4 {
+    return Mat4(r0.x, r0.y, r0.z, r0.w,
+                r1.x, r1.y, r1.z, r1.w,
+                r2.x, r2.y, r2.z, r2.w,
+                r3.x, r3.y, r3.z, r3.w);
+}
+
+export fn mat4FromColumns(c0: Vec4, c1: Vec4, c2: Vec4, c3: Vec4): Mat4 {
+    return Mat4(c0.x, c1.x, c2.x, c3.x,
+                c0.y, c1.y, c2.y, c3.y,
+                c0.z, c1.z, c2.z, c3.z,
+                c0.w, c1.w, c2.w, c3.w);
+}
+
+// Translation sits in the fourth column, because vectors are columns.
+export fn mat4Translation(t: Vec3): Mat4 {
+    return Mat4(1.0, 0.0, 0.0, t.x,
+                0.0, 1.0, 0.0, t.y,
+                0.0, 0.0, 1.0, t.z,
+                0.0, 0.0, 0.0, 1.0);
+}
+
+export fn mat4Scaling(s: Vec3): Mat4 {
+    return Mat4(s.x, 0.0, 0.0, 0.0,
+                0.0, s.y, 0.0, 0.0,
+                0.0, 0.0, s.z, 0.0,
+                0.0, 0.0, 0.0, 1.0);
+}
+
+export fn mat4ScalingUniform(s: float): Mat4 { return mat4Scaling(Vec3(s, s, s)); }
+
+// Right-handed rotations: positive angles turn counter-clockwise when the axis
+// points towards the viewer.
+export fn mat4RotationX(rad: float): Mat4 {
+    let c = cos(rad);
+    let s = sin(rad);
+    return Mat4(1.0, 0.0, 0.0, 0.0,
+                0.0,   c,  -s, 0.0,
+                0.0,   s,   c, 0.0,
+                0.0, 0.0, 0.0, 1.0);
+}
+
+export fn mat4RotationY(rad: float): Mat4 {
+    let c = cos(rad);
+    let s = sin(rad);
+    return Mat4(  c, 0.0,   s, 0.0,
+                0.0, 1.0, 0.0, 0.0,
+                 -s, 0.0,   c, 0.0,
+                0.0, 0.0, 0.0, 1.0);
+}
+
+export fn mat4RotationZ(rad: float): Mat4 {
+    let c = cos(rad);
+    let s = sin(rad);
+    return Mat4(  c,  -s, 0.0, 0.0,
+                  s,   c, 0.0, 0.0,
+                0.0, 0.0, 1.0, 0.0,
+                0.0, 0.0, 0.0, 1.0);
+}
+
+// Rotation about an arbitrary axis, by Rodrigues' formula. The axis is
+// normalized here, so a caller need not; a zero axis yields the identity
+// rather than a NaN.
+export fn mat4RotationAxis(axis: Vec3, rad: float): Mat4 {
+    let a = axis.normalized();
+    if (a.len2() == 0.0) { return mat4Identity(); }
+    let c = cos(rad);
+    let s = sin(rad);
+    let t = 1.0 - c;
+    return Mat4(t * a.x * a.x + c,        t * a.x * a.y - s * a.z, t * a.x * a.z + s * a.y, 0.0,
+                t * a.x * a.y + s * a.z,  t * a.y * a.y + c,       t * a.y * a.z - s * a.x, 0.0,
+                t * a.x * a.z - s * a.y,  t * a.y * a.z + s * a.x, t * a.z * a.z + c,       0.0,
+                0.0, 0.0, 0.0, 1.0);
+}
+
+// A view matrix: moves the world so the camera sits at the origin looking down
+// -z. Right-handed. `up` need only be roughly up — the true up is derived — but
+// it must not be parallel to the view direction, which would make the cross
+// product zero; that case returns the identity rather than a NaN.
+export fn mat4LookAt(eye: Vec3, target: Vec3, up: Vec3): Mat4 {
+    let f = target.sub(eye).normalized();
+    if (f.len2() == 0.0) { return mat4Identity(); }
+    let sVec = f.cross(up);
+    if (sVec.len2() == 0.0) { return mat4Identity(); }
+    let r = sVec.normalized();
+    let u = r.cross(f);
+    return Mat4( r.x,  r.y,  r.z, -r.dot(eye),
+                 u.x,  u.y,  u.z, -u.dot(eye),
+                -f.x, -f.y, -f.z,  f.dot(eye),
+                 0.0,  0.0,  0.0,  1.0);
+}
+
+// Perspective projection. `fovyRad` is the vertical field of view, `aspect` is
+// width/height. Clip depth lands in [-1, 1] (OpenGL), not [0, 1] (Direct3D).
+//
+// The fourth row is (0, 0, -1, 0): it copies -z into w, which is what makes the
+// later perspective divide shrink distant geometry. That is why homogenized()
+// exists on Vec4.
+export fn mat4Perspective(fovyRad: float, aspect: float, near: float, far: float): Mat4 {
+    let f = 1.0 / tan(fovyRad * 0.5);
+    let nf = 1.0 / (near - far);
+    return Mat4(f / aspect, 0.0, 0.0, 0.0,
+                0.0, f, 0.0, 0.0,
+                0.0, 0.0, (far + near) * nf, 2.0 * far * near * nf,
+                0.0, 0.0, -1.0, 0.0);
+}
+
+// Orthographic projection: no perspective divide, so parallel lines stay
+// parallel. CAD, 2D overlays and shadow maps want this.
+export fn mat4Ortho(left: float, right: float, bottom: float, top: float,
+                    near: float, far: float): Mat4 {
+    let rl = 1.0 / (right - left);
+    let tb = 1.0 / (top - bottom);
+    let fn_ = 1.0 / (far - near);
+    return Mat4(2.0 * rl, 0.0, 0.0, -(right + left) * rl,
+                0.0, 2.0 * tb, 0.0, -(top + bottom) * tb,
+                0.0, 0.0, -2.0 * fn_, -(far + near) * fn_,
+                0.0, 0.0, 0.0, 1.0);
 }

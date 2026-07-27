@@ -566,7 +566,7 @@ everything else is pure Vyto.
 | `vyto/surface` ⚙ | windowing + event loop (X11 / Win32 / framebuffer / headless) |
 | `vyto/gfx` ⚙ | 2D canvas (blend2d): shapes, gradients, text, images |
 | `vyto/ui` | widget toolkit — layout, widgets, dialogs, nav, skins (iOS/macOS/Material) |
-| `vyto/anim` · `vyto/geom` | animation/easing · geometry & vector paths |
+| `vyto/anim` · `vyto/geom` | animation/easing · vectors, `Mat4` transforms & vector paths |
 | `vyto/geo` | geodesy — coordinates, datums, ECEF/ENU, projections, tiles, GeoJSON |
 
 **Hardware** — `vyto/hw`

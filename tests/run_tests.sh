@@ -187,6 +187,17 @@ else
     fail=1
 fi
 
+# --- vyto/geom: Mat4 transforms, inverse, projections (pure Vyto) ---
+got=$(./vytoc run tests/fixtures/geom_mat.vt 2>&1)
+if [ "$got" = "$(cat tests/fixtures/geom_mat.expected)" ]; then
+    echo "PASS geom_mat"
+else
+    echo "FAIL geom_mat"
+    echo "--- expected ---"; cat tests/fixtures/geom_mat.expected
+    echo "--- got ---"; printf '%s\n' "$got"
+    fail=1
+fi
+
 # --- vyto/geo: coords, datums, spherical measures, BBox (pure Vyto) ---
 got=$(./vytoc run tests/fixtures/geo_math.vt 2>&1)
 if [ "$got" = "$(cat tests/fixtures/geo_math.expected)" ]; then
