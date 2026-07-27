@@ -1,0 +1,112 @@
+// vyto/geo — geodesy, projections, tiles and GeoJSON.
+//
+// The module is projection-independent at its core: coordinates, datums, 3D
+// Cartesian conversion and spherical measurement come first, and Web Mercator
+// and slippy tiles are one layer on top. A 3D globe uses the core and never
+// touches the tile maths.
+
+import { LatLon, datumWgs84, distanceM, initialBearing, destination,
+         midpoint, toEcef, fromEcef, enuBasis, rayHitsEllipsoid, toUnitVector,
+         BBox, Geometry, GEOM_POLYGON, pointInGeometry,
+         simplifyIndicesM } from "vyto/geo";
+import { mercatorProject, OrthographicProjection } from "vyto/geo/project";
+import { lonLatToTile, tileKey, tileBounds, bboxToTileRange, metersPerPixel,
+         zoomForBBox } from "vyto/geo/tiles";
+import { parseGeoJson } from "vyto/geo/geojson";
+import { decodePolyline } from "vyto/geo/polyline";
+import { round } from "vyto/math";
+
+// Distances and angles print rounded: a bare float would render through %g at
+// six significant digits, which is not what anyone wants to read.
+fn km(m: float): int { return round(m / 1000.0) as int; }
+fn km2(m2: float): int { return round(m2 / 1e6) as int; }
+fn deg(d: float): int { return round(d) as int; }
+fn whole(x: float): int { return round(x) as int; }
+
+fn main() {
+    let sf = LatLon(-122.4194, 37.7749);
+    let ny = LatLon(-74.0060, 40.7128);
+
+    // ---- Measuring on a sphere ----
+    print("San Francisco to New York: " + km(distanceM(sf, ny)) + " km");
+    print("initial bearing: " + deg(initialBearing(sf, ny)) + " degrees");
+
+    // Walking the measured distance along the measured bearing lands on NY.
+    let arrived = destination(sf, initialBearing(sf, ny), distanceM(sf, ny));
+    print("arrived at: " + deg(arrived.lon) + ", " + deg(arrived.lat));
+
+    let mid = midpoint(sf, ny);
+    print("great-circle midpoint: " + deg(mid.lon) + ", " + deg(mid.lat));
+
+    // ---- 3D: the part that makes globes work ----
+    let wgs = datumWgs84();
+    let ecef = toEcef(sf.withAlt(0.0), wgs);
+    print("ECEF: " + km(ecef.x) + ", " + km(ecef.y) + ", " + km(ecef.z) + " km");
+    let back = fromEcef(ecef, wgs);
+    print("round trip within a millimetre: "
+          + (round(back.lon * 1e9) == round(sf.lon * 1e9)));
+
+    // The local east/north/up frame, for placing something on the surface.
+    let basis = enuBasis(sf);
+    print("up at SF points away from the centre: " + (basis[2].dot(toUnitVector(sf)) > 0.9));
+
+    // A camera ray straight down at the city: where does it hit the ellipsoid?
+    let camera = ecef.scale(3.0);
+    let dir = ecef.sub(camera).normalized();
+    let t = rayHitsEllipsoid(camera, dir, wgs);
+    let hit = fromEcef(camera.add(dir.scale(t)), wgs);
+    print("ray hits at: " + deg(hit.lon) + ", " + deg(hit.lat));
+
+    // ---- Projections ----
+    let m = mercatorProject(sf);
+    print("Web Mercator: " + km(m.x) + ", " + km(m.y) + " km");
+
+    // A globe centred on the Atlantic: SF is on the near side, Tokyo is not.
+    let globe = new OrthographicProjection(LatLon(-30.0, 20.0));
+    print("globe sees SF: " + globe.isVisible(sf)
+          + ", Tokyo: " + globe.isVisible(LatLon(139.7, 35.7)));
+
+    // ---- Tiles ----
+    let t12 = lonLatToTile(sf, 12);
+    print("tile at zoom 12: " + tileKey(t12));
+    let tb = tileBounds(t12);
+    print("that tile spans " + km(distanceM(LatLon(tb.west, tb.north),
+                                            LatLon(tb.east, tb.north))) + " km");
+    print("resolution at zoom 12: " + whole(metersPerPixel(sf.lat, 12)) + " m/px");
+
+    let area = BBox(-122.6, 37.7, -122.3, 37.9);
+    let range = bboxToTileRange(area, 13);
+    print("tiles needed for the Bay at zoom 13: " + range.count());
+    print("that area fits a 800x600 view at zoom " + whole(zoomForBBox(area, 800.0, 600.0)));
+
+    // ---- Shapes ----
+    // A square degree at the equator, with a hole in the middle. partOuter is
+    // what keeps the hole from being mistaken for a second exterior ring.
+    let g = new Geometry(GEOM_POLYGON);
+    g.addPart([0.0, 1.0, 1.0, 0.0], [0.0, 0.0, 1.0, 1.0], true);
+    g.addPart([0.4, 0.6, 0.6, 0.4], [0.4, 0.4, 0.6, 0.6], false);
+    print("outer area: " + km2(g.partAreaM2(0)) + " km2");
+    print("with the hole removed: " + km2(g.areaM2()) + " km2");
+    print("inside the ring: " + pointInGeometry(g, 0.1, 0.1)
+          + ", inside the hole: " + pointInGeometry(g, 0.5, 0.5));
+
+    // Douglas-Peucker with a tolerance in metres, not degrees.
+    let lons = [0.0, 0.25, 0.5, 0.75, 1.0];
+    let lats = [0.0, 0.0, 0.0, 0.0, 0.0];
+    print("a straight line simplifies to "
+          + simplifyIndicesM(lons, lats, 0, 5, 100.0).len + " points");
+
+    // ---- GeoJSON ----
+    let features = parseGeoJson("{\"type\":\"FeatureCollection\",\"features\":["
+        + "{\"type\":\"Feature\",\"properties\":{\"name\":\"Ferry Building\"},"
+        + "\"geometry\":{\"type\":\"Point\",\"coordinates\":[-122.3933,37.7955,4.5]}}]}");
+    print("parsed " + features.len + " feature: " + features[0].name());
+    print("altitude survives the parse: " + whole(features[0].geom.alts[0] * 10.0) + " decimetres");
+    // Malformed input soft-fails; a bad overlay must not take the app down.
+    print("a broken document yields " + parseGeoJson("{").len + " features");
+
+    // ---- Encoded polyline ----
+    let route = decodePolyline("_p~iF~ps|U_ulLnnqC_mqNvxq`@", 5);
+    print("route has " + route.pointCount() + " points, "
+          + km(route.partLengthM(0)) + " km long");
+}

@@ -1,0 +1,218 @@
+// Pure-Vyto coverage for vyto/geo/geojson and vyto/geo/polyline. The GeoJSON
+// documents are inline string literals, so this stays a pure computation test
+// with no file I/O and runs on every host.
+//
+// Same golden rule as the rest of vyto/geo: ints and bools only, never a bare
+// float.
+import { LatLon, GEOM_POINT, GEOM_LINE, GEOM_POLYGON, pointInGeometry } from "vyto/geo";
+import { parseGeoJson, parseGeoJsonValue, geometryFromJson, featureCollectionBBox,
+         GeoFeature } from "vyto/geo/geojson";
+import { decodePolyline, encodePolyline, encodePolylineRange,
+         encodeGeometryPart } from "vyto/geo/polyline";
+import { json_parse } from "vyto/util/json";
+import { round, fabs } from "vyto/math";
+
+fn q(x: float, scale: float): int { return round(x * scale) as int; }
+
+fn main() {
+    // ---- Point, with the altitude a naive reader throws away ----
+    let pt = parseGeoJson("{\"type\":\"Feature\","
+        + "\"geometry\":{\"type\":\"Point\",\"coordinates\":[1.5,2.5,300.25]},"
+        + "\"properties\":{\"name\":\"somewhere\"}}");
+    print("pt=" + pt.len + "," + pt[0].geom.kind + "," + pt[0].geom.pointCount());
+    print("ptxy=" + q(pt[0].geom.lons[0], 10.0) + "," + q(pt[0].geom.lats[0], 10.0));
+    print("ptalt=" + q(pt[0].geom.alts[0], 100.0));
+    print("ptname=" + pt[0].name());
+    // A 2D position still gets an altitude slot, so the three arrays stay in step.
+    let pt2 = parseGeoJson("{\"type\":\"Point\",\"coordinates\":[3.0,4.0]}");
+    print("pt2d=" + q(pt2[0].geom.alts[0], 1.0)
+          + "," + (pt2[0].geom.alts.len == pt2[0].geom.lons.len));
+
+    // ---- MultiPoint: one part each, so a renderer can address them ----
+    let mp = parseGeoJson("{\"type\":\"MultiPoint\",\"coordinates\":[[0.0,0.0],[1.0,1.0],[2.0,2.0]]}");
+    print("multipt=" + mp[0].geom.partCount() + "," + mp[0].geom.pointCount());
+
+    // ---- Lines ----
+    let ls = parseGeoJson("{\"type\":\"LineString\",\"coordinates\":[[0.0,0.0],[1.0,0.0],[2.0,0.0]]}");
+    print("line=" + ls[0].geom.kind + "," + ls[0].geom.partCount()
+          + "," + ls[0].geom.pointCount());
+    let mls = parseGeoJson("{\"type\":\"MultiLineString\",\"coordinates\":"
+        + "[[[0.0,0.0],[1.0,0.0]],[[5.0,5.0],[6.0,5.0],[7.0,5.0]]]}");
+    print("multiline=" + mls[0].geom.partCount() + "," + mls[0].geom.partLen[0]
+          + "," + mls[0].geom.partLen[1]);
+    // Every part of a MultiLineString is an outer: none of them is a hole.
+    print("mlouter=" + mls[0].geom.partOuter[0] + "," + mls[0].geom.partOuter[1]);
+
+    // ---- Polygon with a hole: the partOuter flag doing its job ----
+    let poly = parseGeoJson("{\"type\":\"Polygon\",\"coordinates\":["
+        + "[[0.0,0.0],[10.0,0.0],[10.0,10.0],[0.0,10.0],[0.0,0.0]],"
+        + "[[4.0,4.0],[6.0,4.0],[6.0,6.0],[4.0,6.0],[4.0,4.0]]]}");
+    print("poly=" + poly[0].geom.kind + "," + poly[0].geom.partCount());
+    print("polyouter=" + poly[0].geom.partOuter[0] + "," + poly[0].geom.partOuter[1]);
+    // The hole reads as outside, which is the whole reason the flag exists.
+    print("polyhit=" + pointInGeometry(poly[0].geom, 1.0, 1.0)
+          + "," + pointInGeometry(poly[0].geom, 5.0, 5.0)
+          + "," + pointInGeometry(poly[0].geom, 20.0, 20.0));
+
+    // ---- MultiPolygon: a second EXTERIOR ring, not a hole in the first ----
+    // This is the case start/length alone cannot represent.
+    let mpoly = parseGeoJson("{\"type\":\"MultiPolygon\",\"coordinates\":["
+        + "[[[0.0,0.0],[1.0,0.0],[1.0,1.0],[0.0,1.0],[0.0,0.0]]],"
+        + "[[[5.0,5.0],[6.0,5.0],[6.0,6.0],[5.0,6.0],[5.0,5.0]]]]}");
+    print("multipoly=" + mpoly[0].geom.partCount());
+    print("multipolyouter=" + mpoly[0].geom.partOuter[0] + "," + mpoly[0].geom.partOuter[1]);
+    // Both squares are inside; the gap between them is not.
+    print("multipolyhit=" + pointInGeometry(mpoly[0].geom, 0.5, 0.5)
+          + "," + pointInGeometry(mpoly[0].geom, 5.5, 5.5)
+          + "," + pointInGeometry(mpoly[0].geom, 3.0, 3.0));
+    // A MultiPolygon whose first polygon has a hole keeps the flags aligned.
+    let mph = parseGeoJson("{\"type\":\"MultiPolygon\",\"coordinates\":["
+        + "[[[0.0,0.0],[10.0,0.0],[10.0,10.0],[0.0,10.0],[0.0,0.0]],"
+        + "[[4.0,4.0],[6.0,4.0],[6.0,6.0],[4.0,6.0],[4.0,4.0]]],"
+        + "[[[20.0,20.0],[21.0,20.0],[21.0,21.0],[20.0,21.0],[20.0,20.0]]]]}");
+    print("mphflags=" + mph[0].geom.partOuter[0] + "," + mph[0].geom.partOuter[1]
+          + "," + mph[0].geom.partOuter[2]);
+    print("mphhit=" + pointInGeometry(mph[0].geom, 5.0, 5.0)
+          + "," + pointInGeometry(mph[0].geom, 20.5, 20.5));
+
+    // ---- FeatureCollection ----
+    let fc = parseGeoJson("{\"type\":\"FeatureCollection\",\"features\":["
+        + "{\"type\":\"Feature\",\"id\":\"a1\","
+        + "\"geometry\":{\"type\":\"Point\",\"coordinates\":[-10.0,-10.0]},"
+        + "\"properties\":{\"name\":\"first\",\"level\":7,\"open\":true,\"score\":1.5}},"
+        + "{\"type\":\"Feature\","
+        + "\"geometry\":{\"type\":\"Point\",\"coordinates\":[10.0,10.0]},"
+        + "\"properties\":{\"title\":\"second\"}}]}");
+    print("fc=" + fc.len);
+    print("fcid=" + fc[0].id + "," + (fc[1].id == ""));
+    print("fcname=" + fc[0].name() + "," + fc[1].name());     // title is a fallback
+    // Numbers flatten to strings; integral ones keep an integer spelling, so a
+    // zoom threshold or an admin level reads back as "7" and not "7.000000".
+    // The fractional one is compared rather than printed -- it is still a float
+    // going through %g, and no golden in vyto/geo prints one of those.
+    print("fcprops=" + fc[0].prop("level") + "," + fc[0].prop("open")
+          + "," + (fc[0].prop("score") == "1.5"));
+    // A missing property returns "" instead of panicking, which Map.get would.
+    print("fcmissing=" + (fc[0].prop("nope") == "") + "," + fc[0].hasProp("nope")
+          + "," + fc[0].hasProp("level"));
+    let b = featureCollectionBBox(fc);
+    print("fcbbox=" + q(b.west, 1.0) + "," + q(b.south, 1.0) + ","
+          + q(b.east, 1.0) + "," + q(b.north, 1.0));
+
+    // ---- The three shapes of document that turn up in the wild ----
+    // A bare geometry, a bare Feature and a FeatureCollection all parse.
+    print("bare=" + parseGeoJson("{\"type\":\"Point\",\"coordinates\":[1.0,1.0]}").len
+          + "," + parseGeoJson("{\"type\":\"Feature\",\"geometry\":"
+                 + "{\"type\":\"Point\",\"coordinates\":[1.0,1.0]},\"properties\":{}}").len
+          + "," + fc.len);
+
+    // ---- GeometryCollection flattens, carrying the parent's properties ----
+    let gc = parseGeoJson("{\"type\":\"Feature\","
+        + "\"geometry\":{\"type\":\"GeometryCollection\",\"geometries\":["
+        + "{\"type\":\"Point\",\"coordinates\":[1.0,1.0]},"
+        + "{\"type\":\"LineString\",\"coordinates\":[[0.0,0.0],[1.0,1.0]]}]},"
+        + "\"properties\":{\"name\":\"both\"}}");
+    print("gc=" + gc.len + "," + gc[0].geom.kind + "," + gc[1].geom.kind);
+    print("gcprops=" + gc[0].name() + "," + gc[1].name());
+
+    // ---- Properties that have no flat form are skipped, not mangled ----
+    let np = parseGeoJson("{\"type\":\"Feature\","
+        + "\"geometry\":{\"type\":\"Point\",\"coordinates\":[0.0,0.0]},"
+        + "\"properties\":{\"name\":\"x\",\"tags\":[1,2],\"meta\":{\"a\":1},\"n\":null}}");
+    print("skipnested=" + np[0].hasProp("name") + "," + np[0].hasProp("tags")
+          + "," + np[0].hasProp("meta"));
+
+    // ---- Malformed input soft-fails; a bad overlay must not kill the app ----
+    print("bad=" + parseGeoJson("{").len + "," + parseGeoJson("[]").len
+          + "," + parseGeoJson("").len + "," + parseGeoJson("null").len
+          + "," + parseGeoJson("not json at all").len);
+    print("bad2=" + parseGeoJson("{\"type\":\"Nonsense\"}").len
+          + "," + parseGeoJson("{\"type\":\"Point\"}").len
+          + "," + parseGeoJson("{\"type\":\"Point\",\"coordinates\":[1.0]}").len
+          + "," + parseGeoJson("{\"type\":\"FeatureCollection\"}").len);
+    // A collection where one feature is broken keeps the others.
+    let partial = parseGeoJson("{\"type\":\"FeatureCollection\",\"features\":["
+        + "{\"type\":\"Feature\",\"geometry\":{\"type\":\"Point\",\"coordinates\":[1.0]},"
+        + "\"properties\":{}},"
+        + "{\"type\":\"Feature\",\"geometry\":{\"type\":\"Point\","
+        + "\"coordinates\":[2.0,2.0]},\"properties\":{\"name\":\"ok\"}}]}");
+    print("partial=" + partial.len + "," + partial[0].name());
+    // An empty collection has an empty extent, not the whole world.
+    let none: GeoFeature[] = [];
+    print("emptybbox=" + featureCollectionBBox(none).isEmpty());
+
+    // ---- parseGeoJsonValue: reuse a tree the caller already parsed ----
+    let tree = json_parse("{\"type\":\"Point\",\"coordinates\":[7.0,8.0]}");
+    let fromTree = parseGeoJsonValue(tree);
+    print("fromtree=" + fromTree.len + "," + q(fromTree[0].geom.lons[0], 1.0));
+    // geometryFromJson on its own, for callers holding just a geometry member.
+    let justGeom = geometryFromJson(json_parse("{\"type\":\"LineString\","
+        + "\"coordinates\":[[0.0,0.0],[1.0,1.0]]}"));
+    print("justgeom=" + (justGeom != null) + "," + justGeom.pointCount());
+    print("justgeombad=" + (geometryFromJson(json_parse("{\"type\":\"Nope\"}")) == null));
+
+    // ---- Polyline: the canonical Google vector ----
+    // Documented as (38.5, -120.2), (40.7, -120.95), (43.252, -126.453).
+    let g = decodePolyline("_p~iF~ps|U_ulLnnqC_mqNvxq`@", 5);
+    print("plcount=" + g.pointCount() + "," + g.kind + "," + g.partCount());
+    print("pl0=" + q(g.lons[0], 100000.0) + "," + q(g.lats[0], 100000.0));
+    print("pl1=" + q(g.lons[1], 100000.0) + "," + q(g.lats[1], 100000.0));
+    print("pl2=" + q(g.lons[2], 100000.0) + "," + q(g.lats[2], 100000.0));
+    // Altitude has no place in the format, but the array still lines up.
+    print("plalt=" + (g.alts.len == g.lons.len) + "," + q(g.alts[0], 1.0));
+
+    // Re-encoding reproduces the input byte for byte.
+    print("plre=" + (encodePolyline(g.lons, g.lats, 5) == "_p~iF~ps|U_ulLnnqC_mqNvxq`@"));
+
+    // Round trip through the codec at both precisions in use.
+    let lons = [-122.41941, -122.40001, -121.99999];
+    let lats = [37.77493, 37.80001, 38.00001];
+    let e5 = encodePolyline(lons, lats, 5);
+    let d5 = decodePolyline(e5, 5);
+    let ok5 = true;
+    let i = 0;
+    while (i < 3) {
+        if (fabs(d5.lons[i] - lons[i]) > 1e-5) { ok5 = false; }
+        if (fabs(d5.lats[i] - lats[i]) > 1e-5) { ok5 = false; }
+        i = i + 1;
+    }
+    print("plround5=" + ok5 + "," + d5.pointCount());
+    // Precision 6 is what OSRM and Valhalla emit; it must round-trip tighter
+    // and produce a different string.
+    let e6 = encodePolyline(lons, lats, 6);
+    let d6 = decodePolyline(e6, 6);
+    let ok6 = true;
+    i = 0;
+    while (i < 3) {
+        if (fabs(d6.lons[i] - lons[i]) > 1e-6) { ok6 = false; }
+        i = i + 1;
+    }
+    print("plround6=" + ok6 + "," + (e5 != e6));
+    // Decoding at the wrong precision scales by ten -- the failure mode the
+    // explicit argument exists to make visible.
+    print("plwrongprec=" + (q(decodePolyline(e5, 6).lons[0], 100.0) != q(lons[0], 100.0)));
+
+    // Negative deltas and a line that reverses direction.
+    let zz = [0.0, 1.0, -1.0, 0.5];
+    let zzlat = [0.0, -1.0, 1.0, -0.5];
+    let dz = decodePolyline(encodePolyline(zz, zzlat, 5), 5);
+    print("plzigzag=" + dz.pointCount() + "," + q(dz.lons[2], 100000.0)
+          + "," + q(dz.lats[2], 100000.0));
+
+    // (start, count) encodes one part without slicing.
+    print("plrange=" + (encodePolylineRange(lons, lats, 0, 3, 5) == e5)
+          + "," + (encodePolylineRange(lons, lats, 1, 2, 5) != e5));
+    print("plpart=" + (encodeGeometryPart(g, 0, 5) == "_p~iF~ps|U_ulLnnqC_mqNvxq`@"));
+
+    // Degenerates: empty string, empty run, a single point, and a stream cut
+    // in half mid-coordinate.
+    print("plempty=" + decodePolyline("", 5).pointCount()
+          + "," + (encodePolyline([], [], 5) == "")
+          + "," + (encodePolylineRange(lons, lats, 0, 0, 5) == ""));
+    let one = decodePolyline(encodePolyline([1.0], [2.0], 5), 5);
+    print("plone=" + one.pointCount() + "," + q(one.lons[0], 100000.0)
+          + "," + q(one.lats[0], 100000.0));
+    // A latitude with no matching longitude is dropped rather than emitted at
+    // longitude zero.
+    print("pltruncated=" + decodePolyline("_p~iF", 5).pointCount());
+}

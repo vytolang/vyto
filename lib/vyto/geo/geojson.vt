@@ -1,0 +1,299 @@
+// vyto/geo/geojson — a GeoJSON reader.
+//
+//   import { parseGeoJson } from "vyto/geo/geojson";
+//   let features = parseGeoJson(text);
+//
+// Reads RFC 7946 into vyto/geo's flat Geometry representation. Geometry comes
+// from the core module, so this file only adds properties and the walk over
+// the nested coordinate arrays.
+//
+// Reader only in this version. Writing GeoJSON is a different job with
+// different questions (precision, key order, whether to emit a bbox) and
+// nothing yet needs it.
+//
+// This is the one part of vyto/geo that depends on the JSON parser and
+// therefore on an allocator. The core, project and tiles modules do not, which
+// is why the parser lives here rather than there.
+
+import { LatLon, BBox, Geometry, GEOM_POINT, GEOM_LINE, GEOM_POLYGON,
+         bboxEmpty } from "vyto/geo";
+import { JsonValue, json_parse, JS_ARR, JS_OBJ, JS_STR, JS_NUM,
+         JS_BOOL } from "vyto/util/json";
+
+// A geometry with its properties.
+//
+// Properties are flattened to strings rather than kept as JsonValue. Exposing
+// JsonValue here would leak vyto/util/json into the types of every consumer,
+// including ones that only want to draw the shapes; and keeping only the name
+// is not enough, because styling by class/highway/admin_level is ordinary work.
+// Nested objects and arrays are skipped — a value that is not a scalar has no
+// useful flat form.
+export class GeoFeature {
+    geom: Geometry;
+    props: Map<string, string>;
+    id: string;
+
+    fn init(geom: Geometry) {
+        this.geom = geom;
+        this.props = new Map<string, string>();
+        this.id = "";
+    }
+
+    // Missing keys return "" rather than panicking. Required, not a
+    // convenience: Map.get panics on a missing key, and real-world GeoJSON is
+    // full of features that lack whichever property is being read.
+    fn prop(k: string): string { return this.props.get_or(k, ""); }
+    fn hasProp(k: string): bool { return this.props.has(k); }
+
+    // The usual name keys, in the order a renderer should prefer them.
+    fn name(): string {
+        if (this.props.has("name")) { return this.props.get_or("name", ""); }
+        if (this.props.has("NAME")) { return this.props.get_or("NAME", ""); }
+        if (this.props.has("title")) { return this.props.get_or("title", ""); }
+        return "";
+    }
+
+    fn bbox(): BBox { return this.geom.bbox(); }
+}
+
+// ---------------------------------------------------------------------------
+// Coordinate walking
+// ---------------------------------------------------------------------------
+
+// A GeoJSON position is [lon, lat] or [lon, lat, alt]. Anything shorter is
+// skipped rather than read past the end.
+fn readPosition(v: JsonValue, lons: float[], lats: float[], alts: float[]): bool {
+    if (v.kind != JS_ARR || v.len() < 2) { return false; }
+    lons.push(v.at(0).asFloat());
+    lats.push(v.at(1).asFloat());
+    // The third element is altitude. Dropping it is the easy mistake: terrain,
+    // flight paths and satellite tracks are exactly the apps that need it.
+    if (v.len() >= 3) { alts.push(v.at(2).asFloat()); } else { alts.push(0.0); }
+    return true;
+}
+
+// An array of positions — one LineString, or one ring of a Polygon.
+fn readPositions(v: JsonValue, g: Geometry, outer: bool) {
+    if (v.kind != JS_ARR) { return; }
+    let lons: float[] = [];
+    let lats: float[] = [];
+    let alts: float[] = [];
+    let i = 0;
+    while (i < v.len()) {
+        readPosition(v.at(i), lons, lats, alts);
+        i = i + 1;
+    }
+    if (lons.len > 0) { g.addPart3(lons, lats, alts, outer); }
+}
+
+// An array of rings. The first is the exterior; the rest are holes — that is
+// what partOuter is for, and it is why a MultiPolygon's second polygon does
+// not get mistaken for a hole in the first.
+fn readRings(v: JsonValue, g: Geometry) {
+    if (v.kind != JS_ARR) { return; }
+    let i = 0;
+    while (i < v.len()) {
+        readPositions(v.at(i), g, i == 0);
+        i = i + 1;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Geometry
+// ---------------------------------------------------------------------------
+
+// One GeoJSON geometry object to a Geometry, or null for an unrecognised or
+// malformed one. GeometryCollection is not handled here — it has no single
+// kind, so parseGeoJsonValue flattens it into separate features instead.
+export fn geometryFromJson(v: JsonValue): Geometry {
+    if (v.kind != JS_OBJ) { return null; }
+    let t = v.get("type");
+    if (t.kind != JS_STR) { return null; }
+    let kind = t.asString();
+    let coords = v.get("coordinates");
+    if (coords.kind != JS_ARR) { return null; }
+
+    if (kind == "Point") {
+        let g = new Geometry(GEOM_POINT);
+        let lons: float[] = [];
+        let lats: float[] = [];
+        let alts: float[] = [];
+        if (!readPosition(coords, lons, lats, alts)) { return null; }
+        g.addPart3(lons, lats, alts, true);
+        return g;
+    }
+    if (kind == "MultiPoint") {
+        let g = new Geometry(GEOM_POINT);
+        // Each point is its own part, so a renderer can address them
+        // individually rather than treating the set as a path.
+        let i = 0;
+        while (i < coords.len()) {
+            let lons: float[] = [];
+            let lats: float[] = [];
+            let alts: float[] = [];
+            if (readPosition(coords.at(i), lons, lats, alts)) {
+                g.addPart3(lons, lats, alts, true);
+            }
+            i = i + 1;
+        }
+        if (g.isEmpty()) { return null; }
+        return g;
+    }
+    if (kind == "LineString") {
+        let g = new Geometry(GEOM_LINE);
+        readPositions(coords, g, true);
+        if (g.isEmpty()) { return null; }
+        return g;
+    }
+    if (kind == "MultiLineString") {
+        let g = new Geometry(GEOM_LINE);
+        let i = 0;
+        while (i < coords.len()) { readPositions(coords.at(i), g, true); i = i + 1; }
+        if (g.isEmpty()) { return null; }
+        return g;
+    }
+    if (kind == "Polygon") {
+        let g = new Geometry(GEOM_POLYGON);
+        readRings(coords, g);
+        if (g.isEmpty()) { return null; }
+        return g;
+    }
+    if (kind == "MultiPolygon") {
+        let g = new Geometry(GEOM_POLYGON);
+        let i = 0;
+        while (i < coords.len()) { readRings(coords.at(i), g); i = i + 1; }
+        if (g.isEmpty()) { return null; }
+        return g;
+    }
+    return null;
+}
+
+// ---------------------------------------------------------------------------
+// Properties
+// ---------------------------------------------------------------------------
+
+fn scalarToString(v: JsonValue): string {
+    if (v.kind == JS_STR) { return v.asString(); }
+    if (v.kind == JS_BOOL) { if (v.asBool()) { return "true"; } return "false"; }
+    if (v.kind == JS_NUM) {
+        let f = v.asFloat();
+        let i = f as int;
+        // Integral values print as integers: "3", not "3.000000". Zoom
+        // thresholds and admin levels are the common case and reading "7" back
+        // as a level is easier than parsing a float.
+        if ((i as float) == f) { return "" + i; }
+        return "" + f;
+    }
+    return "";
+}
+
+fn readProps(v: JsonValue, f: GeoFeature) {
+    if (v.kind != JS_OBJ) { return; }
+    let keys = v.objKeys();
+    let i = 0;
+    while (i < keys.len) {
+        let val = v.get(keys[i]);
+        // Objects and arrays have no useful flat form, so they are skipped
+        // rather than stringified into something no caller can use.
+        if (val.kind != JS_OBJ && val.kind != JS_ARR) {
+            f.props.set(keys[i], scalarToString(val));
+        }
+        i = i + 1;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Documents
+// ---------------------------------------------------------------------------
+
+fn addFeature(out: GeoFeature[], v: JsonValue) {
+    let geomV = v.get("geometry");
+
+    // A GeometryCollection has no single kind, so it becomes one feature per
+    // member, each carrying a copy of the parent's properties. That keeps
+    // Geometry's invariant that a shape has one kind.
+    if (geomV.kind == JS_OBJ) {
+        let t = geomV.get("type");
+        if (t.kind == JS_STR && t.asString() == "GeometryCollection") {
+            let members = geomV.get("geometries");
+            if (members.kind != JS_ARR) { return; }
+            let i = 0;
+            while (i < members.len()) {
+                let g = geometryFromJson(members.at(i));
+                if (g != null) {
+                    let f = new GeoFeature(g);
+                    readProps(v.get("properties"), f);
+                    f.id = scalarToString(v.get("id"));
+                    out.push(f);
+                }
+                i = i + 1;
+            }
+            return;
+        }
+    }
+
+    let g = geometryFromJson(geomV);
+    if (g == null) { return; }
+    let f = new GeoFeature(g);
+    readProps(v.get("properties"), f);
+    f.id = scalarToString(v.get("id"));
+    out.push(f);
+}
+
+// Features from an already-parsed document. Use this when the caller has its
+// own JsonValue tree and wants to read exotic properties out of it too, rather
+// than parsing the text twice.
+//
+// Accepts a FeatureCollection, a bare Feature, or a bare geometry object —
+// all three turn up in the wild, and rejecting the last two would mean every
+// caller writing the same three-way branch.
+export fn parseGeoJsonValue(root: JsonValue): GeoFeature[] {
+    let out: GeoFeature[] = [];
+    if (root == null || root.kind != JS_OBJ) { return out; }
+    let t = root.get("type");
+    if (t.kind != JS_STR) { return out; }
+    let kind = t.asString();
+
+    if (kind == "FeatureCollection") {
+        let feats = root.get("features");
+        if (feats.kind != JS_ARR) { return out; }
+        let i = 0;
+        while (i < feats.len()) {
+            let f = feats.at(i);
+            if (f.kind == JS_OBJ) { addFeature(out, f); }
+            i = i + 1;
+        }
+        return out;
+    }
+    if (kind == "Feature") {
+        addFeature(out, root);
+        return out;
+    }
+    // A bare geometry object.
+    let g = geometryFromJson(root);
+    if (g != null) { out.push(new GeoFeature(g)); }
+    return out;
+}
+
+// Features from GeoJSON text.
+//
+// Soft-fails to an empty array on malformed input. A bad overlay file must not
+// take an app down, and a caller that wants the parse error can run
+// json_parse itself and use parseGeoJsonValue.
+export fn parseGeoJson(text: string): GeoFeature[] {
+    let root = json_parse(text);
+    if (root == null) {
+        let empty: GeoFeature[] = [];
+        return empty;
+    }
+    return parseGeoJsonValue(root);
+}
+
+// Extent of a whole feature collection. bboxEmpty is the identity for union,
+// so an empty collection returns an empty box rather than the whole world.
+export fn featureCollectionBBox(features: GeoFeature[]): BBox {
+    let b = bboxEmpty();
+    let i = 0;
+    while (i < features.len) { b = b.union(features[i].bbox()); i = i + 1; }
+    return b;
+}

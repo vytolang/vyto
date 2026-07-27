@@ -1,0 +1,135 @@
+// vyto/geo/polyline — Google's encoded polyline format.
+//
+//   import { decodePolyline, encodePolyline } from "vyto/geo/polyline";
+//
+// The compact line encoding every routing API returns: coordinates are scaled
+// to a fixed number of decimal places, delta-encoded against the previous
+// point, zig-zagged so small negatives stay small, then written five bits at a
+// time in base64-adjacent ASCII.
+//
+// A separate module from the core because it needs a StringBuilder, and that
+// is a C shim — the core deliberately depends on nothing but libm.
+//
+// `precision` is the number of decimal places: 5 is the original Google
+// format, 6 is what OSRM and Valhalla use by default. Getting it wrong scales
+// every coordinate by ten, which looks like data corruption rather than a
+// parameter mismatch, so it is an explicit argument with no default.
+
+import { Geometry, GEOM_LINE } from "vyto/geo";
+import { pow, floor, round, fabs } from "vyto/math";
+import { StringBuilder, stringBuilder } from "vyto/util/text";
+
+fn scaleFor(precision: int): float {
+    return pow(10.0, precision as float);
+}
+
+// Decode to a single-part LINE geometry. Altitudes are zero: the format has no
+// third dimension.
+//
+// Malformed input decodes as far as it can and returns what it got, rather
+// than failing the whole route because one chunk was truncated in transit.
+export fn decodePolyline(s: string, precision: int): Geometry {
+    let g = new Geometry(GEOM_LINE);
+    let lons: float[] = [];
+    let lats: float[] = [];
+    let alts: float[] = [];
+    let scale = scaleFor(precision);
+
+    let i = 0;
+    let lat = 0;
+    let lon = 0;
+    let n = s.len;
+    while (i < n) {
+        // Each value is a run of 5-bit chunks, low bits first, with bit 6 set
+        // on every chunk but the last, and 63 added so the result is printable.
+        let shift = 0;
+        let result = 0;
+        let b = 32;
+        let consumed = 0;
+        while (b >= 32 && i < n) {
+            b = s[i] - 63;
+            i = i + 1;
+            consumed = consumed + 1;
+            result = result | ((b & 31) << shift);
+            shift = shift + 5;
+        }
+        if (consumed == 0) { break; }
+        // Zig-zag: the low bit is the sign, so -1 encodes as 1 rather than as
+        // a value with every high bit set.
+        if ((result & 1) != 0) { lat = lat + (~(result >> 1)); }
+        else { lat = lat + (result >> 1); }
+
+        shift = 0;
+        result = 0;
+        b = 32;
+        consumed = 0;
+        while (b >= 32 && i < n) {
+            b = s[i] - 63;
+            i = i + 1;
+            consumed = consumed + 1;
+            result = result | ((b & 31) << shift);
+            shift = shift + 5;
+        }
+        // A latitude with no matching longitude is a truncated stream: drop the
+        // half-point rather than emitting a coordinate at longitude zero.
+        if (consumed == 0) { break; }
+        if ((result & 1) != 0) { lon = lon + (~(result >> 1)); }
+        else { lon = lon + (result >> 1); }
+
+        lats.push((lat as float) / scale);
+        lons.push((lon as float) / scale);
+        alts.push(0.0);
+    }
+
+    if (lons.len > 0) { g.addPart3(lons, lats, alts, true); }
+    return g;
+}
+
+fn encodeValue(sb: StringBuilder, v: int) {
+    // Zig-zag, then emit 5 bits at a time with the continuation bit set on
+    // every chunk but the last.
+    let u = v << 1;
+    if (v < 0) { u = ~(v << 1); }
+    while (u >= 32) {
+        sb.appendByte((32 | (u & 31)) + 63);
+        u = u >> 5;
+    }
+    sb.appendByte(u + 63);
+}
+
+// Encode a coordinate run. Takes (start, count) like every other bulk function
+// in vyto/geo, so one part of a multi-part geometry encodes without a slice.
+//
+// round(), not truncation: truncating each scaled coordinate accumulates a
+// systematic drift toward zero along the line, which shows up as a route that
+// slowly leaves the road.
+export fn encodePolylineRange(lons: float[], lats: float[], start: int, count: int,
+                              precision: int): string {
+    if (count <= 0) { return ""; }
+    let scale = scaleFor(precision);
+    let sb = stringBuilder(count * 12);
+    let prevLat = 0;
+    let prevLon = 0;
+    let i = start;
+    let end = start + count;
+    while (i < end) {
+        let la = round(lats[i] * scale) as int;
+        let lo = round(lons[i] * scale) as int;
+        encodeValue(sb, la - prevLat);
+        encodeValue(sb, lo - prevLon);
+        prevLat = la;
+        prevLon = lo;
+        i = i + 1;
+    }
+    return sb.toString();
+}
+
+export fn encodePolyline(lons: float[], lats: float[], precision: int): string {
+    return encodePolylineRange(lons, lats, 0, lons.len, precision);
+}
+
+// Encode one part of a geometry.
+export fn encodeGeometryPart(g: Geometry, part: int, precision: int): string {
+    return encodePolylineRange(g.lons, g.lats, g.partStart[part], g.partLen[part],
+                               precision);
+}
