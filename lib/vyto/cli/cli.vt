@@ -1,0 +1,582 @@
+// vyto/cli — command-line flags, options, operands and subcommands.
+//
+// Pure Vyto with no imports at all: help columns use the `pad_end` string
+// builtin and help assembly uses `string[].join`, so nothing here needs
+// vyto/util/fmt (native-shim-backed) or vyto/os. It runs anywhere the runtime
+// runs, including a freestanding target.
+//
+//     let cli = new Cli("httpd", "a static file server");
+//     cli.intOption("port", "port to listen on").short("p").dfltInt(8080);
+//     cli.flag("quiet", "suppress the request log").short("q");
+//     cli.positional("root", "directory to serve").dflt(".");
+//     if (!cli.parse(args())) { print(cli.report()); exit(cli.exitCode()); }
+//     serve(cli.get("root"), cli.getInt("port"), cli.on("quiet"));
+//
+// `parse` returns false for BOTH a bad command line and `--help`; report() and
+// exitCode() tell them apart, so the four lines above are the whole idiom.
+//
+// Two rules shape the design:
+//
+//   * User input never panics. `to_int`/`to_float` abort the process on bad
+//     text, so every value goes through parse_int/parse_float/parse_bool below
+//     and a bad one becomes an error message naming the flag.
+//   * Your own mistakes do panic. Reading a name you never declared, or reading
+//     the wrong kind, is a source typo — the exact bug class this module exists
+//     to remove — so it fails loudly instead of returning "".
+
+// ---- value kinds ----------------------------------------------------------
+// A tagged kind with one payload field per kind, rather than Flag<T>: v1
+// generics have no bounds, and a generic instantiated with a type from another
+// module is unsupported (see vyto/util/sort). Same shape as JsonValue.
+export const CLI_BOOL:   int = 0;
+export const CLI_STRING: int = 1;
+export const CLI_INT:    int = 2;
+export const CLI_FLOAT:  int = 3;
+
+// ---- non-panicking scalar parsing -----------------------------------------
+// The repo's first parses that report failure instead of aborting. Each returns
+// false and leaves `out` untouched on bad input; `out` is a 1-element array
+// because Vyto has no out-parameters (the vyto/ui/datatable idiom).
+
+// Strict decimal integer: [+-]?digits. No whitespace, no hex, no separators,
+// and — unlike to_int, which panics — no overflow.
+export fn parse_int(s: string, out: int[]): bool {
+    if (s.len == 0) { return false; }
+    let i = 0;
+    let neg = false;
+    if (s[0] == 43 || s[0] == 45) { neg = s[0] == 45; i = 1; }
+    if (i >= s.len) { return false; }          // a sign and nothing else
+    let j = i;
+    while (j < s.len) {
+        if (s[j] < 48 || s[j] > 57) { return false; }
+        j += 1;
+    }
+    // Overflow, without ever handing to_int something it would abort on: count
+    // significant digits, then compare the 19-digit case against the bound.
+    let lead = i;
+    while (lead < s.len - 1 && s[lead] == 48) { lead += 1; }
+    let digits = s.len - lead;
+    if (digits > 19) { return false; }
+    if (digits == 19) {
+        let bound = "9223372036854775807";
+        if (neg) { bound = "9223372036854775808"; }
+        let k = 0;
+        while (k < 19) {
+            if (s[lead + k] > bound[k]) { return false; }
+            if (s[lead + k] < bound[k]) { k = 19; }   // definitely under; stop
+            else { k += 1; }
+        }
+    }
+    out[0] = s.to_int();
+    return true;
+}
+
+// [+-]?digits[.digits][(e|E)[+-]digits] — the grammar to_float accepts, minus
+// the surrounding whitespace it tolerates. No "inf", no "nan", no hex.
+export fn parse_float(s: string, out: float[]): bool {
+    if (s.len == 0) { return false; }
+    let i = 0;
+    if (s[0] == 43 || s[0] == 45) { i = 1; }
+    let intDigits = 0;
+    while (i < s.len && s[i] >= 48 && s[i] <= 57) { i += 1; intDigits += 1; }
+    if (intDigits == 0) { return false; }
+    if (i < s.len && s[i] == 46) {                  // '.'
+        i += 1;
+        let fracDigits = 0;
+        while (i < s.len && s[i] >= 48 && s[i] <= 57) { i += 1; fracDigits += 1; }
+        if (fracDigits == 0) { return false; }      // "1." is not a number here
+    }
+    if (i < s.len && (s[i] == 101 || s[i] == 69)) { // 'e' | 'E'
+        i += 1;
+        if (i < s.len && (s[i] == 43 || s[i] == 45)) { i += 1; }
+        let expDigits = 0;
+        while (i < s.len && s[i] >= 48 && s[i] <= 57) { i += 1; expDigits += 1; }
+        if (expDigits == 0) { return false; }
+    }
+    if (i != s.len) { return false; }               // trailing junk
+    out[0] = s.to_float();
+    return true;
+}
+
+// true|false, 1|0, yes|no, on|off — case-insensitive.
+export fn parse_bool(s: string, out: bool[]): bool {
+    let t = s.to_lower();
+    if (t == "true" || t == "1" || t == "yes" || t == "on") { out[0] = true; return true; }
+    if (t == "false" || t == "0" || t == "no" || t == "off") { out[0] = false; return true; }
+    return false;
+}
+
+// ---- Flag -----------------------------------------------------------------
+
+// One declared thing: a switch, a value-taking option, or an operand. A class
+// rather than a struct because it holds strings and arrays, which a Vyto value
+// type cannot.
+export class Flag {
+    name: string;        // long name without "--", or the operand's display name
+    shortName: string;   // "" or one letter, without "-"
+    about: string;       // one-line help text
+    kind: int;
+    metavar: string;     // help placeholder; "" derives one from the kind
+    isPositional: bool;
+    isVariadic: bool;    // the tail operand that swallows everything left
+    isRequired: bool;
+    isRepeated: bool;
+    hasDefault: bool;
+    choiceList: string[];
+
+    sval: string;        // raw text, kept for every kind
+    ival: int;
+    fval: float;
+    bval: bool;
+    list: string[];      // every raw value, when isRepeated
+    given: bool;         // explicitly present on the command line
+
+    fn init(name: string, about: string, kind: int) {
+        this.name = name;
+        this.about = about;
+        this.kind = kind;
+        this.shortName = "";
+        this.metavar = "";
+        this.sval = "";
+        this.choiceList = [];
+        this.list = [];
+    }
+
+    // A one-letter alias: .short("o") answers to -o, -o=V and -o V.
+    builder fn short(c: string) {
+        if (c.len != 1) { panic("vyto/cli: short name for --" + this.name + " must be one letter"); }
+        this.shortName = c;
+        return this;
+    }
+
+    // Placeholder shown in help: .meta("PATH") renders --out=<PATH>.
+    builder fn meta(m: string) { this.metavar = m; return this; }
+
+    // Absent from the command line is an error.
+    builder fn need() { this.isRequired = true; return this; }
+
+    // May repeat; read every occurrence back with Cli.all(name).
+    builder fn many() { this.isRepeated = true; return this; }
+
+    // Restrict to a fixed set. Anything else is an error naming the choices —
+    // and the same data a future shell-completion generator needs.
+    builder fn choices(vals: string[]) { this.choiceList = vals; return this; }
+
+    builder fn dflt(v: string)     { this.requireKind(CLI_STRING); this.sval = v; this.hasDefault = true; return this; }
+    builder fn dfltInt(v: int)     { this.requireKind(CLI_INT);    this.ival = v; this.sval = str(v); this.hasDefault = true; return this; }
+    builder fn dfltFloat(v: float) { this.requireKind(CLI_FLOAT);  this.fval = v; this.sval = str(v); this.hasDefault = true; return this; }
+    builder fn dfltBool(v: bool)   { this.requireKind(CLI_BOOL);   this.bval = v; this.hasDefault = true; return this; }
+
+    // Declaring a default of the wrong type is a source error, not user input.
+    fn requireKind(k: int) {
+        if (this.kind == k) { return; }
+        if (this.isPositional && k == CLI_STRING) { return; }   // operands are text
+        panic("vyto/cli: wrong default type for --" + this.name);
+    }
+
+    // "PATH", "<name>", "N" — what the value slot is called in help.
+    fn placeholder(): string {
+        if (this.metavar != "") { return this.metavar; }
+        if (this.choiceList.len > 0) { return "name"; }
+        if (this.kind == CLI_INT) { return "n"; }
+        if (this.kind == CLI_FLOAT) { return "x"; }
+        return "value";
+    }
+
+    fn allowed(v: string): bool {
+        if (this.choiceList.len == 0) { return true; }
+        for (let c in this.choiceList) { if (c == v) { return true; } }
+        return false;
+    }
+}
+
+// ---- Cli ------------------------------------------------------------------
+
+// One command: the root program, or a subcommand (a subcommand is just a child
+// Cli, so it parses, validates and prints help by the same code).
+export class Cli {
+    name: string;
+    about: string;
+    flags: Flag[];        // options and switches, declaration order
+    operands: Flag[];     // positionals, declaration order
+    subs: Cli[];
+    subRequired: bool;
+    usageOverride: string;
+
+    err: string;
+    helpAsked: bool;
+    chosenName: string;
+    chosenCli: Cli;
+    extras: string[];     // operands after an in-program "--"
+
+    fn init(name: string, about: string) {
+        this.name = name;
+        this.about = about;
+        this.flags = [];
+        this.operands = [];
+        this.subs = [];
+        this.err = "";
+        this.chosenName = "";
+        this.usageOverride = "";
+        this.extras = [];
+    }
+
+    // ---- declaration ----
+
+    // A switch: present means true. --name=false also works.
+    fn flag(name: string, about: string): Flag { return this.declare(name, about, CLI_BOOL); }
+    // A value-taking option: --name=V, --name V, and the short forms.
+    fn option(name: string, about: string): Flag { return this.declare(name, about, CLI_STRING); }
+    fn intOption(name: string, about: string): Flag { return this.declare(name, about, CLI_INT); }
+    fn floatOption(name: string, about: string): Flag { return this.declare(name, about, CLI_FLOAT); }
+
+    fn declare(name: string, about: string, kind: int): Flag {
+        if (this.findLong(name) != null) { panic("vyto/cli: --" + name + " declared twice"); }
+        let f = new Flag(name, about, kind);
+        this.flags.push(f);
+        return f;
+    }
+
+    // One operand, filled in declaration order. Operands and subcommands are
+    // mutually exclusive: with both declared, a leading word is ambiguous.
+    fn positional(name: string, about: string): Flag {
+        if (this.subs.len > 0) { panic("vyto/cli: " + this.name + " has subcommands, so it cannot take operands"); }
+        if (this.operands.len > 0 && this.operands[this.operands.len - 1].isVariadic) {
+            panic("vyto/cli: " + this.name + " declares an operand after its variadic tail");
+        }
+        let f = new Flag(name, about, CLI_STRING);
+        f.isPositional = true;
+        this.operands.push(f);
+        return f;
+    }
+
+    // The tail operand: takes everything left over. Declare it last; only one.
+    fn rest(name: string, about: string): Flag {
+        let f = this.positional(name, about);
+        f.isVariadic = true;
+        f.isRepeated = true;
+        return f;
+    }
+
+    // A subcommand, returned so you can declare its own flags and operands.
+    fn command(name: string, about: string): Cli {
+        if (this.operands.len > 0) { panic("vyto/cli: " + this.name + " takes operands, so it cannot have subcommands"); }
+        let c = new Cli(name, about);
+        this.subs.push(c);
+        return c;
+    }
+
+    // Without this a subcommand is optional, so a bare invocation still runs.
+    builder fn needCommand() { this.subRequired = true; return this; }
+    // Replace the generated "usage:" line.
+    builder fn usageLine(s: string) { this.usageOverride = s; return this; }
+
+    // ---- lookup ----
+
+    fn findLong(name: string): Flag {
+        for (let f in this.flags) { if (f.name == name) { return f; } }
+        return null;
+    }
+
+    fn findShort(c: string): Flag {
+        for (let f in this.flags) { if (f.shortName != "" && f.shortName == c) { return f; } }
+        return null;
+    }
+
+    fn findAny(name: string): Flag {
+        let f = this.findLong(name);
+        if (f != null) { return f; }
+        for (let o in this.operands) { if (o.name == name) { return o; } }
+        return null;
+    }
+
+    fn mustFind(name: string): Flag {
+        let f = this.findAny(name);
+        if (f == null) { panic("vyto/cli: no flag named " + name); }
+        return f;
+    }
+
+    // ---- parse ----
+
+    // Walk `argv` (the result of args(), which excludes the program name).
+    // Returns true when the caller may proceed; false means either an error or
+    // a --help request — report()/exitCode() distinguish them.
+    fn parse(argv: string[]): bool {
+        let i = 0;
+        let posIdx = 0;
+        let afterSep = false;
+        while (i < argv.len) {
+            let t = argv[i];
+            if (afterSep) { this.extras.push(t); i += 1; }
+            else if (t == "--") { afterSep = true; i += 1; }
+            else if (t.starts_with("--") && t.len > 2) { i = this.takeLong(argv, i); }
+            else if (t.starts_with("-") && t.len > 1) { i = this.takeShort(argv, i); }
+            else if (this.subs.len > 0) {
+                // Everything from here belongs to the subcommand.
+                let c = this.findSub(t);
+                if (c == null) { this.fail("unknown command: " + t); return false; }
+                this.chosenName = t;
+                this.chosenCli = c;
+                let ok = c.parse(tail(argv, i + 1));
+                if (c.helpAsked) { this.helpAsked = true; }
+                if (c.err != "") { this.err = c.err; }
+                return ok;
+            }
+            else { posIdx = this.takeOperand(t, posIdx); i += 1; }
+            if (this.helpAsked) { return false; }
+            if (this.err != "") { return false; }
+        }
+        return this.finish();
+    }
+
+    fn findSub(name: string): Cli {
+        for (let c in this.subs) { if (c.name == name) { return c; } }
+        return null;
+    }
+
+    // "--name", "--name=value", "--name value". Returns the next index.
+    fn takeLong(argv: string[], i: int): int {
+        let body = argv[i].slice(2, argv[i].len);
+        let eq = body.index_of("=");
+        let name = body;
+        let inline = "";
+        let hasInline = eq >= 0;
+        if (hasInline) { name = body.slice(0, eq); inline = body.slice(eq + 1, body.len); }
+        if (name == "help" && this.findLong("help") == null) { this.helpAsked = true; return i + 1; }
+        let f = this.findLong(name);
+        if (f == null) { this.fail("unknown flag: --" + name); return i + 1; }
+        return this.assign(f, "--" + name, argv, i, hasInline, inline);
+    }
+
+    // "-k", "-k=value", "-k value". No bundling: -abc is an unknown flag.
+    fn takeShort(argv: string[], i: int): int {
+        let body = argv[i].slice(1, argv[i].len);
+        let eq = body.index_of("=");
+        let name = body;
+        let inline = "";
+        let hasInline = eq >= 0;
+        if (hasInline) { name = body.slice(0, eq); inline = body.slice(eq + 1, body.len); }
+        if (name == "h" && this.findShort("h") == null) { this.helpAsked = true; return i + 1; }
+        let f = this.findShort(name);
+        if (f == null) { this.fail("unknown flag: -" + name); return i + 1; }
+        return this.assign(f, "-" + name, argv, i, hasInline, inline);
+    }
+
+    // Shared tail of takeLong/takeShort: work out the value text, then store it.
+    fn assign(f: Flag, shown: string, argv: string[], i: int, hasInline: bool, inline: string): int {
+        if (f.kind == CLI_BOOL) {
+            if (!hasInline) { f.bval = true; f.given = true; return i + 1; }
+            let out: bool[] = [false];
+            if (!parse_bool(inline, out)) { this.fail(shown + ": '" + inline + "' is not a boolean"); return i + 1; }
+            f.bval = out[0];
+            f.given = true;
+            return i + 1;
+        }
+        let value = inline;
+        let next = i + 1;
+        if (!hasInline) {
+            // A separated value must exist and must not look like another flag,
+            // so `--out --verbose` is an error rather than out="--verbose".
+            // A bare "-" is a legal value (the stdin convention); for anything
+            // else that starts with a dash, use --out=-x.
+            if (i + 1 >= argv.len) { this.fail(shown + " needs a value"); return i + 1; }
+            let cand = argv[i + 1];
+            if (cand.len > 1 && cand.starts_with("-")) { this.fail(shown + " needs a value"); return i + 1; }
+            value = cand;
+            next = i + 2;
+        }
+        this.store(f, shown, value);
+        return next;
+    }
+
+    // Validate `value` against the flag's kind and choices, then record it.
+    fn store(f: Flag, shown: string, value: string) {
+        if (!f.allowed(value)) {
+            this.fail(shown + ": '" + value + "' is not one of: " + f.choiceList.join(", "));
+            return;
+        }
+        if (f.kind == CLI_INT) {
+            let out: int[] = [0];
+            if (!parse_int(value, out)) { this.fail(shown + ": '" + value + "' is not an integer"); return; }
+            f.ival = out[0];
+        }
+        if (f.kind == CLI_FLOAT) {
+            let out: float[] = [0.0];
+            if (!parse_float(value, out)) { this.fail(shown + ": '" + value + "' is not a number"); return; }
+            f.fval = out[0];
+        }
+        f.sval = value;
+        f.given = true;
+        if (f.isRepeated) { f.list.push(value); }
+    }
+
+    // Fill the next declared operand, or the variadic tail once reached.
+    fn takeOperand(t: string, posIdx: int): int {
+        if (this.operands.len == 0) { this.fail("unexpected argument: " + t); return posIdx; }
+        let idx = posIdx;
+        if (idx >= this.operands.len) { idx = this.operands.len - 1; }
+        let f = this.operands[idx];
+        if (!f.isVariadic && idx != posIdx) { this.fail("unexpected argument: " + t); return posIdx; }
+        this.store(f, f.name, t);
+        if (f.isVariadic) { return posIdx; }
+        return posIdx + 1;
+    }
+
+    // Everything the walk could not check until it was over.
+    fn finish(): bool {
+        for (let f in this.flags) {
+            if (f.isRequired && !f.given) { this.fail("missing required option --" + f.name); return false; }
+        }
+        for (let o in this.operands) {
+            if (o.isRequired && !o.given) { this.fail("missing required argument " + o.name); return false; }
+        }
+        if (this.subRequired && this.chosenName == "") { this.fail("a command is required"); return false; }
+        return true;
+    }
+
+    // First error wins: later complaints are usually consequences of the first.
+    fn fail(msg: string) { if (this.err == "") { this.err = msg; } }
+
+    // ---- outcome ----
+
+    fn ok(): bool { return this.err == "" && !this.helpAsked; }
+    fn error(): string { return this.err; }
+    fn helpWanted(): bool { return this.helpAsked; }
+    fn exitCode(): int { if (this.err != "") { return 2; } return 0; }
+
+    // What to print when parse() returned false: the help text if that is what
+    // was asked for, otherwise the error and how to get help.
+    fn report(): string {
+        if (this.helpAsked) { return this.helpFor().usage(); }
+        return this.name + ": " + this.err + "\ntry '" + this.name + " --help' for usage";
+    }
+
+    // `prog sub --help` documents the subcommand, not the program.
+    fn helpFor(): Cli {
+        if (this.chosenCli != null && this.chosenCli.helpAsked) { return this.chosenCli.helpFor(); }
+        return this;
+    }
+
+    // ---- reading values back ----
+
+    fn on(name: string): bool { return this.kindOf(name, CLI_BOOL).bval; }
+    fn get(name: string): string { return this.mustFind(name).sval; }
+    fn getInt(name: string): int { return this.kindOf(name, CLI_INT).ival; }
+    fn getFloat(name: string): float { return this.kindOf(name, CLI_FLOAT).fval; }
+    fn all(name: string): string[] { return this.mustFind(name).list; }
+    fn seen(name: string): bool { return this.mustFind(name).given; }
+    fn extra(): string[] { return this.extras; }
+    fn chosen(): string { return this.chosenName; }
+    fn sub(): Cli { return this.chosenCli; }
+
+    // Reading the wrong type is a source error too — the declaration is your
+    // own code, unlike the command line.
+    fn kindOf(name: string, k: int): Flag {
+        let f = this.mustFind(name);
+        if (f.kind != k) { panic("vyto/cli: " + name + " was not declared with that type"); }
+        return f;
+    }
+
+    // ---- help ----
+
+    // The whole help text. Assembled as lines and joined once: `s = s + x` in a
+    // loop is O(n^2) in Vyto, and join is O(n) with no StringBuilder import.
+    fn usage(): string {
+        let out: string[] = [];
+        if (this.about != "") { out.push(this.name + " — " + this.about); out.push(""); }
+        out.push("usage: " + this.usageText());
+
+        let width = this.labelWidth();
+        if (this.operands.len > 0) {
+            out.push("");
+            out.push("Arguments:");
+            for (let o in this.operands) { this.describe(out, o.name.to_upper(), o, width); }
+        }
+        if (this.subs.len > 0) {
+            out.push("");
+            out.push("Commands:");
+            for (let c in this.subs) { out.push("  " + c.name.pad_end(width, " ") + "  " + c.about); }
+        }
+        out.push("");
+        out.push("Options:");
+        for (let f in this.flags) { this.describe(out, this.flagLabel(f), f, width); }
+        if (this.findLong("help") == null) {
+            out.push("  " + "-h, --help".pad_end(width, " ") + "  show this help");
+        }
+        return out.join("\n");
+    }
+
+    fn usageText(): string {
+        if (this.usageOverride != "") { return this.usageOverride; }
+        let s = this.name;
+        if (this.flags.len > 0 || this.findLong("help") == null) { s = s + " [options]"; }
+        if (this.subs.len > 0) {
+            if (this.subRequired) { s = s + " <command>"; } else { s = s + " [command]"; }
+        }
+        for (let o in this.operands) {
+            let n = o.name.to_upper();
+            if (o.isVariadic) { n = n + "..."; }
+            if (o.isRequired) { s = s + " <" + n + ">"; } else { s = s + " [" + n + "]"; }
+        }
+        return s;
+    }
+
+    // "-s, --surface" / "    --screen=<name>", short column reserved either way
+    // so the long names stay aligned down the block.
+    fn flagLabel(f: Flag): string {
+        let head = "    ";
+        if (f.shortName != "") { head = "-" + f.shortName + ", "; }
+        let s = head + "--" + f.name;
+        if (f.kind != CLI_BOOL) { s = s + "=<" + f.placeholder() + ">"; }
+        return s;
+    }
+
+    // One help row, plus continuation lines for choices and defaults. A label
+    // wider than the column gets its text on the next line rather than pushing
+    // every other row out of alignment.
+    fn describe(out: string[], label: string, f: Flag, width: int) {
+        if (label.len > width) {
+            out.push("  " + label);
+            out.push("  " + "".pad_end(width, " ") + "  " + f.about);
+        } else {
+            out.push("  " + label.pad_end(width, " ") + "  " + f.about);
+        }
+        let note = "";
+        if (f.choiceList.len > 0) { note = "(one of: " + f.choiceList.join(", ") + ")"; }
+        if (f.hasDefault && f.sval != "") {
+            if (note != "") { note = note + " "; }
+            note = note + "[default: " + f.sval + "]";
+        }
+        if (f.isRequired) {
+            if (note != "") { note = note + " "; }
+            note = note + "(required)";
+        }
+        if (note != "") { out.push("  " + "".pad_end(width, " ") + "    " + note); }
+    }
+
+    // Widest label, capped: one long flag should not indent the whole block.
+    fn labelWidth(): int {
+        let w = 10;                                  // "-h, --help"
+        for (let f in this.flags) {
+            let n = this.flagLabel(f).len;
+            if (n > w) { w = n; }
+        }
+        for (let o in this.operands) {
+            if (o.name.len > w) { w = o.name.len; }
+        }
+        for (let c in this.subs) {
+            if (c.name.len > w) { w = c.name.len; }
+        }
+        if (w > 28) { w = 28; }
+        return w;
+    }
+}
+
+// Everything from index `at` on. Vyto arrays have no slice builtin, and this is
+// the only place the module needs one (handing the tail to a subcommand).
+fn tail(a: string[], at: int): string[] {
+    let out: string[] = [];
+    let i = at;
+    while (i < a.len) { out.push(a[i]); i += 1; }
+    return out;
+}
