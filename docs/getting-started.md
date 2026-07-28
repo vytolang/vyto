@@ -180,6 +180,13 @@ and prebuilt `native/windows-x64/*.dll` packages.
 carry a native shim: `getrandom(2)` on Linux, `BCryptGenRandom` on Windows (so it
 `#link`s `bcrypt` there), `/dev/urandom` otherwise.
 
+`vyto/regex` is portable and needs no provisioning, which is worth calling out
+because it carries by far the most in-tree C of any module: PCRE2 and its JIT
+are vendored under `lib/vyto/regex/native/src/pcre2/` and compiled from source
+like any other shim. That is exactly why it sits here rather than in the "not
+portable" list with `vyto/intl` — there is no system library to be missing. Where
+the JIT cannot run it falls back to PCRE2's interpreter with identical results.
+
 **GUI and graphics**: `vyto/surface` (the Win32 GDI backend), `vyto/ui`, and
 `vyto/gfx` all build for `windows-x64` — see the next section for the one
 prerequisite `vyto/gfx` has.
@@ -290,6 +297,12 @@ as `examples/45_os.vt`) is handled.
 - **Showcase apps** — [apps/charts](../apps/charts/charts.vt) (15-chart gallery),
   [apps/datagrid](../apps/datagrid/datagrid.vt) (spreadsheet-grade DataTable),
   [apps/vytopad](../apps/vytopad/vytopad.vt) (a text editor).
+- **[Strings & regular expressions](strings.md)** — every string operation in
+  one place: the built-in methods and their exact edge cases, `vyto/util/text`,
+  the `vyto/regex` engine, and the Unicode-aware operations in
+  `vyto/intl/unicode`.
+- **[Hardware & peripherals](hardware.md)** — cameras, sensors, GPIO, serial,
+  USB and GPS through `vyto/hw/*`.
 - **[README](../README.md)** — language highlights, why it's fast, the standard
   library, native packages, and platform status.
 - **Run the tests** — `make test` builds every example and checks it against

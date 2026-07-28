@@ -529,6 +529,11 @@ Bundled under `lib/vyto/`, imported as `vyto/<path>`. Modules marked ⚙ are
 backed by a native shim (compiled from source or a `#link`ed system library);
 everything else is pure Vyto.
 
+> Text handling spans the built-in `string` methods, `vyto/util/text`,
+> `vyto/regex` and `vyto/intl/unicode`.
+> **[docs/strings.md](docs/strings.md)** covers all four in one place, including
+> the byte-vs-character rules that catch people out.
+
 **Core & utilities**
 
 | Module | What it gives you |
@@ -541,6 +546,7 @@ everything else is pure Vyto.
 | `vyto/os` ⚙ | environment, args, process helpers |
 | `vyto/cli` | flags, options, operands and subcommands, generated `--help`, and non-panicking `parse_int`/`parse_float`/`parse_bool` |
 | `vyto/util/log` | levelled, structured logging with a JSON-lines sink |
+| `vyto/regex` ⚙ | Perl-compatible regular expressions (PCRE2, vendored and JIT-compiled) — `Regex`, named groups, `findAll`, `replaceAll`, `split` |
 | `vyto/util/uuid` ⚙ | UUID v4 and v7, plus the CSPRNG they need (`rand_bytes`, `rand_int`) |
 | `vyto/os/worker` ⚙ | `fork()`-based `WorkerPool` — CPU parallelism, no shared state |
 
@@ -614,6 +620,11 @@ without them):
 - **`vyto/intl`** (ICU) — links the system ICU by default; install
   `libicu-dev` (Debian/Ubuntu) or `libicu-devel` (Fedora). For `--bundle` or
   targets without a system ICU, run `lib/vyto/intl/native/build-icu.sh`.
+- **`vyto/regex`** (PCRE2) — **nothing to do.** PCRE2 and sljit are vendored
+  under `lib/vyto/regex/native/src/pcre2/` and compiled from source on every
+  build, so the module works on a bare clone and on every target, Windows
+  included. This is the one deliberate exception to "fetch, don't vendor";
+  `lib/vyto/regex/README.md` explains why and what it costs.
 
 ## Platform status
 
