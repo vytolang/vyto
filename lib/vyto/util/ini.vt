@@ -1,0 +1,203 @@
+// vyto/util/ini — the INI/conf format, over vyto/util/json's tree.
+//
+//     let cfg = ini_parse(readfile("app.ini"));
+//     cfg.get("server").get("port").asString()      // "8080"
+//     cfg.get("debug").asString()                   // a key before any section
+//     ini_encode(cfg)                               // back to INI text
+//
+// INI has no specification, so this implements the intersection everything
+// agrees on: `[section]` headers, `key = value` (or `key: value`) pairs, and
+// `;` or `#` comments. Keys before the first header live at the root. Values
+// are trimmed, and a wholly-quoted value has its quotes removed so that
+// trailing spaces can be written deliberately.
+//
+// Values land in a JsonValue for the same reason vyto/util/toml uses one: a
+// config file is a tree of strings, JsonValue already is that, and it brings
+// forgiving accessors and json_encode with it.
+//
+// Failure is soft: ini_parse never panics. A line that is neither a header, a
+// comment nor a pair sets parseError() and the parse stops there.
+//
+// Caveats, all consequences of the format rather than of this implementation:
+//
+//   * **Every value is a string.** INI has no types — `port = 8080` and
+//     `port = "8080"` are the same file. Use asString() then to_int(), or
+//     vyto/cli's non-panicking parse_int, rather than asInt(), which reads a
+//     JS_STR as 0.
+//   * Sections are flat by default: `[a.b]` is one section whose name contains
+//     a dot. Pass `true` to ini_parse_nested when the dots mean nesting.
+//   * A repeated key replaces the earlier one, and a repeated `[section]`
+//     reopens it. Both are what the Python and Git readers do.
+
+import { JsonValue, jnull, jstr, jobj, JS_NULL, JS_STR, JS_OBJ, JS_ARR }
+    from "vyto/util/json";
+import { StringBuilder } from "vyto/util/text";
+
+// Parse INI text. `[a.b]` is a single flat section name.
+export fn ini_parse(text: string): JsonValue { return parse(text, false); }
+
+// Parse INI text treating a dot in a section name as nesting, so `[a.b]`
+// becomes the object `b` inside the object `a` — the layout some tools use.
+export fn ini_parse_nested(text: string): JsonValue { return parse(text, true); }
+
+// True when `v` came back from ini_parse as a failure.
+export fn ini_failed(v: JsonValue): bool { return v.parseError() != ""; }
+
+fn parse(text: string, nested: bool): JsonValue {
+    let root = jobj();
+    let cur = root;
+    let lines = text.lines();
+    let i = 0;
+    while (i < lines.len) {
+        let lineNo = i + 1;
+        let line = lines[i].trim();
+        i += 1;
+        if (line.len == 0) { continue; }
+        let c0 = line[0];
+        if (c0 == 59 || c0 == 35) { continue; }               // ';' or '#'
+
+        if (c0 == 91) {                                       // '['
+            let close = line.last_index_of("]");
+            if (close < 1) { return failure(root, "unterminated section header", lineNo); }
+            let name = line.slice(1, close).trim();
+            if (name.len == 0) { return failure(root, "empty section name", lineNo); }
+            cur = section(root, name, nested);
+            if (cur.kind != JS_OBJ) {
+                return failure(root, "section '" + name + "' collides with a key", lineNo);
+            }
+            continue;
+        }
+
+        // key = value, or key: value. Whichever separator comes first wins, so
+        // a value containing the other one needs no escaping.
+        let eq = line.index_of("=");
+        let colon = line.index_of(":");
+        let at = eq;
+        if (eq < 0) { at = colon; }
+        else {
+            if (colon >= 0 && colon < eq) { at = colon; }
+        }
+        if (at < 0) { return failure(root, "line is not a key/value pair", lineNo); }
+        let key = line.slice(0, at).trim();
+        if (key.len == 0) { return failure(root, "empty key", lineNo); }
+        let raw = line.slice(at + 1, line.len).trim();
+        cur.set(key, jstr(unquote(strip_inline_comment(raw))));
+    }
+    return root;
+}
+
+fn failure(root: JsonValue, msg: string, line: int): JsonValue {
+    let v = jnull();
+    v.err = msg + " at line " + str(line);
+    return v;
+}
+
+// Resolve (creating as needed) the object a `[header]` names.
+fn section(root: JsonValue, name: string, nested: bool): JsonValue {
+    if (!nested) { return child(root, name); }
+    let node = root;
+    let parts = name.split(".");
+    let i = 0;
+    while (i < parts.len) {
+        let k = parts[i].trim();
+        if (k.len > 0) {
+            node = child(node, k);
+            if (node.kind != JS_OBJ) { return node; }
+        }
+        i += 1;
+    }
+    return node;
+}
+
+// The object at `k`, reopening an existing section rather than replacing it.
+fn child(parent: JsonValue, k: string): JsonValue {
+    if (parent.has(k)) { return parent.get(k); }
+    let t = jobj();
+    parent.set(k, t);
+    return t;
+}
+
+// Drop a trailing ` ; comment` or ` # comment`. The separator must be preceded
+// by whitespace, so a value like `pass = a#b` keeps its hash — the rule Git and
+// most INI readers use, and the one that surprises people least.
+fn strip_inline_comment(v: string): string {
+    let i = 1;
+    while (i < v.len) {
+        let c = v[i];
+        if (c == 59 || c == 35) {
+            let prev = v[i - 1];
+            if (prev == 32 || prev == 9) { return v.slice(0, i).trim_end(); }
+        }
+        i += 1;
+    }
+    return v;
+}
+
+// Remove wrapping quotes, so `name = "  padded  "` keeps its spaces. Only a
+// value quoted at both ends is affected.
+fn unquote(v: string): string {
+    if (v.len < 2) { return v; }
+    let f = v[0];
+    let l = v[v.len - 1];
+    if ((f == 34 && l == 34) || (f == 39 && l == 39)) { return v.slice(1, v.len - 1); }
+    return v;
+}
+
+// ---- writer ----------------------------------------------------------------
+
+// Render a JsonValue tree as INI: root-level keys first, then one `[section]`
+// per object. Values are written with str()-style text, and quoted when
+// leading/trailing whitespace would otherwise be lost.
+//
+// Panics on structure INI cannot represent — an array, or a section nested more
+// than one level deep — because that is a programmer error, per the
+// library-wide "panic hard, sentinel soft" rule. Flatten first, or use
+// vyto/util/toml, which has a format for it.
+export fn ini_encode(v: JsonValue): string {
+    if (v.kind != JS_OBJ) { panic("vyto/util/ini: ini_encode needs an object at the root"); }
+    let sb = new StringBuilder(256);
+    let keys = v.objKeys();
+
+    let i = 0;
+    while (i < keys.len) {
+        let val = v.get(keys[i]);
+        if (val.kind != JS_OBJ) {
+            sb.append(keys[i]).append(" = ").append(scalar_text(val)).append("\n");
+        }
+        i += 1;
+    }
+
+    i = 0;
+    while (i < keys.len) {
+        let val = v.get(keys[i]);
+        if (val.kind == JS_OBJ) {
+            if (sb.len() > 0) { sb.append("\n"); }
+            sb.append("[").append(keys[i]).append("]\n");
+            let sub = val.objKeys();
+            let j = 0;
+            while (j < sub.len) {
+                let sv = val.get(sub[j]);
+                if (sv.kind == JS_OBJ) {
+                    panic("vyto/util/ini: INI has no nested sections ('" + keys[i] + "." + sub[j] + "')");
+                }
+                sb.append(sub[j]).append(" = ").append(scalar_text(sv)).append("\n");
+                j += 1;
+            }
+        }
+        i += 1;
+    }
+    return sb.toString();
+}
+
+fn scalar_text(v: JsonValue): string {
+    if (v.kind == JS_ARR) { panic("vyto/util/ini: INI has no arrays"); }
+    if (v.kind == JS_NULL) { panic("vyto/util/ini: INI has no null; remove the key instead"); }
+    let s = "";
+    if (v.kind == JS_STR) { s = v.asString(); }
+    else { s = v.stringify(); }
+    if (s.len == 0) { return s; }
+    let f = s[0];
+    let l = s[s.len - 1];
+    if (f == 32 || f == 9 || l == 32 || l == 9) { return "\"" + s + "\""; }
+    return s;
+}

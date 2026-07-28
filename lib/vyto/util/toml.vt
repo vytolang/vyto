@@ -1,0 +1,1052 @@
+// vyto/util/toml — a TOML v1.0 parser and writer, over vyto/util/json's tree.
+//
+//     let cfg = toml_parse(readfile("app.toml"));
+//     cfg.get("server").get("port").asInt()      // 8080
+//     cfg.get("hosts").at(0).asString()          // "alpha"
+//     toml_encode(cfg)                           // back to TOML text
+//
+// Values land in a `JsonValue`, not a type of this module's own. TOML's data
+// model *is* JSON's — tables are objects, arrays are arrays, and the scalars
+// line up — so reusing it means one tree type, one set of forgiving accessors,
+// and json_encode for free on a config file. The alternative was a second
+// almost-identical tagged class, and the "almost" is where the bugs live.
+//
+// Supported, which is the whole of TOML v1.0 apart from the caveat below:
+// bare/quoted/dotted keys, [tables], [[arrays of tables]], inline tables,
+// multi-line arrays with trailing commas, basic and literal strings in both
+// single- and triple-quoted forms (with escapes and line-ending backslashes),
+// integers in decimal/hex/octal/binary with underscores, floats including
+// inf and nan, and booleans.
+//
+// Failure is soft: toml_parse never panics. It returns a Null-kind value whose
+// parseError() says what went wrong and where, exactly as json_parse does.
+//
+// Caveats, both deliberate:
+//
+//   * Dates and times become **strings**. TOML has four datetime types; a
+//     JsonValue has no way to carry one, and inventing a fifth kind for them
+//     would push the cost onto every JSON user. "1979-05-27T07:32:00Z" arrives
+//     as that text, which is what a caller passes to date_parse anyway.
+//   * Integers are stored as `float`, as they are in JSON, so a value beyond
+//     2^53 loses precision. TOML permits the full 64-bit range; if you need it,
+//     read the key as a string. The same single number kind means toml_encode
+//     cannot tell 8080 from 8080.0 and writes both as `8080` — the values
+//     round-trip, the integer-versus-float distinction does not.
+//
+// One consequence of sharing the tree: `inf` and `nan` are TOML values but not
+// JSON ones, so json_encode of a document containing them emits `inf`/`nan`,
+// which no JSON parser accepts. toml_encode round-trips them correctly.
+
+import { JsonValue, jnull, jbool, jnum, jstr, jarr, jobj,
+         JS_NULL, JS_BOOL, JS_NUM, JS_STR, JS_ARR, JS_OBJ } from "vyto/util/json";
+import { StringBuilder } from "vyto/util/text";
+
+// Nesting bound, as in json.vt: arrays and inline tables recurse, so hostile
+// input has to soft-fail rather than overflow the C stack.
+const TOML_MAX_DEPTH: int = 256;
+
+// ---- parser ----------------------------------------------------------------
+
+class TomlParser {
+    s: string;
+    pos: int;
+    n: int;
+    line: int;
+    err: string;
+    depth: int;
+    root: JsonValue;
+    cur: JsonValue;
+    // Tables created by a [header], so a second [header] for the same path is
+    // a duplicate; and tables created implicitly by a dotted key, which may
+    // not be reopened either. Paths are joined with \x01, a byte no bare or
+    // quoted key can contain by the time it gets here.
+    defined: string[];
+    curPath: string;
+
+    fn init(text: string) {
+        this.s = text;
+        this.pos = 0;
+        this.n = text.len;
+        this.line = 1;
+        this.err = "";
+        this.depth = 0;
+        this.root = jobj();
+        this.cur = this.root;
+        this.defined = [];
+        this.curPath = "";
+    }
+
+    fn fail(msg: string): JsonValue {
+        if (this.err == "") { this.err = msg + " at line " + str(this.line); }
+        let v = jnull();
+        v.err = this.err;
+        return v;
+    }
+    fn failed(): bool { return this.err != ""; }
+
+    // ---- lexical helpers ----
+
+    fn atEnd(): bool { return this.pos >= this.n; }
+    fn peek(): int {
+        if (this.pos < this.n) { return this.s[this.pos]; }
+        return -1;
+    }
+
+    // Spaces and tabs only.
+    fn sp() {
+        while (this.pos < this.n) {
+            let c = this.s[this.pos];
+            if (c == 32 || c == 9) { this.pos += 1; } else { break; }
+        }
+    }
+    // Skip a comment if one starts here.
+    fn skipComment() {
+        if (this.peek() != 35) { return; }
+        while (this.pos < this.n && this.s[this.pos] != 10) { this.pos += 1; }
+    }
+    // Whitespace, comments and newlines — everything between statements.
+    fn blank() {
+        while (this.pos < this.n) {
+            let c = this.s[this.pos];
+            if (c == 32 || c == 9 || c == 13) { this.pos += 1; }
+            else {
+                if (c == 10) { this.pos += 1; this.line += 1; }
+                else {
+                    if (c == 35) { this.skipComment(); }
+                    else { break; }
+                }
+            }
+        }
+    }
+    // End of a statement: optional comment then a newline (or end of input).
+    fn endOfLine(what: string): bool {
+        this.sp();
+        this.skipComment();
+        if (this.atEnd()) { return true; }
+        if (this.s[this.pos] == 13) { this.pos += 1; }
+        if (this.atEnd()) { return true; }
+        if (this.s[this.pos] != 10) {
+            this.fail("unexpected text after " + what);
+            return false;
+        }
+        this.pos += 1;
+        this.line += 1;
+        return true;
+    }
+
+    // ---- top level ----
+
+    fn parse(): JsonValue {
+        while (true) {
+            this.blank();
+            if (this.atEnd()) { break; }
+            if (this.s[this.pos] == 91) {                     // '['
+                if (!this.header()) { return this.errValue(); }
+            } else {
+                if (!this.keyval(this.cur, this.curPath)) { return this.errValue(); }
+            }
+            if (this.failed()) { return this.errValue(); }
+        }
+        return this.root;
+    }
+
+    fn errValue(): JsonValue {
+        let v = jnull();
+        v.err = this.err;
+        return v;
+    }
+
+    // [table] or [[array of tables]]
+    fn header(): bool {
+        let arrayOfTables = false;
+        this.pos += 1;                                        // '['
+        if (this.peek() == 91) {
+            arrayOfTables = true;
+            this.pos += 1;
+        }
+        this.sp();
+        let parts = this.keyPath();
+        if (this.failed()) { return false; }
+        if (parts.len == 0) {
+            this.fail("empty table name");
+            return false;
+        }
+        this.sp();
+        if (this.peek() != 93) {                              // ']'
+            this.fail("expected ']' after table name");
+            return false;
+        }
+        this.pos += 1;
+        if (arrayOfTables) {
+            if (this.peek() != 93) {
+                this.fail("expected ']]' after array-of-tables name");
+                return false;
+            }
+            this.pos += 1;
+        }
+
+        let path = join_path(parts);
+        let t = this.walkTo(parts, arrayOfTables);
+        if (this.failed()) { return false; }
+        if (!arrayOfTables) {
+            if (this.isDefined(path)) {
+                this.fail("table [" + dotted(parts) + "] defined twice");
+                return false;
+            }
+            this.defined.push(path);
+        }
+        this.cur = t;
+        this.curPath = path;
+        return this.endOfLine("table header");
+    }
+
+    // Walk (creating as needed) to the table named by `parts`. For an array of
+    // tables the last segment is an array and a fresh table is appended to it.
+    fn walkTo(parts: string[], arrayOfTables: bool): JsonValue {
+        let node = this.root;
+        let i = 0;
+        while (i < parts.len) {
+            let last = i == parts.len - 1;
+            let k = parts[i];
+            let nxt = node.get(k);
+            if (nxt.kind == JS_NULL && !node.has(k)) {
+                if (last && arrayOfTables) {
+                    let a = jarr();
+                    node.set(k, a);
+                    let t = jobj();
+                    a.append(t);
+                    return t;
+                }
+                let t = jobj();
+                node.set(k, t);
+                node = t;
+            } else {
+                if (nxt.kind == JS_ARR) {
+                    if (last && arrayOfTables) {
+                        let t = jobj();
+                        nxt.append(t);
+                        return t;
+                    }
+                    // Walking *through* an array of tables addresses its last
+                    // element, which is how [[a]] then [a.b] nests.
+                    if (nxt.len() == 0) {
+                        this.fail("cannot index empty array '" + k + "'");
+                        return node;
+                    }
+                    node = nxt.at(nxt.len() - 1);
+                } else {
+                    if (nxt.kind != JS_OBJ) {
+                        this.fail("key '" + k + "' is not a table");
+                        return node;
+                    }
+                    if (last && arrayOfTables) {
+                        this.fail("'" + k + "' is a table, not an array of tables");
+                        return node;
+                    }
+                    node = nxt;
+                }
+            }
+            i += 1;
+        }
+        return node;
+    }
+
+    fn isDefined(path: string): bool {
+        let i = 0;
+        while (i < this.defined.len) {
+            if (this.defined[i] == path) { return true; }
+            i += 1;
+        }
+        return false;
+    }
+
+    // key = value
+    fn keyval(table: JsonValue, prefix: string): bool {
+        let parts = this.keyPath();
+        if (this.failed()) { return false; }
+        if (parts.len == 0) {
+            this.fail("expected a key");
+            return false;
+        }
+        this.sp();
+        if (this.peek() != 61) {                              // '='
+            this.fail("expected '=' after key '" + dotted(parts) + "'");
+            return false;
+        }
+        this.pos += 1;
+        this.sp();
+        let v = this.value();
+        if (this.failed()) { return false; }
+
+        // Dotted keys build intermediate tables under the current table.
+        let node = table;
+        let i = 0;
+        while (i < parts.len - 1) {
+            let k = parts[i];
+            if (!node.has(k)) {
+                let t = jobj();
+                node.set(k, t);
+                node = t;
+            } else {
+                let nxt = node.get(k);
+                if (nxt.kind != JS_OBJ) {
+                    this.fail("key '" + k + "' is not a table");
+                    return false;
+                }
+                node = nxt;
+            }
+            i += 1;
+        }
+        let leaf = parts[parts.len - 1];
+        if (node.has(leaf)) {
+            this.fail("duplicate key '" + dotted(parts) + "'");
+            return false;
+        }
+        node.set(leaf, v);
+        // A dotted key also closes its intermediate tables to later headers.
+        if (parts.len > 1) {
+            let p = prefix;
+            let j = 0;
+            while (j < parts.len - 1) {
+                if (p == "") { p = parts[j]; } else { p = p + "\x01" + parts[j]; }
+                this.defined.push(p);
+                j += 1;
+            }
+        }
+        return this.endOfLine("value");
+    }
+
+    // A dotted key path: bare, "quoted" or 'literal' segments joined by '.'.
+    fn keyPath(): string[] {
+        let out: string[] = [];
+        while (true) {
+            this.sp();
+            let k = this.keySegment();
+            if (this.failed()) { return out; }
+            out.push(k);
+            this.sp();
+            if (this.peek() != 46) { break; }                 // '.'
+            this.pos += 1;
+        }
+        return out;
+    }
+
+    fn keySegment(): string {
+        let c = this.peek();
+        if (c == 34) { return this.basicString(false); }
+        if (c == 39) { return this.literalString(false); }
+        let start = this.pos;
+        while (this.pos < this.n) {
+            let b = this.s[this.pos];
+            let bare = (b >= 65 && b <= 90) || (b >= 97 && b <= 122) ||
+                       (b >= 48 && b <= 57) || b == 95 || b == 45;
+            if (!bare) { break; }
+            this.pos += 1;
+        }
+        if (this.pos == start) {
+            this.fail("expected a key");
+            return "";
+        }
+        return this.s.slice(start, this.pos);
+    }
+
+    // ---- values ----
+
+    fn value(): JsonValue {
+        this.depth += 1;
+        if (this.depth > TOML_MAX_DEPTH) {
+            this.depth -= 1;
+            return this.fail("nesting deeper than 256 levels");
+        }
+        let v = this.valueInner();
+        this.depth -= 1;
+        return v;
+    }
+
+    fn valueInner(): JsonValue {
+        let c = this.peek();
+        if (c < 0) { return this.fail("expected a value"); }
+        if (c == 34) {                                        // '"'
+            if (this.startsWith("\"\"\"")) { return jstr(this.mlString(true)); }
+            return jstr(this.basicString(false));
+        }
+        if (c == 39) {                                        // '\''
+            if (this.startsWith("'''")) { return jstr(this.mlString(false)); }
+            return jstr(this.literalString(false));
+        }
+        if (c == 91) { return this.array(); }                 // '['
+        if (c == 123) { return this.inlineTable(); }          // '{'
+        return this.scalar();
+    }
+
+    fn startsWith(lit: string): bool {
+        if (this.pos + lit.len > this.n) { return false; }
+        return this.s.slice(this.pos, this.pos + lit.len) == lit;
+    }
+
+    // "..." — escapes decoded. `keyContext` is unused now but keeps the two
+    // call sites honest about which grammar production they are in.
+    fn basicString(keyContext: bool): string {
+        this.pos += 1;                                        // opening quote
+        let sb = new StringBuilder(32);
+        let runStart = this.pos;
+        while (this.pos < this.n) {
+            let c = this.s[this.pos];
+            if (c == 10) {
+                this.fail("unterminated string");
+                return sb.toString();
+            }
+            if (c == 34) {
+                if (this.pos > runStart) { sb.append(this.s.slice(runStart, this.pos)); }
+                this.pos += 1;
+                return sb.toString();
+            }
+            if (c != 92) { this.pos += 1; continue; }         // '\'
+            if (this.pos > runStart) { sb.append(this.s.slice(runStart, this.pos)); }
+            this.pos += 1;
+            this.escape(sb);
+            if (this.failed()) { return sb.toString(); }
+            runStart = this.pos;
+        }
+        this.fail("unterminated string");
+        return sb.toString();
+    }
+
+    // '...' — no escapes at all, by definition.
+    fn literalString(keyContext: bool): string {
+        this.pos += 1;
+        let start = this.pos;
+        while (this.pos < this.n) {
+            let c = this.s[this.pos];
+            if (c == 10) { break; }
+            if (c == 39) {
+                let v = this.s.slice(start, this.pos);
+                this.pos += 1;
+                return v;
+            }
+            this.pos += 1;
+        }
+        this.fail("unterminated literal string");
+        return "";
+    }
+
+    // """...""" or '''...''' — a newline immediately after the opener is
+    // dropped, and in the basic form a backslash at end of line swallows the
+    // line break and the indentation that follows it.
+    fn mlString(basic: bool): string {
+        let delim = "'''";
+        if (basic) { delim = "\"\"\""; }
+        this.pos += 3;
+        if (this.pos < this.n && this.s[this.pos] == 13) { this.pos += 1; }
+        if (this.pos < this.n && this.s[this.pos] == 10) {
+            this.pos += 1;
+            this.line += 1;
+        }
+        let sb = new StringBuilder(64);
+        let runStart = this.pos;
+        while (this.pos < this.n) {
+            if (this.startsWith(delim)) {
+                if (this.pos > runStart) { sb.append(this.s.slice(runStart, this.pos)); }
+                this.pos += 3;
+                // Up to two extra quotes belong to the content, per the spec.
+                let extra = 0;
+                let q = 39;
+                if (basic) { q = 34; }
+                while (extra < 2 && this.pos < this.n && this.s[this.pos] == q) {
+                    sb.appendByte(q);
+                    this.pos += 1;
+                    extra += 1;
+                }
+                return sb.toString();
+            }
+            let c = this.s[this.pos];
+            if (c == 10) { this.line += 1; }
+            if (basic && c == 92) {                           // '\'
+                if (this.pos > runStart) { sb.append(this.s.slice(runStart, this.pos)); }
+                this.pos += 1;
+                // Line-ending backslash: swallow the break and the following
+                // whitespace, which is how a long string is wrapped in source.
+                let save = this.pos;
+                this.sp();
+                if (this.pos < this.n && this.s[this.pos] == 13) { this.pos += 1; }
+                if (this.pos < this.n && this.s[this.pos] == 10) {
+                    this.pos += 1;
+                    this.line += 1;
+                    while (this.pos < this.n) {
+                        let w = this.s[this.pos];
+                        if (w == 32 || w == 9 || w == 13) { this.pos += 1; }
+                        else {
+                            if (w == 10) { this.pos += 1; this.line += 1; }
+                            else { break; }
+                        }
+                    }
+                    runStart = this.pos;
+                    continue;
+                }
+                this.pos = save;
+                this.escape(sb);
+                if (this.failed()) { return sb.toString(); }
+                runStart = this.pos;
+                continue;
+            }
+            this.pos += 1;
+        }
+        this.fail("unterminated multi-line string");
+        return sb.toString();
+    }
+
+    // The byte after a backslash.
+    fn escape(sb: StringBuilder) {
+        if (this.atEnd()) {
+            this.fail("truncated escape");
+            return;
+        }
+        let c = this.s[this.pos];
+        this.pos += 1;
+        if (c == 34) { sb.appendByte(34); return; }
+        if (c == 92) { sb.appendByte(92); return; }
+        if (c == 98) { sb.appendByte(8); return; }            // \b
+        if (c == 116) { sb.appendByte(9); return; }           // \t
+        if (c == 110) { sb.appendByte(10); return; }          // \n
+        if (c == 102) { sb.appendByte(12); return; }          // \f
+        if (c == 114) { sb.appendByte(13); return; }          // \r
+        if (c == 101) { sb.appendByte(27); return; }          // \e (TOML 1.1, harmless)
+        if (c == 117) { this.unicodeEscape(sb, 4); return; }  // \uXXXX
+        if (c == 85) { this.unicodeEscape(sb, 8); return; }   // \UXXXXXXXX
+        this.fail("unknown escape '\\" + chr_of(c) + "'");
+    }
+
+    fn unicodeEscape(sb: StringBuilder, width: int) {
+        if (this.pos + width > this.n) {
+            this.fail("truncated unicode escape");
+            return;
+        }
+        let cp = 0;
+        let i = 0;
+        while (i < width) {
+            let v = hex_val(this.s[this.pos + i]);
+            if (v < 0) {
+                this.fail("bad unicode escape");
+                return;
+            }
+            cp = cp * 16 + v;
+            i += 1;
+        }
+        this.pos += width;
+        if (cp <= 0 || cp > 0x10FFFF) {
+            this.fail("unicode escape out of range");
+            return;
+        }
+        sb.append(utf8_encode(cp));
+    }
+
+    // Arrays: heterogeneous, multi-line, trailing comma allowed.
+    fn array(): JsonValue {
+        this.pos += 1;                                        // '['
+        let a = jarr();
+        while (true) {
+            this.blank();
+            if (this.atEnd()) { return this.fail("unterminated array"); }
+            if (this.s[this.pos] == 93) {                     // ']'
+                this.pos += 1;
+                return a;
+            }
+            let v = this.value();
+            if (this.failed()) { return v; }
+            a.append(v);
+            this.blank();
+            if (this.atEnd()) { return this.fail("unterminated array"); }
+            let c = this.s[this.pos];
+            if (c == 44) { this.pos += 1; continue; }          // ','
+            if (c == 93) { this.pos += 1; return a; }
+            return this.fail("expected ',' or ']' in array");
+        }
+        return a;
+    }
+
+    // Inline tables: single line, no trailing comma (the spec is strict here).
+    fn inlineTable(): JsonValue {
+        this.pos += 1;                                        // '{'
+        let t = jobj();
+        this.sp();
+        if (this.peek() == 125) {                             // '}'
+            this.pos += 1;
+            return t;
+        }
+        while (true) {
+            this.sp();
+            let parts = this.keyPath();
+            if (this.failed()) { return this.errValue(); }
+            if (parts.len == 0) { return this.fail("expected a key in inline table"); }
+            this.sp();
+            if (this.peek() != 61) { return this.fail("expected '=' in inline table"); }
+            this.pos += 1;
+            this.sp();
+            let v = this.value();
+            if (this.failed()) { return v; }
+            let node = t;
+            let i = 0;
+            while (i < parts.len - 1) {
+                let k = parts[i];
+                if (!node.has(k)) {
+                    let sub = jobj();
+                    node.set(k, sub);
+                    node = sub;
+                } else {
+                    node = node.get(k);
+                }
+                i += 1;
+            }
+            let leaf = parts[parts.len - 1];
+            if (node.has(leaf)) { return this.fail("duplicate key '" + leaf + "' in inline table"); }
+            node.set(leaf, v);
+            this.sp();
+            let c = this.peek();
+            if (c == 44) { this.pos += 1; continue; }          // ','
+            if (c == 125) { this.pos += 1; return t; }         // '}'
+            return this.fail("expected ',' or '}' in inline table");
+        }
+        return t;
+    }
+
+    // A bare token: boolean, number, or a date/time (which becomes a string).
+    fn scalar(): JsonValue {
+        let start = this.pos;
+        while (this.pos < this.n) {
+            let c = this.s[this.pos];
+            if (c == 44 || c == 93 || c == 125 || c == 35 || c == 10 || c == 13) { break; }
+            // A space ends the token, unless it is the one separating a TOML
+            // date from its time ("1979-05-27 07:32:00").
+            if (c == 32 || c == 9) {
+                if (!this.dateSpace(start)) { break; }
+            }
+            this.pos += 1;
+        }
+        let tokRaw = this.s.slice(start, this.pos);
+        let tok = tokRaw.trim_end();
+        this.pos = start + tok.len;
+        if (tok.len == 0) { return this.fail("expected a value"); }
+        let v = classify(tok);
+        if (v.kind == JS_NULL) { return this.fail("invalid value '" + tok + "'"); }
+        return v;
+    }
+
+    // True when the space at this.pos joins a date to a time.
+    fn dateSpace(start: int): bool {
+        let sofar = this.s.slice(start, this.pos);
+        if (sofar.len != 10) { return false; }
+        if (sofar[4] != 45 || sofar[7] != 45) { return false; }         // 'YYYY-MM-DD'
+        if (this.pos + 3 >= this.n) { return false; }
+        let a = this.s[this.pos + 1];
+        let b = this.s[this.pos + 2];
+        return a >= 48 && a <= 57 && b >= 48 && b <= 57 && this.s[this.pos + 3] == 58;
+    }
+}
+
+// ---- token classification --------------------------------------------------
+
+// Turn a bare token into a value, or a Null when it is not one. Kept out of the
+// parser class so the rules are readable on their own.
+fn classify(tok: string): JsonValue {
+    if (tok == "true") { return jbool(true); }
+    if (tok == "false") { return jbool(false); }
+    if (tok == "inf" || tok == "+inf") { return jnum(inf_value()); }
+    if (tok == "-inf") { return jnum(0.0 - inf_value()); }
+    if (tok == "nan" || tok == "+nan" || tok == "-nan") { return jnum(nan_value()); }
+
+    // Radix-prefixed integers, which never carry a sign in TOML.
+    if (tok.len > 2 && tok[0] == 48) {
+        let p = tok[1];
+        if (p == 120 || p == 88) { return radix(tok.slice(2, tok.len), 16); }   // 0x
+        if (p == 111 || p == 79) { return radix(tok.slice(2, tok.len), 8); }    // 0o
+        if (p == 98 || p == 66) { return radix(tok.slice(2, tok.len), 2); }     // 0b
+    }
+
+    if (looks_like_datetime(tok)) { return jstr(tok); }
+
+    // Decimal integer or float. Underscores are separators and are removed
+    // before handing the text to to_float, which panics on a malformed token —
+    // so the shape is validated first, exactly as json.vt's scan_number does.
+    let clean = strip_underscores(tok);
+    if (clean == "") { return jnull(); }
+    if (!valid_number(clean)) { return jnull(); }
+    return jnum(clean.to_float());
+}
+
+fn strip_underscores(tok: string): string {
+    if (tok.index_of("_") < 0) { return tok; }
+    // An underscore must sit between two digits; anything else is malformed.
+    let sb = new StringBuilder(tok.len);
+    let i = 0;
+    while (i < tok.len) {
+        let c = tok[i];
+        if (c == 95) {
+            if (i == 0 || i + 1 >= tok.len) { return ""; }
+            if (!is_digit(tok[i - 1]) || !is_digit(tok[i + 1])) { return ""; }
+        } else {
+            sb.appendByte(c);
+        }
+        i += 1;
+    }
+    return sb.toString();
+}
+
+fn strip_radix_underscores(tok: string, base: int): string {
+    if (tok.index_of("_") < 0) { return tok; }
+    let sb = new StringBuilder(tok.len);
+    let i = 0;
+    while (i < tok.len) {
+        let c = tok[i];
+        if (c == 95) {
+            if (i == 0 || i + 1 >= tok.len) { return ""; }
+            if (!is_base_digit(tok[i - 1], base) || !is_base_digit(tok[i + 1], base)) { return ""; }
+        } else {
+            sb.appendByte(c);
+        }
+        i += 1;
+    }
+    return sb.toString();
+}
+
+fn is_base_digit(c: int, base: int): bool {
+    let v = hex_val(c);
+    return v >= 0 && v < base;
+}
+
+// Strict decimal-number shape: [+-] digits [. digits] [eE [+-] digits].
+// TOML also forbids leading zeros, which this enforces.
+fn valid_number(s: string): bool {
+    let i = 0;
+    if (i < s.len && (s[i] == 43 || s[i] == 45)) { i += 1; }
+    let intStart = i;
+    while (i < s.len && is_digit(s[i])) { i += 1; }
+    let intLen = i - intStart;
+    if (intLen == 0) { return false; }
+    if (intLen > 1 && s[intStart] == 48) { return false; }
+    if (i < s.len && s[i] == 46) {
+        i += 1;
+        let fs = i;
+        while (i < s.len && is_digit(s[i])) { i += 1; }
+        if (i == fs) { return false; }
+    }
+    if (i < s.len && (s[i] == 101 || s[i] == 69)) {
+        i += 1;
+        if (i < s.len && (s[i] == 43 || s[i] == 45)) { i += 1; }
+        let es = i;
+        while (i < s.len && is_digit(s[i])) { i += 1; }
+        if (i == es) { return false; }
+    }
+    return i == s.len;
+}
+
+fn radix(body: string, base: int): JsonValue {
+    // Underscores separate digits here too, but the neighbours must be digits
+    // *of this base* — the decimal 0-9 test would reject 0xdead_beef.
+    let clean = strip_radix_underscores(body, base);
+    if (clean.len == 0) { return jnull(); }
+    let v = 0;
+    let i = 0;
+    while (i < clean.len) {
+        let d = hex_val(clean[i]);
+        if (d < 0 || d >= base) { return jnull(); }
+        v = v * base + d;
+        i += 1;
+    }
+    return jnum(v as float);
+}
+
+// A TOML date, time, or datetime, which this module keeps as text. The shapes
+// are YYYY-MM-DD…, and HH:MM:SS…; nothing else starts that way.
+fn looks_like_datetime(tok: string): bool {
+    if (tok.len >= 10 && tok[4] == 45 && tok[7] == 45 &&
+        is_digit(tok[0]) && is_digit(tok[1]) && is_digit(tok[2]) && is_digit(tok[3])) {
+        return true;
+    }
+    if (tok.len >= 8 && tok[2] == 58 && tok[5] == 58 &&
+        is_digit(tok[0]) && is_digit(tok[1])) {
+        return true;
+    }
+    return false;
+}
+
+fn is_digit(c: int): bool { return c >= 48 && c <= 57; }
+
+fn hex_val(c: int): int {
+    if (c >= 48 && c <= 57) { return c - 48; }
+    if (c >= 97 && c <= 102) { return c - 87; }
+    if (c >= 65 && c <= 70) { return c - 55; }
+    return -1;
+}
+
+// There is no way to write an infinite literal in Vyto, and 1.0/0.0 is a
+// checked division that panics — so the value comes from the one route that
+// does produce it, an overflowing decimal.
+fn inf_value(): float { return "1e400".to_float(); }
+fn nan_value(): float {
+    let i = inf_value();
+    return i - i;
+}
+export fn toml_is_nan(v: float): bool { return v != v; }
+
+fn utf8_encode(cp: int): string {
+    let b = bytes(5);
+    let n = 0;
+    if (cp < 0x80) {
+        b[0] = cp as byte;
+        n = 1;
+    } else {
+        if (cp < 0x800) {
+            b[0] = (0xC0 | (cp >> 6)) as byte;
+            b[1] = (0x80 | (cp & 0x3F)) as byte;
+            n = 2;
+        } else {
+            if (cp < 0x10000) {
+                b[0] = (0xE0 | (cp >> 12)) as byte;
+                b[1] = (0x80 | ((cp >> 6) & 0x3F)) as byte;
+                b[2] = (0x80 | (cp & 0x3F)) as byte;
+                n = 3;
+            } else {
+                b[0] = (0xF0 | (cp >> 18)) as byte;
+                b[1] = (0x80 | ((cp >> 12) & 0x3F)) as byte;
+                b[2] = (0x80 | ((cp >> 6) & 0x3F)) as byte;
+                b[3] = (0x80 | (cp & 0x3F)) as byte;
+                n = 4;
+            }
+        }
+    }
+    return strbytes(b, n);
+}
+
+fn chr_of(code: int): string {
+    if (code == 0) { return ""; }
+    let b = bytes(2);
+    b[0] = code as byte;
+    return str(b as cstring);
+}
+
+fn join_path(parts: string[]): string {
+    let out = "";
+    let i = 0;
+    while (i < parts.len) {
+        if (i > 0) { out = out + "\x01"; }
+        out = out + parts[i];
+        i += 1;
+    }
+    return out;
+}
+
+fn dotted(parts: string[]): string { return parts.join("."); }
+
+// ---- public entry points ---------------------------------------------------
+
+// Parse TOML text into a JsonValue tree. Never panics: on failure the result is
+// a Null-kind value whose parseError() explains what happened.
+export fn toml_parse(text: string): JsonValue {
+    let p = new TomlParser(text);
+    return p.parse();
+}
+
+// True when `v` came back from toml_parse as a failure.
+export fn toml_failed(v: JsonValue): bool { return v.parseError() != ""; }
+
+// ---- writer ----------------------------------------------------------------
+
+// Render a JsonValue tree as TOML. Scalars and inline-able values come first,
+// then [sub.tables], then [[arrays.of.tables]] — the ordering TOML requires,
+// since a key written after a table header would belong to that table.
+//
+// Panics on a value TOML cannot express (a null, or an array mixing tables with
+// scalars) — an encoder failure is a programmer error, which is the
+// library-wide "panic hard, sentinel soft" rule.
+export fn toml_encode(v: JsonValue): string {
+    if (v.kind != JS_OBJ) { panic("vyto/util/toml: toml_encode needs an object at the root"); }
+    let sb = new StringBuilder(256);
+    write_table(v, [], sb);
+    return sb.toString();
+}
+
+fn write_table(t: JsonValue, path: string[], sb: StringBuilder) {
+    let keys = t.objKeys();
+
+    // Pass 1: everything that is written as `key = value`.
+    let i = 0;
+    while (i < keys.len) {
+        let k = keys[i];
+        let v = t.get(k);
+        if (!is_table(v) && !is_table_array(v)) {
+            sb.append(encode_key(k)).append(" = ");
+            write_value(v, sb);
+            sb.append("\n");
+        }
+        i += 1;
+    }
+
+    // Pass 2: sub-tables.
+    i = 0;
+    while (i < keys.len) {
+        let k = keys[i];
+        let v = t.get(k);
+        if (is_table(v)) {
+            let sub = extend(path, k);
+            sb.append("\n[").append(header_path(sub)).append("]\n");
+            write_table(v, sub, sb);
+        }
+        i += 1;
+    }
+
+    // Pass 3: arrays of tables.
+    i = 0;
+    while (i < keys.len) {
+        let k = keys[i];
+        let v = t.get(k);
+        if (is_table_array(v)) {
+            let sub = extend(path, k);
+            let j = 0;
+            while (j < v.len()) {
+                sb.append("\n[[").append(header_path(sub)).append("]]\n");
+                write_table(v.at(j), sub, sb);
+                j += 1;
+            }
+        }
+        i += 1;
+    }
+}
+
+fn is_table(v: JsonValue): bool { return v.kind == JS_OBJ; }
+
+// An array of tables only if it is non-empty and *every* element is a table:
+// an empty array is written inline, and a mixed one is an error at write time.
+fn is_table_array(v: JsonValue): bool {
+    if (v.kind != JS_ARR || v.len() == 0) { return false; }
+    let i = 0;
+    while (i < v.len()) {
+        if (v.at(i).kind != JS_OBJ) { return false; }
+        i += 1;
+    }
+    return true;
+}
+
+fn extend(path: string[], k: string): string[] {
+    let out: string[] = [];
+    let i = 0;
+    while (i < path.len) {
+        out.push(path[i]);
+        i += 1;
+    }
+    out.push(k);
+    return out;
+}
+
+fn header_path(path: string[]): string {
+    let out = "";
+    let i = 0;
+    while (i < path.len) {
+        if (i > 0) { out = out + "."; }
+        out = out + encode_key(path[i]);
+        i += 1;
+    }
+    return out;
+}
+
+// A key needs quoting unless it is entirely bare-key characters.
+fn encode_key(k: string): string {
+    let bare = k.len > 0;
+    let i = 0;
+    while (i < k.len) {
+        let c = k[i];
+        let ok = (c >= 65 && c <= 90) || (c >= 97 && c <= 122) ||
+                 (c >= 48 && c <= 57) || c == 95 || c == 45;
+        if (!ok) { bare = false; }
+        i += 1;
+    }
+    if (bare) { return k; }
+    return quote_basic(k);
+}
+
+fn write_value(v: JsonValue, sb: StringBuilder) {
+    if (v.kind == JS_STR) { sb.append(quote_basic(v.asString())); return; }
+    if (v.kind == JS_BOOL) {
+        if (v.asBool()) { sb.append("true"); } else { sb.append("false"); }
+        return;
+    }
+    if (v.kind == JS_NUM) { sb.append(format_number(v.asFloat())); return; }
+    if (v.kind == JS_ARR) {
+        sb.append("[");
+        let i = 0;
+        while (i < v.len()) {
+            if (i > 0) { sb.append(", "); }
+            write_value(v.at(i), sb);
+            i += 1;
+        }
+        sb.append("]");
+        return;
+    }
+    if (v.kind == JS_OBJ) {
+        // Reached only for an object nested inside an array, which has no
+        // header form and must go inline.
+        sb.append("{");
+        let keys = v.objKeys();
+        let i = 0;
+        while (i < keys.len) {
+            if (i > 0) { sb.append(", "); }
+            sb.append(encode_key(keys[i])).append(" = ");
+            write_value(v.get(keys[i]), sb);
+            i += 1;
+        }
+        sb.append("}");
+        return;
+    }
+    panic("vyto/util/toml: TOML has no null; remove the key instead");
+}
+
+// Integral values print without a decimal point, because TOML distinguishes
+// integers from floats and `port = 8080.0` is a different type from `8080`.
+fn format_number(f: float): string {
+    if (f != f) { return "nan"; }
+    let inf = inf_value();
+    if (f == inf) { return "inf"; }
+    if (f == 0.0 - inf) { return "-inf"; }
+    let i = f as int;
+    if ((i as float) == f) { return str(i); }
+    return str(f);
+}
+
+fn quote_basic(s: string): string {
+    let sb = new StringBuilder(s.len + 8);
+    sb.append("\"");
+    let runStart = 0;
+    let i = 0;
+    while (i < s.len) {
+        let c = s[i];
+        let esc = "";
+        if (c == 34) { esc = "\\\""; }
+        else { if (c == 92) { esc = "\\\\"; }
+        else { if (c == 10) { esc = "\\n"; }
+        else { if (c == 13) { esc = "\\r"; }
+        else { if (c == 9) { esc = "\\t"; }
+        else { if (c == 8) { esc = "\\b"; }
+        else { if (c == 12) { esc = "\\f"; }
+        else { if (c < 0x20) { esc = "\\u" + hex4(c); } } } } } } } }
+        if (esc != "") {
+            if (i > runStart) { sb.append(s.slice(runStart, i)); }
+            sb.append(esc);
+            runStart = i + 1;
+        }
+        i += 1;
+    }
+    if (s.len > runStart) { sb.append(s.slice(runStart, s.len)); }
+    sb.append("\"");
+    return sb.toString();
+}
+
+fn hex4(c: int): string {
+    let d = "0123456789abcdef";
+    let out = "";
+    let shift = 12;
+    while (shift >= 0) {
+        let v = (c >> shift) & 0xF;
+        out = out + d.slice(v, v + 1);
+        shift -= 4;
+    }
+    return out;
+}
