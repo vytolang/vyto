@@ -248,6 +248,73 @@ rx_split(",\\s*", "a, b,c").len;               // 3
 | `named(n)` / `hasNamed(n)` / `namedGroups()` | `namedGroups()` returns a `Map<string, string>` of the groups that participated. |
 | `groupCount()` | Groups in this match, excluding group 0. |
 
+### The convenience layer
+
+The tables above are the engine. These are the shortcuts, and they are where
+most day-to-day work happens. **Every `rx_*` function takes a trailing `flags`
+that defaults to `0`.**
+
+| Call | Gives you |
+|---|---|
+| `rx_find_all(pat, s)` / `re.findAllText(s)` | every match's text |
+| `rx_find_all_group(pat, s, i)` / `re.findAllGroup(s, i)` | one capture across every match |
+| `rx_count(pat, s)` / `re.count(s)` | how many, counted in C with no allocation |
+| `rx_grep(pat, s)` / `rx_grep_v(pat, s)` | the lines that do / don't match |
+| `rx_find_or(pat, s, dflt)` / `re.findOr(s, dflt)` | first match, or a default |
+| `rx_group(pat, s, i)` / `rx_named(pat, s, name)` | one capture from the first match |
+| `rx_quote(s)` | escape a literal for use in a pattern |
+| `rx_full_match(pat, s)` / `re.fullMatch(s)` | must match the whole subject |
+| `rx_index_of` / `rx_last_index_of` | byte offset of the first / last match |
+| `rx_trim` / `rx_strip_prefix` / `rx_strip_suffix` | pattern twins of the `text` helpers |
+| `rx_replace_first(pat, s, repl)` | first only — twin of `text.replace_first` |
+| `re.replaceFn(s, f)` / `re.replaceN(s, repl, n)` / `re.each(s, f)` | callback and bounded editing |
+| `re.partition(s)` / `re.splitKeep(s)` | `[before, match, after]` / split keeping delimiters |
+| `re.expand(m, template)` | apply `$1`/`${name}` to a `Match` you already have |
+| `rx_test_any(pats, s)` | true if any pattern matches |
+
+Two of these are worth calling out because getting them wrong is silent.
+
+**`rx_quote` when the pattern came from a user.** Without it, `a.*b` typed into
+a search box is a wildcard and `(a+)+$` is a denial of service:
+
+```vyto
+rx_count(rx_quote(userInput), haystack);      // literal, and safe
+```
+
+**`fullMatch`, not `^…$`.** `$` also matches before a final newline, so
+`rx_test("^abc$", "abc\n")` is `true` — almost never what was meant.
+`rx_full_match("abc", "abc\n")` is `false`. It is also not the same as checking
+`find`'s offsets: matching is leftmost-first, so `a|ab` on `"ab"` finds `"a"`
+and an offset test would wrongly report no full match.
+
+`replaceFn`'s callback must be assigned to a typed target before the call and
+cannot capture `this` — both are v0.1 language limits:
+
+```vyto
+let redact: fn(Match): string = (m) => m.named("user") + "@***";
+mail.replaceFn(log, redact);
+```
+
+### Validators
+
+| Call | |
+|---|---|
+| `rx_is_email_loose(s)` / `RX_P_EMAIL_LOOSE` | a shape check, nothing more |
+| `rx_is_ipv4(s)` / `RX_P_IPV4` | dotted quad, range-checked, rejects leading zeros |
+
+**Deliberately only two.** UUID, URL, ISO-date and numbers already have
+hand-written validators that beat a regex on accuracy and error reporting — use
+`uuid_is_valid`, `url_is_valid`, `date_parse` + `date_is_valid`, and
+`cli.parse_int` / `parse_float` instead.
+
+`rx_is_email_loose` accepts `first.last@sub.example.co.uk`, `user+tag@x.io` and
+internationalised domains; rejects a missing `@`, whitespace, a domain with no
+dot, a trailing dot and consecutive dots in the domain. It does not accept
+quoted local parts or IP-literal domains, which are legal RFC 5322 and
+vanishingly rare. **It is not an RFC 5322 validator and not a deliverability
+check** — the only way to know an address works is to send to it. Use it to
+catch a typo in a form field, not to make a decision.
+
 ### Flags
 
 Compile flags, OR them together: `RX_CASELESS`, `RX_MULTILINE`, `RX_DOTALL`,
@@ -355,6 +422,14 @@ Use `foldCase` or a `Collator` for case-insensitive comparison of real text;
 | Replace a literal | `s.replace(old, neu)` / `text.replace_first` |
 | Replace a pattern | `rx_replace_all(pat, s, repl)` |
 | Iterate lines | `s.lines()` |
+| Keep only the lines that match | `rx_grep(pat, s)` |
+| Count occurrences of a literal | `s.count(sub)` |
+| Count matches of a pattern | `rx_count(pat, s)` — allocates nothing |
+| All matches as strings | `rx_find_all(pat, s)` |
+| One capture from every match | `rx_find_all_group(pat, s, i)` |
+| Search for text a user typed | `rx_quote` it first — always |
+| "Is this string exactly …?" | `rx_full_match`, **never** `^…$` |
+| Split into before/match/after | `re.partition(s)` |
 | Count characters for display | `unicode.graphemes(s).len` — **not** `s.len` |
 | Truncate for display | slice on a `graphemes` boundary, never on a byte index |
 | Case-insensitive compare, ASCII | `text.equals_ignore_case` |

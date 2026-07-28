@@ -40,6 +40,142 @@ bad.errorOffset();                   // 9
 ⚙ marks a module backed by a native shim. `vyto/regex` is deliberately a single
 module — see [Layout](#layout).
 
+## The convenience layer
+
+The core API (`find`, `findAll`, `replace*`, `split*`) is what everything else
+is built from. These are the shortcuts for the jobs people actually do.
+
+**Every `rx_*` function takes a trailing `flags` that defaults to `0`**, so the
+cached path honours `RX_CASELESS`, `RX_MULTILINE`, `RX_BYTES` and the rest. The
+flags are part of the cache key, so one pattern under two flag sets occupies two
+slots rather than colliding.
+
+### Getting text out
+
+| Call | Gives you |
+|---|---|
+| `re.findAllText(s)` / `rx_find_all(pat, s)` | every match's text — no `Match` built |
+| `re.findAllGroup(s, i)` / `rx_find_all_group(pat, s, i)` | one capture across every match |
+| `re.count(s)` / `rx_count(pat, s)` | how many, counted in C with zero allocation |
+| `re.findOr(s, dflt)` / `rx_find_or(pat, s, dflt)` | first match, or a default |
+| `rx_group(pat, s, i)` / `rx_named(pat, s, name)` | one capture from the first match |
+| `rx_grep(pat, s)` / `rx_grep_v(pat, s)` | the lines that do / don't match |
+
+```vyto
+rx_find_all("\\d+", "a1 b22 c333");        // ["1", "22", "333"]
+rx_find_all_group("(\\w)=(\\d)", cfg, 2);  // every value
+rx_count("ERROR", log);                     // no array allocated
+rx_grep("^ERROR", log, RX_MULTILINE);       // matching lines
+rx_find_or("v(\\d+)", s, "0");
+```
+
+### Whole-string matching
+
+`fullMatch` is not the same as checking `find`'s offsets. Matching is
+leftmost-first, so `a|ab` against `"ab"` finds `"a"`, and an offset test would
+wrongly report no full match. It compiles `\A(?:pattern)\z` once, on demand.
+
+`\A` and `\z` rather than `^` and `$` is deliberate: they are absolute, so the
+answer does not shift under `RX_MULTILINE` and does not fall for `$`'s "also
+matches before a final newline" rule — which is the exact bug this exists to
+prevent.
+
+```vyto
+rx_test("^abc$", "abc\n");          // true  — the classic surprise
+rx_full_match("abc", "abc\n");      // false — what you meant
+```
+
+`(?:...)` is non-capturing, so group numbering is untouched.
+
+### Escaping user input
+
+**`rx_quote` is not optional when any part of a pattern came from outside the
+program.** Without it, someone typing `a.*b` into a search box gets a wildcard,
+and someone typing `(a+)+$` gets a denial of service.
+
+```vyto
+rx_count(rx_quote(userInput), haystack);
+```
+
+It escapes ``\ . ^ $ | ? * + ( ) [ ] { }`` and encodes NUL as `\x00`.
+Over-escaping is harmless; under-escaping is a bug, so the set is deliberately
+wide.
+
+### Editing
+
+| Call | Does |
+|---|---|
+| `re.replaceFn(s, f)` | replace each match with what `f` returns for it |
+| `re.replaceN(s, repl, n)` | replace at most the first `n` |
+| `rx_replace_first(pat, s, repl)` | first only — twin of `text.replace_first` |
+| `re.expand(m, template)` | apply `$1`/`${name}`/`$$` to a `Match` you already have |
+| `re.each(s, f)` | call `f` per match without building the array |
+
+```vyto
+let redact: fn(Match): string = (m) => m.named("user") + "@***";
+mail.replaceFn(log, redact);
+```
+
+Two v0.1 language limits bite here, and they are the language's, not this
+module's: **the arrow must be assigned to a typed target** (an inline one at the
+call site cannot be inferred), and **it cannot capture `this`**, so it cannot be
+written inside a method that needs instance state. Accumulating across calls
+needs the 1-element-array idiom, since captures cannot be assigned to.
+
+### Slicing up a subject
+
+| Call | Gives |
+|---|---|
+| `re.partition(s)` | `[before, match, after]` — always 3 elements, always rejoins to `s` |
+| `re.splitKeep(s)` | split keeping the delimiters; also rejoins exactly |
+| `re.trim(s)` / `rx_trim(pat, s)` | strip one leading and one trailing match |
+| `rx_strip_prefix` / `rx_strip_suffix` | drop a leading / trailing match if present |
+| `rx_index_of` / `rx_last_index_of` | byte offset of the first / last match, or `-1` |
+
+### Validators
+
+Only two, and the omissions are the point. UUID, URL, ISO-date and numbers all
+already have hand-written validators that beat a regex on accuracy *and* on
+error reporting — use `uuid_is_valid` (`vyto/util/uuid`), `url_is_valid`
+(`vyto/util/url`), `date_parse` + `date_is_valid` (`vyto/util/date`), and
+`parse_int` / `parse_float` (`vyto/cli`).
+
+| Call | |
+|---|---|
+| `rx_is_email_loose(s)` / `RX_P_EMAIL_LOOSE` | a shape check, see below |
+| `rx_is_ipv4(s)` / `RX_P_IPV4` | dotted quad, range-checked |
+| `rx_test_any(pats, s)` | true if any pattern matches |
+
+**`rx_is_email_loose` — the `_LOOSE` is not decoration.**
+
+It accepts `a@b.co`, `first.last@sub.example.co.uk`, `user+tag@x.io`,
+internationalised domains, and a local part containing almost anything —
+consecutive dots, a leading dot, `!#$%`. It rejects a missing `@`, whitespace
+anywhere, a domain with no dot, a trailing dot, consecutive dots in the domain,
+and an empty local part or domain label.
+
+It deliberately does **not** accept three things that are legal RFC 5322 and
+vanishingly rare: quoted local parts with spaces (`"a b"@x.com`), IP-literal
+domains (`a@[10.0.0.1]`), and comments.
+
+**What it is not:** an RFC 5322 validator, a deliverability check, or evidence
+that mail sent there arrives. The only way to know an address works is to send
+to it and have someone click the link. Use this to catch a typo in a form field,
+not to make a decision.
+
+It is ReDoS-safe by construction: dot is excluded from the domain character
+classes, so no two parts of the pattern can match the same byte and there is
+nothing for the engine to backtrack through. The classic `([a-z0-9.]+)+@`
+catastrophe cannot occur. The fixture asserts a 5000-character non-matching
+subject returns rather than burning the match limit.
+
+`RX_P_IPV4` range-checks each octet, so `999.1.1.1` is rejected where the usual
+`\d{1,3}` version accepts it, and it rejects leading zeros — `01.2.3.4` is read
+as octal by some resolvers and is a spoofing vector.
+
+Both constants are exported as plain strings, so they compose:
+`rx_test("<" + RX_P_EMAIL_LOOSE + ">", "<a@b.co>")`.
+
 ## Errors: where the line falls
 
 The library-wide rule is **panic hard, sentinel soft**
