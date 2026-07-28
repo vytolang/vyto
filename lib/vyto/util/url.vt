@@ -1,0 +1,731 @@
+// vyto/util/url — URL parsing, joining, and percent-encoding.
+//
+//     let u = url_parse("https://ada:pw@example.com:8443/docs/a.html?q=hi+there#top");
+//     u.scheme                             // "https"
+//     u.host                               // "example.com"
+//     u.port                               // 8443
+//     u.path                               // "/docs/a.html"
+//     u.params().get("q")                  // "hi there"
+//     url_join("http://a.com/x/y", "../z") // "http://a.com/z"
+//     url_encode("a b/c")                  // "a%20b%2Fc"
+//
+//     url().scheme("https").host("api.example.com")
+//          .segment("v2").segment("things")
+//          .param("limit", "10").fragment("top").toString()
+//     // "https://api.example.com/v2/things?limit=10#top"
+//
+// Parsing follows RFC 3986: an optional scheme, an optional `//` authority
+// (userinfo, host, port), then path / query / fragment. `url_join` implements
+// the reference-resolution algorithm of §5.2, dot segments and all.
+//
+// Failure is *soft*, the same contract vyto/util/json keeps: `url_parse` never
+// panics — it returns a Url whose `error()` explains what went wrong, and whose
+// fields hold whatever was parsed before the problem. Only a malformed port or
+// an unterminated IPv6 literal are errors; everything else the grammar permits
+// is accepted, because a URL is data from elsewhere and rejecting it late is
+// the caller's decision, not this module's.
+//
+// This is where `url_encode` lives. vyto/net/http re-exports it, so
+// `import { url_encode } from "vyto/net/http"` still resolves.
+//
+// Caveat: `%00` decodes to a NUL, which truncates the resulting string — Vyto
+// strings reach C as NUL-terminated buffers. Every other byte round-trips.
+// A Url also does not distinguish an absent query/fragment from an empty one,
+// so "http://a.com/p#" formats back as "http://a.com/p".
+
+import { StringBuilder } from "vyto/util/text";
+
+// ---- percent-encoding ------------------------------------------------------
+
+// Percent-encode a query component (RFC 3986 unreserved set passes through).
+export fn url_encode(s: string): string { return encode_set(s, false, false); }
+
+// Percent-encode a path, leaving `/` intact so segment structure survives.
+export fn url_encode_path(s: string): string { return encode_set(s, true, false); }
+
+// Encode for application/x-www-form-urlencoded: like url_encode, but a space
+// becomes `+` rather than `%20`. This is what HTML form bodies use.
+export fn url_encode_form(s: string): string { return encode_set(s, false, true); }
+
+// Decode `%XX` escapes. Lenient: a `%` that is not followed by two hex digits
+// is passed through literally rather than failing, so partially-encoded input
+// still yields something usable. `+` is left alone — see url_decode_form.
+export fn url_decode(s: string): string { return decode_set(s, false); }
+
+// Decode a form-encoded component: `%XX` escapes plus `+` for a space.
+export fn url_decode_form(s: string): string { return decode_set(s, true); }
+
+fn is_unreserved(c: int): bool {
+    return (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) ||
+           c == 45 || c == 46 || c == 95 || c == 126;
+}
+
+// Unescaped bytes are appended in runs rather than one at a time — the same
+// shape as json.vt's quote_into, and the reason encoding is O(n) not O(n·calls).
+fn encode_set(s: string, keepSlash: bool, plusSpace: bool): string {
+    let sb = new StringBuilder(s.len + 16);
+    let runStart = 0;
+    let i = 0;
+    while (i < s.len) {
+        let c = s[i];
+        if (is_unreserved(c) || (keepSlash && c == 47)) { i += 1; continue; }
+        if (i > runStart) { sb.append(s.slice(runStart, i)); }
+        if (plusSpace && c == 32) {
+            sb.appendByte(43);
+        } else {
+            sb.appendByte(37);
+            sb.append(hex2(c));
+        }
+        i += 1;
+        runStart = i;
+    }
+    if (i > runStart) { sb.append(s.slice(runStart, i)); }
+    return sb.toString();
+}
+
+fn decode_set(s: string, plusSpace: bool): string {
+    let sb = new StringBuilder(s.len + 1);
+    let i = 0;
+    while (i < s.len) {
+        let c = s[i];
+        if (c == 37 && i + 2 < s.len) {
+            let hi = hex_val(s[i + 1]);
+            let lo = hex_val(s[i + 2]);
+            if (hi >= 0 && lo >= 0) {
+                sb.appendByte((hi << 4) | lo);
+                i += 3;
+                continue;
+            }
+        }
+        if (plusSpace && c == 43) { sb.appendByte(32); i += 1; continue; }
+        sb.appendByte(c);
+        i += 1;
+    }
+    return sb.toString();
+}
+
+fn hex2(c: int): string {
+    let digits = "0123456789ABCDEF";
+    let hi = (c >> 4) & 0xF;
+    let lo = c & 0xF;
+    return digits.slice(hi, hi + 1) + digits.slice(lo, lo + 1);
+}
+
+fn hex_val(c: int): int {
+    if (c >= 48 && c <= 57) { return c - 48; }
+    if (c >= 97 && c <= 102) { return c - 87; }
+    if (c >= 65 && c <= 70) { return c - 55; }
+    return -1;
+}
+
+// ---- query parameters ------------------------------------------------------
+
+// A query string as an ordered key/value list. Repeated keys are *kept* —
+// `?tag=a&tag=b` is two entries, not one — so getAll can return both and
+// toString round-trips. Parallel keys/vals arrays with a linear scan, the same
+// layout JsonValue uses for objects and for the same reason: a query has a
+// handful of entries, and two small arrays beat a hash table for that.
+export class QueryParams {
+    keys: string[];
+    vals: string[];
+
+    fn init() { this.keys = []; this.vals = []; }
+
+    fn len(): int { return this.keys.len; }
+    fn keyAt(i: int): string {
+        if (i >= 0 && i < this.keys.len) { return this.keys[i]; }
+        return "";
+    }
+    fn valAt(i: int): string {
+        if (i >= 0 && i < this.vals.len) { return this.vals[i]; }
+        return "";
+    }
+
+    // Index of the first entry named `k`, or -1.
+    fn indexOf(k: string): int {
+        let i = 0;
+        while (i < this.keys.len) {
+            if (this.keys[i] == k) { return i; }
+            i += 1;
+        }
+        return -1;
+    }
+    fn has(k: string): bool { return this.indexOf(k) >= 0; }
+
+    // First value for `k`, or "" when absent. Use has() to tell an absent key
+    // from one whose value is genuinely empty.
+    fn get(k: string): string {
+        let i = this.indexOf(k);
+        if (i >= 0) { return this.vals[i]; }
+        return "";
+    }
+    fn getOr(k: string, dflt: string): string {
+        let i = this.indexOf(k);
+        if (i >= 0) { return this.vals[i]; }
+        return dflt;
+    }
+    // Every value for `k`, in order.
+    fn getAll(k: string): string[] {
+        let out: string[] = [];
+        let i = 0;
+        while (i < this.keys.len) {
+            if (this.keys[i] == k) { out.push(this.vals[i]); }
+            i += 1;
+        }
+        return out;
+    }
+
+    // Append an entry, keeping any existing one with the same name.
+    fn add(k: string, v: string): QueryParams {
+        this.keys.push(k);
+        this.vals.push(v);
+        return this;
+    }
+    // Replace every entry named `k` with a single one.
+    fn set(k: string, v: string): QueryParams {
+        let i = this.indexOf(k);
+        if (i < 0) { return this.add(k, v); }
+        this.vals[i] = v;
+        let j = this.keys.len - 1;
+        while (j > i) {
+            if (this.keys[j] == k) { this.keys.remove_at(j); this.vals.remove_at(j); }
+            j -= 1;
+        }
+        return this;
+    }
+    fn remove(k: string): QueryParams {
+        let j = this.keys.len - 1;
+        while (j >= 0) {
+            if (this.keys[j] == k) { this.keys.remove_at(j); this.vals.remove_at(j); }
+            j -= 1;
+        }
+        return this;
+    }
+
+    // Re-encode as a form-encoded query string (no leading "?").
+    fn toString(): string {
+        let sb = new StringBuilder(64);
+        let i = 0;
+        while (i < this.keys.len) {
+            if (i > 0) { sb.append("&"); }
+            sb.append(url_encode_form(this.keys[i]));
+            sb.append("=");
+            sb.append(url_encode_form(this.vals[i]));
+            i += 1;
+        }
+        return sb.toString();
+    }
+}
+
+export fn queryParams(): QueryParams { return new QueryParams(); }
+
+// Parse a query string, with or without its leading "?". Keys and values are
+// form-decoded. A segment with no "=" becomes a key with an empty value.
+export fn query_parse(q: string): QueryParams {
+    let p = new QueryParams();
+    let s = q;
+    if (s.starts_with("?")) { s = s.slice(1, s.len); }
+    if (s.len == 0) { return p; }
+    let parts = s.split("&");
+    let i = 0;
+    while (i < parts.len) {
+        let seg = parts[i];
+        i += 1;
+        if (seg.len == 0) { continue; }
+        let eq = seg.index_of("=");
+        if (eq < 0) {
+            let bare = url_decode_form(seg);
+            p.add(bare, "");
+            continue;
+        }
+        let k = url_decode_form(seg.slice(0, eq));
+        let v = url_decode_form(seg.slice(eq + 1, seg.len));
+        p.add(k, v);
+    }
+    return p;
+}
+
+// ---- the Url type ----------------------------------------------------------
+
+// A parsed URL. Components are stored *decoded-as-found*: no percent-decoding
+// happens, because decoding a path before splitting it on "/" is how path
+// traversal bugs are written. Decode individual segments yourself.
+//
+// `host` never carries the brackets of an IPv6 literal; toString puts them
+// back. `port` is 0 when absent — effectivePort() falls back to the scheme's
+// well-known port.
+export class Url {
+    scheme: string;
+    user: string;
+    pass: string;
+    host: string;
+    port: int;
+    path: string;
+    query: string;
+    fragment: string;
+    hasAuthority: bool;
+    err: string;
+
+    fn init() {
+        this.scheme = "";
+        this.user = "";
+        this.pass = "";
+        this.host = "";
+        this.port = 0;
+        this.path = "";
+        this.query = "";
+        this.fragment = "";
+        this.hasAuthority = false;
+        this.err = "";
+    }
+
+    fn error(): string { return this.err; }
+    fn isValid(): bool { return this.err == ""; }
+
+    // The declared port, or the scheme default (0 for an unknown scheme).
+    fn effectivePort(): int {
+        if (this.port != 0) { return this.port; }
+        return url_default_port(this.scheme);
+    }
+
+    // "host", "host:port", or "[::1]:port" — what a connect() call wants.
+    fn hostPort(): string {
+        let sb = new StringBuilder(32);
+        if (this.host.contains(":")) {
+            sb.append("[").append(this.host).append("]");
+        } else {
+            sb.append(this.host);
+        }
+        if (this.port != 0) { sb.append(":").appendInt(this.port); }
+        return sb.toString();
+    }
+
+    // The full authority including userinfo, without the leading "//".
+    fn authority(): string {
+        let sb = new StringBuilder(48);
+        if (this.user != "") {
+            sb.append(this.user);
+            if (this.pass != "") { sb.append(":").append(this.pass); }
+            sb.append("@");
+        }
+        sb.append(this.hostPort());
+        return sb.toString();
+    }
+
+    // Parse the query string into an ordered key/value list.
+    fn params(): QueryParams { return query_parse(this.query); }
+
+    // Reassemble. Round-trips any URL this module parsed, modulo the
+    // empty-versus-absent query/fragment caveat in the header.
+    fn toString(): string {
+        let sb = new StringBuilder(64);
+        if (this.scheme != "") { sb.append(this.scheme).append(":"); }
+        if (this.hasAuthority) { sb.append("//").append(this.authority()); }
+        sb.append(this.path);
+        if (this.query != "") { sb.append("?").append(this.query); }
+        if (this.fragment != "") { sb.append("#").append(this.fragment); }
+        return sb.toString();
+    }
+}
+
+// Well-known port for a scheme, or 0 if there isn't one.
+export fn url_default_port(scheme: string): int {
+    if (scheme == "http") { return 80; }
+    if (scheme == "https") { return 443; }
+    if (scheme == "ws") { return 80; }
+    if (scheme == "wss") { return 443; }
+    if (scheme == "ftp") { return 21; }
+    if (scheme == "ssh") { return 22; }
+    return 0;
+}
+
+// Parse an absolute or relative URL. Never panics; check error()/isValid().
+export fn url_parse(s: string): Url {
+    let u = new Url();
+    if (s.len == 0) {
+        u.err = "empty url";
+        return u;
+    }
+    let rest = s;
+
+    let ci = scheme_end(rest);
+    if (ci >= 0) {
+        u.scheme = rest.slice(0, ci).to_lower();
+        rest = rest.slice(ci + 1, rest.len);
+    }
+
+    if (rest.starts_with("//")) {
+        u.hasAuthority = true;
+        rest = rest.slice(2, rest.len);
+        let end = rest.len;
+        let i = 0;
+        while (i < rest.len) {
+            let c = rest[i];
+            if (c == 47 || c == 63 || c == 35) { end = i; break; }  // '/' '?' '#'
+            i += 1;
+        }
+        let auth = rest.slice(0, end);
+        rest = rest.slice(end, rest.len);
+        if (!parse_authority(u, auth)) { return u; }
+    }
+
+    let h = rest.index_of("#");
+    if (h >= 0) {
+        u.fragment = rest.slice(h + 1, rest.len);
+        rest = rest.slice(0, h);
+    }
+    let q = rest.index_of("?");
+    if (q >= 0) {
+        u.query = rest.slice(q + 1, rest.len);
+        rest = rest.slice(0, q);
+    }
+    u.path = rest;
+    return u;
+}
+
+// True when `s` parses without an error.
+export fn url_is_valid(s: string): bool { return url_parse(s).isValid(); }
+
+// Index of the ':' ending a valid scheme, or -1 when there is no scheme. A
+// scheme is ALPHA *( ALPHA / DIGIT / "+" / "-" / "." ), so "/a:b" and "1x:"
+// correctly have none. Note that "example.com:8080" therefore parses as the
+// scheme "example.com" with the path "8080" — that is what the grammar says
+// and what a browser does; a host:port pair with no scheme is not a URL.
+fn scheme_end(s: string): int {
+    let c0 = s[0];
+    if (!((c0 >= 65 && c0 <= 90) || (c0 >= 97 && c0 <= 122))) { return -1; }
+    let i = 1;
+    while (i < s.len) {
+        let c = s[i];
+        if (c == 58) { return i; }
+        let ok = (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) ||
+                 c == 43 || c == 45 || c == 46;
+        if (!ok) { return -1; }
+        i += 1;
+    }
+    return -1;
+}
+
+// Fill in userinfo / host / port. Returns false (with u.err set) on the two
+// authority forms that are genuinely unparseable.
+fn parse_authority(u: Url, auth: string): bool {
+    let rest = auth;
+
+    // Rightmost '@': a password may itself contain '@'.
+    let at = rest.last_index_of("@");
+    if (at >= 0) {
+        let userinfo = rest.slice(0, at);
+        rest = rest.slice(at + 1, rest.len);
+        let colon = userinfo.index_of(":");
+        if (colon >= 0) {
+            u.user = userinfo.slice(0, colon);
+            u.pass = userinfo.slice(colon + 1, userinfo.len);
+        } else {
+            u.user = userinfo;
+        }
+    }
+
+    if (rest.starts_with("[")) {
+        let close = rest.index_of("]");
+        if (close < 0) {
+            u.err = "unterminated IPv6 literal in authority";
+            return false;
+        }
+        u.host = rest.slice(1, close);
+        rest = rest.slice(close + 1, rest.len);
+        if (rest.len > 0 && !rest.starts_with(":")) {
+            u.err = "trailing text after IPv6 literal";
+            return false;
+        }
+    } else {
+        let colon = rest.index_of(":");
+        if (colon >= 0) {
+            u.host = rest.slice(0, colon);
+            rest = rest.slice(colon, rest.len);
+        } else {
+            u.host = rest;
+            rest = "";
+        }
+    }
+    u.host = u.host.to_lower();
+
+    if (rest.starts_with(":")) {
+        let ds = rest.slice(1, rest.len);
+        if (ds.len == 0) { return true; }   // "host:" — an empty port is absent
+        if (ds.len > 5) {
+            u.err = "invalid port";
+            return false;
+        }
+        let i = 0;
+        while (i < ds.len) {
+            let c = ds[i];
+            if (c < 48 || c > 57) {
+                u.err = "invalid port";
+                return false;
+            }
+            i += 1;
+        }
+        let p = ds.to_int();
+        if (p > 65535) {
+            u.err = "invalid port";
+            return false;
+        }
+        u.port = p;
+    }
+    return true;
+}
+
+// ---- the builder -----------------------------------------------------------
+
+// Assembles a URL a component at a time.
+//
+//     url().scheme("https").host("api.example.com").port(8443)
+//          .segment("v2").segment("things")
+//          .param("limit", "10").param("tag", "a").param("tag", "b")
+//          .fragment("results")
+//          .toString()
+//     // https://api.example.com:8443/v2/things?limit=10&tag=a&tag=b#results
+//
+// A separate type from `Url` rather than builder methods on it, because a
+// method may not share a name with a field and `Url`'s fields are already
+// called `scheme`, `host`, `port` and so on — `u.host` reading a parse result
+// is the better use of that name. `urlOf` seeds a builder from an existing URL,
+// which is how you add a parameter to one you were handed.
+//
+// Every setter is a `builder` method, so it returns the receiver's static type
+// and the chain stays typed the whole way down.
+export class UrlBuilder {
+    u: Url;
+    q: QueryParams;
+
+    fn init() {
+        this.u = new Url();
+        this.q = new QueryParams();
+    }
+
+    builder fn scheme(s: string) {
+        this.u.scheme = s.to_lower();
+        if (s != "") { this.u.hasAuthority = true; }
+        return this;
+    }
+    // Userinfo. Rarely what you want — credentials in a URL leak into logs,
+    // proxies and browser history — but the grammar has it, so this does too.
+    builder fn user(s: string) {
+        this.u.user = s;
+        this.u.hasAuthority = true;
+        return this;
+    }
+    builder fn password(s: string) {
+        this.u.pass = s;
+        this.u.hasAuthority = true;
+        return this;
+    }
+    // Host, with or without the brackets of an IPv6 literal — they are stripped
+    // here and put back by toString, so both spellings work.
+    builder fn host(s: string) {
+        let h = s;
+        if (h.starts_with("[") && h.ends_with("]")) { h = h.slice(1, h.len - 1); }
+        this.u.host = h.to_lower();
+        this.u.hasAuthority = true;
+        return this;
+    }
+    // A port of 0 means "unset", so toString omits it and the scheme default
+    // applies.
+    builder fn port(p: int) {
+        this.u.port = p;
+        if (p != 0) { this.u.hasAuthority = true; }
+        return this;
+    }
+    // The whole path at once, taken as written — use segment() for anything
+    // that came from outside.
+    builder fn path(p: string) {
+        this.u.path = p;
+        return this;
+    }
+    // Append one path segment, percent-encoded. A `/` inside `s` becomes %2F
+    // rather than a separator, which is what stops a value from elsewhere
+    // climbing out of the path it was meant to sit in.
+    builder fn segment(s: string) {
+        if (!this.u.path.starts_with("/")) { this.u.path = "/" + this.u.path; }
+        if (!this.u.path.ends_with("/")) { this.u.path = this.u.path + "/"; }
+        this.u.path = this.u.path + url_encode(s);
+        return this;
+    }
+    // Append a query parameter, keeping any existing one with the same name —
+    // `?tag=a&tag=b` is two parameters, and both survive.
+    builder fn param(k: string, v: string) {
+        this.q.add(k, v);
+        return this;
+    }
+    builder fn paramInt(k: string, v: int) {
+        this.q.add(k, str(v));
+        return this;
+    }
+    // Replace every parameter named `k` with a single one.
+    builder fn setParam(k: string, v: string) {
+        this.q.set(k, v);
+        return this;
+    }
+    builder fn removeParam(k: string) {
+        this.q.remove(k);
+        return this;
+    }
+    // Set the query string verbatim, discarding anything param() added. For a
+    // query that is already encoded, or one that is not key/value shaped.
+    builder fn query(raw: string) {
+        this.q = query_parse(raw);
+        return this;
+    }
+    builder fn fragment(s: string) {
+        this.u.fragment = s;
+        return this;
+    }
+
+    // The parameters accumulated so far, for inspection.
+    fn params(): QueryParams { return this.q; }
+
+    // A finished `Url`, snapshotting the builder's state. build() neither
+    // consumes nor resets the builder — a later param() adds to what is
+    // already there, and a second build() sees it.
+    fn build(): Url {
+        let out = new Url();
+        out.scheme = this.u.scheme;
+        out.user = this.u.user;
+        out.pass = this.u.pass;
+        out.host = this.u.host;
+        out.port = this.u.port;
+        out.path = this.u.path;
+        out.fragment = this.u.fragment;
+        out.hasAuthority = this.u.hasAuthority;
+        out.query = this.q.toString();
+        return out;
+    }
+
+    fn toString(): string { return this.build().toString(); }
+}
+
+// An empty builder.
+export fn url(): UrlBuilder { return new UrlBuilder(); }
+
+// A builder seeded from an existing URL, for adding a parameter or swapping a
+// component. A URL that does not parse yields an empty builder rather than
+// failing — check url_is_valid first when that matters.
+export fn urlOf(s: string): UrlBuilder {
+    let b = new UrlBuilder();
+    let p = url_parse(s);
+    if (!p.isValid()) { return b; }
+    b.u.scheme = p.scheme;
+    b.u.user = p.user;
+    b.u.pass = p.pass;
+    b.u.host = p.host;
+    b.u.port = p.port;
+    b.u.path = p.path;
+    b.u.fragment = p.fragment;
+    b.u.hasAuthority = p.hasAuthority;
+    b.q = query_parse(p.query);
+    return b;
+}
+
+// ---- reference resolution (RFC 3986 §5.2) ----------------------------------
+
+// Resolve `ref` against `base`, the operation a browser performs on an href.
+// An absolute `ref` wins outright; otherwise missing components are inherited
+// and the path is merged and normalized:
+//
+//     url_join("http://a.com/x/y/z", "../q")   // "http://a.com/x/q"
+//     url_join("http://a.com/x/y/z", "/q")     // "http://a.com/q"
+//     url_join("http://a.com/x/y/z", "#frag")  // "http://a.com/x/y/z#frag"
+//
+// A base that fails to parse yields `ref` unchanged.
+export fn url_join(base: string, ref: string): string {
+    let b = url_parse(base);
+    if (!b.isValid()) { return ref; }
+    // §5.4.1: an empty reference resolves to the base without its fragment.
+    // url_parse rejects "" (it is not a URL), so the algorithm below never
+    // sees this case and it is handled here instead.
+    if (ref.len == 0) {
+        b.fragment = "";
+        return b.toString();
+    }
+    let r = url_parse(ref);
+    if (!r.isValid()) { return ref; }
+
+    let t = new Url();
+    if (r.scheme != "") {
+        t.scheme = r.scheme;
+        copy_authority(t, r);
+        t.path = remove_dot_segments(r.path);
+        t.query = r.query;
+    } else {
+        t.scheme = b.scheme;
+        if (r.hasAuthority) {
+            copy_authority(t, r);
+            t.path = remove_dot_segments(r.path);
+            t.query = r.query;
+        } else {
+            copy_authority(t, b);
+            if (r.path == "") {
+                t.path = b.path;
+                if (r.query != "") { t.query = r.query; } else { t.query = b.query; }
+            } else {
+                if (r.path.starts_with("/")) {
+                    t.path = remove_dot_segments(r.path);
+                } else {
+                    t.path = remove_dot_segments(merge_path(b, r.path));
+                }
+                t.query = r.query;
+            }
+        }
+    }
+    t.fragment = r.fragment;
+    return t.toString();
+}
+
+fn copy_authority(dst: Url, src: Url) {
+    dst.hasAuthority = src.hasAuthority;
+    dst.user = src.user;
+    dst.pass = src.pass;
+    dst.host = src.host;
+    dst.port = src.port;
+}
+
+// RFC 3986 §5.2.3.
+fn merge_path(b: Url, rpath: string): string {
+    if (b.hasAuthority && b.path == "") { return "/" + rpath; }
+    let i = b.path.last_index_of("/");
+    if (i < 0) { return rpath; }
+    return b.path.slice(0, i + 1) + rpath;
+}
+
+// RFC 3986 §5.2.4: collapse "." and ".." segments. A ".." that would escape the
+// root is discarded rather than kept, which is what makes this safe to run on
+// an untrusted request target.
+export fn remove_dot_segments(p: string): string {
+    if (p == "") { return ""; }
+    let absolute = p.starts_with("/");
+    let trailing = p.ends_with("/") || p.ends_with("/.") || p.ends_with("/..") ||
+                   p == "." || p == "..";
+    let out: string[] = [];
+    let parts = p.split("/");
+    let i = 0;
+    while (i < parts.len) {
+        let seg = parts[i];
+        i += 1;
+        if (seg == "" || seg == ".") { continue; }
+        if (seg == "..") {
+            if (out.len > 0) { out.pop(); }
+            continue;
+        }
+        out.push(seg);
+    }
+    let sb = new StringBuilder(p.len + 2);
+    if (absolute) { sb.append("/"); }
+    let j = 0;
+    while (j < out.len) {
+        if (j > 0) { sb.append("/"); }
+        sb.append(out[j]);
+        j += 1;
+    }
+    if (trailing && out.len > 0) { sb.append("/"); }
+    return sb.toString();
+}

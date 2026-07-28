@@ -1,0 +1,627 @@
+// vyto/util/mime — media types, base64, quoted-printable, and multipart bodies.
+//
+//     mime_from_path("logo.png")                 // "image/png"
+//     let mt = mime_parse("text/html; charset=UTF-8");
+//     mt.essence()                                // "text/html"
+//     mt.charset()                                // "utf-8"
+//     base64_encode(mime_bytes("hi"))             // "aGk="
+//     str(base64_decode("aGk=") as cstring)       // "hi"
+//
+//     let w = multipartWriter("----vyto0123");
+//     w.addField("name", "ada").addFile("cv", "cv.txt", "text/plain", data);
+//     let body = w.finish();                      // w.contentType() names the boundary
+//
+// Deliberately dependency-free beyond vyto/util/text: a MIME lookup should not
+// drag the vyto/io package's native shims into a binary that only wanted to
+// name a file type, so the extension scan here is four lines rather than an
+// import of path_ext.
+//
+// Failure is soft throughout: mime_parse returns a MediaType whose error() is
+// non-empty rather than panicking, base64_decode ignores every byte outside the
+// alphabet, and multipart_parse returns however many well-formed parts it found.
+//
+// Caveat: part bodies are `string`, so a part containing an embedded NUL is
+// truncated at it — the vyto-wide string/cstring caveat. Binary uploads should
+// go through base64 or be written straight from a byte[]. Boundaries are not
+// generated here, because that needs randomness and this module has no native
+// dependency; pass one in (vyto/util/uuid's uuid4() is a good source).
+
+import { StringBuilder } from "vyto/util/text";
+
+// ---- base64 ----------------------------------------------------------------
+
+const B64_STD: string = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+const B64_URL: string = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
+// Standard base64 with `=` padding (RFC 4648 §4).
+export fn base64_encode(data: byte[]): string { return b64_encode(data, B64_STD, true); }
+
+// URL/filename-safe base64 (RFC 4648 §5): `-` and `_` instead of `+` and `/`,
+// and no padding, which is what JWTs and query parameters want.
+export fn base64url_encode(data: byte[]): string { return b64_encode(data, B64_URL, false); }
+
+// Decode either alphabet, padded or not. Every byte outside the alphabet —
+// whitespace, `=`, line breaks from a wrapped body — is ignored, so a decoder
+// never fails; a truncated group simply yields fewer bytes.
+export fn base64_decode(s: string): byte[] {
+    let nsym = 0;
+    let i = 0;
+    while (i < s.len) {
+        if (b64_val(s[i]) >= 0) { nsym += 1; }
+        i += 1;
+    }
+    let nout = (nsym * 6) / 8;
+    let out = bytes(nout);
+    let acc = 0;
+    let nbits = 0;
+    let o = 0;
+    i = 0;
+    while (i < s.len) {
+        let v = b64_val(s[i]);
+        i += 1;
+        if (v < 0) { continue; }
+        acc = ((acc << 6) | v) & 0xFFFFFF;
+        nbits += 6;
+        if (nbits >= 8) {
+            nbits -= 8;
+            if (o < nout) {
+                out[o] = ((acc >> nbits) & 0xFF) as byte;
+                o += 1;
+            }
+        }
+    }
+    return out;
+}
+
+fn b64_encode(data: byte[], tbl: string, pad: bool): string {
+    let n = data.len;
+    let sb = new StringBuilder((n / 3) * 4 + 8);
+    let i = 0;
+    while (i < n) {
+        let b0 = data[i] as int;
+        let has1 = (i + 1) < n;
+        let has2 = (i + 2) < n;
+        let b1 = 0;
+        let b2 = 0;
+        if (has1) { b1 = data[i + 1] as int; }
+        if (has2) { b2 = data[i + 2] as int; }
+        let triple = (b0 << 16) | (b1 << 8) | b2;
+        sb.appendByte(tbl[(triple >> 18) & 0x3F]);
+        sb.appendByte(tbl[(triple >> 12) & 0x3F]);
+        if (has1) { sb.appendByte(tbl[(triple >> 6) & 0x3F]); }
+        else { if (pad) { sb.appendByte(61); } }
+        if (has2) { sb.appendByte(tbl[triple & 0x3F]); }
+        else { if (pad) { sb.appendByte(61); } }
+        i += 3;
+    }
+    return sb.toString();
+}
+
+fn b64_val(c: int): int {
+    if (c >= 65 && c <= 90) { return c - 65; }
+    if (c >= 97 && c <= 122) { return c - 71; }
+    if (c >= 48 && c <= 57) { return c + 4; }
+    if (c == 43 || c == 45) { return 62; }
+    if (c == 47 || c == 95) { return 63; }
+    return -1;
+}
+
+// Convenience: the bytes of a string, for feeding the encoders.
+export fn mime_bytes(s: string): byte[] {
+    let b = bytes(s.len);
+    let i = 0;
+    while (i < s.len) {
+        b[i] = s[i] as byte;
+        i += 1;
+    }
+    return b;
+}
+
+// ---- quoted-printable (RFC 2045 §6.7) --------------------------------------
+
+// Encode for a quoted-printable body: printable ASCII passes through, `=` and
+// everything else becomes `=XX`, trailing whitespace on a line is protected,
+// and soft line breaks keep lines under 76 characters.
+export fn qp_encode(s: string): string {
+    let sb = new StringBuilder(s.len + 16);
+    let col = 0;
+    let i = 0;
+    while (i < s.len) {
+        let c = s[i];
+        // A literal CRLF is a hard break and resets the column.
+        if (c == 13 && i + 1 < s.len && s[i + 1] == 10) {
+            sb.append("\r\n");
+            col = 0;
+            i += 2;
+            continue;
+        }
+        let atEnd = (i + 1 >= s.len) || (s[i + 1] == 13 && i + 2 < s.len && s[i + 2] == 10);
+        let space = c == 32 || c == 9;
+        let literal = (c >= 33 && c <= 126 && c != 61) || (space && !atEnd);
+        let width = 1;
+        if (!literal) { width = 3; }
+        if (col + width > 75) {
+            sb.append("=\r\n");
+            col = 0;
+        }
+        if (literal) {
+            sb.appendByte(c);
+        } else {
+            sb.appendByte(61);
+            sb.append(hex2_upper(c));
+        }
+        col += width;
+        i += 1;
+    }
+    return sb.toString();
+}
+
+// Decode a quoted-printable body: `=XX` escapes plus soft line breaks. A `=`
+// that begins neither is passed through literally rather than failing.
+export fn qp_decode(s: string): string {
+    let sb = new StringBuilder(s.len + 1);
+    let i = 0;
+    while (i < s.len) {
+        let c = s[i];
+        if (c != 61) {
+            sb.appendByte(c);
+            i += 1;
+            continue;
+        }
+        if (i + 2 < s.len && s[i + 1] == 13 && s[i + 2] == 10) { i += 3; continue; }
+        if (i + 1 < s.len && s[i + 1] == 10) { i += 2; continue; }
+        if (i + 2 < s.len) {
+            let hi = hex_val(s[i + 1]);
+            let lo = hex_val(s[i + 2]);
+            if (hi >= 0 && lo >= 0) {
+                sb.appendByte((hi << 4) | lo);
+                i += 3;
+                continue;
+            }
+        }
+        sb.appendByte(c);
+        i += 1;
+    }
+    return sb.toString();
+}
+
+fn hex2_upper(c: int): string {
+    let digits = "0123456789ABCDEF";
+    let hi = (c >> 4) & 0xF;
+    let lo = c & 0xF;
+    return digits.slice(hi, hi + 1) + digits.slice(lo, lo + 1);
+}
+
+fn hex_val(c: int): int {
+    if (c >= 48 && c <= 57) { return c - 48; }
+    if (c >= 97 && c <= 102) { return c - 87; }
+    if (c >= 65 && c <= 70) { return c - 55; }
+    return -1;
+}
+
+// ---- media types -----------------------------------------------------------
+
+// A parsed media type: `text/plain; charset=utf-8`. Type, subtype and parameter
+// names are lowercased (they are case-insensitive per RFC 2045); parameter
+// *values* are left exactly as written, except that charset() lowercases its
+// answer because charset names are case-insensitive too.
+export class MediaType {
+    type: string;
+    subtype: string;
+    keys: string[];
+    vals: string[];
+    err: string;
+
+    fn init(t: string, sub: string) {
+        this.type = t.to_lower();
+        this.subtype = sub.to_lower();
+        this.keys = [];
+        this.vals = [];
+        this.err = "";
+    }
+
+    fn error(): string { return this.err; }
+    fn isValid(): bool { return this.err == ""; }
+
+    // "text/plain" — the type without its parameters.
+    fn essence(): string { return this.type + "/" + this.subtype; }
+
+    // Case-insensitive essence comparison: mt.matches("TEXT/HTML") is true for
+    // "text/html; charset=utf-8".
+    fn matches(essence: string): bool { return this.essence() == essence.to_lower(); }
+
+    // True when the type half matches, e.g. mt.isType("image").
+    fn isType(t: string): bool { return this.type == t.to_lower(); }
+
+    fn paramIndex(name: string): int {
+        let want = name.to_lower();
+        let i = 0;
+        while (i < this.keys.len) {
+            if (this.keys[i] == want) { return i; }
+            i += 1;
+        }
+        return -1;
+    }
+    fn hasParam(name: string): bool { return this.paramIndex(name) >= 0; }
+    // Parameter value, or "" when absent.
+    fn param(name: string): string {
+        let i = this.paramIndex(name);
+        if (i >= 0) { return this.vals[i]; }
+        return "";
+    }
+    fn setParam(name: string, v: string): MediaType {
+        let i = this.paramIndex(name);
+        if (i >= 0) { this.vals[i] = v; return this; }
+        this.keys.push(name.to_lower());
+        this.vals.push(v);
+        return this;
+    }
+
+    // The `charset` parameter, lowercased; "" when unset.
+    fn charset(): string { return this.param("charset").to_lower(); }
+    // The `boundary` parameter of a multipart type; "" when unset.
+    fn boundary(): string { return this.param("boundary"); }
+
+    // Reassemble, quoting any parameter value that needs it.
+    fn toString(): string {
+        let sb = new StringBuilder(48);
+        sb.append(this.essence());
+        let i = 0;
+        while (i < this.keys.len) {
+            sb.append("; ").append(this.keys[i]).append("=");
+            sb.append(quote_param(this.vals[i]));
+            i += 1;
+        }
+        return sb.toString();
+    }
+}
+
+// Build a media type directly, e.g. mediaType("text", "plain").
+export fn mediaType(t: string, sub: string): MediaType { return new MediaType(t, sub); }
+
+// Parse a Content-Type / Accept-style header value. An empty or slash-less
+// input is an error; unterminated quotes and stray semicolons are tolerated,
+// because a header from the wire should degrade rather than abort.
+export fn mime_parse(s: string): MediaType {
+    let mt = new MediaType("", "");
+    let semi = s.index_of(";");
+    let head = s;
+    if (semi >= 0) { head = s.slice(0, semi); }
+    head = head.trim();
+    let slash = head.index_of("/");
+    if (head.len == 0) {
+        mt.err = "empty media type";
+        return mt;
+    }
+    if (slash < 0) {
+        mt.err = "media type has no '/'";
+        mt.type = head.to_lower();
+        return mt;
+    }
+    mt.type = head.slice(0, slash).trim().to_lower();
+    mt.subtype = head.slice(slash + 1, head.len).trim().to_lower();
+    if (semi >= 0) { scan_params(s, semi, mt.keys, mt.vals); }
+    return mt;
+}
+
+// Shared `; name=value` / `; name="value"` scanner. Used for media types and
+// for Content-Disposition, which has the same parameter grammar over a head
+// that is a bare token rather than type/subtype. Appends into keys/vals.
+fn scan_params(s: string, start: int, keys: string[], vals: string[]) {
+    let i = start;
+    while (i < s.len) {
+        if (s[i] != 59) { i += 1; continue; }    // find the next ';'
+        i += 1;
+        while (i < s.len && (s[i] == 32 || s[i] == 9)) { i += 1; }
+        let nameStart = i;
+        while (i < s.len && s[i] != 61 && s[i] != 59) { i += 1; }
+        let name = s.slice(nameStart, i).trim().to_lower();
+        if (i >= s.len || s[i] == 59) {
+            if (name.len > 0) { keys.push(name); vals.push(""); }
+            continue;
+        }
+        i += 1;                                   // skip '='
+        while (i < s.len && (s[i] == 32 || s[i] == 9)) { i += 1; }
+        let v = "";
+        if (i < s.len && s[i] == 34) {            // quoted-string
+            i += 1;
+            let sb = new StringBuilder(16);
+            while (i < s.len && s[i] != 34) {
+                if (s[i] == 92 && i + 1 < s.len) { i += 1; }   // '\' escapes the next byte
+                sb.appendByte(s[i]);
+                i += 1;
+            }
+            if (i < s.len) { i += 1; }            // closing quote
+            v = sb.toString();
+        } else {
+            let vs = i;
+            while (i < s.len && s[i] != 59) { i += 1; }
+            v = s.slice(vs, i).trim();
+        }
+        if (name.len > 0) { keys.push(name); vals.push(v); }
+    }
+}
+
+// Quote a parameter value if it contains anything outside the token charset.
+fn quote_param(v: string): string {
+    let needs = v.len == 0;
+    let i = 0;
+    while (i < v.len) {
+        let c = v[i];
+        let tok = (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) ||
+                  c == 45 || c == 46 || c == 95 || c == 126 || c == 43 || c == 33 ||
+                  c == 35 || c == 36 || c == 38 || c == 94 || c == 96 || c == 124;
+        if (!tok) { needs = true; }
+        i += 1;
+    }
+    if (!needs) { return v; }
+    let sb = new StringBuilder(v.len + 4);
+    sb.appendByte(34);
+    let j = 0;
+    while (j < v.len) {
+        let c = v[j];
+        if (c == 34 || c == 92) { sb.appendByte(92); }
+        sb.appendByte(c);
+        j += 1;
+    }
+    sb.appendByte(34);
+    return sb.toString();
+}
+
+// ---- extension → type ------------------------------------------------------
+
+// Media type for a file extension, with or without its leading dot and in any
+// case: mime_from_ext("PNG") and mime_from_ext(".png") both give "image/png".
+// Unknown extensions give "application/octet-stream".
+export fn mime_from_ext(ext: string): string {
+    let e = ext.to_lower();
+    if (e.starts_with(".")) { e = e.slice(1, e.len); }
+    if (e == "txt" || e == "text" || e == "log" || e == "ini" || e == "cfg") { return "text/plain; charset=utf-8"; }
+    if (e == "html" || e == "htm") { return "text/html; charset=utf-8"; }
+    if (e == "css") { return "text/css; charset=utf-8"; }
+    if (e == "csv") { return "text/csv; charset=utf-8"; }
+    if (e == "md" || e == "markdown") { return "text/markdown; charset=utf-8"; }
+    if (e == "js" || e == "mjs") { return "text/javascript; charset=utf-8"; }
+    if (e == "json") { return "application/json"; }
+    if (e == "jsonl" || e == "ndjson") { return "application/x-ndjson"; }
+    if (e == "xml") { return "application/xml"; }
+    if (e == "xhtml") { return "application/xhtml+xml"; }
+    if (e == "toml") { return "application/toml"; }
+    if (e == "yaml" || e == "yml") { return "application/yaml"; }
+    if (e == "pdf") { return "application/pdf"; }
+    if (e == "zip") { return "application/zip"; }
+    if (e == "gz") { return "application/gzip"; }
+    if (e == "tar") { return "application/x-tar"; }
+    if (e == "bz2") { return "application/x-bzip2"; }
+    if (e == "xz") { return "application/x-xz"; }
+    if (e == "7z") { return "application/x-7z-compressed"; }
+    if (e == "wasm") { return "application/wasm"; }
+    if (e == "png") { return "image/png"; }
+    if (e == "jpg" || e == "jpeg") { return "image/jpeg"; }
+    if (e == "gif") { return "image/gif"; }
+    if (e == "webp") { return "image/webp"; }
+    if (e == "avif") { return "image/avif"; }
+    if (e == "bmp") { return "image/bmp"; }
+    if (e == "ico") { return "image/vnd.microsoft.icon"; }
+    if (e == "svg") { return "image/svg+xml"; }
+    if (e == "tif" || e == "tiff") { return "image/tiff"; }
+    if (e == "mp3") { return "audio/mpeg"; }
+    if (e == "wav") { return "audio/wav"; }
+    if (e == "ogg" || e == "oga") { return "audio/ogg"; }
+    if (e == "opus") { return "audio/opus"; }
+    if (e == "flac") { return "audio/flac"; }
+    if (e == "aac") { return "audio/aac"; }
+    if (e == "mp4" || e == "m4v") { return "video/mp4"; }
+    if (e == "webm") { return "video/webm"; }
+    if (e == "mkv") { return "video/x-matroska"; }
+    if (e == "mov") { return "video/quicktime"; }
+    if (e == "avi") { return "video/x-msvideo"; }
+    if (e == "ttf") { return "font/ttf"; }
+    if (e == "otf") { return "font/otf"; }
+    if (e == "woff") { return "font/woff"; }
+    if (e == "woff2") { return "font/woff2"; }
+    if (e == "vt") { return "text/x-vyto; charset=utf-8"; }
+    if (e == "c" || e == "h") { return "text/x-c; charset=utf-8"; }
+    if (e == "sh") { return "application/x-sh"; }
+    return "application/octet-stream";
+}
+
+// Media type for a path, from its last extension. A dotfile with no extension
+// ("/etc/.bashrc") and an extensionless name both give the default type.
+export fn mime_from_path(p: string): string { return mime_from_ext(path_ext_of(p)); }
+
+// Last ".ext" of a path, including the dot; "" when there is none. Inlined
+// rather than imported from vyto/io/file — see the module header.
+fn path_ext_of(p: string): string {
+    let i = p.len - 1;
+    while (i >= 0) {
+        let c = p[i];
+        if (c == 47 || c == 92) { return ""; }         // '/' or '\': no dot in the last segment
+        if (c == 46) {
+            if (i == 0) { return ""; }
+            let prev = p[i - 1];
+            if (prev == 47 || prev == 92) { return ""; }   // a dotfile, not an extension
+            return p.slice(i, p.len);
+        }
+        i -= 1;
+    }
+    return "";
+}
+
+// ---- multipart -------------------------------------------------------------
+
+// One part of a multipart body: its headers plus its raw content.
+export class Part {
+    keys: string[];
+    vals: string[];
+    body: string;
+
+    fn init() { this.keys = []; this.vals = []; this.body = ""; }
+
+    // Case-insensitive header lookup; "" when absent.
+    fn header(name: string): string {
+        let want = name.to_lower();
+        let i = 0;
+        while (i < this.keys.len) {
+            if (this.keys[i] == want) { return this.vals[i]; }
+            i += 1;
+        }
+        return "";
+    }
+    fn headerCount(): int { return this.keys.len; }
+    fn headerName(i: int): string {
+        if (i >= 0 && i < this.keys.len) { return this.keys[i]; }
+        return "";
+    }
+
+    // The `name` parameter of Content-Disposition — the form field name.
+    fn name(): string { return this.disposition("name"); }
+    // The `filename` parameter of Content-Disposition; "" for a plain field.
+    fn filename(): string { return this.disposition("filename"); }
+    fn contentType(): string { return this.header("content-type"); }
+    fn isFile(): bool { return this.filename() != ""; }
+
+    fn disposition(param: string): string {
+        let cd = this.header("content-disposition");
+        if (cd.len == 0) { return ""; }
+        let keys: string[] = [];
+        let vals: string[] = [];
+        scan_params(cd, 0, keys, vals);
+        let want = param.to_lower();
+        let i = 0;
+        while (i < keys.len) {
+            if (keys[i] == want) { return vals[i]; }
+            i += 1;
+        }
+        return "";
+    }
+}
+
+// Build a multipart/form-data body. The boundary is supplied by the caller
+// (see the header): it must not appear anywhere in the content, which is why
+// a random one is the right answer and why this module will not invent it.
+export class MultipartWriter {
+    bnd: string;
+    sb: StringBuilder;
+    closed: bool;
+
+    fn init(boundary: string) {
+        this.bnd = boundary;
+        this.sb = new StringBuilder(512);
+        this.closed = false;
+    }
+
+    fn boundary(): string { return this.bnd; }
+    // The Content-Type header value that names this body's boundary.
+    fn contentType(): string { return "multipart/form-data; boundary=" + this.bnd; }
+
+    // A plain form field.
+    fn addField(name: string, value: string): MultipartWriter {
+        this.sb.append("--").append(this.bnd).append("\r\n");
+        this.sb.append("Content-Disposition: form-data; name=");
+        this.sb.append(quote_param(name)).append("\r\n\r\n");
+        this.sb.append(value).append("\r\n");
+        return this;
+    }
+
+    // A file part. `ctype` may be "" to let mime_from_path guess from the name.
+    fn addFile(name: string, filename: string, ctype: string, data: byte[]): MultipartWriter {
+        let t = ctype;
+        if (t == "") { t = mime_from_path(filename); }
+        this.sb.append("--").append(this.bnd).append("\r\n");
+        this.sb.append("Content-Disposition: form-data; name=");
+        this.sb.append(quote_param(name));
+        this.sb.append("; filename=").append(quote_param(filename)).append("\r\n");
+        this.sb.append("Content-Type: ").append(t).append("\r\n\r\n");
+        let i = 0;
+        while (i < data.len) {
+            this.sb.appendByte(data[i] as int);
+            i += 1;
+        }
+        this.sb.append("\r\n");
+        return this;
+    }
+
+    // Byte length written so far, excluding the closing delimiter.
+    fn len(): int { return this.sb.len(); }
+
+    // Append the closing delimiter and return the body. Idempotent.
+    fn finish(): string {
+        if (!this.closed) {
+            this.sb.append("--").append(this.bnd).append("--\r\n");
+            this.closed = true;
+        }
+        return this.sb.toString();
+    }
+}
+
+export fn multipartWriter(boundary: string): MultipartWriter {
+    return new MultipartWriter(boundary);
+}
+
+// Split a multipart body on its boundary. Returns however many well-formed
+// parts it found — a truncated or boundary-less body yields an empty array
+// rather than an error, on the same soft-failure principle as the rest of the
+// module. Prologue and epilogue are discarded.
+export fn multipart_parse(body: string, boundary: string): Part[] {
+    let out: Part[] = [];
+    if (boundary.len == 0) { return out; }
+    let delim = "--" + boundary;
+    let pos = body.index_of(delim);
+    if (pos < 0) { return out; }
+    while (pos >= 0) {
+        let after = pos + delim.len;
+        if (after + 1 < body.len && body[after] == 45 && body[after + 1] == 45) { break; }  // "--" closer
+        // Skip the CRLF (or bare LF) that ends the delimiter line.
+        if (after < body.len && body[after] == 13) { after += 1; }
+        if (after < body.len && body[after] == 10) { after += 1; }
+        let next = index_at(body, delim, after);
+        let end = body.len;
+        if (next >= 0) { end = next; }
+        let raw = body.slice(after, end);
+        // The CRLF before the next delimiter belongs to the delimiter, not the part.
+        if (raw.ends_with("\r\n")) { raw = raw.slice(0, raw.len - 2); }
+        else { if (raw.ends_with("\n")) { raw = raw.slice(0, raw.len - 1); } }
+        out.push(parse_part(raw));
+        pos = next;
+    }
+    return out;
+}
+
+fn parse_part(raw: string): Part {
+    let p = new Part();
+    let split = raw.index_of("\r\n\r\n");
+    let sepLen = 4;
+    if (split < 0) {
+        split = raw.index_of("\n\n");
+        sepLen = 2;
+    }
+    if (split < 0) {
+        p.body = raw;
+        return p;
+    }
+    let head = raw.slice(0, split);
+    p.body = raw.slice(split + sepLen, raw.len);
+    let lines = head.lines();
+    let i = 0;
+    while (i < lines.len) {
+        let line = lines[i];
+        i += 1;
+        let colon = line.index_of(":");
+        if (colon < 0) { continue; }
+        let k = line.slice(0, colon).trim().to_lower();
+        let v = line.slice(colon + 1, line.len).trim();
+        if (k.len == 0) { continue; }
+        p.keys.push(k);
+        p.vals.push(v);
+    }
+    return p;
+}
+
+// First index of `sub` at or after `at`, or -1.
+fn index_at(s: string, sub: string, at: int): int {
+    if (at >= s.len) { return -1; }
+    let rel = s.slice(at, s.len).index_of(sub);
+    if (rel < 0) { return -1; }
+    return at + rel;
+}
