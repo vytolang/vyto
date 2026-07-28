@@ -5,6 +5,7 @@
 #include "parse.h"
 
 #include <dirent.h>
+#include <errno.h>
 #include <libgen.h>
 #include <limits.h>
 #include <sys/stat.h>
@@ -46,6 +47,28 @@ static bool file_exists(const char *path) {
 static bool dir_exists(const char *path) {
     struct stat st;
     return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
+}
+
+static bool dir_writable(const char *path) {
+    return access(path, W_OK | X_OK) == 0;
+}
+
+static int run_cmd(const char *cmd, bool echo);   /* defined below */
+
+/* mkdir -p. Returns 0 when the directory exists afterwards. Walks the path
+   creating each component, ignoring EEXIST so a concurrent build racing us is
+   not an error. */
+static int mkdir_p(const char *path) {
+    if (dir_exists(path)) return 0;
+    char *tmp = arena_strdup(&g_arena, path);
+    for (char *p = tmp + 1; *p; p++) {
+        if (*p != '/') continue;
+        *p = 0;
+        if (mkdir(tmp, 0755) != 0 && errno != EEXIST) { *p = '/'; return -1; }
+        *p = '/';
+    }
+    if (mkdir(tmp, 0755) != 0 && errno != EEXIST) return -1;
+    return dir_exists(path) ? 0 : -1;
 }
 
 /* Locate the stdlib directory: $VYTO_HOME/lib, else lib/ next to the vytoc
@@ -124,6 +147,190 @@ static const char *lib_module_name(const char *libdir, const char *canon) {
         if (strlen(leaf) == dirlen && strncmp(prev, leaf, dirlen) == 0) *slash = 0;
     }
     return sanitize(p);
+}
+
+/* ---- shared object cache ------------------------------------------------
+ *
+ * Objects compiled from files that do not depend on the program being built --
+ * the runtime, and every native package's C -- are content-addressed and shared
+ * across every entry-file directory on the machine. Without this, each
+ * directory that runs a program gets its own .vyto-cache and recompiles the
+ * same translation units: vyto/regex vendors 30 of them, so examples/ and
+ * tests/fixtures/ were each holding a byte-identical copy.
+ *
+ * Emitted Vyto C (mod_*.c) is deliberately NOT shared. A generic instantiation
+ * is attached to the module that declared the generic (check.c, instantiate_fn),
+ * so mod_vyto_util_sort.c contains sort_by__int or sort_by__MyType depending on
+ * what the *program* asked for. Those objects stay in the local cache.
+ */
+
+/* Where shared objects live. In order: $VYTO_OBJ_CACHE (or "off" to disable),
+ * the repo root beside the stdlib, then the user cache dir. Never fatal --
+ * a build that cannot find anywhere to share simply keeps its objects local. */
+static const char *find_obj_cache_dir(void) {
+    static bool cached = false;
+    static const char *dir;
+    if (cached) return dir;
+    cached = true;
+
+    const char *env = getenv("VYTO_OBJ_CACHE");
+    if (env && strcmp(env, "off") == 0) return dir = NULL;
+    if (env && *env) {
+        if (mkdir_p(env) == 0 && dir_writable(env)) return dir = arena_strdup(&g_arena, env);
+        return dir = NULL;              /* explicit request we cannot honour */
+    }
+
+    /* find_lib_dir() canonicalizes to <root>/lib, so its parent is the repo
+       root in a checkout -- no separate root discovery, no git dependency. */
+    const char *lib = find_lib_dir();
+    if (lib) {
+        const char *p = arena_printf(&g_arena, "%s/.vyto-cache/obj", dir_of(lib));
+        if (mkdir_p(p) == 0 && dir_writable(p)) return dir = p;
+    }
+
+    /* Installed vytoc: the stdlib sits somewhere unwritable like /usr/local. */
+    const char *xdg = getenv("XDG_CACHE_HOME");
+    const char *home = getenv("HOME");
+    const char *p = NULL;
+    if (xdg && *xdg) p = arena_printf(&g_arena, "%s/vyto/obj", xdg);
+    else if (home && *home) p = arena_printf(&g_arena, "%s/.cache/vyto/obj", home);
+    if (p && mkdir_p(p) == 0 && dir_writable(p)) return dir = p;
+
+    return dir = NULL;
+}
+
+/* Digest every file directly in `d` (name and bytes, in readdir order made
+ * deterministic by sorting) into `h`.
+ *
+ * Hashing the whole directory rather than just the one translation unit is the
+ * point: an object depends on the headers it includes, so keying on
+ * vregex_compile.c alone would serve a stale object after an edit to
+ * pcre2_internal.h. This is the content-addressed replacement for the
+ * newest-mtime scan that used to guard these objects.
+ *
+ * It does not cover headers from outside the directory (system headers, a
+ * per-triple include dir). Neither did the mtime rule, so this is not a
+ * regression -- but it is why the -I flags stay part of the key. */
+/* Bits reported by dir_digest: which baked-in directory macros the package's
+   sources actually mention. */
+#define USES_LIBDIR 1u
+#define USES_APPDIR 2u
+
+static uint64_t dir_digest_at(const char *d, int depth, unsigned *uses) {
+    if (depth > 8) return 0;               /* guard against a symlink cycle */
+    char *names[1024];
+    int n = 0;
+    DIR *dp = opendir(d);
+    if (!dp) return 0;
+    struct dirent *de;
+    while ((de = readdir(dp)) && n < 1024) {
+        if (de->d_name[0] == '.') continue;
+        names[n++] = arena_strdup(&g_arena, de->d_name);
+    }
+    closedir(dp);
+    for (int i = 1; i < n; i++) {          /* insertion sort: n is small */
+        char *k = names[i];
+        int j = i - 1;
+        while (j >= 0 && strcmp(names[j], k) > 0) { names[j + 1] = names[j]; j--; }
+        names[j + 1] = k;
+    }
+    uint64_t h = 1469598103934665603ULL;
+    for (int i = 0; i < n; i++) {
+        const char *p = arena_printf(&g_arena, "%s/%s", d, names[i]);
+        struct stat st;
+        if (stat(p, &st) != 0) continue;
+        h ^= fnv1a(names[i], strlen(names[i]));
+        h *= 1099511628211ULL;
+        if (S_ISDIR(st.st_mode)) {
+            /* Recurse. The flat glob does not compile subdirectories, but their
+               contents are still inputs: vyto/regex keeps the whole vendored
+               PCRE2 tree under native/src/pcre2/ and includes into it, so an
+               edit there must invalidate the objects. The mtime rule this
+               replaces missed that -- a directory's mtime does not change when
+               a file inside it is edited. */
+            h ^= dir_digest_at(p, depth + 1, uses);
+            h *= 1099511628211ULL;
+            continue;
+        }
+        /* Regular files only. fopen() on anything else (a fifo, a device)
+           either blocks or reports a nonsense size to read_file. */
+        if (!S_ISREG(st.st_mode)) continue;
+        size_t len = 0;
+        char *src = read_file(p, &len);
+        if (!src) continue;
+        h ^= fnv1a(src, len);
+        h *= 1099511628211ULL;
+        /* read_file NUL-terminates, so strstr is safe on source text. */
+        if (uses) {
+            if (strstr(src, "VYTO_LIBDIR")) *uses |= USES_LIBDIR;
+            if (strstr(src, "VYTO_APPDIR")) *uses |= USES_APPDIR;
+        }
+    }
+    return h;
+}
+
+static uint64_t dir_digest(const char *d, unsigned *uses) {
+    if (uses) *uses = 0;
+    return dir_digest_at(d, 0, uses);
+}
+
+/* Compile `csrc` to a shared object and return its path, or NULL when there is
+ * no shared cache and the caller should fall back to its local one.
+ *
+ * `cmd_head` is everything on the compile line before `-c -o <out> <src>`: the
+ * compiler, the optimisation level, the sanitizer and freestanding flags, every
+ * -D (including -DVYTO_APPDIR, which is why vyto/os's shim correctly gets one
+ * entry per app while every other package shares one) and every -I. Hashing it
+ * therefore keys the object by target triple and build profile as well, and
+ * nothing else needs adding.
+ *
+ * It is taken as a plain string rather than a printf format on purpose: a path
+ * containing a '%' would otherwise be re-interpreted as a conversion.
+ *
+ * Writes via a pid-suffixed temporary and rename(), which is atomic within a
+ * directory: a concurrent build never observes a half-written object, and two
+ * builds racing on the same key simply both compile and one wins. */
+static const char *cached_object(const char *csrc, uint64_t inputs, const char *cmd_head,
+                                 const char *what, bool verbose, bool *compiled) {
+    const char *root = find_obj_cache_dir();
+    if (!root) return NULL;            /* NULL means "no shared cache", nothing else */
+
+    uint64_t h = inputs;
+    h ^= fnv1a(cmd_head, strlen(cmd_head));
+    h *= 1099511628211ULL;
+    h ^= fnv1a(csrc, strlen(csrc));
+    h *= 1099511628211ULL;
+
+    const char *shard = arena_printf(&g_arena, "%s/%02x", root, (unsigned)(h >> 56) & 0xff);
+    mkdir(shard, 0755);
+    const char *obj = arena_printf(&g_arena, "%s/%016llx.o", shard, (unsigned long long)h);
+    if (file_exists(obj)) return obj;
+
+    const char *tmp = arena_printf(&g_arena, "%s/%016llx.o.tmp.%d", shard,
+                                   (unsigned long long)h, (int)getpid());
+    char *cmd = arena_printf(&g_arena, "%s -c -o %s %s", cmd_head, tmp, csrc);
+    if (run_cmd(cmd, verbose) != 0) {
+        unlink(tmp);
+        fatal("%s failed to compile", what);
+    }
+    /* Same directory, so this is atomic. A failure here is the filesystem
+       (full, or permissions changed mid-build), not the compile -- say so
+       rather than blaming the source. */
+    if (rename(tmp, obj) != 0) {
+        unlink(tmp);
+        fatal("cannot write to the object cache at %s", root);
+    }
+
+    /* Sidecar so the cache can be read by a human: which source, which command.
+       `grep -rl pcre2 .vyto-cache/obj` answers "what is this object". */
+    const char *side = arena_printf(&g_arena, "%s/%016llx.txt", shard, (unsigned long long)h);
+    FILE *f = fopen(side, "w");
+    if (f) {
+        fprintf(f, "%s\n%s -c -o %s %s\n", csrc, cmd_head, obj, csrc);
+        fclose(f);
+    }
+    if (compiled) *compiled = true;
+    return obj;
 }
 
 static Module *load_module(const char *path) {
@@ -371,8 +578,8 @@ static void usage(void) {
             "                   into one self-contained exe (no shipped .so)\n"
             "    --with-assets  embed the app's assets/, conf/ and storage/ dirs into\n"
             "                   the binary; without it they resolve from disk at runtime\n"
-            "    --clean        delete this file's .vyto-cache first and rebuild from\n"
-            "                   scratch — use when a build looks stale after a lib edit\n"
+            "    --clean        delete this file's own .vyto-cache and rebuild it; the\n"
+            "                   shared object cache is content-keyed, so it is left alone\n"
             "    --freestanding no libc: route alloc/print/abort through vt_host_* hooks\n"
             "                   the embedder supplies; output is lib<name>.a, not an exe\n"
             "    --no-float     stub float-to-string (no soft-float formatter pulled in)\n"
@@ -526,26 +733,36 @@ int main(int argc, char **argv) {
     sb_init(&objs);
     bool relink = false;
 
-    /* runtime object (cc name sanitized: --cc commands may contain spaces) */
-    const char *rt_o = arena_printf(&g_arena, "%s/vyto_rt_%s%s%s.o", cache, sanitize(cc),
-                                    release ? "_rel" : "", prof);
+    /* Runtime object. Compiled from fixed sources with a fixed command line, so
+       it does not depend on the program being built and is shared across every
+       entry-file directory. The builtin-method helpers are amalgamated into
+       vyto_rt.c via #include, so the translation unit is still vyto_rt.c, but
+       edits to them must invalidate it -- dir_digest over the whole runtime
+       directory covers that and the header at once. */
     const char *rt_c = arena_printf(&g_arena, "%s/vyto_rt.c", rtdir);
-    /* builtin-method helpers are amalgamated into vyto_rt.c via #include, so the
-       compile unit is still vyto_rt.c; track their mtimes so edits rebuild it. */
-    static const char *rt_amalg[] = {"vyto_rt_num.c", "vyto_rt_str.c",
-                                     "vyto_rt_arr.c", "vyto_rt_map.c", "vyto_vfs.c"};
-    long rt_newest = file_mtime(rt_c);
-    long rt_h_mt = file_mtime(arena_printf(&g_arena, "%s/vyto_rt.h", rtdir));
-    if (rt_h_mt > rt_newest) rt_newest = rt_h_mt;
-    for (size_t i = 0; i < sizeof rt_amalg / sizeof *rt_amalg; i++) {
-        long t = file_mtime(arena_printf(&g_arena, "%s/%s", rtdir, rt_amalg[i]));
-        if (t > rt_newest) rt_newest = t;
-    }
-    if (!file_exists(rt_o) || rt_newest > file_mtime(rt_o)) {
-        char *c = arena_printf(&g_arena, "%s %s%s -w -c -o %s %s/vyto_rt.c", cc, opt, fsflags, rt_o,
-                               rtdir);
-        if (run_cmd(c, verbose) != 0) fatal("runtime compilation failed");
-        relink = true;
+    const char *rt_cmd = arena_printf(&g_arena, "%s %s%s -w", cc, opt, fsflags);
+    const char *rt_o = cached_object(rt_c, dir_digest(rtdir, NULL), rt_cmd,
+                                     "the runtime", verbose, &relink);
+    if (!rt_o) {
+        /* No shared cache (or it failed): fall back to a local object, keyed the
+           way it always was. cc is sanitized because --cc may contain spaces. */
+        rt_o = arena_printf(&g_arena, "%s/vyto_rt_%s%s%s.o", cache, sanitize(cc),
+                            release ? "_rel" : "", prof);
+        static const char *rt_amalg[] = {"vyto_rt_num.c", "vyto_rt_str.c",
+                                         "vyto_rt_arr.c", "vyto_rt_map.c", "vyto_vfs.c"};
+        long rt_newest = file_mtime(rt_c);
+        long rt_h_mt = file_mtime(arena_printf(&g_arena, "%s/vyto_rt.h", rtdir));
+        if (rt_h_mt > rt_newest) rt_newest = rt_h_mt;
+        for (size_t i = 0; i < sizeof rt_amalg / sizeof *rt_amalg; i++) {
+            long t = file_mtime(arena_printf(&g_arena, "%s/%s", rtdir, rt_amalg[i]));
+            if (t > rt_newest) rt_newest = t;
+        }
+        if (!file_exists(rt_o) || rt_newest > file_mtime(rt_o)) {
+            char *c = arena_printf(&g_arena, "%s %s%s -w -c -o %s %s", cc, opt, fsflags,
+                                   rt_o, rt_c);
+            if (run_cmd(c, verbose) != 0) fatal("runtime compilation failed");
+            relink = true;
+        }
     }
     sb_printf(&objs, " %s", rt_o);
 
@@ -570,9 +787,12 @@ int main(int argc, char **argv) {
 
         const char *nsrc = arena_printf(&g_arena, "%s/native/src", mdir);
         /* Headers aren't tracked per-object (no dependency scanner), so a .h edit
-           would otherwise serve a stale .o. Rebuild every object in the package
-           when anything under native/src is newer than it — same conservative
-           newest-of-the-set rule the runtime uses above. */
+           would otherwise serve a stale .o. Both paths below therefore key on
+           the whole directory rather than the single translation unit: the
+           shared cache digests its contents, the local fallback takes the
+           newest mtime in it. */
+        unsigned nsrc_uses = 0;
+        uint64_t nsrc_digest = dir_digest(nsrc, &nsrc_uses);
         long nsrc_newest = -1;
         DIR *ndp = opendir(nsrc);
         if (ndp) {
@@ -589,19 +809,26 @@ int main(int argc, char **argv) {
         {
             long t = file_mtime(arena_printf(&g_arena, "%s/native/%s/include", mdir, triple));
             if (t > nsrc_newest) nsrc_newest = t;
+            nsrc_digest ^= dir_digest(arena_printf(&g_arena, "%s/native/%s/include",
+                                                   mdir, triple), NULL);
+            nsrc_digest *= 1099511628211ULL;
         }
         /* Bake the resolved stdlib dir into native shims so vyto_lib_dir() can
            return it at runtime (used to locate vendored assets like fonts).
            Single-quoted so the shell keeps the inner quotes and the C
-           preprocessor sees a string literal. Runtime VYTO_HOME still wins. */
+           preprocessor sees a string literal. Runtime VYTO_HOME still wins.
+           Also the app's own directory (the entry file's dir, canonical) so
+           os_app_dir()/appDir() can find its assets/conf/storage. Runtime
+           VYTO_APP_DIR still wins.
+           Passed ONLY to packages whose sources mention them. VYTO_APPDIR
+           differs per program, so handing it to a package that ignores it --
+           which is every package except vyto/os -- would make otherwise
+           identical objects unshareable for no benefit. */
         const char *lib_dir = find_lib_dir();
-        const char *libdef = lib_dir
+        const char *libdef = (lib_dir && (nsrc_uses & USES_LIBDIR))
             ? arena_printf(&g_arena, " -DVYTO_LIBDIR='\"%s\"'", lib_dir) : "";
-        /* Also bake the app's own directory (the entry file's dir, canonical)
-           so os_app_dir()/appDir() can locate the app's assets/conf/storage at
-           runtime. Runtime VYTO_APP_DIR still wins. */
         const char *app_dir = dir_of(entry->path);
-        const char *appdef = app_dir
+        const char *appdef = (app_dir && (nsrc_uses & USES_APPDIR))
             ? arena_printf(&g_arena, " -DVYTO_APPDIR='\"%s\"'", app_dir) : "";
         /* Headers that belong to one target only. native/src is shared by every
            triple, so a package vendoring headers there imposes them on all of
@@ -619,15 +846,28 @@ int main(int argc, char **argv) {
             while ((de = readdir(dp))) {
                 if (!has_suffix(de->d_name, ".c")) continue;
                 const char *csrc = arena_printf(&g_arena, "%s/%s", nsrc, de->d_name);
-                const char *obj = arena_printf(&g_arena, "%s/native_%s_%s%s%s.o", cache, m->name,
-                                               stem_of(de->d_name), release ? "_rel" : "", prof);
-                if (!file_exists(obj) || nsrc_newest > file_mtime(obj)) {
-                    char *cl = arena_printf(&g_arena, "%s %s%s%s%s -w%s -I%s -c -o %s %s", cc,
-                                            release ? "-O2" : opt, fsflags, libdef, appdef,
-                                            incflag, nsrc, obj, csrc);
-                    if (run_cmd(cl, verbose) != 0)
-                        fatal("native source of package '%s' failed to compile", m->name);
-                    relink = true;
+                /* The command line carries cc, opt, sanitizer and freestanding
+                   flags, both -D bakes and every -I, so hashing it keys the
+                   object by target triple and build profile as well. It is also
+                   what keeps vyto/os honest: its shim is the only one that reads
+                   VYTO_APPDIR, and since appdef differs per app it lands on a
+                   different key while every other package shares one. */
+                const char *cmd = arena_printf(&g_arena, "%s %s%s%s%s -w%s -I%s", cc,
+                                               release ? "-O2" : opt, fsflags, libdef, appdef,
+                                               incflag, nsrc);
+                const char *label = arena_printf(&g_arena, "native source of package '%s'",
+                                                 m->name);
+                const char *obj = cached_object(csrc, nsrc_digest, cmd, label, verbose, &relink);
+                if (!obj) {
+                    /* No shared cache: keep the object beside the program. */
+                    obj = arena_printf(&g_arena, "%s/native_%s_%s%s%s.o", cache, m->name,
+                                       stem_of(de->d_name), release ? "_rel" : "", prof);
+                    if (!file_exists(obj) || nsrc_newest > file_mtime(obj)) {
+                        char *cl = arena_printf(&g_arena, "%s -c -o %s %s", cmd, obj, csrc);
+                        if (run_cmd(cl, verbose) != 0)
+                            fatal("native source of package '%s' failed to compile", m->name);
+                        relink = true;
+                    }
                 }
                 sb_printf(&objs, " %s", obj);
             }

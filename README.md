@@ -42,6 +42,13 @@ make test                         # runs all examples against golden output
 `vytoc build file.vt` compiles to `.vyto-cache/<name>` next to the source.
 Generated C is human-readable — look inside `.vyto-cache/`.
 
+Objects compiled from the runtime and from native packages' C are shared across
+the whole tree in `.vyto-cache/obj/`, keyed on content, so a package like
+`vyto/regex` (30 vendored PCRE2 sources) is compiled once rather than once per
+directory you build from. `make clean-cache` clears everything;
+`VYTO_OBJ_CACHE=off` disables sharing. See
+[docs/getting-started.md](docs/getting-started.md) for the details.
+
 ## Build a standalone executable
 
 `vytoc run` builds and runs in one step. To produce a distributable binary,

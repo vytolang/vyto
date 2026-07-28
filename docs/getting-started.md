@@ -74,6 +74,31 @@ Run it:
 The generated C is human-readable — look inside the `.vyto-cache/` directory
 created next to your source.
 
+### The two caches
+
+Builds use two caches, and knowing which is which saves confusion:
+
+| | Where | Holds |
+|---|---|---|
+| **Local** | `.vyto-cache/` next to the file you ran | the generated C, its objects, and the executable |
+| **Shared** | `.vyto-cache/obj/` at the root of the Vyto tree | objects compiled from the runtime and from native packages' C |
+
+The shared one exists because a native package's C does not depend on the
+program being built. `vyto/regex` vendors 30 translation units of PCRE2; without
+sharing, every directory you ran a program from compiled its own copy. Entries
+are keyed on a hash of the source contents **and** the full compile command, so
+switching branches or touching a file cannot serve a stale object — and reverting
+a change makes the previous objects valid again instantly.
+
+Generated C stays local on purpose: a generic instantiated with your types is
+emitted into the module that *declared* the generic, so a stdlib module's C
+depends on your program.
+
+Delete either at any time — they only cost a rebuild. `make clean-cache` removes
+every one in the tree, including the shared one. `--clean` clears only the local
+cache for that file. `VYTO_OBJ_CACHE=<dir>` moves the shared cache;
+`VYTO_OBJ_CACHE=off` disables sharing entirely.
+
 ## 5. A small GUI app
 
 Vyto ships a native UI toolkit, `vyto/ui`. It renders on two tiers: a lean X11

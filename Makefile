@@ -23,9 +23,10 @@ test: vytoc vytobind
 test-win: vytoc
 	./tests/run_tests_win.sh
 
-# Every .vyto-cache in the tree, including apps/* which `clean` does not cover.
-# Run this before regenerating any golden — a stale cache validates the previous
-# build, not the current one.
+# Every .vyto-cache in the tree, including apps/* which `clean` does not cover
+# and the shared object cache at the repo root (also a .vyto-cache, so the same
+# find catches it). Run this before regenerating any golden — a stale cache
+# validates the previous build, not the current one.
 clean-cache:
 	find . -name .vyto-cache -prune -exec rm -rf {} +
 	rm -rf tests/tmp
