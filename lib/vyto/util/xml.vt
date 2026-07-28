@@ -1,0 +1,938 @@
+// vyto/util/xml — a pull parser and a small DOM, with namespaces and entities.
+//
+//     let r = xmlReader("<feed xmlns='http://www.w3.org/2005/Atom'><title>Hi</title></feed>");
+//     while (r.next() != XML_EOF) {
+//         if (r.kind() == XML_START) { print(r.localName() + " in " + r.nsUri()); }
+//     }
+//
+//     let doc = xml_parse("<rss><channel><title>News</title></channel></rss>");
+//     doc.findDeep("title").text()          // "News"
+//     doc.root().name()                     // "rss"
+//
+// Two layers over one scanner. The pull reader is the primary API — it walks a
+// document in constant memory, which is what a 40 MB feed or a .xlsx sheet
+// needs. The DOM sits on top for the common case where the document is small
+// and random access is easier to write.
+//
+// Namespaces are resolved as you go: a prefix→URI scope stack is pushed and
+// popped with element depth, so nsUri() answers for the element in hand and
+// `xmlns` redefinitions nest correctly. The five predefined entities and
+// numeric character references (&#65; &#x41;) are decoded in text and in
+// attribute values.
+//
+// Failure is soft, as in vyto/util/json: the reader never panics. A malformed
+// construct sets error(), and next() returns XML_ERR and then XML_EOF. The DOM
+// returns whatever it built with the error attached to the document node.
+//
+// Caveat: no DTD, so no external entities (deliberately — that is the XXE
+// attack), no entity declarations beyond the predefined five, and no
+// validation. A `<!DOCTYPE>` is skipped, internal subset and all. Encoding is
+// assumed to be UTF-8: the XML declaration's `encoding` is reported but never
+// acted on, because Vyto strings are UTF-8 bytes and transcoding belongs in a
+// separate module.
+
+import { StringBuilder } from "vyto/util/text";
+
+// ---- token kinds -----------------------------------------------------------
+
+export const XML_NONE:    int = 0;   // before the first next()
+export const XML_START:   int = 1;   // <name ...>  or  <name .../>
+export const XML_END:     int = 2;   // </name>  (also synthesized for <name/>)
+export const XML_TEXT:    int = 3;
+export const XML_CDATA:   int = 4;
+export const XML_COMMENT: int = 5;
+export const XML_PI:      int = 6;   // <?target data?>
+export const XML_DOCTYPE: int = 7;
+export const XML_EOF:     int = 8;
+export const XML_ERR:     int = 9;
+
+// Recursion is bounded the same way json.vt bounds it: element nesting costs a
+// stack frame in the DOM builder, so hostile input must soft-fail rather than
+// overflow the C stack.
+const XML_MAX_DEPTH: int = 1024;
+
+// ---- escaping --------------------------------------------------------------
+
+// Escape text content: `&`, `<` and `>`. (`>` is not strictly required outside
+// `]]>`, but escaping it costs nothing and removes the exception.)
+export fn xml_escape(s: string): string { return escape_into(s, false); }
+
+// Escape an attribute value: text escaping plus `"` and `'`.
+export fn xml_escape_attr(s: string): string { return escape_into(s, true); }
+
+fn escape_into(s: string, attr: bool): string {
+    let sb = new StringBuilder(s.len + 16);
+    let runStart = 0;
+    let i = 0;
+    while (i < s.len) {
+        let c = s[i];
+        let rep = "";
+        if (c == 38) { rep = "&amp;"; }
+        else { if (c == 60) { rep = "&lt;"; }
+        else { if (c == 62) { rep = "&gt;"; }
+        else { if (attr && c == 34) { rep = "&quot;"; }
+        else { if (attr && c == 39) { rep = "&apos;"; } } } } }
+        if (rep == "") { i += 1; continue; }
+        if (i > runStart) { sb.append(s.slice(runStart, i)); }
+        sb.append(rep);
+        i += 1;
+        runStart = i;
+    }
+    if (i > runStart) { sb.append(s.slice(runStart, i)); }
+    return sb.toString();
+}
+
+// Decode the five predefined entities and numeric character references. An
+// unrecognized `&name;` is left exactly as written rather than dropped — there
+// is no DTD here to define it, and silently deleting content is worse than
+// passing it through.
+export fn xml_unescape(s: string): string {
+    if (s.index_of("&") < 0) { return s; }
+    let sb = new StringBuilder(s.len);
+    let runStart = 0;
+    let i = 0;
+    while (i < s.len) {
+        if (s[i] != 38) { i += 1; continue; }
+        let semi = index_at(s, ";", i + 1);
+        if (semi < 0 || semi - i > 12) { i += 1; continue; }
+        let body = s.slice(i + 1, semi);
+        let rep = entity_value(body);
+        if (rep == "") { i += 1; continue; }
+        if (i > runStart) { sb.append(s.slice(runStart, i)); }
+        sb.append(rep);
+        i = semi + 1;
+        runStart = i;
+    }
+    if (i > runStart) { sb.append(s.slice(runStart, i)); }
+    return sb.toString();
+}
+
+// The replacement text for an entity body (what sits between & and ;), or ""
+// when it is not one this parser knows.
+fn entity_value(body: string): string {
+    if (body == "amp") { return "&"; }
+    if (body == "lt") { return "<"; }
+    if (body == "gt") { return ">"; }
+    if (body == "quot") { return "\""; }
+    if (body == "apos") { return "'"; }
+    if (body.len < 2 || body[0] != 35) { return ""; }        // '#'
+    let cp = 0;
+    if (body[1] == 120 || body[1] == 88) {                    // 'x' or 'X'
+        if (body.len < 3) { return ""; }
+        let i = 2;
+        while (i < body.len) {
+            let v = hex_val(body[i]);
+            if (v < 0) { return ""; }
+            cp = cp * 16 + v;
+            i += 1;
+        }
+    } else {
+        let i = 1;
+        while (i < body.len) {
+            let c = body[i];
+            if (c < 48 || c > 57) { return ""; }
+            cp = cp * 10 + (c - 48);
+            i += 1;
+        }
+    }
+    if (cp <= 0 || cp > 0x10FFFF) { return ""; }
+    return utf8_encode(cp);
+}
+
+fn hex_val(c: int): int {
+    if (c >= 48 && c <= 57) { return c - 48; }
+    if (c >= 97 && c <= 102) { return c - 87; }
+    if (c >= 65 && c <= 70) { return c - 55; }
+    return -1;
+}
+
+// A Unicode scalar as UTF-8. Same four length classes as json.vt's encoder.
+fn utf8_encode(cp: int): string {
+    let b = bytes(5);
+    let n = 0;
+    if (cp < 0x80) {
+        b[0] = cp as byte;
+        n = 1;
+    } else {
+        if (cp < 0x800) {
+            b[0] = (0xC0 | (cp >> 6)) as byte;
+            b[1] = (0x80 | (cp & 0x3F)) as byte;
+            n = 2;
+        } else {
+            if (cp < 0x10000) {
+                b[0] = (0xE0 | (cp >> 12)) as byte;
+                b[1] = (0x80 | ((cp >> 6) & 0x3F)) as byte;
+                b[2] = (0x80 | (cp & 0x3F)) as byte;
+                n = 3;
+            } else {
+                b[0] = (0xF0 | (cp >> 18)) as byte;
+                b[1] = (0x80 | ((cp >> 12) & 0x3F)) as byte;
+                b[2] = (0x80 | ((cp >> 6) & 0x3F)) as byte;
+                b[3] = (0x80 | (cp & 0x3F)) as byte;
+                n = 4;
+            }
+        }
+    }
+    return strbytes(b, n);
+}
+
+fn index_at(s: string, sub: string, at: int): int {
+    if (at >= s.len) { return -1; }
+    let rel = s.slice(at, s.len).index_of(sub);
+    if (rel < 0) { return -1; }
+    return at + rel;
+}
+
+// ---- the pull reader -------------------------------------------------------
+
+// A streaming XML scanner. next() advances to the next token and returns its
+// kind; the accessors describe the token in hand.
+//
+// `<name/>` is reported as an XML_START immediately followed by an XML_END, so
+// a consumer never has to special-case empty elements — the same choice Java's
+// StAX and Go's xml.Decoder make.
+export class XmlReader {
+    s: string;
+    pos: int;
+    n: int;
+    tok: int;
+    rawName: string;
+    txt: string;
+    akeys: string[];
+    avals: string[];
+    err: string;
+    line: int;
+    selfClose: bool;
+    pendingEnd: bool;
+    skipSpace: bool;
+
+    // Open elements, and the namespace scope stack. `marks[d]` is the length of
+    // the prefix stack when element d was entered, so closing it truncates back.
+    stack: string[];
+    marks: int[];
+    nsPre: string[];
+    nsUriv: string[];
+
+    fn init(text: string) {
+        this.s = text;
+        this.pos = 0;
+        this.n = text.len;
+        this.tok = XML_NONE;
+        this.rawName = "";
+        this.txt = "";
+        this.akeys = [];
+        this.avals = [];
+        this.err = "";
+        this.line = 1;
+        this.selfClose = false;
+        this.pendingEnd = false;
+        this.skipSpace = false;
+        this.stack = [];
+        this.marks = [];
+        this.nsPre = [];
+        this.nsUriv = [];
+    }
+
+    // Skip text tokens that are entirely whitespace. Off by default, because in
+    // mixed content ("<p>a <b>b</b> c</p>") that whitespace is meaningful; turn
+    // it on for element-only documents like configuration or RSS.
+    fn ignoreWhitespace(b: bool): XmlReader { this.skipSpace = b; return this; }
+
+    fn kind(): int { return this.tok; }
+    fn error(): string { return this.err; }
+    fn ok(): bool { return this.err == ""; }
+    fn lineNo(): int { return this.line; }
+    fn depth(): int { return this.stack.len; }
+    fn isSelfClosing(): bool { return this.selfClose; }
+
+    // Element name exactly as written, prefix included.
+    fn name(): string { return this.rawName; }
+    fn localName(): string { return local_of(this.rawName); }
+    fn prefix(): string { return prefix_of(this.rawName); }
+    // Namespace URI in effect for this element's prefix; "" when unbound.
+    fn nsUri(): string { return this.lookupNs(prefix_of(this.rawName)); }
+
+    // Text, CDATA, comment body, or PI content, entities already decoded.
+    fn text(): string { return this.txt; }
+
+    fn attrCount(): int { return this.akeys.len; }
+    fn attrName(i: int): string {
+        if (i >= 0 && i < this.akeys.len) { return this.akeys[i]; }
+        return "";
+    }
+    fn attrLocalName(i: int): string { return local_of(this.attrName(i)); }
+    fn attrPrefix(i: int): string { return prefix_of(this.attrName(i)); }
+    fn attrValue(i: int): string {
+        if (i >= 0 && i < this.avals.len) { return this.avals[i]; }
+        return "";
+    }
+    // Attribute by name as written; "" when absent.
+    fn attr(name: string): string {
+        let i = 0;
+        while (i < this.akeys.len) {
+            if (this.akeys[i] == name) { return this.avals[i]; }
+            i += 1;
+        }
+        return "";
+    }
+    fn hasAttr(name: string): bool {
+        let i = 0;
+        while (i < this.akeys.len) {
+            if (this.akeys[i] == name) { return true; }
+            i += 1;
+        }
+        return false;
+    }
+    // Attribute by namespace URI and local name. An unprefixed attribute is in
+    // *no* namespace (not the default one) — that is what the spec says, and
+    // getting it wrong is the classic namespace bug.
+    fn attrNs(uri: string, local: string): string {
+        let i = 0;
+        while (i < this.akeys.len) {
+            let p = prefix_of(this.akeys[i]);
+            if (p != "" && local_of(this.akeys[i]) == local && this.lookupNs(p) == uri) {
+                return this.avals[i];
+            }
+            i += 1;
+        }
+        return "";
+    }
+
+    // Innermost binding for `prefix` ("" is the default namespace).
+    fn lookupNs(prefix: string): string {
+        let i = this.nsPre.len - 1;
+        while (i >= 0) {
+            if (this.nsPre[i] == prefix) { return this.nsUriv[i]; }
+            i -= 1;
+        }
+        if (prefix == "xml") { return "http://www.w3.org/XML/1998/namespace"; }
+        return "";
+    }
+
+    fn fail(msg: string): int {
+        if (this.err == "") { this.err = msg + " at line " + str(this.line); }
+        this.tok = XML_ERR;
+        this.pos = this.n;
+        return this.tok;
+    }
+
+    // Advance to the next token; XML_EOF at the end, XML_ERR once on a
+    // malformed construct.
+    fn next(): int {
+        if (this.tok == XML_ERR) { this.tok = XML_EOF; return this.tok; }
+        // The synthetic close of a <name/>.
+        if (this.pendingEnd) {
+            this.pendingEnd = false;
+            this.tok = XML_END;
+            this.selfClose = true;
+            this.popScope();
+            return this.tok;
+        }
+        this.selfClose = false;
+        this.akeys = [];
+        this.avals = [];
+        this.rawName = "";
+        this.txt = "";
+
+        if (this.pos >= this.n) {
+            if (this.stack.len > 0) { return this.fail("unclosed element <" + this.stack[this.stack.len - 1] + ">"); }
+            this.tok = XML_EOF;
+            return this.tok;
+        }
+
+        if (this.s[this.pos] != 60) { return this.textToken(); }   // '<'
+
+        // '<' — decide which construct.
+        if (this.startsWith("<!--")) { return this.comment(); }
+        if (this.startsWith("<![CDATA[")) { return this.cdata(); }
+        if (this.startsWith("<?")) { return this.pi(); }
+        if (this.startsWith("<!DOCTYPE")) { return this.doctype(); }
+        if (this.startsWith("</")) { return this.endTag(); }
+        if (this.pos + 1 >= this.n) { return this.fail("truncated tag"); }
+        return this.startTag();
+    }
+
+    fn startsWith(lit: string): bool {
+        if (this.pos + lit.len > this.n) { return false; }
+        return this.s.slice(this.pos, this.pos + lit.len) == lit;
+    }
+
+    // ('from' is a keyword, hence the parameter names.)
+    fn countLines(lo: int, hi: int) {
+        let i = lo;
+        while (i < hi) {
+            if (this.s[i] == 10) { this.line += 1; }
+            i += 1;
+        }
+    }
+
+    fn textToken(): int {
+        let start = this.pos;
+        while (this.pos < this.n && this.s[this.pos] != 60) { this.pos += 1; }
+        let raw = this.s.slice(start, this.pos);
+        this.countLines(start, this.pos);
+        if (this.skipSpace && raw.trim() == "") { return this.next(); }
+        this.txt = xml_unescape(raw);
+        this.tok = XML_TEXT;
+        return this.tok;
+    }
+
+    fn comment(): int {
+        let start = this.pos + 4;
+        let end = index_at(this.s, "-->", start);
+        if (end < 0) { return this.fail("unterminated comment"); }
+        this.txt = this.s.slice(start, end);
+        this.countLines(this.pos, end + 3);
+        this.pos = end + 3;
+        this.tok = XML_COMMENT;
+        return this.tok;
+    }
+
+    fn cdata(): int {
+        let start = this.pos + 9;
+        let end = index_at(this.s, "]]>", start);
+        if (end < 0) { return this.fail("unterminated CDATA section"); }
+        // CDATA is raw by definition: no entity decoding inside it.
+        this.txt = this.s.slice(start, end);
+        this.countLines(this.pos, end + 3);
+        this.pos = end + 3;
+        this.tok = XML_CDATA;
+        return this.tok;
+    }
+
+    fn pi(): int {
+        let start = this.pos + 2;
+        let end = index_at(this.s, "?>", start);
+        if (end < 0) { return this.fail("unterminated processing instruction"); }
+        let body = this.s.slice(start, end);
+        let sp = body.index_of(" ");
+        if (sp < 0) {
+            this.rawName = body;
+            this.txt = "";
+        } else {
+            this.rawName = body.slice(0, sp);
+            this.txt = body.slice(sp + 1, body.len).trim();
+        }
+        this.countLines(this.pos, end + 2);
+        this.pos = end + 2;
+        this.tok = XML_PI;
+        return this.tok;
+    }
+
+    // <!DOCTYPE name ... [ internal subset ] > — skipped whole. Nothing here
+    // reads entity declarations, so the internal subset only has to be walked
+    // past without letting its ']' or '>' confuse the scan.
+    fn doctype(): int {
+        let start = this.pos;
+        let i = this.pos + 9;
+        let depth = 0;
+        let done = false;
+        while (i < this.n && !done) {
+            let c = this.s[i];
+            if (c == 91) { depth += 1; }                      // '['
+            else { if (c == 93) { depth -= 1; }                // ']'
+            else { if (c == 62 && depth <= 0) { done = true; } } }
+            i += 1;
+        }
+        if (!done) { return this.fail("unterminated DOCTYPE"); }
+        this.txt = this.s.slice(start + 9, i - 1).trim();
+        this.countLines(start, i);
+        this.pos = i;
+        this.tok = XML_DOCTYPE;
+        return this.tok;
+    }
+
+    fn endTag(): int {
+        let start = this.pos + 2;
+        let i = start;
+        while (i < this.n && is_name_byte(this.s[i])) { i += 1; }
+        let nm = this.s.slice(start, i);
+        while (i < this.n && is_space(this.s[i])) { i += 1; }
+        if (i >= this.n || this.s[i] != 62) { return this.fail("malformed closing tag"); }
+        this.countLines(this.pos, i + 1);
+        this.pos = i + 1;
+        if (nm.len == 0) { return this.fail("empty closing tag name"); }
+        if (this.stack.len == 0) { return this.fail("unexpected </" + nm + ">"); }
+        let open = this.stack[this.stack.len - 1];
+        if (open != nm) { return this.fail("</" + nm + "> closes <" + open + ">"); }
+        this.rawName = nm;
+        this.tok = XML_END;
+        this.popScope();
+        return this.tok;
+    }
+
+    fn startTag(): int {
+        let start = this.pos + 1;
+        let i = start;
+        while (i < this.n && is_name_byte(this.s[i])) { i += 1; }
+        if (i == start) { return this.fail("malformed tag name"); }
+        this.rawName = this.s.slice(start, i);
+
+        // Attributes.
+        let closed = false;
+        let empty = false;
+        while (i < this.n && !closed) {
+            while (i < this.n && is_space(this.s[i])) {
+                if (this.s[i] == 10) { this.line += 1; }
+                i += 1;
+            }
+            if (i >= this.n) { break; }
+            let c = this.s[i];
+            if (c == 62) { i += 1; closed = true; break; }                       // '>'
+            if (c == 47) {                                                        // '/'
+                if (i + 1 < this.n && this.s[i + 1] == 62) {
+                    i += 2;
+                    closed = true;
+                    empty = true;
+                    break;
+                }
+                this.pos = i;
+                return this.fail("stray '/' in tag");
+            }
+            let ks = i;
+            while (i < this.n && is_name_byte(this.s[i])) { i += 1; }
+            if (i == ks) {
+                this.pos = i;
+                return this.fail("malformed attribute name");
+            }
+            let key = this.s.slice(ks, i);
+            while (i < this.n && is_space(this.s[i])) { i += 1; }
+            if (i >= this.n || this.s[i] != 61) {
+                this.pos = i;
+                return this.fail("attribute '" + key + "' has no value");
+            }
+            i += 1;
+            while (i < this.n && is_space(this.s[i])) { i += 1; }
+            if (i >= this.n) {
+                this.pos = i;
+                return this.fail("attribute '" + key + "' has no value");
+            }
+            let q = this.s[i];
+            if (q != 34 && q != 39) {
+                this.pos = i;
+                return this.fail("attribute '" + key + "' value is not quoted");
+            }
+            i += 1;
+            let vs = i;
+            while (i < this.n && this.s[i] != q) {
+                if (this.s[i] == 10) { this.line += 1; }
+                i += 1;
+            }
+            if (i >= this.n) {
+                this.pos = i;
+                return this.fail("unterminated value for attribute '" + key + "'");
+            }
+            let raw = this.s.slice(vs, i);
+            i += 1;
+            this.akeys.push(key);
+            this.avals.push(xml_unescape(raw));
+        }
+        if (!closed) {
+            this.pos = this.n;
+            return this.fail("unterminated tag <" + this.rawName + ">");
+        }
+        this.pos = i;
+
+        if (this.stack.len >= XML_MAX_DEPTH) {
+            return this.fail("nesting deeper than 1024 levels");
+        }
+        this.pushScope();
+        this.selfClose = empty;
+        if (empty) { this.pendingEnd = true; }
+        this.tok = XML_START;
+        return this.tok;
+    }
+
+    // Enter an element: record where its namespace bindings start, then bind
+    // whatever xmlns attributes it declares.
+    fn pushScope() {
+        this.stack.push(this.rawName);
+        this.marks.push(this.nsPre.len);
+        let i = 0;
+        while (i < this.akeys.len) {
+            let k = this.akeys[i];
+            if (k == "xmlns") {
+                this.nsPre.push("");
+                this.nsUriv.push(this.avals[i]);
+            } else {
+                if (k.len > 6 && k.slice(0, 6) == "xmlns:") {
+                    this.nsPre.push(k.slice(6, k.len));
+                    this.nsUriv.push(this.avals[i]);
+                }
+            }
+            i += 1;
+        }
+    }
+
+    // Leave an element: truncate the prefix stack back to where it was. The
+    // element's own bindings are still in scope while XML_END is reported,
+    // which is what a consumer reading nsUri() on the close tag expects.
+    fn popScope() {
+        if (this.stack.len == 0) { return; }
+        this.stack.pop();
+        let mark = this.marks[this.marks.len - 1];
+        this.marks.pop();
+        while (this.nsPre.len > mark) {
+            this.nsPre.pop();
+            this.nsUriv.pop();
+        }
+    }
+}
+
+export fn xmlReader(text: string): XmlReader { return new XmlReader(text); }
+
+fn is_space(c: int): bool { return c == 32 || c == 9 || c == 10 || c == 13; }
+
+// XML name characters, approximated: ASCII letters and digits, `_ - . :`, and
+// every byte >= 0x80 so UTF-8 names pass through. Precise NameStartChar rules
+// would need codepoint decoding for no practical gain here.
+fn is_name_byte(c: int): bool {
+    return (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) ||
+           c == 95 || c == 45 || c == 46 || c == 58 || c >= 128;
+}
+
+fn prefix_of(name: string): string {
+    let i = name.index_of(":");
+    if (i <= 0) { return ""; }
+    return name.slice(0, i);
+}
+
+fn local_of(name: string): string {
+    let i = name.index_of(":");
+    if (i < 0) { return name; }
+    return name.slice(i + 1, name.len);
+}
+
+// ---- the DOM ---------------------------------------------------------------
+
+export const XN_DOC:     int = 0;
+export const XN_ELEM:    int = 1;
+export const XN_TEXT:    int = 2;
+export const XN_CDATA:   int = 3;
+export const XN_COMMENT: int = 4;
+export const XN_PI:      int = 5;
+
+// One node of a parsed document. As with JsonValue, a single tagged class
+// carries every kind — Vyto has no sum types, and a class hierarchy would make
+// `kids: XmlNode[]` awkward for no benefit.
+//
+// Attributes are parallel keys/vals arrays with a linear scan, not a Map: an
+// element has a handful of attributes and two small arrays cost far less than
+// a hash table per node.
+export class XmlNode {
+    kind: int;
+    nodeName: string;
+    uri: string;
+    txt: string;
+    akeys: string[];
+    avals: string[];
+    kids: XmlNode[];
+    err: string;
+
+    fn init(k: int) {
+        this.kind = k;
+        this.nodeName = "";
+        this.uri = "";
+        this.txt = "";
+        this.akeys = [];
+        this.avals = [];
+        this.kids = [];
+        this.err = "";
+    }
+
+    fn isDoc(): bool { return this.kind == XN_DOC; }
+    fn isElem(): bool { return this.kind == XN_ELEM; }
+    fn isText(): bool { return this.kind == XN_TEXT || this.kind == XN_CDATA; }
+
+    fn name(): string { return this.nodeName; }
+    fn localName(): string { return local_of(this.nodeName); }
+    fn prefix(): string { return prefix_of(this.nodeName); }
+    // Namespace URI resolved at parse time; "" when the element is unqualified.
+    fn nsUri(): string { return this.uri; }
+    fn error(): string { return this.err; }
+
+    fn attrCount(): int { return this.akeys.len; }
+    fn attrName(i: int): string {
+        if (i >= 0 && i < this.akeys.len) { return this.akeys[i]; }
+        return "";
+    }
+    fn attrValue(i: int): string {
+        if (i >= 0 && i < this.avals.len) { return this.avals[i]; }
+        return "";
+    }
+    // Attribute by name as written; "" when absent (use hasAttr to distinguish
+    // that from an attribute whose value is genuinely empty).
+    fn attr(name: string): string {
+        let i = 0;
+        while (i < this.akeys.len) {
+            if (this.akeys[i] == name) { return this.avals[i]; }
+            i += 1;
+        }
+        return "";
+    }
+    fn attrOr(name: string, dflt: string): string {
+        let i = 0;
+        while (i < this.akeys.len) {
+            if (this.akeys[i] == name) { return this.avals[i]; }
+            i += 1;
+        }
+        return dflt;
+    }
+    fn hasAttr(name: string): bool {
+        let i = 0;
+        while (i < this.akeys.len) {
+            if (this.akeys[i] == name) { return true; }
+            i += 1;
+        }
+        return false;
+    }
+    fn setAttr(name: string, v: string): XmlNode {
+        let i = 0;
+        while (i < this.akeys.len) {
+            if (this.akeys[i] == name) { this.avals[i] = v; return this; }
+            i += 1;
+        }
+        this.akeys.push(name);
+        this.avals.push(v);
+        return this;
+    }
+
+    fn childCount(): int { return this.kids.len; }
+    fn child(i: int): XmlNode {
+        if (i >= 0 && i < this.kids.len) { return this.kids[i]; }
+        return new XmlNode(XN_TEXT);
+    }
+    fn append(n: XmlNode): XmlNode { this.kids.push(n); return this; }
+
+    // The document's single element child; a Null-ish empty node when there
+    // isn't one. Also works on an element, where it returns the element itself,
+    // so `xml_parse(s).root()` and `xml_root(s)` agree.
+    fn root(): XmlNode {
+        if (this.kind == XN_ELEM) { return this; }
+        let i = 0;
+        while (i < this.kids.len) {
+            if (this.kids[i].kind == XN_ELEM) { return this.kids[i]; }
+            i += 1;
+        }
+        return new XmlNode(XN_ELEM);
+    }
+
+    // First element child matching `name`, which may be the written name or the
+    // local name — for a document with no prefixes those are the same, and for
+    // one with prefixes the local name is almost always what a caller means.
+    // An empty node is returned on a miss, so chains like
+    // doc.find("a").find("b").text() never crash.
+    fn find(name: string): XmlNode {
+        let i = 0;
+        while (i < this.kids.len) {
+            let k = this.kids[i];
+            if (k.kind == XN_ELEM && matches_name(k, name)) { return k; }
+            i += 1;
+        }
+        return new XmlNode(XN_ELEM);
+    }
+    // Every element child matching `name`.
+    fn findAll(name: string): XmlNode[] {
+        let out: XmlNode[] = [];
+        let i = 0;
+        while (i < this.kids.len) {
+            let k = this.kids[i];
+            if (k.kind == XN_ELEM && matches_name(k, name)) { out.push(k); }
+            i += 1;
+        }
+        return out;
+    }
+    // First matching *descendant*, depth-first.
+    fn findDeep(name: string): XmlNode {
+        let i = 0;
+        while (i < this.kids.len) {
+            let k = this.kids[i];
+            if (k.kind == XN_ELEM) {
+                if (matches_name(k, name)) { return k; }
+                let deeper = k.findDeep(name);
+                if (deeper.nodeName != "") { return deeper; }
+            }
+            i += 1;
+        }
+        return new XmlNode(XN_ELEM);
+    }
+    // Every matching descendant, in document order.
+    fn findAllDeep(name: string): XmlNode[] {
+        let out: XmlNode[] = [];
+        this.collectDeep(name, out);
+        return out;
+    }
+    fn collectDeep(name: string, out: XmlNode[]) {
+        let i = 0;
+        while (i < this.kids.len) {
+            let k = this.kids[i];
+            if (k.kind == XN_ELEM) {
+                if (matches_name(k, name)) { out.push(k); }
+                k.collectDeep(name, out);
+            }
+            i += 1;
+        }
+    }
+    // First element child (or descendant, with findDeep) in a namespace.
+    fn findNs(uri: string, local: string): XmlNode {
+        let i = 0;
+        while (i < this.kids.len) {
+            let k = this.kids[i];
+            if (k.kind == XN_ELEM && k.uri == uri && k.localName() == local) { return k; }
+            i += 1;
+        }
+        return new XmlNode(XN_ELEM);
+    }
+
+    // All descendant text and CDATA, concatenated. Comments and PIs contribute
+    // nothing, which is what "the text of this element" means to a caller.
+    fn text(): string {
+        let sb = new StringBuilder(64);
+        this.textInto(sb);
+        return sb.toString();
+    }
+    fn textInto(sb: StringBuilder) {
+        if (this.kind == XN_TEXT || this.kind == XN_CDATA) { sb.append(this.txt); return; }
+        let i = 0;
+        while (i < this.kids.len) {
+            this.kids[i].textInto(sb);
+            i += 1;
+        }
+    }
+    // text() with surrounding whitespace removed — the usual want for
+    // <title>\n  News\n</title>.
+    fn textTrimmed(): string { return this.text().trim(); }
+
+    // Serialize back to XML.
+    fn toString(): string {
+        let sb = new StringBuilder(128);
+        write_node(this, sb);
+        return sb.toString();
+    }
+}
+
+fn matches_name(n: XmlNode, name: string): bool {
+    return n.nodeName == name || local_of(n.nodeName) == name;
+}
+
+export fn xmlElem(name: string): XmlNode {
+    let n = new XmlNode(XN_ELEM);
+    n.nodeName = name;
+    return n;
+}
+export fn xmlText(s: string): XmlNode {
+    let n = new XmlNode(XN_TEXT);
+    n.txt = s;
+    return n;
+}
+export fn xmlComment(s: string): XmlNode {
+    let n = new XmlNode(XN_COMMENT);
+    n.txt = s;
+    return n;
+}
+export fn xmlDoc(): XmlNode { return new XmlNode(XN_DOC); }
+
+// Parse a whole document into a tree. Whitespace-only text between elements is
+// dropped — see xml_parse_mixed when it is significant.
+export fn xml_parse(s: string): XmlNode { return build(s, true); }
+
+// xml_parse that keeps whitespace-only text nodes, for mixed content where the
+// space between a word and an inline element is part of the document.
+export fn xml_parse_mixed(s: string): XmlNode { return build(s, false); }
+
+// The document's root element directly, for when the prologue is not wanted.
+export fn xml_root(s: string): XmlNode { return xml_parse(s).root(); }
+
+fn build(s: string, ignoreSpace: bool): XmlNode {
+    let doc = new XmlNode(XN_DOC);
+    let r = new XmlReader(s);
+    r.ignoreWhitespace(ignoreSpace);
+    // An explicit stack rather than recursion: depth is already bounded by the
+    // reader, and this keeps the whole parse to one frame.
+    let open: XmlNode[] = [];
+    let cur = doc;
+    let k = r.next();
+    while (k != XML_EOF && k != XML_ERR) {
+        if (k == XML_START) {
+            let e = new XmlNode(XN_ELEM);
+            e.nodeName = r.name();
+            e.uri = r.nsUri();
+            let i = 0;
+            while (i < r.attrCount()) {
+                e.akeys.push(r.attrName(i));
+                e.avals.push(r.attrValue(i));
+                i += 1;
+            }
+            cur.kids.push(e);
+            open.push(cur);
+            cur = e;
+        } else {
+            if (k == XML_END) {
+                if (open.len > 0) {
+                    cur = open[open.len - 1];
+                    open.pop();
+                }
+            } else {
+                if (k == XML_TEXT || k == XML_CDATA || k == XML_COMMENT || k == XML_PI) {
+                    let t = new XmlNode(XN_TEXT);
+                    if (k == XML_CDATA) { t.kind = XN_CDATA; }
+                    if (k == XML_COMMENT) { t.kind = XN_COMMENT; }
+                    if (k == XML_PI) {
+                        t.kind = XN_PI;
+                        t.nodeName = r.name();
+                    }
+                    t.txt = r.text();
+                    cur.kids.push(t);
+                }
+                // XML_DOCTYPE contributes no node.
+            }
+        }
+        k = r.next();
+    }
+    doc.err = r.error();
+    return doc;
+}
+
+// ---- serialization ---------------------------------------------------------
+
+// Serialize a node (or a whole document) back to XML. Empty elements are
+// written self-closing; text and attribute values are escaped.
+export fn xml_write(n: XmlNode): string { return n.toString(); }
+
+fn write_node(n: XmlNode, sb: StringBuilder) {
+    if (n.kind == XN_TEXT) { sb.append(xml_escape(n.txt)); return; }
+    if (n.kind == XN_CDATA) { sb.append("<![CDATA[").append(n.txt).append("]]>"); return; }
+    if (n.kind == XN_COMMENT) { sb.append("<!--").append(n.txt).append("-->"); return; }
+    if (n.kind == XN_PI) {
+        sb.append("<?").append(n.nodeName);
+        if (n.txt != "") { sb.append(" ").append(n.txt); }
+        sb.append("?>");
+        return;
+    }
+    if (n.kind == XN_DOC) {
+        let i = 0;
+        while (i < n.kids.len) {
+            write_node(n.kids[i], sb);
+            i += 1;
+        }
+        return;
+    }
+    sb.append("<").append(n.nodeName);
+    let a = 0;
+    while (a < n.akeys.len) {
+        sb.append(" ").append(n.akeys[a]).append("=\"");
+        sb.append(xml_escape_attr(n.avals[a])).append("\"");
+        a += 1;
+    }
+    if (n.kids.len == 0) {
+        sb.append("/>");
+        return;
+    }
+    sb.append(">");
+    let c = 0;
+    while (c < n.kids.len) {
+        write_node(n.kids[c], sb);
+        c += 1;
+    }
+    sb.append("</").append(n.nodeName).append(">");
+}
