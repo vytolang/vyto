@@ -5,6 +5,11 @@ set -u
 cd "$(dirname "$0")/.."
 fail=0
 
+# Scratch dir for tests that write files. Created here rather than beside its
+# first use, because `make clean-cache` removes it and the UI section (which
+# runs earlier) writes an events file into it.
+mkdir -p tests/tmp
+
 # --- prepare the greeter package: prebuilt .so + vytobind-generated binding ---
 triple=linux-x64   # matches vyto_triple() on this CI/dev box
 mkdir -p "examples/greeter/native/$triple"
@@ -283,6 +288,132 @@ if [ "$got" = "$(cat tests/fixtures/cli_help.expected)" ]; then
 else
     echo "FAIL cli_help"
     echo "--- expected ---"; cat tests/fixtures/cli_help.expected
+    echo "--- got ---"; printf '%s\n' "$got"
+    fail=1
+fi
+
+# --- vyto/util/url: parsing, encoding, query strings, and the RFC 3986 §5.4
+#     reference-resolution examples (pure Vyto) ---
+got=$(./vytoc run tests/fixtures/url_parse.vt 2>&1)
+if [ "$got" = "$(cat tests/fixtures/url_parse.expected)" ]; then
+    echo "PASS url_parse"
+else
+    echo "FAIL url_parse"
+    echo "--- expected ---"; cat tests/fixtures/url_parse.expected
+    echo "--- got ---"; printf '%s\n' "$got"
+    fail=1
+fi
+
+# --- vyto/util/mime: base64 (RFC 4648 §10 vectors), quoted-printable, media
+#     types, extension lookup and multipart (pure Vyto) ---
+got=$(./vytoc run tests/fixtures/mime_codec.vt 2>&1)
+if [ "$got" = "$(cat tests/fixtures/mime_codec.expected)" ]; then
+    echo "PASS mime_codec"
+else
+    echo "FAIL mime_codec"
+    echo "--- expected ---"; cat tests/fixtures/mime_codec.expected
+    echo "--- got ---"; printf '%s\n' "$got"
+    fail=1
+fi
+
+# --- vyto/util/uuid: format/parse against fixed vectors, plus properties of a
+#     few thousand generated values. The one vyto/util module with a native
+#     shim, so unlike its siblings this one links C (getrandom/urandom) ---
+got=$(./vytoc run tests/fixtures/uuid_format.vt 2>&1)
+if [ "$got" = "$(cat tests/fixtures/uuid_format.expected)" ]; then
+    echo "PASS uuid_format"
+else
+    echo "FAIL uuid_format"
+    echo "--- expected ---"; cat tests/fixtures/uuid_format.expected
+    echo "--- got ---"; printf '%s\n' "$got"
+    fail=1
+fi
+
+# --- vyto/util/csv: the RFC 4180 grammar (quotes, embedded delimiters and
+#     newlines), dialects, sniffing, writer quoting, and the file round trip.
+#     Writes under /tmp, not the repo (pure Vyto) ---
+got=$(./vytoc run tests/fixtures/csv_parse.vt 2>&1)
+if [ "$got" = "$(cat tests/fixtures/csv_parse.expected)" ]; then
+    echo "PASS csv_parse"
+else
+    echo "FAIL csv_parse"
+    echo "--- expected ---"; cat tests/fixtures/csv_parse.expected
+    echo "--- got ---"; printf '%s\n' "$got"
+    fail=1
+fi
+
+# --- vyto/util/xml: the pull reader's token stream, namespace scoping, entity
+#     decoding, the DOM's search methods, serialization, every error path
+#     (pure Vyto) ---
+got=$(./vytoc run tests/fixtures/xml_parse.vt 2>&1)
+if [ "$got" = "$(cat tests/fixtures/xml_parse.expected)" ]; then
+    echo "PASS xml_parse"
+else
+    echo "FAIL xml_parse"
+    echo "--- expected ---"; cat tests/fixtures/xml_parse.expected
+    echo "--- got ---"; printf '%s\n' "$got"
+    fail=1
+fi
+
+# --- vyto/util/toml: the whole v1.0 grammar, the documented deviations
+#     (dates as strings, integers as floats), errors, encoder round trip.
+#     Results print as JSON because a TOML document *is* a JsonValue here ---
+got=$(./vytoc run tests/fixtures/toml_parse.vt 2>&1)
+if [ "$got" = "$(cat tests/fixtures/toml_parse.expected)" ]; then
+    echo "PASS toml_parse"
+else
+    echo "FAIL toml_parse"
+    echo "--- expected ---"; cat tests/fixtures/toml_parse.expected
+    echo "--- got ---"; printf '%s\n' "$got"
+    fail=1
+fi
+
+# --- vyto/util/ini: sections, both separators, both comment characters,
+#     quoting, nested mode, errors, encoder round trip (pure Vyto) ---
+got=$(./vytoc run tests/fixtures/ini_parse.vt 2>&1)
+if [ "$got" = "$(cat tests/fixtures/ini_parse.expected)" ]; then
+    echo "PASS ini_parse"
+else
+    echo "FAIL ini_parse"
+    echo "--- expected ---"; cat tests/fixtures/ini_parse.expected
+    echo "--- got ---"; printf '%s\n' "$got"
+    fail=1
+fi
+
+# --- vyto/util/html: the escapers (every case is a string that would be an
+#     injection unescaped), the entity decoder, the builder and its error
+#     paths, the one-shot helpers (pure Vyto) ---
+got=$(./vytoc run tests/fixtures/html_escape.vt 2>&1)
+if [ "$got" = "$(cat tests/fixtures/html_escape.expected)" ]; then
+    echo "PASS html_escape"
+else
+    echo "FAIL html_escape"
+    echo "--- expected ---"; cat tests/fixtures/html_escape.expected
+    echo "--- got ---"; printf '%s\n' "$got"
+    fail=1
+fi
+
+# --- vyto/util/markdown: block structure, inline spans, the tree shape, and
+#     the documented exclusions (raw HTML is escaped, not forwarded) ---
+got=$(./vytoc run tests/fixtures/markdown_render.vt 2>&1)
+if [ "$got" = "$(cat tests/fixtures/markdown_render.expected)" ]; then
+    echo "PASS markdown_render"
+else
+    echo "FAIL markdown_render"
+    echo "--- expected ---"; cat tests/fixtures/markdown_render.expected
+    echo "--- got ---"; printf '%s\n' "$got"
+    fail=1
+fi
+
+# --- vyto/util/log: levels, both formats, fields and context, escaping,
+#     timestamps, the file sink. Every logger pins its clock with fixedTime(),
+#     which is the only reason a logging module is golden-testable ---
+got=$(./vytoc run tests/fixtures/log_format.vt 2>&1)
+if [ "$got" = "$(cat tests/fixtures/log_format.expected)" ]; then
+    echo "PASS log_format"
+else
+    echo "FAIL log_format"
+    echo "--- expected ---"; cat tests/fixtures/log_format.expected
     echo "--- got ---"; printf '%s\n' "$got"
     fail=1
 fi

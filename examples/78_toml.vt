@@ -1,0 +1,127 @@
+// vyto/util/toml — TOML v1.0 configuration, parsed into vyto/util/json's tree.
+//
+// TOML's data model is JSON's: tables are objects, arrays are arrays, and the
+// scalars line up. So a parsed document is a JsonValue, which means one tree
+// type across the standard library, the same forgiving accessors, and
+// json_encode for free on a config file.
+//
+// The two deliberate deviations are dates (kept as strings — a JsonValue has no
+// datetime kind) and integer width (stored as float, as in JSON).
+
+import { toml_parse, toml_encode, toml_failed } from "vyto/util/toml";
+import { JsonValue, json_encode, json_encode_pretty } from "vyto/util/json";
+
+fn config(): string {
+    return "# An application's configuration.\n" +
+        "title   = \"Vyto service\"\n" +
+        "debug   = false\n" +
+        "workers = 8\n" +
+        "hosts   = [\"alpha\", \"beta\", \"gamma\"]\n" +
+        "\n" +
+        "[server]\n" +
+        "bind    = \"0.0.0.0\"\n" +
+        "port    = 8080\n" +
+        "timeout = 2.5\n" +
+        "\n" +
+        "[server.tls]\n" +
+        "enabled = true\n" +
+        "cert    = \"/etc/ssl/app.pem\"\n" +
+        "\n" +
+        "[[route]]\n" +
+        "path = \"/\"\n" +
+        "kind = \"static\"\n" +
+        "\n" +
+        "[[route]]\n" +
+        "path = \"/api\"\n" +
+        "kind = \"proxy\"\n";
+}
+
+fn main() {
+    let cfg = toml_parse(config());
+    if (toml_failed(cfg)) {
+        print("parse failed: " + cfg.parseError());
+        return;
+    }
+
+    // ---- reading it ----
+    print("title       = " + cfg.get("title").asString());
+    print("debug       = " + str(cfg.get("debug").asBool()));
+    print("workers     = " + str(cfg.get("workers").asInt()));
+    print("hosts       = " + str(cfg.get("hosts").len()) + " -> " +
+          cfg.get("hosts").at(0).asString() + ", " + cfg.get("hosts").at(2).asString());
+    print("bind        = " + cfg.get("server").get("bind").asString());
+    print("port        = " + str(cfg.get("server").get("port").asInt()));
+    print("tls enabled = " + str(cfg.get("server").get("tls").get("enabled").asBool()));
+
+    // Accessors are forgiving all the way down: a missing key yields a Null
+    // value rather than crashing, so an optional setting needs no guard.
+    print("missing     = [" + cfg.get("nope").get("deeper").asString() + "]");
+    print("with default= " + str(defaultInt(cfg.get("retries"), 3)));
+
+    // An array of tables is just an array of objects.
+    let routes = cfg.get("route");
+    print("routes      = " + str(routes.len()));
+    for (let i in 0..routes.len()) {
+        print("  " + routes.at(i).get("path").asString() +
+              " -> " + routes.at(i).get("kind").asString());
+    }
+
+    // ---- because it is a JsonValue, it is also JSON ----
+    print("");
+    print("as JSON:");
+    print(json_encode(cfg.get("server")));
+
+    // ---- the scalar grammar ----
+    print("");
+    let nums = toml_parse("dec = 1_000_000\nhex = 0xDEADBEEF\noct = 0o755\nbin = 0b1011\n" +
+                          "neg = -17\nflt = 6.02e23\nsmall = -2.5e-3\n");
+    print("underscores = " + str(nums.get("dec").asInt()));
+    print("hex         = " + str(nums.get("hex").asInt()));
+    print("octal       = " + str(nums.get("oct").asInt()));
+    print("binary      = " + str(nums.get("bin").asInt()));
+    print("negative    = " + str(nums.get("neg").asInt()));
+
+    let strs = toml_parse("basic   = \"a\\tb\\nc\"\n" +
+                          "literal = 'C:\\path\\no\\escapes'\n" +
+                          "multi   = \"\"\"\nfirst\nsecond\"\"\"\n" +
+                          "folded  = \"\"\"one \\\n           two\"\"\"\n" +
+                          "unicode = \"caf\\u00e9\"\n");
+    print("basic       = " + strs.get("basic").asString().replace("\n", "\\n").replace("\t", "\\t"));
+    print("literal     = " + strs.get("literal").asString());
+    print("multi-line  = " + strs.get("multi").asString().replace("\n", "\\n"));
+    print("line-folded = " + strs.get("folded").asString());
+    print("unicode     = " + strs.get("unicode").asString());
+
+    // Dates stay as text — a JsonValue has no datetime kind, and the text is
+    // what date_parse wants anyway.
+    let when = toml_parse("stamp = 1979-05-27T07:32:00Z\nday = 1979-05-27\ntime = 07:32:00\n");
+    print("datetime    = " + when.get("stamp").asString());
+    print("date        = " + when.get("day").asString());
+    print("time        = " + when.get("time").asString());
+
+    // Dotted keys and inline tables are two spellings of the same tree.
+    print("");
+    print("dotted      = " + json_encode(toml_parse("a.b.c = 1\na.b.d = 2\n")));
+    print("inline      = " + json_encode(toml_parse("point = { x = 1, y = 2 }\n")));
+
+    // ---- failure is soft, and says where ----
+    print("");
+    print("duplicate   = " + toml_parse("a = 1\na = 2\n").parseError());
+    print("bad number  = " + toml_parse("a = 01\n").parseError());
+    print("unterminated= " + toml_parse("a = \"oops\n").parseError());
+    print("junk after  = " + toml_parse("a = 1 b\n").parseError());
+
+    // ---- writing it back ----
+    // Scalars first, then [tables], then [[arrays of tables]] — the order TOML
+    // requires, since a key written after a header belongs to that table.
+    print("");
+    print("re-encoded:");
+    print(toml_encode(cfg));
+    print("round trip stable = " +
+          str(json_encode(toml_parse(toml_encode(cfg))) == json_encode(cfg)));
+}
+
+fn defaultInt(v: JsonValue, dflt: int): int {
+    if (v.isNull()) { return dflt; }
+    return v.asInt();
+}

@@ -1,0 +1,262 @@
+// Pure-Vyto coverage for vyto/util/url's parser, encoders and query handling.
+// No display, no network, no native dependency beyond the vyto/util shims, so
+// this runs on every host. Deterministic, golden-checked.
+//
+// Every case prints `label=value` and the assertions live entirely in the
+// golden, the same shape as tests/fixtures/cli_parse.vt.
+//
+// Note: Vyto evaluates binary operands right-to-left, so a parse and a read of
+// its result must not share one expression — each case parses into a local.
+
+import { url_parse, url_join, url_encode, url_encode_path, url_encode_form,
+         url_decode, url_decode_form, url_is_valid, url_default_port,
+         query_parse, queryParams, url, urlOf, UrlBuilder,
+         remove_dot_segments } from "vyto/util/url";
+
+fn showUrl(label: string, s: string) {
+    let u = url_parse(s);
+    let line = label + "=" + u.scheme + "|" + u.user + "|" + u.pass + "|" +
+               u.host + "|" + str(u.port) + "|" + u.path + "|" + u.query + "|" +
+               u.fragment + "|auth=" + str(u.hasAuthority);
+    print(line);
+}
+
+fn showErr(label: string, s: string) {
+    let u = url_parse(s);
+    print(label + "=[" + u.error() + "]");
+}
+
+fn main() {
+    // ---- the general shape: scheme|user|pass|host|port|path|query|frag ----
+    showUrl("full", "https://ada:pw@example.com:8443/a/b.html?x=1#top");
+    showUrl("plain", "http://example.com/");
+    showUrl("noslash", "http://example.com");
+    showUrl("useronly", "http://ada@example.com/");
+    showUrl("atinpass", "http://ada:p@ss@example.com/");
+    showUrl("query", "http://example.com/?a=1&b=2");
+    showUrl("frag", "http://example.com/p#sec");
+    showUrl("queryfrag", "http://example.com/p?a=1#sec");
+    showUrl("fragfirst", "http://example.com/p#sec?notquery");
+    showUrl("emptypath", "http://example.com?a=1");
+    showUrl("upper", "HTTP://Example.COM/Path");
+    showUrl("ipv6", "http://[2001:db8::1]:8080/h");
+    showUrl("ipv6nop", "http://[::1]/h");
+    showUrl("emptyport", "http://example.com:/p");
+    showUrl("port0", "http://example.com:0/p");
+    showUrl("maxport", "http://example.com:65535/p");
+
+    // ---- relative and scheme-less forms ----
+    showUrl("relative", "a/b.html");
+    showUrl("absolute", "/a/b.html");
+    showUrl("protorel", "//cdn.example.com/s.js");
+    showUrl("colonseg", "example.com:8080");
+    showUrl("mailto", "mailto:ada@example.com");
+    showUrl("filepath", "file:///etc/hosts");
+    showUrl("dataish", "urn:isbn:0451450523");
+    showUrl("plusscheme", "coap+tcp://h/p");
+    showUrl("digitstart", "1http://h/p");
+
+    // ---- errors: only a bad port and a broken IPv6 literal ----
+    showErr("ok", "http://example.com/");
+    showErr("empty", "");
+    showErr("bigport", "http://h:99999/");
+    showErr("alphaport", "http://h:80a/");
+    showErr("longport", "http://h:1234567/");
+    showErr("openv6", "http://[::1/p");
+    showErr("v6trail", "http://[::1]x/p");
+    print("valid.good=" + str(url_is_valid("http://a/")));
+    print("valid.bad=" + str(url_is_valid("http://a:99999/")));
+
+    // ---- ports ----
+    let httpUrl = url_parse("http://h/p");
+    print("eff.http=" + str(httpUrl.effectivePort()));
+    let httpsUrl = url_parse("https://h/p");
+    print("eff.https=" + str(httpsUrl.effectivePort()));
+    let statedUrl = url_parse("https://h:9000/p");
+    print("eff.stated=" + str(statedUrl.effectivePort()));
+    let unknownUrl = url_parse("gopher://h/p");
+    print("eff.unknown=" + str(unknownUrl.effectivePort()));
+    print("dflt.ws=" + str(url_default_port("ws")));
+    print("dflt.wss=" + str(url_default_port("wss")));
+    print("dflt.ftp=" + str(url_default_port("ftp")));
+    print("dflt.none=" + str(url_default_port("xyz")));
+
+    // ---- printing back ----
+    let r1 = url_parse("https://ada:pw@example.com:8443/a?x=1#t");
+    print("round.full=" + r1.toString());
+    let r2 = url_parse("http://[::1]:8080/p");
+    print("round.v6=" + r2.toString());
+    let r3 = url_parse("/just/a/path");
+    print("round.rel=" + r3.toString());
+    let r4 = url_parse("http://ada@h/p");
+    print("round.user=" + r4.toString());
+    print("hostport=" + r1.hostPort());
+    print("authority=" + r1.authority());
+    let r5 = url_parse("http://h/p");
+    print("hostport.noport=" + r5.hostPort());
+
+    // ---- percent-encoding ----
+    print("enc.space=" + url_encode("a b"));
+    print("enc.reserved=" + url_encode("a/b?c=d&e#f"));
+    print("enc.unreserved=" + url_encode("aZ09-._~"));
+    print("enc.utf8=" + url_encode("café"));
+    print("enc.empty=[" + url_encode("") + "]");
+    print("enc.path=" + url_encode_path("/dir name/a+b.txt"));
+    print("enc.form=" + url_encode_form("a b+c"));
+    print("dec.pct=" + url_decode("caf%C3%A9"));
+    print("dec.plusliteral=" + url_decode("a+b"));
+    print("dec.form=" + url_decode_form("a+b"));
+    print("dec.badpct=" + url_decode("100% sure"));
+    print("dec.trunc=" + url_decode("ab%C"));
+    print("dec.lower=" + url_decode("%c3%a9"));
+    print("dec.roundtrip=" + url_decode(url_encode("a b/c?d=e&f#g")));
+
+    // ---- query strings ----
+    let q1 = query_parse("?a=1&b=2&a=3");
+    print("q.len=" + str(q1.len()));
+    print("q.first=" + q1.get("a"));
+    print("q.all=" + q1.getAll("a").join(","));
+    print("q.missing=[" + q1.get("zz") + "] has=" + str(q1.has("zz")));
+    print("q.or=" + q1.getOr("zz", "dflt"));
+    print("q.round=" + q1.toString());
+
+    let q2 = query_parse("flag&k=&=v&x=1");
+    print("q2.len=" + str(q2.len()));
+    print("q2.flag=[" + q2.get("flag") + "]");
+    print("q2.k=[" + q2.get("k") + "]");
+    print("q2.empty=[" + q2.get("") + "]");
+
+    let q3 = query_parse("");
+    print("q3.len=" + str(q3.len()));
+    let q4 = query_parse("name=Ada+Lovelace&sym=%26");
+    print("q4.name=" + q4.get("name"));
+    print("q4.sym=" + q4.get("sym"));
+
+    let q5 = queryParams();
+    q5.add("a", "1");
+    q5.add("b", "2");
+    q5.add("a", "3");
+    print("q5.add=" + q5.toString());
+    q5.set("a", "9");
+    print("q5.set=" + q5.toString());
+    q5.set("new", "n");
+    print("q5.setnew=" + q5.toString());
+    q5.remove("b");
+    print("q5.remove=" + q5.toString());
+    print("q5.at=" + q5.keyAt(0) + "/" + q5.valAt(0) + " oob=[" + q5.keyAt(99) + "]");
+
+    // ---- dot-segment removal (RFC 3986 §5.2.4) ----
+    print("rds.simple=" + remove_dot_segments("/a/b/c"));
+    print("rds.dot=" + remove_dot_segments("/a/./b"));
+    print("rds.dotdot=" + remove_dot_segments("/a/b/../c"));
+    print("rds.escape=" + remove_dot_segments("/../../etc/passwd"));
+    print("rds.trailing=" + remove_dot_segments("/a/b/"));
+    print("rds.trailingdot=" + remove_dot_segments("/a/b/."));
+    print("rds.trailingdd=" + remove_dot_segments("/a/b/.."));
+    print("rds.rel=" + remove_dot_segments("a/b/../c"));
+    print("rds.relempty=[" + remove_dot_segments("a/..") + "]");
+    print("rds.onlydot=[" + remove_dot_segments(".") + "]");
+    print("rds.root=" + remove_dot_segments("/"));
+    print("rds.empty=[" + remove_dot_segments("") + "]");
+
+    // ---- the builder ----
+    print("b.full=" + url().scheme("https").host("api.example.com").port(8443)
+                           .segment("v2").segment("things")
+                           .param("limit", "10").param("tag", "a").param("tag", "b")
+                           .fragment("results").toString());
+    print("b.minimal=" + url().scheme("http").host("h").toString());
+    print("b.empty=[" + url().toString() + "]");
+    print("b.pathonly=" + url().path("/a/b").toString());
+    print("b.hostonly=" + url().host("h").toString());
+    print("b.wholepath=" + url().scheme("http").host("h").path("/a/b").toString());
+    print("b.port0=" + url().scheme("http").host("h").port(0).toString());
+    print("b.userinfo=" + url().scheme("http").user("ada").password("pw").host("h").toString());
+    print("b.useronly=" + url().scheme("http").user("ada").host("h").toString());
+    print("b.lowercases=" + url().scheme("HTTPS").host("EXAMPLE.COM").toString());
+    print("b.fragment=" + url().scheme("http").host("h").fragment("f").toString());
+
+    // Host accepts an IPv6 literal with or without its brackets.
+    print("b.v6.bare=" + url().scheme("http").host("::1").port(80).toString());
+    print("b.v6.bracketed=" + url().scheme("http").host("[2001:db8::1]").toString());
+
+    // segment() percent-encodes, so a value from elsewhere cannot climb out.
+    print("b.seg.one=" + url().scheme("http").host("h").segment("a").toString());
+    print("b.seg.two=" + url().scheme("http").host("h").segment("a").segment("b").toString());
+    print("b.seg.space=" + url().scheme("http").host("h").segment("a b").toString());
+    print("b.seg.slash=" + url().scheme("http").host("h").segment("a/b").toString());
+    print("b.seg.traversal=" + url().scheme("http").host("h").segment("../../etc/passwd").toString());
+    print("b.seg.empty=" + url().scheme("http").host("h").segment("").toString());
+    print("b.seg.afterpath=" + url().scheme("http").host("h").path("/base").segment("x").toString());
+    print("b.seg.afterslash=" + url().scheme("http").host("h").path("/base/").segment("x").toString());
+    print("b.seg.utf8=" + url().scheme("http").host("h").segment("café").toString());
+
+    // Parameters: add keeps repeats, set replaces, remove drops.
+    print("b.param=" + url().scheme("http").host("h").param("a", "1").toString());
+    print("b.param.repeat=" + url().scheme("http").host("h")
+                                   .param("t", "a").param("t", "b").toString());
+    print("b.param.encoded=" + url().scheme("http").host("h").param("q", "a b&c=d").toString());
+    print("b.param.int=" + url().scheme("http").host("h").paramInt("n", -42).toString());
+    print("b.param.set=" + url().scheme("http").host("h")
+                                .param("a", "1").param("a", "2").setParam("a", "9").toString());
+    print("b.param.setnew=" + url().scheme("http").host("h").setParam("a", "1").toString());
+    print("b.param.remove=" + url().scheme("http").host("h")
+                                   .param("a", "1").param("b", "2").removeParam("a").toString());
+    print("b.param.removeall=" + url().scheme("http").host("h")
+                                      .param("a", "1").removeParam("a").toString());
+    print("b.param.emptyvalue=" + url().scheme("http").host("h").param("a", "").toString());
+    print("b.query.raw=" + url().scheme("http").host("h").query("x=1&y=2").toString());
+    // query() discards whatever param() had added.
+    print("b.query.replaces=" + url().scheme("http").host("h")
+                                     .param("a", "1").query("b=2").toString());
+    let pb = url().scheme("http").host("h").param("a", "1").param("a", "2");
+    print("b.params.len=" + str(pb.params().len()) + " first=" + pb.params().get("a"));
+
+    // build() snapshots without consuming, so the builder keeps accumulating.
+    let reuse = url().scheme("https").host("h").segment("api");
+    print("b.reuse.1=" + reuse.param("v", "1").toString());
+    print("b.reuse.2=" + reuse.toString());
+    print("b.reuse.3=" + reuse.param("w", "2").toString());
+
+    let built = url().scheme("https").host("h").port(8443).path("/p")
+                     .param("a", "1").fragment("f").build();
+    print("b.build=" + built.scheme + "|" + built.host + "|" + str(built.port) + "|" +
+          built.path + "|" + built.query + "|" + built.fragment);
+    print("b.build.valid=" + str(built.isValid()) + " eff=" + str(built.effectivePort()));
+    print("b.build.roundtrip=" + str(url_parse(built.toString()).host == built.host));
+
+    // urlOf seeds from an existing URL.
+    print("b.of=" + urlOf("https://x.dev/a?k=1#f").toString());
+    print("b.of.add=" + urlOf("https://x.dev/a?k=1#f").param("k2", "2").toString());
+    print("b.of.swaphost=" + urlOf("https://x.dev/a?k=1").host("y.dev").toString());
+    print("b.of.setparam=" + urlOf("https://x.dev/a?k=1").setParam("k", "9").toString());
+    print("b.of.userinfo=" + urlOf("https://ada:pw@x.dev:8443/a").toString());
+    print("b.of.v6=" + urlOf("http://[::1]:8080/p").toString());
+    print("b.of.relative=" + urlOf("/just/a/path").toString());
+    print("b.of.params=" + str(urlOf("https://x.dev/?a=1&a=2&b=3").params().len()));
+    // A URL that does not parse yields an empty builder rather than failing.
+    print("b.of.bad=[" + urlOf("http://h:99999/").toString() + "]");
+    print("b.of.empty=[" + urlOf("").toString() + "]");
+
+    // ---- reference resolution (RFC 3986 §5.4 examples) ----
+    let b = "http://a/b/c/d;p?q";
+    print("j.g=" + url_join(b, "g"));
+    print("j.slashg=" + url_join(b, "/g"));
+    print("j.dotslashg=" + url_join(b, "./g"));
+    print("j.gslash=" + url_join(b, "g/"));
+    print("j.protorel=" + url_join(b, "//g"));
+    print("j.query=" + url_join(b, "?y"));
+    print("j.gquery=" + url_join(b, "g?y"));
+    print("j.frag=" + url_join(b, "#s"));
+    print("j.gfrag=" + url_join(b, "g#s"));
+    print("j.empty=" + url_join(b, ""));
+    print("j.dot=" + url_join(b, "."));
+    print("j.dotslash=" + url_join(b, "./"));
+    print("j.dotdot=" + url_join(b, ".."));
+    print("j.dotdotslash=" + url_join(b, "../"));
+    print("j.dotdotg=" + url_join(b, "../g"));
+    print("j.dotdot2=" + url_join(b, "../.."));
+    print("j.dotdot2g=" + url_join(b, "../../g"));
+    print("j.overshoot=" + url_join(b, "../../../g"));
+    print("j.absolute=" + url_join(b, "https://other/x"));
+    print("j.badbase=" + url_join("http://h:99999/", "g"));
+}

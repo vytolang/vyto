@@ -1,0 +1,166 @@
+// Pure-Vyto coverage for vyto/util/mime: base64, quoted-printable, media-type
+// parsing, extension lookup and multipart. No display, no network, no native
+// dependency beyond the vyto/util shims, so this runs on every host.
+//
+// Binary vectors are written as \xNN escapes and checked through base64 rather
+// than printed raw, so the golden stays a text file. Note that a byte[] carrying
+// an interior NUL cannot be printed through str(b as cstring) at all — that is
+// the documented string/cstring truncation, and the NUL cases below assert the
+// encoded form instead.
+
+import { base64_encode, base64url_encode, base64_decode, mime_bytes,
+         qp_encode, qp_decode, mime_parse, mediaType, mime_from_ext,
+         mime_from_path, multipartWriter, multipart_parse } from "vyto/util/mime";
+
+fn text(b: byte[]): string { return str(b as cstring); }
+
+fn hexOf(b: byte[]): string {
+    let digits = "0123456789abcdef";
+    let out = "";
+    let i = 0;
+    while (i < b.len) {
+        let v = b[i] as int;
+        out = out + digits.slice((v >> 4) & 0xF, ((v >> 4) & 0xF) + 1) +
+                    digits.slice(v & 0xF, (v & 0xF) + 1);
+        i += 1;
+    }
+    return out;
+}
+
+fn main() {
+    // ---- base64: the RFC 4648 §10 vectors ----
+    print("b64.empty=[" + base64_encode(mime_bytes("")) + "]");
+    print("b64.f=" + base64_encode(mime_bytes("f")));
+    print("b64.fo=" + base64_encode(mime_bytes("fo")));
+    print("b64.foo=" + base64_encode(mime_bytes("foo")));
+    print("b64.foob=" + base64_encode(mime_bytes("foob")));
+    print("b64.fooba=" + base64_encode(mime_bytes("fooba")));
+    print("b64.foobar=" + base64_encode(mime_bytes("foobar")));
+
+    // ---- base64 decode, including the same vectors backwards ----
+    print("dec.empty=[" + text(base64_decode("")) + "]");
+    print("dec.f=" + text(base64_decode("Zg==")));
+    print("dec.fo=" + text(base64_decode("Zm8=")));
+    print("dec.foobar=" + text(base64_decode("Zm9vYmFy")));
+    // Unpadded input decodes to the same bytes.
+    print("dec.nopad=" + text(base64_decode("Zm9vYmFy")) + "/" + text(base64_decode("Zm8")));
+    // Anything outside the alphabet is skipped, so a wrapped body needs no
+    // pre-processing and a truncated group simply yields fewer bytes.
+    print("dec.wrapped=" + text(base64_decode("Zm9v\r\nYmFy")));
+    print("dec.spaces=" + text(base64_decode("Z m 9 v")));
+    print("dec.junk=" + text(base64_decode("Zm9v!!!YmFy")));
+    print("dec.partial=" + text(base64_decode("Zm9vY")));
+
+    // ---- the two alphabets ----
+    let hi = mime_bytes("\xfb\xff\xbe");
+    print("alpha.std=" + base64_encode(hi));
+    print("alpha.url=" + base64url_encode(hi));
+    print("alpha.stdback=" + hexOf(base64_decode(base64_encode(hi))));
+    print("alpha.urlback=" + hexOf(base64_decode(base64url_encode(hi))));
+    // A NUL survives the round trip in the byte[], even though it could not be
+    // printed as a string.
+    let withNul = bytes(3);
+    withNul[0] = 65 as byte;
+    withNul[1] = 0 as byte;
+    withNul[2] = 66 as byte;
+    print("alpha.nul=" + base64_encode(withNul) + "/" + hexOf(base64_decode(base64_encode(withNul))));
+
+    // ---- quoted-printable ----
+    print("qp.plain=" + qp_encode("hello"));
+    print("qp.equals=" + qp_encode("a=b"));
+    print("qp.utf8=" + qp_encode("café"));
+    print("qp.trailspace=" + qp_encode("a "));
+    print("qp.midspace=" + qp_encode("a b"));
+    print("qp.tab=" + qp_encode("a\tb"));
+    print("qp.crlf=[" + qp_encode("a\r\nb").replace("\r", "\\r").replace("\n", "\\n") + "]");
+    print("qp.dec.hex=" + qp_decode("caf=C3=A9"));
+    print("qp.dec.eq=" + qp_decode("a=3Db"));
+    print("qp.dec.softcrlf=" + qp_decode("one=\r\ntwo"));
+    print("qp.dec.softlf=" + qp_decode("one=\ntwo"));
+    print("qp.dec.badesc=" + qp_decode("a=zz"));
+    print("qp.dec.trailing=" + qp_decode("ab="));
+    print("qp.round=" + qp_decode(qp_encode("Grüße = 100% ")));
+    // Long input wraps with soft breaks; decoding removes them again.
+    let long = "x".repeat(200);
+    let wrapped = qp_encode(long);
+    print("qp.wrapped.len=" + str(wrapped.len));
+    print("qp.wrapped.round=" + str(qp_decode(wrapped) == long));
+
+    // ---- media types ----
+    let mt = mime_parse("text/plain");
+    print("mt.simple=" + mt.essence() + " params=" + str(mt.keys.len) + " err=[" + mt.error() + "]");
+    let mt2 = mime_parse("  TEXT / HTML ; Charset = UTF-8 ");
+    print("mt.spaced=" + mt2.essence() + " cs=" + mt2.charset());
+    let mt3 = mime_parse("multipart/form-data; boundary=\"a;b=c\"; other=x");
+    print("mt.quoted=" + mt3.boundary() + " other=" + mt3.param("other"));
+    let mt4 = mime_parse("application/json;charset=\"utf\\\"8\"");
+    print("mt.escaped=" + mt4.param("charset"));
+    let mt5 = mime_parse("text/plain; flag");
+    print("mt.flagparam=" + str(mt5.hasParam("flag")) + " val=[" + mt5.param("flag") + "]");
+    print("mt.case=" + str(mt2.matches("text/HTML")) + "/" + str(mt2.isType("TEXT")));
+    print("mt.missing=[" + mt2.param("nope") + "] has=" + str(mt2.hasParam("nope")));
+
+    let e1 = mime_parse("");
+    print("mt.err.empty=[" + e1.error() + "]");
+    let e2 = mime_parse("nonsense");
+    print("mt.err.noslash=[" + e2.error() + "] type=" + e2.type);
+    let e3 = mime_parse("   ");
+    print("mt.err.spaces=[" + e3.error() + "]");
+
+    let built = mediaType("Application", "JSON");
+    built.setParam("charset", "utf-8");
+    print("mt.built=" + built.toString());
+    built.setParam("charset", "ascii");
+    print("mt.replaced=" + built.toString());
+    built.setParam("name", "a b;c");
+    print("mt.needsquote=" + built.toString());
+    print("mt.reparse=" + mime_parse(built.toString()).param("name"));
+
+    // ---- extension lookup ----
+    print("ext.dot=" + mime_from_ext(".png"));
+    print("ext.nodot=" + mime_from_ext("png"));
+    print("ext.upper=" + mime_from_ext("PNG"));
+    print("ext.unknown=" + mime_from_ext("zzz"));
+    print("ext.empty=" + mime_from_ext(""));
+    print("path.simple=" + mime_from_path("index.html"));
+    print("path.dirs=" + mime_from_path("/srv/www/app.js"));
+    print("path.double=" + mime_from_path("a.tar.gz"));
+    print("path.noext=" + mime_from_path("README"));
+    print("path.dotfile=" + mime_from_path("/home/ada/.bashrc"));
+    print("path.dotdir=" + mime_from_path("/a.b/c"));
+    print("path.winsep=" + mime_from_path("C:\\tmp\\note.txt"));
+
+    // ---- multipart ----
+    let w = multipartWriter("BOUND123");
+    w.addField("who", "ada");
+    w.addField("empty", "");
+    w.addFile("f", "notes.txt", "", mime_bytes("alpha\nbeta"));
+    // An explicit content type overrides the guess mime_from_path would make.
+    w.addFile("g", "blob.bin", "application/octet-stream", mime_bytes("raw"));
+    let body = w.finish();
+    print("mp.ct=" + w.contentType());
+    print("mp.boundary=" + w.boundary());
+    print("mp.idempotent=" + str(w.finish() == body));
+
+    let parts = multipart_parse(body, "BOUND123");
+    print("mp.n=" + str(parts.len));
+    let i = 0;
+    while (i < parts.len) {
+        let p = parts[i];
+        print("mp." + str(i) + ".name=" + p.name() +
+              " file=[" + p.filename() + "]" +
+              " ct=[" + p.contentType() + "]" +
+              " isFile=" + str(p.isFile()) +
+              " headers=" + str(p.headerCount()) +
+              " body=[" + p.body.replace("\n", "\\n") + "]");
+        i += 1;
+    }
+
+    // Soft failure: a body with no matching boundary yields no parts.
+    print("mp.nomatch=" + str(multipart_parse(body, "OTHER").len));
+    print("mp.noboundary=" + str(multipart_parse(body, "").len));
+    print("mp.emptybody=" + str(multipart_parse("", "BOUND123").len));
+    // A part with no header block is all body.
+    let headless = multipart_parse("--B\r\njust text\r\n--B--\r\n", "B");
+    print("mp.headless=" + str(headless.len) + " body=[" + headless[0].body + "]");
+}

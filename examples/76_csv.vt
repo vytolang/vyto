@@ -1,0 +1,121 @@
+// vyto/util/csv — RFC 4180 reading and writing, dialects, and streaming.
+//
+// The reason this module exists is that a CSV *record* is not a line of text.
+// A field may be quoted; a quoted field may contain the delimiter, a doubled
+// quote, or a newline. `line.split(",")` gets all three wrong, and every one of
+// them appears in files that spreadsheets produce.
+//
+// vyto/data/frame's loadCsv and vyto/ui/datatable's CSV export both run through
+// here now, so a quoted field loads and saves correctly everywhere.
+
+import { csv_parse, csv_parse_with, csv_write, csv_write_with, csv_field,
+         csvReader, csvReaderWith, csvWriter,
+         csv_dialect, csv_tsv, csv_semicolon, csv_sniff,
+         csv_read_file, csv_write_file, csv_each_file } from "vyto/util/csv";
+
+fn show(label: string, rows: string[][]) {
+    let out = label;
+    for (let i in 0..rows.len) {
+        out = out + "\n  " + str(i) + ": ";
+        for (let j in 0..rows[i].len) {
+            if (j > 0) { out = out + " | "; }
+            out = out + "[" + rows[i][j].replace("\n", "\\n") + "]";
+        }
+    }
+    print(out);
+}
+
+fn main() {
+    // ---- the three things split(",") gets wrong ----
+    show("a delimiter inside a quoted field:", csv_parse("name,city\nAda,\"London, UK\"\n"));
+    show("a doubled quote is one quote:", csv_parse("quote\n\"she said \"\"hi\"\"\"\n"));
+    show("a quoted field may span lines:", csv_parse("id,note\n1,\"line one\nline two\"\n"));
+
+    // ---- the ordinary cases still work ----
+    print("");
+    show("empty fields are preserved:", csv_parse("a,,c\n"));
+    show("CRLF is accepted on input:", csv_parse("a,b\r\n1,2\r\n"));
+    show("a missing final newline is fine:", csv_parse("a,b"));
+    show("blank lines are skipped:", csv_parse("a,b\n\n\nc,d\n"));
+
+    // ---- dialects ----
+    print("");
+    show("tab-separated:", csv_parse_with("a\tb\n1\t2\n", csv_tsv()));
+    show("semicolon-separated:", csv_parse_with("a;b\n1;2\n", csv_semicolon()));
+
+    // A dialect is a plain struct, so adjust the field you need.
+    let commented = csv_dialect();
+    commented.comment = 35;                    // '#'
+    show("with comment lines:", csv_parse_with("# generated\na,b\n# note\n1,2\n", commented));
+
+    let trimmed = csv_dialect();
+    trimmed.trimSpace = true;
+    show("trimming unquoted padding:", csv_parse_with("  a  ,  b  \n", trimmed));
+
+    // csv_sniff guesses the delimiter from a sample: the candidate that appears
+    // the same number of times on every line wins. Commas inside quotes do not
+    // vote, so a quoted address does not fool it.
+    print("");
+    let guessed = csv_sniff("name;address;zip\nAda;\"1, High St\";E1\n");
+    print("sniffed delimiter byte = " + str(guessed.delim) + "   (';' is 59)");
+    show("parsed with it:", csv_parse_with("name;address;zip\nAda;\"1, High St\";E1\n", guessed));
+
+    // ---- reading one record at a time ----
+    // The pull reader tracks the line each record started on, which is what an
+    // error message needs when row 40,000 is malformed.
+    print("");
+    let r = csvReader("id,name\n1,Ada\n2,\"Grace\nHopper\"\n3,Alan\n");
+    while (r.next()) {
+        print("line " + str(r.lineNo()) + ": " + str(r.count()) + " fields, first=" + r.field(0));
+    }
+
+    // Failure is soft: an unterminated quote ends the record and is reported,
+    // rather than panicking or silently dropping data.
+    let broken = csvReader("a,\"never closed\n");
+    broken.next();
+    print("error = " + broken.error());
+    show("what survived:", [broken.row()]);
+
+    // ---- writing ----
+    print("");
+    print("quoting is applied only where needed:");
+    print("  plain   -> " + csv_field("abc", csv_dialect()));
+    print("  comma   -> " + csv_field("a,b", csv_dialect()));
+    print("  quote   -> " + csv_field("say \"hi\"", csv_dialect()));
+    print("  newline -> " + csv_field("a\nb", csv_dialect()).replace("\n", "\\n"));
+
+    let out = csv_write([["name", "city"], ["Ada", "London, UK"], ["Grace", "say \"hi\""]]);
+    print("");
+    print("csv_write:");
+    print(out);
+
+    // Round trip: what comes out parses back to what went in.
+    show("round trip:", csv_parse(out));
+
+    // A writer builds field by field when the rows are not already an array.
+    let w = csvWriter();
+    w.field("x").fieldInt(42).field("a,b").endRow();
+    w.field("y").fieldInt(7).field("plain").endRow();
+    print("built by hand:");
+    print(w.toString());
+
+    // ---- files ----
+    // csv_each_file streams in bounded memory and stitches lines back together
+    // when a record's quotes are still open, so multi-line fields survive.
+    // Closures capture by value, so counters ride in a 1-element array.
+    let path = "/tmp/vyto_csv_example.csv";
+    let wrote = csv_write_file(path, [["id", "note"], ["1", "has, comma"], ["2", "has\nnewline"]]);
+    print("wrote file = " + str(wrote));
+    show("read back:", csv_read_file(path));
+
+    let n = [0];
+    let cells = [0];
+    csv_each_file(path, (row) => {
+        n[0] = n[0] + 1;
+        cells[0] = cells[0] + row.len;
+    });
+    print("streamed " + str(n[0]) + " records, " + str(cells[0]) + " fields");
+
+    // A file that is not there yields no rows rather than panicking.
+    print("missing file = " + str(csv_read_file("/tmp/vyto_no_such_file.csv").len) + " rows");
+}

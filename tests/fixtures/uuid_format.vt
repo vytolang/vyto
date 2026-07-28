@@ -1,0 +1,223 @@
+// Pure-Vyto coverage for vyto/util/uuid. The generator is a CSPRNG, so a golden
+// cannot pin its output — every case here either uses a fixed literal or
+// asserts a *property* that must hold for every draw, which is what makes this
+// deterministic. The random path is exercised hard (thousands of draws) so a
+// broken bit-fiddle shows up rather than passing by luck.
+//
+// This is the one vyto/util module with a native shim (getrandom/BCryptGenRandom/
+// urandom), so unlike the other Tier B fixtures it does link C — but nothing
+// platform-specific, and it runs anywhere the compiler does.
+
+import { uuid4, uuid7, uuid7Gen, uuid_nil, uuid_format, uuid_parse, uuid_bytes,
+         uuid_canonical, uuid_is_valid, uuid_is_nil, uuid_version, uuid_variant,
+         uuid_compare, uuid_timestamp_ms,
+         rand_bytes, rand_int, rand_u63, rand_float } from "vyto/util/uuid";
+import { unixMs } from "vyto/util/time";
+
+const NS_DNS: string = "6ba7b810-9dad-11d1-80b4-00c04fd430c8";
+
+fn shapeOf(s: string): string {
+    let out = "";
+    let i = 0;
+    while (i < s.len) {
+        let c = s[i];
+        if (c == 45) { out = out + "-"; }
+        else {
+            if ((c >= 48 && c <= 57) || (c >= 97 && c <= 102)) { out = out + "x"; }
+            else { out = out + "?"; }
+        }
+        i += 1;
+    }
+    return out;
+}
+
+fn showParse(label: string, s: string) {
+    let b = bytes(16);
+    let ok = uuid_parse(s, b);
+    if (ok) { print(label + "=true/" + uuid_format(b)); }
+    else { print(label + "=false"); }
+}
+
+fn main() {
+    // ---- formatting from bytes ----
+    let b = bytes(16);
+    let i = 0;
+    while (i < 16) {
+        b[i] = (i * 17) as byte;
+        i += 1;
+    }
+    print("fmt.seq=" + uuid_format(b));
+    print("fmt.zero=" + uuid_format(bytes(16)));
+    print("fmt.short=" + uuid_format(bytes(8)));
+    let big = bytes(32);
+    print("fmt.long=" + uuid_format(big));
+    print("nil=" + uuid_nil());
+
+    // ---- parsing every accepted spelling ----
+    showParse("p.canonical", NS_DNS);
+    showParse("p.upper", "6BA7B810-9DAD-11D1-80B4-00C04FD430C8");
+    showParse("p.mixed", "6Ba7B810-9dAd-11D1-80b4-00C04fD430c8");
+    showParse("p.bare", "6ba7b8109dad11d180b400c04fd430c8");
+    showParse("p.braced", "{6ba7b810-9dad-11d1-80b4-00c04fd430c8}");
+    showParse("p.bracedbare", "{6ba7b8109dad11d180b400c04fd430c8}");
+    showParse("p.urn", "urn:uuid:6ba7b810-9dad-11d1-80b4-00c04fd430c8");
+    showParse("p.urnupper", "URN:UUID:6BA7B810-9DAD-11D1-80B4-00C04FD430C8");
+    showParse("p.spaces", "  6ba7b810-9dad-11d1-80b4-00c04fd430c8  ");
+    showParse("p.nil", "00000000-0000-0000-0000-000000000000");
+
+    // ---- rejection ----
+    showParse("r.empty", "");
+    showParse("r.short", "6ba7b810-9dad-11d1-80b4-00c04fd430c");
+    showParse("r.long", "6ba7b810-9dad-11d1-80b4-00c04fd430c89");
+    showParse("r.nonhex", "6ba7b810-9dad-11d1-80b4-00c04fd430cg");
+    showParse("r.badsep", "6ba7b810_9dad_11d1_80b4_00c04fd430c8");
+    showParse("r.shifted", "6ba7b8109-dad-11d1-80b4-00c04fd430c8");
+    showParse("r.words", "not-a-uuid-at-all-whatsoever-nope");
+    showParse("r.halfbrace", "{6ba7b810-9dad-11d1-80b4-00c04fd430c8");
+    showParse("r.badurn", "urn:uuid:nope");
+
+    let tooSmall = bytes(15);
+    print("r.smallout=" + str(uuid_parse(NS_DNS, tooSmall)));
+
+    print("valid.good=" + str(uuid_is_valid(NS_DNS)));
+    print("valid.bad=" + str(uuid_is_valid("nope")));
+    print("canon.upper=" + uuid_canonical("6BA7B810-9DAD-11D1-80B4-00C04FD430C8"));
+    print("canon.bad=[" + uuid_canonical("nope") + "]");
+    print("bytes.len=" + str(uuid_bytes(NS_DNS).len));
+    print("bytes.bad=" + uuid_format(uuid_bytes("nope")));
+
+    // ---- version and variant fields ----
+    print("ver.ns=" + str(uuid_version(NS_DNS)));
+    print("ver.nil=" + str(uuid_version(uuid_nil())));
+    print("ver.bad=" + str(uuid_version("nope")));
+    print("var.ns=" + str(uuid_variant(NS_DNS)));
+    print("var.ncs=" + str(uuid_variant("00000000-0000-4000-0000-000000000000")));
+    print("var.rfc=" + str(uuid_variant("00000000-0000-4000-8000-000000000000")));
+    print("var.ms=" + str(uuid_variant("00000000-0000-4000-c000-000000000000")));
+    print("var.future=" + str(uuid_variant("00000000-0000-4000-e000-000000000000")));
+    print("var.bad=" + str(uuid_variant("nope")));
+    print("isnil.yes=" + str(uuid_is_nil(uuid_nil())));
+    print("isnil.no=" + str(uuid_is_nil(NS_DNS)));
+    print("isnil.bad=" + str(uuid_is_nil("nope")));
+
+    // ---- ordering ----
+    print("cmp.eq=" + str(uuid_compare(NS_DNS, NS_DNS)));
+    print("cmp.lt=" + str(uuid_compare(uuid_nil(), NS_DNS)));
+    print("cmp.gt=" + str(uuid_compare(NS_DNS, uuid_nil())));
+    print("cmp.lastbyte=" + str(uuid_compare("00000000-0000-0000-0000-000000000001",
+                                             "00000000-0000-0000-0000-000000000002")));
+    print("cmp.case=" + str(uuid_compare(NS_DNS, "6BA7B810-9DAD-11D1-80B4-00C04FD430C8")));
+
+    // ---- v4: 2000 draws, every one well-formed and distinct ----
+    let shapeOk = true;
+    let verOk = true;
+    let varOk = true;
+    let nilOk = true;
+    let n = 0;
+    while (n < 2000) {
+        let u = uuid4();
+        if (shapeOf(u) != "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx") { shapeOk = false; }
+        if (uuid_version(u) != 4) { verOk = false; }
+        if (uuid_variant(u) != 1) { varOk = false; }
+        if (uuid_is_nil(u)) { nilOk = false; }
+        n += 1;
+    }
+    print("v4.shape=" + str(shapeOk));
+    print("v4.version=" + str(verOk));
+    print("v4.variant=" + str(varOk));
+    print("v4.notnil=" + str(nilOk));
+    print("v4.roundtrip=" + str(uuid_canonical(uuid4()).len == 36));
+    let d1 = uuid4();
+    let d2 = uuid4();
+    let d3 = uuid4();
+    print("v4.distinct=" + str(d1 != d2 && d2 != d3 && d1 != d3));
+    print("v4.nots=" + str(uuid_timestamp_ms(d1) == (-1 as i64)));
+
+    // ---- v7: version, variant, and a timestamp that tracks the clock ----
+    let t0 = unixMs();
+    let v7 = uuid7();
+    let t1 = unixMs();
+    let ts = uuid_timestamp_ms(v7);
+    print("v7.version=" + str(uuid_version(v7)));
+    print("v7.variant=" + str(uuid_variant(v7)));
+    print("v7.tsrange=" + str(ts >= t0 && ts <= t1));
+    print("v7.shape=" + str(shapeOf(v7) == "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"));
+    print("v7.tsbad=" + str(uuid_timestamp_ms("nope") == (-1 as i64)));
+
+    // A generator is strictly increasing. 5000 draws forces the counter past
+    // its 4096 values in a single millisecond and onto the borrow path.
+    let g = uuid7Gen();
+    let ordered = true;
+    let allV7 = true;
+    let prev = g.next();
+    let k = 0;
+    while (k < 5000) {
+        let u = g.next();
+        if (uuid_compare(u, prev) <= 0) { ordered = false; }
+        if (uuid_version(u) != 7 || uuid_variant(u) != 1) { allV7 = false; }
+        prev = u;
+        k += 1;
+    }
+    print("gen.ordered=" + str(ordered));
+    print("gen.fields=" + str(allV7));
+    // Borrowing from the next millisecond keeps the timestamp near the clock.
+    let drift = uuid_timestamp_ms(prev) - unixMs();
+    print("gen.drift.small=" + str(drift >= (-1 as i64) && drift < (100 as i64)));
+
+    // ---- the random API ----
+    print("rb.len=" + str(rand_bytes(32).len));
+    print("rb.zero=" + str(rand_bytes(0).len));
+    print("rb.negative=" + str(rand_bytes(-4).len));
+    print("rb.one=" + str(rand_bytes(1).len));
+    // 64 bytes that are all zero would mean the source is not filling anything.
+    let rb = rand_bytes(64);
+    let nonzero = 0;
+    let m = 0;
+    while (m < rb.len) {
+        if ((rb[m] as int) != 0) { nonzero += 1; }
+        m += 1;
+    }
+    print("rb.nonzero=" + str(nonzero > 32));
+
+    let u63ok = true;
+    let q = 0;
+    while (q < 1000) {
+        if (rand_u63() < 0) { u63ok = false; }
+        q += 1;
+    }
+    print("u63.nonneg=" + str(u63ok));
+
+    let fok = true;
+    let r = 0;
+    while (r < 1000) {
+        let f = rand_float();
+        if (f < 0.0 || f >= 1.0) { fok = false; }
+        r += 1;
+    }
+    print("float.range=" + str(fok));
+
+    // rand_int is half-open, unbiased, and covers its whole range.
+    let seen = 0;
+    let rangeOk = true;
+    let s = 0;
+    while (s < 5000) {
+        let v = rand_int(10, 17);
+        if (v < 10 || v > 16) { rangeOk = false; }
+        seen = seen | (1 << (v - 10));
+        s += 1;
+    }
+    print("randint.range=" + str(rangeOk));
+    print("randint.covers=" + str(seen == 127));
+    print("randint.empty=" + str(rand_int(5, 5)));
+    print("randint.inverted=" + str(rand_int(9, 3)));
+    print("randint.single=" + str(rand_int(4, 5)));
+    // A negative range still lands inside it.
+    let negOk = true;
+    let p = 0;
+    while (p < 1000) {
+        let v = rand_int(-5, 5);
+        if (v < -5 || v > 4) { negOk = false; }
+        p += 1;
+    }
+    print("randint.negative=" + str(negOk));
+}

@@ -1,0 +1,129 @@
+// vyto/util/uuid — v4 and v7 UUIDs, and the random source they need.
+//
+// The generated values are random, so this example prints *properties* of them
+// rather than the values themselves — that is what makes it golden-checkable.
+// The one place a literal appears is the well-known RFC 9562 namespace UUID,
+// used to demonstrate parsing.
+//
+// This is the only module under vyto/util backed by native code: getrandom(2)
+// on Linux, BCryptGenRandom on Windows, /dev/urandom otherwise. It exports that
+// source directly as rand_bytes/rand_int/rand_float, which is the general
+// random API the standard library previously lacked.
+
+import { uuid4, uuid7, uuid7Gen, uuid_nil, uuid_format, uuid_parse,
+         uuid_bytes, uuid_canonical, uuid_is_valid, uuid_is_nil,
+         uuid_version, uuid_variant, uuid_compare, uuid_timestamp_ms,
+         rand_bytes, rand_int, rand_u63, rand_float } from "vyto/util/uuid";
+import { unixMs } from "vyto/util/time";
+
+// A UUID's shape: 8-4-4-4-12 lowercase hex.
+fn shapeOf(s: string): string {
+    let out = "";
+    let i = 0;
+    while (i < s.len) {
+        let c = s[i];
+        if (c == 45) { out = out + "-"; }
+        else {
+            if ((c >= 48 && c <= 57) || (c >= 97 && c <= 102)) { out = out + "x"; }
+            else { out = out + "?"; }
+        }
+        i += 1;
+    }
+    return out;
+}
+
+fn main() {
+    // ---- version 4: random ----
+    let a = uuid4();
+    print("v4 shape   = " + shapeOf(a));
+    print("v4 length  = " + str(a.len));
+    print("v4 version = " + str(uuid_version(a)));
+    print("v4 variant = " + str(uuid_variant(a)));
+    // Two calls must not agree. (They are 122 random bits apart.)
+    print("v4 unique  = " + str(uuid4() != uuid4()));
+
+    // ---- version 7: time-ordered ----
+    // The first 48 bits are Unix milliseconds, so the creation time comes back
+    // out and sorting the strings sorts by creation order.
+    let b = uuid7();
+    let before = unixMs();
+    print("");
+    print("v7 shape   = " + shapeOf(b));
+    print("v7 version = " + str(uuid_version(b)));
+    print("v7 recent  = " + str(uuid_timestamp_ms(b) <= before));
+    print("v7 not old = " + str(uuid_timestamp_ms(b) > before - (5000 as i64)));
+    // A v4 carries no timestamp at all.
+    print("v4 has ts  = " + str(uuid_timestamp_ms(a) != (-1 as i64)));
+
+    // Vyto's relational operators do not work on strings, so ordering goes
+    // through uuid_compare — which is also what you would hand to sort_by.
+    let g = uuid7Gen();
+    let first = g.next();
+    let second = g.next();
+    let third = g.next();
+    print("ordered    = " + str(uuid_compare(first, second) < 0 &&
+                                uuid_compare(second, third) < 0));
+    print("self       = " + str(uuid_compare(first, first)));
+
+    // A bare uuid7() has no counter, so two of them inside one millisecond are
+    // unordered — use a generator when that matters. See the module header.
+    let gen = uuid7Gen();
+    let ok = true;
+    let prev = gen.next();
+    let i = 0;
+    while (i < 5000) {
+        let u = gen.next();
+        if (uuid_compare(u, prev) <= 0) { ok = false; }
+        prev = u;
+        i += 1;
+    }
+    print("5000 in order = " + str(ok));
+
+    // ---- parsing accepts every spelling in the wild ----
+    let ns = "6ba7b810-9dad-11d1-80b4-00c04fd430c8";   // RFC 9562 DNS namespace
+    print("");
+    print("hyphenated = " + uuid_canonical(ns));
+    print("braced     = " + uuid_canonical("{6BA7B810-9DAD-11D1-80B4-00C04FD430C8}"));
+    print("bare       = " + uuid_canonical("6ba7b8109dad11d180b400c04fd430c8"));
+    print("urn        = " + uuid_canonical("urn:uuid:6ba7b810-9dad-11d1-80b4-00c04fd430c8"));
+    print("version    = " + str(uuid_version(ns)));
+
+    print("nil        = " + uuid_nil());
+    print("nil is nil = " + str(uuid_is_nil(uuid_nil())));
+    print("v4 is nil  = " + str(uuid_is_nil(a)));
+
+    // Rejection is soft everywhere: a bad string is invalid, not fatal.
+    print("bad valid  = " + str(uuid_is_valid("not-a-uuid")));
+    print("bad version= " + str(uuid_version("not-a-uuid")));
+    print("bad canon  = [" + uuid_canonical("not-a-uuid") + "]");
+
+    // Bytes in, string out and back again.
+    let raw = uuid_bytes(ns);
+    print("bytes      = " + str(raw.len) + " -> " + uuid_format(raw));
+    let out = bytes(16);
+    print("parse ok   = " + str(uuid_parse(ns, out)));
+    let tooSmall = bytes(8);
+    print("parse small= " + str(uuid_parse(ns, tooSmall)));
+
+    // ---- the random API on its own ----
+    print("");
+    print("bytes(24)  = " + str(rand_bytes(24).len));
+    print("bytes(0)   = " + str(rand_bytes(0).len));
+    print("u63 >= 0   = " + str(rand_u63() >= 0));
+    let f = rand_float();
+    print("float 0..1 = " + str(f >= 0.0 && f < 1.0));
+
+    // rand_int is half-open and unbiased — a die roll is rand_int(1, 7).
+    let inRange = true;
+    let seen = 0;
+    let j = 0;
+    while (j < 2000) {
+        let roll = rand_int(1, 7);
+        if (roll < 1 || roll > 6) { inRange = false; }
+        seen = seen | (1 << roll);
+        j += 1;
+    }
+    print("die range  = " + str(inRange));
+    print("all 6 seen = " + str(seen == 126));   // bits 1..6 set
+    print("empty range= " + str(rand_int(5, 5)));
+}

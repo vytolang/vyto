@@ -1,0 +1,131 @@
+// vyto/util/xml — a pull parser and a small DOM, with namespaces and entities.
+//
+// Two layers over one scanner. The pull reader walks a document in constant
+// memory, which is what a large feed or a spreadsheet sheet needs; the DOM sits
+// on top for small documents where random access is easier to write.
+//
+// No DTD, so no external entities — that is the XXE attack, and this parser
+// simply has no mechanism for it.
+
+import { xmlReader, xml_parse, xml_parse_mixed, xml_root,
+         xml_escape, xml_escape_attr, xml_unescape, xml_write,
+         xmlElem, xmlText, xmlComment, xmlDoc,
+         XML_START, XML_END, XML_TEXT, XML_CDATA, XML_COMMENT, XML_PI,
+         XML_DOCTYPE, XML_EOF, XML_ERR } from "vyto/util/xml";
+
+// A const initializer must be a constant expression, so a multi-line document
+// is assembled in a function rather than declared as a const.
+fn feed(): string {
+    return "<?xml version=\"1.0\"?>\n" +
+        "<rss version=\"2.0\">\n" +
+        "  <channel>\n" +
+        "    <title>Vyto News</title>\n" +
+        "    <item><title>First post</title><guid isPermaLink=\"false\">a1</guid></item>\n" +
+        "    <item><title>Second post</title><guid isPermaLink=\"false\">a2</guid></item>\n" +
+        "  </channel>\n" +
+        "</rss>\n";
+}
+
+fn main() {
+    let FEED = feed();
+    // ---- streaming: one token at a time, constant memory ----
+    // ignoreWhitespace(true) drops the indentation between elements, which in a
+    // document like this is layout rather than content.
+    print("--- pull reader ---");
+    let r = xmlReader(FEED);
+    r.ignoreWhitespace(true);
+    let k = r.next();
+    while (k != XML_EOF && k != XML_ERR) {
+        if (k == XML_START) {
+            let line = "";
+            for (let i in 0..r.depth()) { line = line + "  "; }
+            line = line + "<" + r.name() + ">";
+            for (let i in 0..r.attrCount()) {
+                line = line + " " + r.attrName(i) + "=" + r.attrValue(i);
+            }
+            print(line);
+        }
+        if (k == XML_TEXT) { print("      text: " + r.text()); }
+        k = r.next();
+    }
+
+    // ---- the DOM: the same document, addressed by name ----
+    // A miss returns an empty node rather than null, so chains never crash.
+    print("");
+    print("--- DOM ---");
+    let doc = xml_parse(FEED);
+    let rss = doc.root();
+    print("root         = " + rss.name() + " version=" + rss.attr("version"));
+    print("channel title= " + doc.findDeep("title").text());
+    let items = rss.find("channel").findAll("item");
+    print("items        = " + str(items.len));
+    for (let i in 0..items.len) {
+        print("  " + items[i].find("guid").text() + ": " + items[i].find("title").text());
+    }
+    print("every title  = " + str(doc.findAllDeep("title").len));
+    print("a miss       = [" + rss.find("nope").find("deeper").text() + "]");
+    print("attrOr       = " + rss.find("channel").attrOr("lang", "(unset)"));
+
+    // ---- namespaces are resolved as you go ----
+    // A prefix is bound by the element that declares it and unbound when that
+    // element closes, so the same prefix can mean different things in one file.
+    print("");
+    print("--- namespaces ---");
+    let ns = "<feed xmlns=\"http://www.w3.org/2005/Atom\" xmlns:dc=\"http://purl.org/dc/elements/1.1/\">" +
+             "<entry><title>Hello</title><dc:creator>Ada</dc:creator></entry></feed>";
+    let nr = xmlReader(ns);
+    let nk = nr.next();
+    while (nk != XML_EOF && nk != XML_ERR) {
+        if (nk == XML_START) {
+            print(nr.name() + "  local=" + nr.localName() +
+                  "  prefix=[" + nr.prefix() + "]  uri=" + nr.nsUri());
+        }
+        nk = nr.next();
+    }
+    // In the DOM the URI is recorded on each element, so findNs selects by
+    // namespace rather than by whatever prefix the author happened to pick.
+    let nsdoc = xml_parse(ns);
+    let entry = nsdoc.findDeep("entry");
+    print("creator      = " + entry.findNs("http://purl.org/dc/elements/1.1/", "creator").text());
+
+    // Note the rule that catches people out: an *unprefixed attribute* is in no
+    // namespace at all, not in the default one.
+
+    // ---- entities and CDATA ----
+    print("");
+    print("--- entities ---");
+    let ent = xml_parse("<p>5 &lt; 6 &amp;&amp; &#65;&#x42; <![CDATA[<raw> & unescaped]]></p>");
+    print("decoded      = " + ent.root().text());
+    print("unescape     = " + xml_unescape("&lt;tag&gt; &#233;"));
+    // An entity with no declaration is passed through untouched rather than
+    // dropped: there is no DTD here to define it, and losing content silently
+    // is worse than leaving it visible.
+    print("unknown      = " + xml_unescape("caf&eacute;"));
+
+    // ---- writing ----
+    print("");
+    print("--- writing ---");
+    let note = xmlElem("note");
+    note.setAttr("id", "42");
+    note.setAttr("tag", "a & b");
+    note.append(xmlText("5 < 6"));
+    note.append(xmlElem("br"));
+    print("built        = " + note.toString());
+    print("empty        = " + xmlElem("hr").toString());
+    print("escape       = " + xml_escape("a<b>&c"));
+    print("escape attr  = " + xml_escape_attr("say \"hi\""));
+    // Round trip: parse then serialize.
+    print("round trip   = " + xml_parse("<a x=\"1\"><b/>text</a>").toString());
+
+    // ---- failure is soft ----
+    print("");
+    print("--- errors ---");
+    let bad = xml_parse("<a><b></a>");
+    print("mismatched   = " + bad.error());
+    let bad2 = xml_parse("<a x=1/>");
+    print("unquoted     = " + bad2.error());
+    let bad3 = xml_parse("<a><b/>");
+    print("unclosed     = " + bad3.error());
+    // Whatever was parsed before the error is still there to inspect.
+    print("salvaged     = " + bad.root().name());
+}

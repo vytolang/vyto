@@ -1,0 +1,239 @@
+// Pure-Vyto coverage for vyto/util/xml: the scanner's token stream, namespace
+// scoping, entity decoding, the DOM's search methods, serialization, and every
+// error path. No display, no network, no native dependency beyond the
+// vyto/util shims. Deterministic, golden-checked.
+//
+// The token stream is rendered as a single line per document so the golden
+// shows the whole shape of a parse at a glance: <name> for a start tag,
+// </name> for an end tag, t[..] for text, cd[..] for CDATA, and so on.
+
+import { xmlReader, xml_parse, xml_parse_mixed, xml_root,
+         xml_escape, xml_escape_attr, xml_unescape, xml_write,
+         xmlElem, xmlText, xmlComment, xmlDoc, XmlNode,
+         XML_NONE, XML_START, XML_END, XML_TEXT, XML_CDATA, XML_COMMENT,
+         XML_PI, XML_DOCTYPE, XML_EOF, XML_ERR,
+         XN_DOC, XN_ELEM, XN_TEXT, XN_CDATA, XN_COMMENT, XN_PI } from "vyto/util/xml";
+
+fn esc(s: string): string {
+    return s.replace("\r", "\\r").replace("\n", "\\n").replace("\t", "\\t");
+}
+
+fn tokens(label: string, s: string, skipSpace: bool) {
+    let r = xmlReader(s);
+    r.ignoreWhitespace(skipSpace);
+    let out = label + "=";
+    let k = r.next();
+    while (k != XML_EOF && k != XML_ERR) {
+        if (k == XML_START) {
+            out = out + " <" + r.name();
+            for (let i in 0..r.attrCount()) {
+                out = out + " " + r.attrName(i) + "='" + esc(r.attrValue(i)) + "'";
+            }
+            if (r.isSelfClosing()) { out = out + "/"; }
+            out = out + ">";
+        }
+        if (k == XML_END) { out = out + " </" + r.name() + ">"; }
+        if (k == XML_TEXT) { out = out + " t[" + esc(r.text()) + "]"; }
+        if (k == XML_CDATA) { out = out + " cd[" + esc(r.text()) + "]"; }
+        if (k == XML_COMMENT) { out = out + " c[" + esc(r.text()) + "]"; }
+        if (k == XML_PI) { out = out + " pi[" + r.name() + "|" + esc(r.text()) + "]"; }
+        if (k == XML_DOCTYPE) { out = out + " dt[" + esc(r.text()) + "]"; }
+        k = r.next();
+    }
+    if (k == XML_ERR) { out = out + " ERR(" + r.error() + ")"; }
+    print(out);
+}
+
+fn tok(label: string, s: string) { tokens(label, s, false); }
+
+fn main() {
+    // ---- the basic token stream ----
+    tok("t.simple", "<a>hi</a>");
+    tok("t.nested", "<a><b><c>x</c></b></a>");
+    tok("t.selfclose", "<a/>");
+    tok("t.selfclose.nested", "<a><b/><c/></a>");
+    tok("t.selfclose.space", "<a />");
+    tok("t.empty.pair", "<a></a>");
+    tok("t.siblings", "<r><a/><b/><c/></r>");
+    tok("t.textonly", "bare text");
+    tok("t.empty", "");
+    tok("t.mixed", "<p>a <b>bold</b> c</p>");
+
+    // ---- attributes ----
+    tok("a.double", "<a x=\"1\"/>");
+    tok("a.single", "<a x='1'/>");
+    tok("a.several", "<a x='1' y='2' z='3'/>");
+    tok("a.spaced", "<a  x = '1'  y = '2' />");
+    tok("a.empty", "<a x=''/>");
+    tok("a.entity", "<a x='&lt;&amp;&gt;'/>");
+    tok("a.quoteinside", "<a x=\"it's\" y='say \"hi\"'/>");
+    tok("a.newline", "<a x='one\ntwo'/>");
+    tok("a.dashes", "<a data-id='7' xml:lang='en'/>");
+
+    // ---- comments, CDATA, PIs, doctype ----
+    tok("s.comment", "<a><!-- hello --></a>");
+    tok("s.comment.empty", "<a><!----></a>");
+    tok("s.comment.dashes", "<a><!-- a - b --></a>");
+    tok("s.cdata", "<a><![CDATA[<raw> & co]]></a>");
+    tok("s.cdata.empty", "<a><![CDATA[]]></a>");
+    tok("s.cdata.brackets", "<a><![CDATA[a]b]]></a>");
+    tok("s.pi", "<?xml version='1.0'?><a/>");
+    tok("s.pi.notarget", "<?stylesheet?><a/>");
+    tok("s.doctype", "<!DOCTYPE html><a/>");
+    tok("s.doctype.subset", "<!DOCTYPE a [<!ENTITY x 'y'>]><a/>");
+    tok("s.prolog", "<?xml version='1.0'?><!DOCTYPE a><!-- c --><a/>");
+
+    // ---- whitespace handling ----
+    tok("w.keep", "<a>\n  <b/>\n</a>");
+    tokens("w.skip", "<a>\n  <b/>\n</a>", true);
+    tokens("w.skip.keepsreal", "<a>\n  text\n</a>", true);
+
+    // ---- entities ----
+    tok("e.five", "<a>&lt;&gt;&amp;&quot;&apos;</a>");
+    tok("e.decimal", "<a>&#65;&#66;&#233;</a>");
+    tok("e.hex", "<a>&#x41;&#x42;&#xE9;</a>");
+    tok("e.astral", "<a>&#x1F600;</a>");
+    tok("e.unknown", "<a>caf&eacute;</a>");
+    tok("e.bare", "<a>a & b</a>");
+    tok("e.nosemi", "<a>&ltx</a>");
+    tok("e.empty", "<a>&;</a>");
+    tok("e.zero", "<a>&#0;</a>");
+    tok("e.toobig", "<a>&#x110000;</a>");
+    tok("e.notincdata", "<a><![CDATA[&lt;]]></a>");
+
+    print("un.five=" + xml_unescape("&lt;&gt;&amp;&quot;&apos;"));
+    print("un.none=" + xml_unescape("plain text"));
+    print("un.numeric=" + xml_unescape("&#72;&#105;"));
+    print("un.mixed=" + xml_unescape("a&amp;b&unknown;c&#33;"));
+    print("esc.text=" + xml_escape("a<b>&c\"d'e"));
+    print("esc.attr=" + xml_escape_attr("a<b>&c\"d'e"));
+    print("esc.empty=[" + xml_escape("") + "]");
+    print("esc.round=" + xml_unescape(xml_escape_attr("<a href=\"x\">it's</a>")));
+
+    // ---- errors ----
+    tok("x.mismatch", "<a></b></a>");
+    tok("x.unclosed", "<a><b></b>");
+    tok("x.strayclose", "</a>");
+    tok("x.truncated", "<a");
+    tok("x.badname", "<>");
+    tok("x.unquoted", "<a x=1/>");
+    tok("x.novalue", "<a x/>");
+    tok("x.novalue2", "<a x=/>");
+    tok("x.opencomment", "<a><!-- never");
+    tok("x.opencdata", "<a><![CDATA[never");
+    tok("x.openpi", "<?never");
+    tok("x.opendoctype", "<!DOCTYPE never");
+    tok("x.openattr", "<a x='never");
+    tok("x.emptyclose", "</>");
+    tok("x.slashmid", "<a /x/>");
+    // The error line is where the construct went wrong, not where the doc ends.
+    tok("x.line3", "<a>\n\n<b x=1/></a>");
+
+    // ---- namespaces ----
+    let nsdoc = "<f xmlns='urn:default' xmlns:x='urn:x'>" +
+                "<c a='1' x:b='2'/>" +
+                "<x:d><g xmlns='urn:inner'/></x:d>" +
+                "<h/></f>";
+    let r = xmlReader(nsdoc);
+    let k = r.next();
+    while (k != XML_EOF && k != XML_ERR) {
+        if (k == XML_START) {
+            print("ns." + r.name() + "=local:" + r.localName() +
+                  " prefix:[" + r.prefix() + "]" +
+                  " uri:" + r.nsUri() +
+                  " a:[" + r.attr("a") + "]" +
+                  " xb:[" + r.attrNs("urn:x", "b") + "]");
+        }
+        k = r.next();
+    }
+    // The default namespace declared on <g> must not leak to its siblings —
+    // <h> is back in urn:default. That is what the scope stack is for.
+    let nd = xml_parse(nsdoc);
+    print("ns.h.uri=" + nd.root().find("h").nsUri());
+    print("ns.g.uri=" + nd.findDeep("g").nsUri());
+    // The `xml` prefix is bound by the spec itself, with no declaration.
+    print("ns.xml=" + xmlReader("<a xml:lang='en'/>").lookupNs("xml"));
+    print("ns.unbound=[" + xmlReader("<a/>").lookupNs("nope") + "]");
+
+    // ---- the DOM ----
+    let doc = xml_parse("<lib name='main'><book id='1'><t>A</t></book>" +
+                        "<book id='2'><t>B</t></book><note>n</note></lib>");
+    print("d.kind=" + str(doc.kind) + " isDoc=" + str(doc.isDoc()));
+    print("d.root=" + doc.root().name() + " isElem=" + str(doc.root().isElem()));
+    print("d.attr=" + doc.root().attr("name") + " has=" + str(doc.root().hasAttr("name")));
+    print("d.attr.miss=[" + doc.root().attr("zz") + "] or=" + doc.root().attrOr("zz", "dflt"));
+    print("d.attr.count=" + str(doc.root().attrCount()) +
+          " name0=" + doc.root().attrName(0) + " val0=" + doc.root().attrValue(0) +
+          " oob=[" + doc.root().attrName(9) + "]");
+    print("d.children=" + str(doc.root().childCount()));
+    print("d.child0=" + doc.root().child(0).name() + " oob=[" + doc.root().child(9).name() + "]");
+    print("d.find=" + doc.root().find("note").text());
+    print("d.findAll=" + str(doc.root().findAll("book").len));
+    print("d.findDeep=" + doc.findDeep("t").text());
+    print("d.findAllDeep=" + str(doc.findAllDeep("t").len));
+    print("d.miss.chain=[" + doc.find("nope").find("deeper").find("deepest").text() + "]");
+    print("d.text=" + doc.root().text());
+    let books = doc.root().findAll("book");
+    let ids = "";
+    for (let i in 0..books.len) { ids = ids + books[i].attr("id"); }
+    print("d.ids=" + ids);
+
+    // find matches the written name or the local name.
+    let pdoc = xml_parse("<r xmlns:p='urn:p'><p:x>v</p:x></r>");
+    print("d.byraw=" + pdoc.findDeep("p:x").text());
+    print("d.bylocal=" + pdoc.findDeep("x").text());
+    print("d.byns=" + pdoc.root().findNs("urn:p", "x").text());
+    print("d.byns.miss=[" + pdoc.root().findNs("urn:other", "x").text() + "]");
+
+    // Text collection walks descendants and skips comments.
+    let mixed = xml_parse_mixed("<p>a <b>bo<i>ld</i></b> c<!--x--><![CDATA[!]]></p>");
+    print("d.textdeep=[" + mixed.root().text() + "]");
+    print("d.texttrim=[" + xml_parse("<t>\n  padded\n</t>").root().textTrimmed() + "]");
+
+    // Whitespace-only text nodes: dropped by xml_parse, kept by xml_parse_mixed.
+    print("d.ws.parse=" + str(xml_parse("<a>\n  <b/>\n</a>").root().childCount()));
+    print("d.ws.mixed=" + str(xml_parse_mixed("<a>\n  <b/>\n</a>").root().childCount()));
+
+    // A document that failed still carries what was built.
+    let broken = xml_parse("<a><b>text</a>");
+    print("d.err=" + broken.error());
+    print("d.err.salvaged=" + broken.root().name() + "/" + str(broken.root().childCount()));
+    print("d.ok.err=[" + xml_parse("<a/>").error() + "]");
+    print("d.root.of.empty=[" + xml_parse("").root().name() + "]");
+    print("d.xml_root=" + xml_root("<a><b/></a>").name());
+
+    // ---- building and serializing ----
+    let n = xmlElem("note");
+    n.setAttr("id", "1");
+    n.setAttr("tag", "a & b");
+    n.setAttr("id", "2");                     // replaces rather than duplicates
+    n.append(xmlText("5 < 6"));
+    n.append(xmlElem("br"));
+    n.append(xmlComment("hidden"));
+    print("b.built=" + n.toString());
+    print("b.attrs=" + str(n.attrCount()));
+    print("b.empty=" + xmlElem("hr").toString());
+    print("b.text=" + xmlText("a<b").toString());
+    print("b.write=" + xml_write(n));
+
+    let d2 = xmlDoc();
+    d2.append(xmlComment(" generated "));
+    d2.append(n);
+    print("b.doc=" + d2.toString());
+
+    // Round trips.
+    print("r.simple=" + xml_parse("<a x=\"1\"><b/>text</a>").toString());
+    print("r.entities=" + xml_parse("<a>5 &lt; 6 &amp; 7</a>").toString());
+    print("r.cdata=" + xml_parse("<a><![CDATA[<raw>]]></a>").toString());
+    print("r.pi=" + xml_parse("<?xml version='1.0'?><a/>").toString());
+    print("r.nested=" + xml_parse("<a><b><c/></b></a>").toString());
+    print("r.mixed=" + xml_parse_mixed("<p>a <b>b</b> c</p>").toString());
+
+    // ---- depth ----
+    let deep = "";
+    for (let i in 0..50) { deep = deep + "<n>"; }
+    deep = deep + "x";
+    for (let i in 0..50) { deep = deep + "</n>"; }
+    let dd = xml_parse(deep);
+    print("deep.err=[" + dd.error() + "] text=" + dd.root().text());
+}

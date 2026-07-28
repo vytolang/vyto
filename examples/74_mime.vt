@@ -1,0 +1,95 @@
+// vyto/util/mime — media types, base64, quoted-printable, and multipart bodies.
+//
+// This is where base64 lives now. vyto/net/websocket re-exports base64_encode,
+// so the older spelling still works, and every caller gains base64_decode.
+//
+// Pure Vyto with no native dependency and no network, so the output is the same
+// on every host and can be golden-checked. The one thing this module will not
+// do is invent a multipart boundary: that needs randomness, and a module with
+// no native code has none. Pass one in — vyto/util/uuid's uuid4() is a good
+// source when the content is untrusted.
+
+import { base64_encode, base64url_encode, base64_decode, mime_bytes,
+         qp_encode, qp_decode, mime_parse, mediaType, mime_from_ext,
+         mime_from_path, multipartWriter, multipart_parse } from "vyto/util/mime";
+
+fn text(b: byte[]): string { return str(b as cstring); }
+
+fn main() {
+    // ---- base64, RFC 4648 test vectors ----
+    print("Man   -> " + base64_encode(mime_bytes("Man")));
+    print("Ma    -> " + base64_encode(mime_bytes("Ma")));
+    print("M     -> " + base64_encode(mime_bytes("M")));
+    print("empty -> [" + base64_encode(mime_bytes("")) + "]");
+    print("back  -> " + text(base64_decode("SGVsbG8sIHdvcmxkIQ==")));
+
+    // Decoding ignores anything outside the alphabet, so a body wrapped across
+    // lines by a mail transport decodes without being unwrapped first.
+    print("wrapped -> " + text(base64_decode("SGVsbG8s\r\nIHdvcmxkIQ==")));
+
+    // The URL-safe alphabet swaps '+/' for '-_' and drops the padding.
+    let raw = mime_bytes("\xfb\xff\xbe");
+    print("std   -> " + base64_encode(raw));
+    print("url   -> " + base64url_encode(raw));
+    // One decoder reads either alphabet.
+    print("both  -> " + str(text(base64_decode(base64url_encode(raw))) == text(raw)));
+
+    // ---- quoted-printable ----
+    print("");
+    print("qp    -> " + qp_encode("Caf\xc3\xa9 costs 5=10 francs"));
+    print("qp back -> " + qp_decode("Caf=C3=A9 costs 5=3D10 francs"));
+    // A soft line break is an '=' at end of line and vanishes on decode.
+    print("soft  -> " + qp_decode("one=\r\ntwo"));
+
+    // ---- media types ----
+    print("");
+    let mt = mime_parse("text/HTML; charset=UTF-8");
+    print("essence = " + mt.essence());
+    print("charset = " + mt.charset());
+    print("matches = " + str(mt.matches("TEXT/html")));
+    print("isType  = " + str(mt.isType("text")));
+
+    // A quoted parameter may contain the ';' that otherwise separates them.
+    let mp = mime_parse("multipart/form-data; boundary=\"a;b\"");
+    print("boundary= " + mp.boundary());
+    print("reprint = " + mp.toString());
+
+    // Parsing is soft: a header that is not a media type reports why.
+    let bad = mime_parse("nonsense");
+    print("bad     = " + bad.error());
+
+    // Building one from scratch.
+    let built = mediaType("application", "json").setParam("charset", "utf-8");
+    print("built   = " + built.toString());
+
+    // ---- extension lookup ----
+    print("");
+    print(".png    = " + mime_from_ext("PNG"));
+    print("path    = " + mime_from_path("/srv/www/index.html"));
+    print("double  = " + mime_from_path("archive.tar.gz"));
+    print("dotfile = " + mime_from_path("/home/ada/.bashrc"));
+    print("unknown = " + mime_from_ext("qqq"));
+
+    // ---- multipart round trip ----
+    print("");
+    let w = multipartWriter("----vyto-example-74");
+    w.addField("who", "ada");
+    w.addFile("notes", "notes.txt", "", mime_bytes("first line\nsecond line"));
+    let body = w.finish();
+    print("content-type = " + w.contentType());
+    print("--- body ---");
+    print(body);
+
+    print("--- parsed back ---");
+    let parts = multipart_parse(body, "----vyto-example-74");
+    let i = 0;
+    while (i < parts.len) {
+        let p = parts[i];
+        print("part " + str(i) + ": name=" + p.name() +
+              " filename=[" + p.filename() + "]" +
+              " type=[" + p.contentType() + "]" +
+              " isFile=" + str(p.isFile()));
+        print("  body: " + p.body.replace("\n", "\\n"));
+        i += 1;
+    }
+}

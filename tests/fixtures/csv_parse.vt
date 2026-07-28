@@ -1,0 +1,216 @@
+// Pure-Vyto coverage for vyto/util/csv: the RFC 4180 grammar, dialects,
+// sniffing, the writer's quoting rules, and the file round trip. No display and
+// no network, so this runs on every host. Deterministic, golden-checked.
+//
+// Rows are rendered as [field][field] with newlines escaped, so a field that
+// legitimately contains a newline stays on one golden line.
+//
+// The file cases write under /tmp rather than the repo, and read back what they
+// wrote — the round trip is the assertion that the writer's quoting and the
+// reader's unquoting agree.
+
+import { csv_parse, csv_parse_with, csv_write, csv_write_with, csv_field,
+         csvReader, csvReaderWith, csvWriter, csvWriterWith,
+         csv_dialect, csv_tsv, csv_semicolon, csv_pipe, csv_sniff,
+         csv_read_file, csv_read_file_with, csv_write_file, csv_write_file_with,
+         csv_each_file, Dialect } from "vyto/util/csv";
+
+fn rowText(row: string[]): string {
+    let out = "";
+    let i = 0;
+    while (i < row.len) {
+        out = out + "[" + row[i].replace("\r", "\\r").replace("\n", "\\n") + "]";
+        i += 1;
+    }
+    return out;
+}
+
+fn show(label: string, rows: string[][]) {
+    let out = label + "=" + str(rows.len) + ":";
+    let i = 0;
+    while (i < rows.len) {
+        out = out + " " + rowText(rows[i]);
+        i += 1;
+    }
+    print(out);
+}
+
+fn showWith(label: string, text: string, d: Dialect) {
+    show(label, csv_parse_with(text, d));
+}
+
+fn main() {
+    // ---- the basic grammar ----
+    show("basic", csv_parse("a,b,c\n1,2,3\n"));
+    show("noeol", csv_parse("a,b,c"));
+    show("onefield", csv_parse("a\n"));
+    show("onerow", csv_parse("a,b"));
+    show("empty", csv_parse(""));
+    show("onlynewline", csv_parse("\n"));
+    show("onlynewlines", csv_parse("\n\n\n"));
+    show("emptyfields", csv_parse("a,,c\n"));
+    show("allempty", csv_parse(",,\n"));
+    show("trailingdelim", csv_parse("a,b,\n"));
+    show("leadingdelim", csv_parse(",a,b\n"));
+    show("blankskipped", csv_parse("a\n\nb\n"));
+    show("ragged", csv_parse("a,b,c\n1,2\n3,4,5,6\n"));
+
+    // ---- line endings ----
+    show("lf", csv_parse("a\nb\n"));
+    show("crlf", csv_parse("a\r\nb\r\n"));
+    show("mixed", csv_parse("a\r\nb\nc\r\n"));
+    show("crlf.noeol", csv_parse("a,b\r\n1,2"));
+    show("blank.crlf", csv_parse("a\r\n\r\nb\r\n"));
+
+    // ---- quoting ----
+    show("q.simple", csv_parse("\"a\",\"b\"\n"));
+    show("q.delim", csv_parse("a,\"x,y\",c\n"));
+    show("q.doubled", csv_parse("\"say \"\"hi\"\"\"\n"));
+    show("q.onlyquotes", csv_parse("\"\"\"\"\n"));
+    show("q.emptyquoted", csv_parse("\"\",b\n"));
+    show("q.newline", csv_parse("a,\"one\ntwo\",c\n"));
+    show("q.crlfinside", csv_parse("a,\"one\r\ntwo\"\n"));
+    show("q.multiline.multi", csv_parse("\"a\nb\",\"c\nd\"\n"));
+    show("q.leadingspace", csv_parse("a, \"quoted\"\n"));
+    show("q.tailafter", csv_parse("a,\"q\"tail,c\n"));
+    show("q.strayinbare", csv_parse("a,b\"c,d\n"));
+    show("q.quotedthenrow", csv_parse("\"a\"\nb\n"));
+
+    // ---- soft failure ----
+    show("bad.unterminated", csv_parse("a,\"never closed\n"));
+    let r1 = csvReader("a,\"never closed\n");
+    r1.next();
+    print("bad.err=[" + r1.error() + "] ok=" + str(r1.ok()));
+    let r2 = csvReader("a,b\n");
+    r2.next();
+    print("good.err=[" + r2.error() + "] ok=" + str(r2.ok()));
+    // The error is recorded once and does not change on later records.
+    let r3 = csvReader("\"open\nrow2,x\n");
+    while (r3.next()) { }
+    print("bad.sticky=[" + r3.error() + "]");
+
+    // ---- the pull reader ----
+    let r = csvReader("id,name\n1,Ada\n2,\"Grace\nHopper\"\n3,Alan\n");
+    while (r.next()) {
+        print("pull.line" + str(r.lineNo()) + "=" + str(r.count()) + ":" + rowText(r.row()));
+    }
+    let r4 = csvReader("a,b\n");
+    r4.next();
+    print("field.oob=[" + r4.field(5) + "] neg=[" + r4.field(-1) + "]");
+    print("exhausted=" + str(r4.next()) + "/" + str(r4.next()));
+    // Each record is a fresh array, so a held row is not clobbered by the next.
+    let r5 = csvReader("a\nb\n");
+    r5.next();
+    let held = r5.row();
+    r5.next();
+    print("rows.independent=" + rowText(held) + rowText(r5.row()));
+
+    // ---- dialects ----
+    showWith("d.tsv", "a\tb\n1\t2\n", csv_tsv());
+    showWith("d.semi", "a;b\n1;2\n", csv_semicolon());
+    showWith("d.pipe", "a|b\n1|2\n", csv_pipe());
+    showWith("d.tsv.comma", "a,b\tc\n", csv_tsv());
+    showWith("d.tsv.quoted", "a\t\"x\ty\"\n", csv_tsv());
+
+    let comment = csv_dialect();
+    comment.comment = 35;
+    showWith("d.comment", "# head\na,b\n# mid\n1,2\n# tail\n", comment);
+    showWith("d.comment.only", "# just a comment\n", comment);
+    showWith("d.comment.mid", "a,b\n#x\n", comment);
+    // A '#' that is not at the start of a record is ordinary data.
+    showWith("d.comment.inline", "a,#b\n", comment);
+
+    let trim = csv_dialect();
+    trim.trimSpace = true;
+    showWith("d.trim", "  a  ,  b  \n", trim);
+    showWith("d.trim.quoted", "  \"  keep  \"  ,b\n", trim);
+    showWith("d.trim.empty", "   ,   \n", trim);
+    showWith("d.notrim", "  a  ,  b  \n", csv_dialect());
+
+    let alt = Dialect(58, 39, 0, false, false);      // ':' delimited, '-quoted
+    showWith("d.custom", "a:'x:y':c\n", alt);
+
+    // ---- sniffing ----
+    print("sniff.comma=" + str(csv_sniff("a,b,c\n1,2,3\n").delim));
+    print("sniff.tab=" + str(csv_sniff("a\tb\n1\t2\n").delim));
+    print("sniff.semi=" + str(csv_sniff("a;b;c\n1;2;3\n").delim));
+    print("sniff.pipe=" + str(csv_sniff("a|b\n1|2\n").delim));
+    // A comma inside a quoted field does not vote for the comma.
+    print("sniff.quoted=" + str(csv_sniff("a;b\n\"x,y\";z\n").delim));
+    // Inconsistent counts fall back to the comma default.
+    print("sniff.none=" + str(csv_sniff("just one line of prose\n").delim));
+    print("sniff.empty=" + str(csv_sniff("").delim));
+    print("sniff.single=" + str(csv_sniff("a,b,c").delim));
+
+    // ---- the writer's quoting rules ----
+    let d = csv_dialect();
+    print("f.plain=" + csv_field("abc", d));
+    print("f.empty=[" + csv_field("", d) + "]");
+    print("f.comma=" + csv_field("a,b", d));
+    print("f.quote=" + csv_field("a\"b", d));
+    print("f.bothquotes=" + csv_field("\"a\"", d));
+    print("f.newline=" + csv_field("a\nb", d).replace("\n", "\\n"));
+    print("f.cr=" + csv_field("a\rb", d).replace("\r", "\\r"));
+    print("f.space=" + csv_field(" a ", d));
+    print("f.tab.comma=" + csv_field("a\tb", d));
+    print("f.tab.tsv=" + csv_field("a\tb", csv_tsv()).replace("\t", "\\t"));
+    print("f.space.trim=" + csv_field(" a ", trim));
+
+    // ---- the writer ----
+    print("w.rows=" + csv_write([["a", "b"], ["1", "x,y"]]).replace("\n", "\\n"));
+    print("w.empty=[" + csv_write([]).replace("\n", "\\n") + "]");
+    print("w.emptyrow=[" + csv_write([[]]).replace("\n", "\\n") + "]");
+    print("w.crlf=" + csv_write_with([["a", "b"]], crlfDialect()).replace("\r", "\\r").replace("\n", "\\n"));
+    print("w.tsv=" + csv_write_with([["a", "b"]], csv_tsv()).replace("\t", "\\t").replace("\n", "\\n"));
+
+    let w = csvWriter();
+    w.field("x").fieldInt(42).field("a,b").endRow();
+    w.field("y").fieldInt(-7).endRow();
+    print("w.built=" + w.toString().replace("\n", "\\n"));
+    print("w.len=" + str(w.len()));
+    let w2 = csvWriterWith(csv_tsv());
+    w2.writeRow(["a", "b"]).writeRow(["c", "d"]);
+    print("w.writeRow=" + w2.toString().replace("\t", "\\t").replace("\n", "\\n"));
+    let w3 = csvWriter();
+    w3.writeRows([["1", "2"], ["3", "4"]]);
+    print("w.writeRows=" + w3.toString().replace("\n", "\\n"));
+
+    // ---- round trips: everything the writer quotes, the reader unquotes ----
+    let tricky = [["plain", "with,comma"],
+                  ["with\"quote", "with\nnewline"],
+                  ["", " padded "],
+                  ["tab\there", "trailing,"]];
+    show("round.mem", csv_parse(csv_write(tricky)));
+    show("round.tsv", csv_parse_with(csv_write_with(tricky, csv_tsv()), csv_tsv()));
+
+    // ---- files ----
+    let path = "/tmp/vyto_csv_fixture.csv";
+    print("file.write=" + str(csv_write_file(path, tricky)));
+    show("file.read", csv_read_file(path));
+    let n = [0];
+    let fields = [0];
+    print("file.each=" + str(csv_each_file(path, (row) => {
+        n[0] = n[0] + 1;
+        fields[0] = fields[0] + row.len;
+    })));
+    print("file.counts=" + str(n[0]) + "/" + str(fields[0]));
+
+    let tpath = "/tmp/vyto_csv_fixture.tsv";
+    print("file.tsv.write=" + str(csv_write_file_with(tpath, tricky, csv_tsv())));
+    show("file.tsv.read", csv_read_file_with(tpath, csv_tsv()));
+
+    // Missing files fail softly rather than panicking.
+    print("file.missing=" + str(csv_read_file("/tmp/vyto_csv_does_not_exist.csv").len));
+    print("file.missing.each=" + str(csv_each_file("/tmp/vyto_csv_does_not_exist.csv", (row) => { })));
+    print("file.badpath.write=" + str(csv_write_file("/no/such/dir/x.csv", tricky)));
+
+    // An empty file yields no records.
+    print("file.empty.write=" + str(csv_write_file("/tmp/vyto_csv_empty.csv", [])));
+    print("file.empty.read=" + str(csv_read_file("/tmp/vyto_csv_empty.csv").len));
+}
+
+fn crlfDialect(): Dialect {
+    let d = csv_dialect();
+    d.crlf = true;
+    return d;
+}

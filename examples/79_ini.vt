@@ -1,0 +1,93 @@
+// vyto/util/ini — the INI/conf format, parsed into vyto/util/json's tree.
+//
+// INI has no specification, so this implements the intersection everything
+// agrees on: [section] headers, `key = value` or `key: value`, and `;` or `#`
+// comments. The one thing to keep in mind is that **every value is a string** —
+// INI has no types, so `port = 8080` and `port = "8080"` are the same file.
+
+import { ini_parse, ini_parse_nested, ini_encode, ini_failed } from "vyto/util/ini";
+import { JsonValue, json_encode, jobj, jstr } from "vyto/util/json";
+import { parse_int } from "vyto/cli";
+
+fn conf(): string {
+    return "; the application's own settings\n" +
+        "name  = vyto-service\n" +
+        "debug = false\n" +
+        "\n" +
+        "[server]\n" +
+        "host = 0.0.0.0\n" +
+        "port = 8080          ; inline comments need whitespace before them\n" +
+        "motd = \"  keep my spaces  \"\n" +
+        "\n" +
+        "[paths]\n" +
+        "data: /var/lib/app   # a colon works as well as an '='\n" +
+        "tag = release#7\n";
+}
+
+fn main() {
+    let cfg = ini_parse(conf());
+    if (ini_failed(cfg)) {
+        print("parse failed: " + cfg.parseError());
+        return;
+    }
+
+    // ---- reading it ----
+    print("name    = " + cfg.get("name").asString());
+    print("debug   = " + cfg.get("debug").asString());
+    print("host    = " + cfg.get("server").get("host").asString());
+    print("motd    = [" + cfg.get("server").get("motd").asString() + "]");
+    print("data    = " + cfg.get("paths").get("data").asString());
+    // A '#' with no space before it is part of the value, not a comment — the
+    // rule Git and most INI readers use, and the one that surprises least.
+    print("tag     = " + cfg.get("paths").get("tag").asString());
+    print("missing = [" + cfg.get("nope").get("deeper").asString() + "]");
+
+    // Values are text, so numbers go through a parser. asInt() would read a
+    // string as 0; vyto/cli's parse_int reports failure instead of panicking.
+    print("");
+    let out = [0];
+    let ok = parse_int(cfg.get("server").get("port").asString(), out);
+    print("port ok = " + str(ok) + ", value = " + str(out[0]));
+    let bad = [0];
+    let badOk = parse_int(cfg.get("name").asString(), bad);
+    print("name as int = " + str(badOk) + " (a name is not a number)");
+
+    // ---- because it is a JsonValue, it is also JSON ----
+    print("");
+    print("as JSON: " + json_encode(cfg.get("server")));
+
+    // ---- the grammar's corners ----
+    print("");
+    print("keys before any section stay at the root: " +
+          json_encode(ini_parse("a = 1\n[s]\nb = 2\n")));
+    print("a reopened section merges:                " +
+          json_encode(ini_parse("[s]\na = 1\n[t]\nx = 0\n[s]\nb = 2\n")));
+    print("a repeated key takes the last value:      " +
+          json_encode(ini_parse("a = 1\na = 2\n")));
+    print("an empty value is an empty string:        " +
+          json_encode(ini_parse("a =\n")));
+
+    // Section names are flat by default — [a.b] is one name with a dot in it.
+    // Pass ini_parse_nested when the dots are meant as structure.
+    print("flat:   " + json_encode(ini_parse("[a.b]\nx = 1\n")));
+    print("nested: " + json_encode(ini_parse_nested("[a.b]\nx = 1\n[a.c]\ny = 2\n")));
+
+    // ---- failure is soft, and says where ----
+    print("");
+    print("not a pair       = " + ini_parse("a = 1\njust some words\n").parseError());
+    print("open header      = " + ini_parse("[unterminated\n").parseError());
+    print("key vs section   = " + ini_parse("a = 1\n[a]\nb = 2\n").parseError());
+
+    // ---- writing it back ----
+    print("");
+    let built = jobj();
+    built.set("name", jstr("built-by-hand"));
+    let srv = jobj();
+    srv.set("host", jstr("localhost"));
+    srv.set("motd", jstr("  padded  "));
+    built.set("server", srv);
+    print("encoded:");
+    print(ini_encode(built));
+    print("round trip stable = " +
+          str(json_encode(ini_parse(ini_encode(built))) == json_encode(built)));
+}

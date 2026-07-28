@@ -1,0 +1,102 @@
+// vyto/util/log — levelled, structured logging with a JSON-lines sink.
+//
+// Two formats over the same records: text for a person reading a terminal,
+// JSON lines for a machine — one object per line, which is what every log
+// shipper expects and what makes `jq` work on the result.
+//
+// Timestamps here are pinned with fixedTime() so the example is reproducible
+// and can be golden-checked. Real code leaves the clock alone.
+
+import { logger, log_default, log_timestamp, log_level_name, log_level_from,
+         LOG_TRACE, LOG_DEBUG, LOG_INFO, LOG_WARN, LOG_ERROR, LOG_FATAL,
+         LOG_OFF } from "vyto/util/log";
+import { fmt, fs, fi } from "vyto/util/fmt";
+
+fn stamp(): i64 { return 1769593262317 as i64; }
+
+fn main() {
+    // ---- the text format ----
+    print("--- text ---");
+    let log = logger("api").fixedTime(stamp());
+    log.info("listening");
+    log.warn("upstream slow");
+    log.error("upstream refused");
+
+    // Below the level, so nothing is written and nothing is formatted.
+    log.debug("this never appears");
+    print("debug enabled? " + str(log.enabled(LOG_DEBUG)));
+
+    // ---- structured fields ----
+    // The point of the module: a search becomes `level=error user=42` instead
+    // of a regular expression over prose.
+    print("");
+    print("--- fields ---");
+    log.field("port", "8080").fieldInt("workers", 4).info("configured");
+    // field() applies to the next record only, so this one is bare again.
+    log.info("started");
+
+    // context() sticks for the logger's lifetime — a request id, a component.
+    log.context("region", "eu-west");
+    log.info("with context");
+    log.field("attempt", "2").warn("retrying");
+
+    // A value with a space, a quote or an `=` is quoted; everything else is
+    // left bare. That is the logfmt convention, and it keeps lines readable.
+    log.field("path", "/a b/c").field("empty", "").field("q", "say \"hi\"").info("quoting");
+
+    // ---- formatted messages ----
+    // The format string is only expanded if the record survives the level
+    // check, so a debugf in a hot loop costs one integer comparison.
+    print("");
+    print("--- formatted ---");
+    log.infof("served %d requests in %d ms", [fi(1204), fi(37)]);
+    log.errorf("host %s failed after %d attempts", [fs("db-1"), fi(3)]);
+
+    // ---- levels ----
+    print("");
+    print("--- levels ---");
+    let verbose = logger("worker").fixedTime(stamp()).level(LOG_TRACE);
+    verbose.trace("entering loop");
+    verbose.debug("batch of 100");
+    verbose.info("done");
+
+    // A level can come from a config string; an unrecognized name falls back
+    // rather than stopping the program.
+    print("parsed 'warn'  = " + str(log_level_from("warn", LOG_INFO)));
+    print("parsed 'nope'  = " + str(log_level_from("nope", LOG_INFO)) + " (the default)");
+    print("name of WARN   = " + log_level_name(LOG_WARN));
+
+    let silent = logger("quiet").level(LOG_OFF);
+    silent.error("not written");
+    print("records from a LOG_OFF logger: " + str(silent.count()));
+
+    // ---- a child logger ----
+    // withContext copies the configuration and the context, so a request can
+    // have its own logger without mutating the shared one.
+    print("");
+    print("--- child ---");
+    let req = log.withContext("req", "a1b2c3");
+    req.info("handling");
+    log.info("parent is unchanged");
+
+    // ---- the JSON-lines format ----
+    // One object per line, with a fixed key order so lines diff and sort well.
+    // Escaping comes from vyto/util/json, so a message containing a quote or a
+    // newline is escaped exactly as the JSON encoder would.
+    print("");
+    print("--- json lines ---");
+    let j = logger("api").json().fixedTime(stamp()).context("host", "node-1");
+    j.info("started");
+    j.field("port", "8080").field("tls", "on").info("listening");
+    j.field("err", "connection reset\nby peer").error("upstream failed");
+
+    // ---- timestamps ----
+    print("");
+    print("--- timestamps ---");
+    print("RFC 3339 with ms = " + log_timestamp(stamp()));
+    print("the epoch        = " + log_timestamp(0 as i64));
+    // Suppressed when something else already stamps the line — a systemd
+    // journal, a container runtime.
+    let bare = log_default().timestamps(false);
+    bare.info("no timestamp, no logger name");
+}

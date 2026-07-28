@@ -1,0 +1,80 @@
+// vyto/util/html — escaping and generation.
+//
+// The escaper is the part that matters. Before this module the tree had no
+// HTML escaping at all, and every string that reaches a page without passing
+// through html_escape or html_escape_attr is an injection.
+//
+// This is not an HTML parser: a real HTML5 tree builder is a different project.
+// For input that is genuinely well-formed, use vyto/util/xml.
+
+import { html_escape, html_escape_attr, html_unescape,
+         htmlBuilder, html_tag, html_document, html_strip_tags,
+         html_is_void, html_is_raw_text } from "vyto/util/html";
+
+fn main() {
+    // ---- escaping ----
+    print("text  = " + html_escape("5 < 6 & 7 > 4"));
+    print("attr  = " + html_escape_attr("say \"hi\" & don't"));
+    // The classic injection, defused.
+    let userInput = "<script>alert('xss')</script>";
+    print("input = " + html_escape(userInput));
+
+    // ---- decoding ----
+    print("");
+    print("named   = " + html_unescape("caf&eacute; &mdash; 100&deg; &amp; more"));
+    print("numeric = " + html_unescape("&#72;&#101;&#108;&#108;&#111; &#x21;"));
+    // An entity this module does not know is left as written rather than
+    // dropped — losing content silently is worse than showing it.
+    print("unknown = " + html_unescape("&notarealentity; stays"));
+
+    // ---- the builder ----
+    // Text and attribute values are escaped for you; the open-tag stack means
+    // close() never needs a tag name and cannot mismatch.
+    print("");
+    let h = htmlBuilder();
+    h.open("article").attr("class", "post").attr("data-id", "7");
+    h.open("h2").text("Ada & the Engine").close();
+    h.open("p").text("She wrote the first ").open("em").text("program").close();
+    h.text(".").close();
+    h.open("ul");
+    h.open("li").text("note <one>").close();
+    h.open("li").text("note \"two\"").close();
+    h.close();
+    h.close();
+    print(h.toString());
+    print("well formed = " + str(h.ok()) + ", still open = " + str(h.depth()));
+
+    // Void elements need no close, and get none.
+    print("");
+    let v = htmlBuilder();
+    v.open("p").text("line one").open("br").text("line two").close();
+    print("void      = " + v.toString());
+    print("is void   = br:" + str(html_is_void("BR")) + " div:" + str(html_is_void("div")));
+    print("raw text  = script:" + str(html_is_raw_text("script")));
+
+    // Attributes with no value, and comments.
+    let f = htmlBuilder();
+    f.open("input").attr("type", "checkbox").flag("checked").flag("disabled");
+    f.comment("the -- sequence is neutralized, since it would end the comment");
+    print("flags     = " + f.toString());
+
+    // raw() is the deliberate hole in the escaping, and the only one — which
+    // makes "where does unescaped markup enter this page" a grep for `.raw(`.
+    let r = htmlBuilder();
+    r.open("div").raw("<b>trusted markup</b>").close();
+    print("raw       = " + r.toString());
+
+    // Mistakes are recorded rather than fatal: half a page plus a diagnostic
+    // beats a dead process, and ok() makes it checkable.
+    let bad = htmlBuilder();
+    bad.open("p").close().close();
+    print("error     = " + bad.error());
+
+    // ---- one-liners ----
+    print("");
+    print("tag       = " + html_tag("h1", "Title & subtitle"));
+    print("strip     = " + html_strip_tags("<p>Hello <b>world</b> &amp; friends</p>"));
+    print("");
+    print("a whole page:");
+    print(html_document("Ada & Co", "<h1>Hello</h1>"));
+}

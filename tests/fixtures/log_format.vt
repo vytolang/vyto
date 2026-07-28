@@ -1,0 +1,204 @@
+// Pure-Vyto coverage for vyto/util/log: level filtering, both output formats,
+// field and context handling, escaping, timestamps, and the file sink.
+//
+// Every logger here pins its clock with fixedTime(), which is the only reason
+// a logging module can be golden-tested at all. The file cases write under
+// /tmp, not the repo, and read back what they wrote.
+
+import { Logger, logger, log_default, log_timestamp, log_level_name,
+         log_level_from, LOG_TRACE, LOG_DEBUG, LOG_INFO, LOG_WARN, LOG_ERROR,
+         LOG_FATAL, LOG_OFF, LOG_TEXT, LOG_JSON } from "vyto/util/log";
+import { fmt, fs, fi, fb } from "vyto/util/fmt";
+
+fn stamp(): i64 { return 1769593262317 as i64; }
+
+fn at(name: string): Logger { return logger(name).fixedTime(stamp()); }
+
+fn main() {
+    // ---- timestamps ----
+    print("ts.epoch=" + log_timestamp(0 as i64));
+    print("ts.known=" + log_timestamp(stamp()));
+    print("ts.ms0=" + log_timestamp(1000 as i64));
+    print("ts.ms1=" + log_timestamp(1001 as i64));
+    print("ts.ms999=" + log_timestamp(1999 as i64));
+    print("ts.leapday=" + log_timestamp(1709164800000 as i64));
+    print("ts.y2038=" + log_timestamp(2147483648000 as i64));
+    // A negative millisecond count is before the epoch; the fraction must not
+    // come out negative.
+    print("ts.negative=" + log_timestamp(-1 as i64));
+    print("ts.negativesec=" + log_timestamp(-1500 as i64));
+
+    // ---- level names ----
+    print("n.trace=" + log_level_name(LOG_TRACE));
+    print("n.debug=" + log_level_name(LOG_DEBUG));
+    print("n.info=" + log_level_name(LOG_INFO));
+    print("n.warn=" + log_level_name(LOG_WARN));
+    print("n.error=" + log_level_name(LOG_ERROR));
+    print("n.fatal=" + log_level_name(LOG_FATAL));
+    print("n.off=" + log_level_name(LOG_OFF));
+    print("n.below=" + log_level_name(-5));
+    print("n.above=" + log_level_name(99));
+
+    print("p.exact=" + str(log_level_from("warn", LOG_INFO)));
+    print("p.upper=" + str(log_level_from("WARN", LOG_INFO)));
+    print("p.spaced=" + str(log_level_from("  error  ", LOG_INFO)));
+    print("p.alias=" + str(log_level_from("warning", LOG_INFO)) + "/" +
+          str(log_level_from("err", LOG_INFO)) + "/" +
+          str(log_level_from("silent", LOG_INFO)));
+    print("p.unknown=" + str(log_level_from("nonsense", LOG_WARN)));
+    print("p.empty=" + str(log_level_from("", LOG_DEBUG)));
+
+    // ---- text format ----
+    print("");
+    let t = at("api");
+    t.info("plain");
+    t.warn("warned");
+    t.error("errored");
+    t.fatal("fatal but not exiting");
+    print("t.count=" + str(t.count()));
+
+    // Level filtering. Records below the minimum are not written and do not
+    // count.
+    let f = at("f").level(LOG_WARN);
+    f.trace("no");
+    f.debug("no");
+    f.info("no");
+    f.warn("yes");
+    f.error("yes");
+    print("f.count=" + str(f.count()));
+    print("f.enabled=" + str(f.enabled(LOG_INFO)) + "/" + str(f.enabled(LOG_WARN)));
+    print("f.minimum=" + str(f.minimum()));
+
+    let off = at("off").level(LOG_OFF);
+    off.fatal("never");
+    print("off.count=" + str(off.count()));
+
+    let byName = at("byname").levelName("DEBUG");
+    byName.debug("visible after levelName");
+    let byBadName = at("badname").levelName("nonsense");
+    byBadName.debug("still filtered, level unchanged");
+    byBadName.info("but info gets through");
+
+    // An unnamed logger has no `name:` prefix.
+    let anon = log_default().fixedTime(stamp());
+    anon.info("no name");
+    // Timestamps can be suppressed.
+    at("nots").timestamps(false).info("no timestamp");
+    log_default().timestamps(false).info("neither");
+
+    // ---- fields ----
+    print("");
+    let fl = at("fields");
+    fl.field("a", "1").info("one field");
+    fl.info("fields do not persist");
+    fl.field("a", "1").field("b", "2").field("c", "3").info("three fields");
+    fl.fieldInt("n", -42).fieldBool("ok", true).fieldFloat("r", 1.5).info("typed");
+    // A dropped record must still consume its fields, or they leak onto the
+    // next record that *is* written.
+    fl.level(LOG_ERROR);
+    fl.field("leaked", "no").info("dropped");
+    fl.error("should carry no fields");
+    fl.level(LOG_INFO);
+
+    // Values are quoted only when they would otherwise be ambiguous.
+    let q = at("q");
+    q.field("plain", "value").info("bare");
+    q.field("space", "a b").info("quoted");
+    q.field("empty", "").info("quoted");
+    q.field("quote", "say \"hi\"").info("escaped");
+    q.field("equals", "a=b").info("quoted");
+    q.field("newline", "a\nb").info("escaped");
+    q.field("tab", "a\tb").info("escaped");
+    q.field("backslash", "a\\b").info("bare: a backslash alone is unambiguous");
+
+    // ---- context ----
+    print("");
+    let c = at("ctx").context("req", "r1");
+    c.info("has context");
+    c.info("still has context");
+    c.field("extra", "e").info("context then fields");
+    c.context("user", "u9");
+    c.info("two context fields");
+    c.clearContext();
+    c.info("context cleared");
+
+    let parent = at("p").context("app", "svc");
+    let child = parent.withContext("req", "r2");
+    child.info("child");
+    parent.info("parent unaffected");
+    let grandchild = child.withContext("span", "s3");
+    grandchild.info("grandchild");
+    print("c.counts=" + str(parent.count()) + "/" + str(child.count()) + "/" +
+          str(grandchild.count()));
+    // A child inherits the level and the format, not the record fields.
+    let lv = at("lv").level(LOG_ERROR);
+    let lvChild = lv.withContext("k", "v");
+    lvChild.info("filtered in the child too");
+    lvChild.error("but errors get through");
+
+    // ---- formatted ----
+    print("");
+    let fo = at("fmtd");
+    fo.infof("%d and %s and %s", [fi(7), fs("x"), fb(true)]);
+    fo.tracef("never expanded %d", [fi(1)]);
+    fo.debugf("also never %d", [fi(2)]);
+    fo.warnf("warned %d", [fi(3)]);
+    fo.errorf("errored %s", [fs("bad")]);
+    fo.fatalf("fatal %s", [fs("end")]);
+    // A dropped formatted record still consumes its fields.
+    fo.level(LOG_ERROR);
+    fo.field("gone", "yes").infof("dropped %d", [fi(9)]);
+    fo.error("no stray fields");
+
+    // ---- JSON lines ----
+    print("");
+    let j = at("api").json();
+    j.info("plain");
+    j.field("port", "8080").info("with a field");
+    j.context("host", "h1");
+    j.info("with context");
+    j.field("n", "1").warn("both");
+    j.field("q", "say \"hi\"").field("nl", "a\nb").field("tab", "a\tb").error("escaped");
+    j.field("ctl", "a\x01b").info("control byte");
+    // An unnamed JSON logger omits the logger key entirely.
+    log_default().json().fixedTime(stamp()).info("anonymous");
+    // Without timestamps the object starts at level.
+    at("nots").json().timestamps(false).info("no ts");
+    // Switching formats back and forth on one logger.
+    let sw = at("sw");
+    sw.info("text");
+    sw.json();
+    sw.info("json");
+    sw.text();
+    sw.info("text again");
+
+    // ---- the file sink ----
+    print("");
+    let path = "/tmp/vyto_log_fixture.jsonl";
+    let fw = at("file").json().toFile(path);
+    print("file.has=" + str(fw.hasFile()));
+    fw.info("one");
+    fw.field("n", "2").info("two");
+    fw.flush();
+    fw.info("three");
+    fw.close();
+    print("file.count=" + str(fw.count()));
+    print("--- file contents ---");
+    print(readfile(path).trim_end());
+    print("--- ---");
+
+    // A path that cannot be opened leaves the logger on stdout rather than
+    // losing the records.
+    let bad = at("badpath").toFile("/no/such/dir/x.log");
+    print("file.badpath=" + str(bad.hasFile()));
+    bad.info("still printed");
+
+    // Text format to a file, and closing twice is harmless.
+    let tp = "/tmp/vyto_log_fixture.txt";
+    let tf = at("txt").toFile(tp);
+    tf.warn("to a file");
+    tf.close();
+    tf.close();
+    print("--- text file ---");
+    print(readfile(tp).trim_end());
+}

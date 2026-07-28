@@ -1,0 +1,121 @@
+// vyto/util/url — parsing, percent-encoding, query strings, and reference
+// resolution.
+//
+// This is where url_encode lives. vyto/net/http re-exports it, so the older
+// spelling `import { url_encode } from "vyto/net/http"` still works; new code
+// should import it from here.
+//
+// Everything below is pure Vyto over string bytes — no native dependency, no
+// network — so the output is identical on every host and can be golden-checked.
+
+import { url_parse, url_join, url_encode, url_encode_path, url_encode_form,
+         url_decode, url_decode_form, query_parse, queryParams,
+         url, urlOf, remove_dot_segments } from "vyto/util/url";
+
+fn main() {
+    // ---- taking a URL apart ----
+    let u = url_parse("https://ada:s3cret@example.com:8443/docs/intro.html?q=hi+there&tag=a&tag=b#install");
+    print("scheme    = " + u.scheme);
+    print("user      = " + u.user);
+    print("host      = " + u.host);
+    print("port      = " + str(u.port));
+    print("path      = " + u.path);
+    print("query     = " + u.query);
+    print("fragment  = " + u.fragment);
+    print("hostPort  = " + u.hostPort());
+    print("round     = " + u.toString());
+
+    // A port the URL does not state comes from the scheme.
+    let plain = url_parse("http://example.com/");
+    print("");
+    print("no port   = " + str(plain.port) + ", effective = " + str(plain.effectivePort()));
+
+    // An IPv6 literal keeps its brackets only in the printed form.
+    let v6 = url_parse("http://[2001:db8::1]:8080/health");
+    print("v6 host   = " + v6.host);
+    print("v6 print  = " + v6.toString());
+
+    // ---- the parse is soft, like json_parse ----
+    // Only a malformed port and an unterminated IPv6 literal are errors; the
+    // fields parsed before the problem are still there to look at.
+    print("");
+    let bad = url_parse("http://example.com:99999/x");
+    print("bad host  = " + bad.host);
+    print("bad error = " + bad.error());
+
+    // ---- query strings keep repeated keys ----
+    let p = u.params();
+    print("");
+    print("q         = " + p.get("q"));
+    print("tag first = " + p.get("tag"));
+    print("tag all   = " + p.getAll("tag").join(","));
+    print("missing   = [" + p.get("nope") + "] present=" + str(p.has("nope")));
+
+    // Building one back up. set() replaces every entry with the same name,
+    // add() keeps them side by side.
+    let q = queryParams();
+    q.add("name", "Ada Lovelace");
+    q.add("lang", "vyto");
+    q.add("lang", "c");
+    q.set("name", "Grace Hopper");
+    print("assembled = " + q.toString());
+    print("reparsed  = " + query_parse(q.toString()).get("name"));
+
+    // ---- building one up ----
+    // Every setter is a `builder` method, so the chain stays typed the whole
+    // way down. This is a separate type from Url because a method may not
+    // share a name with a field, and `u.host` on a parse result is the better
+    // use of that name.
+    print("");
+    print("built     = " + url().scheme("https").host("api.example.com").port(8443)
+                                .segment("v2").segment("things")
+                                .param("limit", "10")
+                                .param("tag", "a").param("tag", "b")
+                                .fragment("results").toString());
+
+    // segment() percent-encodes, so a value from elsewhere cannot climb out of
+    // the path it was meant to sit in: a '/' becomes %2F, not a separator.
+    let userSupplied = "../../etc/passwd";
+    print("safe      = " + url().scheme("https").host("h").segment("files")
+                                .segment(userSupplied).toString());
+
+    // urlOf seeds a builder from an existing URL — how you add a parameter to
+    // one you were handed.
+    print("edited    = " + urlOf("https://x.dev/a?k=1#f").param("k2", "2").toString());
+    print("swapped   = " + urlOf("https://x.dev/a?k=1").host("y.dev")
+                                .setParam("k", "9").toString());
+
+    // build() gives a Url rather than a string, for code that wants the parts.
+    let api = url().scheme("https").host("h").param("a", "1").build();
+    print("as a Url  = " + api.host + " query=" + api.query +
+          " port=" + str(api.effectivePort()));
+
+    // ---- percent-encoding ----
+    print("");
+    print("component = " + url_encode("a b/c?d=e&f"));
+    print("path      = " + url_encode_path("/dir name/a+b.txt"));
+    print("form      = " + url_encode_form("a b/c"));
+    print("decode    = " + url_decode("caf%C3%A9%20au%20lait"));
+    print("form back = " + url_decode_form("a+b%2Fc"));
+    // A stray '%' is passed through rather than failing the whole decode.
+    print("lenient   = " + url_decode("100% done"));
+
+    // ---- resolving a link against the page it appeared on ----
+    // This is RFC 3986 §5.2 — what a browser does with an href.
+    print("");
+    let base = "http://example.com/a/b/page.html";
+    print("base      = " + base);
+    print("  ../q    -> " + url_join(base, "../q"));
+    print("  /q      -> " + url_join(base, "/q"));
+    print("  q.html  -> " + url_join(base, "q.html"));
+    print("  #sec    -> " + url_join(base, "#sec"));
+    print("  ?y=2    -> " + url_join(base, "?y=2"));
+    print("  //cdn.example.com/s.js -> " + url_join(base, "//cdn.example.com/s.js"));
+    print("  https://other/x        -> " + url_join(base, "https://other/x"));
+
+    // A "..' that would escape the root is discarded, which is what makes this
+    // safe to run on a request target that arrived from outside.
+    print("");
+    print("normalize = " + remove_dot_segments("/a/b/../../../../etc/passwd"));
+    print("normalize = " + remove_dot_segments("/a/./b/../c/"));
+}

@@ -1,0 +1,192 @@
+// Pure-Vyto coverage for vyto/util/toml: the whole v1.0 grammar, the two
+// documented deviations (dates as strings, integers as floats), every error
+// path, and the encoder's round trip. No display, no native dependency beyond
+// the vyto/util shims. Deterministic, golden-checked.
+//
+// Each parse is rendered through json_encode, which is only possible because a
+// TOML document *is* a JsonValue here — that shared tree is the point of the
+// module, so the golden asserting on it is the right assertion.
+
+import { toml_parse, toml_encode, toml_failed, toml_is_nan } from "vyto/util/toml";
+import { JsonValue, json_encode } from "vyto/util/json";
+
+fn p(label: string, src: string) {
+    let v = toml_parse(src);
+    if (toml_failed(v)) { print(label + "=ERR(" + v.parseError() + ")"); }
+    else { print(label + "=" + json_encode(v)); }
+}
+
+fn main() {
+    // ---- key/value basics ----
+    p("k.string", "a = \"x\"\n");
+    p("k.int", "a = 1\n");
+    p("k.float", "a = 1.5\n");
+    p("k.bool", "a = true\nb = false\n");
+    p("k.spaces", "  a   =   1  \n");
+    p("k.noeol", "a = 1");
+    p("k.empty", "");
+    p("k.blanklines", "\n\n\na = 1\n\n\n");
+    p("k.bare", "a-b_c1 = 1\n");
+    p("k.quoted", "\"a b\" = 1\n'c.d' = 2\n\"\" = 3\n");
+    p("k.multiple", "a = 1\nb = 2\nc = 3\n");
+
+    // ---- comments ----
+    p("c.line", "# comment\na = 1\n");
+    p("c.trailing", "a = 1 # after\n");
+    p("c.only", "# nothing but a comment\n");
+    p("c.inarray", "a = [\n  1, # one\n  2,\n]\n");
+    p("c.hashinstring", "a = \"x # y\"\n");
+
+    // ---- tables ----
+    p("t.simple", "[s]\na = 1\n");
+    p("t.nested", "[a.b.c]\nx = 1\n");
+    p("t.several", "[a]\nx = 1\n[b]\ny = 2\n");
+    p("t.reopen.sub", "[a]\nx = 1\n[a.b]\ny = 2\n");
+    p("t.implicit", "[a.b]\nx = 1\n");
+    p("t.rootfirst", "top = 0\n[s]\na = 1\n");
+    p("t.empty", "[s]\n");
+    p("t.spacedname", "[ a . b ]\nx = 1\n");
+    p("t.quotedname", "[\"a b\"]\nx = 1\n");
+
+    // ---- dotted keys ----
+    p("dk.simple", "a.b = 1\n");
+    p("dk.deep", "a.b.c.d = 1\n");
+    p("dk.siblings", "a.b = 1\na.c = 2\n");
+    p("dk.intable", "[t]\na.b = 1\n");
+    p("dk.quoted", "\"a b\".c = 1\n");
+
+    // ---- arrays of tables ----
+    p("aot.two", "[[f]]\nn = 1\n[[f]]\nn = 2\n");
+    p("aot.one", "[[f]]\nn = 1\n");
+    p("aot.empty", "[[f]]\n");
+    p("aot.sub", "[[f]]\nn = 1\n[f.s]\nx = 2\n[[f]]\nn = 3\n");
+    p("aot.nested", "[[a.b]]\nx = 1\n");
+
+    // ---- arrays ----
+    p("a.ints", "a = [1, 2, 3]\n");
+    p("a.empty", "a = []\n");
+    p("a.trailingcomma", "a = [1, 2,]\n");
+    p("a.multiline", "a = [\n  1,\n  2\n]\n");
+    p("a.nested", "a = [[1, 2], [3]]\n");
+    p("a.mixed", "a = [1, \"x\", true]\n");
+    p("a.oftables", "a = [{x = 1}, {x = 2}]\n");
+    p("a.spaces", "a = [ 1 , 2 ]\n");
+
+    // ---- inline tables ----
+    p("it.simple", "a = {x = 1, y = 2}\n");
+    p("it.empty", "a = {}\n");
+    p("it.nested", "a = {p = {q = 1}}\n");
+    p("it.dotted", "a = {p.q = 1}\n");
+    p("it.spaces", "a = { x = 1 }\n");
+
+    // ---- strings ----
+    p("s.basic", "a = \"plain\"\n");
+    p("s.escapes", "a = \"q\\\"b\\\\s\\tt\\nn\\rr\\ff\\bb\"\n");
+    p("s.unicode4", "a = \"\\u00e9\"\n");
+    p("s.unicode8", "a = \"\\U0001F600\"\n");
+    p("s.literal", "a = 'no \\escapes here'\n");
+    p("s.literal.quote", "a = 'say \"hi\"'\n");
+    p("s.empty", "a = \"\"\nb = ''\n");
+    p("s.ml", "a = \"\"\"\nline1\nline2\"\"\"\n");
+    p("s.ml.nolead", "a = \"\"\"first\"\"\"\n");
+    p("s.ml.fold", "a = \"\"\"one \\\n      two\"\"\"\n");
+    p("s.ml.quotes", "a = \"\"\"say \"\"\"\"\n");
+    p("s.ml.literal", "a = '''\nraw \\n here'''\n");
+    p("s.utf8", "a = \"café ☕\"\n");
+
+    // ---- integers ----
+    p("i.plain", "a = 42\n");
+    p("i.zero", "a = 0\n");
+    p("i.signed", "a = -17\nb = +7\n");
+    p("i.underscores", "a = 1_000_000\n");
+    p("i.hex", "a = 0xdeadBEEF\n");
+    p("i.oct", "a = 0o755\n");
+    p("i.bin", "a = 0b1011\n");
+    p("i.hexunder", "a = 0xdead_beef\n");
+
+    // ---- floats ----
+    p("f.plain", "a = 1.5\n");
+    p("f.exp", "a = 1e3\nb = 1E3\nc = 6.02e23\n");
+    p("f.negexp", "a = -2.5e-3\n");
+    p("f.zero", "a = 0.0\n");
+    p("f.underscores", "a = 1_0.5\n");
+    p("f.inf", "a = inf\nb = +inf\nc = -inf\n");
+    // NaN never equals itself, which is how it is checked rather than printed.
+    let nan = toml_parse("a = nan\n");
+    print("f.nan=" + str(toml_is_nan(nan.get("a").asFloat())));
+    print("f.nan.signed=" + str(toml_is_nan(toml_parse("a = -nan\n").get("a").asFloat())));
+
+    // ---- dates stay as text (the documented deviation) ----
+    p("d.offset", "a = 1979-05-27T07:32:00Z\n");
+    p("d.offsetnum", "a = 1979-05-27T00:32:00-07:00\n");
+    p("d.local", "a = 1979-05-27T07:32:00\n");
+    p("d.space", "a = 1979-05-27 07:32:00\n");
+    p("d.dateonly", "a = 1979-05-27\n");
+    p("d.timeonly", "a = 07:32:00\n");
+    p("d.fraction", "a = 1979-05-27T00:32:00.999999Z\n");
+    p("d.inarray", "a = [1979-05-27, 1980-01-01]\n");
+
+    // ---- errors ----
+    p("e.dupkey", "a = 1\na = 2\n");
+    p("e.duptable", "[a]\n[a]\n");
+    p("e.dupdotted", "a.b = 1\na.b = 2\n");
+    p("e.noeq", "a 1\n");
+    p("e.noval", "a =\n");
+    p("e.nokey", "= 1\n");
+    p("e.leadingzero", "a = 01\n");
+    p("e.doubleunder", "a = 1__0\n");
+    p("e.trailingunder", "a = 1_\n");
+    p("e.leadingunder", "a = _1\n");
+    p("e.openstring", "a = \"oops\n");
+    p("e.openliteral", "a = 'oops\n");
+    p("e.openml", "a = \"\"\"oops\n");
+    p("e.openarray", "a = [1, 2\n");
+    p("e.openinline", "a = {x = 1\n");
+    p("e.opentable", "[a\nx = 1\n");
+    p("e.emptytable", "[]\n");
+    p("e.junkafter", "a = 1 b\n");
+    p("e.notatable", "a = 1\n[a.b]\nc = 2\n");
+    p("e.aotvstable", "[a]\nx = 1\n[[a]]\ny = 2\n");
+    p("e.badescape", "a = \"\\q\"\n");
+    p("e.badunicode", "a = \"\\uZZZZ\"\n");
+    p("e.shortunicode", "a = \"\\u12\"\n");
+    p("e.dupinline", "a = {x = 1, x = 2}\n");
+    p("e.inlinenocomma", "a = {x = 1 y = 2}\n");
+    p("e.arraynocomma", "a = [1 2]\n");
+    p("e.garbage", "a = @@@\n");
+    // The reported line is where the problem is, not where the file ends.
+    p("e.line4", "a = 1\nb = 2\n\nc = 01\n");
+
+    // ---- encoding ----
+    print("");
+    let doc = toml_parse("title = \"x\"\nn = 42\nf = 1.5\nok = false\nlist = [1, 2]\n" +
+                         "empty = []\nnested = [[1], [2]]\n" +
+                         "[srv]\nhost = \"h\"\n[srv.tls]\non = true\n" +
+                         "[[item]]\nid = 1\n[[item]]\nid = 2\n");
+    let enc = toml_encode(doc);
+    print("--- encoded ---");
+    print(enc);
+    print("--- ---");
+    print("enc.stable=" + str(json_encode(toml_parse(enc)) == json_encode(doc)));
+
+    // Keys that are not bare get quoted, and escapes survive the trip.
+    let tricky = toml_parse("\"a b\" = 1\n\"c.d\" = \"has \\\"quotes\\\" and \\\\ and \\n\"\n");
+    let tenc = toml_encode(tricky);
+    print("enc.keys=" + tenc.replace("\n", "\\n"));
+    print("enc.keys.stable=" + str(json_encode(toml_parse(tenc)) == json_encode(tricky)));
+
+    // Integral floats print without a decimal point, because TOML separates
+    // integers from floats and `port = 8080.0` is a different type.
+    print("enc.ints=" + toml_encode(toml_parse("a = 8080\nb = 8080.0\nc = -3\n")).replace("\n", "\\n"));
+    print("enc.inf=" + toml_encode(toml_parse("a = inf\nb = -inf\nc = nan\n")).replace("\n", "\\n"));
+    print("enc.empty=[" + toml_encode(toml_parse("")).replace("\n", "\\n") + "]");
+    print("enc.inlineinarray=" + toml_encode(toml_parse("a = [{x = 1}]\n")).replace("\n", "\\n"));
+
+    // ---- depth ----
+    let deep = "a = ";
+    for (let i in 0..60) { deep = deep + "["; }
+    deep = deep + "1";
+    for (let i in 0..60) { deep = deep + "]"; }
+    let dv = toml_parse(deep + "\n");
+    print("deep.ok=" + str(!toml_failed(dv)));
+}

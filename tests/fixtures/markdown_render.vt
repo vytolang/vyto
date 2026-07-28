@@ -1,0 +1,256 @@
+// Pure-Vyto coverage for vyto/util/markdown: block structure, inline spans,
+// the tree shape, and the documented exclusions. No display, no native
+// dependency beyond the vyto/util shims. Deterministic, golden-checked.
+//
+// Rendered HTML is printed with newlines escaped so each case stays on one
+// golden line, which makes a regression a one-line diff rather than a
+// twenty-line one.
+
+import { md_parse, md_render, md_to_html, md_text, MdNode,
+         MD_DOC, MD_HEADING, MD_PARA, MD_CODE, MD_QUOTE, MD_LIST, MD_ITEM,
+         MD_HRULE, MD_TEXT, MD_EMPH, MD_STRONG, MD_CODESPAN, MD_LINK,
+         MD_IMAGE, MD_BREAK, MD_SOFTBREAK } from "vyto/util/markdown";
+
+fn r(label: string, src: string) {
+    print(label + "=" + md_render(src).replace("\n", "\\n"));
+}
+
+fn kindName(k: int): string {
+    if (k == MD_DOC) { return "DOC"; }
+    if (k == MD_HEADING) { return "H"; }
+    if (k == MD_PARA) { return "P"; }
+    if (k == MD_CODE) { return "CODE"; }
+    if (k == MD_QUOTE) { return "QUOTE"; }
+    if (k == MD_LIST) { return "LIST"; }
+    if (k == MD_ITEM) { return "ITEM"; }
+    if (k == MD_HRULE) { return "HR"; }
+    if (k == MD_TEXT) { return "TEXT"; }
+    if (k == MD_EMPH) { return "EM"; }
+    if (k == MD_STRONG) { return "STRONG"; }
+    if (k == MD_CODESPAN) { return "CODE1"; }
+    if (k == MD_LINK) { return "LINK"; }
+    if (k == MD_IMAGE) { return "IMG"; }
+    if (k == MD_BREAK) { return "BR"; }
+    return "SOFT";
+}
+
+fn shape(n: MdNode): string {
+    let out = kindName(n.kind);
+    if (n.childCount() > 0) {
+        out = out + "(";
+        for (let i in 0..n.childCount()) {
+            if (i > 0) { out = out + " "; }
+            out = out + shape(n.child(i));
+        }
+        out = out + ")";
+    }
+    return out;
+}
+
+fn tree(label: string, src: string) { print(label + "=" + shape(md_parse(src))); }
+
+fn main() {
+    // ---- headings ----
+    r("h.atx1", "# One\n");
+    r("h.atx6", "###### Six\n");
+    r("h.atx7", "####### Seven\n");
+    r("h.nospace", "#NoSpace\n");
+    r("h.closing", "## Two ##\n");
+    r("h.closingnospace", "## Two##\n");
+    r("h.empty", "#\n");
+    r("h.emptyspace", "# \n");
+    r("h.inline", "# A *b* `c`\n");
+    r("h.indented", "   # Three spaces\n");
+    r("h.tooindented", "    # Four spaces\n");
+    r("h.setext1", "Title\n=====\n");
+    r("h.setext2", "Title\n-----\n");
+    r("h.setext.multiline", "One\ntwo\n===\n");
+    r("h.setext.short", "Title\n=\n");
+
+    // ---- paragraphs ----
+    r("p.simple", "hello\n");
+    r("p.twolines", "one\ntwo\n");
+    r("p.two", "one\n\ntwo\n");
+    r("p.leadingspace", "   indented para\n");
+    r("p.blankonly", "\n\n\n");
+    r("p.empty", "");
+    r("p.noeol", "no trailing newline");
+    r("p.crlf", "one\r\ntwo\r\n");
+    r("p.trailingblanks", "text\n\n\n");
+
+    // ---- thematic breaks ----
+    r("hr.dash", "---\n");
+    r("hr.star", "***\n");
+    r("hr.underscore", "___\n");
+    r("hr.spaced", "- - -\n");
+    r("hr.long", "**********\n");
+    r("hr.two", "--\n");
+    r("hr.afterpara", "text\n\n---\n");
+
+    // ---- code blocks ----
+    r("c.fence", "```\ncode\n```\n");
+    r("c.fence.lang", "```vyto\nlet x = 1;\n```\n");
+    r("c.fence.langextra", "```vyto linenos\ncode\n```\n");
+    r("c.fence.tilde", "~~~\ncode\n~~~\n");
+    r("c.fence.longer", "````\na ``` inside\n````\n");
+    r("c.fence.unclosed", "```\ncode\n");
+    r("c.fence.empty", "```\n```\n");
+    r("c.fence.escapes", "```\n<b> & \"x\"\n```\n");
+    r("c.fence.blank", "```\na\n\nb\n```\n");
+    r("c.indented", "    code\n");
+    r("c.indented.multi", "    one\n    two\n");
+    r("c.indented.blank", "    one\n\n    two\n");
+    r("c.indented.afterpara", "text\n\n    code\n");
+    r("c.tab", "\tcode\n");
+
+    // ---- block quotes ----
+    r("q.simple", "> quoted\n");
+    r("q.multi", "> one\n> two\n");
+    r("q.nospace", ">tight\n");
+    r("q.lazy", "> one\ntwo\n");
+    r("q.nested", "> > deep\n");
+    r("q.blank", "> one\n>\n> two\n");
+    r("q.blocks", "> # head\n>\n> para\n");
+    r("q.list", "> - a\n> - b\n");
+    r("q.afterpara", "text\n\n> quote\n");
+
+    // ---- lists ----
+    r("l.dash", "- a\n- b\n");
+    r("l.star", "* a\n* b\n");
+    r("l.plus", "+ a\n+ b\n");
+    r("l.mixed", "- a\n* b\n");
+    r("l.ordered", "1. a\n2. b\n");
+    r("l.paren", "1) a\n2) b\n");
+    r("l.start", "5. a\n6. b\n");
+    r("l.nonsequential", "1. a\n1. b\n");
+    r("l.tight", "- a\n- b\n");
+    r("l.loose", "- a\n\n- b\n");
+    r("l.nested", "- a\n  - b\n");
+    r("l.nested.deep", "- a\n  - b\n    - c\n");
+    r("l.multiline", "- one\n  two\n");
+    r("l.lazy", "- one\ntwo\n");
+    r("l.blocks", "- para\n\n  second para\n");
+    r("l.code", "- item\n\n      code\n");
+    r("l.emptyitem", "-\n- b\n");
+    r("l.inline", "- *a* and `b`\n");
+    r("l.afterpara", "text\n\n- a\n");
+    r("l.interrupts", "text\n- a\n");
+    r("l.nointerrupt", "text\n2. a\n");
+    r("l.ordinterrupt", "text\n1. a\n");
+
+    // ---- inline: emphasis ----
+    r("i.em.star", "*a*\n");
+    r("i.em.under", "_a_\n");
+    r("i.strong.star", "**a**\n");
+    r("i.strong.under", "__a__\n");
+    r("i.both", "***a***\n");
+    r("i.intraword.star", "a*b*c\n");
+    r("i.intraword.under", "snake_case_name\n");
+    r("i.nested", "*a **b** c*\n");
+    r("i.empty", "**\n");
+    r("i.emptyinner", "* *\n");
+    r("i.unclosed", "*a\n");
+    r("i.spaceclose", "*a *\n");
+    r("i.multiword", "*two words*\n");
+    r("i.acrosscode", "*a `b*c` d*\n");
+
+    // ---- inline: code spans ----
+    r("i.code", "`x`\n");
+    r("i.code.double", "``a ` b``\n");
+    r("i.code.spaces", "`` ` ``\n");
+    r("i.code.escapes", "`<b> & \"x\"`\n");
+    r("i.code.unclosed", "`x\n");
+    r("i.code.empty", "``\n");
+    r("i.code.nostar", "`*not em*`\n");
+
+    // ---- inline: links and images ----
+    r("i.link", "[t](u)\n");
+    r("i.link.title", "[t](u \"Title\")\n");
+    r("i.link.singlequote", "[t](u 'Title')\n");
+    r("i.link.angle", "[t](<a url>)\n");
+    r("i.link.empty", "[](u)\n");
+    r("i.link.nourl", "[t]()\n");
+    r("i.link.inline", "[*em*](u)\n");
+    r("i.link.nested", "[a [b] c](u)\n");
+    r("i.link.notalink", "[t] (u)\n");
+    r("i.link.bare", "[t]\n");
+    r("i.link.escape", "[t](u?a=1&b=2)\n");
+    r("i.img", "![alt](i.png)\n");
+    r("i.img.title", "![alt](i.png \"T\")\n");
+    r("i.img.emptyalt", "![](i.png)\n");
+    r("i.img.markup", "![a *b*](i.png)\n");
+    r("i.autolink", "<https://x.dev>\n");
+    r("i.autolink.mail", "<a@b.com>\n");
+    r("i.autolink.mailto", "<mailto:a@b.com>\n");
+    r("i.autolink.notone", "<notaurl>\n");
+    r("i.autolink.space", "<has space>\n");
+
+    // ---- inline: breaks and escapes ----
+    r("i.hardbreak", "a  \nb\n");
+    r("i.hardbreak.backslash", "a\\\nb\n");
+    r("i.softbreak", "a\nb\n");
+    r("i.escape.star", "\\*not em\\*\n");
+    r("i.escape.hash", "\\# not a heading\n");
+    r("i.escape.backslash", "a \\\\ b\n");
+    r("i.escape.nonpunct", "a \\z b\n");
+    r("i.escape.bracket", "\\[not a link\\]\n");
+
+    // ---- the documented exclusions ----
+    r("x.rawhtml", "<b>bold</b>\n");
+    r("x.rawhtml.attack", "<img src=x onerror=alert(1)>\n");
+    r("x.rawhtml.inline", "text <span>x</span> more\n");
+    r("x.reflink", "[a][ref]\n\n[ref]: http://x\n");
+    r("x.table", "| a | b |\n|---|---|\n| 1 | 2 |\n");
+    r("x.strike", "~~struck~~\n");
+    r("x.entity", "&amp; stays\n");
+
+    // ---- the tree ----
+    print("");
+    tree("t.head", "# A *b*\n");
+    tree("t.para", "text\n");
+    tree("t.list", "- a\n- b\n");
+    tree("t.nested", "- a\n  - b\n");
+    tree("t.quote", "> a\n");
+    tree("t.code", "```\nx\n```\n");
+    tree("t.hr", "---\n");
+    tree("t.link", "[a](b)\n");
+    tree("t.img", "![a](b)\n");
+    tree("t.breaks", "a  \nb\nc\n");
+    tree("t.doc", "# H\n\ntext\n\n- a\n");
+
+    let doc = md_parse("# Heading *here*\n\nBody text.\n");
+    print("n.count=" + str(doc.childCount()));
+    print("n.kind0=" + kindName(doc.child(0).kind) + " level=" + str(doc.child(0).level));
+    print("n.text0=" + md_text(doc.child(0)));
+    print("n.text.all=" + md_text(doc).replace("\n", "\\n"));
+    print("n.oob=" + kindName(doc.child(99).kind));
+    print("n.isblock=" + str(doc.child(0).isBlock()) + "/" +
+          str(doc.child(0).child(0).isBlock()));
+    print("n.tohtml=" + doc.child(0).toHtml().replace("\n", "\\n"));
+    print("n.nodetext=" + doc.child(1).text());
+
+    let lst = md_parse("- a\n\n- b\n");
+    print("n.loose=" + str(lst.child(0).tight));
+    let tightList = md_parse("- a\n- b\n");
+    print("n.tight=" + str(tightList.child(0).tight));
+    let ord = md_parse("7. a\n");
+    print("n.ordered=" + str(ord.child(0).ordered) + " start=" + str(ord.child(0).start));
+    let fence = md_parse("```rust\nx\n```\n");
+    print("n.lang=" + fence.child(0).url + " body=" + fence.child(0).txt);
+    let link = md_parse("[t](u \"T\")\n");
+    print("n.link=" + link.child(0).child(0).url + "|" + link.child(0).child(0).title);
+    let img = md_parse("![alt text](i.png)\n");
+    print("n.img=" + img.child(0).child(0).url + "|" + img.child(0).child(0).txt);
+
+    // ---- depth is bounded, not fatal ----
+    let deep = "";
+    for (let i in 0..40) { deep = deep + "> "; }
+    deep = deep + "bottom\n";
+    print("deep.render=" + str(md_render(deep).len > 0));
+    let deepList = "";
+    for (let i in 0..30) {
+        for (let j in 0..i) { deepList = deepList + " "; }
+        deepList = deepList + "- item\n";
+    }
+    print("deep.list=" + str(md_render(deepList).len > 0));
+}

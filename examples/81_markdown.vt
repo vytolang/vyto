@@ -1,0 +1,129 @@
+// vyto/util/markdown — CommonMark to a tree, and a tree to HTML.
+//
+// Parsing and rendering are separate on purpose: md_parse produces an MdNode
+// tree and nothing else, and md_to_html is one renderer over it. A renderer
+// that paints into a vyto/ui Painter is the other obvious one, and it belongs
+// in vyto/ui — keeping this module free of the UI stack is what lets it run
+// headless and cross-compile.
+//
+// Raw HTML in the source is escaped, not passed through. A renderer that
+// forwards arbitrary HTML is an XSS hole wherever the source is not fully
+// trusted, and a library cannot assume that it is.
+
+import { md_parse, md_render, md_to_html, md_text, MdNode,
+         MD_DOC, MD_HEADING, MD_PARA, MD_CODE, MD_QUOTE, MD_LIST, MD_ITEM,
+         MD_HRULE, MD_TEXT, MD_EMPH, MD_STRONG, MD_CODESPAN, MD_LINK,
+         MD_IMAGE, MD_BREAK, MD_SOFTBREAK } from "vyto/util/markdown";
+
+fn doc(): string {
+    return "# Release notes\n" +
+        "\n" +
+        "The parser handles *emphasis*, **strong emphasis**, `code spans`,\n" +
+        "and [links](https://vyto.dev \"the site\").\n" +
+        "\n" +
+        "## What landed\n" +
+        "\n" +
+        "- CSV, with real quoting\n" +
+        "- XML, with namespaces\n" +
+        "  - a pull reader\n" +
+        "  - and a DOM\n" +
+        "- TOML and INI\n" +
+        "\n" +
+        "1. First\n" +
+        "2. Second\n" +
+        "\n" +
+        "> Every module is pure Vyto.\n" +
+        "> No native code at all.\n" +
+        "\n" +
+        "```vyto\n" +
+        "let doc = md_parse(source);\n" +
+        "```\n" +
+        "\n" +
+        "---\n" +
+        "\n" +
+        "Raw <b>HTML</b> is escaped, not forwarded.\n";
+}
+
+fn kindName(k: int): string {
+    if (k == MD_DOC) { return "DOC"; }
+    if (k == MD_HEADING) { return "HEADING"; }
+    if (k == MD_PARA) { return "PARA"; }
+    if (k == MD_CODE) { return "CODE"; }
+    if (k == MD_QUOTE) { return "QUOTE"; }
+    if (k == MD_LIST) { return "LIST"; }
+    if (k == MD_ITEM) { return "ITEM"; }
+    if (k == MD_HRULE) { return "HRULE"; }
+    if (k == MD_TEXT) { return "TEXT"; }
+    if (k == MD_EMPH) { return "EMPH"; }
+    if (k == MD_STRONG) { return "STRONG"; }
+    if (k == MD_CODESPAN) { return "CODESPAN"; }
+    if (k == MD_LINK) { return "LINK"; }
+    if (k == MD_IMAGE) { return "IMAGE"; }
+    if (k == MD_BREAK) { return "BREAK"; }
+    return "SOFTBREAK";
+}
+
+fn outline(n: MdNode, indent: string) {
+    for (let i in 0..n.childCount()) {
+        let c = n.child(i);
+        let line = indent + kindName(c.kind);
+        if (c.kind == MD_HEADING) { line = line + " level=" + str(c.level); }
+        if (c.kind == MD_LIST) {
+            line = line + " ordered=" + str(c.ordered) + " tight=" + str(c.tight);
+        }
+        if (c.kind == MD_CODE && c.url != "") { line = line + " lang=" + c.url; }
+        if (c.isBlock() && c.kind != MD_LIST && c.kind != MD_QUOTE && c.kind != MD_ITEM) {
+            let t = md_text(c);
+            if (t.len > 40) { t = t.slice(0, 37) + "..."; }
+            if (t != "") { line = line + "  \"" + t.replace("\n", " ") + "\""; }
+        }
+        print(line);
+        if (c.kind == MD_LIST || c.kind == MD_QUOTE || c.kind == MD_ITEM) {
+            outline(c, indent + "  ");
+        }
+    }
+}
+
+fn main() {
+    let tree = md_parse(doc());
+
+    // ---- the tree ----
+    print("--- block outline ---");
+    outline(tree, "");
+
+    // md_text strips every bit of markup, which is what a table of contents or
+    // a search index wants.
+    print("");
+    print("first heading = " + md_text(tree.child(0)));
+
+    // ---- the HTML ----
+    print("");
+    print("--- rendered ---");
+    print(md_to_html(tree));
+
+    // ---- inline details, one at a time ----
+    print("--- inline ---");
+    print(md_render("*em* and **strong** and ***both***").trim());
+    print(md_render("`code` and ``a ` inside`` and `` ` ``").trim());
+    print(md_render("[text](url) and ![alt](img.png \"t\") and <https://auto.link>").trim());
+    print(md_render("a snake_case_name keeps its underscores").trim());
+    print(md_render("but a*star*works intraword").trim());
+    print(md_render("escapes: \\*not emphasis\\* and \\# not a heading").trim());
+    print(md_render("a hard break follows this  \nand a soft one\nfollows this").trim());
+
+    // ---- block details ----
+    print("");
+    print("--- blocks ---");
+    print(md_render("Setext\n======").trim());
+    print(md_render("Also setext\n-----------").trim());
+    print(md_render("    indented code\n    second line").trim());
+    print(md_render("- tight\n- list").trim());
+    print(md_render("- loose\n\n- list").trim());
+    print(md_render("5. numbered from five\n6. and six").trim());
+    print(md_render("> quoted\n> lazily continued").trim());
+
+    // ---- and the thing it will not do ----
+    print("");
+    print("--- raw HTML is escaped ---");
+    print(md_render("<img src=x onerror=alert(1)>").trim());
+}

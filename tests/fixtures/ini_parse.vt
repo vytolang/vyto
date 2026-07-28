@@ -1,0 +1,141 @@
+// Pure-Vyto coverage for vyto/util/ini: sections, both separators, both comment
+// characters, quoting, the nested-section mode, every error path, and the
+// encoder's round trip. No display, no native dependency beyond the vyto/util
+// shims. Deterministic, golden-checked.
+//
+// As with toml, each parse is rendered through json_encode — an INI document is
+// a JsonValue here, and every value in it is a string, which the golden shows
+// plainly.
+
+import { ini_parse, ini_parse_nested, ini_encode, ini_failed } from "vyto/util/ini";
+import { JsonValue, json_encode, jobj, jstr, jint, jbool } from "vyto/util/json";
+
+fn p(label: string, src: string) {
+    let v = ini_parse(src);
+    if (ini_failed(v)) { print(label + "=ERR(" + v.parseError() + ")"); }
+    else { print(label + "=" + json_encode(v)); }
+}
+
+fn pn(label: string, src: string) {
+    let v = ini_parse_nested(src);
+    if (ini_failed(v)) { print(label + "=ERR(" + v.parseError() + ")"); }
+    else { print(label + "=" + json_encode(v)); }
+}
+
+fn main() {
+    // ---- pairs ----
+    p("k.simple", "a = 1\n");
+    p("k.noeol", "a = 1");
+    p("k.several", "a = 1\nb = 2\n");
+    p("k.spaces", "   a   =   1   \n");
+    p("k.nospaces", "a=1\n");
+    p("k.empty", "");
+    p("k.blanklines", "\n\n a = 1 \n\n");
+    p("k.emptyvalue", "a =\n");
+    p("k.valuewithspaces", "a = one two three\n");
+    p("k.valuewitheq", "a = x=y=z\n");
+    p("k.dotinkey", "a.b = 1\n");
+    p("k.dupe", "a = 1\na = 2\n");
+
+    // ---- separators ----
+    p("sep.colon", "a: 1\n");
+    p("sep.colonspaced", "a : 1\n");
+    p("sep.firstwins.eq", "a = x:y\n");
+    p("sep.firstwins.colon", "a: x=y\n");
+
+    // ---- comments ----
+    p("c.semi", "; note\na = 1\n");
+    p("c.hash", "# note\na = 1\n");
+    p("c.inline.semi", "a = 1 ; note\n");
+    p("c.inline.hash", "a = 1 # note\n");
+    p("c.inline.tab", "a = 1\t# note\n");
+    // No whitespace before the marker means it is part of the value.
+    p("c.nospace", "a = x#y\n");
+    p("c.nospace.semi", "a = x;y\n");
+    p("c.onlycomments", "; one\n# two\n");
+    p("c.afterheader", "[s] ; note\na = 1\n");
+
+    // ---- sections ----
+    p("s.simple", "[s]\na = 1\n");
+    p("s.rootfirst", "top = 0\n[s]\na = 1\n");
+    p("s.two", "[a]\nx = 1\n[b]\ny = 2\n");
+    p("s.empty", "[s]\n");
+    p("s.spaces", "[  s  ]\na = 1\n");
+    p("s.reopen", "[s]\na = 1\n[t]\nx = 0\n[s]\nb = 2\n");
+    p("s.dotsflat", "[a.b]\nx = 1\n");
+    p("s.spacesinname", "[my section]\nx = 1\n");
+    p("s.bracketinname", "[a[b]]\nx = 1\n");
+
+    // ---- nested mode ----
+    pn("n.simple", "[a.b]\nx = 1\n");
+    pn("n.siblings", "[a.b]\nx = 1\n[a.c]\ny = 2\n");
+    pn("n.deep", "[a.b.c.d]\nx = 1\n");
+    pn("n.plain", "[a]\nx = 1\n");
+    pn("n.mixed", "[a]\nx = 1\n[a.b]\ny = 2\n");
+    pn("n.emptyparts", "[a..b]\nx = 1\n");
+
+    // ---- quoting and whitespace ----
+    p("q.double", "a = \"  padded  \"\n");
+    p("q.single", "a = '  padded  '\n");
+    p("q.inner", "a = \"say \\\"hi\\\"\"\n");
+    p("q.unbalanced", "a = \"open\n");
+    p("q.mismatched", "a = \"x'\n");
+    p("q.onlyquotes", "a = \"\"\n");
+    p("q.oneChar", "a = \"\n");
+    p("q.notwrapping", "a = say \"hi\" there\n");
+
+    // ---- line endings ----
+    p("le.crlf", "a = 1\r\n[s]\r\nb = 2\r\n");
+    p("le.mixed", "a = 1\r\nb = 2\n");
+
+    // ---- errors ----
+    p("e.notapair", "just words\n");
+    p("e.notapair.late", "a = 1\nb = 2\nnonsense\n");
+    p("e.openheader", "[unterminated\n");
+    p("e.emptyheader", "[]\n");
+    p("e.emptyheader.spaces", "[   ]\n");
+    p("e.emptykey", " = v\n");
+    p("e.emptykey.colon", ": v\n");
+    p("e.collision", "a = 1\n[a]\nb = 2\n");
+
+    // ---- encoding ----
+    print("");
+    let cfg = jobj();
+    cfg.set("name", jstr("app"));
+    cfg.set("debug", jstr("false"));
+    let srv = jobj();
+    srv.set("host", jstr("localhost"));
+    srv.set("port", jstr("8080"));
+    srv.set("motd", jstr("  padded  "));
+    cfg.set("server", srv);
+    let enc = ini_encode(cfg);
+    print("--- encoded ---");
+    print(enc);
+    print("--- ---");
+    print("enc.stable=" + str(json_encode(ini_parse(enc)) == json_encode(cfg)));
+
+    // Non-string scalars are written through stringify, so a tree built by hand
+    // (or one that came from JSON) still encodes.
+    let mixed = jobj();
+    mixed.set("n", jint(42));
+    mixed.set("b", jbool(true));
+    print("enc.scalars=" + ini_encode(mixed).replace("\n", "\\n"));
+
+    print("enc.empty=[" + ini_encode(jobj()).replace("\n", "\\n") + "]");
+
+    let onlySection = jobj();
+    let inner = jobj();
+    inner.set("x", jstr("1"));
+    onlySection.set("s", inner);
+    print("enc.sectiononly=" + ini_encode(onlySection).replace("\n", "\\n"));
+
+    let emptySection = jobj();
+    emptySection.set("s", jobj());
+    print("enc.emptysection=" + ini_encode(emptySection).replace("\n", "\\n"));
+
+    // A full circle from text.
+    let src = "top = 0\n[a]\nx = 1\n[b]\ny = 2\n";
+    let parsed = ini_parse(src);
+    print("round.text=" + ini_encode(parsed).replace("\n", "\\n"));
+    print("round.stable=" + str(json_encode(ini_parse(ini_encode(parsed))) == json_encode(parsed)));
+}

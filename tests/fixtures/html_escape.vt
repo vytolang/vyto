@@ -1,0 +1,153 @@
+// Pure-Vyto coverage for vyto/util/html: the escapers, the entity decoder, the
+// builder's tag/attribute/void handling and its error paths, and the one-shot
+// helpers. No display, no native dependency beyond the vyto/util shims.
+// Deterministic, golden-checked.
+//
+// The escaping cases are the ones that matter: every one of them is a string
+// that would be an injection if it reached a page unescaped.
+
+import { html_escape, html_escape_attr, html_unescape,
+         htmlBuilder, htmlBuilderCap, html_tag, html_document,
+         html_strip_tags, html_is_void, html_is_raw_text } from "vyto/util/html";
+
+fn main() {
+    // ---- text escaping ----
+    print("e.empty=[" + html_escape("") + "]");
+    print("e.plain=" + html_escape("nothing special"));
+    print("e.amp=" + html_escape("a & b"));
+    print("e.lt=" + html_escape("a < b"));
+    print("e.gt=" + html_escape("a > b"));
+    print("e.all=" + html_escape("<a href=\"x\">it's & more</a>"));
+    print("e.quotes=" + html_escape("\"double\" and 'single'"));
+    print("e.script=" + html_escape("<script>alert('xss')</script>"));
+    print("e.doubleesc=" + html_escape(html_escape("a & b")));
+    print("e.utf8=" + html_escape("café ☕ <x>"));
+    print("e.runs=" + html_escape("aaa<bbb>ccc&ddd"));
+
+    // ---- attribute escaping ----
+    print("a.empty=[" + html_escape_attr("") + "]");
+    print("a.plain=" + html_escape_attr("plain"));
+    print("a.double=" + html_escape_attr("say \"hi\""));
+    print("a.single=" + html_escape_attr("don't"));
+    print("a.all=" + html_escape_attr("<a>&\"'"));
+    print("a.breakout=" + html_escape_attr("x\" onerror=\"alert(1)"));
+
+    // ---- decoding ----
+    print("u.none=" + html_unescape("no entities here"));
+    print("u.five=" + html_unescape("&lt;&gt;&amp;&quot;&apos;"));
+    print("u.named=" + html_unescape("caf&eacute; 100&deg; &mdash; &hellip;"));
+    print("u.symbols=" + html_unescape("&copy;&reg;&trade;&euro;&pound;"));
+    print("u.arrows=" + html_unescape("&larr;&rarr;&harr;"));
+    print("u.dec=" + html_unescape("&#72;&#105;&#33;"));
+    print("u.hex=" + html_unescape("&#x48;&#x69;&#x21;"));
+    print("u.hexupper=" + html_unescape("&#X48;"));
+    print("u.astral=" + html_unescape("&#x1F600;"));
+    print("u.unknown=" + html_unescape("&notanentity; stays"));
+    print("u.bare=" + html_unescape("a & b"));
+    print("u.nosemi=" + html_unescape("&amp no semicolon"));
+    print("u.empty=" + html_unescape("&;"));
+    print("u.zero=[" + html_unescape("a&#0;b") + "]");
+    print("u.toobig=" + html_unescape("&#x110000;"));
+    print("u.baddigits=" + html_unescape("&#12x;"));
+    print("u.long=" + html_unescape("&thisnameisfartoolongtobeanentity;"));
+    print("u.round=" + html_unescape(html_escape_attr("<a href=\"x\">it's & more</a>")));
+
+    // ---- void and raw-text elements ----
+    print("v.br=" + str(html_is_void("br")) + " BR=" + str(html_is_void("BR")));
+    print("v.img=" + str(html_is_void("img")) + " div=" + str(html_is_void("div")));
+    print("v.input=" + str(html_is_void("input")) + " meta=" + str(html_is_void("meta")));
+    print("v.raw=" + str(html_is_raw_text("script")) + "/" + str(html_is_raw_text("STYLE")) +
+          "/" + str(html_is_raw_text("p")));
+
+    // ---- the builder ----
+    let h = htmlBuilder();
+    h.open("div").attr("class", "a b").attr("id", "x");
+    h.open("p").text("hello & goodbye").close();
+    h.close();
+    print("b.basic=" + h.toString());
+    print("b.ok=" + str(h.ok()) + " depth=" + str(h.depth()));
+
+    let n = htmlBuilder();
+    n.open("a").attr("href", "?x=1&y=2").attr("title", "say \"hi\"").text("link").close();
+    print("b.attrs=" + n.toString());
+
+    let i2 = htmlBuilder();
+    i2.open("meter").attrInt("value", 42).attrInt("max", 100).close();
+    print("b.attrint=" + i2.toString());
+
+    let f = htmlBuilder();
+    f.open("input").attr("type", "checkbox").flag("checked");
+    print("b.flag=" + f.toString());
+
+    let v = htmlBuilder();
+    v.open("p").text("a").open("br").text("b").open("img").attr("src", "x.png").text("c").close();
+    print("b.void=" + v.toString());
+
+    let t = htmlBuilder();
+    t.open("p").textInt(42).text(" items").close();
+    print("b.textint=" + t.toString());
+
+    let r = htmlBuilder();
+    r.open("div").raw("<b>trusted</b>").text(" & escaped").close();
+    print("b.raw=" + r.toString());
+
+    let c = htmlBuilder();
+    c.comment("a note").comment("with -- inside");
+    print("b.comment=" + c.toString());
+
+    let d = htmlBuilder();
+    d.doctype().open("html").close();
+    print("b.doctype=" + d.toString());
+
+    let e2 = htmlBuilder();
+    e2.elem("h1", "Title & more").elem("hr", "ignored").elem("p", "body");
+    print("b.elem=" + e2.toString());
+
+    let deep = htmlBuilder();
+    deep.open("a").open("b").open("c").text("x");
+    print("b.unclosed=" + deep.toString() + " depth=" + str(deep.depth()));
+    deep.closeAll();
+    print("b.closeall=" + deep.toString() + " depth=" + str(deep.depth()));
+
+    let cap = htmlBuilderCap(16);
+    cap.open("p").text("sized").close();
+    print("b.cap=" + cap.toString() + " len=" + str(cap.len()));
+
+    let empty = htmlBuilder();
+    print("b.empty=[" + empty.toString() + "]");
+
+    // Errors are recorded, not fatal, and the first one wins.
+    let x1 = htmlBuilder();
+    x1.close();
+    print("x.closeempty=" + x1.error());
+    let x2 = htmlBuilder();
+    x2.open("p").close().close();
+    print("x.overclose=" + x2.error());
+    let x3 = htmlBuilder();
+    x3.text("t").attr("a", "b");
+    print("x.attroutside=" + x3.error());
+    let x4 = htmlBuilder();
+    x4.flag("checked");
+    print("x.flagoutside=" + x4.error());
+    let x5 = htmlBuilder();
+    x5.close();
+    x5.close();
+    print("x.firstwins=" + x5.error());
+    // Output up to the error is still there.
+    print("x.partial=" + x2.toString());
+
+    // ---- one-shot helpers ----
+    print("t.tag=" + html_tag("h1", "A & B"));
+    print("t.void=" + html_tag("br", "ignored"));
+    print("t.empty=" + html_tag("p", ""));
+    print("t.doc=" + html_document("A & B", "<p>body</p>"));
+    print("t.docempty=" + html_document("", ""));
+
+    print("s.strip=" + html_strip_tags("<p>Hello <b>world</b></p>"));
+    print("s.entities=" + html_strip_tags("<p>a &amp; b</p>"));
+    print("s.notags=" + html_strip_tags("plain text"));
+    print("s.empty=[" + html_strip_tags("") + "]");
+    print("s.unclosed=[" + html_strip_tags("<p>text") + "]");
+    print("s.attrs=" + html_strip_tags("<a href=\"x\" title=\"y\">link</a>"));
+    print("s.adjacent=" + html_strip_tags("<b>a</b><i>b</i>"));
+}
