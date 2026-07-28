@@ -1,0 +1,300 @@
+// vyto/util/uuid — UUIDs (v4 and v7) and the random source they need.
+//
+//     uuid4()                       // "5f2b0c18-6a3e-4d71-9c2a-1e7f3b8d4a06"
+//     uuid7()                       // time-ordered: sorts by creation time
+//     uuid_is_valid(s)              // accepts hyphenated, bare, braced, urn:
+//     uuid_version("…-4d71-…")      // 4
+//
+//     let g = uuid7Gen();           // strictly increasing, even within one ms
+//     g.next(); g.next();
+//
+//     rand_bytes(32)                // the general random API, exported here
+//     rand_int(0, 6)                // 0..5, unbiased
+//
+// This is the only module under vyto/util with native code, and it is 30 lines
+// of it: getrandom(2) on Linux, BCryptGenRandom on Windows, /dev/urandom
+// otherwise. A language with no OS entropy call cannot produce unpredictable
+// bytes for itself, and a guessable v4 UUID is a security bug wherever one is
+// used as a session identifier or a capability token.
+//
+// It lives in its own directory for a build reason: a native/src is compiled
+// once per *package directory*, for every module in it, so putting the shim in
+// lib/vyto/util/native/src would compile it — and force the Windows bcrypt
+// link — into every program that imports vyto/util/fmt. Here the cost lands
+// only on callers who asked for randomness.
+//
+// Caveat: v7 is ordered by millisecond. Two bare uuid7() calls inside the same
+// millisecond have no defined order relative to each other — RFC 9562 permits
+// that. When you need keys that sort strictly, use a Uuid7 generator, which
+// carries the 12-bit counter the spec reserves for exactly this.
+
+import { unixMs } from "vyto/util/time";
+
+// vt_rand_bytes reaches BCryptGenRandom on Windows; POSIX uses
+// getrandom/urandom and needs no library.
+#link "bcrypt" if "windows"
+
+extern "C" {
+    fn vt_rand_bytes(out: cstring, n: i32);
+}
+
+// ---- random ----------------------------------------------------------------
+
+// `n` cryptographically random bytes. An n <= 0 yields an empty buffer.
+export fn rand_bytes(n: int): byte[] {
+    if (n <= 0) { return bytes(0); }
+    let b = bytes(n);
+    vt_rand_bytes(b as cstring, n as i32);
+    return b;
+}
+
+// A random 63-bit non-negative integer. (63 rather than 64 so the result is
+// never negative — Vyto's `int` is signed, and a negative "random number"
+// breaks every modulo and comparison a caller would write.)
+export fn rand_u63(): int {
+    let b = rand_bytes(8);
+    let v = 0;
+    let i = 0;
+    while (i < 8) {
+        v = (v << 8) | (b[i] as int);
+        i += 1;
+    }
+    return v & 0x7FFFFFFFFFFFFFFF;
+}
+
+// A random integer in [lo, hi). Returns `lo` when the range is empty.
+//
+// Rejection sampling against a power-of-two mask rather than `% span`, which
+// would over-represent the low end of any range that is not a power of two.
+// The loop retries with probability under 1/2 per draw, so it terminates fast.
+export fn rand_int(lo: int, hi: int): int {
+    if (hi <= lo) { return lo; }
+    let span = hi - lo;
+    let mask = 1;
+    while (mask < span) { mask = (mask << 1) | 1; }
+    let v = rand_u63() & mask;
+    while (v >= span) { v = rand_u63() & mask; }
+    return lo + v;
+}
+
+// A random float in [0, 1), with 53 bits of precision (the mantissa width, so
+// every representable value in the range is reachable and none is favoured).
+export fn rand_float(): float {
+    let bits = rand_u63() & 0x1FFFFFFFFFFFFF;
+    return (bits as float) / 9007199254740992.0;
+}
+
+// ---- formatting and parsing ------------------------------------------------
+
+const HEXD: string = "0123456789abcdef";
+
+// The canonical 8-4-4-4-12 lowercase form of 16 bytes. A short buffer yields
+// the nil UUID rather than reading past the end.
+export fn uuid_format(b: byte[]): string {
+    if (b.len < 16) { return uuid_nil(); }
+    let out = "";
+    let i = 0;
+    while (i < 16) {
+        if (i == 4 || i == 6 || i == 8 || i == 10) { out = out + "-"; }
+        let v = b[i] as int;
+        let hi = (v >> 4) & 0xF;
+        let lo = v & 0xF;
+        out = out + HEXD.slice(hi, hi + 1) + HEXD.slice(lo, lo + 1);
+        i += 1;
+    }
+    return out;
+}
+
+// The all-zero UUID.
+export fn uuid_nil(): string { return "00000000-0000-0000-0000-000000000000"; }
+
+// Parse into `out` (which must hold at least 16 bytes) and report success.
+// Accepts the hyphenated form, the bare 32-hex form, `{…}` braces, and a
+// leading `urn:uuid:`, in any case. `out` is a 1-element-style buffer because
+// Vyto has no out-parameters — the same idiom as vyto/cli's parse_int.
+export fn uuid_parse(s: string, out: byte[]): bool {
+    if (out.len < 16) { return false; }
+    let t = s.trim();
+    if (t.len > 9 && t.slice(0, 9).to_lower() == "urn:uuid:") { t = t.slice(9, t.len); }
+    if (t.starts_with("{") && t.ends_with("}")) { t = t.slice(1, t.len - 1); }
+    if (t.len == 36) {
+        if (t[8] != 45 || t[13] != 45 || t[18] != 45 || t[23] != 45) { return false; }
+        t = t.slice(0, 8) + t.slice(9, 13) + t.slice(14, 18) + t.slice(19, 23) + t.slice(24, 36);
+    }
+    if (t.len != 32) { return false; }
+    let i = 0;
+    while (i < 16) {
+        let hi = hex_val(t[i * 2]);
+        let lo = hex_val(t[i * 2 + 1]);
+        if (hi < 0 || lo < 0) { return false; }
+        out[i] = ((hi << 4) | lo) as byte;
+        i += 1;
+    }
+    return true;
+}
+
+// The 16 bytes of `s`, or the nil UUID's bytes when it does not parse. Use
+// uuid_parse when you need to tell those two apart.
+export fn uuid_bytes(s: string): byte[] {
+    let b = bytes(16);
+    uuid_parse(s, b);
+    return b;
+}
+
+export fn uuid_is_valid(s: string): bool {
+    let b = bytes(16);
+    return uuid_parse(s, b);
+}
+
+// Normalize any accepted spelling to the canonical lowercase hyphenated form;
+// "" when the input does not parse.
+export fn uuid_canonical(s: string): string {
+    let b = bytes(16);
+    if (!uuid_parse(s, b)) { return ""; }
+    return uuid_format(b);
+}
+
+// The version nibble (1..8), or -1 when `s` does not parse. The nil UUID
+// reports 0, which is not a real version — check uuid_is_nil first if that
+// distinction matters.
+export fn uuid_version(s: string): int {
+    let b = bytes(16);
+    if (!uuid_parse(s, b)) { return -1; }
+    return ((b[6] as int) >> 4) & 0xF;
+}
+
+// The variant field: 1 for the RFC 4122/9562 layout every UUID here uses,
+// 0 for the legacy NCS layout, 2 for Microsoft's, 3 reserved. -1 if unparseable.
+export fn uuid_variant(s: string): int {
+    let b = bytes(16);
+    if (!uuid_parse(s, b)) { return -1; }
+    let v = b[8] as int;
+    if ((v & 0x80) == 0) { return 0; }
+    if ((v & 0x40) == 0) { return 1; }
+    if ((v & 0x20) == 0) { return 2; }
+    return 3;
+}
+
+export fn uuid_is_nil(s: string): bool {
+    let b = bytes(16);
+    if (!uuid_parse(s, b)) { return false; }
+    let i = 0;
+    while (i < 16) {
+        if ((b[i] as int) != 0) { return false; }
+        i += 1;
+    }
+    return true;
+}
+
+// Unix milliseconds encoded in a v7 UUID, or -1 for anything else. This is the
+// property that makes v7 useful as a database key: the creation time is
+// recoverable and the ordering is the insertion ordering.
+export fn uuid_timestamp_ms(s: string): i64 {
+    let b = bytes(16);
+    if (!uuid_parse(s, b)) { return -1 as i64; }
+    if ((((b[6] as int) >> 4) & 0xF) != 7) { return -1 as i64; }
+    let ms = 0;
+    let i = 0;
+    while (i < 6) {
+        ms = (ms << 8) | (b[i] as int);
+        i += 1;
+    }
+    return ms as i64;
+}
+
+// Order two UUIDs: -1, 0 or 1, comparing the 16 bytes big-endian.
+//
+// This exists because Vyto's relational operators do not apply to strings, and
+// v7's entire value is that this ordering *is* the creation ordering — so a
+// comparator has to exist for the sort to be writable at all. Pass it to
+// sort_by from vyto/util/sort. Unparseable input sorts as the nil UUID.
+export fn uuid_compare(a: string, b: string): int {
+    let ba = uuid_bytes(a);
+    let bb = uuid_bytes(b);
+    let i = 0;
+    while (i < 16) {
+        let x = ba[i] as int;
+        let y = bb[i] as int;
+        if (x < y) { return -1; }
+        if (x > y) { return 1; }
+        i += 1;
+    }
+    return 0;
+}
+
+fn hex_val(c: int): int {
+    if (c >= 48 && c <= 57) { return c - 48; }
+    if (c >= 97 && c <= 102) { return c - 87; }
+    if (c >= 65 && c <= 70) { return c - 55; }
+    return -1;
+}
+
+// ---- generation ------------------------------------------------------------
+
+// A random (version 4) UUID: 122 random bits, with the version and variant
+// fields overwritten as RFC 9562 §5.4 requires.
+export fn uuid4(): string {
+    let b = rand_bytes(16);
+    b[6] = ((((b[6] as int) & 0x0F)) | 0x40) as byte;
+    b[8] = ((((b[8] as int) & 0x3F)) | 0x80) as byte;
+    return uuid_format(b);
+}
+
+// A time-ordered (version 7) UUID: a 48-bit Unix-millisecond prefix, then 74
+// random bits. Sorts by creation time, which is what makes it a better primary
+// key than v4 — see the same-millisecond caveat in the header, and Uuid7 below.
+export fn uuid7(): string {
+    let ms = unixMs() as int;
+    return uuid7_at(ms, rand_int(0, 4096));
+}
+
+// Lay out a v7 UUID for an explicit timestamp and 12-bit `seq` (RFC 9562's
+// rand_a field). The remaining 62 bits are random.
+fn uuid7_at(ms: int, seq: int): string {
+    let b = rand_bytes(16);
+    b[0] = ((ms >> 40) & 0xFF) as byte;
+    b[1] = ((ms >> 32) & 0xFF) as byte;
+    b[2] = ((ms >> 24) & 0xFF) as byte;
+    b[3] = ((ms >> 16) & 0xFF) as byte;
+    b[4] = ((ms >> 8) & 0xFF) as byte;
+    b[5] = (ms & 0xFF) as byte;
+    b[6] = (0x70 | ((seq >> 8) & 0x0F)) as byte;
+    b[7] = (seq & 0xFF) as byte;
+    b[8] = ((((b[8] as int) & 0x3F)) | 0x80) as byte;
+    return uuid_format(b);
+}
+
+// A v7 generator whose output strictly increases, including within a single
+// millisecond and across a clock that steps backwards.
+//
+// RFC 9562 §6.2 reserves the 12 bits after the timestamp for exactly this. The
+// counter gives 4096 ordered values per millisecond; past that the generator
+// borrows from the next millisecond rather than repeating a value or blocking,
+// so a burst stays ordered and the timestamp is at most a few milliseconds
+// ahead of the clock.
+//
+// State is per-generator rather than global: Vyto has no threads, but a shared
+// mutable module variable would still make two unrelated call sites interfere.
+export class Uuid7 {
+    lastMs: int;
+    seq: int;
+
+    fn init() { this.lastMs = 0; this.seq = 0; }
+
+    fn next(): string {
+        let ms = unixMs() as int;
+        if (ms > this.lastMs) {
+            this.lastMs = ms;
+            this.seq = 0;
+        } else {
+            this.seq += 1;
+            if (this.seq > 0xFFF) {
+                this.lastMs += 1;
+                this.seq = 0;
+            }
+        }
+        return uuid7_at(this.lastMs, this.seq);
+    }
+}
+
+export fn uuid7Gen(): Uuid7 { return new Uuid7(); }
