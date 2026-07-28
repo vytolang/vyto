@@ -171,9 +171,14 @@ DLLs:
 
 The **core language, the runtime, and the stdlib packages with no POSIX
 dependency**: `vyto/math`, `vyto/reactive`, `vyto/util/*` (fmt, json, sort, text,
-time, date), `vyto/io/file`, `vyto/data/frame`, `vyto/os/os`, `vyto/anim`, `vyto/cli`,
-`vyto/geom/*`, `vyto/geo/*`, plus FFI, native packages with in-tree C, and prebuilt
-`native/windows-x64/*.dll` packages.
+time, date, and the data-format modules — csv, xml, toml, ini, markdown, html,
+url, mime, log), `vyto/io/file`, `vyto/data/frame`, `vyto/os/os`, `vyto/anim`,
+`vyto/cli`, `vyto/geom/*`, `vyto/geo/*`, plus FFI, native packages with in-tree C,
+and prebuilt `native/windows-x64/*.dll` packages.
+
+`vyto/util/uuid` is portable too, though unlike its `vyto/util` siblings it does
+carry a native shim: `getrandom(2)` on Linux, `BCryptGenRandom` on Windows (so it
+`#link`s `bcrypt` there), `/dev/urandom` otherwise.
 
 **GUI and graphics**: `vyto/surface` (the Win32 GDI backend), `vyto/ui`, and
 `vyto/gfx` all build for `windows-x64` — see the next section for the one

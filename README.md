@@ -540,7 +540,21 @@ everything else is pure Vyto.
 | `vyto/io/file` ⚙ | files & paths (`File`, read/write, `file_exists`, `mkdirs`, …) |
 | `vyto/os` ⚙ | environment, args, process helpers |
 | `vyto/cli` | flags, options, operands and subcommands, generated `--help`, and non-panicking `parse_int`/`parse_float`/`parse_bool` |
+| `vyto/util/log` | levelled, structured logging with a JSON-lines sink |
+| `vyto/util/uuid` ⚙ | UUID v4 and v7, plus the CSPRNG they need (`rand_bytes`, `rand_int`) |
 | `vyto/os/worker` ⚙ | `fork()`-based `WorkerPool` — CPU parallelism, no shared state |
+
+**Data formats** — all pure Vyto, all soft-failing (a parse error is a value, never a panic)
+
+| Module | What it gives you |
+|--------|-------------------|
+| `vyto/util/csv` | RFC 4180 reader/writer, dialects, sniffing, streaming |
+| `vyto/util/xml` | pull parser + small DOM, namespaces, entities |
+| `vyto/util/toml` · `vyto/util/ini` | configuration formats, parsed into a `JsonValue` |
+| `vyto/util/markdown` | CommonMark blocks and inline spans, to a tree and to HTML |
+| `vyto/util/html` | HTML escaping and generation (`html_escape`, `HtmlBuilder`) |
+| `vyto/util/url` | URL parse/join/format, query strings, percent-encoding |
+| `vyto/util/mime` | media types, base64, quoted-printable, multipart |
 
 **Internationalization** — `vyto/intl` ⚙ (ICU-backed)
 
