@@ -449,6 +449,31 @@ else
     fail=1
 fi
 
+# --- vyto/regex: the convenience layer — the four match walkers agreeing on a
+#     zero-width pattern, rx_quote round-tripping every metacharacter,
+#     fullMatch's \z beating a trailing newline, expand's template syntax, the
+#     flags default on every rx_*, and the two validators ---
+got=$(./vytoc run tests/fixtures/regex_extra.vt 2>&1)
+if [ "$got" = "$(cat tests/fixtures/regex_extra.expected)" ]; then
+    echo "PASS regex_extra"
+else
+    echo "FAIL regex_extra"
+    echo "--- expected ---"; cat tests/fixtures/regex_extra.expected
+    echo "--- got ---"; printf '%s\n' "$got"
+    fail=1
+fi
+
+# --- vyto/regex: the convenience layer with the JIT forced off ---
+got=$(VYTO_REGEX_JIT=0 ./vytoc run tests/fixtures/regex_extra.vt 2>&1)
+if [ "$got" = "$(cat tests/fixtures/regex_extra.expected)" ]; then
+    echo "PASS regex_extra_nojit"
+else
+    echo "FAIL regex_extra_nojit"
+    echo "--- expected ---"; cat tests/fixtures/regex_extra.expected
+    echo "--- got ---"; printf '%s\n' "$got"
+    fail=1
+fi
+
 # --- vyto/gfx: blend2d Canvas -> blitPtr (gated on the prebuilt lib) ---
 if [ -f lib/vyto/gfx/native/linux-x64/libblend2d.so ]; then
     gfx_bin=apps/gfxdemo/.vyto-cache/gfxdemo_test

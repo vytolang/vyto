@@ -1,0 +1,213 @@
+// vyto/regex — the convenience layer added on top of the core API.
+//
+// tests/fixtures/regex_match.vt covers the engine. This covers everything built
+// over it: the walkers, the one-liners, the offset helpers and the validators.
+//
+// Same two rules as the core fixture. Never print PCRE2's own error text
+// (upstream rewords it between releases), and never print anything that varies
+// with whether the JIT is active — the suite runs this file twice, the second
+// time with VYTO_REGEX_JIT=0, against the same golden.
+
+import { Regex, Match,
+         rx_find_all, rx_find_all_group, rx_count, rx_grep, rx_grep_v, rx_quote,
+         rx_full_match, rx_find_or, rx_group, rx_named, rx_replace_first,
+         rx_index_of, rx_last_index_of, rx_trim, rx_strip_prefix, rx_strip_suffix,
+         rx_test_any, rx_is_email_loose, rx_is_ipv4, rx_test, rx_find,
+         rx_cache_clear, rx_cache_count,
+         RX_P_EMAIL_LOOSE, RX_P_IPV4, RX_CASELESS, RX_MULTILINE } from "vyto/regex";
+
+// Every walker must agree on the match count. There are four of them — two on
+// Regex (findAll builds Match objects, spans reads offsets), one in C
+// (vre_count), one on the cached path (cached_spans) — and they step through a
+// zero-width match independently. If any of them drifts, this line catches it.
+fn agree(pat: string, s: string, label: string) {
+    let re = new Regex(pat, 0);
+    let a = re.findAllText(s).len;
+    let b = rx_find_all(pat, s).len;
+    let c = re.count(s);
+    let d = rx_count(pat, s);
+    let e = re.findAll(s).len;
+    print("  " + label + ": " + a + " " + b + " " + c + " " + d + " " + e +
+          " agree=" + (a == b && b == c && c == d && d == e));
+}
+
+fn main() {
+    print("---- the four walkers agree ----");
+    agree("\\w+", "one two three", "words");
+    agree("a*", "bab", "zero-width");
+    agree("", "héllo", "empty on utf8");        // 5 chars + end = 6, not 7 bytes
+    agree("", "a\r\nb", "empty over crlf");     // CRLF steps as one unit
+    agree("\\b", "ab cd", "word boundary");
+    agree("x", "no match here", "no match");
+
+    print("---- findAllText / findAllGroup ----");
+    let w = new Regex("(\\w)(\\d)", 0);
+    print("text=" + w.findAllText("a1 b2 c3").join(","));
+    print("group1=" + w.findAllGroup("a1 b2 c3", 1).join(","));
+    print("group2=" + w.findAllGroup("a1 b2 c3", 2).join(","));
+    print("cached: all=" + rx_find_all("(\\w)(\\d)", "a1 b2").join(",") +
+          " g2=" + rx_find_all_group("(\\w)(\\d)", "a1 b2", 2).join(","));
+    // A group that did not participate contributes nothing, so the result can
+    // be shorter than the match count.
+    let opt = new Regex("(a)?b", 0);
+    print("unset group skipped: matches=" + opt.count("ab b ab") +
+          " group1=" + opt.findAllGroup("ab b ab", 1).len);
+
+    print("---- count ----");
+    print("count=" + rx_count("\\d+", "a1b22c333") + " none=" + rx_count("z", "abc"));
+
+    print("---- rx_quote ----");
+    // Round-trip: quoting a string of every metacharacter must produce a
+    // pattern that matches exactly that string and nothing clever.
+    let meta = "a.*b(c)[d]{e}^f$g|h?i+j\\k";
+    let q = rx_quote(meta);
+    print("round-trip=" + rx_test(q, meta) + " full=" + rx_full_match(q, meta));
+    print("no wildcard leak=" + rx_test(rx_quote("a.c"), "abc"));
+    print("quoted='" + rx_quote("a.b") + "'");
+
+    print("---- fullMatch ----");
+    // Not the same as checking find()'s offsets: matching is leftmost-first, so
+    // "a|ab" on "ab" finds "a" and an offset test would wrongly say no.
+    let alt = new Regex("a|ab", 0);
+    let am = alt.find("ab");
+    print("leftmost-first find=[" + am.start() + "," + am.end() + "] fullMatch=" +
+          alt.fullMatch("ab"));
+    // \z rather than $, so a trailing newline does not sneak through. This is
+    // the bug the method exists to prevent.
+    print("trailing newline: test=" + rx_test("^abc$", "abc\n") +
+          " fullMatch=" + rx_full_match("abc", "abc\n"));
+    print("partial=" + rx_full_match("\\d+", "12a") + " whole=" + rx_full_match("\\d+", "123"));
+    // Group numbering must survive the \A(?:...)\z wrap.
+    print("groups survive wrap=" + rx_group("(\\w+)@(\\w+)", "a@b", 2) +
+          " full=" + rx_full_match("(\\w+)@(\\w+)", "a@b"));
+
+    print("---- findOr / group / named ----");
+    let d = new Regex("\\d+", 0);
+    print("findOr hit=" + d.findOr("x42", "?") + " miss=" + d.findOr("none", "?"));
+    print("rx_find_or=" + rx_find_or("\\d+", "none", "fallback"));
+    print("rx_group=" + rx_group("(\\w+)@(\\w+)", "bob@corp", 1) +
+          " missing='" + rx_group("(\\w+)@(\\w+)", "nope", 1) + "'");
+    print("rx_named=" + rx_named("(?<u>\\w+)@", "bob@corp", "u") +
+          " absent='" + rx_named("(?<u>\\w+)@", "bob@corp", "zz") + "'");
+
+    print("---- grep ----");
+    let log = "ERROR disk full\nINFO started\nerror lowercase\nWARN slow";
+    print("grep=" + rx_grep("^ERROR", log, RX_MULTILINE).len +
+          " grep_v=" + rx_grep_v("^ERROR", log, RX_MULTILINE).len);
+    print("caseless grep=" + rx_grep("^error", log, RX_CASELESS).len);
+    print("first=" + rx_grep("^ERROR", log).join("|"));
+    // lines() drops the trailing empty piece, so a trailing newline adds nothing.
+    print("trailing newline=" + rx_grep("a", "a\nb\n").len);
+
+    print("---- offsets ----");
+    print("indexOf=" + rx_index_of("b", "abcb") + " last=" + rx_last_index_of("b", "abcb"));
+    print("absent=" + rx_index_of("z", "abc") + "/" + rx_last_index_of("z", "abc"));
+
+    print("---- trim / strip ----");
+    print("trim='" + rx_trim("\\s+", "   hi   ") + "'");
+    print("trim nothing='" + rx_trim("\\s+", "hi") + "'");
+    print("trim all='" + rx_trim("\\s+", "    ") + "'");
+    print("prefix='" + rx_strip_prefix("\\d+", "12ab") + "' absent='" +
+          rx_strip_prefix("\\d+", "ab12") + "'");
+    print("suffix='" + rx_strip_suffix("\\d+", "ab12") + "' absent='" +
+          rx_strip_suffix("\\d+", "12ab") + "'");
+
+    print("---- partition / splitKeep ----");
+    let comma = new Regex(",", 0);
+    let p = comma.partition("a,b,c");
+    print("partition=[" + p[0] + "|" + p[1] + "|" + p[2] + "] n=" + p.len);
+    let pn = comma.partition("abc");
+    print("no match=[" + pn[0] + "|" + pn[1] + "|" + pn[2] + "] rejoins=" +
+          (pn[0] + pn[1] + pn[2] == "abc"));
+    let sk = comma.splitKeep("a,b,c");
+    print("splitKeep n=" + sk.len + " rejoins=" + (sk.join("") == "a,b,c") +
+          " [" + sk.join("/") + "]");
+
+    print("---- replaceFn / each / replaceN ----");
+    // The arrow must be assigned to a typed target: an inline one cannot be
+    // inferred at the call site. It also cannot capture `this`.
+    let mail = new Regex("(?<user>\\w+)@(?<host>\\w+)", 0);
+    let redact: fn(Match): string = (m) => m.named("user") + "@***";
+    print("replaceFn=" + mail.replaceFn("a@b and c@d", redact));
+    let upper: fn(Match): string = (m) => m.text().to_upper();
+    print("upper=" + mail.replaceFn("a@b", upper));
+    let seen: string[] = [];
+    let collect: fn(Match) = (m) => seen.push(m.text());
+    mail.each("a@b c@d", collect);
+    print("each collected=" + seen.join(","));
+    print("replaceN(1)=" + mail.replaceN("a@b c@d", "<$1>", 1));
+    print("replaceN(0)=" + mail.replaceN("a@b c@d", "<$1>", 0));
+    print("replaceN(9)=" + mail.replaceN("a@b c@d", "<$1>", 9));
+    print("rx_replace_first=" + rx_replace_first("a", "aaa", "X") +
+          " (contrast replace_all)");
+
+    print("---- expand ----");
+    let em = mail.find("bob@corp");
+    print("numbered=" + mail.expand(em, "$2/$1"));
+    print("named=" + mail.expand(em, "${host}/${user}"));
+    print("literal=" + mail.expand(em, "$$5"));
+    print("out of range='" + mail.expand(em, "[$9]") + "'");
+    print("unknown escape=" + mail.expand(em, "$x"));
+    print("trailing dollar=" + mail.expand(em, "a$"));
+    print("unclosed brace=" + mail.expand(em, "a${b"));
+
+    print("---- flags default to 0 on every rx_* ----");
+    print("with=" + rx_test("abc", "ABC", RX_CASELESS) + " without=" + rx_test("abc", "ABC"));
+    print("count with=" + rx_count("a", "aAa", RX_CASELESS) + " without=" + rx_count("a", "aAa"));
+    print("find_all with=" + rx_find_all("a", "aAa", RX_CASELESS).len +
+          " without=" + rx_find_all("a", "aAa").len);
+    print("find with=" + rx_find("a", "A", RX_CASELESS).matched() +
+          " without=" + rx_find("a", "A").matched());
+    // The same pattern under two flag sets must occupy two cache slots, not
+    // collide into one.
+    rx_cache_clear();
+    rx_test("zq", "x");
+    rx_test("zq", "x", RX_CASELESS);
+    print("flags key the cache: slots=" + rx_cache_count());
+
+    print("---- rx_test_any ----");
+    print("hit=" + rx_test_any(["^x", "\\d"], "a1") +
+          " miss=" + rx_test_any(["^x", "\\d"], "abc"));
+
+    print("---- rx_is_email_loose ----");
+    let good = ["a@b.co", "first.last@sub.example.co.uk", "user+tag@x.io",
+                "UPPER@EXAMPLE.COM", "x@y.z", "a..b@c.de"];
+    let bad  = ["", "plain", "no@domain", "@example.com", "a@.com", "a@b.",
+                "a b@c.de", "a@b c.de", "a@b..co", "two@at@x.co"];
+    let i = 0;
+    while (i < good.len) {
+        print("  accept " + good[i] + " = " + rx_is_email_loose(good[i]));
+        i += 1;
+    }
+    let j = 0;
+    while (j < bad.len) {
+        print("  reject '" + bad[j] + "' = " + rx_is_email_loose(bad[j]));
+        j += 1;
+    }
+    // No nested quantifier, so a long non-matching subject returns rather than
+    // burning the match limit. If this ever hangs or panics, the pattern
+    // regressed into a ReDoS.
+    let longLocal = "a".repeat(5000) + "!";
+    print("  5000-char non-match returns=" + rx_is_email_loose(longLocal));
+    // The constant is usable inside a bigger pattern.
+    print("  composable=" + rx_test("<" + RX_P_EMAIL_LOOSE + ">", "<a@b.co>"));
+
+    print("---- rx_is_ipv4 ----");
+    let ips = ["0.0.0.0", "255.255.255.255", "192.168.1.1", "8.8.8.8"];
+    let notips = ["256.1.1.1", "1.2.3", "1.2.3.4.5", "01.2.3.4", "1.2.3.-1",
+                  "999.999.999.999", "a.b.c.d", ""];
+    let k = 0;
+    while (k < ips.len) { print("  accept " + ips[k] + " = " + rx_is_ipv4(ips[k])); k += 1; }
+    let l = 0;
+    while (l < notips.len) {
+        print("  reject '" + notips[l] + "' = " + rx_is_ipv4(notips[l]));
+        l += 1;
+    }
+    print("  finds one in text=" + rx_find_or(RX_P_IPV4, "host 10.0.0.7 up", "none"));
+
+    print("---- cache is not leaked by the walkers ----");
+    rx_cache_clear();
+    let n = 0;
+    while (n < 40) { rx_find_all("\\d+", "a1b2c3"); n += 1; }
+    print("40 walks over one pattern: slots=" + rx_cache_count());
+}

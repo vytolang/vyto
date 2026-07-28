@@ -1,0 +1,76 @@
+// vyto/regex — the convenience layer, in the shape of a small log tool.
+//
+// examples/83_regex.vt is the tour of the core API: Regex, Match, find,
+// replaceAll. This one is about the layer on top — the functions that turn a
+// three-line loop into one call.
+//
+// The job: triage a log, count what happened, pull out fields, redact the
+// personal data, and validate a config file. Nothing here reads a clock, a file
+// or the environment, so the output is fixed.
+
+import { Regex, Match, rx_grep, rx_grep_v, rx_count, rx_find_all,
+         rx_find_all_group, rx_quote, rx_is_email_loose, rx_is_ipv4,
+         rx_find_or, RX_MULTILINE } from "vyto/regex";
+
+fn main() {
+    let log = "2026-07-28 ERROR  db   timeout on shard 3 from 10.0.0.7\n" +
+              "2026-07-28 WARN   web  slow reply to bob@example.com\n" +
+              "2026-07-28 ERROR  web  auth failed for carol@example.org\n" +
+              "2026-07-28 INFO   db   compaction finished\n" +
+              "2026-07-28 ERROR  net  no route to 192.168.1.99";
+
+    // ---- grep, without splitting and looping yourself ----
+    let errors = rx_grep("ERROR", log);
+    print("errors: " + errors.len + " of " + log.lines().len + " lines");
+    print("  first: " + errors[0]);
+    print("quiet lines: " + rx_grep_v("ERROR|WARN", log).len);
+
+    // ---- count without building the matches ----
+    // rx_count loops in C and allocates nothing, so this is the cheap way to
+    // ask "how many" over a large file.
+    print("ip mentions: " + rx_count("\\d+\\.\\d+\\.\\d+\\.\\d+", log));
+
+    // ---- pull out fields ----
+    // findAll gives Match objects; rx_find_all gives just the strings, which is
+    // usually what you wanted.
+    print("addresses: " + rx_find_all("\\d+\\.\\d+\\.\\d+\\.\\d+", log).join(" "));
+    // rx_find_all_group takes one capture across every match, so "the third
+    // column of every line" is a single call rather than a loop over Match.
+    let subs = rx_find_all_group("^\\S+ +(\\w+) +(\\w+)", log, 2, RX_MULTILINE);
+    print("subsystems: " + subs.join(","));
+    print("levels:     " + rx_find_all_group("^\\S+ +(\\w+)", log, 1, RX_MULTILINE).join(","));
+
+    // ---- redact with a callback ----
+    // The closure has to be assigned to a typed target before the call — an
+    // inline arrow cannot be inferred here — and it cannot capture `this`.
+    let mail = new Regex("(?<user>[\\w.]+)@(?<host>[\\w.]+)", 0);
+    let redact: fn(Match): string = (m) => m.named("user") + "@[redacted]";
+    let clean = mail.replaceFn(log, redact);
+    print("redacted: " + rx_grep("redacted", clean)[0]);
+
+    // ---- searching for text the user typed ----
+    // rx_quote is not optional here. Without it "10.0.0.7" is a pattern where
+    // every dot is a wildcard, and a user typing "(a+)+$" gets a denial of
+    // service instead of a search.
+    let typed = "10.0.0.7";
+    print("literal search: " + rx_count(rx_quote(typed), log) +
+          "   unquoted would also match 10x0y0z7");
+
+    // ---- validate a config ----
+    let settings = "admin=ops@example.com\nbind=192.168.1.10\nrelay=not-an-email\n" +
+                   "fallback=999.1.1.1";
+    for (let line in settings.lines()) {
+        let parts = new Regex("=", 0).partition(line);
+        let key = parts[0];
+        let val = parts[2];
+        let kind = "text";
+        if (rx_is_email_loose(val)) { kind = "email"; }
+        if (rx_is_ipv4(val)) { kind = "ipv4"; }
+        print("  " + key + " -> " + kind);
+    }
+
+    // ---- one-liners with a default ----
+    // findOr saves the matched() dance when a miss just means "use this".
+    print("shard: " + rx_find_or("shard (\\d+)", log, "none"));
+    print("region: " + rx_find_or("region (\\w+)", log, "none"));
+}
