@@ -1,0 +1,584 @@
+// vyto/regex — Perl-compatible regular expressions, backed by PCRE2.
+//
+//     import { Regex, rx_find } from "vyto/regex";
+//
+//     let re = new Regex("(?<user>\\w+)@(?<host>[\\w.]+)", 0);
+//     let m = re.find("mail bob@example.com now");
+//     m.text();              // "bob@example.com"
+//     m.named("user");       // "bob"
+//     re.replaceAll("a@b c@d", "<$1>");   // "<a> <c>"
+//     rx_find("\\d+", "x42").text();      // "42" — cached, no Regex to keep
+//
+// PCRE2 is vendored under native/src/pcre2/ and compiled from source, so this
+// module needs no provisioning and works on every target. JIT compilation is on
+// by default; set VYTO_REGEX_JIT=0 to force the interpreter.
+//
+// Unicode is the default. Patterns and subjects are UTF-8, \w and \b follow
+// Unicode rules, and \p{...} works. Pass RX_BYTES for binary data.
+//
+// Errors follow the library-wide "panic hard, sentinel soft" rule, and the line
+// falls in an unusual place, so it is worth stating plainly:
+//
+//   * Compiling a bad pattern is SOFT. A regex is usually data — a config
+//     value, a --filter argument, a search box — so `new Regex(...)` never
+//     panics. Check isValid() and read error().
+//   * Matching with a Regex that failed to compile PANICS. Ignoring the
+//     sentinel is the programmer error; silently reporting "no match" would be
+//     a wrong answer rather than a loud one.
+//   * Exceeding the match limit is soft where there is somewhere to put the
+//     error (find returns a Match carrying RX_ERR_LIMIT) and a panic where
+//     there is not (test, findAll, replace, split all return plain values, and
+//     a truncated result would be indistinguishable from a real one).
+//
+// Replacement strings use PCRE2's syntax: $1, ${name}, $$ for a literal
+// dollar. Not \1.
+//
+// Ownership: a Regex owns a compiled pattern, its match data and its match
+// context; deinit frees all three. Because the match data is allocated once
+// rather than per call, a single Regex is NOT reentrant — do not interleave two
+// scans over the same object. (Vyto has no threads; vyto/os/worker is
+// fork-based, so a worker gets its own copy of everything here.)
+
+// ---- compile flags -------------------------------------------------------
+export const RX_CASELESS:         int = 1;
+export const RX_MULTILINE:        int = 2;
+export const RX_DOTALL:           int = 4;
+export const RX_EXTENDED:         int = 8;
+export const RX_UNGREEDY:         int = 16;
+export const RX_ANCHORED:         int = 32;
+export const RX_DOLLAR_ENDONLY:   int = 64;
+export const RX_FIRSTLINE:        int = 128;
+export const RX_NO_AUTO_CAPTURE:  int = 256;
+// Treat pattern and subject as bytes: no UTF-8 validation, no Unicode \w.
+export const RX_BYTES:            int = 512;
+
+// ---- substitution flags --------------------------------------------------
+const RX_SUB_GLOBAL:              int = 1;
+export const RX_SUB_EXTENDED:     int = 2;    // \n, \U, ${name:-default} in the replacement
+export const RX_SUB_UNSET_EMPTY:  int = 4;    // an unset group substitutes as ""
+
+// ---- Match.code ----------------------------------------------------------
+export const RX_OK:            int = 0;
+export const RX_NO_MATCH:      int = 1;
+export const RX_ERR_LIMIT:     int = 2;   // backtracking budget exhausted
+export const RX_ERR_UTF:       int = 3;   // subject is not valid UTF-8
+export const RX_ERR_INTERNAL:  int = 4;
+
+// ---- default limits, as set on every new Regex ---------------------------
+export const RX_DEFAULT_MATCH_LIMIT: int = 1000000;
+export const RX_DEFAULT_DEPTH_LIMIT: int = 10000;
+export const RX_DEFAULT_HEAP_KB:     int = 16384;
+
+extern "C" {
+    fn vre_compile(pat: cstring, patlen: i64, flags: i32): rawptr;
+    fn vre_free(h: rawptr);
+    fn vre_last_errcode(): i32;
+    fn vre_last_erroffset(): i64;
+    fn vre_error_message(code: i32, out: cstring, cap: i64): i64;
+    fn vre_jit_ok(h: rawptr): i32;
+    fn vre_set_limits(h: rawptr, match: i64, depth: i64, heapKB: i64);
+    fn vre_config_jit(): i32;
+
+    fn vre_match(h: rawptr, subj: cstring, len: i64, start: i64, flags: i32): i32;
+    fn vre_match_next(h: rawptr, subj: cstring, len: i64, start: i64): i32;
+    fn vre_advance(h: rawptr, subj: cstring, len: i64, pos: i64): i64;
+    fn vre_group_count(h: rawptr): i32;
+    fn vre_pair_count(h: rawptr): i32;
+    fn vre_group_start(h: rawptr, i: i32): i64;
+    fn vre_group_end(h: rawptr, i: i32): i64;
+
+    fn vre_name_count(h: rawptr): i32;
+    fn vre_name_at(h: rawptr, i: i32, out: cstring, cap: i64): i64;
+    fn vre_name_number(h: rawptr, i: i32): i32;
+
+    fn vre_substitute(h: rawptr, subj: cstring, slen: i64, repl: cstring,
+                      rlen: i64, flags: i32, out: cstring, cap: i64): i64;
+
+    fn vre_cached_find(pat: cstring, patlen: i64, flags: i32,
+                       subj: cstring, len: i64, start: i64): i32;
+    fn vre_cached_next(pat: cstring, patlen: i64, flags: i32,
+                       subj: cstring, len: i64, start: i64): i32;
+    fn vre_cached_advance(subj: cstring, len: i64, pos: i64): i64;
+    fn vre_cached_group_count(): i32;
+    fn vre_cached_pair_count(): i32;
+    fn vre_cached_group_start(i: i32): i64;
+    fn vre_cached_group_end(i: i32): i64;
+    fn vre_cached_name_count(): i32;
+    fn vre_cached_name_at(i: i32, out: cstring, cap: i64): i64;
+    fn vre_cached_name_number(i: i32): i32;
+    fn vre_cached_substitute(pat: cstring, patlen: i64, flags: i32,
+                             subj: cstring, slen: i64, repl: cstring, rlen: i64,
+                             sflags: i32, out: cstring, cap: i64): i64;
+    fn vre_cache_clear();
+    fn vre_cache_count(): i32;
+}
+
+// The shim's negative returns, mapped onto RX_*. It never leaks a PCRE2 error
+// number, so a PCRE2 upgrade cannot change a value that appears in a golden.
+fn code_of(rc: int): int {
+    if (rc > 0)   { return RX_OK; }
+    if (rc == -1) { return RX_NO_MATCH; }
+    if (rc == -2) { return RX_ERR_LIMIT; }
+    if (rc == -3) { return RX_ERR_UTF; }
+    return RX_ERR_INTERNAL;
+}
+
+fn code_text(code: int): string {
+    if (code == RX_OK)        { return ""; }
+    if (code == RX_NO_MATCH)  { return "no match"; }
+    if (code == RX_ERR_LIMIT) { return "match limit exceeded"; }
+    if (code == RX_ERR_UTF)   { return "subject is not valid UTF-8"; }
+    return "internal regex error";
+}
+
+// PCRE2's own compile-error text. Only ever shown to a human — nothing in this
+// module branches on it, and the fixtures never print it, because upstream
+// rewords these between releases.
+fn errmsg(code: int): string {
+    let cap = 256;
+    let buf = bytes(cap);
+    let n = vre_error_message(code as i32, buf as cstring, cap as i64) as int;
+    if (n < 0) { return "regex compile failed"; }
+    if (n >= cap) {
+        cap = n + 1;
+        buf = bytes(cap);
+        n = vre_error_message(code as i32, buf as cstring, cap as i64) as int;
+    }
+    return strbytes(buf, n);
+}
+
+// One match: the whole match plus every capturing group, resolved to byte
+// offsets into the subject at the moment the match was found. Group text is
+// sliced out of the Vyto string rather than copied back from C, so an embedded
+// NUL survives and no strlen is involved.
+export class Match {
+    ok: bool;
+    code: int;
+    err: string;
+    subject: string;
+    starts: int[];
+    ends: int[];
+    gnames: string[];
+    gnums: int[];
+
+    fn matched(): bool { return this.ok; }
+    fn errorCode(): int { return this.code; }
+    fn error(): string { return this.err; }
+
+    // Number of capturing groups available, not counting the whole match.
+    fn groupCount(): int {
+        if (this.starts.len == 0) { return 0; }
+        return this.starts.len - 1;
+    }
+
+    fn hasGroup(i: int): bool {
+        if (i < 0 || i >= this.starts.len) { return false; }
+        return this.starts[i] >= 0;
+    }
+
+    fn group(i: int): string {
+        if (!this.hasGroup(i)) { return ""; }
+        return this.subject.slice(this.starts[i], this.ends[i]);
+    }
+
+    fn groupStart(i: int): int {
+        if (i < 0 || i >= this.starts.len) { return -1; }
+        return this.starts[i];
+    }
+
+    fn groupEnd(i: int): int {
+        if (i < 0 || i >= this.ends.len) { return -1; }
+        return this.ends[i];
+    }
+
+    // Group 0 — the whole match.
+    fn text(): string { return this.group(0); }
+    fn start(): int { return this.groupStart(0); }
+    fn end(): int { return this.groupEnd(0); }
+
+    // Every group including the whole match at index 0.
+    fn groups(): string[] {
+        let out: string[] = [];
+        let i = 0;
+        while (i < this.starts.len) { out.push(this.group(i)); i += 1; }
+        return out;
+    }
+
+    fn namedIndex(n: string): int {
+        let i = 0;
+        while (i < this.gnames.len) {
+            if (this.gnames[i] == n) { return this.gnums[i]; }
+            i += 1;
+        }
+        return -1;
+    }
+
+    fn hasNamed(n: string): bool {
+        let g = this.namedIndex(n);
+        if (g < 0) { return false; }
+        return this.hasGroup(g);
+    }
+
+    fn named(n: string): string {
+        let g = this.namedIndex(n);
+        if (g < 0) { return ""; }
+        return this.group(g);
+    }
+
+    // Every named group that participated in the match.
+    fn namedGroups(): Map<string, string> {
+        let m = new Map<string, string>();
+        let i = 0;
+        while (i < this.gnames.len) {
+            let g = this.gnums[i];
+            if (this.hasGroup(g)) { m.set(this.gnames[i], this.group(g)); }
+            i += 1;
+        }
+        return m;
+    }
+}
+
+fn failed_match(s: string, code: int): Match {
+    let m = new Match();
+    m.ok = false;
+    m.code = code;
+    m.err = code_text(code);
+    m.subject = s;
+    m.starts = [];
+    m.ends = [];
+    m.gnames = [];
+    m.gnums = [];
+    return m;
+}
+
+// A compiled pattern. Construct once and reuse; compilation is the expensive
+// half. See the module header for what panics and what does not.
+export class Regex {
+    handle: rawptr;
+    pattern: string;
+    err: string;
+    errOffset: int;
+    ngroups: int;
+    gnames: string[];
+    gnums: int[];
+
+    fn init(pattern: string, flags: int) {
+        this.pattern = pattern;
+        this.gnames = [];
+        this.gnums = [];
+        this.errOffset = -1;
+        this.err = "";
+        this.ngroups = 0;
+        this.handle = vre_compile(pattern.cstr(), pattern.len as i64, flags as i32);
+        if (this.handle == null) {
+            this.err = errmsg(vre_last_errcode() as int);
+            this.errOffset = vre_last_erroffset() as int;
+            return;
+        }
+        this.ngroups = vre_group_count(this.handle) as int;
+        let n = vre_name_count(this.handle) as int;
+        let i = 0;
+        while (i < n) {
+            let cap = 64;
+            let buf = bytes(cap);
+            let len = vre_name_at(this.handle, i as i32, buf as cstring, cap as i64) as int;
+            if (len >= cap) {
+                cap = len + 1;
+                buf = bytes(cap);
+                len = vre_name_at(this.handle, i as i32, buf as cstring, cap as i64) as int;
+            }
+            if (len >= 0) {
+                this.gnames.push(strbytes(buf, len));
+                this.gnums.push(vre_name_number(this.handle, i as i32) as int);
+            }
+            i += 1;
+        }
+    }
+
+    deinit { vre_free(this.handle); }
+
+    fn isValid(): bool { return this.handle != null; }
+    fn error(): string { return this.err; }
+    // Byte offset in the pattern where compilation failed, or -1 if it did not.
+    fn errorOffset(): int { return this.errOffset; }
+    fn groupCount(): int { return this.ngroups; }
+    fn names(): string[] { return this.gnames; }
+    fn jitEnabled(): bool { return this.isValid() && (vre_jit_ok(this.handle) as int) != 0; }
+
+    // Raise or lower this pattern's backtracking budget. Pass 0 to leave one
+    // alone. The defaults are RX_DEFAULT_*; they exist so a hostile pattern
+    // fails in bounded time rather than hanging the process.
+    fn setLimits(match: int, depth: int, heapKB: int) {
+        this.ensure();
+        vre_set_limits(this.handle, match as i64, depth as i64, heapKB as i64);
+    }
+
+    fn ensure() {
+        if (this.handle == null) {
+            panic("vyto/regex: match attempted with an invalid pattern: " + this.err);
+        }
+    }
+
+    // Build a Match from the offsets the shim is currently holding. Must be
+    // called before any further match on this handle: the next call, including
+    // a failing one, overwrites the ovector.
+    fn snap(s: string): Match {
+        let m = new Match();
+        m.ok = true;
+        m.code = RX_OK;
+        m.err = "";
+        m.subject = s;
+        m.starts = [];
+        m.ends = [];
+        m.gnames = this.gnames;
+        m.gnums = this.gnums;
+        let pairs = vre_pair_count(this.handle) as int;
+        let i = 0;
+        // Trailing groups that did not participate are absent from the pair
+        // count; report them as unset so group(i) is defined for every i.
+        while (i <= this.ngroups) {
+            if (i < pairs) {
+                m.starts.push(vre_group_start(this.handle, i as i32) as int);
+                m.ends.push(vre_group_end(this.handle, i as i32) as int);
+            } else {
+                m.starts.push(-1);
+                m.ends.push(-1);
+            }
+            i += 1;
+        }
+        return m;
+    }
+
+    fn findFrom(s: string, start: int): Match {
+        this.ensure();
+        let rc = vre_match(this.handle, s.cstr(), s.len as i64,
+                           start as i64, 0 as i32) as int;
+        if (rc > 0) { return this.snap(s); }
+        return failed_match(s, code_of(rc));
+    }
+
+    fn find(s: string): Match { return this.findFrom(s, 0); }
+
+    // A bool has nowhere to carry an error, so a limit hit panics here rather
+    // than being reported as "no match".
+    fn test(s: string): bool {
+        let m = this.find(s);
+        if (m.ok) { return true; }
+        if (m.code == RX_NO_MATCH) { return false; }
+        panic("vyto/regex: test failed: " + m.err);
+    }
+
+    // Every non-overlapping match, left to right.
+    //
+    // The awkward part is a pattern that can match the empty string (a*, \b,
+    // (?=x)): naively retrying at the previous end returns the same empty match
+    // forever. Upstream's fix, which this follows, is to first retry at the
+    // same offset forbidding an empty match there, and only if that fails to
+    // step forward — by a whole character, and over a CRLF pair as one unit.
+    fn findAll(s: string): Match[] {
+        this.ensure();
+        let out: Match[] = [];
+        let pos = 0;
+        let n = s.len;
+        while (pos <= n) {
+            let rc = vre_match(this.handle, s.cstr(), n as i64,
+                               pos as i64, 0 as i32) as int;
+            if (rc <= 0) {
+                let code = code_of(rc);
+                if (code == RX_NO_MATCH) { break; }
+                panic("vyto/regex: findAll failed: " + code_text(code));
+            }
+            let m = this.snap(s);
+            out.push(m);
+            if (m.end() > m.start()) {
+                pos = m.end();
+            } else {
+                // Empty match: retry anchored and non-empty at the same offset.
+                let rc2 = vre_match_next(this.handle, s.cstr(), n as i64,
+                                         m.end() as i64) as int;
+                if (rc2 > 0) {
+                    let m2 = this.snap(s);
+                    out.push(m2);
+                    pos = m2.end();
+                } else {
+                    let code2 = code_of(rc2);
+                    if (code2 != RX_NO_MATCH) {
+                        panic("vyto/regex: findAll failed: " + code_text(code2));
+                    }
+                    pos = vre_advance(this.handle, s.cstr(), n as i64,
+                                      m.end() as i64) as int;
+                }
+            }
+        }
+        return out;
+    }
+
+    fn subst(s: string, repl: string, sflags: int): string {
+        this.ensure();
+        // First guess: the subject plus room for the replacement to grow every
+        // match. One retry after that is exact, because the shim returns the
+        // full length needed.
+        let cap = s.len + repl.len * 4 + 64;
+        let buf = bytes(cap);
+        let n = vre_substitute(this.handle, s.cstr(), s.len as i64,
+                               repl.cstr(), repl.len as i64, sflags as i32,
+                               buf as cstring, cap as i64) as int;
+        if (n >= cap) {
+            cap = n + 1;
+            buf = bytes(cap);
+            n = vre_substitute(this.handle, s.cstr(), s.len as i64,
+                               repl.cstr(), repl.len as i64, sflags as i32,
+                               buf as cstring, cap as i64) as int;
+        }
+        if (n < 0) {
+            panic("vyto/regex: replace failed: " + code_text(code_of(n)));
+        }
+        return strbytes(buf, n);
+    }
+
+    // Replacement syntax is PCRE2's: $1, ${name}, $$ for a literal dollar.
+    fn replace(s: string, repl: string): string {
+        return this.subst(s, repl, 0);
+    }
+    fn replaceAll(s: string, repl: string): string {
+        return this.subst(s, repl, RX_SUB_GLOBAL);
+    }
+    fn replaceAllExt(s: string, repl: string, sflags: int): string {
+        return this.subst(s, repl, RX_SUB_GLOBAL | sflags);
+    }
+
+    // Split on every match. limit <= 0 means no limit; otherwise at most
+    // `limit` pieces, the last holding the unsplit remainder.
+    fn splitN(s: string, limit: int): string[] {
+        this.ensure();
+        let out: string[] = [];
+        let ms = this.findAll(s);
+        let prev = 0;
+        let i = 0;
+        while (i < ms.len) {
+            if (limit > 0 && out.len == limit - 1) { break; }
+            let m = ms[i];
+            // A zero-width match at the current cut point would emit an empty
+            // piece for every position; skip it, as every other language does.
+            if (m.end() > m.start() || m.start() > prev) {
+                out.push(s.slice(prev, m.start()));
+                prev = m.end();
+            }
+            i += 1;
+        }
+        out.push(s.slice(prev, s.len));
+        return out;
+    }
+
+    fn split(s: string): string[] { return this.splitN(s, 0); }
+}
+
+// ---- the cached convenience path ----------------------------------------
+//
+// These compile through a 64-entry process-local cache keyed on (pattern,
+// flags), so a pattern used in a loop is compiled once without the caller
+// holding a Regex. The cache owns its compiled patterns and never hands one
+// out, which is why these are free functions rather than a memoising
+// constructor. Cleared only by rx_cache_clear().
+//
+// A pattern that will not compile panics here: there is no Regex to carry the
+// sentinel, and these entry points exist for literal patterns written in the
+// source, where a bad pattern is a bug rather than data.
+
+fn cached_snap(s: string): Match {
+    let m = new Match();
+    m.ok = true;
+    m.code = RX_OK;
+    m.err = "";
+    m.subject = s;
+    m.starts = [];
+    m.ends = [];
+    m.gnames = [];
+    m.gnums = [];
+    let pairs = vre_cached_pair_count() as int;
+    let ng = vre_cached_group_count() as int;
+    let i = 0;
+    while (i <= ng) {
+        if (i < pairs) {
+            m.starts.push(vre_cached_group_start(i as i32) as int);
+            m.ends.push(vre_cached_group_end(i as i32) as int);
+        } else {
+            m.starts.push(-1);
+            m.ends.push(-1);
+        }
+        i += 1;
+    }
+    let n = vre_cached_name_count() as int;
+    let j = 0;
+    while (j < n) {
+        let cap = 64;
+        let buf = bytes(cap);
+        let len = vre_cached_name_at(j as i32, buf as cstring, cap as i64) as int;
+        if (len >= cap) {
+            cap = len + 1;
+            buf = bytes(cap);
+            len = vre_cached_name_at(j as i32, buf as cstring, cap as i64) as int;
+        }
+        if (len >= 0) {
+            m.gnames.push(strbytes(buf, len));
+            m.gnums.push(vre_cached_name_number(j as i32) as int);
+        }
+        j += 1;
+    }
+    return m;
+}
+
+export fn rx_find(pattern: string, s: string): Match {
+    let rc = vre_cached_find(pattern.cstr(), pattern.len as i64, 0 as i32,
+                             s.cstr(), s.len as i64, 0 as i64) as int;
+    if (rc > 0) { return cached_snap(s); }
+    let code = code_of(rc);
+    if (code == RX_ERR_INTERNAL) {
+        panic("vyto/regex: bad pattern '" + pattern + "': " +
+              errmsg(vre_last_errcode() as int));
+    }
+    return failed_match(s, code);
+}
+
+export fn rx_test(pattern: string, s: string): bool {
+    let m = rx_find(pattern, s);
+    if (m.ok) { return true; }
+    if (m.code == RX_NO_MATCH) { return false; }
+    panic("vyto/regex: test failed: " + m.err);
+}
+
+export fn rx_replace_all(pattern: string, s: string, repl: string): string {
+    let cap = s.len + repl.len * 4 + 64;
+    let buf = bytes(cap);
+    let n = vre_cached_substitute(pattern.cstr(), pattern.len as i64, 0 as i32,
+                                  s.cstr(), s.len as i64, repl.cstr(),
+                                  repl.len as i64, RX_SUB_GLOBAL as i32,
+                                  buf as cstring, cap as i64) as int;
+    if (n >= cap) {
+        cap = n + 1;
+        buf = bytes(cap);
+        n = vre_cached_substitute(pattern.cstr(), pattern.len as i64, 0 as i32,
+                                  s.cstr(), s.len as i64, repl.cstr(),
+                                  repl.len as i64, RX_SUB_GLOBAL as i32,
+                                  buf as cstring, cap as i64) as int;
+    }
+    if (n < 0) {
+        panic("vyto/regex: replace failed for '" + pattern + "'");
+    }
+    return strbytes(buf, n);
+}
+
+export fn rx_split(pattern: string, s: string): string[] {
+    let re = new Regex(pattern, 0);
+    if (!re.isValid()) {
+        panic("vyto/regex: bad pattern '" + pattern + "': " + re.error());
+    }
+    return re.split(s);
+}
+
+export fn rx_cache_clear() { vre_cache_clear(); }
+export fn rx_cache_count(): int { return vre_cache_count() as int; }
+
+// 1 if this build of PCRE2 has JIT support compiled in at all. jitEnabled() on
+// a Regex is the one that says whether this pattern is actually JIT'd.
+export fn rx_jit_available(): bool { return (vre_config_jit() as int) != 0; }
