@@ -336,6 +336,58 @@ long vre_advance(void *vh, const char *subj, long len, long pos)
     return pos + 1;
 }
 
+/* Count matches without building anything.
+ *
+ * This exists in C rather than as findAll(s).len on the Vyto side for one
+ * reason: allocation. Counting through findAll allocates a Match object and
+ * four arrays per hit, which for a scan over a large log is the whole cost.
+ * Here the loop touches no memory at all.
+ *
+ * The stepping below is the same three-step protocol vre_match /
+ * vre_match_next / vre_advance implement, deliberately spelled out against the
+ * same helpers rather than reimplemented: if the two ever diverge, count() and
+ * findAll().len would disagree on any pattern that can match empty (a*, \b,
+ * (?=x)), which is exactly the kind of bug nobody finds for a year. */
+static long count_in(VRe *h, const char *subj, long len)
+{
+    long pos = 0, n = 0;
+    PCRE2_SIZE *ov;
+
+    if (h == NULL) return VRE_INTERNAL;
+
+    while (pos <= len) {
+        long s, e;
+        int rc = match_at(h, subj, len, pos, 0);
+        if (rc == VRE_NOMATCH) break;
+        if (rc < 0) return rc;                  /* limit / bad UTF-8 / internal */
+
+        ov = pcre2_get_ovector_pointer(h->md);
+        s = (long)ov[0];
+        e = (long)ov[1];
+        n++;
+
+        if (e > s) { pos = e; continue; }
+
+        /* Empty match: retry anchored and non-empty at the same offset, and
+           only then step forward by a whole character. */
+        rc = match_at(h, subj, len, e, PCRE2_NOTEMPTY_ATSTART | PCRE2_ANCHORED);
+        if (rc > 0) {
+            ov = pcre2_get_ovector_pointer(h->md);
+            n++;
+            pos = (long)ov[1];
+            continue;
+        }
+        if (rc < 0 && rc != VRE_NOMATCH) return rc;
+        pos = vre_advance(h, subj, len, e);
+    }
+    return n;
+}
+
+long vre_count(void *vh, const char *subj, long len)
+{
+    return count_in((VRe *)vh, subj, len);
+}
+
 /* Group offsets come out of the match data, which the *next* match overwrites —
    including a failed one. Read every group you want before calling vre_match,
    vre_match_next or vre_advance again. The Vyto side builds a whole Match up
@@ -586,4 +638,13 @@ long vre_cached_substitute(const char *pat, long patlen, int flags,
     g_cache_last = h;
     if (h == NULL) return -1;
     return vre_substitute(h, subj, slen, repl, rlen, sflags, out, cap);
+}
+
+long vre_cached_count(const char *pat, long patlen, int flags,
+                      const char *subj, long len)
+{
+    VRe *h = cache_get(pat, patlen, flags);
+    g_cache_last = h;
+    if (h == NULL) return VRE_INTERNAL;
+    return count_in(h, subj, len);
 }

@@ -69,6 +69,26 @@ export const RX_DEFAULT_MATCH_LIMIT: int = 1000000;
 export const RX_DEFAULT_DEPTH_LIMIT: int = 10000;
 export const RX_DEFAULT_HEAP_KB:     int = 16384;
 
+// ---- ready-made patterns --------------------------------------------------
+//
+// Only two, and the omissions are deliberate: UUID, URL, ISO-date and numbers
+// all already have hand-written validators that beat a regex on both accuracy
+// and error reporting. Use `uuid_is_valid` (vyto/util/uuid), `url_is_valid`
+// (vyto/util/url), `date_parse` + `date_is_valid` (vyto/util/date), and
+// `parse_int` / `parse_float` (vyto/cli) instead.
+
+// A deliberately permissive email shape. LOOSE is not decoration — see
+// rx_is_email_loose for exactly what it does and does not accept. Dot is
+// excluded from the domain classes so no two parts can match the same byte,
+// which is what keeps it linear and ReDoS-free.
+export const RX_P_EMAIL_LOOSE: string = "[^@\\s]+@[^@\\s.]+(?:\\.[^@\\s.]+)+";
+
+// Dotted-quad IPv4 with real 0-255 range checking, so "999.1.1.1" is rejected
+// where the usual \d{1,3} version accepts it. Leading zeros are rejected too:
+// "01.2.3.4" is read as octal by some resolvers and is a spoofing vector.
+export const RX_P_IPV4: string =
+    "(?:(?:25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)\\.){3}(?:25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)";
+
 extern "C" {
     fn vre_compile(pat: cstring, patlen: i64, flags: i32): rawptr;
     fn vre_free(h: rawptr);
@@ -93,6 +113,9 @@ extern "C" {
 
     fn vre_substitute(h: rawptr, subj: cstring, slen: i64, repl: cstring,
                       rlen: i64, flags: i32, out: cstring, cap: i64): i64;
+    fn vre_count(h: rawptr, subj: cstring, len: i64): i64;
+    fn vre_cached_count(pat: cstring, patlen: i64, flags: i32,
+                        subj: cstring, len: i64): i64;
 
     fn vre_cached_find(pat: cstring, patlen: i64, flags: i32,
                        subj: cstring, len: i64, start: i64): i32;
@@ -261,9 +284,16 @@ export class Regex {
     ngroups: int;
     gnames: string[];
     gnums: int[];
+    flags: int;
+    // A second compile of \A(?:pattern)\z, built on first use by fullMatch and
+    // freed alongside the main one. Most patterns never need it, so it stays
+    // null until someone asks.
+    fullHandle: rawptr;
 
     fn init(pattern: string, flags: int) {
         this.pattern = pattern;
+        this.flags = flags;
+        this.fullHandle = null;
         this.gnames = [];
         this.gnums = [];
         this.errOffset = -1;
@@ -295,7 +325,10 @@ export class Regex {
         }
     }
 
-    deinit { vre_free(this.handle); }
+    deinit {
+        vre_free(this.handle);
+        vre_free(this.fullHandle);      // the shim no-ops on null
+    }
 
     fn isValid(): bool { return this.handle != null; }
     fn error(): string { return this.err; }
@@ -471,6 +504,320 @@ export class Regex {
     }
 
     fn split(s: string): string[] { return this.splitN(s, 0); }
+
+    // ---- convenience layer -----------------------------------------------
+
+    // Flattened [start0, end0, start1, end1, ...] for capture group `g` across
+    // every match; g == 0 is the whole match. Matches where the group did not
+    // participate are skipped, so the result can be shorter than the match
+    // count.
+    //
+    // This is the second of the two match-walking loops in this file (findAll
+    // is the other) and it steps identically: on a zero-width match, retry
+    // anchored and non-empty at the same offset, else advance a whole
+    // character. If the two ever diverge, findAllText and findAll disagree on
+    // patterns like a* — the fixture asserts they don't.
+    fn spans(s: string, g: int): int[] {
+        this.ensure();
+        let out: int[] = [];
+        let pos = 0;
+        let n = s.len;
+        while (pos <= n) {
+            let rc = vre_match(this.handle, s.cstr(), n as i64, pos as i64, 0 as i32) as int;
+            if (rc <= 0) {
+                let code = code_of(rc);
+                if (code == RX_NO_MATCH) { break; }
+                panic("vyto/regex: scan failed: " + code_text(code));
+            }
+            let ws = vre_group_start(this.handle, 0 as i32) as int;
+            let we = vre_group_end(this.handle, 0 as i32) as int;
+            if (g == 0) {
+                out.push(ws);
+                out.push(we);
+            } else {
+                let pairs = vre_pair_count(this.handle) as int;
+                if (g < pairs) {
+                    let gs = vre_group_start(this.handle, g as i32) as int;
+                    let ge = vre_group_end(this.handle, g as i32) as int;
+                    if (gs >= 0) { out.push(gs); out.push(ge); }
+                }
+            }
+            if (we > ws) {
+                pos = we;
+            } else {
+                let rc2 = vre_match_next(this.handle, s.cstr(), n as i64, we as i64) as int;
+                if (rc2 > 0) {
+                    let ws2 = vre_group_start(this.handle, 0 as i32) as int;
+                    let we2 = vre_group_end(this.handle, 0 as i32) as int;
+                    if (g == 0) {
+                        out.push(ws2);
+                        out.push(we2);
+                    } else {
+                        let pairs2 = vre_pair_count(this.handle) as int;
+                        if (g < pairs2) {
+                            let gs2 = vre_group_start(this.handle, g as i32) as int;
+                            let ge2 = vre_group_end(this.handle, g as i32) as int;
+                            if (gs2 >= 0) { out.push(gs2); out.push(ge2); }
+                        }
+                    }
+                    pos = we2;
+                } else {
+                    let code2 = code_of(rc2);
+                    if (code2 != RX_NO_MATCH) {
+                        panic("vyto/regex: scan failed: " + code_text(code2));
+                    }
+                    pos = vre_advance(this.handle, s.cstr(), n as i64, we as i64) as int;
+                }
+            }
+        }
+        return out;
+    }
+
+    // Every match's text. Cheaper than findAll when you only want the strings:
+    // it slices straight out of the subject and never builds a Match.
+    fn findAllText(s: string): string[] {
+        let sp = this.spans(s, 0);
+        let out: string[] = [];
+        let i = 0;
+        while (i < sp.len) { out.push(s.slice(sp[i], sp[i + 1])); i += 2; }
+        return out;
+    }
+
+    // Capture group `i` across every match, skipping matches where it did not
+    // participate. "Every request id in this log" is one call.
+    fn findAllGroup(s: string, i: int): string[] {
+        let sp = this.spans(s, i);
+        let out: string[] = [];
+        let k = 0;
+        while (k < sp.len) { out.push(s.slice(sp[k], sp[k + 1])); k += 2; }
+        return out;
+    }
+
+    // How many matches, without building any of them. Counted in C with no
+    // allocation at all, which is the point.
+    fn count(s: string): int {
+        this.ensure();
+        let n = vre_count(this.handle, s.cstr(), s.len as i64) as int;
+        if (n < 0) {
+            panic("vyto/regex: count failed: " + code_text(code_of(n)));
+        }
+        return n;
+    }
+
+    // Does the pattern match the WHOLE subject?
+    //
+    // Not the same as `find(s).start() == 0 && end() == s.len`: matching is
+    // leftmost-first, so "a|ab" against "ab" finds "a" and that test would say
+    // no even though the whole string can be matched. The only correct way is
+    // to anchor both ends, so this compiles \A(?:pattern)\z once, on demand.
+    //
+    // \A and \z are used rather than ^ and $ deliberately: they are absolute,
+    // so the answer does not change under RX_MULTILINE and does not fall for
+    // $'s "also matches before a final newline" rule — which is the exact bug
+    // this method exists to avoid. (?:) keeps group numbering intact.
+    fn fullMatch(s: string): bool {
+        this.ensure();
+        if (this.fullHandle == null) {
+            let wrapped = "\\A(?:" + this.pattern + ")\\z";
+            this.fullHandle = vre_compile(wrapped.cstr(), wrapped.len as i64,
+                                          this.flags as i32);
+            if (this.fullHandle == null) {
+                panic("vyto/regex: cannot anchor pattern '" + this.pattern + "'");
+            }
+        }
+        let rc = vre_match(this.fullHandle, s.cstr(), s.len as i64,
+                           0 as i64, 0 as i32) as int;
+        if (rc > 0) { return true; }
+        let code = code_of(rc);
+        if (code == RX_NO_MATCH) { return false; }
+        panic("vyto/regex: fullMatch failed: " + code_text(code));
+    }
+
+    // First match's text, or `fallback` when there is none. Saves the
+    // matched() dance for the common "read it or use a default" case.
+    fn findOr(s: string, fallback: string): string {
+        let m = this.find(s);
+        if (m.matched()) { return m.text(); }
+        if (m.errorCode() != RX_NO_MATCH) {
+            panic("vyto/regex: findOr failed: " + m.error());
+        }
+        return fallback;
+    }
+
+    // Byte offset of the first / last match, or -1. Twins of the built-in
+    // string index_of / last_index_of.
+    fn indexOf(s: string): int {
+        let m = this.find(s);
+        if (m.matched()) { return m.start(); }
+        return -1;
+    }
+
+    fn lastIndexOf(s: string): int {
+        let sp = this.spans(s, 0);
+        if (sp.len == 0) { return -1; }
+        return sp[sp.len - 2];
+    }
+
+    // Call `f` once per match, without materialising the array.
+    fn each(s: string, f: fn(Match)) {
+        let ms = this.findAll(s);
+        let i = 0;
+        while (i < ms.len) { f(ms[i]); i += 1; }
+    }
+
+    // Replace every match with whatever `f` returns for it.
+    //
+    // The closure must be assigned to a typed target before the call — an
+    // inline arrow cannot be type-inferred here — and it cannot capture `this`,
+    // so it cannot be written inside a method that needs instance state. Both
+    // are v0.1 language limits, not choices this module made.
+    fn replaceFn(s: string, f: fn(Match): string): string {
+        let ms = this.findAll(s);
+        let parts: string[] = [];
+        let prev = 0;
+        let i = 0;
+        while (i < ms.len) {
+            let m = ms[i];
+            parts.push(s.slice(prev, m.start()));
+            parts.push(f(m));
+            prev = m.end();
+            i += 1;
+        }
+        parts.push(s.slice(prev, s.len));
+        return parts.join("");
+    }
+
+    // Replace at most the first `n` matches. n <= 0 changes nothing.
+    fn replaceN(s: string, repl: string, n: int): string {
+        if (n <= 0) { return s; }
+        let ms = this.findAll(s);
+        let parts: string[] = [];
+        let prev = 0;
+        let i = 0;
+        while (i < ms.len && i < n) {
+            let m = ms[i];
+            parts.push(s.slice(prev, m.start()));
+            parts.push(this.expand(m, repl));
+            prev = m.end();
+            i += 1;
+        }
+        parts.push(s.slice(prev, s.len));
+        return parts.join("");
+    }
+
+    // [before, match, after]. No match gives [s, "", ""], so the result always
+    // has exactly three elements and rejoining them always reproduces `s`.
+    fn partition(s: string): string[] {
+        let m = this.find(s);
+        let out: string[] = [];
+        if (!m.matched()) {
+            if (m.errorCode() != RX_NO_MATCH) {
+                panic("vyto/regex: partition failed: " + m.error());
+            }
+            out.push(s);
+            out.push("");
+            out.push("");
+            return out;
+        }
+        out.push(s.slice(0, m.start()));
+        out.push(m.text());
+        out.push(s.slice(m.end(), s.len));
+        return out;
+    }
+
+    // Split keeping the delimiters: text, delimiter, text, delimiter, ... The
+    // result always starts and ends with a (possibly empty) text piece, so
+    // joining it reproduces the subject exactly.
+    fn splitKeep(s: string): string[] {
+        let sp = this.spans(s, 0);
+        let out: string[] = [];
+        let prev = 0;
+        let i = 0;
+        while (i < sp.len) {
+            let ms = sp[i];
+            let me = sp[i + 1];
+            if (me > ms) {
+                out.push(s.slice(prev, ms));
+                out.push(s.slice(ms, me));
+                prev = me;
+            }
+            i += 2;
+        }
+        out.push(s.slice(prev, s.len));
+        return out;
+    }
+
+    // Strip one leading and one trailing match. Anything in the middle stays.
+    fn trim(s: string): string {
+        let lo = 0;
+        let hi = s.len;
+        let head = this.find(s);
+        if (head.matched() && head.start() == 0 && head.end() > 0) {
+            lo = head.end();
+        }
+        let sp = this.spans(s, 0);
+        if (sp.len >= 2) {
+            let ls = sp[sp.len - 2];
+            let le = sp[sp.len - 1];
+            if (le == s.len && ls >= lo && le > ls) { hi = ls; }
+        }
+        if (hi < lo) { return ""; }
+        return s.slice(lo, hi);
+    }
+
+    // Apply a $1 / ${name} / $$ template to a Match that has already been
+    // found, without matching again. This is the same substitution syntax
+    // replace() uses, evaluated in Vyto rather than by PCRE2.
+    fn expand(m: Match, template: string): string {
+        if (!m.matched()) { panic("vyto/regex: expand on a failed match"); }
+        let parts: string[] = [];
+        let i = 0;
+        let run = 0;
+        while (i < template.len) {
+            if (template[i] != 36) { i += 1; continue; }      // '$'
+            parts.push(template.slice(run, i));
+            if (i + 1 >= template.len) { run = i; i += 1; break; }
+            let c = template[i + 1];
+            if (c == 36) {                                    // "$$" -> "$"
+                parts.push("$");
+                i += 2;
+            } else if (c == 123) {                            // "${name}"
+                let close = index_of_at(template, 125, i + 2);
+                if (close < 0) { run = i; i += 1; break; }
+                parts.push(m.named(template.slice(i + 2, close)));
+                i = close + 1;
+            } else if (c >= 48 && c <= 57) {                  // "$1", "$12"
+                let j = i + 1;
+                let num = 0;
+                while (j < template.len && template[j] >= 48 && template[j] <= 57) {
+                    num = num * 10 + (template[j] - 48);
+                    j += 1;
+                }
+                parts.push(m.group(num));
+                i = j;
+            } else {
+                // "$" followed by anything else is a literal dollar; the next
+                // character is ordinary text and gets picked up by the run.
+                parts.push("$");
+                i += 1;
+            }
+            run = i;
+        }
+        parts.push(template.slice(run, template.len));
+        return parts.join("");
+    }
+}
+
+// First index of byte `b` at or after `at`, or -1. Local to expand(); the
+// public equivalent is index_of_from in vyto/util/text, which this module does
+// not import in order to stay dependency-free.
+fn index_of_at(s: string, b: int, at: int): int {
+    let i = at;
+    while (i < s.len) {
+        if (s[i] == b) { return i; }
+        i += 1;
+    }
+    return -1;
 }
 
 // ---- the cached convenience path ----------------------------------------
@@ -528,8 +875,13 @@ fn cached_snap(s: string): Match {
     return m;
 }
 
-export fn rx_find(pattern: string, s: string): Match {
-    let rc = vre_cached_find(pattern.cstr(), pattern.len as i64, 0 as i32,
+// Every rx_* function takes a trailing `flags` that defaults to 0, so the
+// RX_CASELESS / RX_MULTILINE / RX_BYTES family works on the cached path too.
+// The flags are part of the cache key, so the same pattern under two flag sets
+// occupies two slots rather than colliding.
+
+export fn rx_find(pattern: string, s: string, flags: int = 0): Match {
+    let rc = vre_cached_find(pattern.cstr(), pattern.len as i64, flags as i32,
                              s.cstr(), s.len as i64, 0 as i64) as int;
     if (rc > 0) { return cached_snap(s); }
     let code = code_of(rc);
@@ -540,26 +892,27 @@ export fn rx_find(pattern: string, s: string): Match {
     return failed_match(s, code);
 }
 
-export fn rx_test(pattern: string, s: string): bool {
-    let m = rx_find(pattern, s);
+export fn rx_test(pattern: string, s: string, flags: int = 0): bool {
+    let m = rx_find(pattern, s, flags);
     if (m.ok) { return true; }
     if (m.code == RX_NO_MATCH) { return false; }
     panic("vyto/regex: test failed: " + m.err);
 }
 
-export fn rx_replace_all(pattern: string, s: string, repl: string): string {
+fn cached_subst(pattern: string, s: string, repl: string,
+                flags: int, sflags: int): string {
     let cap = s.len + repl.len * 4 + 64;
     let buf = bytes(cap);
-    let n = vre_cached_substitute(pattern.cstr(), pattern.len as i64, 0 as i32,
+    let n = vre_cached_substitute(pattern.cstr(), pattern.len as i64, flags as i32,
                                   s.cstr(), s.len as i64, repl.cstr(),
-                                  repl.len as i64, RX_SUB_GLOBAL as i32,
+                                  repl.len as i64, sflags as i32,
                                   buf as cstring, cap as i64) as int;
     if (n >= cap) {
         cap = n + 1;
         buf = bytes(cap);
-        n = vre_cached_substitute(pattern.cstr(), pattern.len as i64, 0 as i32,
+        n = vre_cached_substitute(pattern.cstr(), pattern.len as i64, flags as i32,
                                   s.cstr(), s.len as i64, repl.cstr(),
-                                  repl.len as i64, RX_SUB_GLOBAL as i32,
+                                  repl.len as i64, sflags as i32,
                                   buf as cstring, cap as i64) as int;
     }
     if (n < 0) {
@@ -568,16 +921,313 @@ export fn rx_replace_all(pattern: string, s: string, repl: string): string {
     return strbytes(buf, n);
 }
 
-export fn rx_split(pattern: string, s: string): string[] {
-    let re = new Regex(pattern, 0);
-    if (!re.isValid()) {
-        panic("vyto/regex: bad pattern '" + pattern + "': " + re.error());
-    }
-    return re.split(s);
+export fn rx_replace_all(pattern: string, s: string, repl: string,
+                         flags: int = 0): string {
+    return cached_subst(pattern, s, repl, flags, RX_SUB_GLOBAL);
+}
+
+// First match only. Twin of replace_first in vyto/util/text, which does the
+// same job for a literal.
+export fn rx_replace_first(pattern: string, s: string, repl: string,
+                           flags: int = 0): string {
+    return cached_subst(pattern, s, repl, flags, 0);
+}
+
+export fn rx_split(pattern: string, s: string, flags: int = 0): string[] {
+    return cached_regex(pattern, flags).split(s);
 }
 
 export fn rx_cache_clear() { vre_cache_clear(); }
 export fn rx_cache_count(): int { return vre_cache_count() as int; }
+
+// ---- Tier 1: the one-liners ----------------------------------------------
+//
+// Most of these go through the C cache and never compile anything twice.
+// rx_grep and rx_split are the exceptions: they need a Regex object because
+// they test or split many times per call, and the C cache owns its compiled
+// patterns and never hands one out. They pay one pcre2_compile per call, which
+// is amortised over every line or piece. If that shows up in a profile, hold a
+// Regex instead — which is what it is for.
+fn cached_regex(pattern: string, flags: int): Regex {
+    let re = new Regex(pattern, flags);
+    if (!re.isValid()) {
+        panic("vyto/regex: bad pattern '" + pattern + "': " + re.error());
+    }
+    return re;
+}
+
+// The cached walker: flattened [start, end, ...] for group `g` over every
+// match, without compiling anything the cache already holds.
+//
+// This is the third and last match-walking loop in this file — Regex.findAll
+// and Regex.spans are the others — and all three step identically: on a
+// zero-width match, retry anchored and non-empty at the same offset, else
+// advance a whole character. They must agree or count() and findAll() disagree
+// on patterns like a*; tests/fixtures/regex_extra.vt asserts it.
+//
+// Safe against cache eviction because every call in the loop passes the same
+// (pattern, flags), so cache_get returns the same slot each time and nothing
+// else can run in between — Vyto has no threads.
+fn cached_spans(pattern: string, s: string, flags: int, g: int): int[] {
+    let out: int[] = [];
+    let pos = 0;
+    let n = s.len;
+    while (pos <= n) {
+        let rc = vre_cached_find(pattern.cstr(), pattern.len as i64, flags as i32,
+                                 s.cstr(), n as i64, pos as i64) as int;
+        if (rc <= 0) {
+            let code = code_of(rc);
+            if (code == RX_NO_MATCH) { break; }
+            if (code == RX_ERR_INTERNAL) {
+                panic("vyto/regex: bad pattern '" + pattern + "': " +
+                      errmsg(vre_last_errcode() as int));
+            }
+            panic("vyto/regex: scan failed: " + code_text(code));
+        }
+        let ws = vre_cached_group_start(0 as i32) as int;
+        let we = vre_cached_group_end(0 as i32) as int;
+        push_span(out, g, ws, we);
+        if (we > ws) {
+            pos = we;
+        } else {
+            let rc2 = vre_cached_next(pattern.cstr(), pattern.len as i64,
+                                      flags as i32, s.cstr(), n as i64,
+                                      we as i64) as int;
+            if (rc2 > 0) {
+                let ws2 = vre_cached_group_start(0 as i32) as int;
+                let we2 = vre_cached_group_end(0 as i32) as int;
+                push_span(out, g, ws2, we2);
+                pos = we2;
+            } else {
+                let code2 = code_of(rc2);
+                if (code2 != RX_NO_MATCH) {
+                    panic("vyto/regex: scan failed: " + code_text(code2));
+                }
+                pos = vre_cached_advance(s.cstr(), n as i64, we as i64) as int;
+            }
+        }
+    }
+    return out;
+}
+
+// Append the span for group `g` of the match the cache is currently holding.
+// Group 0 is the whole match and always participates; a higher group may not,
+// in which case the match contributes nothing.
+fn push_span(out: int[], g: int, ws: int, we: int) {
+    if (g == 0) {
+        out.push(ws);
+        out.push(we);
+        return;
+    }
+    if (g >= (vre_cached_pair_count() as int)) { return; }
+    let gs = vre_cached_group_start(g as i32) as int;
+    if (gs < 0) { return; }
+    out.push(gs);
+    out.push(vre_cached_group_end(g as i32) as int);
+}
+
+fn slice_spans(s: string, sp: int[]): string[] {
+    let out: string[] = [];
+    let i = 0;
+    while (i < sp.len) { out.push(s.slice(sp[i], sp[i + 1])); i += 2; }
+    return out;
+}
+
+// Every match's text.
+export fn rx_find_all(pattern: string, s: string, flags: int = 0): string[] {
+    return slice_spans(s, cached_spans(pattern, s, flags, 0));
+}
+
+// Capture group `i` from every match.
+export fn rx_find_all_group(pattern: string, s: string, i: int,
+                            flags: int = 0): string[] {
+    return slice_spans(s, cached_spans(pattern, s, flags, i));
+}
+
+// How many matches. Counted in C with no allocation.
+export fn rx_count(pattern: string, s: string, flags: int = 0): int {
+    let n = vre_cached_count(pattern.cstr(), pattern.len as i64, flags as i32,
+                             s.cstr(), s.len as i64) as int;
+    if (n == -4) {
+        panic("vyto/regex: bad pattern '" + pattern + "': " +
+              errmsg(vre_last_errcode() as int));
+    }
+    if (n < 0) {
+        panic("vyto/regex: count failed: " + code_text(code_of(n)));
+    }
+    return n;
+}
+
+// The lines of `s` that match, and the lines that do not. `lines()` handles
+// CRLF and drops the trailing empty piece, so both round-trip cleanly.
+export fn rx_grep(pattern: string, s: string, flags: int = 0): string[] {
+    let re = cached_regex(pattern, flags);
+    let out: string[] = [];
+    for (let line in s.lines()) {
+        if (re.test(line)) { out.push(line); }
+    }
+    return out;
+}
+
+export fn rx_grep_v(pattern: string, s: string, flags: int = 0): string[] {
+    let re = cached_regex(pattern, flags);
+    let out: string[] = [];
+    for (let line in s.lines()) {
+        if (!re.test(line)) { out.push(line); }
+    }
+    return out;
+}
+
+// Escape a literal so it can be dropped into a pattern and mean itself.
+//
+// Use this on ANY substring that came from outside the program. Without it a
+// user typing "a.*b" into a search box gets a wildcard, and a user typing
+// "(a+)+$" gets a denial of service.
+//
+// Over-escaping is harmless and under-escaping is a bug, so the set is
+// deliberately wide. NUL cannot survive as a literal pattern byte and becomes
+// \x00.
+export fn rx_quote(s: string): string {
+    let parts: string[] = [];
+    let run = 0;
+    let i = 0;
+    while (i < s.len) {
+        let c = s[i];
+        let special = c == 92 || c == 46 || c == 94 || c == 36 || c == 124 ||
+                      c == 63 || c == 42 || c == 43 || c == 40 || c == 41 ||
+                      c == 91 || c == 93 || c == 123 || c == 125;
+        if (special) {
+            parts.push(s.slice(run, i));
+            parts.push("\\");
+            parts.push(s.slice(i, i + 1));
+            run = i + 1;
+        } else if (c == 0) {
+            parts.push(s.slice(run, i));
+            parts.push("\\x00");
+            run = i + 1;
+        }
+        i += 1;
+    }
+    parts.push(s.slice(run, s.len));
+    return parts.join("");
+}
+
+// Does the pattern match the whole subject? See Regex.fullMatch for why this
+// is not the same as checking the offsets of find().
+export fn rx_full_match(pattern: string, s: string, flags: int = 0): bool {
+    let wrapped = "\\A(?:" + pattern + ")\\z";
+    return rx_test(wrapped, s, flags);
+}
+
+// First match's text, or `fallback`.
+export fn rx_find_or(pattern: string, s: string, fallback: string,
+                     flags: int = 0): string {
+    let m = rx_find(pattern, s, flags);
+    if (m.matched()) { return m.text(); }
+    return fallback;
+}
+
+// One capture group from the first match; "" if it did not match or the group
+// did not participate.
+export fn rx_group(pattern: string, s: string, i: int, flags: int = 0): string {
+    let m = rx_find(pattern, s, flags);
+    if (!m.matched()) { return ""; }
+    return m.group(i);
+}
+
+export fn rx_named(pattern: string, s: string, name: string,
+                   flags: int = 0): string {
+    let m = rx_find(pattern, s, flags);
+    if (!m.matched()) { return ""; }
+    return m.named(name);
+}
+
+// ---- Tier 2: offsets, trimming, splitting --------------------------------
+
+// Byte offset of the first / last match, or -1. Twins of the built-in string
+// index_of and last_index_of.
+export fn rx_index_of(pattern: string, s: string, flags: int = 0): int {
+    let m = rx_find(pattern, s, flags);
+    if (m.matched()) { return m.start(); }
+    return -1;
+}
+
+export fn rx_last_index_of(pattern: string, s: string, flags: int = 0): int {
+    let sp = cached_spans(pattern, s, flags, 0);
+    if (sp.len == 0) { return -1; }
+    return sp[sp.len - 2];
+}
+
+// Strip one leading and one trailing match.
+export fn rx_trim(pattern: string, s: string, flags: int = 0): string {
+    let sp = cached_spans(pattern, s, flags, 0);
+    let lo = 0;
+    let hi = s.len;
+    if (sp.len >= 2 && sp[0] == 0 && sp[1] > 0) { lo = sp[1]; }
+    if (sp.len >= 2) {
+        let ls = sp[sp.len - 2];
+        let le = sp[sp.len - 1];
+        if (le == s.len && ls >= lo && le > ls) { hi = ls; }
+    }
+    if (hi < lo) { return ""; }
+    return s.slice(lo, hi);
+}
+
+// Drop a leading / trailing match if there is one. Twins of strip_prefix and
+// strip_suffix in vyto/util/text.
+export fn rx_strip_prefix(pattern: string, s: string, flags: int = 0): string {
+    let m = rx_find(pattern, s, flags);
+    if (m.matched() && m.start() == 0 && m.end() > 0) {
+        return s.slice(m.end(), s.len);
+    }
+    return s;
+}
+
+export fn rx_strip_suffix(pattern: string, s: string, flags: int = 0): string {
+    let sp = cached_spans(pattern, s, flags, 0);
+    if (sp.len >= 2) {
+        let ls = sp[sp.len - 2];
+        let le = sp[sp.len - 1];
+        if (le == s.len && le > ls) { return s.slice(0, ls); }
+    }
+    return s;
+}
+
+// ---- Tier 3: validators ---------------------------------------------------
+
+// True if any of `patterns` matches.
+export fn rx_test_any(patterns: string[], s: string, flags: int = 0): bool {
+    for (let p in patterns) {
+        if (rx_test(p, s, flags)) { return true; }
+    }
+    return false;
+}
+
+// A shape check for an email address, and nothing more.
+//
+// It ACCEPTS: a@b.co, first.last@sub.example.co.uk, user+tag@x.io, internationalised
+// domains, and a local part containing almost anything — consecutive dots, a
+// leading dot, !#$%.
+//
+// It REJECTS: no @, whitespace anywhere, a domain with no dot, a trailing dot,
+// consecutive dots in the domain, and an empty local part or domain label.
+//
+// It deliberately DOES NOT accept three things that are legal RFC 5322 and
+// vanishingly rare in practice: quoted local parts containing spaces
+// ("a b"@x.com), IP-literal domains (a@[10.0.0.1]), and comments.
+//
+// What this is NOT: an RFC 5322 validator, a deliverability check, or any kind
+// of evidence that mail sent there will arrive. The only way to establish that
+// an address works is to send to it and have someone click the link. Use this
+// to catch a typo in a form field, not to make a decision.
+export fn rx_is_email_loose(s: string): bool {
+    return rx_full_match(RX_P_EMAIL_LOOSE, s);
+}
+
+// Dotted-quad IPv4, range-checked. Rejects 256.1.1.1 and leading zeros.
+export fn rx_is_ipv4(s: string): bool {
+    return rx_full_match(RX_P_IPV4, s);
+}
 
 // 1 if this build of PCRE2 has JIT support compiled in at all. jitEnabled() on
 // a Regex is the one that says whether this pattern is actually JIT'd.
