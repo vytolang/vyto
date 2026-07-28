@@ -1,0 +1,1189 @@
+// vyto/util/markdown — CommonMark blocks and inline spans, to a tree and to HTML.
+//
+//     md_render("# Title\n\nSome *emphasis* and a [link](https://x).\n")
+//     // <h1>Title</h1>\n<p>Some <em>emphasis</em> and a <a href="https://x">link</a>.</p>
+//
+//     let doc = md_parse(source);      // the tree, for your own renderer
+//     doc.child(0).kind == MD_HEADING
+//     md_text(doc.child(0))            // "Title"
+//
+// Parsing and rendering are separate on purpose. `md_parse` produces an MdNode
+// tree and nothing else; `md_to_html` is one renderer over it. A renderer that
+// paints into a vyto/ui Painter is the other obvious one, and it belongs in
+// vyto/ui rather than here — keeping this module free of any dependency on the
+// UI stack is what lets it run headless, cross-compile to Windows, and be
+// golden-tested as text.
+//
+// Supported: ATX and setext headings, paragraphs, fenced and indented code
+// blocks, block quotes, ordered and unordered lists (nested, tight and loose),
+// thematic breaks, and inline emphasis, strong emphasis, code spans, links,
+// images, autolinks, hard breaks and backslash escapes.
+//
+// Not supported, deliberately, and each one is a documented subset rather than
+// a bug:
+//
+//   * **Raw HTML is escaped, not passed through.** A markdown renderer that
+//     forwards arbitrary HTML is an XSS hole wherever the source is not fully
+//     trusted, and "fully trusted" is not a property a library can assume.
+//     `<b>x</b>` in the source renders as visible text.
+//   * Link reference definitions (`[a]: http://…` with `[a]` elsewhere).
+//     Inline links only.
+//   * Tables, footnotes, strikethrough, task lists — none of these are
+//     CommonMark; they are GitHub extensions.
+//   * Entity references in the source are not decoded; `&amp;` stays as the
+//     five characters it is, and is escaped to `&amp;amp;` on output.
+//
+// Failure is not a concept here: every byte sequence is valid markdown. The
+// worst input produces a paragraph of text.
+
+import { StringBuilder } from "vyto/util/text";
+import { html_escape, html_escape_attr } from "vyto/util/html";
+
+// ---- node kinds ------------------------------------------------------------
+
+export const MD_DOC:       int = 0;
+export const MD_HEADING:   int = 1;    // level 1..6
+export const MD_PARA:      int = 2;
+export const MD_CODE:      int = 3;    // txt is the code; info is the language
+export const MD_QUOTE:     int = 4;
+export const MD_LIST:      int = 5;    // ordered, start, tight
+export const MD_ITEM:      int = 6;
+export const MD_HRULE:     int = 7;
+export const MD_TEXT:      int = 8;
+export const MD_EMPH:      int = 9;
+export const MD_STRONG:    int = 10;
+export const MD_CODESPAN:  int = 11;
+export const MD_LINK:      int = 12;   // url, title
+export const MD_IMAGE:     int = 13;   // url, title, txt is the alt text
+export const MD_BREAK:     int = 14;   // hard line break
+export const MD_SOFTBREAK: int = 15;   // newline inside a paragraph
+
+// Block nesting bound. Quotes and lists recurse, so a document of 10,000 `>`
+// characters must soft-cap rather than overflow the C stack — the same
+// reasoning as json.vt's depth guard.
+const MD_MAX_DEPTH: int = 128;
+
+// One node of the tree. A single tagged class, as everywhere else in
+// vyto/util: Vyto has no sum types, and a hierarchy would buy nothing here.
+export class MdNode {
+    kind: int;
+    txt: string;        // text content, code body, or image alt text
+    url: string;        // link/image destination, or a code block's info string
+    title: string;      // link/image title
+    level: int;         // heading level
+    ordered: bool;      // list type
+    start: int;         // ordered list's first number
+    tight: bool;        // list rendered without <p> in its items
+    kids: MdNode[];
+
+    fn init(k: int) {
+        this.kind = k;
+        this.txt = "";
+        this.url = "";
+        this.title = "";
+        this.level = 0;
+        this.ordered = false;
+        this.start = 1;
+        this.tight = true;
+        this.kids = [];
+    }
+
+    fn childCount(): int { return this.kids.len; }
+    fn child(i: int): MdNode {
+        if (i >= 0 && i < this.kids.len) { return this.kids[i]; }
+        return new MdNode(MD_TEXT);
+    }
+    fn append(n: MdNode): MdNode { this.kids.push(n); return this; }
+    fn isBlock(): bool { return this.kind <= MD_HRULE; }
+
+    // This node rendered as HTML.
+    fn toHtml(): string { return md_to_html(this); }
+    // This node's visible text, with all markup removed.
+    fn text(): string { return md_text(this); }
+}
+
+fn node(k: int): MdNode { return new MdNode(k); }
+
+// ---- public entry points ---------------------------------------------------
+
+// Parse markdown into a tree rooted at an MD_DOC node.
+export fn md_parse(text: string): MdNode {
+    let doc = node(MD_DOC);
+    let b = new Blocks(split_lines(text), 0);
+    b.parseInto(doc);
+    return doc;
+}
+
+// Parse and render in one step.
+export fn md_render(text: string): string { return md_to_html(md_parse(text)); }
+
+// The visible text of a node and its descendants, markup removed. Useful for
+// headings (an anchor id, a table of contents) and for search indexing.
+export fn md_text(n: MdNode): string {
+    let sb = new StringBuilder(64);
+    text_into(n, sb);
+    return sb.toString();
+}
+
+fn text_into(n: MdNode, sb: StringBuilder) {
+    if (n.kind == MD_TEXT || n.kind == MD_CODESPAN || n.kind == MD_CODE) {
+        sb.append(n.txt);
+        return;
+    }
+    if (n.kind == MD_IMAGE) {
+        sb.append(n.txt);
+        return;
+    }
+    if (n.kind == MD_BREAK || n.kind == MD_SOFTBREAK) {
+        sb.append(" ");
+        return;
+    }
+    let i = 0;
+    while (i < n.kids.len) {
+        text_into(n.kids[i], sb);
+        i += 1;
+    }
+}
+
+// ---- line utilities --------------------------------------------------------
+
+// Split on \n, dropping a \r before it. `.lines()` would do this, but it also
+// discards a trailing empty line that block parsing needs to see.
+fn split_lines(text: string): string[] {
+    let out: string[] = [];
+    let start = 0;
+    let i = 0;
+    while (i < text.len) {
+        if (text[i] == 10) {
+            let end = i;
+            if (end > start && text[end - 1] == 13) { end -= 1; }
+            out.push(text.slice(start, end));
+            start = i + 1;
+        }
+        i += 1;
+    }
+    if (start < text.len) {
+        let end = text.len;
+        if (end > start && text[end - 1] == 13) { end -= 1; }
+        out.push(text.slice(start, end));
+    }
+    return out;
+}
+
+fn is_blank(line: string): bool { return line.trim() == ""; }
+
+// Leading indentation in columns, counting a tab as the next multiple of four.
+fn indent_of(line: string): int {
+    let n = 0;
+    let i = 0;
+    while (i < line.len) {
+        let c = line[i];
+        if (c == 32) { n += 1; }
+        else {
+            if (c == 9) { n = n + 4 - (n % 4); }
+            else { break; }
+        }
+        i += 1;
+    }
+    return n;
+}
+
+// Drop up to `n` columns of leading indentation.
+fn strip_indent(line: string, n: int): string {
+    let col = 0;
+    let i = 0;
+    while (i < line.len && col < n) {
+        let c = line[i];
+        if (c == 32) { col += 1; }
+        else {
+            if (c == 9) { col = col + 4 - (col % 4); }
+            else { break; }
+        }
+        i += 1;
+    }
+    return line.slice(i, line.len);
+}
+
+// ATX heading level (1..6), or 0. Requires a space after the hashes, which is
+// what distinguishes `# Heading` from `#hashtag`.
+fn atx_level(line: string): int {
+    let t = line.trim_start();
+    if (indent_of(line) >= 4) { return 0; }
+    let n = 0;
+    while (n < t.len && t[n] == 35) { n += 1; }
+    if (n == 0 || n > 6) { return 0; }
+    if (n < t.len && t[n] != 32 && t[n] != 9) { return 0; }
+    return n;
+}
+
+fn atx_text(line: string, level: int): string {
+    let t = line.trim_start().slice(level, line.trim_start().len).trim();
+    // A closing run of hashes is decoration and is dropped.
+    let end = t.len;
+    while (end > 0 && t[end - 1] == 35) { end -= 1; }
+    if (end < t.len && (end == 0 || t[end - 1] == 32 || t[end - 1] == 9)) {
+        t = t.slice(0, end).trim_end();
+    }
+    return t;
+}
+
+// A thematic break: three or more of `*`, `-` or `_`, spaces allowed between.
+fn is_hrule(line: string): bool {
+    if (indent_of(line) >= 4) { return false; }
+    let t = line.trim();
+    if (t.len < 3) { return false; }
+    let c0 = t[0];
+    if (c0 != 42 && c0 != 45 && c0 != 95) { return false; }
+    let n = 0;
+    let i = 0;
+    while (i < t.len) {
+        let c = t[i];
+        if (c == c0) { n += 1; }
+        else {
+            if (c != 32 && c != 9) { return false; }
+        }
+        i += 1;
+    }
+    return n >= 3;
+}
+
+// A setext underline: all `=` (level 1) or all `-` (level 2). Returns 0 if not.
+fn setext_level(line: string): int {
+    if (indent_of(line) >= 4) { return 0; }
+    let t = line.trim();
+    if (t.len == 0) { return 0; }
+    let c0 = t[0];
+    if (c0 != 61 && c0 != 45) { return 0; }
+    let i = 0;
+    while (i < t.len) {
+        if (t[i] != c0) { return 0; }
+        i += 1;
+    }
+    if (c0 == 61) { return 1; }
+    return 2;
+}
+
+// The fence character count if this line opens or closes a fenced code block.
+// out[0] is the fence character, out[1] the indentation.
+fn fence_run(line: string, out: int[]): int {
+    let ind = indent_of(line);
+    if (ind >= 4) { return 0; }
+    let t = strip_indent(line, ind);
+    if (t.len == 0) { return 0; }
+    let c0 = t[0];
+    if (c0 != 96 && c0 != 126) { return 0; }                  // ` or ~
+    let n = 0;
+    while (n < t.len && t[n] == c0) { n += 1; }
+    if (n < 3) { return 0; }
+    // A backtick fence's info string may not contain a backtick.
+    let info = t.slice(n, t.len);
+    if (c0 == 96 && info.index_of("`") >= 0) { return 0; }
+    out[0] = c0;
+    out[1] = ind;
+    return n;
+}
+
+// A list marker at the start of `line`. On success:
+//   out[0] the *column* the item's content starts at (for continuation lines)
+//   out[1] 1 for an ordered list, 0 for a bullet
+//   out[2] the start number
+//   out[3] the marker byte
+//   out[4] the *byte offset* in this line where the content starts
+// Returns false when there is no marker. The column and the byte offset differ
+// whenever a tab is involved, and both are needed: continuation lines are
+// measured in columns, but this line has to be sliced by byte.
+fn list_marker(line: string, out: int[]): bool {
+    let ind = indent_of(line);
+    if (ind >= 4) { return false; }
+    let t = strip_indent(line, ind);
+    if (t.len == 0) { return false; }
+    let base = line.len - t.len;
+    let c0 = t[0];
+    if (c0 == 42 || c0 == 45 || c0 == 43) {                   // * - +
+        // `- - -` is a thematic break, not a one-item list.
+        if (is_hrule(line)) { return false; }
+        if (t.len == 1) {
+            out[0] = ind + 2;
+            out[1] = 0;
+            out[2] = 1;
+            out[3] = c0;
+            out[4] = line.len;
+            return true;
+        }
+        if (t[1] != 32 && t[1] != 9) { return false; }
+        let after = 1;
+        let spaces = 0;
+        while (after < t.len && (t[after] == 32 || t[after] == 9) && spaces < 4) {
+            after += 1;
+            spaces += 1;
+        }
+        if (spaces == 0) { return false; }
+        out[0] = ind + after;
+        out[1] = 0;
+        out[2] = 1;
+        out[3] = c0;
+        out[4] = base + after;
+        return true;
+    }
+    // An ordered marker: up to nine digits then '.' or ')'.
+    let d = 0;
+    while (d < t.len && d < 9 && t[d] >= 48 && t[d] <= 57) { d += 1; }
+    if (d == 0) { return false; }
+    if (d >= t.len) { return false; }
+    let delim = t[d];
+    if (delim != 46 && delim != 41) { return false; }          // . )
+    if (d + 1 >= t.len) {
+        out[0] = ind + d + 2;
+        out[1] = 1;
+        out[2] = t.slice(0, d).to_int();
+        out[3] = delim;
+        out[4] = line.len;
+        return true;
+    }
+    if (t[d + 1] != 32 && t[d + 1] != 9) { return false; }
+    let after = d + 1;
+    let spaces = 0;
+    while (after < t.len && (t[after] == 32 || t[after] == 9) && spaces < 4) {
+        after += 1;
+        spaces += 1;
+    }
+    out[0] = ind + after;
+    out[1] = 1;
+    out[2] = t.slice(0, d).to_int();
+    out[3] = delim;
+    out[4] = base + after;
+    return true;
+}
+
+// True when a line would start a new block, and so must end a paragraph.
+fn interrupts_paragraph(line: string): bool {
+    if (is_blank(line)) { return true; }
+    if (atx_level(line) > 0) { return true; }
+    if (is_hrule(line)) { return true; }
+    let f: int[] = [0, 0];
+    if (fence_run(line, f) > 0) { return true; }
+    if (indent_of(line) < 4 && strip_indent(line, indent_of(line)).starts_with(">")) { return true; }
+    // A list can interrupt a paragraph only if it is a bullet, or an ordered
+    // list starting at 1 — otherwise "the year 1986. It was" would become one.
+    let m: int[] = [0, 0, 0, 0, 0];
+    if (list_marker(line, m)) {
+        if (m[1] == 0) { return true; }
+        if (m[2] == 1) { return true; }
+    }
+    return false;
+}
+
+// ---- block parser ----------------------------------------------------------
+
+class Blocks {
+    lines: string[];
+    n: int;
+    pos: int;
+    depth: int;
+
+    fn init(lines: string[], depth: int) {
+        this.lines = lines;
+        this.n = lines.len;
+        this.pos = 0;
+        this.depth = depth;
+    }
+
+    fn parseInto(parent: MdNode) {
+        if (this.depth > MD_MAX_DEPTH) { return; }
+        while (this.pos < this.n) {
+            let line = this.lines[this.pos];
+            if (is_blank(line)) { this.pos += 1; continue; }
+
+            let lvl = atx_level(line);
+            if (lvl > 0) {
+                let h = node(MD_HEADING);
+                h.level = lvl;
+                inline_into(atx_text(line, lvl), h);
+                parent.append(h);
+                this.pos += 1;
+                continue;
+            }
+
+            let f: int[] = [0, 0];
+            let fence = fence_run(line, f);
+            if (fence > 0) {
+                parent.append(this.fenced(fence, f[0], f[1]));
+                continue;
+            }
+
+            if (is_hrule(line)) {
+                parent.append(node(MD_HRULE));
+                this.pos += 1;
+                continue;
+            }
+
+            let ind = indent_of(line);
+            if (ind < 4 && strip_indent(line, ind).starts_with(">")) {
+                parent.append(this.quote());
+                continue;
+            }
+
+            let m: int[] = [0, 0, 0, 0, 0];
+            if (list_marker(line, m)) {
+                parent.append(this.list(m));
+                continue;
+            }
+
+            if (ind >= 4) {
+                parent.append(this.indentedCode());
+                continue;
+            }
+
+            parent.append(this.paragraph());
+        }
+    }
+
+    // ``` info … ``` — the body is literal, never inline-parsed.
+    fn fenced(runLen: int, fenceChar: int, ind: int): MdNode {
+        let opener = strip_indent(this.lines[this.pos], ind);
+        let info = opener.slice(runLen, opener.len).trim();
+        this.pos += 1;
+        let sb = new StringBuilder(128);
+        let first = true;
+        while (this.pos < this.n) {
+            let line = this.lines[this.pos];
+            let f: int[] = [0, 0];
+            let close = fence_run(line, f);
+            if (close >= runLen && f[0] == fenceChar &&
+                strip_indent(line, indent_of(line)).trim().len == close) {
+                this.pos += 1;
+                break;
+            }
+            if (!first) { sb.append("\n"); }
+            sb.append(strip_indent(line, ind));
+            first = false;
+            this.pos += 1;
+        }
+        let c = node(MD_CODE);
+        c.txt = sb.toString();
+        // Only the first word of the info string is the language.
+        let sp = info.index_of(" ");
+        if (sp >= 0) { c.url = info.slice(0, sp); } else { c.url = info; }
+        return c;
+    }
+
+    // Four-space-indented code, blank lines included but trailing ones trimmed.
+    fn indentedCode(): MdNode {
+        let body: string[] = [];
+        while (this.pos < this.n) {
+            let line = this.lines[this.pos];
+            if (is_blank(line)) {
+                // A blank line continues the block only if indented code follows.
+                let look = this.pos + 1;
+                while (look < this.n && is_blank(this.lines[look])) { look += 1; }
+                if (look >= this.n || indent_of(this.lines[look]) < 4) { break; }
+                body.push("");
+                this.pos += 1;
+                continue;
+            }
+            if (indent_of(line) < 4) { break; }
+            body.push(strip_indent(line, 4));
+            this.pos += 1;
+        }
+        while (body.len > 0 && body[body.len - 1] == "") { body.pop(); }
+        let c = node(MD_CODE);
+        c.txt = body.join("\n");
+        return c;
+    }
+
+    // A block quote: consecutive `>` lines plus lazy continuation lines, with
+    // the marker stripped and the remainder parsed as blocks in its own right.
+    fn quote(): MdNode {
+        let inner: string[] = [];
+        while (this.pos < this.n) {
+            let line = this.lines[this.pos];
+            let ind = indent_of(line);
+            let t = strip_indent(line, ind);
+            if (ind < 4 && t.starts_with(">")) {
+                let rest = t.slice(1, t.len);
+                if (rest.len > 0 && rest[0] == 32) { rest = rest.slice(1, rest.len); }
+                inner.push(rest);
+                this.pos += 1;
+                continue;
+            }
+            // Lazy continuation: a plain line right after quoted text stays in.
+            if (!is_blank(line) && inner.len > 0 && !interrupts_paragraph(line)) {
+                inner.push(line);
+                this.pos += 1;
+                continue;
+            }
+            break;
+        }
+        let q = node(MD_QUOTE);
+        let sub = new Blocks(inner, this.depth + 1);
+        sub.parseInto(q);
+        return q;
+    }
+
+    // A list: consecutive items sharing a marker type. An item's content is
+    // every following line indented to its content column, so nesting works by
+    // recursion on the dedented text.
+    fn list(first: int[]): MdNode {
+        let lst = node(MD_LIST);
+        lst.ordered = first[1] == 1;
+        lst.start = first[2];
+        lst.tight = true;
+        let markerChar = first[3];
+        let sawBlank = false;
+
+        while (this.pos < this.n) {
+            let line = this.lines[this.pos];
+            if (is_blank(line)) {
+                // A blank line ends the list unless the next line continues it.
+                let look = this.pos + 1;
+                while (look < this.n && is_blank(this.lines[look])) { look += 1; }
+                if (look >= this.n) { this.pos = look; break; }
+                let nextLine = this.lines[look];
+                let m2: int[] = [0, 0, 0, 0, 0];
+                let continues = false;
+                if (list_marker(nextLine, m2) && m2[3] == markerChar && m2[1] == first[1]) {
+                    continues = true;
+                }
+                if (indent_of(nextLine) >= first[0]) { continues = true; }
+                if (!continues) { this.pos = look; break; }
+                sawBlank = true;
+                this.pos = look;
+                continue;
+            }
+
+            let m: int[] = [0, 0, 0, 0, 0];
+            if (!list_marker(line, m)) { break; }
+            // A different marker character starts a *new* list, per CommonMark.
+            if (m[3] != markerChar || m[1] != first[1]) { break; }
+
+            let contentCol = m[0];
+            let inner: string[] = [];
+            // The first line loses the marker itself, by byte; the rest lose
+            // the same number of *columns* of indentation.
+            inner.push(line.slice(m[4], line.len));
+            this.pos += 1;
+            let itemBlank = false;
+            while (this.pos < this.n) {
+                let cont = this.lines[this.pos];
+                if (is_blank(cont)) {
+                    let look = this.pos + 1;
+                    while (look < this.n && is_blank(this.lines[look])) { look += 1; }
+                    if (look >= this.n) { break; }
+                    if (indent_of(this.lines[look]) < contentCol) { break; }
+                    itemBlank = true;
+                    inner.push("");
+                    this.pos += 1;
+                    continue;
+                }
+                if (indent_of(cont) >= contentCol) {
+                    inner.push(strip_indent(cont, contentCol));
+                    this.pos += 1;
+                    continue;
+                }
+                // Lazy continuation of the item's paragraph.
+                let m3: int[] = [0, 0, 0, 0, 0];
+                if (!interrupts_paragraph(cont) && !list_marker(cont, m3)) {
+                    inner.push(cont.trim_start());
+                    this.pos += 1;
+                    continue;
+                }
+                break;
+            }
+            if (itemBlank) { sawBlank = true; }
+
+            let item = node(MD_ITEM);
+            let sub = new Blocks(inner, this.depth + 1);
+            sub.parseInto(item);
+            lst.append(item);
+        }
+        if (sawBlank) { lst.tight = false; }
+        return lst;
+    }
+
+    // A paragraph, or a setext heading when a following line underlines it.
+    fn paragraph(): MdNode {
+        let sb = new StringBuilder(128);
+        let count = 0;
+        let level = 0;
+        while (this.pos < this.n) {
+            let line = this.lines[this.pos];
+            if (is_blank(line)) { break; }
+            if (count > 0) {
+                // A setext underline is only an underline under something. A
+                // bare "---" was taken as a thematic break before we got here.
+                let sl = setext_level(line);
+                if (sl > 0) {
+                    level = sl;
+                    this.pos += 1;
+                    break;
+                }
+                if (interrupts_paragraph(line)) { break; }
+                sb.append("\n");
+            }
+            sb.append(line.trim_start());
+            count += 1;
+            this.pos += 1;
+        }
+        let body = sb.toString().trim_end();
+        if (level > 0) {
+            let h = node(MD_HEADING);
+            h.level = level;
+            inline_into(body, h);
+            return h;
+        }
+        let p = node(MD_PARA);
+        inline_into(body, p);
+        return p;
+    }
+}
+
+// ---- inline parser ---------------------------------------------------------
+
+// Parse `s` as inline content, appending the spans to `parent`.
+fn inline_into(s: string, parent: MdNode) {
+    let out = inline_spans(s, 0);
+    let i = 0;
+    while (i < out.len) {
+        parent.append(out[i]);
+        i += 1;
+    }
+}
+
+fn inline_spans(s: string, depth: int): MdNode[] {
+    let out: MdNode[] = [];
+    if (depth > MD_MAX_DEPTH) {
+        out.push(text_node(s));
+        return out;
+    }
+    let sb = new StringBuilder(s.len + 8);
+    let i = 0;
+    while (i < s.len) {
+        let c = s[i];
+
+        // Backslash escape: only before punctuation, else the backslash is text.
+        if (c == 92 && i + 1 < s.len) {
+            let nx = s[i + 1];
+            if (nx == 10) {                                    // hard break
+                flush(sb, out);
+                out.push(node(MD_BREAK));
+                i += 2;
+                continue;
+            }
+            if (is_punct(nx)) {
+                sb.appendByte(nx);
+                i += 2;
+                continue;
+            }
+            sb.appendByte(c);
+            i += 1;
+            continue;
+        }
+
+        // Line break: two trailing spaces make it hard, otherwise it is soft.
+        if (c == 10) {
+            let hard = ends_with_two_spaces(s, i);
+            flush_trim(sb, out);
+            if (hard) { out.push(node(MD_BREAK)); } else { out.push(node(MD_SOFTBREAK)); }
+            i += 1;
+            // Leading whitespace on the next line is not content.
+            while (i < s.len && (s[i] == 32 || s[i] == 9)) { i += 1; }
+            continue;
+        }
+
+        // Code span: a run of N backticks closed by another run of exactly N.
+        if (c == 96) {
+            let run = 0;
+            while (i + run < s.len && s[i + run] == 96) { run += 1; }
+            let close = find_backtick_run(s, i + run, run);
+            if (close >= 0) {
+                flush(sb, out);
+                let code = s.slice(i + run, close);
+                // One leading and trailing space is stripped, so `` ` `` works.
+                if (code.len >= 2 && code[0] == 32 && code[code.len - 1] == 32 &&
+                    code.trim() != "") {
+                    code = code.slice(1, code.len - 1);
+                }
+                let cs = node(MD_CODESPAN);
+                cs.txt = code.replace("\n", " ");
+                out.push(cs);
+                i = close + run;
+                continue;
+            }
+            sb.appendByte(c);
+            i += 1;
+            continue;
+        }
+
+        // Autolink: <https://…> or <a@b.c>.
+        if (c == 60) {
+            let close = index_at(s, ">", i + 1);
+            if (close > i + 1) {
+                let body = s.slice(i + 1, close);
+                if (is_autolink(body)) {
+                    flush(sb, out);
+                    let a = node(MD_LINK);
+                    a.url = body;
+                    if (body.index_of("@") > 0 && body.index_of(":") < 0) {
+                        a.url = "mailto:" + body;
+                    }
+                    a.append(text_node(body));
+                    out.push(a);
+                    i = close + 1;
+                    continue;
+                }
+            }
+            sb.appendByte(c);
+            i += 1;
+            continue;
+        }
+
+        // Image: ![alt](url "title")
+        if (c == 33 && i + 1 < s.len && s[i + 1] == 91) {
+            let endOut = [0];
+            let img = try_link(s, i + 1, true, depth, endOut);
+            if (img != null) {
+                flush(sb, out);
+                out.push(img);
+                i = endOut[0];
+                continue;
+            }
+            sb.appendByte(c);
+            i += 1;
+            continue;
+        }
+
+        // Link: [text](url "title")
+        if (c == 91) {
+            let endOut = [0];
+            let a = try_link(s, i, false, depth, endOut);
+            if (a != null) {
+                flush(sb, out);
+                out.push(a);
+                i = endOut[0];
+                continue;
+            }
+            sb.appendByte(c);
+            i += 1;
+            continue;
+        }
+
+        // Emphasis and strong emphasis.
+        if (c == 42 || c == 95) {
+            let run = 0;
+            while (i + run < s.len && s[i + run] == c) { run += 1; }
+            // One delimiter is emphasis, two is strong, and three is both
+            // nested — `***x***` is <em><strong>x</strong></em>.
+            let want = 1;
+            if (run == 2) { want = 2; }
+            if (run >= 3) { want = 3; }
+            let close = find_delim(s, i + run, c, want, i);
+            if (close >= 0) {
+                let body = s.slice(i + want, close);
+                if (body.trim() != "") {
+                    flush(sb, out);
+                    let inner = node(MD_EMPH);
+                    if (want == 2) { inner.kind = MD_STRONG; }
+                    let kids = inline_spans(body, depth + 1);
+                    let j = 0;
+                    while (j < kids.len) {
+                        inner.append(kids[j]);
+                        j += 1;
+                    }
+                    if (want == 3) {
+                        let strong = node(MD_STRONG);
+                        strong.kids = inner.kids;
+                        inner.kids = [];
+                        inner.append(strong);
+                    }
+                    out.push(inner);
+                    i = close + want;
+                    continue;
+                }
+            }
+            sb.appendByte(c);
+            i += 1;
+            continue;
+        }
+
+        sb.appendByte(c);
+        i += 1;
+    }
+    flush(sb, out);
+    return out;
+}
+
+// Parse `[text](dest "title")` starting at `at` (the '['). Returns the node,
+// or null when this is not a link. `endOut` is a 1-element array carrying the
+// index just past the closing paren — Vyto has no out-parameters, so this is
+// the vyto/cli parse_int idiom.
+fn try_link(s: string, at: int, isImage: bool, depth: int, endOut: int[]): MdNode {
+    let close = matching_bracket(s, at);
+    if (close < 0) { return null; }
+    if (close + 1 >= s.len || s[close + 1] != 40) { return null; }   // '('
+    let paren = matching_paren(s, close + 1);
+    if (paren < 0) { return null; }
+    let label = s.slice(at + 1, close);
+    let inner = s.slice(close + 2, paren).trim();
+
+    let dest = inner;
+    let title = "";
+    // A title is a quoted run at the end, separated from the destination by
+    // whitespace — which is what tells "a b" apart from a URL containing one.
+    if (inner.len > 0 && (inner[inner.len - 1] == 34 || inner[inner.len - 1] == 39)) {
+        let q = inner[inner.len - 1];
+        let k = inner.len - 2;
+        while (k > 0) {
+            if (inner[k] == q && (inner[k - 1] == 32 || inner[k - 1] == 9)) { break; }
+            k -= 1;
+        }
+        if (k > 0) {
+            dest = inner.slice(0, k).trim();
+            title = inner.slice(k + 1, inner.len - 1);
+        }
+    }
+    // <angle-bracketed destinations> are allowed and the brackets are not part
+    // of the URL.
+    if (dest.len >= 2 && dest[0] == 60 && dest[dest.len - 1] == 62) {
+        dest = dest.slice(1, dest.len - 1);
+    }
+
+    let n = node(MD_LINK);
+    if (isImage) { n.kind = MD_IMAGE; }
+    n.url = dest;
+    n.title = title;
+    if (isImage) {
+        n.txt = plain_of(label);
+    } else {
+        let kids = inline_spans(label, depth + 1);
+        let j = 0;
+        while (j < kids.len) {
+            n.append(kids[j]);
+            j += 1;
+        }
+    }
+    endOut[0] = paren + 1;
+    return n;
+}
+
+// Index of the ']' matching the '[' at `at`, honouring nesting; -1 if none.
+fn matching_bracket(s: string, at: int): int {
+    let depth = 0;
+    let i = at;
+    while (i < s.len) {
+        let c = s[i];
+        if (c == 92) { i += 2; continue; }
+        if (c == 91) { depth += 1; }
+        else {
+            if (c == 93) {
+                depth -= 1;
+                if (depth == 0) { return i; }
+            }
+        }
+        i += 1;
+    }
+    return -1;
+}
+
+fn matching_paren(s: string, at: int): int {
+    let depth = 0;
+    let i = at;
+    while (i < s.len) {
+        let c = s[i];
+        if (c == 92) { i += 2; continue; }
+        if (c == 40) { depth += 1; }
+        else {
+            if (c == 41) {
+                depth -= 1;
+                if (depth == 0) { return i; }
+            }
+        }
+        i += 1;
+    }
+    return -1;
+}
+
+// The closing run for an emphasis delimiter, or -1.
+//
+// `_` is not recognized inside a word — snake_case_names would otherwise turn
+// into emphasis, which is the single most common false positive in markdown.
+// `*` is allowed intraword, as CommonMark specifies.
+fn find_delim(s: string, at: int, c: int, want: int, openAt: int): int {
+    if (c == 95 && openAt > 0 && is_word_byte(s[openAt - 1])) { return -1; }
+    // Two passes. The first accepts only a run of exactly `want`, so that in
+    // "*a **b** c*" the single `*` pairs with the final one rather than with
+    // the `**` that opens the strong span inside it. The second pass relaxes
+    // that, so "*a **b*" still closes somewhere instead of losing its
+    // emphasis entirely. A full CommonMark delimiter stack would subsume
+    // both; this covers the cases that occur in real documents.
+    let exact = scan_delim(s, at, c, want, true);
+    if (exact >= 0) { return exact; }
+    return scan_delim(s, at, c, want, false);
+}
+
+fn scan_delim(s: string, at: int, c: int, want: int, exact: bool): int {
+    let i = at;
+    while (i < s.len) {
+        let ch = s[i];
+        if (ch == 92) { i += 2; continue; }
+        if (ch == 96) {
+            // Skip a code span: a delimiter inside one is literal.
+            let run = 0;
+            while (i + run < s.len && s[i + run] == 96) { run += 1; }
+            let end = find_backtick_run(s, i + run, run);
+            if (end >= 0) { i = end + run; continue; }
+            i += 1;
+            continue;
+        }
+        if (ch != c) { i += 1; continue; }
+        let run = 0;
+        while (i + run < s.len && s[i + run] == c) { run += 1; }
+        if (run < want) { i += run; continue; }
+        if (exact && run != want) { i += run; continue; }
+        // The closer may not be preceded by whitespace, and for `_` may not be
+        // followed by a word byte.
+        if (i > 0 && (s[i - 1] == 32 || s[i - 1] == 9)) { i += run; continue; }
+        if (c == 95 && i + run < s.len && is_word_byte(s[i + run])) { i += run; continue; }
+        return i;
+    }
+    return -1;
+}
+
+// Start of the next run of exactly `n` backticks at or after `at`, or -1.
+fn find_backtick_run(s: string, at: int, n: int): int {
+    let i = at;
+    while (i < s.len) {
+        if (s[i] != 96) { i += 1; continue; }
+        let run = 0;
+        while (i + run < s.len && s[i + run] == 96) { run += 1; }
+        if (run == n) { return i; }
+        i += run;
+    }
+    return -1;
+}
+
+fn is_autolink(body: string): bool {
+    if (body.len < 3) { return false; }
+    if (body.index_of(" ") >= 0 || body.index_of("\n") >= 0) { return false; }
+    if (body.index_of("://") > 0) { return true; }
+    if (body.starts_with("mailto:")) { return true; }
+    // A bare address: one '@' with something either side and a dot after it.
+    let at = body.index_of("@");
+    if (at > 0 && at < body.len - 1 && body.index_of(":") < 0) {
+        return body.slice(at, body.len).index_of(".") > 0;
+    }
+    return false;
+}
+
+fn is_word_byte(c: int): bool {
+    return (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c >= 128;
+}
+
+// The characters a backslash may escape, per CommonMark.
+fn is_punct(c: int): bool {
+    return (c >= 33 && c <= 47) || (c >= 58 && c <= 64) ||
+           (c >= 91 && c <= 96) || (c >= 123 && c <= 126);
+}
+
+fn ends_with_two_spaces(s: string, nl: int): bool {
+    if (nl < 2) { return false; }
+    return s[nl - 1] == 32 && s[nl - 2] == 32;
+}
+
+fn text_node(s: string): MdNode {
+    let t = node(MD_TEXT);
+    t.txt = s;
+    return t;
+}
+
+fn flush(sb: StringBuilder, out: MdNode[]) {
+    if (sb.len() == 0) { return; }
+    out.push(text_node(sb.toString()));
+    sb.clear();
+}
+
+// flush for a line break: trailing spaces before the newline are markup, not
+// content, so they never reach the output.
+fn flush_trim(sb: StringBuilder, out: MdNode[]) {
+    if (sb.len() == 0) { return; }
+    let s = sb.toString().trim_end();
+    sb.clear();
+    if (s.len > 0) { out.push(text_node(s)); }
+}
+
+// Inline markup removed, for an image's alt attribute.
+fn plain_of(s: string): string {
+    let spans = inline_spans(s, MD_MAX_DEPTH);
+    let sb = new StringBuilder(s.len);
+    let i = 0;
+    while (i < spans.len) {
+        text_into(spans[i], sb);
+        i += 1;
+    }
+    return sb.toString();
+}
+
+fn index_at(s: string, sub: string, at: int): int {
+    if (at >= s.len) { return -1; }
+    let rel = s.slice(at, s.len).index_of(sub);
+    if (rel < 0) { return -1; }
+    return at + rel;
+}
+
+fn chr_of(code: int): string {
+    if (code == 0) { return ""; }
+    let b = bytes(2);
+    b[0] = code as byte;
+    return str(b as cstring);
+}
+
+// ---- HTML renderer ---------------------------------------------------------
+
+// Render a tree as HTML. Every piece of text goes through html_escape, so raw
+// HTML in the source appears as visible text rather than as markup — see the
+// module header for why that is the default and the only behaviour.
+export fn md_to_html(n: MdNode): string {
+    let sb = new StringBuilder(256);
+    render(n, sb, true);
+    return sb.toString();
+}
+
+fn render(n: MdNode, sb: StringBuilder, blockLevel: bool) {
+    let k = n.kind;
+
+    if (k == MD_DOC) {
+        render_children_blocks(n, sb);
+        return;
+    }
+    if (k == MD_HEADING) {
+        sb.append("<h").appendInt(n.level).append(">");
+        render_children(n, sb);
+        sb.append("</h").appendInt(n.level).append(">\n");
+        return;
+    }
+    if (k == MD_PARA) {
+        if (blockLevel) { sb.append("<p>"); }
+        render_children(n, sb);
+        if (blockLevel) { sb.append("</p>\n"); }
+        return;
+    }
+    if (k == MD_CODE) {
+        sb.append("<pre><code");
+        if (n.url != "") {
+            sb.append(" class=\"language-").append(html_escape_attr(n.url)).append("\"");
+        }
+        sb.append(">");
+        sb.append(html_escape(n.txt));
+        if (n.txt.len > 0) { sb.append("\n"); }
+        sb.append("</code></pre>\n");
+        return;
+    }
+    if (k == MD_QUOTE) {
+        sb.append("<blockquote>\n");
+        render_children_blocks(n, sb);
+        sb.append("</blockquote>\n");
+        return;
+    }
+    if (k == MD_HRULE) {
+        sb.append("<hr>\n");
+        return;
+    }
+    if (k == MD_LIST) {
+        if (n.ordered) {
+            sb.append("<ol");
+            if (n.start != 1) { sb.append(" start=\"").appendInt(n.start).append("\""); }
+            sb.append(">\n");
+        } else {
+            sb.append("<ul>\n");
+        }
+        let i = 0;
+        while (i < n.kids.len) {
+            render_item(n.kids[i], sb, n.tight);
+            i += 1;
+        }
+        if (n.ordered) { sb.append("</ol>\n"); } else { sb.append("</ul>\n"); }
+        return;
+    }
+
+    // Inline kinds.
+    if (k == MD_TEXT) { sb.append(html_escape(n.txt)); return; }
+    if (k == MD_EMPH) {
+        sb.append("<em>");
+        render_children(n, sb);
+        sb.append("</em>");
+        return;
+    }
+    if (k == MD_STRONG) {
+        sb.append("<strong>");
+        render_children(n, sb);
+        sb.append("</strong>");
+        return;
+    }
+    if (k == MD_CODESPAN) {
+        sb.append("<code>").append(html_escape(n.txt)).append("</code>");
+        return;
+    }
+    if (k == MD_LINK) {
+        sb.append("<a href=\"").append(html_escape_attr(n.url)).append("\"");
+        if (n.title != "") { sb.append(" title=\"").append(html_escape_attr(n.title)).append("\""); }
+        sb.append(">");
+        render_children(n, sb);
+        sb.append("</a>");
+        return;
+    }
+    if (k == MD_IMAGE) {
+        sb.append("<img src=\"").append(html_escape_attr(n.url)).append("\"");
+        sb.append(" alt=\"").append(html_escape_attr(n.txt)).append("\"");
+        if (n.title != "") { sb.append(" title=\"").append(html_escape_attr(n.title)).append("\""); }
+        sb.append(">");
+        return;
+    }
+    if (k == MD_BREAK) { sb.append("<br>\n"); return; }
+    if (k == MD_SOFTBREAK) { sb.append("\n"); return; }
+    render_children(n, sb);
+}
+
+fn render_children(n: MdNode, sb: StringBuilder) {
+    let i = 0;
+    while (i < n.kids.len) {
+        render(n.kids[i], sb, true);
+        i += 1;
+    }
+}
+
+fn render_children_blocks(n: MdNode, sb: StringBuilder) {
+    let i = 0;
+    while (i < n.kids.len) {
+        render(n.kids[i], sb, true);
+        i += 1;
+    }
+}
+
+// A tight list drops the <p> around each item's single paragraph, which is the
+// difference between `<li>a</li>` and `<li><p>a</p></li>`.
+fn render_item(item: MdNode, sb: StringBuilder, tight: bool) {
+    sb.append("<li>");
+    if (tight) {
+        let i = 0;
+        while (i < item.kids.len) {
+            let c = item.kids[i];
+            if (c.kind == MD_PARA) {
+                if (i > 0) { sb.append("\n"); }
+                render(c, sb, false);
+            } else {
+                // A nested block inside a tight item starts on its own line,
+                // which is what the CommonMark reference output does.
+                sb.append("\n");
+                render(c, sb, true);
+            }
+            i += 1;
+        }
+    } else {
+        sb.append("\n");
+        let i = 0;
+        while (i < item.kids.len) {
+            render(item.kids[i], sb, true);
+            i += 1;
+        }
+    }
+    sb.append("</li>\n");
+}

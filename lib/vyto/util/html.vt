@@ -1,0 +1,435 @@
+// vyto/util/html — HTML escaping and generation.
+//
+//     html_escape("<a> & <b>")                  // "&lt;a&gt; &amp; &lt;b&gt;"
+//     html_unescape("caf&eacute; &#233;")       // "café é"
+//
+//     let h = htmlBuilder();
+//     h.open("ul").attr("class", "list");
+//     h.open("li").text("first").close();
+//     h.open("li").text("second").close();
+//     h.close();
+//     h.toString()   // <ul class="list"><li>first</li><li>second</li></ul>
+//
+// Generation and escaping only — this is not an HTML *parser*. A real HTML5
+// tree builder is a different project (the spec's tokenizer alone has 80
+// states, and the error recovery rules are the whole point of it). For input
+// that is actually well-formed, use vyto/util/xml. vyto/util/markdown renders
+// through this module.
+//
+// The escaper is the part that matters: nothing else in the tree had one, and
+// every string that reaches a page without passing through html_escape or
+// html_escape_attr is an injection. HtmlBuilder escapes text and attribute
+// values for you, and its raw() is the single, greppable place where that is
+// bypassed on purpose.
+//
+// Caveat: `&#0;` decodes to nothing rather than to a NUL, because a NUL would
+// truncate the resulting string — the vyto-wide string/cstring caveat. Unknown
+// entities are left exactly as written rather than dropped.
+
+import { StringBuilder } from "vyto/util/text";
+
+// ---- escaping --------------------------------------------------------------
+
+// Escape text for element content: `&`, `<`, `>`.
+export fn html_escape(s: string): string { return escape_into(s, false); }
+
+// Escape a value going inside quotes in an attribute: the above plus `"` and
+// `'`. Use this for every attribute, including ones you believe are safe —
+// `<a href=` with an unescaped value is the classic way in.
+export fn html_escape_attr(s: string): string { return escape_into(s, true); }
+
+fn escape_into(s: string, attr: bool): string {
+    let sb = new StringBuilder(s.len + 16);
+    let runStart = 0;
+    let i = 0;
+    while (i < s.len) {
+        let c = s[i];
+        let rep = "";
+        if (c == 38) { rep = "&amp;"; }
+        else { if (c == 60) { rep = "&lt;"; }
+        else { if (c == 62) { rep = "&gt;"; }
+        else { if (attr && c == 34) { rep = "&quot;"; }
+        else { if (attr && c == 39) { rep = "&#39;"; } } } } }
+        if (rep == "") { i += 1; continue; }
+        if (i > runStart) { sb.append(s.slice(runStart, i)); }
+        sb.append(rep);
+        i += 1;
+        runStart = i;
+    }
+    if (i > runStart) { sb.append(s.slice(runStart, i)); }
+    return sb.toString();
+}
+
+// Decode named and numeric character references. The named table covers the
+// ones that actually appear in hand-written HTML; an unrecognized `&name;` is
+// left as written, because silently deleting content is worse than showing it.
+export fn html_unescape(s: string): string {
+    if (s.index_of("&") < 0) { return s; }
+    let sb = new StringBuilder(s.len);
+    let runStart = 0;
+    let i = 0;
+    while (i < s.len) {
+        if (s[i] != 38) { i += 1; continue; }
+        let semi = index_at(s, ";", i + 1);
+        if (semi < 0 || semi - i > 12) { i += 1; continue; }
+        let body = s.slice(i + 1, semi);
+        let known = false;
+        let rep = "";
+        if (body.len > 1 && body[0] == 35) {                  // '#'
+            let cp = numeric_ref(body);
+            if (cp >= 0) {
+                known = true;
+                if (cp > 0) { rep = utf8_encode(cp); }        // &#0; decodes to nothing
+            }
+        } else {
+            rep = named_entity(body);
+            if (rep != "") { known = true; }
+        }
+        if (!known) { i += 1; continue; }
+        if (i > runStart) { sb.append(s.slice(runStart, i)); }
+        sb.append(rep);
+        i = semi + 1;
+        runStart = i;
+    }
+    if (i > runStart) { sb.append(s.slice(runStart, i)); }
+    return sb.toString();
+}
+
+// The codepoint of a `#nnn` / `#xnn` reference, or -1 when malformed.
+fn numeric_ref(body: string): int {
+    let cp = 0;
+    if (body[1] == 120 || body[1] == 88) {                    // 'x' / 'X'
+        if (body.len < 3) { return -1; }
+        let i = 2;
+        while (i < body.len) {
+            let v = hex_val(body[i]);
+            if (v < 0) { return -1; }
+            cp = cp * 16 + v;
+            i += 1;
+        }
+    } else {
+        let i = 1;
+        while (i < body.len) {
+            let c = body[i];
+            if (c < 48 || c > 57) { return -1; }
+            cp = cp * 10 + (c - 48);
+            i += 1;
+        }
+    }
+    if (cp < 0 || cp > 0x10FFFF) { return -1; }
+    return cp;
+}
+
+fn named_entity(name: string): string {
+    if (name == "amp") { return "&"; }
+    if (name == "lt") { return "<"; }
+    if (name == "gt") { return ">"; }
+    if (name == "quot") { return "\""; }
+    if (name == "apos") { return "'"; }
+    if (name == "nbsp") { return "\xc2\xa0"; }
+    if (name == "copy") { return "©"; }
+    if (name == "reg") { return "®"; }
+    if (name == "trade") { return "™"; }
+    if (name == "hellip") { return "…"; }
+    if (name == "mdash") { return "—"; }
+    if (name == "ndash") { return "–"; }
+    if (name == "lsquo") { return "‘"; }
+    if (name == "rsquo") { return "’"; }
+    if (name == "ldquo") { return "“"; }
+    if (name == "rdquo") { return "”"; }
+    if (name == "laquo") { return "«"; }
+    if (name == "raquo") { return "»"; }
+    if (name == "deg") { return "°"; }
+    if (name == "plusmn") { return "±"; }
+    if (name == "times") { return "×"; }
+    if (name == "divide") { return "÷"; }
+    if (name == "frac12") { return "½"; }
+    if (name == "middot") { return "·"; }
+    if (name == "bull") { return "•"; }
+    if (name == "dagger") { return "†"; }
+    if (name == "euro") { return "€"; }
+    if (name == "pound") { return "£"; }
+    if (name == "yen") { return "¥"; }
+    if (name == "cent") { return "¢"; }
+    if (name == "sect") { return "§"; }
+    if (name == "para") { return "¶"; }
+    if (name == "larr") { return "←"; }
+    if (name == "rarr") { return "→"; }
+    if (name == "harr") { return "↔"; }
+    if (name == "eacute") { return "é"; }
+    if (name == "egrave") { return "è"; }
+    if (name == "agrave") { return "à"; }
+    if (name == "ccedil") { return "ç"; }
+    if (name == "uuml") { return "ü"; }
+    if (name == "ouml") { return "ö"; }
+    if (name == "auml") { return "ä"; }
+    if (name == "szlig") { return "ß"; }
+    if (name == "ntilde") { return "ñ"; }
+    return "";
+}
+
+// ---- void elements ---------------------------------------------------------
+
+// True for an element that has no closing tag. Writing `</br>` is a bug, and
+// HtmlBuilder uses this to refuse to.
+export fn html_is_void(tag: string): bool {
+    let t = tag.to_lower();
+    return t == "area" || t == "base" || t == "br" || t == "col" ||
+           t == "embed" || t == "hr" || t == "img" || t == "input" ||
+           t == "link" || t == "meta" || t == "source" || t == "track" ||
+           t == "wbr";
+}
+
+// True for an element whose content is raw text, not markup: a `<` inside
+// <script> or <style> is not a tag, and escaping it would break the content.
+export fn html_is_raw_text(tag: string): bool {
+    let t = tag.to_lower();
+    return t == "script" || t == "style";
+}
+
+// ---- the builder -----------------------------------------------------------
+
+// Builds HTML into a StringBuilder, tracking open tags so close() never needs
+// the tag name and can never mismatch.
+//
+// Every text() and attr() escapes. raw() does not, and is the one place a
+// caller opts out — which makes "where does unescaped content enter this page"
+// a grep for `.raw(`.
+export class HtmlBuilder {
+    sb: StringBuilder;
+    stack: string[];
+    inTag: bool;
+    err: string;
+
+    fn init(cap: int) {
+        this.sb = new StringBuilder(cap);
+        this.stack = [];
+        this.inTag = false;
+        this.err = "";
+    }
+
+    // Errors are recorded rather than thrown: a mismatched close is a bug in
+    // the caller, but half a page plus a diagnostic beats a dead process, and
+    // ok() makes it checkable. First error wins, as everywhere else.
+    fn fail(msg: string) {
+        if (this.err == "") { this.err = msg; }
+    }
+    fn error(): string { return this.err; }
+    fn ok(): bool { return this.err == ""; }
+    fn depth(): int { return this.stack.len; }
+    fn len(): int { return this.sb.len(); }
+
+    // Finish the `<tag` currently being written, if any.
+    fn seal() {
+        if (this.inTag) {
+            this.sb.append(">");
+            this.inTag = false;
+        }
+    }
+
+    // Start an element. Attributes may follow with attr(); the tag is closed
+    // off automatically as soon as anything else is written.
+    fn open(tag: string): HtmlBuilder {
+        this.seal();
+        this.sb.append("<").append(tag);
+        this.inTag = true;
+        // A void element never goes on the stack: there is nothing to close,
+        // and seal() will finish its `<br` when the next thing is written.
+        if (!html_is_void(tag)) { this.stack.push(tag); }
+        return this;
+    }
+
+    // Set an attribute on the element being opened. The value is escaped.
+    fn attr(name: string, value: string): HtmlBuilder {
+        if (!this.inTag) {
+            this.fail("attr('" + name + "') outside a tag");
+            return this;
+        }
+        this.sb.append(" ").append(name).append("=\"");
+        this.sb.append(html_escape_attr(value)).append("\"");
+        return this;
+    }
+    fn attrInt(name: string, value: int): HtmlBuilder {
+        if (!this.inTag) {
+            this.fail("attr('" + name + "') outside a tag");
+            return this;
+        }
+        this.sb.append(" ").append(name).append("=\"").appendInt(value).append("\"");
+        return this;
+    }
+    // A valueless attribute: `<input disabled>`.
+    fn flag(name: string): HtmlBuilder {
+        if (!this.inTag) {
+            this.fail("flag('" + name + "') outside a tag");
+            return this;
+        }
+        this.sb.append(" ").append(name);
+        return this;
+    }
+
+    // Escaped text content.
+    fn text(s: string): HtmlBuilder {
+        this.seal();
+        this.sb.append(html_escape(s));
+        return this;
+    }
+    fn textInt(v: int): HtmlBuilder {
+        this.seal();
+        this.sb.appendInt(v);
+        return this;
+    }
+
+    // Unescaped markup. The deliberate hole in the escaping — pass only
+    // content you generated yourself.
+    fn raw(s: string): HtmlBuilder {
+        this.seal();
+        this.sb.append(s);
+        return this;
+    }
+
+    // Close the innermost open element.
+    fn close(): HtmlBuilder {
+        this.seal();
+        if (this.stack.len == 0) {
+            this.fail("close() with no open element");
+            return this;
+        }
+        let tag = this.stack[this.stack.len - 1];
+        this.stack.pop();
+        this.sb.append("</").append(tag).append(">");
+        return this;
+    }
+
+    // Close every open element, innermost first.
+    fn closeAll(): HtmlBuilder {
+        while (this.stack.len > 0) { this.close(); }
+        return this;
+    }
+
+    // <tag ...>text</tag> in one call — the common case.
+    fn elem(tag: string, content: string): HtmlBuilder {
+        this.open(tag);
+        if (!html_is_void(tag)) {
+            this.text(content);
+            this.close();
+        }
+        return this;
+    }
+
+    // A comment. `--` inside is neutralized, since it would end the comment.
+    fn comment(s: string): HtmlBuilder {
+        this.seal();
+        this.sb.append("<!--").append(s.replace("--", "- -")).append("-->");
+        return this;
+    }
+
+    // `<!doctype html>`.
+    fn doctype(): HtmlBuilder {
+        this.seal();
+        this.sb.append("<!doctype html>");
+        return this;
+    }
+
+    // Everything written so far, with any tag in progress sealed. Unclosed
+    // elements are *not* closed for you — call closeAll() if that is what you
+    // want; silently guessing would hide a real structural bug.
+    fn toString(): string {
+        this.seal();
+        return this.sb.toString();
+    }
+}
+
+export fn htmlBuilder(): HtmlBuilder { return new HtmlBuilder(256); }
+export fn htmlBuilderCap(cap: int): HtmlBuilder { return new HtmlBuilder(cap); }
+
+// ---- small helpers ---------------------------------------------------------
+
+// `<tag>escaped text</tag>`, or `<tag>` for a void element.
+export fn html_tag(tag: string, content: string): string {
+    let h = new HtmlBuilder(content.len + 32);
+    h.elem(tag, content);
+    return h.toString();
+}
+
+// A complete minimal document, for the "render one page" case.
+export fn html_document(title: string, bodyHtml: string): string {
+    let h = new HtmlBuilder(bodyHtml.len + 256);
+    h.doctype();
+    h.open("html").attr("lang", "en");
+    h.open("head");
+    h.open("meta").attr("charset", "utf-8");
+    h.open("meta").attr("name", "viewport").attr("content", "width=device-width, initial-scale=1");
+    h.elem("title", title);
+    h.close();
+    h.open("body");
+    h.raw(bodyHtml);
+    h.closeAll();
+    return h.toString();
+}
+
+// Strip every tag, leaving decoded text. A crude reader's view of a fragment,
+// not a sanitizer: do not feed the result back into a page as markup.
+export fn html_strip_tags(s: string): string {
+    let sb = new StringBuilder(s.len);
+    let i = 0;
+    let depth = 0;
+    let runStart = 0;
+    while (i < s.len) {
+        let c = s[i];
+        if (c == 60) {                                        // '<'
+            if (depth == 0 && i > runStart) { sb.append(s.slice(runStart, i)); }
+            depth += 1;
+        } else {
+            if (c == 62 && depth > 0) {                       // '>'
+                depth -= 1;
+                runStart = i + 1;
+            }
+        }
+        i += 1;
+    }
+    if (depth == 0 && s.len > runStart) { sb.append(s.slice(runStart, s.len)); }
+    return html_unescape(sb.toString());
+}
+
+fn index_at(s: string, sub: string, at: int): int {
+    if (at >= s.len) { return -1; }
+    let rel = s.slice(at, s.len).index_of(sub);
+    if (rel < 0) { return -1; }
+    return at + rel;
+}
+
+fn hex_val(c: int): int {
+    if (c >= 48 && c <= 57) { return c - 48; }
+    if (c >= 97 && c <= 102) { return c - 87; }
+    if (c >= 65 && c <= 70) { return c - 55; }
+    return -1;
+}
+
+fn utf8_encode(cp: int): string {
+    let b = bytes(5);
+    let n = 0;
+    if (cp < 0x80) {
+        b[0] = cp as byte;
+        n = 1;
+    } else {
+        if (cp < 0x800) {
+            b[0] = (0xC0 | (cp >> 6)) as byte;
+            b[1] = (0x80 | (cp & 0x3F)) as byte;
+            n = 2;
+        } else {
+            if (cp < 0x10000) {
+                b[0] = (0xE0 | (cp >> 12)) as byte;
+                b[1] = (0x80 | ((cp >> 6) & 0x3F)) as byte;
+                b[2] = (0x80 | (cp & 0x3F)) as byte;
+                n = 3;
+            } else {
+                b[0] = (0xF0 | (cp >> 18)) as byte;
+                b[1] = (0x80 | ((cp >> 12) & 0x3F)) as byte;
+                b[2] = (0x80 | ((cp >> 6) & 0x3F)) as byte;
+                b[3] = (0x80 | (cp & 0x3F)) as byte;
+                n = 4;
+            }
+        }
+    }
+    return strbytes(b, n);
+}
