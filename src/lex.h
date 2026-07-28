@@ -48,5 +48,6 @@ void lex_init(Lexer *lx, const char *file, const char *src);
 void lex_next(Lexer *lx);          /* advance lx->tok */
 Token *lex_peek(Lexer *lx);        /* lookahead one token */
 const char *tok_desc(TokKind k);   /* for error messages */
+const char *tok_keyword(TokKind k); /* the spelling if k is a keyword, else NULL */
 
 #endif

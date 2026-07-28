@@ -254,6 +254,15 @@ Token *lex_peek(Lexer *lx) {
     return &lx->ahead;
 }
 
+/* Reverse the keywords table: the spelling for a keyword token, else NULL.
+   Reads the same table the lexer matches against, so a keyword added there can
+   never go missing from a diagnostic. */
+const char *tok_keyword(TokKind k) {
+    for (size_t i = 0; i < sizeof keywords / sizeof *keywords; i++)
+        if (keywords[i].kind == k) return keywords[i].name;
+    return NULL;
+}
+
 const char *tok_desc(TokKind k) {
     switch (k) {
     case T_EOF: return "end of file";
@@ -269,6 +278,12 @@ const char *tok_desc(TokKind k) {
     case T_DOTDOT: return "'..'"; case T_ARROW: return "'=>'";
     case T_ASSIGN: return "'='"; case T_EQ: return "'=='";
     case T_FN: return "'fn'"; case T_LET: return "'let'";
-    default: return "token";
+    default: break;
     }
+    /* Every other keyword describes itself. Without this the fallback below
+       reported a bare "token", which told the reader nothing about what the
+       parser actually choked on. */
+    const char *kw = tok_keyword(k);
+    if (kw) return arena_printf(&g_arena, "'%s'", kw);
+    return "token";
 }

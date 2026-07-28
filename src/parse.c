@@ -33,8 +33,16 @@ static void expect_gt(Parser *p) {
 }
 
 static const char *expect_ident(Parser *p) {
-    if (cur(p) != T_IDENT)
+    if (cur(p) != T_IDENT) {
+        /* Naming something after a keyword is the common way to land here —
+           `from` and `new` are the ones that bite, being ordinary words in a
+           from/to or old/new pair. Say which word and why, rather than leaving
+           the reader to work out that an innocuous-looking name is reserved. */
+        const char *kw = tok_keyword(cur(p));
+        if (kw)
+            fatal_at(ploc(p), "'%s' is a keyword and cannot be used as a name", kw);
         fatal_at(ploc(p), "expected identifier, got %s", tok_desc(cur(p)));
+    }
     const char *s = p->lx.tok.ident;
     advance(p);
     return s;
