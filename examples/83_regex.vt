@@ -1,0 +1,93 @@
+// vyto/regex — a tour of pattern matching, backed by PCRE2.
+//
+// The fixture at tests/fixtures/regex_match.vt is the exhaustive coverage,
+// including every soft-failure path. This is the narrative version: one small
+// task done end to end, in the shape you would actually write it.
+//
+// The task is a log triage pass — parse lines, count what happened, redact the
+// personal data, and split a config value. That covers named groups, findAll,
+// replaceAll and split without inventing anything artificial.
+//
+// Nothing here reads a clock, a file or the environment, so the output is
+// fixed and the example is golden-testable.
+
+import { Regex, rx_find, rx_replace_all, RX_MULTILINE } from "vyto/regex";
+
+fn main() {
+    let log = "2026-07-28 ERROR  db  timeout contacting shard 3\n" +
+              "2026-07-28 WARN   web bob@example.com retried\n" +
+              "2026-07-28 ERROR  web carol@example.org gave up\n" +
+              "2026-07-28 INFO   db  compaction finished";
+
+    // ---- parse with named groups ----
+    // A named group reads better than $3 at the call site and survives someone
+    // adding a capture in the middle of the pattern.
+    let line = new Regex("^(?<date>\\S+) +(?<level>\\w+) +(?<sub>\\w+) +(?<msg>.*)$",
+                         RX_MULTILINE);
+    let entries = line.findAll(log);
+    print("parsed " + entries.len + " lines");
+
+    let i = 0;
+    while (i < entries.len) {
+        let e = entries[i];
+        print("  " + e.named("level") + " [" + e.named("sub") + "] " + e.named("msg"));
+        i += 1;
+    }
+
+    // ---- count by level ----
+    // A Regex compiled once and reused is the point: compiling is the
+    // expensive half, matching is cheap.
+    let lvl = new Regex("\\b(ERROR|WARN|INFO)\\b", 0);
+    let hits = lvl.findAll(log);
+    let errors = 0;
+    let warns = 0;
+    let infos = 0;
+    let k = 0;
+    while (k < hits.len) {
+        let t = hits[k].text();
+        if (t == "ERROR") { errors += 1; }
+        if (t == "WARN")  { warns  += 1; }
+        if (t == "INFO")  { infos  += 1; }
+        k += 1;
+    }
+    print("levels: ERROR=" + errors + " WARN=" + warns + " INFO=" + infos);
+
+    // ---- redact ----
+    // Replacement syntax is PCRE2's: $1 and ${name}, never \1. Everyone gets
+    // this wrong once.
+    let mail = new Regex("(?<user>[\\w.]+)@(?<host>[\\w.]+)", 0);
+    let clean = mail.replaceAll(log, "${user}@REDACTED");
+    let shown = clean.split("\n");
+    print("redacted line 2: " + shown[1]);
+    print("redacted line 3: " + shown[2]);
+
+    // ---- split a config value ----
+    // splitN keeps the tail intact, which is what you want for "key: rest of
+    // the line, commas and all".
+    let setting = "retries=3, timeout=30s, hosts=a;b;c";
+    let fields = new Regex(",\\s*", 0).split(setting);
+    print("fields=" + fields.len + " last=" + fields[2]);
+    let kv = new Regex("=", 0).splitN(fields[2], 2);
+    print("key=" + kv[0] + " value=" + kv[1]);
+
+    // ---- the cached path ----
+    // For a pattern used once, rx_* compiles through a process-local cache so
+    // there is no Regex to hold. Same engine, less ceremony.
+    print("first shard: " + rx_find("shard (\\d+)", log).group(1));
+    print("squashed:    " + rx_replace_all("\\s+", "a  b   c", " "));
+
+    // ---- a bad pattern is data, not a crash ----
+    // Compiling is soft precisely because patterns often come from a config
+    // file or a --filter flag. Using the failed Regex is what panics.
+    let user = new Regex("(unclosed", 0);
+    if (!user.isValid()) {
+        print("bad pattern rejected at offset " + user.errorOffset());
+    }
+
+    // ---- a hostile pattern fails, it does not hang ----
+    // This is the reason vyto/regex sets a match limit on every pattern. The
+    // classic exponential backtracker returns an error in milliseconds.
+    let evil = new Regex("(a+)+$", 0);
+    let m = evil.find("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa!");
+    print("hostile pattern: matched=" + m.matched() + " error=" + m.error());
+}

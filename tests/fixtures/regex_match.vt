@@ -1,0 +1,200 @@
+// vyto/regex — exhaustive coverage, including every soft-failure path.
+//
+// Two rules for anything printed here, both learned the hard way:
+//
+//   Never print PCRE2's own error message text. Upstream rewords those between
+//   releases, which would turn every version bump into a fixture rewrite. Print
+//   our RX_ERR_* classification, isValid(), and errorOffset() instead.
+//
+//   Never print anything that depends on whether JIT is active. jitEnabled() is
+//   false on a hardened runtime, on a TCC build (see native/src/config.h), and
+//   on any target sljit has no backend for, and depth_limit has no effect when
+//   JIT is on because the JIT uses its own stack. Everything below holds either
+//   way; VYTO_REGEX_JIT=0 must produce byte-identical output.
+
+import { Regex, Match, rx_find, rx_test, rx_replace_all, rx_split,
+         rx_cache_clear, rx_cache_count, rx_jit_available,
+         RX_CASELESS, RX_MULTILINE, RX_DOTALL, RX_EXTENDED, RX_BYTES,
+         RX_SUB_UNSET_EMPTY,
+         RX_OK, RX_NO_MATCH, RX_ERR_LIMIT, RX_ERR_UTF } from "vyto/regex";
+
+fn show(m: Match): string {
+    if (!m.matched()) { return "<code " + m.errorCode() + ">"; }
+    return "[" + m.start() + "," + m.end() + "]=" + m.text();
+}
+
+fn main() {
+    print("---- compile: soft failures ----");
+    let bad1 = new Regex("(unclosed", 0);
+    print("unclosed paren: valid=" + bad1.isValid() + " offset=" + bad1.errorOffset() +
+          " hasMessage=" + (bad1.error().len > 0));
+    let bad2 = new Regex("a{3,1}", 0);
+    print("bad quantifier: valid=" + bad2.isValid() + " offset=" + bad2.errorOffset());
+    let bad3 = new Regex("[z-a]", 0);
+    print("bad class:      valid=" + bad3.isValid() + " offset=" + bad3.errorOffset());
+    let good = new Regex("\\d+", 0);
+    print("good pattern:   valid=" + good.isValid() + " offset=" + good.errorOffset() +
+          " error=" + (good.error() == ""));
+
+    print("---- groups ----");
+    let g = new Regex("(\\w+)@(\\w+)\\.(\\w+)", 0);
+    print("groupCount=" + g.groupCount());
+    let m = g.find("write to bob@example.com today");
+    print("match=" + show(m) + " groupCount=" + m.groupCount());
+    print("groups=" + m.groups().len + " g1=" + m.group(1) + " g2=" + m.group(2) +
+          " g3=" + m.group(3));
+    print("offsets g1=[" + m.groupStart(1) + "," + m.groupEnd(1) + "]");
+    print("out of range: group(9)='" + m.group(9) + "' hasGroup(9)=" + m.hasGroup(9) +
+          " groupStart(9)=" + m.groupStart(9));
+
+    print("---- unset optional groups ----");
+    let opt = new Regex("(a)?(b)", 0);
+    let mo = opt.find("b");
+    print("(a)?(b) on 'b': hasGroup(1)=" + mo.hasGroup(1) + " group(1)='" + mo.group(1) +
+          "' start(1)=" + mo.groupStart(1));
+    print("                hasGroup(2)=" + mo.hasGroup(2) + " group(2)=" + mo.group(2));
+
+    print("---- named groups ----");
+    let n = new Regex("(?<user>\\w+)@(?<host>[\\w.]+)", 0);
+    print("names=" + n.names().len + " [" + n.names()[0] + "," + n.names()[1] + "]");
+    let mn = n.find("bob@example.com");
+    print("named user=" + mn.named("user") + " host=" + mn.named("host"));
+    print("hasNamed(user)=" + mn.hasNamed("user") + " hasNamed(nope)=" + mn.hasNamed("nope") +
+          " named(nope)='" + mn.named("nope") + "'");
+    let ng = mn.namedGroups();
+    print("namedGroups: has user=" + ng.has("user") + " host=" + ng.get("host"));
+    let nopt = new Regex("(?<a>x)?(?<b>y)", 0);
+    let mno = nopt.find("y");
+    print("unset named: hasNamed(a)=" + mno.hasNamed("a") +
+          " namedGroups has a=" + mno.namedGroups().has("a"));
+
+    print("---- no match is soft ----");
+    let nm = good.find("no digits here");
+    print("matched=" + nm.matched() + " code=" + nm.errorCode() + " (RX_NO_MATCH=" +
+          RX_NO_MATCH + ") text='" + nm.text() + "'");
+    print("test=" + good.test("no digits here") + " / " + good.test("has 7"));
+
+    print("---- findFrom ----");
+    let ff = new Regex("a", 0);
+    print("find=" + show(ff.find("aXa")) + " findFrom(1)=" + show(ff.findFrom("aXa", 1)));
+    print("findFrom past end=" + show(ff.findFrom("aXa", 99)));
+
+    print("---- findAll ----");
+    let w = new Regex("\\w+", 0);
+    let all = w.findAll("one two three");
+    print("count=" + all.len + " [0]=" + all[0].text() + " [2]=" + all[2].text());
+
+    print("---- findAll with a zero-width pattern ----");
+    let z = new Regex("a*", 0);
+    let za = z.findAll("bab");
+    let i = 0;
+    let acc = "";
+    while (i < za.len) { acc = acc + show(za[i]) + " "; i += 1; }
+    print("a* on 'bab': " + za.len + " matches: " + acc);
+
+    print("---- findAll advances by character, not byte ----");
+    // "héllo" is 5 characters in 6 bytes. An empty pattern matches at every
+    // character boundary plus the end: 6, not 7.
+    let e = new Regex("", 0);
+    print("empty on 'héllo': " + e.findAll("héllo").len + " (5 chars + end)");
+    let uw = new Regex("(\\w+)", 0);
+    let um = uw.find("héllo wörld");
+    print("utf8 word='" + um.text() + "' byteLen=" + um.text().len +
+          " end=" + um.end());
+
+    print("---- embedded NUL survives ----");
+    let nb = bytes(5);
+    nb[0] = 97 as byte; nb[1] = 0 as byte; nb[2] = 98 as byte;
+    nb[3] = 0 as byte;  nb[4] = 99 as byte;
+    let ns = strbytes(nb, 5);
+    let nre = new Regex("b", 0);
+    print("subject len=" + ns.len + " find 'b' at=" + nre.find(ns).start());
+    let npat = strbytes(nb, 3);           // pattern "a\0b"
+    let npre = new Regex(npat, 0);
+    print("pattern with NUL: valid=" + npre.isValid() + " matches=" + npre.test(ns));
+
+    print("---- invalid UTF-8 is soft, RX_BYTES is the way out ----");
+    let ib = bytes(3);
+    ib[0] = 0xff as byte; ib[1] = 0xfe as byte; ib[2] = 0x41 as byte;
+    let inv = strbytes(ib, 3);
+    let iu = uw.find(inv);
+    print("utf mode: matched=" + iu.matched() + " code=" + iu.errorCode() +
+          " (RX_ERR_UTF=" + RX_ERR_UTF + ")");
+    let bw = new Regex("(\\w+)", RX_BYTES);
+    print("RX_BYTES: matched=" + bw.find(inv).matched() + " text=" + bw.find(inv).text());
+
+    print("---- flags ----");
+    print("CASELESS: " + new Regex("abc", RX_CASELESS).test("ABC") +
+          " / " + new Regex("abc", 0).test("ABC"));
+    print("MULTILINE ^: " + new Regex("^b", RX_MULTILINE).find("a\nb").start() +
+          " / no flag=" + new Regex("^b", 0).find("a\nb").matched());
+    print("DOTALL: " + new Regex("a.b", RX_DOTALL).test("a\nb") +
+          " / " + new Regex("a.b", 0).test("a\nb"));
+    print("EXTENDED: " + new Regex("a b  # comment\n c", RX_EXTENDED).test("abc"));
+
+    print("---- replace ----");
+    let r = new Regex("(\\w+)@(\\w+)", 0);
+    print("replace    =" + r.replace("a@b c@d", "<$1>"));
+    print("replaceAll =" + r.replaceAll("a@b c@d", "<$1>"));
+    print("named ref  =" + n.replaceAll("bob@example.com", "${host}/${user}"));
+    print("literal $$ =" + r.replaceAll("a@b", "$$$1"));
+    print("no match   =" + r.replaceAll("nothing here", "X"));
+    let unset = new Regex("(a)?(b)", 0);
+    print("unset empty=" + unset.replaceAllExt("b", "[$1]", RX_SUB_UNSET_EMPTY));
+
+    print("---- replace needing grow-and-retry ----");
+    // The first buffer guess is len + 4*repl + 64; make the result blow past it.
+    let x = new Regex("x", 0);
+    let long = x.replaceAll("xxxxxxxxxx", "0123456789012345678901234567890123456789");
+    print("len=" + long.len + " head=" + long.slice(0, 10));
+
+    print("---- split ----");
+    let comma = new Regex(",", 0);
+    let sp = comma.split("a,b,c");
+    print("count=" + sp.len + " [" + sp[0] + "|" + sp[1] + "|" + sp[2] + "]");
+    let sp2 = comma.splitN("a,b,c,d", 2);
+    print("splitN(2)=" + sp2.len + " [" + sp2[0] + "|" + sp2[1] + "]");
+    let ws = new Regex("\\s+", 0);
+    let sp3 = ws.split("a  b   c");
+    print("whitespace=" + sp3.len + " [" + sp3[0] + "|" + sp3[2] + "]");
+    print("no match  =" + comma.split("abc").len + " [" + comma.split("abc")[0] + "]");
+    print("empty subj=" + comma.split("").len);
+
+    print("---- ReDoS is bounded, not hung ----");
+    // Holds with JIT on and off: match_limit is what binds here.
+    let evil = new Regex("(a+)+$", 0);
+    let hay = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa!";
+    let em = evil.find(hay);
+    print("matched=" + em.matched() + " code=" + em.errorCode() +
+          " (RX_ERR_LIMIT=" + RX_ERR_LIMIT + ") hasMessage=" + (em.error().len > 0));
+    // setLimits is callable in both directions and leaves an ordinary match alone.
+    let sl = new Regex("\\d+", 0);
+    sl.setLimits(500, 500, 1024);
+    print("tight limits, easy pattern: " + show(sl.find("abc 42")));
+    sl.setLimits(1000000, 10000, 16384);
+    print("restored:                   " + show(sl.find("abc 42")));
+
+    print("---- the cached path ----");
+    rx_cache_clear();
+    print("cleared=" + rx_cache_count());
+    print("rx_find=" + rx_find("\\d+", "x42y").text() +
+          " rx_test=" + rx_test("^a", "abc") + "/" + rx_test("^z", "abc"));
+    print("rx_find no match: matched=" + rx_find("\\d+", "none").matched() +
+          " code=" + rx_find("\\d+", "none").errorCode());
+    print("rx_find named=" + rx_find("(?<d>\\d+)", "x42").named("d"));
+    print("rx_replace_all=" + rx_replace_all("\\s+", "a  b   c", "-"));
+    print("rx_split=" + rx_split(",", "a,b,c").len);
+    print("cache=" + rx_cache_count());
+    let k = 0;
+    while (k < 100) { rx_test("zz" + k, "subject"); k += 1; }
+    print("after 100 distinct patterns, cache=" + rx_cache_count() + " (64 slots)");
+    rx_cache_clear();
+    print("cleared=" + rx_cache_count());
+
+    print("---- build facts ----");
+    // Not whether JIT is active, only that the question is answerable — this
+    // must not vary between a JIT and a no-JIT machine.
+    print("jit_available is a bool: " + (rx_jit_available() || !rx_jit_available()));
+    print("RX_OK=" + RX_OK + " RX_NO_MATCH=" + RX_NO_MATCH +
+          " RX_ERR_LIMIT=" + RX_ERR_LIMIT + " RX_ERR_UTF=" + RX_ERR_UTF);
+}

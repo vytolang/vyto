@@ -108,6 +108,9 @@ examples/43_time.vt|43_time|eq|
 examples/44_date.vt|44_date|eq|
 examples/45_os.vt|45_os|out|
 examples/53_datatable.vt|53_datatable|eq|
+examples/83_regex.vt|83_regex|eq|
+tests/fixtures/regex_match.vt|regex_match|eq|
+tests/fixtures/regex_match.vt|regex_match_nojit|eq||VYTO_REGEX_JIT=0
 tests/fixtures/args_echo.vt|args_echo|eq|alpha beta
 tests/fixtures/anim_clock.vt|anim_clock|eq|
 tests/fixtures/condlink_win.vt|condlink_win|eq|

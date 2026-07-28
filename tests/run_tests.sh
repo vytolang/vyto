@@ -418,6 +418,37 @@ else
     fail=1
 fi
 
+# --- vyto/regex: PCRE2 through the shim — groups, named groups, the zero-width
+#     findAll step, embedded NULs, invalid UTF-8, replace's grow-and-retry, and
+#     a hostile pattern hitting the match limit instead of hanging.
+#     Deliberately NOT gated on anything: PCRE2 is vendored under
+#     lib/vyto/regex/native/src/pcre2/ and built from source, so unlike the gfx
+#     block below this can never legitimately skip. The fixture's output is
+#     identical with JIT on and off, so it also holds where sljit has no
+#     backend ---
+got=$(./vytoc run tests/fixtures/regex_match.vt 2>&1)
+if [ "$got" = "$(cat tests/fixtures/regex_match.expected)" ]; then
+    echo "PASS regex_match"
+else
+    echo "FAIL regex_match"
+    echo "--- expected ---"; cat tests/fixtures/regex_match.expected
+    echo "--- got ---"; printf '%s\n' "$got"
+    fail=1
+fi
+
+# --- vyto/regex: the same fixture with the JIT forced off. Guards the
+#     interpreter fallback that a hardened runtime, a TCC build and every
+#     unsupported architecture rely on ---
+got=$(VYTO_REGEX_JIT=0 ./vytoc run tests/fixtures/regex_match.vt 2>&1)
+if [ "$got" = "$(cat tests/fixtures/regex_match.expected)" ]; then
+    echo "PASS regex_match_nojit"
+else
+    echo "FAIL regex_match_nojit"
+    echo "--- expected ---"; cat tests/fixtures/regex_match.expected
+    echo "--- got ---"; printf '%s\n' "$got"
+    fail=1
+fi
+
 # --- vyto/gfx: blend2d Canvas -> blitPtr (gated on the prebuilt lib) ---
 if [ -f lib/vyto/gfx/native/linux-x64/libblend2d.so ]; then
     gfx_bin=apps/gfxdemo/.vyto-cache/gfxdemo_test
