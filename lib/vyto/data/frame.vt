@@ -25,6 +25,7 @@
 
 import { bufReader, file_size } from "vyto/io/file";
 import { json_parse, json_each, JsonValue } from "vyto/util/json";
+import { csv_each_file_with, csv_dialect, Dialect } from "vyto/util/csv";
 
 extern "C" {
     fn ct_new(ncap: i64): rawptr;
@@ -232,44 +233,49 @@ export fn dataFrame(cap: int): DataFrame { return new DataFrame(cap); }
 // precision, or dictionary-encoded text — as rows stream in. With `hasHeader`
 // the first line names the columns; otherwise they are col0, col1, … . Bounded
 // memory.
+//
+// Records come from vyto/util/csv rather than line.split(","), so a quoted
+// field containing a comma, a doubled quote or a newline loads correctly — the
+// three things the old split-based reader got wrong on any file a spreadsheet
+// produced.
 export fn loadCsv(path: string, hasHeader: bool): DataFrame {
+    return loadCsvWith(path, hasHeader, csv_dialect());
+}
+
+// loadCsv for a non-comma flavour: pass csv_tsv(), csv_semicolon(), or a
+// Dialect from csv_sniff().
+export fn loadCsvWith(path: string, hasHeader: bool, d: Dialect): DataFrame {
     let df = new DataFrame(0);
-    let r = bufReader(path);
-    if (r == null) { return df; }
-
     let names: string[] = [];
-    if (hasHeader && !r.eof()) { names = r.readLine().split(","); }
-
-    // pull the first data row to drive type inference + a capacity estimate
-    let first: string[] = [];
-    let firstLen = 0;
-    while (!r.eof() && first.len == 0) {
-        let line = r.readLine();
-        if (line == "" && r.eof()) { break; }
-        if (line.trim() == "") { continue; }
-        first = line.split(",");
-        firstLen = line.len;
-    }
-    if (first.len == 0) { r.close(); return df; }
-
-    for (let i in 0..first.len) {
-        let nm = "col" + str(i);
-        if (i < names.len) { nm = names[i].trim(); }
-        df.addColumn(nm, CK_AUTO);   // engine infers + narrows the kind from the data
-    }
-
-    // reserve from file size / first-row byte length (a rough row estimate)
-    let sz = file_size(path);
-    if (sz > 0 && firstLen > 0) { df.reserve(sz / (firstLen + 1) + 16); }
-
-    append_csv_row(df, first);
-    while (!r.eof()) {
-        let line = r.readLine();
-        if (line == "" && r.eof()) { break; }
-        if (line.trim() == "") { continue; }
-        append_csv_row(df, line.split(","));
-    }
-    r.close();
+    // Closures capture by value, so the two pieces of mutable state ride in
+    // 1-element arrays (the json_each idiom); `df` and `names` are reference
+    // types, so mutating through them is visible without one.
+    let wantHeader = [hasHeader];
+    let sized = [false];
+    csv_each_file_with(path, d, (row) => {
+        if (wantHeader[0]) {
+            wantHeader[0] = false;
+            for (let i in 0..row.len) { names.push(row[i].trim()); }
+        } else {
+            if (df.ncol() == 0) {
+                for (let i in 0..row.len) {
+                    let nm = "col" + str(i);
+                    if (i < names.len) { nm = names[i]; }
+                    df.addColumn(nm, CK_AUTO);   // engine infers + narrows from the data
+                }
+            }
+            if (!sized[0]) {
+                sized[0] = true;
+                // Reserve from file size / first-row byte length — a rough row
+                // count, so the column buffers grow once rather than log n times.
+                let rowLen = row.len;    // one delimiter per field, plus the newline
+                for (let i in 0..row.len) { rowLen += row[i].len; }
+                let sz = file_size(path);
+                if (sz > 0 && rowLen > 0) { df.reserve(sz / rowLen + 16); }
+            }
+            append_csv_row(df, row);
+        }
+    });
     return df;
 }
 

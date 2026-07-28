@@ -25,6 +25,8 @@ import { DataFrame, CK_STR, CK_CAT, CK_BOOL, CK_F64, CK_F32,
          OP_EQ, OP_LT, OP_LE, OP_GT, OP_GE, OP_CONTAINS,
          AGG_SUM, AGG_MIN, AGG_MAX, AGG_AVG, AGG_COUNT } from "vyto/data/frame";
 import { SIDE_RIGHT, SIDE_BOTTOM } from "vyto/ui/scrollbar";
+import { csvWriter } from "vyto/util/csv";
+import { StringBuilder } from "vyto/util/text";
 
 const DT_SEARCH_H: float = 34.0;
 const DT_HDR_H: float = 30.0;
@@ -584,69 +586,54 @@ export class DataTable extends Widget {
 
     // ---- CSV export / clipboard copy -------------------------------------
 
-    // Quote a CSV field when it contains a comma, quote, or newline (RFC-4180).
-    fn csv_field(v: string): string {
-        let needs = false;
-        for (let i in 0..v.len) {
-            let ch = v[i];
-            if (ch == 44 || ch == 34 || ch == 10 || ch == 13) { needs = true; }
-        }
-        if (!needs) { return v; }
-        let out = "\"";
-        for (let i in 0..v.len) {
-            if (v[i] == 34) { out = out + "\""; }   // escape " as ""
-            out = out + v.slice(i, i + 1);
-        }
-        return out + "\"";
-    }
-
     // The current view (visible rows × visible columns) as CSV text, header
     // included. Uses each column's formatter, so it matches what's on screen.
+    //
+    // Quoting and the O(n) build both come from vyto/util/csv — this used to
+    // carry its own RFC-4180 quoter and concatenate the whole table one field
+    // at a time, which is quadratic in the number of cells.
     fn exportCsv(): string {
-        let out = "";
-        let firstCol = true;
+        let w = csvWriter();
         for (let ci in 0..this.cols.len) {
             let c = this.cols[ci];
-            if (!c.visible) { continue; }
-            if (!firstCol) { out = out + ","; }
-            out = out + this.csv_field(c.title);
-            firstCol = false;
+            if (c.visible) { w.field(c.title); }
         }
-        out = out + "\n";
+        w.endRow();
         let vlen = this.df.viewLen();
         for (let r in 0..vlen) {
-            firstCol = true;
             for (let ci in 0..this.cols.len) {
                 let c = this.cols[ci];
-                if (!c.visible) { continue; }
-                if (!firstCol) { out = out + ","; }
-                out = out + this.csv_field(this.cell_text(r, c));
-                firstCol = false;
+                if (c.visible) { w.field(this.cell_text(r, c)); }
             }
-            out = out + "\n";
+            w.endRow();
         }
-        return out;
+        return w.toString();
     }
 
     // TSV of the selected rows (or the active row) × visible columns.
+    //
+    // Deliberately *not* routed through vyto/util/csv, unlike exportCsv above:
+    // this text goes to the clipboard for a spreadsheet to paste, and a quoted
+    // field pastes as literal quote characters. Fields go out raw. The
+    // StringBuilder is the only thing borrowed, to keep the build O(n).
     fn selectionTsv(): string {
         let rows: int[] = [];
         let vlen = this.df.viewLen();
         for (let i in 0..vlen) { if (this.is_selected(i)) { rows.push(i); } }
         if (rows.len == 0 && this.selected >= 0) { rows.push(this.selected); }
-        let out = "";
+        let sb = new StringBuilder(256);
         for (let ri in 0..rows.len) {
             let firstCol = true;
             for (let ci in 0..this.cols.len) {
                 let c = this.cols[ci];
                 if (!c.visible) { continue; }
-                if (!firstCol) { out = out + "\t"; }
-                out = out + this.cell_text(rows[ri], c);
+                if (!firstCol) { sb.append("\t"); }
+                sb.append(this.cell_text(rows[ri], c));
                 firstCol = false;
             }
-            out = out + "\n";
+            sb.append("\n");
         }
-        return out;
+        return sb.toString();
     }
 
     // Copy the selection to the system clipboard (TSV). Returns the text copied.
