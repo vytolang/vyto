@@ -1,0 +1,84 @@
+// vyto/validator/pattern — the validation rules that need a regex engine.
+//
+//     import { validation } from "vyto/validator";
+//     import { email, ipv4, pattern } from "vyto/validator/pattern";
+//
+//     let v = validation();
+//     email(v.check(form.get("email"), field: "email").required().maxChars(254));
+//     pattern(v.check(sku, field: "sku"), "^[A-Z]{3}-\\d{4}$");
+//
+// These live apart from the core on purpose. Importing vyto/regex compiles the
+// 30 vendored PCRE2 translation units into your program, and a form that only
+// needs "required, 2 to 40 characters" should not pay for a regex engine. Vyto
+// compiles only what you import, so the split makes that cost opt-in.
+//
+// They are free functions taking and returning a StringCheck rather than
+// methods, because Vyto has no extension methods and putting them on
+// StringCheck itself would force the core module to import vyto/regex — exactly
+// what the split exists to avoid. They still chain, just inside-out:
+//
+//     email(v.check(s).required()).value()
+//
+// Everything else about them matches the core: they short-circuit on a check
+// that has already failed or been skipped, and they record at most one error.
+
+import { StringCheck, V_NOT_EMAIL, V_NOT_IPV4, V_NO_MATCH } from "vyto/validator";
+import { rx_is_email_loose, rx_is_ipv4, rx_full_match, rx_test } from "vyto/regex";
+
+// A shape check for an email address, and nothing more.
+//
+// Accepts first.last@sub.example.co.uk, user+tag@x.io and internationalised
+// domains; rejects a missing @, whitespace, a domain with no dot, a trailing
+// dot and consecutive dots in the domain. It is not an RFC 5322 validator and
+// not a deliverability check — the only way to know an address works is to send
+// to it. See lib/vyto/regex/README.md for exactly what it does and does not
+// accept.
+export fn email(c: StringCheck): StringCheck {
+    if (c.done()) { return c; }
+    if (!rx_is_email_loose(c.raw)) {
+        c.fail(V_NOT_EMAIL, "must be an email address");
+    }
+    return c;
+}
+
+// Dotted-quad IPv4 with real range checking: 256.1.1.1 is rejected, and so are
+// leading zeros, which some resolvers read as octal.
+export fn ipv4(c: StringCheck): StringCheck {
+    if (c.done()) { return c; }
+    if (!rx_is_ipv4(c.raw)) {
+        c.fail(V_NOT_IPV4, "must be an IPv4 address");
+    }
+    return c;
+}
+
+// The whole value must match `re`, anchored at both ends — `\d+` will not pass
+// on "a1b". Use `contains`-style patterns explicitly if that is what you want.
+//
+// A pattern that will not compile panics: it is a literal in your source, so a
+// bad one is a bug in the program rather than bad input.
+export fn pattern(c: StringCheck, re: string): StringCheck {
+    if (c.done()) { return c; }
+    if (!rx_full_match(re, c.raw)) {
+        c.fail(V_NO_MATCH, "is not in the expected format");
+    }
+    return c;
+}
+
+// The value must contain a match somewhere, rather than matching in full.
+export fn matches(c: StringCheck, re: string): StringCheck {
+    if (c.done()) { return c; }
+    if (!rx_test(re, c.raw)) {
+        c.fail(V_NO_MATCH, "is not in the expected format");
+    }
+    return c;
+}
+
+// The value must NOT contain a match. Useful for cheap denylists — "no angle
+// brackets", "no control characters".
+export fn notMatches(c: StringCheck, re: string): StringCheck {
+    if (c.done()) { return c; }
+    if (rx_test(re, c.raw)) {
+        c.fail(V_NO_MATCH, "contains disallowed characters");
+    }
+    return c;
+}

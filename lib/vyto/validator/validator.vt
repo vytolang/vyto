@@ -1,0 +1,654 @@
+// vyto/validator — validation for input and literals.
+//
+//     import { validation, v_str } from "vyto/validator";
+//
+//     let v = validation();
+//     let port = v.check(cfg.get("port"), field: "port").asInt().between(1, 65535).valueOr(8080);
+//     v.check(form.get("name"), field: "name").required().trim().betweenChars(2, 40);
+//     if (!v.ok()) { for (let e in v.messages()) { print(e); } }
+//
+//     v_str("hello").minChars(3).ok();          // standalone, no accumulator
+//
+// Scope is deliberately narrow: **values and literals**. Not structs, not
+// classes, not nested trees. The compiler already checks your types; what needs
+// checking is what crosses the boundary, and there the data is flat text — CLI
+// flags, query strings, form fields, INI/TOML settings, environment variables.
+//
+// Coercion is part of the chain and changes its type:
+//
+//     v.check("42").asFloat().min(10.0).max(100.0)
+//
+// `asFloat()` converts, records an error if it cannot, and hands the rest of the
+// chain to a float-typed check — so `.min()` takes a float and `.email()` is not
+// even in scope. Misuse is a compile error, not a runtime one.
+//
+// Errors follow the library-wide "panic hard, sentinel soft" rule. Bad input is
+// data and never panics; you get a ValidationError. The only panic would be a
+// malformed *program*.
+//
+// A failing rule short-circuits: the rest of the chain becomes a no-op and only
+// the first error for that value is recorded. An empty required field reports
+// "required", not also "too short" and "not an email".
+//
+// Cost: this module pulls in vyto/cli (pure Vyto, free) and vyto/util (four
+// small native shims, shared across every vyto/util module). It deliberately
+// does NOT import vyto/regex — the three rules that need a regex engine live in
+// vyto/validator/pattern, so a program that only needs length and range checks
+// does not compile 30 translation units of PCRE2.
+
+import { parse_int, parse_float, parse_bool } from "vyto/cli";
+import { url_parse } from "vyto/util/url";
+
+// ---- error codes ---------------------------------------------------------
+//
+// The codes are the stable API; the English messages beside them are a
+// convenience layer, so a translated message table can be layered behind them
+// later without breaking callers who branch on the code.
+export const V_REQUIRED:   int = 1;
+export const V_BLANK:      int = 2;
+export const V_TOO_SHORT:  int = 3;
+export const V_TOO_LONG:   int = 4;
+export const V_NOT_IN_SET: int = 5;
+export const V_NO_MATCH:   int = 6;
+export const V_NOT_INT:    int = 7;
+export const V_NOT_FLOAT:  int = 8;
+export const V_NOT_BOOL:   int = 9;
+export const V_TOO_SMALL:  int = 10;
+export const V_TOO_LARGE:  int = 11;
+export const V_NOT_EMAIL:  int = 12;
+export const V_NOT_URL:    int = 13;
+export const V_NOT_UUID:   int = 14;
+export const V_NOT_IPV4:   int = 15;
+export const V_NOT_DATE:   int = 16;
+export const V_NOT_TRUE:   int = 17;
+export const V_NOT_FALSE:  int = 18;
+export const V_CUSTOM:     int = 19;
+
+// Number of Unicode code points in a UTF-8 string.
+//
+// Length rules MUST use this rather than `s.len`, which counts bytes: "José" is
+// 5 bytes and 4 characters, and any CJK input would blow a byte-based limit
+// immediately. Counting continuation bytes needs no ICU and no provisioning.
+//
+// Code points are not graphemes — "é" written as e + U+0301 counts as 2 here.
+// For grapheme-exact counting use unicode.graphemes from vyto/intl, which costs
+// an ICU dependency; for input length limits this is the right trade.
+export fn charCount(s: string): int {
+    let n = 0;
+    let i = 0;
+    while (i < s.len) {
+        if ((s[i] & 192) != 128) { n += 1; }    // 0xC0 / 0x80
+        i += 1;
+    }
+    return n;
+}
+
+// 8-4-4-4-12 hex, the canonical UUID shape.
+//
+// Implemented here rather than calling uuid_is_valid from vyto/util/uuid,
+// because that package carries its own CSPRNG shim (and a bcrypt link on
+// Windows) that a pure format check has no need of. Use vyto/util/uuid when you
+// need to parse, generate or inspect a UUID's version.
+fn looks_like_uuid(s: string): bool {
+    if (s.len != 36) { return false; }
+    let i = 0;
+    while (i < 36) {
+        let c = s[i];
+        if (i == 8 || i == 13 || i == 18 || i == 23) {
+            if (c != 45) { return false; }                       // '-'
+        } else {
+            let hex = (c >= 48 && c <= 57) || (c >= 97 && c <= 102) ||
+                      (c >= 65 && c <= 70);
+            if (!hex) { return false; }
+        }
+        i += 1;
+    }
+    return true;
+}
+
+// Strict YYYY-MM-DD, range-checked against the real calendar including leap
+// years. Rejects the shape as well as the values, so "28-07-2026" fails rather
+// than being read as the year 28.
+fn is_iso_date(s: string): bool {
+    if (s.len != 10) { return false; }
+    let i = 0;
+    while (i < 10) {
+        let c = s[i];
+        if (i == 4 || i == 7) {
+            if (c != 45) { return false; }                   // '-'
+        } else if (c < 48 || c > 57) {
+            return false;
+        }
+        i += 1;
+    }
+    let y = (s[0] - 48) * 1000 + (s[1] - 48) * 100 + (s[2] - 48) * 10 + (s[3] - 48);
+    let m = (s[5] - 48) * 10 + (s[6] - 48);
+    let d = (s[8] - 48) * 10 + (s[9] - 48);
+    if (m < 1 || m > 12 || d < 1) { return false; }
+
+    let len = 31;
+    if (m == 4 || m == 6 || m == 9 || m == 11) { len = 30; }
+    if (m == 2) {
+        let leap = (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0);
+        len = 28;
+        if (leap) { len = 29; }
+    }
+    return d <= len;
+}
+
+// One failure. `value` is the input as it stood when the rule ran, which is
+// what you want in a log line and never what you want in an HTTP response.
+export class ValidationError {
+    field: string;
+    code: int;
+    message: string;
+    value: string;
+
+    // "field: message", or just the message for an unlabelled check.
+    // An unset string field is null rather than "", so both are checked.
+    fn describe(): string {
+        if (this.field == null || this.field == "") { return this.message; }
+        return this.field + ": " + this.message;
+    }
+}
+
+// A user-defined rule. A class rather than a closure because closures in v0.1
+// cannot capture `this`, cannot be assigned to, and cannot nest — so a rule
+// that needs configuration cannot be written as one. Subclass this, hold
+// whatever state you need as fields.
+export class Rule {
+    virtual fn test(s: string): bool { return true; }
+    virtual fn code(): int { return V_CUSTOM; }
+    virtual fn message(): string { return "is not valid"; }
+}
+
+// Collects failures across several independent values, so a form reports every
+// bad field at once instead of stopping at the first.
+export class Validation {
+    errs: ValidationError[];
+
+    fn init() { this.errs = []; }
+
+    // Start a chain. The label is optional and trailing so the common one-value
+    // case reads as `v.check(s)`; name it for form fields: `v.check(s, field: "email")`.
+    fn check(value: string, field: string = ""): StringCheck {
+        let c = new StringCheck();
+        c.field = field;
+        c.raw = value;
+        c.parent = this;
+        c.errs = [];
+        return c;
+    }
+
+    fn ok(): bool { return this.errs.len == 0; }
+    fn count(): int { return this.errs.len; }
+    fn errors(): ValidationError[] { return this.errs; }
+
+    // Null when everything passed.
+    fn first(): ValidationError {
+        if (this.errs.len == 0) { return null; }
+        return this.errs[0];
+    }
+
+    fn messages(): string[] {
+        let out: string[] = [];
+        let i = 0;
+        while (i < this.errs.len) { out.push(this.errs[i].describe()); i += 1; }
+        return out;
+    }
+
+    // Every failure recorded against one field name.
+    fn forField(f: string): ValidationError[] {
+        let out: ValidationError[] = [];
+        let i = 0;
+        while (i < this.errs.len) {
+            if (this.errs[i].field == f) { out.push(this.errs[i]); }
+            i += 1;
+        }
+        return out;
+    }
+
+    fn hasField(f: string): bool { return this.forField(f).len > 0; }
+
+    fn clear() { this.errs = []; }
+}
+
+export fn validation(): Validation { return new Validation(); }
+
+// Shared state and the rules that apply whatever the value's type.
+//
+// Two distinct stop conditions, and keeping them apart is what lets an optional
+// field be absent without becoming an error:
+//   failed  — a rule rejected the value; recorded once, rest of chain no-ops
+//   skipped — optional() and the value was empty; NOT an error, chain no-ops
+export class Check {
+    field: string;
+    raw: string;
+    failed: bool;
+    skipped: bool;
+    parent: Validation;          // null when standalone
+    errs: ValidationError[];     // this check's own failures
+
+    // True once the chain has stopped, for whichever reason. Every rule opens
+    // with this.
+    fn done(): bool { return this.failed || this.skipped; }
+
+    // Did this check pass? An optional value that was absent counts as passing.
+    fn ok(): bool { return !this.failed; }
+
+    // Was the value absent, with optional() allowing it?
+    fn absent(): bool { return this.skipped; }
+
+    fn error(): ValidationError {
+        if (this.errs.len == 0) { return null; }
+        return this.errs[0];
+    }
+
+    fn message(): string {
+        if (this.errs.len == 0) { return ""; }
+        return this.errs[0].message;
+    }
+
+    // Record a failure. Idempotent: only the first one for a chain is kept,
+    // which is what makes short-circuiting produce exactly one error.
+    fn fail(code: int, msg: string) {
+        if (this.failed) { return; }
+        this.failed = true;
+        let e = new ValidationError();
+        e.field = this.field;
+        e.code = code;
+        e.message = msg;
+        e.value = this.raw;
+        this.errs.push(e);
+        if (this.parent != null) { this.parent.errs.push(e); }
+    }
+
+    // Must be present and non-empty.
+    builder fn required() {
+        if (this.done()) { return this; }
+        if (this.raw == "") { this.fail(V_REQUIRED, "is required"); }
+        return this;
+    }
+
+    // An empty value is allowed and silently skips the rest of the chain.
+    // A present value runs every rule as normal.
+    builder fn optional() {
+        if (this.done()) { return this; }
+        if (this.raw == "") { this.skipped = true; }
+        return this;
+    }
+
+    builder fn custom(r: Rule) {
+        if (this.done()) { return this; }
+        if (!r.test(this.raw)) { this.fail(r.code(), r.message()); }
+        return this;
+    }
+
+    // The closure form, for a rule with no state. Must be assigned to a typed
+    // target before the call — an inline arrow cannot be inferred here.
+    builder fn customFn(f: fn(string): bool, code: int, msg: string) {
+        if (this.done()) { return this; }
+        if (!f(this.raw)) { this.fail(code, msg); }
+        return this;
+    }
+}
+
+// Copy chain state into the check a coercion hands off to. The error array is
+// shared by reference, so error() on the new link still sees a failure recorded
+// before the transition.
+fn carry(src: Check, dst: Check) {          // 'from' is a keyword
+    dst.field = src.field;
+    dst.raw = src.raw;
+    dst.parent = src.parent;
+    dst.failed = src.failed;
+    dst.skipped = src.skipped;
+    dst.errs = src.errs;
+}
+
+export class StringCheck extends Check {
+
+    // ---- shape ----
+
+    builder fn notBlank() {
+        if (this.done()) { return this; }
+        if (this.raw.trim() == "") { this.fail(V_BLANK, "cannot be blank"); }
+        return this;
+    }
+
+    // The one transform. Input arrives with stray whitespace and length rules
+    // should run on what the user meant, so this is worth having in the chain.
+    builder fn trim() {
+        if (this.done()) { return this; }
+        this.raw = this.raw.trim();
+        return this;
+    }
+
+    // ---- length, in characters ----
+
+    builder fn minChars(n: int) {
+        if (this.done()) { return this; }
+        if (charCount(this.raw) < n) {
+            this.fail(V_TOO_SHORT, "must be at least " + n + " characters");
+        }
+        return this;
+    }
+
+    builder fn maxChars(n: int) {
+        if (this.done()) { return this; }
+        if (charCount(this.raw) > n) {
+            this.fail(V_TOO_LONG, "must be at most " + n + " characters");
+        }
+        return this;
+    }
+
+    builder fn exactChars(n: int) {
+        if (this.done()) { return this; }
+        let c = charCount(this.raw);
+        if (c < n) { this.fail(V_TOO_SHORT, "must be exactly " + n + " characters"); }
+        else if (c > n) { this.fail(V_TOO_LONG, "must be exactly " + n + " characters"); }
+        return this;
+    }
+
+    builder fn betweenChars(lo: int, hi: int) {
+        if (this.done()) { return this; }
+        let c = charCount(this.raw);
+        if (c < lo) { this.fail(V_TOO_SHORT, "must be at least " + lo + " characters"); }
+        else if (c > hi) { this.fail(V_TOO_LONG, "must be at most " + hi + " characters"); }
+        return this;
+    }
+
+    // ---- length, in bytes ----
+    //
+    // For a real byte budget: a database column, a protocol field, a fixed
+    // buffer. Not for "how long is this name" — use the character rules.
+
+    builder fn minBytes(n: int) {
+        if (this.done()) { return this; }
+        if (this.raw.len < n) { this.fail(V_TOO_SHORT, "must be at least " + n + " bytes"); }
+        return this;
+    }
+
+    builder fn maxBytes(n: int) {
+        if (this.done()) { return this; }
+        if (this.raw.len > n) { this.fail(V_TOO_LONG, "must be at most " + n + " bytes"); }
+        return this;
+    }
+
+    // ---- membership and substrings ----
+
+    builder fn oneOf(vals: string[]) {
+        if (this.done()) { return this; }
+        let i = 0;
+        while (i < vals.len) {
+            if (vals[i] == this.raw) { return this; }
+            i += 1;
+        }
+        this.fail(V_NOT_IN_SET, "must be one of: " + vals.join(", "));
+        return this;
+    }
+
+    builder fn startsWith(p: string) {
+        if (this.done()) { return this; }
+        if (!this.raw.starts_with(p)) { this.fail(V_NO_MATCH, "must start with '" + p + "'"); }
+        return this;
+    }
+
+    builder fn endsWith(p: string) {
+        if (this.done()) { return this; }
+        if (!this.raw.ends_with(p)) { this.fail(V_NO_MATCH, "must end with '" + p + "'"); }
+        return this;
+    }
+
+    builder fn contains(sub: string) {
+        if (this.done()) { return this; }
+        if (!this.raw.contains(sub)) { this.fail(V_NO_MATCH, "must contain '" + sub + "'"); }
+        return this;
+    }
+
+    // ---- formats that need no regex engine ----
+
+    // An *absolute* URL: scheme and host both present.
+    //
+    // Deliberately stricter than url_is_valid, which parses RFC 3986 references
+    // and so accepts "abc" as a perfectly good relative path. When a form asks
+    // for a URL it means an absolute one, and accepting a bare word would be
+    // the kind of silent pass a validator exists to prevent.
+    builder fn url() {
+        if (this.done()) { return this; }
+        let u = url_parse(this.raw);
+        if (!u.isValid() || u.scheme == "" || u.host == "") {
+            this.fail(V_NOT_URL, "must be an absolute URL");
+        }
+        return this;
+    }
+
+    builder fn uuid() {
+        if (this.done()) { return this; }
+        if (!looks_like_uuid(this.raw)) { this.fail(V_NOT_UUID, "must be a UUID"); }
+        return this;
+    }
+
+    // A real calendar date written as YYYY-MM-DD: 2026-02-30 and 28-07-2026 are
+    // both rejected.
+    //
+    // Checked here rather than through date_parse, which is strptime-backed and
+    // deliberately lenient — it reads "2026-02-30" as February 30th without
+    // complaint, and "28-07-2026" as the year 28. Lenient is right for parsing
+    // input you have already decided to trust; it is wrong for deciding whether
+    // to trust it.
+    builder fn isoDate() {
+        if (this.done()) { return this; }
+        if (!is_iso_date(this.raw)) {
+            this.fail(V_NOT_DATE, "must be a date as YYYY-MM-DD");
+        }
+        return this;
+    }
+
+    // ---- coercion: these change the type of the chain ----
+    //
+    // Not builders — a builder returns the receiver and cannot declare a return
+    // type. Each hands the chain to a check whose rules match the new type.
+
+    fn asInt(): IntCheck {
+        let c = new IntCheck();
+        carry(this, c);
+        if (c.done()) { return c; }
+        let out: int[] = [0];
+        let got = parse_int(this.raw, out);
+        if (!got) { c.fail(V_NOT_INT, "must be a whole number"); return c; }
+        c.val = out[0];
+        return c;
+    }
+
+    fn asFloat(): FloatCheck {
+        let c = new FloatCheck();
+        carry(this, c);
+        if (c.done()) { return c; }
+        let out: float[] = [0.0];
+        let got = parse_float(this.raw, out);
+        if (!got) { c.fail(V_NOT_FLOAT, "must be a number"); return c; }
+        c.val = out[0];
+        return c;
+    }
+
+    fn asBool(): BoolCheck {
+        let c = new BoolCheck();
+        carry(this, c);
+        if (c.done()) { return c; }
+        let out: bool[] = [false];
+        let got = parse_bool(this.raw, out);
+        if (!got) { c.fail(V_NOT_BOOL, "must be true or false"); return c; }
+        c.val = out[0];
+        return c;
+    }
+
+    // ---- reading the value back ----
+
+    fn value(): string { return this.raw; }
+
+    // The value, or `d` when the check failed or the value was absent. This is
+    // the one to reach for after optional().
+    fn valueOr(d: string): string {
+        if (this.done()) { return d; }
+        return this.raw;
+    }
+}
+
+export class IntCheck extends Check {
+    val: int;
+
+    builder fn min(n: int) {
+        if (this.done()) { return this; }
+        if (this.val < n) { this.fail(V_TOO_SMALL, "must be at least " + n); }
+        return this;
+    }
+
+    builder fn max(n: int) {
+        if (this.done()) { return this; }
+        if (this.val > n) { this.fail(V_TOO_LARGE, "must be at most " + n); }
+        return this;
+    }
+
+    builder fn between(lo: int, hi: int) {
+        if (this.done()) { return this; }
+        if (this.val < lo) { this.fail(V_TOO_SMALL, "must be between " + lo + " and " + hi); }
+        else if (this.val > hi) { this.fail(V_TOO_LARGE, "must be between " + lo + " and " + hi); }
+        return this;
+    }
+
+    builder fn positive() {
+        if (this.done()) { return this; }
+        if (this.val <= 0) { this.fail(V_TOO_SMALL, "must be greater than zero"); }
+        return this;
+    }
+
+    builder fn nonNegative() {
+        if (this.done()) { return this; }
+        if (this.val < 0) { this.fail(V_TOO_SMALL, "cannot be negative"); }
+        return this;
+    }
+
+    builder fn oneOfInt(vals: int[]) {
+        if (this.done()) { return this; }
+        let i = 0;
+        while (i < vals.len) {
+            if (vals[i] == this.val) { return this; }
+            i += 1;
+        }
+        this.fail(V_NOT_IN_SET, "is not an allowed value");
+        return this;
+    }
+
+    fn value(): int { return this.val; }
+    fn valueOr(d: int): int {
+        if (this.done()) { return d; }
+        return this.val;
+    }
+}
+
+export class FloatCheck extends Check {
+    val: float;
+
+    builder fn min(f: float) {
+        if (this.done()) { return this; }
+        if (this.val < f) { this.fail(V_TOO_SMALL, "must be at least " + f); }
+        return this;
+    }
+
+    builder fn max(f: float) {
+        if (this.done()) { return this; }
+        if (this.val > f) { this.fail(V_TOO_LARGE, "must be at most " + f); }
+        return this;
+    }
+
+    builder fn between(lo: float, hi: float) {
+        if (this.done()) { return this; }
+        if (this.val < lo) { this.fail(V_TOO_SMALL, "must be between " + lo + " and " + hi); }
+        else if (this.val > hi) { this.fail(V_TOO_LARGE, "must be between " + lo + " and " + hi); }
+        return this;
+    }
+
+    builder fn positive() {
+        if (this.done()) { return this; }
+        if (this.val <= 0.0) { this.fail(V_TOO_SMALL, "must be greater than zero"); }
+        return this;
+    }
+
+    // Rejects inf and nan, which parse happily and then poison arithmetic.
+    builder fn finite() {
+        if (this.done()) { return this; }
+        let bad = this.val != this.val;                       // NaN
+        if (this.val > 1.7976931348623157e308) { bad = true; }
+        if (this.val < -1.7976931348623157e308) { bad = true; }
+        if (bad) { this.fail(V_TOO_LARGE, "must be a finite number"); }
+        return this;
+    }
+
+    fn value(): float { return this.val; }
+    fn valueOr(d: float): float {
+        if (this.done()) { return d; }
+        return this.val;
+    }
+}
+
+export class BoolCheck extends Check {
+    val: bool;
+
+    builder fn isTrue() {
+        if (this.done()) { return this; }
+        if (!this.val) { this.fail(V_NOT_TRUE, "must be true"); }
+        return this;
+    }
+
+    builder fn isFalse() {
+        if (this.done()) { return this; }
+        if (this.val) { this.fail(V_NOT_FALSE, "must be false"); }
+        return this;
+    }
+
+    fn value(): bool { return this.val; }
+    fn valueOr(d: bool): bool {
+        if (this.done()) { return d; }
+        return this.val;
+    }
+}
+
+// ---- standalone entry points ---------------------------------------------
+//
+// For a single literal, with no accumulator to collect into. The chain is
+// identical; read the outcome with .ok() / .message() instead of v.ok().
+
+export fn v_str(s: string): StringCheck {
+    let c = new StringCheck();
+    c.field = "";
+    c.raw = s;
+    c.errs = [];
+    return c;
+}
+
+export fn v_int(n: int): IntCheck {
+    let c = new IntCheck();
+    c.field = "";
+    c.raw = "" + n;
+    c.val = n;
+    c.errs = [];
+    return c;
+}
+
+export fn v_float(f: float): FloatCheck {
+    let c = new FloatCheck();
+    c.field = "";
+    c.raw = "" + f;
+    c.val = f;
+    c.errs = [];
+    return c;
+}
+
+export fn v_bool(b: bool): BoolCheck {
+    let c = new BoolCheck();
+    c.field = "";
+    c.raw = "" + b;
+    c.val = b;
+    c.errs = [];
+    return c;
+}
