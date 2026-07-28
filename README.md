@@ -554,6 +554,7 @@ everything else is pure Vyto.
 | `vyto/cli` | flags, options, operands and subcommands, generated `--help`, and non-panicking `parse_int`/`parse_float`/`parse_bool` |
 | `vyto/util/log` | levelled, structured logging with a JSON-lines sink |
 | `vyto/regex` ⚙ | Perl-compatible regular expressions (PCRE2, vendored and JIT-compiled) — `Regex`, named groups, `findAll`, `replaceAll`, `split` |
+| `vyto/validator` | validation for input and literals — a check chain where coercion changes its type (`.asInt().between(1, 65535)`), one error per failing value, character-aware length rules |
 | `vyto/util/uuid` ⚙ | UUID v4 and v7, plus the CSPRNG they need (`rand_bytes`, `rand_int`) |
 | `vyto/os/worker` ⚙ | `fork()`-based `WorkerPool` — CPU parallelism, no shared state |
 

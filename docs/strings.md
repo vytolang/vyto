@@ -436,4 +436,6 @@ Use `foldCase` or a `Collator` for case-insensitive comparison of real text;
 | Case-insensitive compare, real text | `unicode.foldCase` or a `Collator` |
 | Parse a number you trust | `s.to_int()` |
 | Parse a number from a user | `cli.parse_int(s, out)` |
+| Check *and* convert user input | `vyto/validator` — `v.check(s).asInt().between(1, 99)` |
+| "Is this an email / URL / date?" | `vyto/validator` — and see its notes on why `url()` and `isoDate()` are stricter than the parsers |
 | Build a string in a loop | `text.stringBuilder(cap)` |
