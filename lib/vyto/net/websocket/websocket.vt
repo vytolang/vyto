@@ -12,10 +12,16 @@
 // transparently answers a server ping with a pong before continuing. The
 // socket is owned by the WebSocket and closed on teardown. Client frames are
 // masked with random keys (RFC 6455 requirement); the only native code is the
-// random-byte source — base64 and framing are pure Vyto. `ws://` only for now;
+// random-byte source — SHA-1 and framing are pure Vyto here, and base64 comes
+// from vyto/util/mime, re-exported below. `ws://` only for now;
 // `wss://` (TLS) is a follow-up. Failure is soft: ws_connect returns null.
 
 import { Socket, socket_connect } from "vyto/net/socket";
+// base64 now lives in vyto/util/mime — one O(n) implementation with a decoder,
+// rather than the O(n²) encode-only copy this module used to carry. Importing
+// it re-exports it, so `import { base64_encode } from "vyto/net/websocket"`
+// keeps resolving, and callers gain base64_decode for free.
+import { base64_encode, base64_decode } from "vyto/util/mime";
 
 // ws_random masks frames with BCryptGenRandom on Windows; POSIX uses
 // getrandom/urandom and needs no library.
@@ -338,28 +344,3 @@ export fn sha1(data: byte[]): byte[] {
     return dg;
 }
 
-export fn base64_encode(data: byte[]): string {
-    let tbl = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let out = "";
-    let i = 0;
-    let n = data.len;
-    while (i < n) {
-        let b0 = data[i] as int;
-        let has1 = (i + 1) < n;
-        let has2 = (i + 2) < n;
-        let b1 = 0;
-        let b2 = 0;
-        if (has1) { b1 = data[i + 1] as int; }
-        if (has2) { b2 = data[i + 2] as int; }
-        let triple = (b0 << 16) | (b1 << 8) | b2;
-        let c0 = (triple >> 18) & 0x3F;
-        let c1 = (triple >> 12) & 0x3F;
-        let c2 = (triple >> 6) & 0x3F;
-        let c3 = triple & 0x3F;
-        out = out + tbl.slice(c0, c0 + 1) + tbl.slice(c1, c1 + 1);
-        if (has1) { out = out + tbl.slice(c2, c2 + 1); } else { out = out + "="; }
-        if (has2) { out = out + tbl.slice(c3, c3 + 1); } else { out = out + "="; }
-        i += 3;
-    }
-    return out;
-}
