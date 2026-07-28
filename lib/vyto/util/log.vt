@@ -1,0 +1,432 @@
+// vyto/util/log — levelled, structured logging with a JSON-lines sink.
+//
+//     let log = logger("api");
+//     log.info("listening");
+//     log.field("port", "8080").field("tls", "on").info("listening");
+//     log.errorf("upstream %s failed after %d ms", [fs(host), fi(elapsed)]);
+//
+//     logger("api").json().toFile("app.log.jsonl").info("started");
+//     // {"ts":"2026-07-28T09:41:02.317Z","level":"info","logger":"api","msg":"started"}
+//
+// Two formats over the same records. The text format is for a person reading a
+// terminal; the JSON-lines format is for a machine, one object per line, which
+// is what every log shipper expects and what makes `jq` work on the result.
+//
+// Structured fields are the point of the module. `log.field("user", id)`
+// attaches a key/value pair to the next record, so a search is `level=error
+// user=42` rather than a regular expression over prose. Fields accumulate on
+// the logger and are cleared when a record is written.
+//
+// A record below the logger's level costs one integer comparison: the message
+// is passed by reference and no formatting happens. Put `logf` calls behind
+// nothing.
+//
+// Design notes, both about what this module does *not* do:
+//
+//   * There is no global logger. A module-level mutable singleton would make
+//     two unrelated call sites interfere, and Vyto has no way to declare one
+//     anyway. Construct a logger and pass it, or build one where you need it.
+//   * JSON escaping comes from vyto/util/json's json_quote rather than a
+//     second copy of the rules here, so a message containing a quote, a
+//     newline or a control byte is escaped exactly as the JSON encoder would.
+//
+// Caveat: timestamps are RFC 3339 with milliseconds, formatted here rather
+// than by vyto/util/date, whose date_iso has neither a `Z` nor a sub-second
+// field. The clock is the wall clock, so a log line's time can move backwards
+// across an NTP step — use vyto/util/time's monoNs for measuring durations.
+
+import { StringBuilder } from "vyto/util/text";
+import { fmt, FmtArg } from "vyto/util/fmt";
+import { unixMs } from "vyto/util/time";
+import { DateTime, date_from_unix } from "vyto/util/date";
+import { json_quote } from "vyto/util/json";
+import { BufWriter, bufWriter } from "vyto/io/file";
+
+// ---- levels ----------------------------------------------------------------
+
+export const LOG_TRACE: int = 0;
+export const LOG_DEBUG: int = 1;
+export const LOG_INFO:  int = 2;
+export const LOG_WARN:  int = 3;
+export const LOG_ERROR: int = 4;
+export const LOG_FATAL: int = 5;
+// Above every level, so nothing is written.
+export const LOG_OFF:   int = 6;
+
+// The lowercase name of a level, as it appears in output.
+export fn log_level_name(level: int): string {
+    if (level <= LOG_TRACE) { return "trace"; }
+    if (level == LOG_DEBUG) { return "debug"; }
+    if (level == LOG_INFO) { return "info"; }
+    if (level == LOG_WARN) { return "warn"; }
+    if (level == LOG_ERROR) { return "error"; }
+    if (level == LOG_FATAL) { return "fatal"; }
+    return "off";
+}
+
+// Parse a level name, case-insensitively. Returns `dflt` for anything
+// unrecognized rather than failing — a typo in a config value should not stop
+// a program from starting, it should just log at the default level.
+export fn log_level_from(name: string, dflt: int): int {
+    let n = name.trim().to_lower();
+    if (n == "trace") { return LOG_TRACE; }
+    if (n == "debug") { return LOG_DEBUG; }
+    if (n == "info") { return LOG_INFO; }
+    if (n == "warn" || n == "warning") { return LOG_WARN; }
+    if (n == "error" || n == "err") { return LOG_ERROR; }
+    if (n == "fatal") { return LOG_FATAL; }
+    if (n == "off" || n == "none" || n == "silent") { return LOG_OFF; }
+    return dflt;
+}
+
+// Output formats.
+export const LOG_TEXT: int = 0;
+export const LOG_JSON: int = 1;
+
+// ---- timestamps ------------------------------------------------------------
+
+// Format Unix milliseconds as RFC 3339 UTC with milliseconds:
+// "2026-07-28T09:41:02.317Z". vyto/util/date's date_iso produces neither the
+// `Z` nor the fractional part, and both matter to a log consumer.
+export fn log_timestamp(ms: i64): string {
+    let secs = ms / (1000 as i64);
+    let frac = ms - secs * (1000 as i64);
+    if (frac < (0 as i64)) {
+        secs -= 1 as i64;
+        frac += 1000 as i64;
+    }
+    let dt = date_from_unix(secs);
+    let sb = new StringBuilder(28);
+    pad4(sb, dt.year);
+    sb.append("-");
+    pad2(sb, dt.month);
+    sb.append("-");
+    pad2(sb, dt.day);
+    sb.append("T");
+    pad2(sb, dt.hour);
+    sb.append(":");
+    pad2(sb, dt.min);
+    sb.append(":");
+    pad2(sb, dt.sec);
+    sb.append(".");
+    pad3(sb, frac as int);
+    sb.append("Z");
+    return sb.toString();
+}
+
+fn pad2(sb: StringBuilder, v: int) {
+    if (v < 10) { sb.append("0"); }
+    sb.appendInt(v);
+}
+fn pad3(sb: StringBuilder, v: int) {
+    if (v < 100) { sb.append("0"); }
+    if (v < 10) { sb.append("0"); }
+    sb.appendInt(v);
+}
+fn pad4(sb: StringBuilder, v: int) {
+    if (v < 1000) { sb.append("0"); }
+    if (v < 100) { sb.append("0"); }
+    if (v < 10) { sb.append("0"); }
+    sb.appendInt(v);
+}
+
+// ---- the logger ------------------------------------------------------------
+
+// A levelled logger with an optional name, structured fields, and a sink.
+//
+// Every configuration method returns the receiver, so a logger is built in one
+// expression. Fields set with field() apply to the *next* record only; ones set
+// with context() stay for the logger's lifetime, which is what a request id or
+// a component name wants.
+export class Logger {
+    name: string;
+    minLevel: int;
+    format: int;
+    out: BufWriter;
+    // Fields for the next record, and permanent ones, both as parallel
+    // key/value arrays — a record has a handful of fields, and two small arrays
+    // beat a hash table for that (the same reasoning as JsonValue's objects).
+    fkeys: string[];
+    fvals: string[];
+    ckeys: string[];
+    cvals: string[];
+    showTime: bool;
+    // Fixed timestamp, for tests that need deterministic output. -1 means
+    // "read the clock".
+    fixedMs: i64;
+    written: int;
+
+    fn init(name: string) {
+        this.name = name;
+        this.minLevel = LOG_INFO;
+        this.format = LOG_TEXT;
+        this.out = null;
+        this.fkeys = [];
+        this.fvals = [];
+        this.ckeys = [];
+        this.cvals = [];
+        this.showTime = true;
+        this.fixedMs = -1 as i64;
+        this.written = 0;
+    }
+
+    // ---- configuration ----
+
+    // Records below `l` are dropped. LOG_OFF silences the logger entirely.
+    fn level(l: int): Logger { this.minLevel = l; return this; }
+    fn levelName(name: string): Logger {
+        this.minLevel = log_level_from(name, this.minLevel);
+        return this;
+    }
+    fn minimum(): int { return this.minLevel; }
+    // True when a record at `l` would be written. Guard an expensive message
+    // with this rather than paying to build it and having it dropped.
+    fn enabled(l: int): bool { return l >= this.minLevel; }
+
+    fn text(): Logger { this.format = LOG_TEXT; return this; }
+    fn json(): Logger { this.format = LOG_JSON; return this; }
+
+    // Suppress the timestamp column. Useful when something else already stamps
+    // the line — a systemd journal, a container runtime — and for tests.
+    fn timestamps(on: bool): Logger { this.showTime = on; return this; }
+
+    // Pin the clock, so output is reproducible. Only tests should want this.
+    fn fixedTime(ms: i64): Logger { this.fixedMs = ms; return this; }
+
+    // Write to a file instead of stdout, through a BufWriter so a busy logger
+    // does not make a syscall per line. A path that cannot be opened leaves
+    // the logger on stdout rather than losing the records — check hasFile()
+    // when that distinction matters.
+    fn toFile(path: string): Logger {
+        this.out = bufWriter(path, 16384);
+        return this;
+    }
+    fn toWriter(w: BufWriter): Logger { this.out = w; return this; }
+    fn hasFile(): bool { return this.out != null; }
+
+    // Flush a file sink. A BufWriter also flushes on close and on teardown,
+    // but a long-running process wants its log on disk before it crashes.
+    fn flush(): Logger {
+        if (this.out != null) { this.out.flush(); }
+        return this;
+    }
+    fn close() {
+        if (this.out != null) {
+            this.out.close();
+            this.out = null;
+        }
+    }
+
+    // How many records this logger has written. Handy in tests, and as a cheap
+    // "did anything go wrong" counter next to a level filter.
+    fn count(): int { return this.written; }
+
+    // ---- fields ----
+
+    // Attach a key/value pair to the *next* record.
+    fn field(k: string, v: string): Logger {
+        this.fkeys.push(k);
+        this.fvals.push(v);
+        return this;
+    }
+    fn fieldInt(k: string, v: int): Logger { return this.field(k, str(v)); }
+    fn fieldBool(k: string, v: bool): Logger { return this.field(k, str(v)); }
+    fn fieldFloat(k: string, v: float): Logger { return this.field(k, str(v)); }
+
+    // Attach a key/value pair to *every* record from this logger — a request
+    // id, a component, a host name.
+    fn context(k: string, v: string): Logger {
+        this.ckeys.push(k);
+        this.cvals.push(v);
+        return this;
+    }
+    fn clearContext(): Logger {
+        this.ckeys = [];
+        this.cvals = [];
+        return this;
+    }
+
+    // A logger sharing this one's configuration and context, plus one more
+    // context field. The way to give a request its own logger without
+    // mutating the shared one.
+    fn withContext(k: string, v: string): Logger {
+        let child = new Logger(this.name);
+        child.minLevel = this.minLevel;
+        child.format = this.format;
+        child.out = this.out;
+        child.showTime = this.showTime;
+        child.fixedMs = this.fixedMs;
+        let i = 0;
+        while (i < this.ckeys.len) {
+            child.ckeys.push(this.ckeys[i]);
+            child.cvals.push(this.cvals[i]);
+            i += 1;
+        }
+        child.ckeys.push(k);
+        child.cvals.push(v);
+        return child;
+    }
+
+    // ---- writing ----
+
+    fn trace(msg: string) { this.log(LOG_TRACE, msg); }
+    fn debug(msg: string) { this.log(LOG_DEBUG, msg); }
+    fn info(msg: string)  { this.log(LOG_INFO, msg); }
+    fn warn(msg: string)  { this.log(LOG_WARN, msg); }
+    fn error(msg: string) { this.log(LOG_ERROR, msg); }
+    // Writes at LOG_FATAL and flushes. It does *not* exit: a library deciding
+    // to end the process is a surprise, and the caller knows better whether
+    // there is cleanup to do. Call exit() yourself.
+    fn fatal(msg: string) {
+        this.log(LOG_FATAL, msg);
+        this.flush();
+    }
+
+    fn tracef(f: string, args: FmtArg[]) { this.logf(LOG_TRACE, f, args); }
+    fn debugf(f: string, args: FmtArg[]) { this.logf(LOG_DEBUG, f, args); }
+    fn infof(f: string, args: FmtArg[])  { this.logf(LOG_INFO, f, args); }
+    fn warnf(f: string, args: FmtArg[])  { this.logf(LOG_WARN, f, args); }
+    fn errorf(f: string, args: FmtArg[]) { this.logf(LOG_ERROR, f, args); }
+    fn fatalf(f: string, args: FmtArg[]) {
+        this.logf(LOG_FATAL, f, args);
+        this.flush();
+    }
+
+    // Formatted variant. The fmt() call happens only if the record survives
+    // the level check, so a debugf in a hot loop costs one comparison in
+    // production.
+    fn logf(level: int, f: string, args: FmtArg[]) {
+        if (level < this.minLevel) {
+            this.dropFields();
+            return;
+        }
+        this.log(level, fmt(f, args));
+    }
+
+    fn log(level: int, msg: string) {
+        if (level < this.minLevel) {
+            // A dropped record still consumes its pending fields, or they
+            // would leak onto the next one that *is* written.
+            this.dropFields();
+            return;
+        }
+        let line = "";
+        if (this.format == LOG_JSON) { line = this.renderJson(level, msg); }
+        else { line = this.renderText(level, msg); }
+        this.dropFields();
+        this.written += 1;
+        if (this.out != null) { this.out.write(line).write("\n"); }
+        else { print(line); }
+    }
+
+    fn dropFields() {
+        this.fkeys = [];
+        this.fvals = [];
+    }
+
+    fn nowMillis(): i64 {
+        if (this.fixedMs >= (0 as i64)) { return this.fixedMs; }
+        return unixMs();
+    }
+
+    // "2026-07-28T09:41:02.317Z INFO  api: listening port=8080"
+    //
+    // The level is padded to five columns so messages line up in a terminal,
+    // which is the whole reason a human-readable format exists at all.
+    fn renderText(level: int, msg: string): string {
+        let sb = new StringBuilder(128);
+        if (this.showTime) {
+            sb.append(log_timestamp(this.nowMillis()));
+            sb.append(" ");
+        }
+        sb.append(log_level_name(level).to_upper().pad_end(5, " "));
+        sb.append(" ");
+        if (this.name != "") { sb.append(this.name).append(": "); }
+        sb.append(msg);
+        let i = 0;
+        while (i < this.ckeys.len) {
+            sb.append(" ").append(this.ckeys[i]).append("=").append(text_value(this.cvals[i]));
+            i += 1;
+        }
+        i = 0;
+        while (i < this.fkeys.len) {
+            sb.append(" ").append(this.fkeys[i]).append("=").append(text_value(this.fvals[i]));
+            i += 1;
+        }
+        return sb.toString();
+    }
+
+    // One JSON object per line. Key order is fixed — ts, level, logger, msg,
+    // then context fields, then record fields — so lines diff and sort well.
+    fn renderJson(level: int, msg: string): string {
+        let sb = new StringBuilder(128);
+        sb.append("{");
+        let first = true;
+        if (this.showTime) {
+            sb.append("\"ts\":").append(json_quote(log_timestamp(this.nowMillis())));
+            first = false;
+        }
+        if (!first) { sb.append(","); }
+        sb.append("\"level\":").append(json_quote(log_level_name(level)));
+        if (this.name != "") {
+            sb.append(",\"logger\":").append(json_quote(this.name));
+        }
+        sb.append(",\"msg\":").append(json_quote(msg));
+        let i = 0;
+        while (i < this.ckeys.len) {
+            sb.append(",").append(json_quote(this.ckeys[i])).append(":");
+            sb.append(json_quote(this.cvals[i]));
+            i += 1;
+        }
+        i = 0;
+        while (i < this.fkeys.len) {
+            sb.append(",").append(json_quote(this.fkeys[i])).append(":");
+            sb.append(json_quote(this.fvals[i]));
+            i += 1;
+        }
+        sb.append("}");
+        return sb.toString();
+    }
+
+    deinit { this.close(); }
+}
+
+// A value in the text format is quoted only when it would otherwise be
+// ambiguous — an empty value, or one containing a space or a quote. This is
+// the logfmt convention, and it keeps the common case unquoted and readable.
+fn text_value(v: string): string {
+    let needs = v.len == 0;
+    let i = 0;
+    while (i < v.len) {
+        let c = v[i];
+        if (c == 32 || c == 9 || c == 34 || c == 10 || c == 13 || c == 61) { needs = true; }
+        i += 1;
+    }
+    if (!needs) { return v; }
+    let sb = new StringBuilder(v.len + 8);
+    sb.append("\"");
+    let j = 0;
+    while (j < v.len) {
+        let c = v[j];
+        if (c == 34 || c == 92) { sb.appendByte(92); sb.appendByte(c); }
+        else {
+            if (c == 10) { sb.append("\\n"); }
+            else {
+                if (c == 13) { sb.append("\\r"); }
+                else {
+                    if (c == 9) { sb.append("\\t"); }
+                    else { sb.appendByte(c); }
+                }
+            }
+        }
+        j += 1;
+    }
+    sb.append("\"");
+    return sb.toString();
+}
+
+// A logger named `name`, writing text to stdout at LOG_INFO.
+export fn logger(name: string): Logger { return new Logger(name); }
+
+// An unnamed logger, for a program small enough not to need components.
+export fn log_default(): Logger { return new Logger(""); }
