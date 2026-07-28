@@ -1,0 +1,492 @@
+// vyto/util/csv — an RFC 4180 reader and writer, with dialects and streaming.
+//
+//     for (let row in csv_parse("a,b\n1,\"x,y\"\n")) { ... }   // [["a","b"],["1","x,y"]]
+//
+//     let r = csvReader(text);
+//     while (r.next()) { print(r.field(0) + " @ line " + str(r.lineNo())); }
+//
+//     csv_each_file("big.csv", (row) => { ... });      // bounded memory
+//     csv_write([["a","b"], ["1", "x,y"]])             // "a,b\n1,\"x,y\"\n"
+//
+// The point of this module is the part `line.split(",")` gets wrong: a field
+// may be quoted, a quoted field may contain the delimiter, a doubled quote is
+// a literal quote, and a quoted field may contain a *newline*, so a CSV record
+// is not the same thing as a line of text. vyto/data/frame's loadCsv and
+// vyto/ui/datatable's CSV export both run through here.
+//
+// A `Dialect` carries the delimiter, quote, comment character and whitespace
+// policy, so TSV and semicolon-separated files are the same code path.
+// csv_sniff guesses one from a sample.
+//
+// Failure is soft, as in vyto/util/json: the reader never panics. An
+// unterminated quoted field ends the record and sets error(); a stray quote
+// inside an unquoted field is taken literally, because a parser that rejects
+// real-world exports is not useful. Check error() when it matters.
+//
+// Caveat: line endings on output are LF, not the CRLF that RFC 4180 specifies —
+// these files are read by Unix tools far more often than by the 2005 spec. Set
+// `d.crlf = true` for CRLF. On input both are accepted, always.
+
+import { StringBuilder } from "vyto/util/text";
+import { BufReader, bufReader, BufWriter, bufWriter } from "vyto/io/file";
+
+// ---- dialects --------------------------------------------------------------
+
+// The shape of one CSV flavour. Bytes, not strings, because the parser compares
+// against `s[i]`. `comment` of 0 means no comment character.
+export struct Dialect {
+    delim: int;
+    quote: int;
+    comment: int;
+    trimSpace: bool;
+    crlf: bool;
+}
+
+// Comma-separated, double-quoted, no comments — plain RFC 4180.
+export fn csv_dialect(): Dialect { return Dialect(44, 34, 0, false, false); }
+// Tab-separated.
+export fn csv_tsv(): Dialect { return Dialect(9, 34, 0, false, false); }
+// Semicolon-separated, as exported by spreadsheets in locales where the comma
+// is the decimal separator.
+export fn csv_semicolon(): Dialect { return Dialect(59, 34, 0, false, false); }
+// Pipe-separated.
+export fn csv_pipe(): Dialect { return Dialect(124, 34, 0, false, false); }
+
+// Guess the delimiter from a sample of the file: whichever of `,` `\t` `;` `|`
+// appears the same number of times on every one of the first few lines, most
+// often. Quoted regions are skipped, so a comma inside a quoted field does not
+// vote. Falls back to comma when nothing is consistent.
+export fn csv_sniff(sample: string): Dialect {
+    let cands = [44, 9, 59, 124];
+    let bestDelim = 44;
+    let bestScore = 0;
+    let c = 0;
+    while (c < cands.len) {
+        let delim = cands[c];
+        c += 1;
+        // Count this candidate per line, outside quotes, for up to 10 lines.
+        let counts: int[] = [];
+        let n = 0;
+        let inQuote = false;
+        let i = 0;
+        while (i < sample.len && counts.len < 10) {
+            let ch = sample[i];
+            if (ch == 34) { inQuote = !inQuote; }
+            else {
+                if (!inQuote) {
+                    if (ch == delim) { n += 1; }
+                    if (ch == 10) { counts.push(n); n = 0; }
+                }
+            }
+            i += 1;
+        }
+        if (counts.len == 0 && n > 0) { counts.push(n); }
+        if (counts.len == 0) { continue; }
+        // Consistent and non-zero is the signal; the first count is the arity.
+        let want = counts[0];
+        if (want == 0) { continue; }
+        let consistent = true;
+        let j = 1;
+        while (j < counts.len) {
+            if (counts[j] != want) { consistent = false; }
+            j += 1;
+        }
+        if (consistent && want > bestScore) {
+            bestScore = want;
+            bestDelim = delim;
+        }
+    }
+    return Dialect(bestDelim, 34, 0, false, false);
+}
+
+// ---- reader ----------------------------------------------------------------
+
+// A pull reader over CSV text: next() advances one *record* (which may span
+// several lines), row()/field() read it out.
+//
+// Fields are accumulated into a fresh array per record rather than a reused
+// one, so a caller can keep a row without copying it.
+export class CsvReader {
+    s: string;
+    pos: int;
+    n: int;
+    d: Dialect;
+    fields: string[];
+    line: int;
+    rec: int;
+    err: string;
+
+    fn init(text: string, d: Dialect) {
+        this.s = text;
+        this.pos = 0;
+        this.n = text.len;
+        this.d = d;
+        this.fields = [];
+        this.line = 1;
+        this.rec = 0;
+        this.err = "";
+    }
+
+    // Parse the next record. False at end of input. Blank lines and comment
+    // lines are skipped rather than delivered as one-empty-field records —
+    // the behaviour every real CSV consumer wants.
+    fn next(): bool {
+        this.fields = [];
+        this.skipSkippable();
+        if (this.pos >= this.n) { return false; }
+        this.rec = this.line;
+        let done = false;
+        while (!done) {
+            let f = this.field_v();
+            this.fields.push(f);
+            if (this.pos >= this.n) { done = true; }
+            else {
+                let c = this.s[this.pos];
+                if (c == this.d.delim) { this.pos += 1; }
+                else {
+                    // Only a line break can end a record here.
+                    if (c == 13) { this.pos += 1; }
+                    if (this.pos < this.n && this.s[this.pos] == 10) { this.pos += 1; }
+                    this.line += 1;
+                    done = true;
+                }
+            }
+        }
+        return true;
+    }
+
+    // The record just read. Owned by the caller — the next next() builds a new
+    // array rather than clearing this one.
+    fn row(): string[] { return this.fields; }
+    fn count(): int { return this.fields.len; }
+    fn field(i: int): string {
+        if (i >= 0 && i < this.fields.len) { return this.fields[i]; }
+        return "";
+    }
+    // 1-based line on which the current record started.
+    fn lineNo(): int { return this.rec; }
+    fn error(): string { return this.err; }
+    fn ok(): bool { return this.err == ""; }
+
+    // Every remaining record.
+    fn rows(): string[][] {
+        let out: string[][] = [];
+        while (this.next()) { out.push(this.fields); }
+        return out;
+    }
+
+    // First error wins, as in json.vt. The line reported is where the *record*
+    // started, not where the scan gave up — for an unterminated quote those are
+    // different, and the opening quote is what the reader needs to go look at.
+    fn fail(msg: string) {
+        if (this.err == "") {
+            this.err = msg + " at line " + str(this.rec);
+        }
+    }
+
+    // Consume blank lines and, if the dialect has one, comment lines.
+    fn skipSkippable() {
+        let moved = true;
+        while (moved) {
+            moved = false;
+            if (this.pos < this.n && this.s[this.pos] == 13 &&
+                this.pos + 1 < this.n && this.s[this.pos + 1] == 10) {
+                this.pos += 2;
+                this.line += 1;
+                moved = true;
+            } else {
+                if (this.pos < this.n && this.s[this.pos] == 10) {
+                    this.pos += 1;
+                    this.line += 1;
+                    moved = true;
+                }
+            }
+            if (this.d.comment != 0 && this.pos < this.n && this.s[this.pos] == this.d.comment) {
+                while (this.pos < this.n && this.s[this.pos] != 10) { this.pos += 1; }
+                moved = true;
+            }
+        }
+    }
+
+    fn field_v(): string {
+        if (this.d.trimSpace) {
+            while (this.pos < this.n) {
+                let c = this.s[this.pos];
+                if (c == 32 || c == 9) {
+                    if (c == this.d.delim) { break; }
+                    this.pos += 1;
+                } else { break; }
+            }
+        }
+        if (this.pos < this.n && this.s[this.pos] == this.d.quote) { return this.quoted(); }
+        return this.bare();
+    }
+
+    // An unquoted field runs to the next delimiter or line break. Bytes are
+    // taken in runs rather than one at a time.
+    fn bare(): string {
+        let start = this.pos;
+        while (this.pos < this.n) {
+            let c = this.s[this.pos];
+            if (c == this.d.delim || c == 10 || c == 13) { break; }
+            this.pos += 1;
+        }
+        let v = this.s.slice(start, this.pos);
+        if (this.d.trimSpace) { v = v.trim_end(); }
+        return v;
+    }
+
+    // A quoted field: everything up to the closing quote, with a doubled quote
+    // standing for one literal quote. A quoted field may contain delimiters and
+    // line breaks — this is the whole reason split(",") is wrong.
+    fn quoted(): string {
+        this.pos += 1;                       // opening quote
+        let sb = new StringBuilder(32);
+        let runStart = this.pos;
+        let closed = false;
+        while (this.pos < this.n) {
+            let c = this.s[this.pos];
+            if (c == 10) { this.line += 1; }
+            if (c != this.d.quote) { this.pos += 1; continue; }
+            if (this.pos > runStart) { sb.append(this.s.slice(runStart, this.pos)); }
+            this.pos += 1;
+            if (this.pos < this.n && this.s[this.pos] == this.d.quote) {
+                sb.appendByte(this.d.quote);   // "" → one literal quote
+                this.pos += 1;
+                runStart = this.pos;
+                continue;
+            }
+            closed = true;
+            break;
+        }
+        if (!closed) {
+            if (this.pos > runStart) { sb.append(this.s.slice(runStart, this.pos)); }
+            this.fail("unterminated quoted field");
+            return sb.toString();
+        }
+        // Padding after the closing quote is padding, not content.
+        if (this.d.trimSpace) {
+            while (this.pos < this.n) {
+                let c = this.s[this.pos];
+                if (c == this.d.delim) { break; }
+                if (c != 32 && c != 9) { break; }
+                this.pos += 1;
+            }
+        }
+        // Anything else between the closing quote and the delimiter is
+        // malformed. Keep it rather than dropping it: a soft parser loses no
+        // data, and "a","b"c is far more often a typo than an intent.
+        let tailStart = this.pos;
+        while (this.pos < this.n) {
+            let c = this.s[this.pos];
+            if (c == this.d.delim || c == 10 || c == 13) { break; }
+            this.pos += 1;
+        }
+        if (this.pos > tailStart) { sb.append(this.s.slice(tailStart, this.pos)); }
+        return sb.toString();
+    }
+}
+
+export fn csvReader(text: string): CsvReader { return new CsvReader(text, csv_dialect()); }
+export fn csvReaderWith(text: string, d: Dialect): CsvReader { return new CsvReader(text, d); }
+
+// Every record of `text` as rows of fields.
+export fn csv_parse(text: string): string[][] { return csvReader(text).rows(); }
+export fn csv_parse_with(text: string, d: Dialect): string[][] {
+    return csvReaderWith(text, d).rows();
+}
+
+// ---- writer ----------------------------------------------------------------
+
+// Quote `v` if it contains the delimiter, a quote, a line break, or (with
+// trimSpace) leading/trailing whitespace that would otherwise be eaten. A
+// doubled quote escapes a quote, per RFC 4180 §2.7.
+export fn csv_field(v: string, d: Dialect): string {
+    let needs = false;
+    let i = 0;
+    while (i < v.len) {
+        let c = v[i];
+        if (c == d.delim || c == d.quote || c == 10 || c == 13) { needs = true; }
+        i += 1;
+    }
+    if (v.len > 0 && d.trimSpace) {
+        let f = v[0];
+        let l = v[v.len - 1];
+        if (f == 32 || f == 9 || l == 32 || l == 9) { needs = true; }
+    }
+    if (!needs) { return v; }
+    let sb = new StringBuilder(v.len + 8);
+    sb.appendByte(d.quote);
+    let runStart = 0;
+    let j = 0;
+    while (j < v.len) {
+        if (v[j] == d.quote) {
+            if (j > runStart) { sb.append(v.slice(runStart, j)); }
+            sb.appendByte(d.quote);
+            sb.appendByte(d.quote);
+            runStart = j + 1;
+        }
+        j += 1;
+    }
+    if (v.len > runStart) { sb.append(v.slice(runStart, v.len)); }
+    sb.appendByte(d.quote);
+    return sb.toString();
+}
+
+// Accumulates CSV text field by field. Every call returns the receiver, so
+// writing chains; the StringBuilder underneath keeps it O(n).
+export class CsvWriter {
+    sb: StringBuilder;
+    d: Dialect;
+    atStart: bool;
+
+    fn init(d: Dialect) {
+        this.sb = new StringBuilder(256);
+        this.d = d;
+        this.atStart = true;
+    }
+
+    fn field(v: string): CsvWriter {
+        if (!this.atStart) { this.sb.appendByte(this.d.delim); }
+        this.sb.append(csv_field(v, this.d));
+        this.atStart = false;
+        return this;
+    }
+    fn fieldInt(v: int): CsvWriter {
+        if (!this.atStart) { this.sb.appendByte(this.d.delim); }
+        this.sb.appendInt(v);
+        this.atStart = false;
+        return this;
+    }
+    fn endRow(): CsvWriter {
+        if (this.d.crlf) { this.sb.append("\r\n"); } else { this.sb.appendByte(10); }
+        this.atStart = true;
+        return this;
+    }
+    fn writeRow(vs: string[]): CsvWriter {
+        let i = 0;
+        while (i < vs.len) {
+            this.field(vs[i]);
+            i += 1;
+        }
+        return this.endRow();
+    }
+    fn writeRows(rows: string[][]): CsvWriter {
+        let i = 0;
+        while (i < rows.len) {
+            this.writeRow(rows[i]);
+            i += 1;
+        }
+        return this;
+    }
+
+    fn len(): int { return this.sb.len(); }
+    fn toString(): string { return this.sb.toString(); }
+}
+
+export fn csvWriter(): CsvWriter { return new CsvWriter(csv_dialect()); }
+export fn csvWriterWith(d: Dialect): CsvWriter { return new CsvWriter(d); }
+
+// Rows to CSV text, trailing newline included.
+export fn csv_write(rows: string[][]): string { return csvWriter().writeRows(rows).toString(); }
+export fn csv_write_with(rows: string[][], d: Dialect): string {
+    return csvWriterWith(d).writeRows(rows).toString();
+}
+
+// ---- files -----------------------------------------------------------------
+
+// Stream a CSV file record by record in bounded memory. Returns false when the
+// file cannot be opened.
+//
+// Lines are stitched back together when a record's quotes are still open, so a
+// quoted field spanning several lines arrives as one record — the thing a
+// readLine loop over split(",") cannot do. Closures capture by value, so
+// accumulate through a ref container, as with json_each:
+//
+//     let n = [0];
+//     csv_each_file("big.csv", (row) => { n[0] = n[0] + 1; });
+export fn csv_each_file(path: string, cb: fn(string[])): bool {
+    return csv_each_file_with(path, csv_dialect(), cb);
+}
+
+export fn csv_each_file_with(path: string, d: Dialect, cb: fn(string[])): bool {
+    let r = bufReader(path);
+    if (r == null) { return false; }
+    let pending = "";
+    let held = false;
+    while (!r.eof()) {
+        let line = r.readLine();
+        if (line == "" && r.eof()) { break; }
+        if (held) { pending = pending + "\n" + line; } else { pending = line; held = true; }
+        if (!quotes_open(pending, d)) {
+            emit_record(pending, d, cb);
+            pending = "";
+            held = false;
+        }
+    }
+    // A file whose last quoted field is never closed still yields its record.
+    if (held) { emit_record(pending, d, cb); }
+    r.close();
+    return true;
+}
+
+fn emit_record(text: string, d: Dialect, cb: fn(string[])) {
+    let rd = new CsvReader(text, d);
+    while (rd.next()) { cb(rd.row()); }
+}
+
+// True when `text` ends inside a quoted field, i.e. it has an odd number of
+// quote bytes. A doubled quote is two bytes and so does not flip the state.
+fn quotes_open(text: string, d: Dialect): bool {
+    let n = 0;
+    let i = 0;
+    while (i < text.len) {
+        if (text[i] == d.quote) { n += 1; }
+        i += 1;
+    }
+    return (n % 2) == 1;
+}
+
+// Whole file as rows. An unopenable file yields no rows rather than panicking;
+// for a file embedded with --with-assets, parse the bytes instead:
+// csv_parse(str(assetBytes("data/x.csv"))).
+export fn csv_read_file(path: string): string[][] {
+    return csv_read_file_with(path, csv_dialect());
+}
+
+export fn csv_read_file_with(path: string, d: Dialect): string[][] {
+    let out: string[][] = [];
+    csv_each_file_with(path, d, (row) => { out.push(row); });
+    return out;
+}
+
+// Write rows to `path`, streaming through a BufWriter so a large table never
+// materializes as one string. False when the file cannot be opened.
+export fn csv_write_file(path: string, rows: string[][]): bool {
+    return csv_write_file_with(path, rows, csv_dialect());
+}
+
+export fn csv_write_file_with(path: string, rows: string[][], d: Dialect): bool {
+    let w = bufWriter(path, 65536);
+    if (w == null) { return false; }
+    let i = 0;
+    while (i < rows.len) {
+        let row = rows[i];
+        let j = 0;
+        while (j < row.len) {
+            if (j > 0) { w.write(chr_of(d.delim)); }
+            w.write(csv_field(row[j], d));
+            j += 1;
+        }
+        if (d.crlf) { w.write("\r\n"); } else { w.write("\n"); }
+        i += 1;
+    }
+    w.close();
+    return true;
+}
+
+fn chr_of(code: int): string {
+    let b = bytes(2);
+    b[0] = code as byte;
+    return str(b as cstring);
+}
