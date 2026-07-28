@@ -114,6 +114,8 @@ tests/fixtures/regex_match.vt|regex_match_nojit|eq||VYTO_REGEX_JIT=0
 examples/84_regex_tools.vt|84_regex_tools|eq|
 tests/fixtures/regex_extra.vt|regex_extra|eq|
 tests/fixtures/regex_extra.vt|regex_extra_nojit|eq||VYTO_REGEX_JIT=0
+examples/85_validator.vt|85_validator|eq|
+tests/fixtures/validator.vt|validator|eq|
 tests/fixtures/args_echo.vt|args_echo|eq|alpha beta
 tests/fixtures/anim_clock.vt|anim_clock|eq|
 tests/fixtures/condlink_win.vt|condlink_win|eq|

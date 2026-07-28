@@ -1,0 +1,198 @@
+// vyto/validator — exhaustive coverage, including every soft-failure path.
+//
+// Deterministic by construction: no clock, no environment, no filesystem.
+//
+// The load-bearing assertions are the short-circuit ones. A chain that stops on
+// its first failure is what makes an empty required field report "required"
+// rather than also "too short" and "not an email", and it is what stops a
+// failed coercion from running numeric rules against a garbage value. Every
+// "errors=1" below is checking that, not just that something failed.
+
+import { validation, Validation, v_str, v_int, v_float, v_bool, charCount, Rule,
+         V_REQUIRED, V_BLANK, V_TOO_SHORT, V_TOO_LONG, V_NOT_IN_SET, V_NO_MATCH,
+         V_NOT_INT, V_NOT_FLOAT, V_NOT_BOOL, V_TOO_SMALL, V_TOO_LARGE,
+         V_NOT_EMAIL, V_NOT_URL, V_NOT_UUID, V_NOT_IPV4, V_NOT_DATE,
+         V_NOT_TRUE, V_NOT_FALSE, V_CUSTOM } from "vyto/validator";
+import { email, ipv4, pattern, matches, notMatches } from "vyto/validator/pattern";
+
+// A stateful custom rule. Written as a class because a closure cannot capture
+// `this`, cannot be assigned to and cannot nest — so a rule carrying
+// configuration is not expressible as one.
+class MaxWords extends Rule {
+    limit: int;
+    fn init(n: int) { this.limit = n; }
+    override fn test(s: string): bool { return s.split(" ").len <= this.limit; }
+    override fn code(): int { return V_CUSTOM; }
+    override fn message(): string { return "must be at most " + this.limit + " words"; }
+}
+
+fn one(v: Validation, label: string) {
+    if (v.ok()) { print("  " + label + ": ok"); return; }
+    print("  " + label + ": errors=" + v.count() + " code=" + v.first().code +
+          " | " + v.first().describe());
+}
+
+fn main() {
+    print("---- the coercion chain ----");
+    let a = validation();
+    a.check("42").asFloat().min(10.0).max(100.0);
+    print("42 -> float in [10,100]: ok=" + a.ok());
+    let b = validation();
+    b.check("abc", field: "score").asFloat().min(10.0).max(100.0);
+    // Exactly one: the failed coercion must suppress min() and max().
+    print("abc -> float: errors=" + b.count() + " code=" + b.first().code +
+          " (V_NOT_FLOAT=" + V_NOT_FLOAT + ")");
+    let c = validation();
+    c.check("7", field: "n").asInt().min(10);
+    print("7 -> int min 10: errors=" + c.count() + " code=" + c.first().code +
+          " (V_TOO_SMALL=" + V_TOO_SMALL + ")");
+    print("value out: " + validation().check("42").asInt().min(1).value() +
+          " floatVal=" + validation().check("2.5").asFloat().value() +
+          " boolVal=" + validation().check("yes").asBool().value());
+
+    print("---- short-circuit: one error per chain ----");
+    let s1 = validation();
+    s1.check("", field: "email").required().minChars(3);
+    print("empty .required().minChars(3): errors=" + s1.count() +
+          " code=" + s1.first().code + " (V_REQUIRED=" + V_REQUIRED + ")");
+    let s2 = validation();
+    email(s2.check("", field: "email").required().minChars(3));
+    print("...plus email(): errors=" + s2.count() + " (still 1)");
+    let s3 = validation();
+    s3.check("ab", field: "name").minChars(5).maxChars(1).notBlank();
+    print("three failing rules: errors=" + s3.count() + " code=" + s3.first().code);
+
+    print("---- required vs optional ----");
+    let r1 = validation();
+    r1.check("", field: "a").required();
+    one(r1, "required on empty");
+    let r2 = validation();
+    r2.check("", field: "b").optional().minChars(5).maxChars(2);
+    one(r2, "optional on empty (rules suppressed)");
+    let r3 = validation();
+    r3.check("xy", field: "c").optional().minChars(5);
+    one(r3, "optional on present value (rules still run)");
+    let opt = validation().check("", field: "d").optional();
+    print("  absent()=" + opt.absent() + " ok()=" + opt.ok() +
+          " valueOr='" + opt.valueOr("fallback") + "'");
+
+    print("---- characters, not bytes ----");
+    print("charCount: José=" + charCount("José") + " bytes=" + "José".len +
+          "  中文=" + charCount("中文") + " bytes=" + "中文".len);
+    print("José maxChars(4)=" + v_str("José").maxChars(4).ok() +
+          " maxBytes(4)=" + v_str("José").maxBytes(4).ok());
+    print("中文 exactChars(2)=" + v_str("中文").exactChars(2).ok() +
+          " minBytes(6)=" + v_str("中文").minBytes(6).ok());
+    print("betweenChars: " + v_str("José").betweenChars(2, 4).ok() +
+          "/" + v_str("Josép").betweenChars(2, 4).ok());
+
+    print("---- string rules ----");
+    print("notBlank: " + v_str("  ").notBlank().ok() + "/" + v_str(" x ").notBlank().ok());
+    print("trim then minChars: " + v_str("  hi  ").trim().exactChars(2).ok());
+    print("oneOf: " + v_str("red").oneOf(["red", "green"]).ok() +
+          "/" + v_str("blue").oneOf(["red", "green"]).ok());
+    print("oneOf message: " + v_str("blue").oneOf(["red", "green"]).message());
+    print("startsWith/endsWith/contains: " + v_str("abcdef").startsWith("abc").ok() +
+          v_str("abcdef").endsWith("def").ok() + v_str("abcdef").contains("cd").ok() +
+          v_str("abcdef").startsWith("zz").ok());
+
+    print("---- formats without a regex engine ----");
+    print("url: " + v_str("https://example.com/a?b=1").url().ok() +
+          "/" + v_str("not a url").url().ok());
+    print("uuid: " + v_str("550e8400-e29b-41d4-a716-446655440000").uuid().ok() +
+          "/" + v_str("550e8400e29b41d4a716446655440000").uuid().ok() +
+          "/" + v_str("550e8400-e29b-41d4-a716-44665544zzzz").uuid().ok());
+    print("isoDate: " + v_str("2026-07-28").isoDate().ok() +
+          "/" + v_str("2026-02-30").isoDate().ok() +
+          "/" + v_str("28-07-2026").isoDate().ok());
+
+    print("---- formats that need the pattern module ----");
+    print("email: " + email(v_str("first.last@sub.example.co.uk")).ok() +
+          "/" + email(v_str("no-at-sign")).ok() +
+          "/" + email(v_str("a@b")).ok());
+    print("ipv4: " + ipv4(v_str("255.255.255.255")).ok() +
+          "/" + ipv4(v_str("256.1.1.1")).ok() +
+          "/" + ipv4(v_str("01.2.3.4")).ok());
+    print("pattern anchors: " + pattern(v_str("ABC-1234"), "[A-Z]{3}-\\d{4}").ok() +
+          "/" + pattern(v_str("xABC-1234x"), "[A-Z]{3}-\\d{4}").ok());
+    print("matches (unanchored): " + matches(v_str("xABC-1234x"), "[A-Z]{3}-\\d{4}").ok());
+    print("notMatches: " + notMatches(v_str("clean"), "[<>]").ok() +
+          "/" + notMatches(v_str("a<b").notBlank(), "[<>]").ok());
+
+    print("---- numeric rules ----");
+    print("int min/max/between: " + v_int(5).min(1).ok() + v_int(5).max(1).ok() +
+          v_int(5).between(1, 10).ok() + v_int(50).between(1, 10).ok());
+    print("int positive/nonNegative: " + v_int(1).positive().ok() + v_int(0).positive().ok() +
+          v_int(0).nonNegative().ok() + v_int(-1).nonNegative().ok());
+    print("oneOfInt: " + v_int(3).oneOfInt([1, 2, 3]).ok() + "/" + v_int(9).oneOfInt([1, 2, 3]).ok());
+    print("float min/max/positive: " + v_float(1.5).min(1.0).ok() + v_float(1.5).max(1.0).ok() +
+          v_float(0.5).positive().ok() + v_float(0.0).positive().ok());
+    print("float finite: " + v_float(1.0).finite().ok() + "/" + v_float(0.0 / 0.0).finite().ok());
+    print("bool: " + v_bool(true).isTrue().ok() + v_bool(false).isTrue().ok() +
+          v_bool(false).isFalse().ok());
+    print("codes: tooSmall=" + v_int(0).min(5).error().code + " (V_TOO_SMALL=" + V_TOO_SMALL +
+          ") tooLarge=" + v_int(9).max(5).error().code + " (V_TOO_LARGE=" + V_TOO_LARGE + ")");
+
+    print("---- coercion failures ----");
+    print("asInt: " + validation().check("12x").asInt().ok() +
+          "/" + validation().check("").asInt().ok() +
+          "/" + validation().check("1.5").asInt().ok());
+    print("asFloat: " + validation().check("1.5e3").asFloat().ok() +
+          "/" + validation().check("abc").asFloat().ok());
+    print("asBool: " + validation().check("true").asBool().ok() +
+          "/" + validation().check("maybe").asBool().ok());
+    print("codes: " + validation().check("x").asInt().error().code + "/" +
+          validation().check("x").asFloat().error().code + "/" +
+          validation().check("x").asBool().error().code +
+          " (want " + V_NOT_INT + "/" + V_NOT_FLOAT + "/" + V_NOT_BOOL + ")");
+    // optional() must suppress coercion too — an absent number is not an error.
+    let oc = validation();
+    let n = oc.check("", field: "port").optional().asInt().min(1).valueOr(8080);
+    print("optional absent -> errors=" + oc.count() + " valueOr=" + n);
+
+    print("---- valueOr on each outcome ----");
+    print("passed: " + validation().check("5").asInt().min(1).valueOr(99));
+    print("failed: " + validation().check("x").asInt().min(1).valueOr(99));
+    print("string: '" + validation().check("hi").minChars(1).valueOr("d") + "'/'" +
+          validation().check("").required().valueOr("d") + "'");
+
+    print("---- custom rules ----");
+    let mw: Rule = new MaxWords(3);
+    print("class rule: " + v_str("one two").custom(mw).ok() +
+          "/" + v_str("one two three four").custom(mw).ok());
+    print("  message: " + v_str("a b c d").custom(mw).message());
+    let noDigits: fn(string): bool = (s) => !s.contains("0");
+    print("closure rule: " + v_str("abc").customFn(noDigits, V_CUSTOM, "no zeros").ok() +
+          "/" + v_str("a0c").customFn(noDigits, V_CUSTOM, "no zeros").ok());
+
+    print("---- accumulator over several fields ----");
+    let form = validation();
+    form.check("", field: "name").required();
+    email(form.check("nope", field: "email"));
+    form.check("abc", field: "age").asInt();
+    form.check("ok@example.com", field: "contact").required();
+    print("ok=" + form.ok() + " count=" + form.count());
+    for (let m in form.messages()) { print("  " + m); }
+    print("forField(age)=" + form.forField("age").len +
+          " hasField(name)=" + form.hasField("name") +
+          " hasField(contact)=" + form.hasField("contact"));
+    print("first=" + form.first().field + " describe=" + form.first().describe());
+    form.clear();
+    print("after clear: ok=" + form.ok() + " count=" + form.count() +
+          " first==null=" + (form.first() == null));
+
+    print("---- standalone checks ----");
+    let sc = v_str("hello").minChars(3).maxChars(10);
+    print("ok=" + sc.ok() + " message='" + sc.message() + "' error==null=" + (sc.error() == null));
+    let sf = v_str("hi").minChars(5);
+    print("failed: ok=" + sf.ok() + " code=" + sf.error().code + " msg=" + sf.message());
+    print("unlabelled describe: " + sf.error().describe());
+    print("error carries value: '" + sf.error().value + "'");
+
+    print("---- error code table ----");
+    print("" + V_REQUIRED + V_BLANK + " " + V_TOO_SHORT + V_TOO_LONG + " " +
+          V_NOT_IN_SET + V_NO_MATCH + " " + V_NOT_INT + V_NOT_FLOAT + V_NOT_BOOL +
+          " " + V_TOO_SMALL + V_TOO_LARGE + " " + V_NOT_EMAIL + V_NOT_URL +
+          V_NOT_UUID + V_NOT_IPV4 + V_NOT_DATE + " " + V_NOT_TRUE + V_NOT_FALSE +
+          V_CUSTOM);
+}

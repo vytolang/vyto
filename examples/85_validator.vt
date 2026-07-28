@@ -1,0 +1,95 @@
+// vyto/validator — checking input before you trust it.
+//
+// The job: a signup form arrives as flat text (as every form, query string and
+// config file does), and none of it can be believed until it is checked. Then a
+// config file, where the interesting part is turning text into typed values
+// without a second parse.
+//
+// Two ideas carry the whole library:
+//
+//   Coercion is part of the chain and changes its type.
+//   `v.check("42").asInt()` hands the rest of the chain to an integer check, so
+//   `.between(1, 65535)` takes integers and `.email()` is not even in scope.
+//
+//   A failing rule stops the chain. An empty required field reports "required",
+//   not also "too short" and "not an email".
+//
+// The form data is written out as literals rather than read from anywhere, so
+// the output is fixed.
+
+import { validation, v_str, Rule,
+         V_CUSTOM, V_TOO_SHORT } from "vyto/validator";
+import { email } from "vyto/validator/pattern";
+
+// A rule with configuration. It is a class rather than a closure because a
+// closure cannot capture `this` and cannot nest — so a rule carrying settings
+// is not expressible as one.
+class NoSpaces extends Rule {
+    override fn test(s: string): bool { return !s.contains(" "); }
+    override fn code(): int { return V_CUSTOM; }
+    override fn message(): string { return "cannot contain spaces"; }
+}
+
+fn main() {
+    print("---- a signup form, all of it wrong ----");
+    let bad = validation();
+    bad.check("", field: "name").required().betweenChars(2, 40);
+    email(bad.check("not-an-email", field: "email").required());
+    bad.check("hunter2", field: "password").minChars(12);
+    bad.check("abc", field: "age").asInt().between(13, 120);
+    bad.check("2026-02-30", field: "dob").isoDate();
+
+    print("valid: " + bad.ok() + "   failures: " + bad.count());
+    for (let m in bad.messages()) { print("  " + m); }
+
+    print("---- the same form, filled in properly ----");
+    let good = validation();
+    good.check("  Ada Lovelace  ", field: "name").required().trim().betweenChars(2, 40);
+    email(good.check("ada@example.com", field: "email").required());
+    let age = good.check("36", field: "age").asInt().between(13, 120).value();
+    let dob = good.check("1815-12-10", field: "dob").isoDate().value();
+    print("valid: " + good.ok() + "   age=" + age + " dob=" + dob);
+
+    print("---- one error per field, not three ----");
+    // required, minChars and email would all fail on an empty string. The chain
+    // stops at the first, because a form showing three messages under one empty
+    // box is worse than showing one.
+    let one = validation();
+    email(one.check("", field: "email").required().minChars(6));
+    print("empty email -> " + one.count() + " error: " + one.first().describe());
+
+    print("---- config: text in, typed values out ----");
+    // asInt/asFloat/asBool convert and validate in the same pass, so nothing
+    // downstream re-parses. valueOr supplies the default when a setting is
+    // absent or unusable, and optional() keeps an absent one from being an error.
+    let cfg = validation();
+    let port    = cfg.check("8080",  field: "port").asInt().between(1, 65535).valueOr(80);
+    let ratio   = cfg.check("0.75",  field: "ratio").asFloat().between(0.0, 1.0).valueOr(0.5);
+    let debug   = cfg.check("yes",   field: "debug").asBool().valueOr(false);
+    let workers = cfg.check("",      field: "workers").optional().asInt().positive().valueOr(4);
+    let bogus   = cfg.check("many",  field: "retries").asInt().positive().valueOr(3);
+    print("port=" + port + " ratio=" + ratio + " debug=" + debug +
+          " workers=" + workers + " (absent, defaulted) retries=" + bogus + " (bad, defaulted)");
+    print("config errors: " + cfg.count());
+    for (let m in cfg.messages()) { print("  " + m); }
+
+    print("---- checking a single literal ----");
+    // No accumulator needed when there is only one thing to check.
+    print("'ok' minChars(2): " + v_str("ok").minChars(2).ok());
+    let short = v_str("x").minChars(2);
+    print("'x'  minChars(2): " + short.ok() + " code=" + short.error().code +
+          " (V_TOO_SHORT=" + V_TOO_SHORT + ") msg=" + short.message());
+
+    print("---- a custom rule ----");
+    let noSpaces: Rule = new NoSpaces();
+    let u = validation();
+    u.check("ada lovelace", field: "username").custom(noSpaces);
+    print("username with a space -> " + u.first().describe());
+    print("without one -> " + v_str("ada_lovelace").custom(noSpaces).ok());
+
+    print("---- characters, not bytes ----");
+    // A byte-based limit would reject a perfectly reasonable name. maxBytes
+    // exists too, for when the budget really is bytes.
+    print("'José' is " + "José".len + " bytes but 4 characters: maxChars(4)=" +
+          v_str("José").maxChars(4).ok() + " maxBytes(4)=" + v_str("José").maxBytes(4).ok());
+}

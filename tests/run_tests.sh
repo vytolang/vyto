@@ -449,6 +449,44 @@ else
     fail=1
 fi
 
+# --- vyto/validator: the coercion chain changing the type of the check, the
+#     short-circuit that keeps one failing value to one error, characters vs
+#     bytes in the length rules, required vs optional, every format predicate,
+#     and both custom-rule forms ---
+got=$(./vytoc run tests/fixtures/validator.vt 2>&1)
+if [ "$got" = "$(cat tests/fixtures/validator.expected)" ]; then
+    echo "PASS validator"
+else
+    echo "FAIL validator"
+    echo "--- expected ---"; cat tests/fixtures/validator.expected
+    echo "--- got ---"; printf '%s\n' "$got"
+    fail=1
+fi
+
+# --- vyto/validator: the core must NOT drag in vyto/regex. The three rules that
+#     need a regex engine live in vyto/validator/pattern precisely so a program
+#     doing length and range checks doesn't compile 30 PCRE2 translation units.
+#     Build a core-only program into a scratch cache and prove no regex object
+#     was produced for it ---
+rm -rf tests/tmp/valcore
+mkdir -p tests/tmp/valcore
+cat > tests/tmp/valcore/core.vt <<'VTEOF'
+import { validation } from "vyto/validator";
+fn main() { let v = validation(); v.check("hi").required().minChars(2); print(v.ok()); }
+VTEOF
+if VYTO_OBJ_CACHE=tests/tmp/valcore/obj ./vytoc build tests/tmp/valcore/core.vt \
+        -o tests/tmp/valcore/core >/dev/null 2>&1; then
+    if grep -rl vregex tests/tmp/valcore/obj >/dev/null 2>&1; then
+        echo "FAIL validator_no_regex (core pulled in PCRE2)"
+        fail=1
+    else
+        echo "PASS validator_no_regex"
+    fi
+else
+    echo "FAIL validator_no_regex (build failed)"
+    fail=1
+fi
+
 # --- vyto/regex: the convenience layer — the four match walkers agreeing on a
 #     zero-width pattern, rx_quote round-tripping every metacharacter,
 #     fullMatch's \z beating a trailing newline, expand's template syntax, the
