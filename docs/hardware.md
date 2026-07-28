@@ -455,8 +455,8 @@ while (true) {
   ps.addFd(mon.pollFd(), POLL_READ);
   // on wake:
   let e = mon.next();
-  if (e != null && e.subsystem() == "power_supply") {
-      print(e.action() + " " + e.name() + " online=" + e.get("POWER_SUPPLY_ONLINE"));
+  if (e != null && e.subsystem == "power_supply") {     // fields, not methods
+      print(e.action + " " + e.name() + " online=" + e.get("POWER_SUPPLY_ONLINE"));
   }
   ```
 - **`net/wifi` monitor** — wpa_supplicant *pushes* `CTRL-EVENT-DISCONNECTED` /
