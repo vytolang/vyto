@@ -1,0 +1,383 @@
+// vyto/crypto/openssl — OpenSSL bindings: TLS, X.509, and the primitives the
+// pure-Vyto modules do not cover.
+//
+// STATUS: STUB. Every entry point below panics. The shapes are here so callers
+// and the shim can be designed against something concrete, and so the decisions
+// that are expensive to reverse — package layout, provisioning, error handling,
+// object ownership — are settled before the first line of C is written. Nothing
+// in this file links anything yet; there is deliberately no extern "C" block
+// and no #link, so importing it costs nothing and fails loudly rather than
+// silently returning wrong bytes.
+//
+// The reason this exists is TLS. vyto/net gets HTTPS today by linking libcurl,
+// which is a whole HTTP client dragged in for its TLS; a raw `Socket` cannot be
+// wrapped. Everything else here follows from already having libssl linked.
+//
+// ---- why its own package directory ----
+//
+// A native/src is compiled once per package *directory*, for every module in
+// it. This lives in lib/vyto/crypto/openssl/ rather than beside crypto.vt so a
+// program that hashes a password does not link libcrypto, exactly as
+// vyto/crypto/ecc is split from vyto/crypto and vyto/util/uuid from vyto/util
+// (uuid.vt:20-24). Three packages under vyto/crypto, three different native
+// costs: none, micro-ecc, OpenSSL.
+//
+// ---- relationship to the pure-Vyto modules ----
+//
+// This does NOT replace vyto/crypto or vyto/crypto/argon2, and it must not
+// become the default path for what they already do. They have no dependency,
+// cross-compile with nothing to provision, and are already vector-tested. The
+// rule to hold to:
+//
+//   Use the pure-Vyto module unless you need something it does not have.
+//
+// What only OpenSSL can give: TLS, X.509 certificate parsing and chain
+// verification, RSA, Ed25519/X25519, AES (which is a bad idea in software
+// without AES-NI — cache-timing leaks — and a good idea through OpenSSL, which
+// uses the instruction), SHA-3, and hardware-accelerated hashing when
+// throughput actually matters.
+//
+// Where both implement the same primitive (SHA-256, HMAC, HKDF, PBKDF2,
+// ChaCha20-Poly1305, P-256 ECDSA/ECDH), the two MUST agree byte for byte, and
+// the test suite must prove it rather than assume it. Two implementations of
+// SHA-256 already coexist in this tree — pure Vyto in crypto.vt and C in
+// ecc_shim.c — and examples/86_crypto.vt holds both to the same vectors for
+// precisely this reason. Add OpenSSL as a third column there, not as a
+// replacement column.
+//
+// ---- provisioning, the part that decides everything else ----
+//
+// POSIX links the system library: `#link "crypto"`, `#link "ssl"`. That is how
+// vyto/net already handles libcurl (net.vt), and it means a build-time
+// dependency on the distro's libssl-dev.
+//
+// Windows has no system OpenSSL, so it needs the vendored-DLL arrangement that
+// lib/vyto/net/native/provision-curl.sh already implements: headers generated
+// into native/<triple>/include, the DLL supplied out of band and shipped with a
+// Vyto release, never committed (*.dll is gitignored). A provision-openssl.sh
+// written on that template is the intended path. Note this is the OPPOSITE of
+// how micro-ecc is handled next door — that is vendored into git because it is
+// small pure C and crypto tests must never silently skip. OpenSSL is neither
+// small nor buildable without decisions, so it follows curl instead.
+//
+// Version floor: OpenSSL 3.0. The 1.1 -> 3.x soname change (libcrypto.so.1.1
+// vs libcrypto.so.3) is not ABI-compatible, and supporting both means two code
+// paths for the low-level APIs 3.x deprecated. Pin 3.0 and use the EVP
+// interfaces throughout, which are stable across the 3.x line.
+//
+// Version traps worth knowing before designing around them:
+//   - Argon2id via EVP_KDF exists only in 3.2+. A distro on 3.0 does not have
+//     it. vyto/crypto/argon2 is pure Vyto and always present, so it stays the
+//     default for password hashing regardless of what OpenSSL is installed.
+//   - The FIPS provider must be loaded explicitly in 3.x, and loading it
+//     removes algorithms rather than adding them. Out of scope until asked for.
+//   - Engines are gone in 3.x, replaced by providers.
+//
+// ---- rules the implementation has to follow ----
+//
+// These are the ones that are painful to retrofit:
+//
+//  1. No OpenSSL type, constant or error code crosses into Vyto. The shim
+//     translates. A version bump must not be able to change a number the Vyto
+//     side compares against — the same contract regex_shim.c holds for PCRE2
+//     and ecc_shim.c for micro-ecc.
+//
+//  2. Objects are owned by Vyto classes with `deinit`, so ARC frees the
+//     SSL_CTX / EVP_PKEY / X509 the moment the handle leaves scope, the way
+//     vyto/io's File and vyto/surface's Surface already do. No manual free in
+//     caller code, ever.
+//
+//  3. The OpenSSL error queue is per-thread and stateful: an unread error from
+//     one call surfaces as a bogus diagnostic on the next. The shim must drain
+//     it on every entry and attach the first real reason to the failure it
+//     returns. A "failed for no reason" TLS handshake is nearly always this.
+//
+//  4. Certificate verification is ON by default and turning it off must be
+//     loud. `tls_client()` verifies the chain and the hostname; anything that
+//     disables that gets a name that says so, because a TLS client that does
+//     not verify is strictly worse than plaintext — it costs the same and
+//     provides confidence it has not earned.
+//
+//  5. Failures return a result object, not a sentinel. A zero-length key or an
+//     empty plaintext that a caller mistakes for success is the failure mode
+//     this whole package has to avoid; vyto/crypto's AeadResult and ecc's
+//     EccResult set the shape.
+//
+// ---- scope ----
+//
+// In, roughly in build order:
+//   TLS client over an existing vyto/net Socket, with SNI, ALPN and hostname
+//   verification; TLS server; X.509 parse, chain verify, subject/SAN/validity
+//   extraction; EVP digests (SHA-2, SHA-3); EVP ciphers (AES-GCM, AES-CBC);
+//   EVP_PKEY for RSA, Ed25519, X25519, and the NIST curves; PEM and DER
+//   encoding; CSR generation.
+//
+// Out, for now:
+//   FIPS provider, engines/providers beyond the default, DTLS, QUIC, OCSP
+//   stapling, CMS/PKCS#7, and anything that needs a callback from C into Vyto
+//   until the fn-pointer story is settled (examples/cbwrap shows the mechanism).
+
+// ---- result shapes ----------------------------------------------------------
+
+// A byte string that may not exist, plus the reason when it does not. Mirrors
+// vyto/crypto's AeadResult and vyto/crypto/ecc's EccResult, with `err` added
+// because OpenSSL failures have a diagnosable cause worth surfacing — a TLS
+// handshake fails for a dozen distinct reasons and "false" helps nobody.
+export class OsslResult {
+    ok: bool;
+    data: byte[];
+    err: string;
+
+    fn init(ok: bool, data: byte[], err: string) {
+        this.ok = ok;
+        this.data = data;
+        this.err = err;
+    }
+}
+
+// ---- stubs ------------------------------------------------------------------
+
+fn todo(what: string) {
+    panic("vyto/crypto/openssl: " + what + " is not implemented yet — this module is a stub, see its header");
+}
+
+// Runtime version of the linked library, e.g. "OpenSSL 3.0.13 30 Jan 2024".
+// First thing to implement: it proves the link works and the version floor is met.
+export fn ossl_version(): string {
+    todo("ossl_version");
+    return "";
+}
+
+// True once the library is initialised and the default provider is loaded.
+export fn ossl_available(): bool {
+    todo("ossl_available");
+    return false;
+}
+
+// ---- digests ----------------------------------------------------------------
+
+// One-shot EVP digest. `algo` is a name OpenSSL knows ("SHA256", "SHA512",
+// "SHA3-256"). Deliberately a string rather than an int constant: the set of
+// available digests depends on the loaded providers, so it cannot be a closed
+// enum decided at compile time.
+//
+// For SHA-256 specifically, prefer vyto/crypto's sha256 unless you are hashing
+// enough data for the hardware acceleration to matter — it has no dependency.
+export fn ossl_digest(algo: string, data: byte[]): OsslResult {
+    todo("ossl_digest");
+    return new OsslResult(false, bytes(0), "");
+}
+
+export fn ossl_hmac(algo: string, key: byte[], msg: byte[]): OsslResult {
+    todo("ossl_hmac");
+    return new OsslResult(false, bytes(0), "");
+}
+
+// ---- symmetric --------------------------------------------------------------
+
+// AEAD encrypt. `algo` is "AES-256-GCM", "AES-128-GCM", "ChaCha20-Poly1305".
+// Returns ciphertext ‖ tag, matching the layout vyto/crypto already uses so the
+// two are drop-in for each other.
+//
+// The reason to want AES here rather than vyto/crypto's ChaCha20-Poly1305:
+// OpenSSL uses AES-NI. A software AES is both slow and cache-timing leaky,
+// which is why vyto/crypto does not implement one.
+export fn ossl_seal(algo: string, key: byte[], nonce: byte[], plaintext: byte[], aad: byte[]): OsslResult {
+    todo("ossl_seal");
+    return new OsslResult(false, bytes(0), "");
+}
+
+export fn ossl_open(algo: string, key: byte[], nonce: byte[], sealed: byte[], aad: byte[]): OsslResult {
+    todo("ossl_open");
+    return new OsslResult(false, bytes(0), "");
+}
+
+// ---- keys -------------------------------------------------------------------
+
+// An EVP_PKEY. Owns the C object; ARC frees it on deinit, so callers never free.
+export class Pkey {
+    handle: rawptr;
+    kind: string;       // "RSA", "EC", "ED25519", "X25519"
+    bits: int;
+
+    fn init() {
+        todo("Pkey");
+    }
+}
+
+// Generate a key. `spec` names the algorithm and its parameter: "RSA:3072",
+// "EC:P-256", "ED25519", "X25519".
+export fn ossl_genkey(spec: string): Pkey {
+    todo("ossl_genkey");
+    return new Pkey();
+}
+
+export fn ossl_pkey_from_pem(pem: string, password: string): Pkey {
+    todo("ossl_pkey_from_pem");
+    return new Pkey();
+}
+
+export fn ossl_pkey_to_pem(key: Pkey, password: string): OsslResult {
+    todo("ossl_pkey_to_pem");
+    return new OsslResult(false, bytes(0), "");
+}
+
+// Sign a digest. For Ed25519 this signs the message itself, which is why the
+// parameter is named `data` and not `hash` — Ed25519 does its own hashing and
+// handing it a digest signs the digest, a mistake that still verifies.
+export fn ossl_sign(key: Pkey, algo: string, data: byte[]): OsslResult {
+    todo("ossl_sign");
+    return new OsslResult(false, bytes(0), "");
+}
+
+export fn ossl_verify(key: Pkey, algo: string, data: byte[], sig: byte[]): bool {
+    todo("ossl_verify");
+    return false;
+}
+
+// ---- X.509 ------------------------------------------------------------------
+
+// A parsed certificate. Accessors return already-extracted Vyto values rather
+// than lazily reaching into the X509 — so a chain can be reported on after the
+// context that produced it is gone.
+export class Cert {
+    handle: rawptr;
+    subject: string;
+    issuer: string;
+    notBefore: int;     // unix seconds
+    notAfter: int;      // unix seconds
+    serial: string;
+    sans: string[];     // subjectAltName entries, the ones hostname checks use
+
+    fn init() {
+        todo("Cert");
+    }
+}
+
+export fn cert_from_pem(pem: string): Cert {
+    todo("cert_from_pem");
+    return new Cert();
+}
+
+export fn cert_from_der(der: byte[]): Cert {
+    todo("cert_from_der");
+    return new Cert();
+}
+
+// Verify `leaf` against `roots`, with `intermediates` available to build the
+// chain. Checks signatures, validity dates and basic constraints. It does NOT
+// check the hostname — that is cert_matches_host, kept separate because the
+// two are independently wrong in practice and a combined call hides which one
+// a caller forgot.
+export fn cert_verify_chain(leaf: Cert, intermediates: Cert[], roots: Cert[]): OsslResult {
+    todo("cert_verify_chain");
+    return new OsslResult(false, bytes(0), "");
+}
+
+// RFC 6125 hostname matching against SAN, falling back to CN only when there is
+// no SAN. Wildcards match one label and never the public suffix.
+export fn cert_matches_host(cert: Cert, host: string): bool {
+    todo("cert_matches_host");
+    return false;
+}
+
+// ---- TLS --------------------------------------------------------------------
+
+// Shared configuration for one or many connections. Building this is the
+// expensive part — loading a trust store is not something to do per connection.
+export class TlsContext {
+    handle: rawptr;
+    isServer: bool;
+    minVersion: string;     // "TLS1.2", "TLS1.3"
+    alpn: string[];
+
+    fn init() {
+        todo("TlsContext");
+    }
+}
+
+// A client context that verifies the chain against the system trust store and
+// checks the hostname. This is the one to use.
+export fn tls_client(): TlsContext {
+    todo("tls_client");
+    return new TlsContext();
+}
+
+// A client context that verifies NOTHING: no chain, no hostname, no expiry.
+// Named to be impossible to reach for by accident and impossible to miss in
+// review. It is for talking to a box on a bench whose certificate you have not
+// issued yet, and for nothing else. An unverified TLS connection costs exactly
+// as much as a verified one and provides confidence it has not earned; against
+// an attacker who can route packets, it is worth less than plaintext, because
+// plaintext does not persuade anyone they are safe.
+export fn tls_client_insecure_no_verification(): TlsContext {
+    todo("tls_client_insecure_no_verification");
+    return new TlsContext();
+}
+
+export fn tls_server(certChainPem: string, keyPem: string): TlsContext {
+    todo("tls_server");
+    return new TlsContext();
+}
+
+// A TLS connection over an existing socket. `fd` is a vyto/net Socket's
+// descriptor: this layer does not open sockets, so the same code works over
+// anything that produced one.
+export class TlsConn {
+    handle: rawptr;
+    fd: int;
+    host: string;
+
+    fn init() {
+        todo("TlsConn");
+    }
+
+    // Blocking handshake. Returns the negotiated protocol on success
+    // ("TLSv1.3"), or ok=false with the error queue's reason.
+    fn handshake(): OsslResult {
+        todo("TlsConn.handshake");
+        return new OsslResult(false, bytes(0), "");
+    }
+
+    fn read(max: int): OsslResult {
+        todo("TlsConn.read");
+        return new OsslResult(false, bytes(0), "");
+    }
+
+    fn write(data: byte[]): OsslResult {
+        todo("TlsConn.write");
+        return new OsslResult(false, bytes(0), "");
+    }
+
+    // The peer's certificate, for callers that want to pin or inspect it.
+    fn peerCert(): Cert {
+        todo("TlsConn.peerCert");
+        return new Cert();
+    }
+
+    // The ALPN protocol the peer agreed to, empty when none was negotiated.
+    fn alpnSelected(): string {
+        todo("TlsConn.alpnSelected");
+        return "";
+    }
+
+    // Sends close_notify before dropping the socket. Skipping it is what makes
+    // the other end report a truncation error instead of a clean close.
+    fn close() {
+        todo("TlsConn.close");
+    }
+}
+
+// Wrap a connected socket and drive the client handshake. `host` is used for
+// both SNI and hostname verification — passing the IP when the certificate
+// names the DNS name is the usual cause of a verification failure that looks
+// like a chain problem.
+export fn tls_connect(ctx: TlsContext, fd: int, host: string): TlsConn {
+    todo("tls_connect");
+    return new TlsConn();
+}
+
+export fn tls_accept(ctx: TlsContext, fd: int): TlsConn {
+    todo("tls_accept");
+    return new TlsConn();
+}
