@@ -1,0 +1,663 @@
+// vyto/crypto — the symmetric half: hashing, key derivation, authenticated
+// encryption. Pure Vyto, no native code, no system library.
+//
+//     sha256(strBytes("abc"))                       // 32 bytes
+//     hmac_sha256(key, msg)                         // 32 bytes
+//     hkdf_sha256(ikm, salt, strBytes("ctx"), 32)   // derive a key from a key
+//     pbkdf2_sha256(pw, salt, 600000, 32)           // derive a key from a password
+//
+//     let sealed = chacha20poly1305_seal(key32, nonce12, plaintext, aad);
+//     let r = chacha20poly1305_open(key32, nonce12, sealed, aad);
+//     if (r.ok) { use(r.data); }                    // never use r.data unless ok
+//
+//     ct_equal(a, b)                                // compare secrets with this
+//     hex_encode(digest)  /  hex_decode("ba7816bf…")
+//
+// P-256 (ECDSA, ECDH) is deliberately NOT here: it lives in vyto/crypto/ecc,
+// which is a separate package directory because it carries a native/src. A
+// native/src is compiled once per package *directory*, for every module in it
+// (lib/vyto/util/uuid/uuid.vt:20-24 explains the same split), so keeping the
+// two apart means a program that only wanted to hash a password does not
+// compile micro-ecc, and does not link bcrypt on Windows.
+//
+// Everything here is one-shot over a byte[]. There is no streaming Hasher: the
+// callers this exists for — a vault key, a MAC over a record, a derived
+// subkey — all hold the whole message already, and a streaming API that is
+// never fed incrementally is API surface that only costs test cases. Add one
+// when something needs to hash a file it cannot hold.
+//
+// SECURITY CAVEATS, both real:
+//
+//   1. This code is not hardened against timing side channels. It is straight
+//      -O2 C after transpilation, with data-dependent branches in Poly1305's
+//      final reduction and no defence against cache-timing analysis. It is
+//      appropriate for encrypting a local file that an attacker must already
+//      have filesystem access to read. It is NOT appropriate for a network
+//      service that decrypts attacker-supplied ciphertext on demand and can be
+//      timed. `ct_equal` is the one exception and it is constant-time on
+//      purpose, because tag comparison is where a timing leak becomes a forgery.
+//
+//   2. A nonce must never repeat under one key. ChaCha20-Poly1305 fails
+//      catastrophically on nonce reuse — two messages under the same key and
+//      nonce leak the XOR of their plaintexts *and* let an attacker forge tags
+//      for that key. There is no nonce management here on purpose; the caller
+//      that owns the key owns the counter. Draw nonces with vyto/util/uuid's
+//      rand_bytes(12) and store one per record, or keep a counter that is
+//      persisted before use.
+
+import { StringBuilder } from "vyto/util/text";
+
+// ---- little helpers ---------------------------------------------------------
+
+// The UTF-8 bytes of a string. Note the vyto-wide caveat: a string containing
+// an embedded NUL reaches C truncated at it (vyto/util/text.vt:12), so a
+// password with a NUL in it hashes as its prefix. Pass byte[] directly when
+// that matters.
+export fn strBytes(s: string): byte[] {
+    let b = bytes(s.len);
+    let i = 0;
+    while (i < s.len) { b[i] = s[i] as byte; i += 1; }
+    return b;
+}
+
+// `n` bytes of `b` starting at `off`. Out-of-range requests clamp rather than
+// panic, matching the soft-failure style of vyto/util/mime and vyto/util/json.
+export fn sub_bytes(b: byte[], off: int, n: int): byte[] {
+    if (off < 0) { off = 0; }
+    if (n < 0) { n = 0; }
+    if (off > b.len) { off = b.len; }
+    if (off + n > b.len) { n = b.len - off; }
+    let out = bytes(n);
+    let i = 0;
+    while (i < n) { out[i] = b[off + i]; i += 1; }
+    return out;
+}
+
+export fn concat_bytes(a: byte[], b: byte[]): byte[] {
+    let out = bytes(a.len + b.len);
+    let i = 0;
+    while (i < a.len) { out[i] = a[i]; i += 1; }
+    let j = 0;
+    while (j < b.len) { out[a.len + j] = b[j]; j += 1; }
+    return out;
+}
+
+// Compare two byte strings in time that depends on their length but not on
+// their contents. Use this for MAC tags, password hashes and any other secret:
+// a plain loop that returns early on the first mismatch tells an attacker how
+// many leading bytes they guessed right, which turns forging a 32-byte tag from
+// 2^256 work into 32 * 256.
+export fn ct_equal(a: byte[], b: byte[]): bool {
+    if (a.len != b.len) { return false; }
+    let diff = 0;
+    let i = 0;
+    while (i < a.len) {
+        diff = diff | ((a[i] as int) ^ (b[i] as int));
+        i += 1;
+    }
+    return diff == 0;
+}
+
+const HEXDIG: string = "0123456789abcdef";
+
+export fn hex_encode(b: byte[]): string {
+    let sb = new StringBuilder(b.len * 2 + 1);
+    let i = 0;
+    while (i < b.len) {
+        let v = b[i] as int;
+        sb.appendByte(HEXDIG[(v >> 4) & 0xF]);
+        sb.appendByte(HEXDIG[v & 0xF]);
+        i += 1;
+    }
+    return sb.toString();
+}
+
+// Decodes both cases. Every byte outside [0-9a-fA-F] is ignored (so a digest
+// pasted with spaces or newlines still decodes) and a trailing odd nibble is
+// dropped — same forgiving contract as base64_decode in vyto/util/mime.
+export fn hex_decode(s: string): byte[] {
+    let n = 0;
+    let i = 0;
+    while (i < s.len) {
+        if (hex_val(s[i]) >= 0) { n += 1; }
+        i += 1;
+    }
+    let out = bytes(n / 2);
+    let hi = -1;
+    let o = 0;
+    i = 0;
+    while (i < s.len) {
+        let v = hex_val(s[i]);
+        i += 1;
+        if (v < 0) { continue; }
+        if (hi < 0) { hi = v; continue; }
+        if (o < out.len) { out[o] = ((hi << 4) | v) as byte; o += 1; }
+        hi = -1;
+    }
+    return out;
+}
+
+fn hex_val(c: int): int {
+    if (c >= 48 && c <= 57)  { return c - 48; }       // 0-9
+    if (c >= 97 && c <= 102) { return c - 87; }       // a-f
+    if (c >= 65 && c <= 70)  { return c - 55; }       // A-F
+    return -1;
+}
+
+fn rotr32(x: int, n: int): int {
+    let v = x & 0xFFFFFFFF;
+    return ((v >> n) | (v << (32 - n))) & 0xFFFFFFFF;
+}
+
+fn rotl32(x: int, n: int): int {
+    let v = x & 0xFFFFFFFF;
+    return ((v << n) | (v >> (32 - n))) & 0xFFFFFFFF;
+}
+
+// ---- SHA-256 (FIPS 180-4) ---------------------------------------------------
+
+export const SHA256_SIZE: int = 32;
+export const SHA256_BLOCK: int = 64;
+
+// SHA-256's 64 round constants. This is a function rather than a module-level
+// `const int[]` because vytoc requires a const initializer to be a constant
+// expression and an array literal is not one — so the table is built, and the
+// hot paths below thread one copy through rather than rebuilding it per hash.
+// PBKDF2 at 600 000 iterations calls the compression function about 2.4 million
+// times; rebuilding a 64-element array each time is the difference between an
+// acceptable KDF and an unusable one.
+fn k256(): int[] {
+    return [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1,
+        0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
+        0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786,
+        0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147,
+        0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13,
+        0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a,
+        0x5b9cca4f, 0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
+        0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
+    ];
+}
+
+export fn sha256(data: byte[]): byte[] {
+    return sha256_k(k256(), data);
+}
+
+fn sha256_k(K256: int[], data: byte[]): byte[] {
+    // Pad to a multiple of 64 with 0x80, zeroes, then the length in bits as a
+    // big-endian u64. bytes() returns zeroed memory, so the middle is free.
+    let ml = data.len;
+    let total = ml + 1;
+    while (total % 64 != 56) { total += 1; }
+    total += 8;
+    let msg = bytes(total);
+    let i = 0;
+    while (i < ml) { msg[i] = data[i]; i += 1; }
+    msg[ml] = 0x80 as byte;
+    let bits = ml * 8;
+    let k = 0;
+    while (k < 8) { msg[total - 1 - k] = ((bits >> (k * 8)) & 0xFF) as byte; k += 1; }
+
+    let h0 = 0x6a09e667; let h1 = 0xbb67ae85;
+    let h2 = 0x3c6ef372; let h3 = 0xa54ff53a;
+    let h4 = 0x510e527f; let h5 = 0x9b05688c;
+    let h6 = 0x1f83d9ab; let h7 = 0x5be0cd19;
+
+    let off = 0;
+    while (off < total) {
+        let w: int[] = [];
+        let t = 0;
+        while (t < 16) {
+            let p = off + t * 4;
+            w.push(((msg[p] as int) << 24) | ((msg[p + 1] as int) << 16) |
+                   ((msg[p + 2] as int) << 8) | (msg[p + 3] as int));
+            t += 1;
+        }
+        while (t < 64) {
+            let x = w[t - 15];
+            let y = w[t - 2];
+            let s0 = rotr32(x, 7) ^ rotr32(x, 18) ^ ((x & 0xFFFFFFFF) >> 3);
+            let s1 = rotr32(y, 17) ^ rotr32(y, 19) ^ ((y & 0xFFFFFFFF) >> 10);
+            w.push((w[t - 16] + s0 + w[t - 7] + s1) & 0xFFFFFFFF);
+            t += 1;
+        }
+        let a = h0; let b = h1; let c = h2; let d = h3;
+        let e = h4; let f = h5; let g = h6; let h = h7;
+        let r = 0;
+        while (r < 64) {
+            let S1 = rotr32(e, 6) ^ rotr32(e, 11) ^ rotr32(e, 25);
+            let ch = (e & f) ^ ((~e) & g);
+            let t1 = (h + S1 + (ch & 0xFFFFFFFF) + K256[r] + w[r]) & 0xFFFFFFFF;
+            let S0 = rotr32(a, 2) ^ rotr32(a, 13) ^ rotr32(a, 22);
+            let mj = (a & b) ^ (a & c) ^ (b & c);
+            let t2 = (S0 + (mj & 0xFFFFFFFF)) & 0xFFFFFFFF;
+            h = g; g = f; f = e;
+            e = (d + t1) & 0xFFFFFFFF;
+            d = c; c = b; b = a;
+            a = (t1 + t2) & 0xFFFFFFFF;
+            r += 1;
+        }
+        h0 = (h0 + a) & 0xFFFFFFFF;
+        h1 = (h1 + b) & 0xFFFFFFFF;
+        h2 = (h2 + c) & 0xFFFFFFFF;
+        h3 = (h3 + d) & 0xFFFFFFFF;
+        h4 = (h4 + e) & 0xFFFFFFFF;
+        h5 = (h5 + f) & 0xFFFFFFFF;
+        h6 = (h6 + g) & 0xFFFFFFFF;
+        h7 = (h7 + h) & 0xFFFFFFFF;
+        off += 64;
+    }
+
+    let hs = [h0, h1, h2, h3, h4, h5, h6, h7];
+    let dg = bytes(32);
+    let j = 0;
+    while (j < 8) {
+        dg[j * 4]     = ((hs[j] >> 24) & 0xFF) as byte;
+        dg[j * 4 + 1] = ((hs[j] >> 16) & 0xFF) as byte;
+        dg[j * 4 + 2] = ((hs[j] >> 8) & 0xFF) as byte;
+        dg[j * 4 + 3] = (hs[j] & 0xFF) as byte;
+        j += 1;
+    }
+    return dg;
+}
+
+// ---- HMAC-SHA256 (RFC 2104) -------------------------------------------------
+
+// A key longer than the 64-byte block is hashed down first, per the RFC. That
+// means hmac(k) and hmac(sha256(k)) collide for over-long k — a property of
+// HMAC itself, not of this implementation.
+export fn hmac_sha256(key: byte[], msg: byte[]): byte[] {
+    return hmac_k(k256(), key, msg);
+}
+
+fn hmac_k(K: int[], key: byte[], msg: byte[]): byte[] {
+    let k = key;
+    if (k.len > SHA256_BLOCK) { k = sha256_k(K, k); }
+
+    let ipad = bytes(SHA256_BLOCK);
+    let opad = bytes(SHA256_BLOCK);
+    let i = 0;
+    while (i < SHA256_BLOCK) {
+        let kb = 0;
+        if (i < k.len) { kb = k[i] as int; }
+        ipad[i] = (kb ^ 0x36) as byte;
+        opad[i] = (kb ^ 0x5c) as byte;
+        i += 1;
+    }
+    let inner = sha256_k(K, concat_bytes(ipad, msg));
+    return sha256_k(K, concat_bytes(opad, inner));
+}
+
+// ---- HKDF-SHA256 (RFC 5869) -------------------------------------------------
+
+// Extract-then-expand. Use this to turn one high-entropy secret into several
+// independent keys — an ECDH shared secret into an encryption key, or a master
+// vault key into a per-record key. It is NOT a password KDF: it is fast by
+// design and gives a guessable password no protection. Use pbkdf2_sha256 for
+// anything a human typed.
+//
+// `salt` may be empty (the RFC substitutes a block of zeroes). `info` is the
+// domain separator: different info under the same ikm yields unrelated keys,
+// so name the use ("vault-record-key-v1"), do not leave it empty.
+export fn hkdf_sha256(ikm: byte[], salt: byte[], info: byte[], length: int): byte[] {
+    if (length <= 0) { return bytes(0); }
+    // 255 blocks of 32 bytes is the construction's ceiling; the counter is one
+    // byte and wraps past it, silently repeating output.
+    if (length > 255 * SHA256_SIZE) { length = 255 * SHA256_SIZE; }
+
+    let K = k256();
+    let s = salt;
+    if (s.len == 0) { s = bytes(SHA256_SIZE); }
+    let prk = hmac_k(K, s, ikm);
+
+    let out = bytes(length);
+    let prev = bytes(0);
+    let done = 0;
+    let counter = 1;
+    while (done < length) {
+        let block = concat_bytes(prev, info);
+        let withCtr = bytes(block.len + 1);
+        let i = 0;
+        while (i < block.len) { withCtr[i] = block[i]; i += 1; }
+        withCtr[block.len] = counter as byte;
+
+        prev = hmac_k(K, prk, withCtr);
+        let take = SHA256_SIZE;
+        if (done + take > length) { take = length - done; }
+        let j = 0;
+        while (j < take) { out[done + j] = prev[j]; j += 1; }
+        done += take;
+        counter += 1;
+    }
+    return out;
+}
+
+// ---- PBKDF2-HMAC-SHA256 (RFC 8018) ------------------------------------------
+
+// Derive a key from a password. `iters` is the only thing standing between a
+// stolen vault file and an offline guessing attack, and it must be chosen from
+// measured time on the slowest machine that has to open the vault, not copied
+// from a blog post. OWASP's 2023 floor for PBKDF2-HMAC-SHA256 is 600 000; this
+// implementation is plain transpiled C with no SHA extensions, so measure
+// before assuming that number is affordable here.
+//
+// PBKDF2 is the weakest of the modern password KDFs — it is cheap to run on a
+// GPU because it needs almost no memory. Argon2id is the better primitive and
+// is not implemented here. If this vault is protecting something that a
+// motivated attacker would spend real money on, that gap matters.
+export fn pbkdf2_sha256(password: byte[], salt: byte[], iters: int, dklen: int): byte[] {
+    if (dklen <= 0) { return bytes(0); }
+    if (iters < 1) { iters = 1; }
+
+    let K = k256();
+    let out = bytes(dklen);
+    let done = 0;
+    let block = 1;
+    while (done < dklen) {
+        // U1 = PRF(password, salt || INT_BE32(block))
+        let seed = bytes(salt.len + 4);
+        let i = 0;
+        while (i < salt.len) { seed[i] = salt[i]; i += 1; }
+        seed[salt.len]     = ((block >> 24) & 0xFF) as byte;
+        seed[salt.len + 1] = ((block >> 16) & 0xFF) as byte;
+        seed[salt.len + 2] = ((block >> 8) & 0xFF) as byte;
+        seed[salt.len + 3] = (block & 0xFF) as byte;
+
+        let u = hmac_k(K, password, seed);
+        let acc = bytes(SHA256_SIZE);
+        let j = 0;
+        while (j < SHA256_SIZE) { acc[j] = u[j]; j += 1; }
+
+        let it = 1;
+        while (it < iters) {
+            u = hmac_k(K, password, u);
+            j = 0;
+            while (j < SHA256_SIZE) {
+                acc[j] = ((acc[j] as int) ^ (u[j] as int)) as byte;
+                j += 1;
+            }
+            it += 1;
+        }
+
+        let take = SHA256_SIZE;
+        if (done + take > dklen) { take = dklen - done; }
+        j = 0;
+        while (j < take) { out[done + j] = acc[j]; j += 1; }
+        done += take;
+        block += 1;
+    }
+    return out;
+}
+
+// ---- ChaCha20 (RFC 8439 §2.3) -----------------------------------------------
+
+export const CHACHA_KEY_SIZE: int = 32;
+export const CHACHA_NONCE_SIZE: int = 12;
+export const POLY1305_TAG_SIZE: int = 16;
+
+fn le32(b: byte[], off: int): int {
+    return (b[off] as int) | ((b[off + 1] as int) << 8) |
+           ((b[off + 2] as int) << 16) | ((b[off + 3] as int) << 24);
+}
+
+fn qr(st: int[], a: int, b: int, c: int, d: int) {
+    st[a] = (st[a] + st[b]) & 0xFFFFFFFF; st[d] = rotl32(st[d] ^ st[a], 16);
+    st[c] = (st[c] + st[d]) & 0xFFFFFFFF; st[b] = rotl32(st[b] ^ st[c], 12);
+    st[a] = (st[a] + st[b]) & 0xFFFFFFFF; st[d] = rotl32(st[d] ^ st[a], 8);
+    st[c] = (st[c] + st[d]) & 0xFFFFFFFF; st[b] = rotl32(st[b] ^ st[c], 7);
+}
+
+// One 64-byte keystream block. "expand 32-byte k" is the constant, held as
+// four little-endian words.
+fn chacha_block(key: byte[], nonce: byte[], counter: int): byte[] {
+    let st: int[] = [];
+    st.push(0x61707865); st.push(0x3320646e);
+    st.push(0x79622d32); st.push(0x6b206574);
+    let i = 0;
+    while (i < 8) { st.push(le32(key, i * 4)); i += 1; }
+    st.push(counter & 0xFFFFFFFF);
+    i = 0;
+    while (i < 3) { st.push(le32(nonce, i * 4)); i += 1; }
+
+    let ws: int[] = [];
+    i = 0;
+    while (i < 16) { ws.push(st[i]); i += 1; }
+
+    let r = 0;
+    while (r < 10) {
+        qr(ws, 0, 4, 8, 12);  qr(ws, 1, 5, 9, 13);
+        qr(ws, 2, 6, 10, 14); qr(ws, 3, 7, 11, 15);
+        qr(ws, 0, 5, 10, 15); qr(ws, 1, 6, 11, 12);
+        qr(ws, 2, 7, 8, 13);  qr(ws, 3, 4, 9, 14);
+        r += 1;
+    }
+
+    let out = bytes(64);
+    i = 0;
+    while (i < 16) {
+        let v = (ws[i] + st[i]) & 0xFFFFFFFF;
+        out[i * 4]     = (v & 0xFF) as byte;
+        out[i * 4 + 1] = ((v >> 8) & 0xFF) as byte;
+        out[i * 4 + 2] = ((v >> 16) & 0xFF) as byte;
+        out[i * 4 + 3] = ((v >> 24) & 0xFF) as byte;
+        i += 1;
+    }
+    return out;
+}
+
+// Raw ChaCha20 keystream XOR — encryption without authentication. Exported
+// because RFC 8439 test vectors address it directly, but prefer
+// chacha20poly1305_seal: unauthenticated ciphertext is malleable, and an
+// attacker who can flip bits in it can flip the matching bits of plaintext.
+export fn chacha20(key: byte[], nonce: byte[], counter: int, data: byte[]): byte[] {
+    if (key.len != CHACHA_KEY_SIZE || nonce.len != CHACHA_NONCE_SIZE) { return bytes(0); }
+    let out = bytes(data.len);
+    let off = 0;
+    let ctr = counter;
+    while (off < data.len) {
+        let ks = chacha_block(key, nonce, ctr);
+        let i = 0;
+        while (i < 64 && off + i < data.len) {
+            out[off + i] = ((data[off + i] as int) ^ (ks[i] as int)) as byte;
+            i += 1;
+        }
+        off += 64;
+        ctr += 1;
+    }
+    return out;
+}
+
+// ---- Poly1305 (RFC 8439 §2.5) -----------------------------------------------
+
+// The accumulator is five 26-bit limbs, the standard "donna" layout. Vyto's
+// int is 64-bit signed, and the widest intermediate here is a 5-term sum of
+// 2^27 * 2^29 products, about 2^58 — comfortably inside it, but the masking is
+// not decorative and every limb must be reduced before it is multiplied again.
+fn poly1305_mac(msg: byte[], key: byte[]): byte[] {
+    let t0 = le32(key, 0); let t1 = le32(key, 4);
+    let t2 = le32(key, 8); let t3 = le32(key, 12);
+
+    // r &= 0x0ffffffc0ffffffc0ffffffc0fffffff, spread across the limbs
+    let r0 = t0 & 0x3ffffff;
+    let r1 = (((t0 >> 26) | (t1 << 6)) & 0x3ffff03);
+    let r2 = (((t1 >> 20) | (t2 << 12)) & 0x3ffc0ff);
+    let r3 = (((t2 >> 14) | (t3 << 18)) & 0x3f03fff);
+    let r4 = ((t3 >> 8) & 0x00fffff);
+
+    let s1 = r1 * 5; let s2 = r2 * 5; let s3 = r3 * 5; let s4 = r4 * 5;
+
+    let h0 = 0; let h1 = 0; let h2 = 0; let h3 = 0; let h4 = 0;
+
+    let off = 0;
+    while (off < msg.len) {
+        let n = msg.len - off;
+        if (n > 16) { n = 16; }
+
+        // A short final block is padded with a 0x01 byte and zeroes; a full
+        // block gets the same bit at position 128 (limb 4, bit 24).
+        let blk = bytes(17);
+        let i = 0;
+        while (i < n) { blk[i] = msg[off + i]; i += 1; }
+        blk[n] = 1 as byte;
+
+        let b0 = le32(blk, 0); let b1 = le32(blk, 4);
+        let b2 = le32(blk, 8); let b3 = le32(blk, 12);
+        let hibit = blk[16] as int;
+
+        h0 += b0 & 0x3ffffff;
+        h1 += ((b0 >> 26) | (b1 << 6)) & 0x3ffffff;
+        h2 += ((b1 >> 20) | (b2 << 12)) & 0x3ffffff;
+        h3 += ((b2 >> 14) | (b3 << 18)) & 0x3ffffff;
+        h4 += ((b3 >> 8) & 0x3ffffff) | (hibit << 24);
+
+        let d0 = h0 * r0 + h1 * s4 + h2 * s3 + h3 * s2 + h4 * s1;
+        let d1 = h0 * r1 + h1 * r0 + h2 * s4 + h3 * s3 + h4 * s2;
+        let d2 = h0 * r2 + h1 * r1 + h2 * r0 + h3 * s4 + h4 * s3;
+        let d3 = h0 * r3 + h1 * r2 + h2 * r1 + h3 * r0 + h4 * s4;
+        let d4 = h0 * r4 + h1 * r3 + h2 * r2 + h3 * r1 + h4 * r0;
+
+        let c = d0 >> 26; h0 = d0 & 0x3ffffff;
+        d1 += c; c = d1 >> 26; h1 = d1 & 0x3ffffff;
+        d2 += c; c = d2 >> 26; h2 = d2 & 0x3ffffff;
+        d3 += c; c = d3 >> 26; h3 = d3 & 0x3ffffff;
+        d4 += c; c = d4 >> 26; h4 = d4 & 0x3ffffff;
+        h0 += c * 5; c = h0 >> 26; h0 = h0 & 0x3ffffff;
+        h1 += c;
+
+        off += 16;
+    }
+
+    // Fully carry h.
+    let c = h1 >> 26; h1 = h1 & 0x3ffffff;
+    h2 += c; c = h2 >> 26; h2 = h2 & 0x3ffffff;
+    h3 += c; c = h3 >> 26; h3 = h3 & 0x3ffffff;
+    h4 += c; c = h4 >> 26; h4 = h4 & 0x3ffffff;
+    h0 += c * 5; c = h0 >> 26; h0 = h0 & 0x3ffffff;
+    h1 += c;
+
+    // g = h + 5 mod 2^130; if that did not borrow, h was >= p and g is the
+    // reduced value. Selected with an arithmetic mask rather than an if, which
+    // keeps the reduction from branching on the accumulator.
+    let g0 = h0 + 5; c = g0 >> 26; g0 = g0 & 0x3ffffff;
+    let g1 = h1 + c; c = g1 >> 26; g1 = g1 & 0x3ffffff;
+    let g2 = h2 + c; c = g2 >> 26; g2 = g2 & 0x3ffffff;
+    let g3 = h3 + c; c = g3 >> 26; g3 = g3 & 0x3ffffff;
+    let g4 = h4 + c - (1 << 26);
+
+    let useg = 0;
+    if (g4 >= 0) { useg = 1; }
+    let mask = 0 - useg;            // 0 or all-ones
+    let nmask = ~mask;
+    h0 = (h0 & nmask) | (g0 & mask);
+    h1 = (h1 & nmask) | (g1 & mask);
+    h2 = (h2 & nmask) | (g2 & mask);
+    h3 = (h3 & nmask) | (g3 & mask);
+    h4 = (h4 & nmask) | (g4 & mask);
+
+    // Collapse the limbs back to four 32-bit words and add the pad s.
+    let f0 = ((h0) | (h1 << 26)) & 0xFFFFFFFF;
+    let f1 = ((h1 >> 6) | (h2 << 20)) & 0xFFFFFFFF;
+    let f2 = ((h2 >> 12) | (h3 << 14)) & 0xFFFFFFFF;
+    let f3 = ((h3 >> 18) | (h4 << 8)) & 0xFFFFFFFF;
+
+    let acc = f0 + le32(key, 16);
+    let o0 = acc & 0xFFFFFFFF;
+    acc = f1 + le32(key, 20) + (acc >> 32);
+    let o1 = acc & 0xFFFFFFFF;
+    acc = f2 + le32(key, 24) + (acc >> 32);
+    let o2 = acc & 0xFFFFFFFF;
+    acc = f3 + le32(key, 28) + (acc >> 32);
+    let o3 = acc & 0xFFFFFFFF;
+
+    let tag = bytes(16);
+    let ws = [o0, o1, o2, o3];
+    let i = 0;
+    while (i < 4) {
+        tag[i * 4]     = (ws[i] & 0xFF) as byte;
+        tag[i * 4 + 1] = ((ws[i] >> 8) & 0xFF) as byte;
+        tag[i * 4 + 2] = ((ws[i] >> 16) & 0xFF) as byte;
+        tag[i * 4 + 3] = ((ws[i] >> 24) & 0xFF) as byte;
+        i += 1;
+    }
+    return tag;
+}
+
+// ---- ChaCha20-Poly1305 AEAD (RFC 8439 §2.8) ---------------------------------
+
+// What chacha20poly1305_open returns. `data` is meaningful only when `ok` is
+// true — on a failed tag it is empty, and treating "empty plaintext" and
+// "forged ciphertext" as the same thing is exactly the bug this class exists
+// to prevent. Never branch on data.len; branch on ok.
+export class AeadResult {
+    ok: bool;
+    data: byte[];
+
+    fn init(ok: bool, data: byte[]) {
+        this.ok = ok;
+        this.data = data;
+    }
+}
+
+// The one-time Poly1305 key is the first 32 bytes of the counter-0 keystream
+// block; the message itself starts at counter 1.
+fn poly_key(key: byte[], nonce: byte[]): byte[] {
+    return sub_bytes(chacha_block(key, nonce, 0), 0, 32);
+}
+
+// aad || pad16(aad) || ct || pad16(ct) || le64(|aad|) || le64(|ct|)
+fn mac_data(aad: byte[], ct: byte[]): byte[] {
+    let apad = (16 - (aad.len % 16)) % 16;
+    let cpad = (16 - (ct.len % 16)) % 16;
+    let total = aad.len + apad + ct.len + cpad + 16;
+    let m = bytes(total);
+    let o = 0;
+    let i = 0;
+    while (i < aad.len) { m[o] = aad[i]; o += 1; i += 1; }
+    o += apad;
+    i = 0;
+    while (i < ct.len) { m[o] = ct[i]; o += 1; i += 1; }
+    o += cpad;
+    let k = 0;
+    while (k < 8) { m[o + k] = ((aad.len >> (k * 8)) & 0xFF) as byte; k += 1; }
+    o += 8;
+    k = 0;
+    while (k < 8) { m[o + k] = ((ct.len >> (k * 8)) & 0xFF) as byte; k += 1; }
+    return m;
+}
+
+// Encrypt and authenticate. Returns ciphertext || tag(16), empty on a bad key
+// or nonce length. `aad` is authenticated but not encrypted — put the things a
+// reader needs before decrypting there (record id, format version), so that
+// tampering with them fails the tag.
+//
+// The nonce MUST be unique for this key. See the header caveat: reuse is not a
+// degradation, it is a break.
+export fn chacha20poly1305_seal(key: byte[], nonce: byte[], plaintext: byte[], aad: byte[]): byte[] {
+    if (key.len != CHACHA_KEY_SIZE || nonce.len != CHACHA_NONCE_SIZE) { return bytes(0); }
+    let ct = chacha20(key, nonce, 1, plaintext);
+    let tag = poly1305_mac(mac_data(aad, ct), poly_key(key, nonce));
+    return concat_bytes(ct, tag);
+}
+
+// Verify then decrypt. The tag is checked with ct_equal before a single byte of
+// plaintext is produced, which is the order that matters: decrypting first and
+// checking afterwards hands an attacker a decryption oracle.
+export fn chacha20poly1305_open(key: byte[], nonce: byte[], sealed: byte[], aad: byte[]): AeadResult {
+    if (key.len != CHACHA_KEY_SIZE || nonce.len != CHACHA_NONCE_SIZE) {
+        return new AeadResult(false, bytes(0));
+    }
+    if (sealed.len < POLY1305_TAG_SIZE) {
+        return new AeadResult(false, bytes(0));
+    }
+    let ctlen = sealed.len - POLY1305_TAG_SIZE;
+    let ct = sub_bytes(sealed, 0, ctlen);
+    let tag = sub_bytes(sealed, ctlen, POLY1305_TAG_SIZE);
+    let want = poly1305_mac(mac_data(aad, ct), poly_key(key, nonce));
+    if (!ct_equal(tag, want)) {
+        return new AeadResult(false, bytes(0));
+    }
+    return new AeadResult(true, chacha20(key, nonce, 1, ct));
+}
