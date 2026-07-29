@@ -1,0 +1,260 @@
+// vyto/crypto/ecc — P-256 (secp256r1): key generation, ECDSA, ECDH.
+//
+//     let kp = ecc_keypair();
+//     if (!kp.ok) { /* no entropy — see below, this is not a soft failure */ }
+//
+//     let sig = ecdsa_sign(kp.priv, sha256(msg));     // RFC 6979, deterministic
+//     ecdsa_verify(kp.pub, sha256(msg), sig)          // bool
+//
+//     let secret = ecdh(theirPub, kp.priv);           // then run it through a KDF
+//     let packed = ecc_compress(kp.pub);              // 33 bytes instead of 64
+//
+// P-256 is the curve WebAuthn and FIDO2 mandate for ES256, which is why it is
+// the only one compiled in (native/src/uecc_config.h). Backed by micro-ecc
+// v1.1, vendored byte-for-byte under native/src/microecc and re-vendored by
+// native/refresh-microecc.sh.
+//
+// This is a separate package directory from vyto/crypto on purpose. A
+// native/src is compiled once per package *directory*, for every module in it
+// (the same reasoning as vyto/util/uuid/uuid.vt:20-24), so a program that only
+// wants to hash a password imports vyto/crypto and never compiles micro-ecc.
+//
+// ---- byte formats, all fixed-size and all big-endian ----
+//
+//   private key   32 bytes, the scalar d
+//   public key    64 bytes, the uncompressed point X||Y (no 0x04 prefix — add
+//                 one yourself for SEC1 wire format)
+//   compressed    33 bytes, 0x02/0x03 || X
+//   signature     64 bytes, r||s (NOT DER — WebAuthn's assertion signature is
+//                 DER-encoded, so a FIDO client has to wrap this)
+//   shared secret 32 bytes, the X coordinate of the ECDH point
+//
+// ---- SECURITY, three things that are not optional ----
+//
+//  1. Every operation that needs randomness FAILS rather than degrading. The
+//     shim's entropy ladder (getrandom / BCryptGenRandom / urandom) has no
+//     fallback PRNG, deliberately: vyto/util/uuid's rand_bytes ends in a
+//     time-seeded rand() and returns void, which is fine for a UUID and fatal
+//     for an ECDSA nonce. Check `.ok`. A zeroed key is not a usable key.
+//
+//  2. ecdsa_sign derives its nonce deterministically, by HMAC-SHA256 DRBG over
+//     the private key and the message hash rather than from the RNG. Two
+//     signatures over the same message under the same key are byte-identical,
+//     and that is the point: a repeated or biased random nonce lets anyone
+//     recover the private key from two signatures. ecdsa_sign_random is
+//     exported for the cases that need a fresh nonce each time, and it is the
+//     one to reach for second.
+//
+//     Not byte-compatible with RFC 6979, despite following its K/V structure:
+//     micro-ecc assembles the candidate nonce as raw native-endian machine
+//     words (uECC.c:1450-1468) where the RFC specifies a big-endian bits2int,
+//     so on x86-64 the two derive different k for the same input. The security
+//     property is unaffected — k is still a pseudorandom function of key and
+//     message alone — but a signature made here cannot be reproduced by an
+//     RFC 6979 implementation, so do not use the RFC's vectors to check it.
+//     Verification is unaffected: any ECDSA verifier accepts these signatures.
+//
+//  3. Validate any public key that came from outside before using it, with
+//     ecc_valid_public. ecdh does this for you and returns not-ok on a bad
+//     point; the standalone check exists for keys you are about to store.
+//     Feeding an attacker-chosen invalid point to a static ECDH key is the
+//     textbook way to extract that key one bit at a time.
+//
+// Caveat, same as vyto/crypto's: micro-ecc is written for microcontrollers.
+// It blinds scalars when an RNG is installed, which this shim always does, but
+// it does not claim the constant-time and memory-hardening posture that
+// OpenSSL or BoringSSL do. Right for a local vault on hardware you control;
+// think harder before putting it behind a network service an attacker can time.
+
+import { rand_bytes } from "vyto/util/uuid";
+
+// ecc_shim.c reaches BCryptGenRandom directly for its fail-closed entropy
+// ladder, so this package needs the bcrypt link in its own right. vyto/util/uuid
+// declares the same thing for vt_rand_bytes and this module imports it, but
+// relying on a #link arriving transitively through an import would make the
+// windows-x64 build depend on an implementation detail of module resolution —
+// and the failure mode is an unresolved symbol at link time on a machine that
+// has no compiler to explain it.
+#link "bcrypt" if "windows"
+
+extern "C" {
+    fn vecc_make_key(pub: cstring, priv: cstring): i32;
+    fn vecc_public_from_private(priv: cstring, pub: cstring): i32;
+    fn vecc_valid_public(pub: cstring): i32;
+    fn vecc_shared_secret(pub: cstring, priv: cstring, secret: cstring): i32;
+    fn vecc_sign(priv: cstring, hash: cstring, hashlen: i32, sig: cstring): i32;
+    fn vecc_sign_det(priv: cstring, hash: cstring, hashlen: i32, sig: cstring): i32;
+    fn vecc_verify(pub: cstring, hash: cstring, hashlen: i32, sig: cstring): i32;
+    fn vecc_compress(pub: cstring, comp: cstring);
+    fn vecc_decompress(comp: cstring, pub: cstring);
+}
+
+// Mirrors the VECC_* sizes in native/src/ecc_shim.h.
+export const ECC_PRIV_SIZE: int = 32;
+export const ECC_PUB_SIZE: int = 64;
+export const ECC_COMP_SIZE: int = 33;
+export const ECC_SIG_SIZE: int = 64;
+export const ECC_SECRET_SIZE: int = 32;
+
+// A generated key pair. `ok` false means entropy was unavailable and both
+// buffers are zeroed — there is no partial success here.
+export class KeyPair {
+    ok: bool;
+    pub: byte[];
+    priv: byte[];
+
+    fn init(ok: bool, pub: byte[], priv: byte[]) {
+        this.ok = ok;
+        this.pub = pub;
+        this.priv = priv;
+    }
+}
+
+// A byte string that may not exist. Used for the operations that can fail on
+// bad input (a point off the curve) as well as on missing entropy, so callers
+// get one shape to check rather than a sentinel empty array.
+export class EccResult {
+    ok: bool;
+    data: byte[];
+
+    fn init(ok: bool, data: byte[]) {
+        this.ok = ok;
+        this.data = data;
+    }
+}
+
+// Fresh P-256 key pair from the OS CSPRNG. Check .ok before using either half.
+export fn ecc_keypair(): KeyPair {
+    let pub = bytes(ECC_PUB_SIZE);
+    let priv = bytes(ECC_PRIV_SIZE);
+    let r = vecc_make_key(pub as cstring, priv as cstring);
+    if (r != 1) {
+        return new KeyPair(false, bytes(ECC_PUB_SIZE), bytes(ECC_PRIV_SIZE));
+    }
+    return new KeyPair(true, pub, priv);
+}
+
+// Recover the public key from a private scalar. Fails if the scalar is out of
+// range (zero, or >= the group order).
+export fn ecc_public_from_private(priv: byte[]): EccResult {
+    if (priv.len != ECC_PRIV_SIZE) { return new EccResult(false, bytes(0)); }
+    let pub = bytes(ECC_PUB_SIZE);
+    if (vecc_public_from_private(priv as cstring, pub as cstring) != 1) {
+        return new EccResult(false, bytes(0));
+    }
+    return new EccResult(true, pub);
+}
+
+// Full SEC1 validation: on the curve, not the identity, in the right subgroup.
+// Run it on every public key that arrived from anywhere you do not control.
+export fn ecc_valid_public(pub: byte[]): bool {
+    if (pub.len != ECC_PUB_SIZE) { return false; }
+    return vecc_valid_public(pub as cstring) == 1;
+}
+
+// ---- signing ----------------------------------------------------------------
+
+// Deterministic ECDSA — see the header on why this is RFC 6979 in structure
+// but not in output. `hash` is the message digest, normally the 32 bytes from
+// vyto/crypto's sha256: this signs a hash, never a message, and handing it raw
+// message bytes signs whatever prefix fits.
+//
+// A hash longer than the curve order is truncated by the standard; a shorter
+// one is accepted and weakens the signature, so pass a full SHA-256 digest.
+export fn ecdsa_sign(priv: byte[], hash: byte[]): EccResult {
+    if (priv.len != ECC_PRIV_SIZE || hash.len == 0) { return new EccResult(false, bytes(0)); }
+    let sig = bytes(ECC_SIG_SIZE);
+    if (vecc_sign_det(priv as cstring, hash as cstring, hash.len as i32, sig as cstring) != 1) {
+        return new EccResult(false, bytes(0));
+    }
+    return new EccResult(true, sig);
+}
+
+// ECDSA with a random nonce. Prefer ecdsa_sign. This exists for protocols that
+// require signatures over the same message to differ, and it is strictly more
+// dangerous: its security rests entirely on the RNG at the moment of signing,
+// where the deterministic version does not.
+export fn ecdsa_sign_random(priv: byte[], hash: byte[]): EccResult {
+    if (priv.len != ECC_PRIV_SIZE || hash.len == 0) { return new EccResult(false, bytes(0)); }
+    let sig = bytes(ECC_SIG_SIZE);
+    if (vecc_sign(priv as cstring, hash as cstring, hash.len as i32, sig as cstring) != 1) {
+        return new EccResult(false, bytes(0));
+    }
+    return new EccResult(true, sig);
+}
+
+// Verify an r||s signature. False for a bad signature, a malformed key and a
+// wrong-sized buffer alike — a verifier has nothing useful to say about which,
+// and callers that distinguish them tend to leak the distinction.
+export fn ecdsa_verify(pub: byte[], hash: byte[], sig: byte[]): bool {
+    if (pub.len != ECC_PUB_SIZE || sig.len != ECC_SIG_SIZE || hash.len == 0) { return false; }
+    return vecc_verify(pub as cstring, hash as cstring, hash.len as i32, sig as cstring) == 1;
+}
+
+// ---- ECDH -------------------------------------------------------------------
+
+// The X coordinate of theirPub * myPriv. Validates the incoming point first.
+//
+// This is a shared *secret*, not a key. It is a curve point coordinate with
+// algebraic structure and measurable bias, and it must go through a KDF before
+// anything treats it as key material:
+//
+//     let s = ecdh(theirPub, myPriv);
+//     let k = hkdf_sha256(s.data, salt, strBytes("my-protocol-v1"), 32);
+export fn ecdh(theirPub: byte[], myPriv: byte[]): EccResult {
+    if (theirPub.len != ECC_PUB_SIZE || myPriv.len != ECC_PRIV_SIZE) {
+        return new EccResult(false, bytes(0));
+    }
+    let secret = bytes(ECC_SECRET_SIZE);
+    if (vecc_shared_secret(theirPub as cstring, myPriv as cstring, secret as cstring) != 1) {
+        return new EccResult(false, bytes(0));
+    }
+    return new EccResult(true, secret);
+}
+
+// ---- point compression ------------------------------------------------------
+
+// 64-byte X||Y down to 33 bytes of 0x02/0x03 || X.
+export fn ecc_compress(pub: byte[]): byte[] {
+    if (pub.len != ECC_PUB_SIZE) { return bytes(0); }
+    let comp = bytes(ECC_COMP_SIZE);
+    vecc_compress(pub as cstring, comp as cstring);
+    return comp;
+}
+
+// Recover X||Y from a compressed point. micro-ecc does not validate here — a
+// compressed point whose X is not on the curve yields garbage rather than an
+// error — so this runs ecc_valid_public on the result and reports failure
+// rather than handing back a point that is not on the curve.
+export fn ecc_decompress(comp: byte[]): EccResult {
+    if (comp.len != ECC_COMP_SIZE) { return new EccResult(false, bytes(0)); }
+    let pub = bytes(ECC_PUB_SIZE);
+    vecc_decompress(comp as cstring, pub as cstring);
+    if (!ecc_valid_public(pub)) { return new EccResult(false, bytes(0)); }
+    return new EccResult(true, pub);
+}
+
+// ---- entropy self-check -----------------------------------------------------
+
+// True when the OS CSPRNG is answering. Worth calling once at startup in
+// anything that will later generate keys, so the failure surfaces at a moment
+// the user can act on rather than halfway through creating a credential.
+//
+// Uses vyto/util/uuid's rand_bytes, which is the same ladder minus the
+// fail-closed behaviour — a weak draw here still returns bytes, so this
+// detects "entropy is entirely absent", not "entropy is weak". The shim's own
+// check is the authoritative one and it runs inside ecc_keypair.
+export fn ecc_entropy_available(): bool {
+    let a = rand_bytes(32);
+    let b = rand_bytes(32);
+    if (a.len != 32 || b.len != 32) { return false; }
+    let allZero = true;
+    let same = true;
+    let i = 0;
+    while (i < 32) {
+        if (a[i] != 0 as byte) { allZero = false; }
+        if (a[i] != b[i]) { same = false; }
+        i += 1;
+    }
+    return !allZero && !same;
+}
