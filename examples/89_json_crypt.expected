@@ -1,0 +1,62 @@
+---- plaintext ----
+{"user":"johndoe","email":"johndoe@example.com","ssn":"123-45-6789","balance":4200}
+
+---- whole-document envelope ----
+{"v":"vyto-jsonc-v1","kid":"2026-07","id":"user:42","alg":"ChaCha20-Poly1305","nonce":"AAAAAAAAAAAAAAAB","ct":"3tWSoEV7oDuv+IB2SEp99LGUqJk92LyJ0ykcFEle2STzAFrmMrU80fSl0gs0PN1k7XtIGsevQZqShN0zyirLNyGhDsEmrLSHOFYH7ZBCDb9iszSHAOwgTjwdI27nYIOek2V1"}
+
+the id, key id and nonce are readable; everything about the user is not
+
+decrypts       true (want true)
+round-trips    true (want true)
+email recovered johndoe@example.com
+
+---- what an attacker with the database can try ----
+record id edited      false (want false)
+key id edited         false (want false)
+one flipped bit       false (want false)
+truncated ciphertext  false (want false)
+wrong master key      false (want false)
+
+every one fails at the tag, before a single byte of plaintext exists
+
+---- field-level: keep the record queryable ----
+{"id":"user:42","created":"2026-07-29","email":"AAAAAAAAAAAAAAACHrffStor/ZGOCZLpt83Hg2X/ixZc8HQ9dSIcT2TgZUazq5I=","ssn":"AAAAAAAAAAAAAAADjT9rmxhVeJwxct18kWcgBmqn4VvTcgnBUQjD"}
+
+id and created are still usable by the database; the rest is opaque
+
+email decrypts to  johndoe@example.com
+ssn decrypts to    123-45-6789
+
+---- field binding ----
+ssn read as email     "" (want empty)
+moved to another row  "" (want empty)
+
+without the field name and record id in the AAD both of these would
+decrypt perfectly, and the attacker would not even need the key
+
+---- key separation ----
+email subkey    3ea80c5eaf579391099b5373d137a509…
+ssn subkey      4d849377be5f8f9e98a710193b2cd1ac…
+document subkey c6248ede37777df81f464960b119e247…
+all distinct    true (want true)
+stable          true (want true)
+
+one master key in memory, one derived key per purpose, and no way to
+get from a derived key back to the master or across to a sibling
+
+---- rotation ----
+old kid decrypts  true (want true)
+new kid decrypts  true (want true)
+ciphertexts differ true (want true)
+
+same plaintext, same nonce, different key id — and the ciphertexts
+share nothing, because the key id feeds the key derivation
+
+---- nonce reuse, the one that is fatal ----
+ct_a xor ct_b = 00000000000000000000001404050000
+pt_a xor pt_b = 00000000000000000000001404050000
+identical     true (want true)
+
+the ciphertexts leaked the plaintext difference exactly. draw every
+nonce from rand_bytes(12), or keep a counter you persist BEFORE use —
+never after, or a crash replays one

@@ -1,0 +1,274 @@
+// Encrypting JSON — envelopes, field-level encryption, and key separation.
+//
+// Two shapes, and the choice between them is not about security, it is about
+// what the storage layer still needs to do:
+//
+//   whole document   everything is opaque. simplest and strongest. use it
+//                    unless something has to read part of the record.
+//   field level      only the sensitive values are ciphertext, so ids, dates
+//                    and flags stay indexable and queryable. costs you the
+//                    ability to hide *which* fields exist, and their sizes.
+//
+// Three things carry both of them:
+//
+//   one key per purpose      derived with HKDF from a single master key, so a
+//                            leak of one derived key is not a leak of the rest
+//   a nonce per encryption   never reused, never derived from the data
+//   AAD binding the context  record id and field name are authenticated, so
+//                            ciphertext cannot be moved between records or
+//                            between fields of one record
+//
+// The last one is what people leave out, and it is the difference between an
+// attacker who can only corrupt data and one who can rearrange it into
+// something that decrypts cleanly and means something else.
+
+import { hex_encode, hex_decode, strBytes, sub_bytes, ct_equal, concat_bytes,
+         chacha20poly1305_seal, chacha20poly1305_open, hkdf_sha256, sha256 } from "vyto/crypto";
+import { argon2id } from "vyto/crypto/argon2";
+import { json_parse, jobj, jstr, jint, JsonValue } from "vyto/util/json";
+import { base64_encode, base64_decode } from "vyto/util/mime";
+import { rand_bytes } from "vyto/util/uuid";
+
+const FORMAT: string = "vyto-jsonc-v1";
+
+// Fixed material so this file's output is reproducible as a golden test. Real
+// code derives the master key from a password with argon2id (see
+// masterFromPassword below) and draws every nonce from rand_bytes(12).
+fn demoMasterKey(): byte[] {
+    return hex_decode("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f");
+}
+
+// What a real caller does: master key from a password, or from a key manager.
+fn masterFromPassword(password: string, salt: byte[]): byte[] {
+    return argon2id(strBytes(password), salt, 2, 8192, 1, 32);
+}
+
+// ---- key separation ---------------------------------------------------------
+
+// One master key, many purpose-bound subkeys. The `info` string is the domain
+// separator: different info yields an unrelated key, so a subkey that leaks
+// cannot decrypt anything derived under a different purpose. Naming the purpose
+// is the whole mechanism — an empty info gives every use the same key back.
+fn subkey(master: byte[], purpose: string): byte[] {
+    return hkdf_sha256(master, strBytes(FORMAT + "-salt"), strBytes(purpose), 32);
+}
+
+// ---- whole-document envelope ------------------------------------------------
+
+// Encrypt a whole JSON document into a JSON envelope. The envelope's own fields
+// are cleartext — a reader needs the format, the key id and the nonce before it
+// can decrypt anything — and they are covered by the AAD, so editing them
+// breaks the tag rather than silently changing how decryption proceeds.
+fn sealDocument(master: byte[], keyId: string, recordId: string, doc: JsonValue, nonce: byte[]): string {
+    let key = subkey(master, "document:" + keyId);
+    let aad = strBytes(FORMAT + "|" + keyId + "|" + recordId);
+    let sealed = chacha20poly1305_seal(key, nonce, strBytes(doc.stringify()), aad);
+
+    let env = jobj();
+    env.set("v", jstr(FORMAT));
+    env.set("kid", jstr(keyId));
+    env.set("id", jstr(recordId));
+    env.set("alg", jstr("ChaCha20-Poly1305"));
+    env.set("nonce", jstr(base64_encode(nonce)));
+    env.set("ct", jstr(base64_encode(sealed)));
+    return env.stringify();
+}
+
+// Returns the decrypted document, or a Null-kind JsonValue when the envelope
+// does not authenticate. Callers must check isNull() — an envelope that fails
+// its tag is not a document with missing fields, it is not a document at all.
+fn openDocument(master: byte[], recordId: string, envelopeJson: string): JsonValue {
+    let env = json_parse(envelopeJson);
+    if (env.isNull()) { return env; }
+    if (env.get("v").asString() != FORMAT) { return json_parse("null"); }
+
+    let keyId = env.get("kid").asString();
+    let key = subkey(master, "document:" + keyId);
+    // The AAD is rebuilt from what we *expect*, not from what the envelope
+    // claims: taking recordId out of the envelope would let an attacker swap
+    // records by editing one cleartext field.
+    let aad = strBytes(FORMAT + "|" + keyId + "|" + recordId);
+
+    let r = chacha20poly1305_open(key, base64_decode(env.get("nonce").asString()),
+                                  base64_decode(env.get("ct").asString()), aad);
+    if (!r.ok) { return json_parse("null"); }
+
+    let sb = "";
+    let i = 0;
+    while (i < r.data.len) { sb = sb + chr(r.data[i] as int); i += 1; }
+    return json_parse(sb);
+}
+
+fn chr(c: int): string {
+    let b = bytes(1);
+    b[0] = c as byte;
+    return str(b as cstring);
+}
+
+// ---- field-level encryption -------------------------------------------------
+
+// Encrypt one value. Both the record id and the field name go into the AAD, so
+// a ciphertext lifted from `ssn` cannot be pasted into `phone`, and one lifted
+// from user 1 cannot be pasted into user 2 — even though all of them are
+// encrypted under the same key.
+fn sealField(master: byte[], recordId: string, field: string, value: string, nonce: byte[]): string {
+    let key = subkey(master, "field:" + field);
+    let aad = strBytes(FORMAT + "|" + recordId + "|" + field);
+    let sealed = chacha20poly1305_seal(key, nonce, strBytes(value), aad);
+    return base64_encode(concat_bytes(nonce, sealed));
+}
+
+// Empty string on any failure. A field that will not decrypt must not be
+// confused with a field that was empty, so real code should carry the ok flag;
+// this returns "" and the demo prints the distinction explicitly.
+fn openField(master: byte[], recordId: string, field: string, packed: string): string {
+    let raw = base64_decode(packed);
+    if (raw.len < 12 + 16) { return ""; }
+    let key = subkey(master, "field:" + field);
+    let aad = strBytes(FORMAT + "|" + recordId + "|" + field);
+    let r = chacha20poly1305_open(key, sub_bytes(raw, 0, 12), sub_bytes(raw, 12, raw.len - 12), aad);
+    if (!r.ok) { return ""; }
+    let out = "";
+    let i = 0;
+    while (i < r.data.len) { out = out + chr(r.data[i] as int); i += 1; }
+    return out;
+}
+
+fn main() {
+    let master = demoMasterKey();
+    let nonce1 = hex_decode("000000000000000000000001");
+    let nonce2 = hex_decode("000000000000000000000002");
+    let nonce3 = hex_decode("000000000000000000000003");
+
+    // The record we are protecting.
+    let doc = jobj();
+    doc.set("user", jstr("johndoe"));
+    doc.set("email", jstr("johndoe@example.com"));
+    doc.set("ssn", jstr("123-45-6789"));
+    doc.set("balance", jint(4200));
+
+    print("---- plaintext ----");
+    print(doc.stringify());
+
+    print("");
+    print("---- whole-document envelope ----");
+    let env = sealDocument(master, "2026-07", "user:42", doc, nonce1);
+    print(env);
+    print("");
+    print("the id, key id and nonce are readable; everything about the user is not");
+
+    let back = openDocument(master, "user:42", env);
+    print("");
+    print("decrypts       " + str(!back.isNull()) + " (want true)");
+    print("round-trips    " + str(back.stringify() == doc.stringify()) + " (want true)");
+    print("email recovered " + back.get("email").asString());
+
+    print("");
+    print("---- what an attacker with the database can try ----");
+
+    // Point the envelope at a different record.
+    let swapped = json_parse(env);
+    swapped.set("id", jstr("user:1"));
+    print("record id edited      " + str(!openDocument(master, "user:1", swapped.stringify()).isNull()) + " (want false)");
+
+    // Claim a different key id, hoping to force a weaker or known key.
+    let rekeyed = json_parse(env);
+    rekeyed.set("kid", jstr("attacker"));
+    print("key id edited         " + str(!openDocument(master, "user:42", rekeyed.stringify()).isNull()) + " (want false)");
+
+    // Flip one bit of ciphertext.
+    let ct = base64_decode(json_parse(env).get("ct").asString());
+    ct[5] = ((ct[5] as int) ^ 1) as byte;
+    let flipped = json_parse(env);
+    flipped.set("ct", jstr(base64_encode(ct)));
+    print("one flipped bit       " + str(!openDocument(master, "user:42", flipped.stringify()).isNull()) + " (want false)");
+
+    // Truncate.
+    let cut = json_parse(env);
+    cut.set("ct", jstr(base64_encode(sub_bytes(base64_decode(json_parse(env).get("ct").asString()), 0, 20))));
+    print("truncated ciphertext  " + str(!openDocument(master, "user:42", cut.stringify()).isNull()) + " (want false)");
+
+    // Right ciphertext, wrong key.
+    print("wrong master key      " + str(!openDocument(sha256(strBytes("guess")), "user:42", env).isNull()) + " (want false)");
+    print("");
+    print("every one fails at the tag, before a single byte of plaintext exists");
+
+    print("");
+    print("---- field-level: keep the record queryable ----");
+    let row = jobj();
+    row.set("id", jstr("user:42"));                 // cleartext: you index on it
+    row.set("created", jstr("2026-07-29"));         // cleartext: you sort on it
+    row.set("email", jstr(sealField(master, "user:42", "email", "johndoe@example.com", nonce2)));
+    row.set("ssn", jstr(sealField(master, "user:42", "ssn", "123-45-6789", nonce3)));
+    print(row.stringify());
+    print("");
+    print("id and created are still usable by the database; the rest is opaque");
+
+    print("");
+    print("email decrypts to  " + openField(master, "user:42", "email", row.get("email").asString()));
+    print("ssn decrypts to    " + openField(master, "user:42", "ssn", row.get("ssn").asString()));
+
+    print("");
+    print("---- field binding ----");
+    // Paste the ssn ciphertext into the email field and read it as email.
+    let moved = openField(master, "user:42", "email", row.get("ssn").asString());
+    print("ssn read as email     \"" + moved + "\" (want empty)");
+    // Paste this user's email ciphertext onto another user's row.
+    let crossed = openField(master, "user:1", "email", row.get("email").asString());
+    print("moved to another row  \"" + crossed + "\" (want empty)");
+    print("");
+    print("without the field name and record id in the AAD both of these would");
+    print("decrypt perfectly, and the attacker would not even need the key");
+
+    print("");
+    print("---- key separation ----");
+    let kEmail = subkey(master, "field:email");
+    let kSsn = subkey(master, "field:ssn");
+    let kDoc = subkey(master, "document:2026-07");
+    print("email subkey    " + hex_encode(sub_bytes(kEmail, 0, 16)) + "…");
+    print("ssn subkey      " + hex_encode(sub_bytes(kSsn, 0, 16)) + "…");
+    print("document subkey " + hex_encode(sub_bytes(kDoc, 0, 16)) + "…");
+    print("all distinct    " + str(!ct_equal(kEmail, kSsn) && !ct_equal(kEmail, kDoc)) + " (want true)");
+    print("stable          " + str(ct_equal(kEmail, subkey(master, "field:email"))) + " (want true)");
+    print("");
+    print("one master key in memory, one derived key per purpose, and no way to");
+    print("get from a derived key back to the master or across to a sibling");
+
+    print("");
+    print("---- rotation ----");
+    // The key id in the envelope is what makes rotation possible: old records
+    // keep naming the key they were written with, so both eras stay readable
+    // while the rewrite happens in the background.
+    let oldEnv = sealDocument(master, "2026-06", "user:42", doc, nonce1);
+    let newEnv = sealDocument(master, "2026-07", "user:42", doc, nonce1);
+    print("old kid decrypts  " + str(!openDocument(master, "user:42", oldEnv).isNull()) + " (want true)");
+    print("new kid decrypts  " + str(!openDocument(master, "user:42", newEnv).isNull()) + " (want true)");
+    print("ciphertexts differ " + str(json_parse(oldEnv).get("ct").asString() != json_parse(newEnv).get("ct").asString()) + " (want true)");
+    print("");
+    print("same plaintext, same nonce, different key id — and the ciphertexts");
+    print("share nothing, because the key id feeds the key derivation");
+
+    print("");
+    print("---- nonce reuse, the one that is fatal ----");
+    // Both encrypted under the same key AND the same nonce. ChaCha20-Poly1305
+    // does not degrade here, it breaks: the XOR of the two ciphertexts is the
+    // XOR of the two plaintexts, and the authentication key is recoverable.
+    let key = subkey(master, "demo");
+    let a = chacha20poly1305_seal(key, nonce1, strBytes("attack at dawn!!"), bytes(0));
+    let b = chacha20poly1305_seal(key, nonce1, strBytes("attack at dusk!!"), bytes(0));
+    let leak = bytes(16);
+    let i = 0;
+    while (i < 16) { leak[i] = ((a[i] as int) ^ (b[i] as int)) as byte; i += 1; }
+    print("ct_a xor ct_b = " + hex_encode(leak));
+    let pxor = bytes(16);
+    let pa = strBytes("attack at dawn!!");
+    let pb = strBytes("attack at dusk!!");
+    i = 0;
+    while (i < 16) { pxor[i] = ((pa[i] as int) ^ (pb[i] as int)) as byte; i += 1; }
+    print("pt_a xor pt_b = " + hex_encode(pxor));
+    print("identical     " + str(ct_equal(leak, pxor)) + " (want true)");
+    print("");
+    print("the ciphertexts leaked the plaintext difference exactly. draw every");
+    print("nonce from rand_bytes(12), or keep a counter you persist BEFORE use —");
+    print("never after, or a crash replays one");
+}

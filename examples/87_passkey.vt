@@ -1,0 +1,234 @@
+// Generating a passkey — vyto/crypto end to end.
+//
+// A passkey is not a password and not a random string. It is a P-256 key pair
+// bound to one website, where the private key never leaves your machine and the
+// site only ever stores the public half. That is why a stolen password database
+// full of passkeys is worth nothing: there is nothing in it to replay.
+//
+// Doing it securely is four things, and dropping any one is the whole ballgame:
+//
+//   1. the key pair comes from a real CSPRNG, and refuses to exist otherwise
+//   2. the private key is encrypted at rest under a key derived from a password
+//      that is expensive to guess
+//   3. the stored blob is bound to its own metadata, so an attacker cannot lift
+//      one credential's encrypted key onto another credential's record
+//   4. what gets signed binds the signature to this site and this login, so a
+//      captured signature is not reusable anywhere
+//
+// ---- a note on the fixed values below ----
+//
+// This file is a golden test: its output is diffed byte for byte, so it cannot
+// print anything random. The credential shown is therefore built from a FIXED
+// private key, salt and nonce. Real code must not do that — `realGeneration()`
+// at the end shows the actual path, and checks its properties rather than
+// printing values that change every run.
+
+import { sha256, hex_encode, hex_decode, strBytes, concat_bytes, sub_bytes, ct_equal,
+         chacha20poly1305_seal, chacha20poly1305_open } from "vyto/crypto";
+import { argon2id } from "vyto/crypto/argon2";
+import { ecc_keypair, ecc_public_from_private, ecdsa_sign, ecdsa_verify } from "vyto/crypto/ecc";
+import { rand_bytes } from "vyto/util/uuid";
+
+// Argon2id cost for the vault key. Measured in this tree: t=3/m=64MiB is about
+// 360 ms, m=256MiB about 1.5 s. Choose from the slowest machine that has to
+// unlock the vault, and raise memory before iterations — memory is the resource
+// an attacker's GPU cannot cheaply buy. Kept at 1 MiB here so the test suite is
+// not slow — that is far too low for a real vault, do not copy it.
+const KDF_TIME: int = 1;
+const KDF_MEMORY_KIB: int = 1024;
+const KDF_LANES: int = 1;
+const VAULT_FORMAT: string = "vyto-passkey-v1";
+
+// One stored credential. Everything here is safe to write to disk: the private
+// key exists only inside `sealedKey`, and only the master password opens it.
+class Passkey {
+    rpId: string;           // the site — a passkey is bound to exactly one
+    userName: string;
+    credentialId: byte[];   // 32 bytes; what the site calls this credential by
+    publicKey: byte[];      // 64 bytes, X||Y — this is what the site stores
+    kdfSalt: byte[];        // 16 bytes, unique per credential
+    nonce: byte[];          // 12 bytes, unique per encryption, NEVER reused
+    sealedKey: byte[];      // the private key, encrypted: ciphertext || tag
+    signCount: int;
+
+    fn init(rpId: string, userName: string) {
+        this.rpId = rpId;
+        this.userName = userName;
+        this.signCount = 0;
+    }
+
+    // The metadata the encryption is bound to. As the AEAD's associated data it
+    // is authenticated but not encrypted: change any of it and the tag check
+    // fails. That is what stops an attacker moving `sealedKey` from a throwaway
+    // credential onto the record for a real site and having it still decrypt.
+    fn aad(): byte[] {
+        return concat_bytes(strBytes(VAULT_FORMAT + "|" + this.rpId + "|" + this.userName + "|"),
+                            this.credentialId);
+    }
+}
+
+// The only thing standing between a stolen vault file and offline guessing.
+fn vaultKey(masterPassword: string, salt: byte[]): byte[] {
+    return argon2id(strBytes(masterPassword), salt, KDF_TIME, KDF_MEMORY_KIB, KDF_LANES, 32);
+}
+
+// Seal a private key into a credential record.
+fn sealInto(pk: Passkey, priv: byte[], masterPassword: string) {
+    let vk = vaultKey(masterPassword, pk.kdfSalt);
+    pk.sealedKey = chacha20poly1305_seal(vk, pk.nonce, priv, pk.aad());
+}
+
+// Create a passkey the way real code must: everything random, and a refusal
+// rather than a weak key when entropy is unavailable. Returns null on refusal.
+fn createPasskey(rpId: string, userName: string, masterPassword: string): Passkey {
+    let kp = ecc_keypair();
+    if (!kp.ok) {
+        // Not a soft failure. A key pair from a predictable source is worthless,
+        // and handing one back anyway would hide that it happened.
+        return null;
+    }
+    let pk = new Passkey(rpId, userName);
+    pk.publicKey = kp.pub;
+    pk.credentialId = rand_bytes(32);
+    pk.kdfSalt = rand_bytes(16);
+    pk.nonce = rand_bytes(12);
+    sealInto(pk, kp.priv, masterPassword);
+    return pk;
+}
+
+// Open the credential and sign a WebAuthn challenge. The private key exists in
+// memory only for the duration of this call. Returns an empty array on failure.
+fn signWith(pk: Passkey, masterPassword: string, authData: byte[], clientDataJson: string): byte[] {
+    let vk = vaultKey(masterPassword, pk.kdfSalt);
+    let opened = chacha20poly1305_open(vk, pk.nonce, pk.sealedKey, pk.aad());
+    if (!opened.ok) {
+        // Wrong password and tampered record are indistinguishable here on
+        // purpose. Telling an attacker which one they hit tells them something.
+        return bytes(0);
+    }
+
+    // WebAuthn signs authenticatorData || SHA-256(clientDataJSON). Signing the
+    // bare challenge instead would let a signature captured on one origin be
+    // replayed on another; the client data is what binds it to this site and
+    // this request.
+    let signedData = concat_bytes(authData, sha256(strBytes(clientDataJson)));
+
+    // Deterministic nonce: k comes from an HMAC of key and message, never the
+    // RNG. Two signatures under a repeated k give up the private key to simple
+    // algebra — the failure that has cost people the most.
+    let sig = ecdsa_sign(opened.data, sha256(signedData));
+    if (!sig.ok) { return bytes(0); }
+    return sig.data;
+}
+
+fn main() {
+    let master = "correct horse battery staple";
+
+    // FIXED material, so this file's output is reproducible. Never do this.
+    let fixedPriv = hex_decode("c9afa9d845ba75166b5c215767b1d6934e50c3db36e89b127b8a622b120f6721");
+    let pk = new Passkey("example.com", "johndoe@example.com");
+    pk.credentialId = hex_decode("4ae6262861c2429e9f87a454397fde93e63afe216a775ccb682d631d47ab809e");
+    pk.kdfSalt = hex_decode("7ed8b2dc4d8643466c9be5a58012a28d");
+    pk.nonce = hex_decode("74f644c9da73926fc8512637");
+    pk.publicKey = ecc_public_from_private(fixedPriv).data;
+    sealInto(pk, fixedPriv, master);
+
+    print("---- the credential ----");
+    print("rpId          " + pk.rpId);
+    print("credentialId  " + hex_encode(pk.credentialId));
+    print("publicKey     " + hex_encode(sub_bytes(pk.publicKey, 0, 16)) + "…  (64 bytes, X||Y)");
+    print("kdfSalt       " + hex_encode(pk.kdfSalt));
+    print("nonce         " + hex_encode(pk.nonce));
+    print("sealedKey     " + hex_encode(sub_bytes(pk.sealedKey, 0, 16)) + "…  (" +
+          str(pk.sealedKey.len) + " bytes = 32 key + 16 tag)");
+    print("");
+    print("the site stores : credentialId + publicKey, nothing else");
+    print("never leaves you: the private key, even in encrypted form");
+
+    print("");
+    print("---- signing a login challenge ----");
+    // What a browser hands an authenticator. The challenge is server-chosen and
+    // different every login, which is what stops replay.
+    let challenge = hex_decode("00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff");
+    let clientData = "{\"type\":\"webauthn.get\",\"challenge\":\"" + hex_encode(challenge) +
+                     "\",\"origin\":\"https://example.com\"}";
+    // rpIdHash || flags || signCount — real authenticatorData, abbreviated.
+    let authData = concat_bytes(sha256(strBytes(pk.rpId)), strBytes("\x05\x00\x00\x00\x01"));
+
+    let sig = signWith(pk, master, authData, clientData);
+    print("signature     " + hex_encode(sub_bytes(sig, 0, 16)) + "…  (" + str(sig.len) + " bytes, r||s)");
+
+    // What the server does with the public key it stored at registration.
+    let signedData = concat_bytes(authData, sha256(strBytes(clientData)));
+    print("server verify " + str(ecdsa_verify(pk.publicKey, sha256(signedData), sig)) + "  (want true)");
+
+    print("");
+    print("---- the failures that matter ----");
+
+    print("wrong password        -> " +
+          str(signWith(pk, "correct horse battery stapl", authData, clientData).len) + " bytes (want 0)");
+
+    // Move this credential's encrypted key onto a record claiming another site.
+    // The AAD binding makes the tag check fail.
+    let evil = new Passkey("evil.example", "johndoe@example.com");
+    evil.credentialId = pk.credentialId;
+    evil.kdfSalt = pk.kdfSalt;
+    evil.nonce = pk.nonce;
+    evil.sealedKey = pk.sealedKey;
+    print("key moved to new rpId -> " + str(signWith(evil, master, authData, clientData).len) + " bytes (want 0)");
+
+    // Flip one bit of the stored ciphertext.
+    let corrupt = new Passkey(pk.rpId, pk.userName);
+    corrupt.credentialId = pk.credentialId;
+    corrupt.kdfSalt = pk.kdfSalt;
+    corrupt.nonce = pk.nonce;
+    corrupt.sealedKey = bytes(pk.sealedKey.len);
+    let i = 0;
+    while (i < pk.sealedKey.len) { corrupt.sealedKey[i] = pk.sealedKey[i]; i += 1; }
+    corrupt.sealedKey[0] = ((corrupt.sealedKey[0] as int) ^ 1) as byte;
+    print("one flipped bit       -> " + str(signWith(corrupt, master, authData, clientData).len) + " bytes (want 0)");
+
+    // A signature is bound to its challenge, so a captured one is not reusable.
+    let otherData = "{\"type\":\"webauthn.get\",\"challenge\":\"" +
+                    hex_encode(hex_decode("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")) +
+                    "\",\"origin\":\"https://example.com\"}";
+    let replay = concat_bytes(authData, sha256(strBytes(otherData)));
+    print("replay, new challenge -> " + str(ecdsa_verify(pk.publicKey, sha256(replay), sig)) + " (want false)");
+
+    // Same signature, same challenge, different site.
+    let wrongOrigin = "{\"type\":\"webauthn.get\",\"challenge\":\"" + hex_encode(challenge) +
+                      "\",\"origin\":\"https://example.com.evil.example\"}";
+    let originData = concat_bytes(authData, sha256(strBytes(wrongOrigin)));
+    print("replay, new origin    -> " + str(ecdsa_verify(pk.publicKey, sha256(originData), sig)) + " (want false)");
+
+    print("");
+    print("---- real generation (random, so only properties are printed) ----");
+    realGeneration(master);
+}
+
+fn realGeneration(master: string) {
+    let a = createPasskey("example.com", "johndoe@example.com", master);
+    let b = createPasskey("example.com", "johndoe@example.com", master);
+    if (a == null || b == null) {
+        // The honest output when the OS CSPRNG is unavailable.
+        print("REFUSED: no entropy — no key generated");
+        return;
+    }
+
+    print("generated             " + str(a.publicKey.len == 64 && a.sealedKey.len == 48) + " (want true)");
+    // Same site, same password, same everything a user typed — and still
+    // completely different keys, because none of it seeds the key.
+    print("keys differ           " + str(!ct_equal(a.publicKey, b.publicKey)) + " (want true)");
+    print("salts differ          " + str(!ct_equal(a.kdfSalt, b.kdfSalt)) + " (want true)");
+    print("nonces differ         " + str(!ct_equal(a.nonce, b.nonce)) + " (want true)");
+    print("credential ids differ " + str(!ct_equal(a.credentialId, b.credentialId)) + " (want true)");
+
+    // A generated credential still round-trips through seal/open and produces a
+    // signature its own public key verifies.
+    let authData = concat_bytes(sha256(strBytes(a.rpId)), strBytes("\x05\x00\x00\x00\x01"));
+    let clientData = "{\"type\":\"webauthn.get\",\"origin\":\"https://example.com\"}";
+    let sig = signWith(a, master, authData, clientData);
+    let signed = concat_bytes(authData, sha256(strBytes(clientData)));
+    print("signs and verifies    " + str(ecdsa_verify(a.publicKey, sha256(signed), sig)) + " (want true)");
+    print("wrong key rejects     " + str(ecdsa_verify(b.publicKey, sha256(signed), sig)) + " (want false)");
+}

@@ -1,0 +1,301 @@
+// vyto/crypto — hashing, key derivation, authenticated encryption, and P-256.
+//
+// This example is a known-answer test as much as a demonstration. Cryptographic
+// code that is merely self-consistent is worthless: an implementation that
+// encrypts and decrypts its own output perfectly can still be doing something
+// no other implementation agrees with, and the failure only surfaces the day
+// something else has to read the bytes. So almost every line below checks
+// against a value published by someone else — FIPS 180-4, RFC 4231, RFC 5869,
+// RFC 8439 — rather than against this code's own output.
+//
+// The three exceptions are noted where they appear, and each has a reason:
+// key generation and randomised signing are not reproducible by construction,
+// and micro-ecc's deterministic nonce is not byte-compatible with RFC 6979
+// (see lib/vyto/crypto/ecc/ecc.vt). Those are checked by their properties —
+// round-trips, agreement between two parties, rejection of tampered input.
+
+import { sha256, hmac_sha256, hkdf_sha256, pbkdf2_sha256,
+         chacha20, chacha20poly1305_seal, chacha20poly1305_open,
+         ct_equal, hex_encode, hex_decode, strBytes, sub_bytes } from "vyto/crypto";
+import { ecc_keypair, ecc_public_from_private, ecc_valid_public,
+         ecdsa_sign, ecdsa_sign_random, ecdsa_verify, ecdh,
+         ecc_compress, ecc_decompress } from "vyto/crypto/ecc";
+import { blake2b, argon2_raw, argon2id, argon2i, argon2d,
+         ARGON2D, ARGON2I, ARGON2ID } from "vyto/crypto/argon2";
+
+// Prints "ok" or a loud failure with both values, so a broken build tells you
+// what it produced rather than only that it was wrong.
+fn check(name: string, got: string, want: string) {
+    if (got == want) {
+        print("ok    " + name);
+    } else {
+        print("FAIL  " + name);
+        print("        got  " + got);
+        print("        want " + want);
+    }
+}
+
+fn checkBool(name: string, got: bool, want: bool) {
+    if (got == want) {
+        print("ok    " + name);
+    } else {
+        print("FAIL  " + name + " (got " + str(got) + ", want " + str(want) + ")");
+    }
+}
+
+fn repeatByte(v: int, n: int): byte[] {
+    let b = bytes(n);
+    let i = 0;
+    while (i < n) { b[i] = v as byte; i += 1; }
+    return b;
+}
+
+fn main() {
+    print("---- SHA-256 (FIPS 180-4) ----");
+    check("sha256(\"abc\")", hex_encode(sha256(strBytes("abc"))),
+          "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    check("sha256(\"\")", hex_encode(sha256(strBytes(""))),
+          "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+    check("sha256(448-bit msg)",
+          hex_encode(sha256(strBytes("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"))),
+          "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1");
+    // Multi-block with a length that forces a second padding block — the case
+    // an off-by-one in the padding loop passes everything else and fails here.
+    check("sha256(1M x 'a')", hex_encode(sha256(repeatByte(97, 1000000))),
+          "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0");
+
+    print("---- HMAC-SHA256 (RFC 4231) ----");
+    check("case 1", hex_encode(hmac_sha256(repeatByte(0x0b, 20), strBytes("Hi There"))),
+          "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7");
+    check("case 2", hex_encode(hmac_sha256(strBytes("Jefe"), strBytes("what do ya want for nothing?"))),
+          "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843");
+    check("case 3", hex_encode(hmac_sha256(repeatByte(0xaa, 20), repeatByte(0xdd, 50))),
+          "773ea91e36800e46854db8ebd09181a72959098b3ef8c122d9635514ced565fe");
+    // Key longer than the 64-byte block, so it is hashed down first.
+    check("case 6 (long key)",
+          hex_encode(hmac_sha256(repeatByte(0xaa, 131),
+                                 strBytes("Test Using Larger Than Block-Size Key - Hash Key First"))),
+          "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54");
+
+    print("---- HKDF-SHA256 (RFC 5869) ----");
+    check("case 1 (42 bytes)",
+          hex_encode(hkdf_sha256(repeatByte(0x0b, 22),
+                                 hex_decode("000102030405060708090a0b0c"),
+                                 hex_decode("f0f1f2f3f4f5f6f7f8f9"), 42)),
+          "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865");
+    check("case 3 (empty salt and info)",
+          hex_encode(hkdf_sha256(repeatByte(0x0b, 22), bytes(0), bytes(0), 42)),
+          "8da4e775a563c18f715f802a063c5a31b8a11f5c5ee1879ec3454e5f3c738d2d9d201395faa4b61a96c8");
+
+    print("---- PBKDF2-HMAC-SHA256 (RFC 8018) ----");
+    check("c=1",  hex_encode(pbkdf2_sha256(strBytes("password"), strBytes("salt"), 1, 32)),
+          "120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b");
+    check("c=2",  hex_encode(pbkdf2_sha256(strBytes("password"), strBytes("salt"), 2, 32)),
+          "ae4d0c95af6b46d32d0adff928f06dd02a303f8ef3c251dfd6e2d85a95474c43");
+    check("c=4096", hex_encode(pbkdf2_sha256(strBytes("password"), strBytes("salt"), 4096, 32)),
+          "c5e478d59288c841aa530db6845c4c8d962893a001ce4e11a4963873aa98134a");
+    // dklen spanning two blocks, which exercises the block counter.
+    check("c=4096, 40 bytes",
+          hex_encode(pbkdf2_sha256(strBytes("passwordPASSWORDpassword"),
+                                   strBytes("saltSALTsaltSALTsaltSALTsaltSALTsalt"), 4096, 40)),
+          "348c89dbcbd32b2f32d814b8116e84cf2b17347ebc1800181c4e2a1fb8dd53e1c635518c7dac47e9");
+
+    print("---- BLAKE2b (RFC 7693) ----");
+    check("blake2b(\"abc\", 64)", hex_encode(blake2b(strBytes("abc"), 64)),
+          "ba80a53f981c4d0d6a2797b69f12f6e94c212f14685ac4b74b12bb6fdbffa2d1" +
+          "7d87c5392aab792dc252d5de4533cc9518d38aa8dbf1925ab92386edd4009923");
+    check("blake2b(\"\", 64)", hex_encode(blake2b(strBytes(""), 64)),
+          "786a02f742015903c6c6fd852552d272912f4740e15847618a86e217f71f5419" +
+          "d25e1031afee585313896444934eb04b903a685b1448b755d56f701afe9be2ce");
+    // A short digest is not a truncated long one — the output length goes into
+    // the parameter block, so every length is a different function.
+    check("blake2b(\"abc\", 32)", hex_encode(blake2b(strBytes("abc"), 32)),
+          "bddd813c634239723171ef3fee98579b94964e3bb1cb3e427262c8c068d52319");
+
+    print("---- Argon2 (RFC 9106 §5) ----");
+    // The RFC's own vectors, all three variants, with every optional input in
+    // play: secret and associated data as well as password and salt. p=4, so
+    // this exercises multi-lane addressing even though the lanes run
+    // sequentially here.
+    let apw = repeatByte(1, 32);
+    let asalt = repeatByte(2, 16);
+    let asecret = repeatByte(3, 8);
+    let aad2 = repeatByte(4, 12);
+    check("Argon2d", hex_encode(argon2_raw(ARGON2D, apw, asalt, asecret, aad2, 3, 32, 4, 32)),
+          "512b391b6f1162975371d30919734294f868e3be3984f3c1a13a4db9fabe4acb");
+    check("Argon2i", hex_encode(argon2_raw(ARGON2I, apw, asalt, asecret, aad2, 3, 32, 4, 32)),
+          "c814d9d1dc7f37aa13f0d77f2494bda1c8de6b016dd388d29952a4c4672b6ce8");
+    check("Argon2id", hex_encode(argon2_raw(ARGON2ID, apw, asalt, asecret, aad2, 3, 32, 4, 32)),
+          "0d640df58d78766c08c037a34a8b53c9d01ef0452d75b65eb52520e96b01e659");
+
+    // The convenience wrappers must agree with argon2_raw and no secret/ad.
+    checkBool("argon2id() matches argon2_raw",
+              ct_equal(argon2id(apw, asalt, 3, 32, 4, 32),
+                       argon2_raw(ARGON2ID, apw, asalt, bytes(0), bytes(0), 3, 32, 4, 32)), true);
+    checkBool("argon2i() matches argon2_raw",
+              ct_equal(argon2i(apw, asalt, 3, 32, 4, 32),
+                       argon2_raw(ARGON2I, apw, asalt, bytes(0), bytes(0), 3, 32, 4, 32)), true);
+    checkBool("argon2d() matches argon2_raw",
+              ct_equal(argon2d(apw, asalt, 3, 32, 4, 32),
+                       argon2_raw(ARGON2D, apw, asalt, bytes(0), bytes(0), 3, 32, 4, 32)), true);
+
+    // Every parameter is bound into H_0, so changing any one of them must
+    // change the output. A KDF that ignores a parameter it advertises is a
+    // silent downgrade — the caller thinks they raised the cost and did not.
+    let baseline = argon2id(apw, asalt, 3, 64, 1, 32);
+    checkBool("differs on password", ct_equal(argon2id(repeatByte(9, 32), asalt, 3, 64, 1, 32), baseline), false);
+    checkBool("differs on salt", ct_equal(argon2id(apw, repeatByte(9, 16), 3, 64, 1, 32), baseline), false);
+    checkBool("differs on iterations", ct_equal(argon2id(apw, asalt, 4, 64, 1, 32), baseline), false);
+    checkBool("differs on memory", ct_equal(argon2id(apw, asalt, 3, 128, 1, 32), baseline), false);
+    checkBool("differs on lanes", ct_equal(argon2id(apw, asalt, 3, 64, 2, 32), baseline), false);
+    checkBool("differs on secret",
+              ct_equal(argon2_raw(ARGON2ID, apw, asalt, asecret, bytes(0), 3, 64, 1, 32), baseline), false);
+    checkBool("differs on associated data",
+              ct_equal(argon2_raw(ARGON2ID, apw, asalt, bytes(0), aad2, 3, 64, 1, 32), baseline), false);
+    checkBool("stable across calls", ct_equal(argon2id(apw, asalt, 3, 64, 1, 32), baseline), true);
+
+    // A longer tag must not merely extend a shorter one: H' binds the length.
+    let tag32 = argon2id(apw, asalt, 3, 64, 1, 32);
+    let tag64 = argon2id(apw, asalt, 3, 64, 1, 64);
+    checkBool("64-byte tag is not an extension of the 32-byte one",
+              ct_equal(sub_bytes(tag64, 0, 32), tag32), false);
+    checkBool("long tag has the right length", tag64.len == 64, true);
+    // Past BLAKE2b's 64-byte ceiling, which is where H' starts chaining.
+    checkBool("1024-byte tag", argon2id(apw, asalt, 3, 64, 1, 1024).len == 1024, true);
+
+    print("---- ChaCha20 (RFC 8439 2.4.2) ----");
+    let ckey = hex_decode("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f");
+    let cnonce = hex_decode("000000090000004a00000000");
+    let sunscreen = strBytes("Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it.");
+    // Cross-checked against OpenSSL's chacha20 and python-cryptography, which
+    // agree with this byte for byte.
+    check("keystream XOR, counter 1", hex_encode(chacha20(ckey, cnonce, 1, sunscreen)),
+          "5c90838db44879743e6bfd58c64e05a8a2bc91a913af0e23704acfbaa0b80d3da1a20b2027b893302ee29e63f9c222c1da67f0b5fe7928dfaea2a391cd251c2164e4fa5756b9da6e8ca5dc908c44cbf6e93ea6b4cc406988d7da69bf795bf19b84539df73bd9b3e9ca4d03bc0a586ff528dc");
+
+    print("---- ChaCha20-Poly1305 AEAD (RFC 8439 2.8.2) ----");
+    let akey = hex_decode("808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f");
+    let anonce = hex_decode("070000004041424344454647");
+    let aad = hex_decode("50515253c0c1c2c3c4c5c6c7");
+    let sealed = chacha20poly1305_seal(akey, anonce, sunscreen, aad);
+    check("ciphertext", hex_encode(sub_bytes(sealed, 0, sealed.len - 16)),
+          "d31a8d34648e60db7b86afbc53ef7ec2a4aded51296e08fea9e2b5a736ee62d63dbea45e8ca9671282fafb69da92728b1a71de0a9e060b2905d6a5b67ecd3b3692ddbd7f2d778b8c9803aee328091b58fab324e4fad675945585808b4831d7bc3ff4def08e4b7a9de576d26586cec64b6116");
+    check("tag", hex_encode(sub_bytes(sealed, sealed.len - 16, 16)),
+          "1ae10b594f09e26a7e902ecbd0600691");
+
+    let opened = chacha20poly1305_open(akey, anonce, sealed, aad);
+    checkBool("opens", opened.ok, true);
+    checkBool("plaintext round-trips", ct_equal(opened.data, sunscreen), true);
+
+    // Every one of these must fail. An AEAD that accepts any of them is not an
+    // AEAD, and the failures are silent unless something checks for them.
+    let flipped = chacha20poly1305_seal(akey, anonce, sunscreen, aad);
+    flipped[3] = ((flipped[3] as int) ^ 1) as byte;
+    checkBool("rejects flipped ciphertext bit", chacha20poly1305_open(akey, anonce, flipped, aad).ok, false);
+
+    let tagged = chacha20poly1305_seal(akey, anonce, sunscreen, aad);
+    tagged[tagged.len - 1] = ((tagged[tagged.len - 1] as int) ^ 1) as byte;
+    checkBool("rejects flipped tag bit", chacha20poly1305_open(akey, anonce, tagged, aad).ok, false);
+
+    checkBool("rejects altered aad",
+              chacha20poly1305_open(akey, anonce, sealed, hex_decode("50515253c0c1c2c3c4c5c6c8")).ok, false);
+    checkBool("rejects wrong key",
+              chacha20poly1305_open(repeatByte(0, 32), anonce, sealed, aad).ok, false);
+    checkBool("rejects wrong nonce",
+              chacha20poly1305_open(akey, hex_decode("070000004041424344454648"), sealed, aad).ok, false);
+    checkBool("rejects truncated input",
+              chacha20poly1305_open(akey, anonce, sub_bytes(sealed, 0, 8), aad).ok, false);
+    // Empty plaintext is legal and must still authenticate — the case where
+    // "returns no bytes" and "failed" would be confused if AeadResult did not
+    // carry ok separately.
+    let empty = chacha20poly1305_seal(akey, anonce, bytes(0), aad);
+    let emptyOpened = chacha20poly1305_open(akey, anonce, empty, aad);
+    checkBool("empty plaintext authenticates", emptyOpened.ok, true);
+    checkBool("empty plaintext is empty", emptyOpened.data.len == 0, true);
+
+    print("---- constant-time compare ----");
+    checkBool("equal", ct_equal(hex_decode("00ff10"), hex_decode("00ff10")), true);
+    checkBool("differs in last byte", ct_equal(hex_decode("00ff10"), hex_decode("00ff11")), false);
+    checkBool("differs in first byte", ct_equal(hex_decode("00ff10"), hex_decode("01ff10")), false);
+    checkBool("different lengths", ct_equal(hex_decode("00ff10"), hex_decode("00ff")), false);
+
+    print("---- hex ----");
+    check("encode", hex_encode(hex_decode("DEADbeef")), "deadbeef");
+    check("ignores separators", hex_encode(hex_decode("de ad:be\nef")), "deadbeef");
+
+    print("---- P-256 key agreement and signing ----");
+    // The one published vector this module can match exactly: RFC 6979 A.2.5's
+    // key pair. Deriving the public key from the private scalar is standard, so
+    // this pins the curve, the scalar arithmetic and the X||Y byte order — even
+    // though the signatures further down do not match that RFC.
+    let rfcPriv = hex_decode("C9AFA9D845BA75166B5C215767B1D6934E50C3DB36E89B127B8A622B120F6721");
+    let rfcPub = ecc_public_from_private(rfcPriv);
+    checkBool("derives public key", rfcPub.ok, true);
+    check("public key matches RFC 6979 A.2.5", hex_encode(rfcPub.data),
+          "60fed4ba255a9d31c961eb74c6356d68c049b8923b61fa6ce669622e60f29fb6" +
+          "7903fe1008b8bc99a41ae9e95628bc64f2f1b20c2d7e9f5177a3c294d4462299");
+    checkBool("derived key validates", ecc_valid_public(rfcPub.data), true);
+
+    // Deterministic signing: the value is this implementation's own, so it is
+    // checked as a property (stable across calls, verifies, changes with the
+    // message) rather than against a published constant.
+    let msg = sha256(strBytes("sample"));
+    let sig1 = ecdsa_sign(rfcPriv, msg);
+    let sig2 = ecdsa_sign(rfcPriv, msg);
+    checkBool("signs", sig1.ok, true);
+    checkBool("signature is 64 bytes", sig1.data.len == 64, true);
+    checkBool("deterministic across calls", ct_equal(sig1.data, sig2.data), true);
+    checkBool("verifies", ecdsa_verify(rfcPub.data, msg, sig1.data), true);
+
+    let other = sha256(strBytes("samplf"));
+    checkBool("rejects a different message", ecdsa_verify(rfcPub.data, other, sig1.data), false);
+    checkBool("different message gives different signature",
+              ct_equal(ecdsa_sign(rfcPriv, other).data, sig1.data), false);
+
+    let tamperedSig = ecdsa_sign(rfcPriv, msg).data;
+    tamperedSig[0] = ((tamperedSig[0] as int) ^ 1) as byte;
+    checkBool("rejects a tampered signature", ecdsa_verify(rfcPub.data, msg, tamperedSig), false);
+
+    // Randomised signing must differ every time and still verify.
+    let r1 = ecdsa_sign_random(rfcPriv, msg);
+    let r2 = ecdsa_sign_random(rfcPriv, msg);
+    checkBool("random nonce signs", r1.ok && r2.ok, true);
+    checkBool("random nonce differs per call", ct_equal(r1.data, r2.data), false);
+    checkBool("random nonce verifies", ecdsa_verify(rfcPub.data, msg, r1.data), true);
+
+    print("---- P-256 generated keys ----");
+    let a = ecc_keypair();
+    let b = ecc_keypair();
+    checkBool("generates", a.ok && b.ok, true);
+    checkBool("two keypairs differ", ct_equal(a.priv, b.priv), false);
+    checkBool("generated key validates", ecc_valid_public(a.pub), true);
+    checkBool("public matches private", ct_equal(ecc_public_from_private(a.priv).data, a.pub), true);
+
+    let sa = ecdh(b.pub, a.priv);
+    let sb = ecdh(a.pub, b.priv);
+    checkBool("ECDH both sides succeed", sa.ok && sb.ok, true);
+    checkBool("ECDH agrees", ct_equal(sa.data, sb.data), true);
+
+    // An all-zero buffer is not a point. A static-key ECDH that accepts junk
+    // points leaks its private key one query at a time.
+    checkBool("rejects all-zero public key", ecc_valid_public(bytes(64)), false);
+    checkBool("ECDH rejects invalid point", ecdh(bytes(64), a.priv).ok, false);
+
+    print("---- P-256 point compression ----");
+    let comp = ecc_compress(rfcPub.data);
+    // 0x03, not 0x02: the prefix encodes the parity of Y, and this key's Y ends
+    // in 0x99. Getting that backwards yields the negated point, which still
+    // decompresses and still validates — so only the prefix byte catches it.
+    check("compressed", hex_encode(comp),
+          "0360fed4ba255a9d31c961eb74c6356d68c049b8923b61fa6ce669622e60f29fb6");
+    let back = ecc_decompress(comp);
+    checkBool("decompresses", back.ok, true);
+    checkBool("decompression round-trips", ct_equal(back.data, rfcPub.data), true);
+
+    // x = 1 is not on P-256: 1 - 3 + b is a quadratic non-residue mod p, so no
+    // y exists. micro-ecc's decompress does not check this and returns garbage,
+    // which is why ecc_decompress validates before handing anything back.
+    let offCurve = bytes(33);
+    offCurve[0] = 2 as byte;
+    offCurve[32] = 1 as byte;
+    checkBool("rejects an off-curve compressed point", ecc_decompress(offCurve).ok, false);
+}

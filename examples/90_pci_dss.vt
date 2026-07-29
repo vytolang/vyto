@@ -1,0 +1,369 @@
+// Handling card data — PCI DSS Requirement 3, with vyto/crypto.
+//
+// READ THIS FIRST. This file is not compliance and cannot make you compliant.
+// PCI DSS is an assessment of an entire cardholder data environment: network
+// segmentation, access control, patching, vulnerability scanning, logging,
+// vendor management, written policy, and an assessor who signs it off. What is
+// shown here is the cryptography of Requirement 3, "protect stored account
+// data", which is one requirement out of twelve. Getting this part right and
+// the other eleven wrong leaves you non-compliant and, more to the point,
+// breached.
+//
+// The card numbers below are the publicly published test PANs that every
+// payment processor hands out for exactly this purpose. They belong to nobody.
+//
+// ---- what the rules actually say ----
+//
+//   3.3.1  Sensitive authentication data — CVV/CVC, full track data, PIN and
+//          PIN blocks — MUST NOT be stored after authorization. Not encrypted,
+//          not hashed, not "temporarily". This is the rule that ends companies,
+//          because it is the one where encryption does not save you: storing an
+//          encrypted CVV is still storing the CVV.
+//
+//   3.4.1  When a PAN is displayed, show at most the first six and last four
+//          digits. Anyone with a business need for more has to justify it.
+//
+//   3.5.1  A stored PAN must be unreadable: one-way hash, truncation,
+//          tokenization, or strong encryption with key management.
+//
+//   3.5.1.1  If you hash, it must be a KEYED hash (HMAC or equivalent) with
+//          its own key management. Plain SHA-256 of a PAN does not qualify,
+//          and the section below shows why by breaking one.
+//
+//   3.6/3.7  Keys are protected by other keys, are rotated, and can be retired.
+//          A single key hardcoded forever fails this even if the algorithm is
+//          perfect.
+//
+// Requirement 4 (strong cryptography in transit) needs TLS, which is what
+// vyto/crypto/openssl is being built for and is a stub today.
+
+import { sha256, hmac_sha256, hkdf_sha256, hex_encode, hex_decode, strBytes,
+         sub_bytes, concat_bytes, ct_equal,
+         chacha20poly1305_seal, chacha20poly1305_open } from "vyto/crypto";
+import { base64_encode } from "vyto/util/mime";
+import { StringBuilder } from "vyto/util/text";
+import { rand_bytes } from "vyto/util/uuid";
+
+// ---- key hierarchy (Req 3.6) ------------------------------------------------
+//
+// Three levels, because a flat single key cannot be rotated without re-writing
+// every stored record, and cannot be revoked at all.
+//
+//   KEK   key-encrypting key. In production this lives in an HSM or a KMS and
+//         never appears in application memory in the clear. Here it is a
+//         constant, which is precisely what a real deployment must not do.
+//   DEK   data-encrypting key, one per key generation. Wrapped by the KEK and
+//         stored alongside the data; rotating means issuing a new DEK, not
+//         touching the KEK.
+//   index key  separate key for the searchable HMAC below. Separate because it
+//         is used differently and leaks differently — an index key disclosure
+//         must not also decrypt the ciphertext.
+//
+// Fixed values so this file's output is a reproducible golden test.
+fn demoKek(): byte[] {
+    return hex_decode("2b7e151628aed2a6abf7158809cf4f3c762e7160f38b4da56a784d9045190cfe");
+}
+
+fn dekFor(kek: byte[], generation: string): byte[] {
+    return hkdf_sha256(kek, strBytes("pci-dek-salt"), strBytes("dek:" + generation), 32);
+}
+
+fn indexKey(kek: byte[]): byte[] {
+    return hkdf_sha256(kek, strBytes("pci-idx-salt"), strBytes("pan-index:v1"), 32);
+}
+
+// ---- PAN basics -------------------------------------------------------------
+
+// Luhn check digit (ISO/IEC 7812). Not security — it catches typos, and every
+// attacker knows it. It matters here only because it shrinks a brute-force
+// search space, which is the point made further down.
+fn luhnValid(pan: string): bool {
+    if (pan.len < 12) { return false; }
+    let sum = 0;
+    let dbl = false;
+    let i = pan.len - 1;
+    while (i >= 0) {
+        let c = pan[i];
+        if (c < 48 || c > 57) { return false; }
+        let d = c - 48;
+        if (dbl) {
+            d = d * 2;
+            if (d > 9) { d -= 9; }
+        }
+        sum += d;
+        dbl = !dbl;
+        i -= 1;
+    }
+    return sum % 10 == 0;
+}
+
+// Req 3.4.1: at most first six and last four. Everything between becomes a
+// fixed run of asterisks, not one per hidden digit — the length of a masked
+// region is itself information.
+fn maskPan(pan: string): string {
+    if (pan.len < 10) { return "**********"; }
+    let sb = new StringBuilder(24);
+    let i = 0;
+    while (i < 6) { sb.appendByte(pan[i]); i += 1; }
+    sb.append("******");
+    i = pan.len - 4;
+    while (i < pan.len) { sb.appendByte(pan[i]); i += 1; }
+    return sb.toString();
+}
+
+// ---- a stored card record ---------------------------------------------------
+
+class CardRecord {
+    token: string;          // what every other system uses instead of the PAN
+    generation: string;     // which DEK generation encrypted this
+    masked: string;         // safe to display, log and print on a receipt
+    brand: string;
+    lookupIndex: byte[];    // keyed HMAC — dedupe and search without decrypting
+    nonce: byte[];
+    ciphertext: byte[];     // the PAN, encrypted
+
+    fn init() {}
+
+    // Bound into the AEAD so a ciphertext cannot be moved to another token or
+    // relabelled as a different DEK generation.
+    fn aad(): byte[] {
+        return strBytes("pci-card-v1|" + this.token + "|" + this.generation);
+    }
+}
+
+// Store a card. The CVV is a parameter and is deliberately never assigned to a
+// field: it is used for authorization by the caller and must not survive.
+fn storeCard(kek: byte[], pan: string, brand: string, token: string,
+             generation: string, nonce: byte[]): CardRecord {
+    let rec = new CardRecord();
+    rec.token = token;
+    rec.generation = generation;
+    rec.brand = brand;
+    rec.masked = maskPan(pan);
+    rec.lookupIndex = hmac_sha256(indexKey(kek), strBytes(pan));
+    rec.nonce = nonce;
+    rec.ciphertext = chacha20poly1305_seal(dekFor(kek, generation), nonce, strBytes(pan), rec.aad());
+    return rec;
+}
+
+// Recover the PAN. In a real system this is the most privileged operation
+// there is: it needs its own authorization, and every call belongs in the
+// audit log (Requirement 10) with who asked and why.
+fn revealPan(kek: byte[], rec: CardRecord): string {
+    let r = chacha20poly1305_open(dekFor(kek, rec.generation), rec.nonce, rec.ciphertext, rec.aad());
+    if (!r.ok) { return ""; }
+    let out = "";
+    let i = 0;
+    while (i < r.data.len) {
+        let b = bytes(1);
+        b[0] = r.data[i];
+        out = out + str(b as cstring);
+        i += 1;
+    }
+    return out;
+}
+
+fn main() {
+    let kek = demoKek();
+    let pan = "4111111111111111";        // published Visa test number
+    let cvv = "123";
+
+    print("---- 3.3.1: what must never be stored ----");
+    // Authorization is the only moment the CVV legitimately exists. It goes to
+    // the acquirer and is then gone: not stored, not logged, not encrypted for
+    // later. "We encrypt our CVVs" is a confession, not a mitigation.
+    let approved = authorize(pan, cvv);
+    print("authorized            " + str(approved) + " (want true)");
+    print("cvv retained anywhere false (by construction — CardRecord has no field for it)");
+    print("");
+    print("also forbidden after authorization: full magnetic-stripe/chip track");
+    print("data, and the PIN or PIN block. encryption does not make storing");
+    print("them acceptable — the rule is about existence, not readability");
+
+    print("");
+    print("---- 3.4.1: masking for display ----");
+    print("full pan (never logged)  " + pan);
+    print("what a receipt may show  " + maskPan(pan));
+    print("luhn valid               " + str(luhnValid(pan)) + " (want true)");
+    print("luhn rejects a typo      " + str(luhnValid("4111111111111112")) + " (want false)");
+
+    print("");
+    print("---- 3.5.1.1: why an unkeyed hash is not 'unreadable' ----");
+    // The PAN space is tiny. An attacker who steals a table of SHA-256(PAN)
+    // does not need to reverse SHA-256; they enumerate candidate card numbers
+    // and hash forward until one matches.
+    let stolenHash = sha256(strBytes(pan));
+    print("stolen hash   " + hex_encode(stolenHash));
+    print("");
+    print("the attacker also has what compliant masking already showed them:");
+    print("the first six and last four digits. for an 8-digit BIN that leaves");
+    print("four unknown digits — 10 000 candidates, which is what we search");
+    print("here so this example finishes. a 6-digit BIN leaves six unknown, so");
+    print("1 000 000 candidates, and that is still seconds of work");
+
+    let cracked = bruteForceUnkeyed(stolenHash, "41111111", "1111");
+    print("");
+    print("recovered pan " + cracked);
+    print("matches       " + str(cracked == pan) + " (want true)");
+    print("");
+    print("that is why 3.5.1.1 requires a KEYED hash. without the key the same");
+    print("search is impossible: the attacker cannot compute a candidate's");
+    print("index at all");
+
+    let keyed = hmac_sha256(indexKey(kek), strBytes(pan));
+    print("");
+    print("keyed index   " + hex_encode(keyed));
+    let crackedKeyed = bruteForceUnkeyed(keyed, "41111111", "1111");
+    print("same search   \"" + crackedKeyed + "\" (want empty — no candidate matches)");
+
+    print("");
+    print("---- 3.5.1 + 3.6: storing the card ----");
+    let nonce = hex_decode("a1b2c3d4e5f60718293a4b5c");
+    let rec = storeCard(kek, pan, "visa", "tok_9f2a41c7", "2026-Q3", nonce);
+    print("token         " + rec.token);
+    print("generation    " + rec.generation);
+    print("masked        " + rec.masked);
+    print("lookup index  " + hex_encode(sub_bytes(rec.lookupIndex, 0, 16)) + "…");
+    print("ciphertext    " + hex_encode(sub_bytes(rec.ciphertext, 0, 16)) + "…  (" +
+          str(rec.ciphertext.len) + " bytes)");
+    print("");
+    print("everything above is safe in a database, a backup and a log — the");
+    print("token and masked pan are what the rest of the business uses, and");
+    print("nothing here reveals the card without the KEK");
+
+    print("");
+    print("---- dedupe without decrypting ----");
+    // "Have we seen this card before?" answered by comparing keyed indexes.
+    // No decryption, no plaintext PAN, and it works across records encrypted
+    // under different DEK generations.
+    let same = storeCard(kek, pan, "visa", "tok_different", "2026-Q3", hex_decode("111111111111111111111111"));
+    let other = storeCard(kek, "5555555555554444", "mc", "tok_other", "2026-Q3", hex_decode("222222222222222222222222"));
+    print("same card, different token  " + str(ct_equal(rec.lookupIndex, same.lookupIndex)) + " (want true)");
+    print("different card              " + str(ct_equal(rec.lookupIndex, other.lookupIndex)) + " (want false)");
+    print("ciphertexts still differ    " + str(!ct_equal(rec.ciphertext, same.ciphertext)) + " (want true)");
+    print("");
+    print("identical cards share an index but never a ciphertext, because the");
+    print("nonce differs — equal ciphertexts would leak the match to anyone");
+    print("who could read the table");
+
+    print("");
+    print("---- tamper resistance ----");
+    print("authorized read       " + str(revealPan(kek, rec) == pan) + " (want true)");
+
+    // Relabel the record as a different DEK generation.
+    let relabelled = new CardRecord();
+    relabelled.token = rec.token;
+    relabelled.generation = "2026-Q2";
+    relabelled.nonce = rec.nonce;
+    relabelled.ciphertext = rec.ciphertext;
+    print("generation relabelled \"" + revealPan(kek, relabelled) + "\" (want empty)");
+
+    // Move the ciphertext onto another token's record.
+    let moved = new CardRecord();
+    moved.token = "tok_attacker";
+    moved.generation = rec.generation;
+    moved.nonce = rec.nonce;
+    moved.ciphertext = rec.ciphertext;
+    print("moved to new token    \"" + revealPan(kek, moved) + "\" (want empty)");
+
+    // Wrong KEK.
+    print("wrong kek             \"" + revealPan(sha256(strBytes("guess")), rec) + "\" (want empty)");
+
+    print("");
+    print("---- 3.6.1.4 / 3.7.4: key rotation ----");
+    // Rotation issues a new DEK generation and re-encrypts. The old records
+    // stay readable throughout, because each record names the generation that
+    // wrote it — which is why `generation` is a stored field and not a global.
+    let rotated = storeCard(kek, revealPan(kek, rec), "visa", rec.token, "2026-Q4",
+                            hex_decode("333333333333333333333333"));
+    print("old generation reads  " + str(revealPan(kek, rec) == pan) + " (want true)");
+    print("new generation reads  " + str(revealPan(kek, rotated) == pan) + " (want true)");
+    print("ciphertexts differ    " + str(!ct_equal(rec.ciphertext, rotated.ciphertext)) + " (want true)");
+    print("index unchanged       " + str(ct_equal(rec.lookupIndex, rotated.lookupIndex)) + " (want true)");
+    print("");
+    print("the lookup index survives rotation because it is keyed from the KEK");
+    print("rather than the DEK — rotating data keys does not invalidate every");
+    print("search index, which is what makes rotation something you will");
+    print("actually do rather than postpone forever");
+
+    print("");
+    print("---- Requirement 10: an audit log you cannot quietly edit ----");
+    // Each entry chains the previous entry's MAC, so removing or altering any
+    // line breaks every MAC after it. An attacker with database write access
+    // can still destroy the log; what they cannot do is edit it undetectably.
+    let logKey = hkdf_sha256(kek, strBytes("pci-log-salt"), strBytes("audit:v1"), 32);
+    let entries: string[] = [];
+    entries.push("2026-07-29T09:00:00Z alice authorize tok_9f2a41c7");
+    entries.push("2026-07-29T09:04:12Z bob    reveal    tok_9f2a41c7 case=CHG-4471");
+    entries.push("2026-07-29T09:31:55Z alice rotate    generation=2026-Q4");
+
+    let chain = chainLog(logKey, entries);
+    print("head mac  " + hex_encode(sub_bytes(chain, 0, 16)) + "…");
+
+    // Someone deletes the middle line — the one recording a PAN disclosure.
+    let doctored: string[] = [];
+    doctored.push(entries[0]);
+    doctored.push(entries[2]);
+    print("after deleting the 'reveal' line, mac matches: " +
+          str(ct_equal(chain, chainLog(logKey, doctored))) + " (want false)");
+
+    // Or edits it in place.
+    let edited: string[] = [];
+    edited.push(entries[0]);
+    edited.push("2026-07-29T09:04:12Z bob    reveal    tok_9f2a41c7 case=CHG-0000");
+    edited.push(entries[2]);
+    print("after editing the case number, mac matches:    " +
+          str(ct_equal(chain, chainLog(logKey, edited))) + " (want false)");
+
+    print("");
+    print("---- what this example does not do ----");
+    print("scope reduction   the real win is not storing PANs at all: let the");
+    print("                  processor tokenize, and most of Requirement 3");
+    print("                  stops applying to your systems");
+    print("key custody       the KEK here is a constant in a source file, which");
+    print("                  fails 3.6 outright. it belongs in an HSM or KMS,");
+    print("                  under split knowledge and dual control");
+    print("access control    who may call revealPan, and how that is enforced");
+    print("transit           Requirement 4 needs TLS — vyto/crypto/openssl");
+    print("everything else   eleven other requirements, and an assessor");
+}
+
+// Stands in for the acquirer call. The CVV is used here and nowhere else.
+fn authorize(pan: string, cvv: string): bool {
+    return luhnValid(pan) && cvv.len >= 3;
+}
+
+// Enumerate the unknown middle digits and hash forward. Returns the PAN whose
+// digest matches, or "" if none does — which is what happens against a keyed
+// index, since the attacker cannot compute candidates without the key.
+fn bruteForceUnkeyed(target: byte[], knownPrefix: string, knownSuffix: string): string {
+    let n = 0;
+    while (n < 10000) {
+        let mid = new StringBuilder(8);
+        let d = 1000;
+        let v = n;
+        while (d > 0) {
+            mid.appendByte(48 + (v / d) % 10);
+            d = d / 10;
+        }
+        let candidate = knownPrefix + mid.toString() + knownSuffix;
+        // A real attacker skips candidates that fail Luhn, cutting the work by
+        // a further factor of ten. Left in so the count above is honest.
+        if (luhnValid(candidate)) {
+            if (ct_equal(sha256(strBytes(candidate)), target)) {
+                return candidate;
+            }
+        }
+        n += 1;
+    }
+    return "";
+}
+
+// MAC over the whole log, each entry bound to everything before it.
+fn chainLog(key: byte[], entries: string[]): byte[] {
+    let mac = bytes(32);
+    for (let e in entries) {
+        mac = hmac_sha256(key, concat_bytes(mac, strBytes(e)));
+    }
+    return mac;
+}
