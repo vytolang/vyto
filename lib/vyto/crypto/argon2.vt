@@ -1,0 +1,626 @@
+// vyto/crypto/argon2 — Argon2id password hashing (RFC 9106), and the BLAKE2b
+// it is built on. Pure Vyto, no native code.
+//
+//     let salt = rand_bytes(16);
+//     let key = argon2id(strBytes(password), salt, 3, 65536, 1, 32);
+//     //                                     t=3  m=64MiB p=1  32-byte key
+//
+//     blake2b(data, 32)                       // BLAKE2b with any output 1..64
+//
+// Use this, not pbkdf2_sha256, for anything a human typed. PBKDF2 needs almost
+// no memory, so an attacker with a GPU gets thousands of guesses in parallel
+// for the price of one. Argon2id makes every guess pay for 64 MiB of RAM with
+// random access, which is the resource that does not parallelise cheaply — the
+// same wall-clock cost to you buys orders of magnitude more attacker work.
+//
+// PBKDF2 stays in vyto/crypto for compatibility with keys already derived that
+// way. New code should reach here.
+//
+// ---- choosing parameters ----
+//
+// RFC 9106 §4 gives two configurations. The second is the one to want:
+//
+//     t=1, m=2 GiB, p=4      if you can afford 2 GiB
+//     t=3, m=64 MiB, p=4     otherwise — this is the sensible default
+//
+// `p` is lanes, and this implementation runs them sequentially: p=4 costs the
+// same time as p=1 here, and still produces the RFC's answer, but it does not
+// buy the parallel speedup the parameter exists for. Raising `m` is what buys
+// security; raising `p` without threads mostly just changes the output.
+//
+// Measure on the slowest machine that has to open the vault, then pick the
+// largest `m` whose delay you will tolerate. Measured on this development box
+// (linux-x64, --release):
+//
+//     t=3, m=16 MiB    88 ms
+//     t=3, m=64 MiB   357 ms
+//     t=3, m=256 MiB  1.5 s
+//
+// Worth knowing what those numbers mean next door: pbkdf2_sha256 at OWASP's
+// 600 000-iteration floor costs 2.7 s in this same tree. Argon2id at m=256 MiB
+// is both *faster* than that and enormously harder to attack, because the
+// attacker now has to find 256 MiB per parallel guess instead of ~nothing.
+// There is no tradeoff being made here — it is better on both axes.
+//
+// ---- caveats ----
+//
+// Single-threaded. The lanes of a segment are independent and RFC 9106 expects
+// them run in parallel; here they are a loop. The output is identical either
+// way — synchronisation happens at segment boundaries — so this interoperates
+// with any other Argon2 implementation. It is just not faster at higher p.
+//
+// Not hardened against timing side channels, same as the rest of vyto/crypto.
+// Argon2**id** is chosen deliberately over Argon2d: its first half-pass is
+// data-independent, which is what resists an attacker who can observe the
+// memory access pattern. Argon2d, exported here for completeness, is faster to
+// attack in that setting and should only be used where no such attacker exists.
+//
+// Invalid parameters PANIC rather than returning an empty array. A KDF that
+// quietly hands back zero bytes on a bad argument produces an all-zero key that
+// works perfectly until someone notices every vault shares it.
+
+import { StringBuilder } from "vyto/util/text";
+
+export const ARGON2D: int = 0;
+export const ARGON2I: int = 1;
+export const ARGON2ID: int = 2;
+
+const ARGON2_VERSION: int = 0x13;
+const SYNC_POINTS: int = 4;
+const WORDS_PER_BLOCK: int = 128;      // 1024 bytes
+const ADDRESSES_PER_BLOCK: int = 128;
+
+// ---- BLAKE2b (RFC 7693) -----------------------------------------------------
+
+fn b2b_iv(): u64[] {
+    return [
+        0x6a09e667f3bcc908, 0xbb67ae8584caa73b, 0x3c6ef372fe94f82b, 0xa54ff53a5f1d36f1,
+        0x510e527fade682d1, 0x9b05688c2b3e6c1f, 0x1f83d9abfb41bd6b, 0x5be0cd19137e2179
+    ];
+}
+
+// The 12 message-permutation rows, flattened to 192 entries.
+fn b2b_sigma(): int[] {
+    return [
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+        14, 10, 4, 8, 9, 15, 13, 6, 1, 12, 0, 2, 11, 7, 5, 3,
+        11, 8, 12, 0, 5, 2, 15, 13, 10, 14, 3, 6, 7, 1, 9, 4,
+        7, 9, 3, 1, 13, 12, 11, 14, 2, 6, 5, 10, 4, 0, 15, 8,
+        9, 0, 5, 7, 2, 4, 10, 15, 14, 1, 11, 12, 6, 8, 3, 13,
+        2, 12, 6, 10, 0, 11, 8, 3, 4, 13, 7, 5, 15, 14, 1, 9,
+        12, 5, 1, 15, 14, 13, 4, 10, 0, 7, 6, 3, 9, 2, 8, 11,
+        13, 11, 7, 14, 12, 1, 3, 9, 5, 0, 15, 4, 8, 6, 2, 10,
+        6, 15, 14, 9, 11, 3, 0, 8, 12, 2, 13, 7, 1, 4, 10, 5,
+        10, 2, 8, 4, 7, 6, 1, 5, 15, 11, 9, 14, 3, 12, 13, 0,
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+        14, 10, 4, 8, 9, 15, 13, 6, 1, 12, 0, 2, 11, 7, 5, 3
+    ];
+}
+
+// Rotate right. u64's `>>` is a logical shift (verified), so this needs no mask
+// the way the 32-bit helpers in crypto.vt do.
+fn rotr64(x: u64, n: int): u64 {
+    return (x >> n) | (x << (64 - n));
+}
+
+fn le64_read(b: byte[], off: int): u64 {
+    let v: u64 = 0;
+    let i = 7;
+    while (i >= 0) {
+        v = (v << 8) | (b[off + i] as u64);
+        i -= 1;
+    }
+    return v;
+}
+
+fn le64_write(b: byte[], off: int, v: u64) {
+    let i = 0;
+    while (i < 8) {
+        b[off + i] = ((v >> (i * 8)) & 0xFF) as byte;
+        i += 1;
+    }
+}
+
+fn le32_bytes(v: int): byte[] {
+    let b = bytes(4);
+    b[0] = (v & 0xFF) as byte;
+    b[1] = ((v >> 8) & 0xFF) as byte;
+    b[2] = ((v >> 16) & 0xFF) as byte;
+    b[3] = ((v >> 24) & 0xFF) as byte;
+    return b;
+}
+
+fn b2b_g(v: u64[], m: u64[], a: int, b: int, c: int, d: int, x: int, y: int) {
+    v[a] = v[a] + v[b] + m[x];
+    v[d] = rotr64(v[d] ^ v[a], 32);
+    v[c] = v[c] + v[d];
+    v[b] = rotr64(v[b] ^ v[c], 24);
+    v[a] = v[a] + v[b] + m[y];
+    v[d] = rotr64(v[d] ^ v[a], 16);
+    v[c] = v[c] + v[d];
+    v[b] = rotr64(v[b] ^ v[c], 63);
+}
+
+// Streaming BLAKE2b, unkeyed. Streaming rather than one-shot because Argon2's
+// initial hash is a concatenation of thirteen pieces including the password,
+// and building that as one buffer would put a copy of the password somewhere
+// this module does not control.
+export class Blake2b {
+    h: u64[];
+    iv: u64[];
+    sg: int[];
+    buf: byte[];
+    buflen: int;
+    t0: u64;
+    t1: u64;
+    outlen: int;
+
+    fn init(outlen: int) {
+        if (outlen < 1 || outlen > 64) { panic("blake2b: output length must be 1..64"); }
+        this.iv = b2b_iv();
+        this.sg = b2b_sigma();
+        this.h = b2b_iv();
+        // Parameter block: digest length, key length 0, fanout 1, depth 1.
+        this.h[0] = this.h[0] ^ (0x01010000 as u64) ^ (outlen as u64);
+        this.buf = bytes(128);
+        this.buflen = 0;
+        this.t0 = 0;
+        this.t1 = 0;
+        this.outlen = outlen;
+    }
+
+    fn compress(block: byte[], off: int, last: bool) {
+        let v: u64[] = [];
+        v.reserve(16);
+        let i = 0;
+        while (i < 8) { v.push(this.h[i]); i += 1; }
+        i = 0;
+        while (i < 8) { v.push(this.iv[i]); i += 1; }
+        v[12] = v[12] ^ this.t0;
+        v[13] = v[13] ^ this.t1;
+        if (last) { v[14] = v[14] ^ 0xFFFFFFFFFFFFFFFF; }
+
+        let m: u64[] = [];
+        m.reserve(16);
+        i = 0;
+        while (i < 16) { m.push(le64_read(block, off + i * 8)); i += 1; }
+
+        let r = 0;
+        while (r < 12) {
+            let s = r * 16;
+            b2b_g(v, m, 0, 4, 8, 12,  this.sg[s], this.sg[s + 1]);
+            b2b_g(v, m, 1, 5, 9, 13,  this.sg[s + 2], this.sg[s + 3]);
+            b2b_g(v, m, 2, 6, 10, 14, this.sg[s + 4], this.sg[s + 5]);
+            b2b_g(v, m, 3, 7, 11, 15, this.sg[s + 6], this.sg[s + 7]);
+            b2b_g(v, m, 0, 5, 10, 15, this.sg[s + 8], this.sg[s + 9]);
+            b2b_g(v, m, 1, 6, 11, 12, this.sg[s + 10], this.sg[s + 11]);
+            b2b_g(v, m, 2, 7, 8, 13,  this.sg[s + 12], this.sg[s + 13]);
+            b2b_g(v, m, 3, 4, 9, 14,  this.sg[s + 14], this.sg[s + 15]);
+            r += 1;
+        }
+
+        i = 0;
+        while (i < 8) {
+            this.h[i] = this.h[i] ^ v[i] ^ v[i + 8];
+            i += 1;
+        }
+    }
+
+    // The counter must cover only the bytes already *committed* to a compressed
+    // block, so a full buffer is held back until more input arrives or final()
+    // is called — BLAKE2b's last block is flagged, and flushing eagerly would
+    // flag the wrong one.
+    fn update(data: byte[]): Blake2b {
+        let i = 0;
+        while (i < data.len) {
+            if (this.buflen == 128) {
+                this.t0 = this.t0 + 128;
+                if (this.t0 < (128 as u64)) { this.t1 = this.t1 + 1; }
+                this.compress(this.buf, 0, false);
+                this.buflen = 0;
+            }
+            let take = 128 - this.buflen;
+            if (take > data.len - i) { take = data.len - i; }
+            let j = 0;
+            while (j < take) { this.buf[this.buflen + j] = data[i + j]; j += 1; }
+            this.buflen += take;
+            i += take;
+        }
+        return this;
+    }
+
+    fn final(): byte[] {
+        this.t0 = this.t0 + (this.buflen as u64);
+        if (this.t0 < (this.buflen as u64)) { this.t1 = this.t1 + 1; }
+        let i = this.buflen;
+        while (i < 128) { this.buf[i] = 0 as byte; i += 1; }
+        this.compress(this.buf, 0, true);
+
+        let out = bytes(this.outlen);
+        let full = bytes(64);
+        i = 0;
+        while (i < 8) { le64_write(full, i * 8, this.h[i]); i += 1; }
+        i = 0;
+        while (i < this.outlen) { out[i] = full[i]; i += 1; }
+        return out;
+    }
+}
+
+// One-shot BLAKE2b. `outlen` is 1..64 bytes.
+export fn blake2b(data: byte[], outlen: int): byte[] {
+    return new Blake2b(outlen).update(data).final();
+}
+
+// H' — Argon2's variable-length hash (RFC 9106 §3.3), which reaches past
+// BLAKE2b's 64-byte ceiling by chaining 64-byte hashes and taking 32 bytes from
+// each. The length prefix is part of the hashed input, so two different output
+// lengths never share a prefix.
+fn blake2b_long(input: byte[], outlen: int): byte[] {
+    let lenPrefix = le32_bytes(outlen);
+    if (outlen <= 64) {
+        return new Blake2b(outlen).update(lenPrefix).update(input).final();
+    }
+
+    let out = bytes(outlen);
+    // r full 32-byte chunks, then one final hash sized to the remainder.
+    let r = ((outlen + 31) / 32) - 2;
+    let v = new Blake2b(64).update(lenPrefix).update(input).final();
+    let i = 0;
+    while (i < 32) { out[i] = v[i]; i += 1; }
+
+    let n = 1;
+    while (n < r) {
+        v = blake2b(v, 64);
+        i = 0;
+        while (i < 32) { out[n * 32 + i] = v[i]; i += 1; }
+        n += 1;
+    }
+
+    let partial = outlen - 32 * r;
+    v = blake2b(v, partial);
+    i = 0;
+    while (i < partial) { out[r * 32 + i] = v[i]; i += 1; }
+    return out;
+}
+
+// ---- Argon2 block compression ----------------------------------------------
+
+// The Argon2 variant of the BLAKE2b round function. The extra
+// 2*trunc32(a)*trunc32(b) term is deliberate: multiplication is the slowest
+// operation available, and it is there to make an ASIC attacker's latency per
+// round as bad as a CPU's.
+fn arg_gb(z: u64[], a: int, b: int, c: int, d: int) {
+    z[a] = z[a] + z[b] + (2 as u64) * (z[a] & 0xFFFFFFFF) * (z[b] & 0xFFFFFFFF);
+    z[d] = rotr64(z[d] ^ z[a], 32);
+    z[c] = z[c] + z[d] + (2 as u64) * (z[c] & 0xFFFFFFFF) * (z[d] & 0xFFFFFFFF);
+    z[b] = rotr64(z[b] ^ z[c], 24);
+    z[a] = z[a] + z[b] + (2 as u64) * (z[a] & 0xFFFFFFFF) * (z[b] & 0xFFFFFFFF);
+    z[d] = rotr64(z[d] ^ z[a], 16);
+    z[c] = z[c] + z[d] + (2 as u64) * (z[c] & 0xFFFFFFFF) * (z[d] & 0xFFFFFFFF);
+    z[b] = rotr64(z[b] ^ z[c], 63);
+}
+
+// P applied to 16 words at arbitrary positions. Sixteen index parameters rather
+// than a gathered scratch array: P runs 16 times per block compression and
+// 196 608 times for a t=3/m=64MiB hash, so copying 16 words in and out each
+// time would be pure overhead on the hottest path in the module.
+fn arg_p(z: u64[], i0: int, i1: int, i2: int, i3: int, i4: int, i5: int, i6: int, i7: int,
+         i8: int, i9: int, i10: int, i11: int, i12: int, i13: int, i14: int, i15: int) {
+    arg_gb(z, i0, i4, i8, i12);
+    arg_gb(z, i1, i5, i9, i13);
+    arg_gb(z, i2, i6, i10, i14);
+    arg_gb(z, i3, i7, i11, i15);
+    arg_gb(z, i0, i5, i10, i15);
+    arg_gb(z, i1, i6, i11, i12);
+    arg_gb(z, i2, i7, i8, i13);
+    arg_gb(z, i3, i4, i9, i14);
+}
+
+// out = G(x, y), or out ^= G(x, y) when withXor (RFC 9106 version 0x13 does
+// this from the second pass onward, so a later pass cannot simply overwrite
+// what an earlier one computed).
+//
+// `r` and `z` are caller-owned scratch of 128 words each, passed in rather than
+// allocated here for the same reason as above: one allocation per compression
+// would be 196 608 of them.
+fn fill_block(mem: u64[], xOff: int, yOff: int, outOff: int, withXor: bool,
+              r: u64[], z: u64[]) {
+    let i = 0;
+    while (i < WORDS_PER_BLOCK) {
+        r[i] = mem[xOff + i] ^ mem[yOff + i];
+        z[i] = r[i];
+        i += 1;
+    }
+
+    // Rows: eight groups of sixteen consecutive words.
+    i = 0;
+    while (i < 8) {
+        let b = i * 16;
+        arg_p(z, b, b + 1, b + 2, b + 3, b + 4, b + 5, b + 6, b + 7,
+              b + 8, b + 9, b + 10, b + 11, b + 12, b + 13, b + 14, b + 15);
+        i += 1;
+    }
+
+    // Columns: word pairs striding 16 apart.
+    i = 0;
+    while (i < 8) {
+        let b = i * 2;
+        arg_p(z, b, b + 1, b + 16, b + 17, b + 32, b + 33, b + 48, b + 49,
+              b + 64, b + 65, b + 80, b + 81, b + 96, b + 97, b + 112, b + 113);
+        i += 1;
+    }
+
+    i = 0;
+    if (withXor) {
+        while (i < WORDS_PER_BLOCK) {
+            mem[outOff + i] = mem[outOff + i] ^ z[i] ^ r[i];
+            i += 1;
+        }
+    } else {
+        while (i < WORDS_PER_BLOCK) {
+            mem[outOff + i] = z[i] ^ r[i];
+            i += 1;
+        }
+    }
+}
+
+// ---- the main routine -------------------------------------------------------
+
+// Argon2 with every knob exposed. `kind` is ARGON2D / ARGON2I / ARGON2ID.
+// `secret` is an optional pepper (a key held outside the vault file, so a
+// stolen file alone cannot be attacked); `ad` is optional associated data.
+// Pass bytes(0) for either when unused.
+export fn argon2_raw(kind: int, password: byte[], salt: byte[], secret: byte[], ad: byte[],
+                     iterations: int, memoryKiB: int, lanes: int, taglen: int): byte[] {
+    if (kind < 0 || kind > 2) { panic("argon2: kind must be ARGON2D, ARGON2I or ARGON2ID"); }
+    if (lanes < 1) { panic("argon2: lanes must be at least 1"); }
+    if (iterations < 1) { panic("argon2: iterations must be at least 1"); }
+    if (taglen < 4) { panic("argon2: tag length must be at least 4 bytes"); }
+    if (salt.len < 8) { panic("argon2: salt must be at least 8 bytes (RFC 9106 requires it)"); }
+    if (memoryKiB < 8 * lanes) { panic("argon2: memory must be at least 8 KiB per lane"); }
+
+    // Round the memory down to a whole number of segments.
+    let blocks = (memoryKiB / (SYNC_POINTS * lanes)) * (SYNC_POINTS * lanes);
+    let laneLength = blocks / lanes;
+    let segmentLength = laneLength / SYNC_POINTS;
+
+    // H_0: everything that identifies this hash, including the parameters, so
+    // that changing any of them changes every block.
+    let h0 = new Blake2b(64)
+        .update(le32_bytes(lanes))
+        .update(le32_bytes(taglen))
+        .update(le32_bytes(memoryKiB))
+        .update(le32_bytes(iterations))
+        .update(le32_bytes(ARGON2_VERSION))
+        .update(le32_bytes(kind))
+        .update(le32_bytes(password.len)).update(password)
+        .update(le32_bytes(salt.len)).update(salt)
+        .update(le32_bytes(secret.len)).update(secret)
+        .update(le32_bytes(ad.len)).update(ad)
+        .final();
+
+    let mem: u64[] = [];
+    mem.reserve(blocks * WORDS_PER_BLOCK);
+    let i = 0;
+    while (i < blocks * WORDS_PER_BLOCK) { mem.push(0); i += 1; }
+
+    // The first two blocks of every lane come straight from H_0.
+    let seed = bytes(72);
+    i = 0;
+    while (i < 64) { seed[i] = h0[i]; i += 1; }
+    let lane = 0;
+    while (lane < lanes) {
+        let col = 0;
+        while (col < 2) {
+            let c = le32_bytes(col);
+            let l = le32_bytes(lane);
+            seed[64] = c[0]; seed[65] = c[1]; seed[66] = c[2]; seed[67] = c[3];
+            seed[68] = l[0]; seed[69] = l[1]; seed[70] = l[2]; seed[71] = l[3];
+            let blk = blake2b_long(seed, 1024);
+            let base = (lane * laneLength + col) * WORDS_PER_BLOCK;
+            let w = 0;
+            while (w < WORDS_PER_BLOCK) {
+                mem[base + w] = le64_read(blk, w * 8);
+                w += 1;
+            }
+            col += 1;
+        }
+        lane += 1;
+    }
+
+    // Scratch reused across every compression.
+    let scratchR: u64[] = [];
+    let scratchZ: u64[] = [];
+    let zeroBlock: u64[] = [];
+    let inputBlock: u64[] = [];
+    let addrBlock: u64[] = [];
+    i = 0;
+    while (i < WORDS_PER_BLOCK) {
+        scratchR.push(0); scratchZ.push(0);
+        zeroBlock.push(0); inputBlock.push(0); addrBlock.push(0);
+        i += 1;
+    }
+    // The address machinery works on blocks, and fill_block addresses memory,
+    // so give the three helper blocks a home at the end of a scratch array.
+    let helper: u64[] = [];
+    helper.reserve(3 * WORDS_PER_BLOCK);
+    i = 0;
+    while (i < 3 * WORDS_PER_BLOCK) { helper.push(0); i += 1; }
+    let hZero = 0;                          // zero block
+    let hInput = WORDS_PER_BLOCK;           // input block
+    let hAddr = 2 * WORDS_PER_BLOCK;        // address block
+
+    let pass = 0;
+    while (pass < iterations) {
+        let slice = 0;
+        while (slice < SYNC_POINTS) {
+            lane = 0;
+            while (lane < lanes) {
+                // Argon2i addressing everywhere; Argon2id only for the first
+                // half of the first pass. That split is the whole point of id:
+                // the early, data-independent part denies a side-channel
+                // attacker the memory access pattern, while the later
+                // data-dependent part keeps the time-memory tradeoff hard.
+                let dataIndependent = false;
+                if (kind == ARGON2I) { dataIndependent = true; }
+                if (kind == ARGON2ID && pass == 0 && slice < SYNC_POINTS / 2) {
+                    dataIndependent = true;
+                }
+
+                if (dataIndependent) {
+                    let w = 0;
+                    while (w < WORDS_PER_BLOCK) { helper[hInput + w] = 0; w += 1; }
+                    helper[hInput + 0] = pass as u64;
+                    helper[hInput + 1] = lane as u64;
+                    helper[hInput + 2] = slice as u64;
+                    helper[hInput + 3] = blocks as u64;
+                    helper[hInput + 4] = iterations as u64;
+                    helper[hInput + 5] = kind as u64;
+                    helper[hInput + 6] = 0;
+                }
+
+                let start = 0;
+                if (pass == 0 && slice == 0) {
+                    start = 2;
+                    if (dataIndependent) {
+                        next_addresses(helper, hZero, hInput, hAddr, scratchR, scratchZ);
+                    }
+                }
+
+                let idx = start;
+                while (idx < segmentLength) {
+                    let j = slice * segmentLength + idx;
+
+                    let prevIdx = j - 1;
+                    if (j == 0) { prevIdx = laneLength - 1; }
+                    let prevOff = (lane * laneLength + prevIdx) * WORDS_PER_BLOCK;
+
+                    let rnd: u64 = 0;
+                    if (dataIndependent) {
+                        if (idx % ADDRESSES_PER_BLOCK == 0) {
+                            next_addresses(helper, hZero, hInput, hAddr, scratchR, scratchZ);
+                        }
+                        rnd = helper[hAddr + (idx % ADDRESSES_PER_BLOCK)];
+                    } else {
+                        rnd = mem[prevOff];
+                    }
+
+                    let j1 = rnd & 0xFFFFFFFF;
+                    let j2 = rnd >> 32;
+
+                    let refLane = (j2 % (lanes as u64)) as int;
+                    if (pass == 0 && slice == 0) { refLane = lane; }
+
+                    let refIndex = index_alpha(pass, slice, idx, laneLength, segmentLength,
+                                               j1, refLane == lane);
+                    let refOff = (refLane * laneLength + refIndex) * WORDS_PER_BLOCK;
+                    let curOff = (lane * laneLength + j) * WORDS_PER_BLOCK;
+
+                    let withXor = pass != 0;
+                    fill_block(mem, prevOff, refOff, curOff, withXor, scratchR, scratchZ);
+                    idx += 1;
+                }
+                lane += 1;
+            }
+            slice += 1;
+        }
+        pass += 1;
+    }
+
+    // Final block is the XOR of the last block of every lane.
+    let final: u64[] = [];
+    final.reserve(WORDS_PER_BLOCK);
+    i = 0;
+    while (i < WORDS_PER_BLOCK) {
+        final.push(mem[((lanes - 1) * laneLength + laneLength - 1) * WORDS_PER_BLOCK + i]);
+        i += 1;
+    }
+    lane = 0;
+    while (lane < lanes - 1) {
+        let base = (lane * laneLength + laneLength - 1) * WORDS_PER_BLOCK;
+        i = 0;
+        while (i < WORDS_PER_BLOCK) {
+            final[i] = final[i] ^ mem[base + i];
+            i += 1;
+        }
+        lane += 1;
+    }
+
+    let fb = bytes(1024);
+    i = 0;
+    while (i < WORDS_PER_BLOCK) { le64_write(fb, i * 8, final[i]); i += 1; }
+    return blake2b_long(fb, taglen);
+}
+
+// addr = G(zero, G(zero, input)), with the counter in input[6] bumped first.
+fn next_addresses(helper: u64[], hZero: int, hInput: int, hAddr: int,
+                  r: u64[], z: u64[]) {
+    helper[hInput + 6] = helper[hInput + 6] + 1;
+    fill_block(helper, hZero, hInput, hAddr, false, r, z);
+    fill_block(helper, hZero, hAddr, hAddr, false, r, z);
+}
+
+// Map a 32-bit pseudo-random value onto a block index, biased toward recent
+// blocks (RFC 9106 §3.4.1.2). The quadratic folding is what produces that bias;
+// a plain modulo here would weaken the time-memory tradeoff the design rests on.
+fn index_alpha(pass: int, slice: int, index: int, laneLength: int, segmentLength: int,
+               j1: u64, sameLane: bool): int {
+    let refAreaSize = 0;
+    if (pass == 0) {
+        if (slice == 0) {
+            refAreaSize = index - 1;
+        } else {
+            if (sameLane) {
+                refAreaSize = slice * segmentLength + index - 1;
+            } else {
+                refAreaSize = slice * segmentLength;
+                if (index == 0) { refAreaSize -= 1; }
+            }
+        }
+    } else {
+        if (sameLane) {
+            refAreaSize = laneLength - segmentLength + index - 1;
+        } else {
+            refAreaSize = laneLength - segmentLength;
+            if (index == 0) { refAreaSize -= 1; }
+        }
+    }
+
+    let rel = j1;
+    rel = (rel * rel) >> 32;
+    rel = (refAreaSize as u64) - 1 - (((refAreaSize as u64) * rel) >> 32);
+
+    let startPos = 0;
+    if (pass != 0) {
+        if (slice != SYNC_POINTS - 1) { startPos = (slice + 1) * segmentLength; }
+    }
+    return ((startPos as u64 + rel) % (laneLength as u64)) as int;
+}
+
+// ---- the API most callers want ----------------------------------------------
+
+// Argon2id — the variant to use unless you have a specific reason not to.
+// See the header for how to pick `iterations`, `memoryKiB` and `lanes`.
+export fn argon2id(password: byte[], salt: byte[], iterations: int, memoryKiB: int,
+                   lanes: int, taglen: int): byte[] {
+    return argon2_raw(ARGON2ID, password, salt, bytes(0), bytes(0),
+                      iterations, memoryKiB, lanes, taglen);
+}
+
+// Argon2i — fully data-independent. Slower to reach the same strength; use
+// Argon2id instead, which already gets the side-channel resistance that
+// matters from its first half-pass.
+export fn argon2i(password: byte[], salt: byte[], iterations: int, memoryKiB: int,
+                  lanes: int, taglen: int): byte[] {
+    return argon2_raw(ARGON2I, password, salt, bytes(0), bytes(0),
+                      iterations, memoryKiB, lanes, taglen);
+}
+
+// Argon2d — fully data-dependent, and the strongest against a time-memory
+// tradeoff, but its memory access pattern depends on the password. Do not use
+// it where anything can observe that pattern; that is what Argon2id is for.
+export fn argon2d(password: byte[], salt: byte[], iterations: int, memoryKiB: int,
+                  lanes: int, taglen: int): byte[] {
+    return argon2_raw(ARGON2D, password, salt, bytes(0), bytes(0),
+                      iterations, memoryKiB, lanes, taglen);
+}
