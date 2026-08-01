@@ -3,6 +3,8 @@
  *   - X11 everywhere else
  *   - headless (VS_HEADLESS=1): no window system at all; events replay from
  *     the $VS_EVENTS script. Shared by every platform, used by the tests.
+ *   - Android: NOT here. See vsurf_android.c, which implements the whole
+ *     header on its own; this file compiles to nothing under __ANDROID__.
  */
 #define _POSIX_C_SOURCE 200809L /* clock_gettime */
 
@@ -17,6 +19,20 @@
 #endif
 
 #include "vsurf.h"
+
+/* Android gets its own file. Guarding the whole body rather than adding a
+   third arm at the _WIN32 split below, because the split is not the only
+   platform-dependent part: the shared region above it defines the public
+   vs_key/vs_text/vs_x/vs_y/vs_wheel/vs_mods accessors, which would collide at
+   link time with the ones in vsurf_android.c. (The file-static globals behind
+   them would not collide — internal linkage — but the accessors are external.)
+
+   Placed after the vsurf.h include so the translation unit still contains
+   declarations on Android instead of being empty, which ISO C forbids.
+
+   vytoc compiles every .c in native/src on every target, so vsurf_android.c is
+   likewise wrapped in #ifdef __ANDROID__ and costs nothing here. */
+#ifndef __ANDROID__
 
 #include <stdint.h>
 #include <stdio.h>
@@ -2181,3 +2197,5 @@ unsigned long vs_native_window(void *vs) { return (unsigned long)((VSurf *)vs)->
 void *vs_native_gc(void *vs) { return ((VSurf *)vs)->gc; }
 
 #endif /* _WIN32 / X11 */
+
+#endif /* !__ANDROID__ — Android is vsurf_android.c */
