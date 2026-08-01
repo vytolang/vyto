@@ -109,11 +109,16 @@ fi
 for src in examples/[0-9]*.vt; do
     name=$(basename "$src" .vt)
     expected="examples/$name.expected"
-    got=$(./vytoc run "$src" 2>&1)
+    # Look for the golden BEFORE running. The 18 hardware examples (51-69) have
+    # none, because asserting on them needs a device: a USB port to plug into, a
+    # sensor, a camera. Several block waiting for one that is not there --
+    # 69_uevent watches the kernel for a full 10s, a third of the entire
+    # examples run. Checking first skips them without paying for them.
     if [ ! -f "$expected" ]; then
         echo "SKIP $name (no .expected)"
         continue
     fi
+    got=$(./vytoc run "$src" 2>&1)
     if [ "$got" = "$(cat "$expected")" ]; then
         echo "PASS $name"
     else
