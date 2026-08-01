@@ -1,0 +1,369 @@
+// vyto/mobile/android/painter — AndroidPainter: a Painter that renders vyto/ui
+// through the platform's own Skia (android.graphics.Canvas) instead of blend2d.
+// This is the Android tier. An app opts in with
+//
+//     let win = new Window("App", w, h);
+//     win.use_painter(new AndroidPainter(win.surface(), 15.0));
+//     win.run();
+//
+// STATUS: written on all three sides — this module, the encoder in
+// native/src/apainter_shim.c, and the decoder in java/…/CommandBuffer.java —
+// but never compiled for Android, because this clone has no NDK. The shim is
+// wrapped in #ifdef __ANDROID__, so importing this module on the host builds
+// and links; the vta_* calls simply are not there to run.
+// Design of record: local/docs/ANDROID.md.
+//
+// -- why this exists ---------------------------------------------------------
+//
+// GfxPainter needs blend2d, which on Android means a C++ cross-CMake build
+// against libc++_shared and a vendored font per script (blend2d has no font
+// fallback). Drawing through the platform Canvas drops both: Android's Paint
+// brings system fonts with automatic CJK/emoji fallback, and there is no
+// native graphics dependency to cross-build at all.
+//
+// -- the pipeline ------------------------------------------------------------
+//
+//     AndroidPainter  ->  command buffer  ->  one JNI call per frame
+//                             (native)     ->  replay(Canvas, buf)   [Kotlin]
+//                                          ->  Canvas(Bitmap)        software
+//                                          ->  postInvalidate(dirty)
+//                                          ->  VytoView.onDraw -> drawBitmap
+//
+// Every draw call below *encodes* into a native buffer; nothing crosses JNI
+// until present()/present_rect(). This is load-bearing, not an optimization:
+// per-call JNI with a NewStringUTF per drawText will not hold a frame budget.
+//
+// The Bitmap is a *persistent* backbuffer, which is required rather than
+// merely convenient — Window.repaint() (ui/core.vt:2111) clips to the dirty
+// rect and redraws only the widgets intersecting it, so everything outside
+// that rect must still be there from the previous frame. A swapchain with
+// undefined contents (SurfaceView) produces garbage, not degraded output.
+//
+// -- text --------------------------------------------------------------------
+//
+// text_width is a synchronous query on the hot layout path, called thousands
+// of times per layout, and cannot be batched into the per-frame buffer. Every
+// call would otherwise be a blocking round trip into Paint.measureText. So
+// strings are interned to integer handles once (vta_intern) and the shim keeps
+// a memo cache keyed on (handle, size, weight). The intern table is shared
+// with the command buffer, so a string that gets measured and then drawn
+// crosses the boundary once, not twice. Interning and measurement are one
+// mechanism by design — see ANDROID.md, "Prototypes to run first".
+
+import { Painter, WEIGHT_REG, WEIGHT_MED, WEIGHT_BOLD } from "vyto/ui";
+import { Surface, Rect, rgb } from "vyto/surface";
+
+// The android-* triple does not exist in vytoc yet (Track A adds it to
+// cross_cc_table in src/main.c). #link conditions are OS-prefix matches, so
+// these only bind once that triple lands.
+#link "log" if "android"
+#link "android" if "android"
+#link "jnigraphics" if "android"
+
+extern "C" {
+    // -- lifecycle -----------------------------------------------------------
+    // Takes the VSurf* (Surface.raw_handle()); the Android vsurf arm holds the
+    // VytoView global ref, so the painter does not need its own JNI plumbing
+    // to find the view. Allocates the backing Bitmap at w x h.
+    fn vta_painter_new(surf: rawptr, w: i32, h: i32, font_size: f64): rawptr;
+    fn vta_painter_free(p: rawptr);
+    fn vta_resize(p: rawptr, w: i32, h: i32);
+    fn vta_width(p: rawptr): i32;
+    fn vta_height(p: rawptr): i32;
+
+    // -- string interning ----------------------------------------------------
+    // Stable integer handle for a string, for both the draw path and the
+    // measure cache. Idempotent; the table lives as long as the painter.
+    fn vta_intern(p: rawptr, s: cstring): i32;
+
+    // -- draw ops (encode into the command buffer; nothing crosses JNI) ------
+    fn vta_fill_rect(p: rawptr, x: f64, y: f64, w: f64, h: f64, rgb: i32);
+    fn vta_fill_round_rect(p: rawptr, x: f64, y: f64, w: f64, h: f64, r: f64, rgb: i32);
+    fn vta_stroke_round_rect(p: rawptr, x: f64, y: f64, w: f64, h: f64,
+                             r: f64, width: f64, rgb: i32);
+    fn vta_fill_circle(p: rawptr, cx: f64, cy: f64, radius: f64, rgb: i32);
+    fn vta_stroke_circle(p: rawptr, cx: f64, cy: f64, radius: f64, width: f64, rgb: i32);
+    fn vta_stroke_line(p: rawptr, x0: f64, y0: f64, x1: f64, y1: f64, width: f64, rgb: i32);
+    fn vta_stroke_arc(p: rawptr, cx: f64, cy: f64, rx: f64, ry: f64,
+                      a0: f64, a1: f64, width: f64, rgb: i32);
+    fn vta_fill_polygon(p: rawptr, xs: rawptr, ys: rawptr, n: i32, rgb: i32);
+
+    // LinearGradient/RadialGradient take int[] colors + float[] positions
+    // directly, so gradient_n maps without resampling.
+    fn vta_gradient_v(p: rawptr, x: f64, y: f64, w: f64, h: f64, r: f64,
+                      top: i32, bottom: i32);
+    fn vta_gradient_n(p: rawptr, x: f64, y: f64, w: f64, h: f64, r: f64,
+                      colors: rawptr, positions: rawptr, n: i32);
+    fn vta_radial_gradient(p: rawptr, x: f64, y: f64, w: f64, h: f64, r: f64,
+                           cx: f64, cy: f64, radius: f64,
+                           colors: rawptr, positions: rawptr, n: i32);
+
+    // Paint.setShadowLayer
+    fn vta_shadow(p: rawptr, x: f64, y: f64, w: f64, h: f64,
+                  r: f64, blur: f64, dy: f64, rgb: i32);
+    fn vta_bevel(p: rawptr, x: f64, y: f64, w: f64, h: f64,
+                 radius: f64, width: f64, light: i32, dark: i32, raised: i32);
+
+    // Canvas.save + clipPath(roundRect) / restore. Android clips *rounded*,
+    // so unlike the lean tier the radius is honoured rather than squared off.
+    fn vta_clip_push(p: rawptr, x: f64, y: f64, w: f64, h: f64, r: f64);
+    fn vta_clip_pop(p: rawptr);
+
+    // Canvas save/restore/translate/scale/rotate, 1:1.
+    fn vta_save(p: rawptr);
+    fn vta_restore(p: rawptr);
+    fn vta_translate(p: rawptr, dx: f64, dy: f64);
+    fn vta_scale(p: rawptr, sx: f64, sy: f64);
+    fn vta_rotate(p: rawptr, deg: f64);
+
+    // -- text ----------------------------------------------------------------
+    fn vta_set_font(p: rawptr, size: f64, weight: i32);
+    fn vta_font_size(p: rawptr): f64;
+    fn vta_text(p: rawptr, x: f64, y: f64, str_id: i32, rgb: i32);
+    // synchronous + memo-cached on (str_id, size, weight)
+    fn vta_text_width(p: rawptr, str_id: i32): f64;
+    fn vta_font_ascent(p: rawptr): f64;
+    fn vta_font_height(p: rawptr): f64;
+
+    // -- images --------------------------------------------------------------
+    // BitmapFactory; the handle is an opaque index into a global-ref table.
+    fn vta_load_image(p: rawptr, path: cstring): rawptr;
+    fn vta_draw_image(p: rawptr, handle: rawptr, x: f64, y: f64, w: f64, h: f64);
+    fn vta_free_image(p: rawptr, handle: rawptr);
+
+    // -- present -------------------------------------------------------------
+    // Flush the command buffer across JNI, replay onto the Bitmap, then
+    // postInvalidate. present_rect posts only the dirty region.
+    fn vta_present(p: rawptr);
+    fn vta_present_rect(p: rawptr, x: i32, y: i32, w: i32, h: i32);
+}
+
+export class AndroidPainter extends Painter {
+    surf: Surface;
+    p: rawptr;            // native painter + command buffer + intern table
+    weight: int;          // current active weight (WEIGHT_REG/MED/BOLD)
+    base_font_size: float;
+    size_stack: float[];  // push_font/pop_font, saved (size, weight) pairs
+    weight_stack: int[];
+
+    fn init(surf: Surface, fontSize: float) {
+        this.surf = surf;
+        this.base_font_size = fontSize;
+        this.size_stack = [];
+        this.weight_stack = [];
+        this.weight = WEIGHT_REG;
+        this.p = vta_painter_new(surf.raw_handle(), surf.width() as i32,
+                                 surf.height() as i32, fontSize);
+    }
+
+    fn dispose() {
+        if (this.p != null) {
+            vta_painter_free(this.p);
+            this.p = null;
+        }
+    }
+
+    // Intern once per call site. Hot labels repeat every frame, so this is a
+    // hash lookup rather than a marshal after the first sighting.
+    fn sid(s: string): int { return vta_intern(this.p, s.cstr()); }
+
+    // The Bitmap is fixed-size, so a resize reallocates it. Without this a
+    // grown window paints into a stale-sized buffer and the new area stays
+    // garbage — same contract as GfxPainter.on_resize.
+    override fn on_resize(w: int, h: int) {
+        if (w == vta_width(this.p) && h == vta_height(this.p)) { return; }
+        vta_resize(this.p, w as i32, h as i32);
+    }
+
+    // -- base vocabulary ---------------------------------------------------
+    override fn fill(r: Rect, color: int) {
+        vta_fill_rect(this.p, r.x, r.y, r.w, r.h, color as i32);
+    }
+
+    // 1px outline, matching Surface.frame
+    override fn frame(r: Rect, color: int) {
+        let x = r.x;
+        let y = r.y;
+        let w = r.w;
+        let h = r.h;
+        let c = color as i32;
+        vta_fill_rect(this.p, x, y, w, 1.0, c);
+        vta_fill_rect(this.p, x, y + h - 1.0, w, 1.0, c);
+        vta_fill_rect(this.p, x, y, 1.0, h, c);
+        vta_fill_rect(this.p, x + w - 1.0, y, 1.0, h, c);
+    }
+
+    override fn line(x0: float, y0: float, x1: float, y1: float, color: int) {
+        vta_stroke_line(this.p, x0, y0, x1, y1, 1.0, color as i32);
+    }
+
+    // real anti-aliased stroke width (the base class fakes it with offsets)
+    override fn line_w(x0: float, y0: float, x1: float, y1: float,
+                       width: float, color: int) {
+        vta_stroke_line(this.p, x0, y0, x1, y1, width, color as i32);
+    }
+
+    override fn can_clip(): bool { return true; }
+
+    override fn clip_push(r: Rect, radius: float) {
+        vta_clip_push(this.p, r.x, r.y, r.w, r.h, radius);
+    }
+    override fn clip_pop() { vta_clip_pop(this.p); }
+
+    // -- widened vocabulary ------------------------------------------------
+    override fn fill_round(r: Rect, radius: float, color: int) {
+        vta_fill_round_rect(this.p, r.x, r.y, r.w, r.h, radius, color as i32);
+    }
+    override fn stroke_round(r: Rect, radius: float, width: float, color: int) {
+        vta_stroke_round_rect(this.p, r.x, r.y, r.w, r.h, radius, width, color as i32);
+    }
+    override fn circle(cx: float, cy: float, radius: float, color: int) {
+        vta_fill_circle(this.p, cx, cy, radius, color as i32);
+    }
+    override fn stroke_circle(cx: float, cy: float, radius: float,
+                              width: float, color: int) {
+        vta_stroke_circle(this.p, cx, cy, radius, width, color as i32);
+    }
+    override fn gradient_v(r: Rect, radius: float, top: int, bottom: int) {
+        vta_gradient_v(this.p, r.x, r.y, r.w, r.h, radius,
+                       top as i32, bottom as i32);
+    }
+    override fn gradient_n(r: Rect, radius: float, colors: i32[], positions: float[]) {
+        if (colors.len == 0) { return; }
+        vta_gradient_n(this.p, r.x, r.y, r.w, r.h, radius,
+                       colors as rawptr, positions as rawptr, colors.len as i32);
+    }
+    override fn radial_gradient(r: Rect, cx: float, cy: float, radius: float,
+                                colors: i32[], positions: float[]) {
+        if (colors.len == 0) { return; }
+        vta_radial_gradient(this.p, r.x, r.y, r.w, r.h, 0.0, cx, cy, radius,
+                            colors as rawptr, positions as rawptr, colors.len as i32);
+    }
+    override fn shadow(r: Rect, radius: float, blur: float, dy: float, color: int) {
+        vta_shadow(this.p, r.x, r.y, r.w, r.h, radius, blur, dy, color as i32);
+    }
+    override fn bevel(r: Rect, radius: float, width: float,
+                      light: int, dark: int, raised: bool) {
+        let up = 0;
+        if (raised) { up = 1; }
+        vta_bevel(this.p, r.x, r.y, r.w, r.h, radius, width,
+                  light as i32, dark as i32, up as i32);
+    }
+    override fn polygon(xs: float[], ys: float[], color: int) {
+        if (xs.len == 0) { return; }
+        vta_fill_polygon(this.p, xs as rawptr, ys as rawptr,
+                         xs.len as i32, color as i32);
+    }
+    override fn stroke_arc(cx: float, cy: float, rx: float, ry: float,
+                           a0: float, a1: float, width: float, color: int) {
+        vta_stroke_arc(this.p, cx, cy, rx, ry, a0, a1, width, color as i32);
+    }
+
+    // fill_path/stroke_path are deliberately NOT overridden. The base Painter
+    // flattens curves and calls polygon(), which is overridden above — so
+    // vector paths already render without a Vyto Path -> android.graphics.Path
+    // marshal. Add real Path marshalling only if flattening shows up in a
+    // profile.
+
+    // -- transforms ---------------------------------------------------------
+    override fn can_transform(): bool { return true; }
+    override fn save() { vta_save(this.p); }
+    override fn restore() { vta_restore(this.p); }
+    override fn translate(dx: float, dy: float) { vta_translate(this.p, dx, dy); }
+    override fn scale(sx: float, sy: float) { vta_scale(this.p, sx, sy); }
+    override fn rotate(deg: float) { vta_rotate(this.p, deg); }
+
+    // blur/backdrop are NOT overridden: RenderEffect is API 31+, and
+    // can_blur() defaults false so callers degrade to a plain fill. Revisit
+    // when the minSdk allows it.
+
+    // -- images -------------------------------------------------------------
+    override fn load_image(path: string): rawptr {
+        return vta_load_image(this.p, path.cstr());
+    }
+    override fn draw_image(handle: rawptr, r: Rect) {
+        // A failed decode still has to draw something — same graceful-degrade
+        // contract as GfxPainter, so a null handle is visible rather than a
+        // silently blank rect.
+        if (handle == null) {
+            this.fill(r, rgb(200, 200, 200));
+            return;
+        }
+        vta_draw_image(this.p, handle, r.x, r.y, r.w, r.h);
+    }
+    override fn free_image(handle: rawptr) { vta_free_image(this.p, handle); }
+
+    // load_image_url is not overridden here, matching GfxPainter's boundary:
+    // the base returns null and the widget draws its placeholder. On Android
+    // the network-image case is BitmapFactory over HttpURLConnection in the
+    // Kotlin half, so it never needs libcurl — but it stays opt-in so a plain
+    // AndroidPainter app doesn't carry it.
+
+    // -- typography ---------------------------------------------------------
+    override fn set_weight(w: int) {
+        this.weight = w;
+        vta_set_font(this.p, vta_font_size(this.p), w as i32);
+    }
+
+    override fn push_font(size: float, weight: int) {
+        this.size_stack.push(vta_font_size(this.p));
+        this.weight_stack.push(this.weight);
+        this.weight = weight;
+        vta_set_font(this.p, size, weight as i32);
+    }
+
+    override fn pop_font() {
+        // An unbalanced pop would silently leave text at the wrong size for
+        // the rest of the frame; leaving the font alone makes it visible as
+        // "the size never came back" instead. Same choice as GfxPainter.
+        if (this.size_stack.len == 0) { return; }
+        let size = this.size_stack.pop();
+        this.weight = this.weight_stack.pop();
+        vta_set_font(this.p, size, this.weight as i32);
+    }
+
+    override fn font_size(): float { return vta_font_size(this.p); }
+
+    override fn text(x: float, y: float, s: string, color: int) {
+        vta_text(this.p, x, y, this.sid(s) as i32, color as i32);
+    }
+
+    // vertically center in r with a left pad — same formula as Surface.text_in
+    // and GfxPainter.text_in. Baseline snapped to a whole pixel for stem
+    // crispness; x stays fractional.
+    override fn text_in(r: Rect, pad: float, s: string, color: int) {
+        let baseline = (r.y + (r.h + this.font_ascent()) / 2.0 - 1.0).round();
+        this.text(r.x + pad, baseline, s, color);
+    }
+
+    override fn text_width(s: string): float {
+        return vta_text_width(this.p, this.sid(s) as i32);
+    }
+    override fn font_ascent(): float { return vta_font_ascent(this.p); }
+    override fn font_height(): float { return vta_font_height(this.p); }
+    override fn width(): float { return vta_width(this.p) as float; }
+    override fn height(): float { return vta_height(this.p) as float; }
+
+    // -- present ------------------------------------------------------------
+    // The single JNI crossing per frame: flush the encoded ops, replay them
+    // onto the Bitmap, postInvalidate.
+    override fn present() { vta_present(this.p); }
+
+    // Dirty-region present. Unlike the SurfaceView path this is a real
+    // optimization rather than a correctness requirement, because the Bitmap
+    // persists — but it is the big per-frame win for hover/caret/animation
+    // repaints, so it stays.
+    override fn present_rect(r: Rect) {
+        let d = r.round_out();
+        let x = d.x as int;
+        let y = d.y as int;
+        let w = d.w as int;
+        let h = d.h as int;
+        if (x < 0) { w += x; x = 0; }
+        if (y < 0) { h += y; y = 0; }
+        if (x + w > vta_width(this.p)) { w = vta_width(this.p) - x; }
+        if (y + h > vta_height(this.p)) { h = vta_height(this.p) - y; }
+        if (w <= 0 || h <= 0) { return; }
+        vta_present_rect(this.p, x as i32, y as i32, w as i32, h as i32);
+    }
+}

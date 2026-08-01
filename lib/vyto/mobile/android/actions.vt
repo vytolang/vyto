@@ -1,0 +1,336 @@
+// vyto/mobile/android/actions — platform actions an Android app delegates to
+// the system rather than implementing: the camera, the document picker, the
+// share sheet, dialling, opening a URL. Plus the runtime-permission flow the
+// first two need.
+//
+//     let acts = new Actions();
+//     acts.pick_document("image/*", (r) => {
+//         if (r.ok) { let fd = acts.open_fd(r.uri); ... }
+//     });
+//     // ... and once per event-loop turn:
+//     acts.pump();
+//
+// STATUS: written on all three sides — this module, native/src/aintent_shim.c,
+// and java/…/Actions.java — but never compiled for Android, because this clone
+// has no NDK. Design of record: local/docs/ANDROID.md.
+//
+// Separate from ui.vt because these are not widgets — they are asynchronous
+// platform calls with a completely different shape, and an app that wants the
+// camera should not pull in the bottom sheet (or the reverse). Same boundary
+// logic that splits vyto/gfx into painter / painter_net / fonts.
+//
+// -- the async model, and why it is not a return value -----------------------
+//
+// Every one of these launches an Activity and gets its answer back later, on
+// the UI thread, via ActivityResultLauncher. Vyto's loop runs on its own
+// thread. So nothing here can return a result directly: a blocking
+// `fn pick_file(): string` would either deadlock the Vyto thread or need a
+// nested loop. Instead each request registers a callback against a request id,
+// the shim queues completed results, and pump() drains the queue and dispatches
+// on the Vyto thread.
+//
+// KNOWN GAP: pump() must be called once per event-loop turn, and Window.run()
+// (ui/core.vt:2413) has no hook to do it. The surface event enum is closed at
+// 11 (surface/native/src/vsurf.h:19-32) with no EV_ACTION_RESULT, so results
+// cannot currently arrive as events. Until one of those changes, an app drives
+// pump() itself from a ticker or its own loop. Adding the event type is the
+// cleaner fix and belongs with the Track B lifecycle work.
+//
+// -- the content:// trap -----------------------------------------------------
+//
+// SAF and the photo picker return `content://` URIs, NOT filesystem paths.
+// You cannot fopen one, so vyto/io will not read it and neither will anything
+// in the VFS. Always go through open_fd(), which asks ContentResolver for a
+// ParcelFileDescriptor and detaches a real POSIX fd that read(2) accepts.
+// This is the single most common way an Android file flow breaks.
+
+#link "log" if "android"
+#link "android" if "android"
+
+// Runtime permission names, as passed to ActivityCompat.requestPermissions.
+// Only the dangerous ones need requesting; everything else is manifest-only.
+// Note READ_EXTERNAL_STORAGE is deliberately absent — document/media picking
+// below uses SAF and the photo picker, which need no permission at all. That
+// is why they are the right default and direct file paths are not.
+export const PERM_CAMERA: string = "android.permission.CAMERA";
+export const PERM_RECORD_AUDIO: string = "android.permission.RECORD_AUDIO";
+export const PERM_FINE_LOCATION: string = "android.permission.ACCESS_FINE_LOCATION";
+export const PERM_COARSE_LOCATION: string = "android.permission.ACCESS_COARSE_LOCATION";
+export const PERM_POST_NOTIFICATIONS: string = "android.permission.POST_NOTIFICATIONS";
+export const PERM_READ_CONTACTS: string = "android.permission.READ_CONTACTS";
+
+extern "C" {
+    // -- launchers -----------------------------------------------------------
+    // Each takes a caller-allocated request id and returns 0 on launch, or a
+    // negative errno-ish code when no Activity can handle the intent (e.g. a
+    // device with no camera). A launch failure means the callback will never
+    // fire, so it is reported synchronously rather than as a queued result.
+
+    // ACTION_OPEN_DOCUMENT — the SAF picker. mime is e.g. "image/*", "*/*".
+    fn vta_pick_document(mime: cstring, multi: i32, req: i32): i32;
+    // ACTION_CREATE_DOCUMENT — "save as"; returns a writable content:// URI.
+    fn vta_create_document(mime: cstring, suggested_name: cstring, req: i32): i32;
+    // ACTION_OPEN_DOCUMENT_TREE — pick a directory, for bulk import/export.
+    fn vta_pick_directory(req: i32): i32;
+    // PhotoPicker (ACTION_PICK_IMAGES, API 33+) with an ACTION_PICK fallback.
+    // Preferred over pick_document for photos: no permission, better UI.
+    fn vta_pick_media(mime: cstring, multi: i32, req: i32): i32;
+    // ACTION_IMAGE_CAPTURE / ACTION_VIDEO_CAPTURE. Needs PERM_CAMERA first.
+    fn vta_capture_image(req: i32): i32;
+    fn vta_capture_video(req: i32): i32;
+
+    // Fire-and-forget: no result, so no request id and no callback.
+    fn vta_share_text(text: cstring, title: cstring): i32;
+    fn vta_share_uri(uri: cstring, mime: cstring, title: cstring): i32;
+    fn vta_view_url(url: cstring): i32;          // ACTION_VIEW, opens a browser
+    fn vta_dial(number: cstring): i32;           // ACTION_DIAL, does not call
+    fn vta_send_email(to: cstring, subject: cstring, body: cstring): i32;
+    fn vta_open_app_settings(): i32;             // for a permanently-denied perm
+
+    // -- permissions ---------------------------------------------------------
+    fn vta_permission_has(name: cstring): i32;   // 1 granted, 0 not
+    // 1 when the OS wants a rationale shown (denied once, not permanently).
+    fn vta_permission_should_explain(name: cstring): i32;
+    fn vta_permission_request(name: cstring, req: i32): i32;
+
+    // -- result queue --------------------------------------------------------
+    // Drained by Actions.pump(). poll returns the request id of the next
+    // completed result, or -1 when the queue is empty; the accessors below
+    // describe whatever poll last returned, and stay valid until the next poll.
+    fn vta_result_poll(): i32;
+    fn vta_result_ok(): i32;                     // 1 ok/granted, 0 cancelled/denied
+    fn vta_result_count(): i32;                  // >1 only for a multi-select
+    fn vta_result_uri(i: i32): cstring;          // "" when there is no URI
+
+    // -- content:// bridge ---------------------------------------------------
+    // ContentResolver.openFileDescriptor + detachFd. Returns a real POSIX fd
+    // the caller owns and must close, or -1. This is the only way to read what
+    // the pickers hand back.
+    fn vta_uri_open_fd(uri: cstring, mode: cstring): i32;
+    fn vta_uri_display_name(uri: cstring): cstring;
+    fn vta_uri_size(uri: cstring): i64;
+    // Persist read access across a reboot (SAF grants are per-session by
+    // default, so a "recent files" list breaks without this).
+    fn vta_uri_take_persistable(uri: cstring): i32;
+}
+
+// What a launcher gives back. `uris` is empty when cancelled, has one entry
+// for a normal pick, and several only when a multi-select was requested.
+export class ActionResult {
+    ok: bool;
+    uris: string[];
+
+    fn init(ok: bool, uris: string[]) {
+        this.ok = ok;
+        this.uris = uris;
+    }
+
+    // Convenience for the single-select case: the first URI, or "".
+    fn uri(): string {
+        if (this.uris.len == 0) { return ""; }
+        return this.uris[0];
+    }
+}
+
+// One in-flight request: its id and the callback waiting on it.
+class Pending {
+    id: int;
+    cb: fn(ActionResult);
+
+    fn init(id: int, cb: fn(ActionResult)) {
+        this.id = id;
+        this.cb = cb;
+    }
+}
+
+// Owns the pending-callback table. An app holds one and pumps it.
+//
+// Deliberately an object rather than module-level state: request ids must not
+// collide, and a global counter would make two independently-written libraries
+// stomp each other's callbacks.
+export class Actions {
+    pending: Pending[];
+    next_id: int;
+
+    fn init() {
+        this.pending = [];
+        this.next_id = 1;
+    }
+
+    // Register cb against a fresh id. Returns the id to hand the launcher.
+    fn arm(cb: fn(ActionResult)): int {
+        let id = this.next_id;
+        this.next_id += 1;
+        this.pending.push(new Pending(id, cb));
+        return id;
+    }
+
+    // A launcher that failed to start will never produce a result, so its
+    // callback has to come off the table or it leaks and the id is never reused.
+    fn disarm(id: int) {
+        for (let i in 0..this.pending.len) {
+            if (this.pending[i].id == id) {
+                // swap-with-last then drop; order does not matter here
+                this.pending[i] = this.pending[this.pending.len - 1];
+                this.pending.pop();
+                return;
+            }
+        }
+    }
+
+    fn launched(id: int, rc: int, cb: fn(ActionResult)): bool {
+        if (rc != 0) {
+            // No Activity handled it (no camera, no file manager). Report it
+            // as a cancelled result rather than silently doing nothing, so a
+            // caller has exactly one path to handle.
+            this.disarm(id);
+            cb(new ActionResult(false, []));
+            return false;
+        }
+        return true;
+    }
+
+    // -- pickers -------------------------------------------------------------
+    fn pick_document(mime: string, cb: fn(ActionResult)): bool {
+        let id = this.arm(cb);
+        return this.launched(id, vta_pick_document(mime.cstr(), 0, id as i32), cb);
+    }
+
+    fn pick_documents(mime: string, cb: fn(ActionResult)): bool {
+        let id = this.arm(cb);
+        return this.launched(id, vta_pick_document(mime.cstr(), 1, id as i32), cb);
+    }
+
+    fn create_document(mime: string, name: string, cb: fn(ActionResult)): bool {
+        let id = this.arm(cb);
+        return this.launched(id, vta_create_document(mime.cstr(), name.cstr(), id as i32), cb);
+    }
+
+    fn pick_directory(cb: fn(ActionResult)): bool {
+        let id = this.arm(cb);
+        return this.launched(id, vta_pick_directory(id as i32), cb);
+    }
+
+    // Prefer this over pick_document for photos and video: the system photo
+    // picker needs no permission and shows a media-shaped UI.
+    fn pick_media(mime: string, cb: fn(ActionResult)): bool {
+        let id = this.arm(cb);
+        return this.launched(id, vta_pick_media(mime.cstr(), 0, id as i32), cb);
+    }
+
+    fn pick_media_multi(mime: string, cb: fn(ActionResult)): bool {
+        let id = this.arm(cb);
+        return this.launched(id, vta_pick_media(mime.cstr(), 1, id as i32), cb);
+    }
+
+    // -- camera --------------------------------------------------------------
+    // Both need PERM_CAMERA already granted. They do not request it — the
+    // permission flow is a separate user-visible step and silently bundling it
+    // makes a denial look like a broken camera. Call request_permission first.
+    fn capture_image(cb: fn(ActionResult)): bool {
+        let id = this.arm(cb);
+        return this.launched(id, vta_capture_image(id as i32), cb);
+    }
+
+    fn capture_video(cb: fn(ActionResult)): bool {
+        let id = this.arm(cb);
+        return this.launched(id, vta_capture_video(id as i32), cb);
+    }
+
+    // -- permissions ---------------------------------------------------------
+    fn has_permission(name: string): bool {
+        return vta_permission_has(name.cstr()) == 1;
+    }
+
+    // True when the user denied once and Android wants a rationale before the
+    // second ask. A permanently-denied permission returns false here *and*
+    // false from has_permission — that pair is the signal to send the user to
+    // open_app_settings() instead of asking again, since the dialog will no
+    // longer appear.
+    fn should_explain(name: string): bool {
+        return vta_permission_should_explain(name.cstr()) == 1;
+    }
+
+    // Result callback gets ok = granted. Already-granted short-circuits so a
+    // caller does not have to special-case it.
+    fn request_permission(name: string, cb: fn(ActionResult)): bool {
+        if (this.has_permission(name)) {
+            cb(new ActionResult(true, []));
+            return true;
+        }
+        let id = this.arm(cb);
+        return this.launched(id, vta_permission_request(name.cstr(), id as i32), cb);
+    }
+
+    // -- fire and forget -----------------------------------------------------
+    fn share_text(text: string, title: string): bool {
+        return vta_share_text(text.cstr(), title.cstr()) == 0;
+    }
+    fn share_uri(uri: string, mime: string, title: string): bool {
+        return vta_share_uri(uri.cstr(), mime.cstr(), title.cstr()) == 0;
+    }
+    fn view_url(url: string): bool { return vta_view_url(url.cstr()) == 0; }
+    fn dial(number: string): bool { return vta_dial(number.cstr()) == 0; }
+    fn send_email(to: string, subject: string, body: string): bool {
+        return vta_send_email(to.cstr(), subject.cstr(), body.cstr()) == 0;
+    }
+    fn open_app_settings(): bool { return vta_open_app_settings() == 0; }
+
+    // -- content:// bridge ---------------------------------------------------
+    // A real POSIX fd, or -1. The caller owns it and must close it. mode is
+    // "r" or "w". Everything the pickers return needs this — a content:// URI
+    // is not a path and fopen will not touch it.
+    fn open_fd(uri: string, mode: string): int {
+        return vta_uri_open_fd(uri.cstr(), mode.cstr());
+    }
+    fn display_name(uri: string): string {
+        return str(vta_uri_display_name(uri.cstr()));
+    }
+    fn size_of(uri: string): int { return vta_uri_size(uri.cstr()) as int; }
+    // Survives a reboot; needed for anything remembering a file across runs.
+    fn take_persistable(uri: string): bool {
+        return vta_uri_take_persistable(uri.cstr()) == 1;
+    }
+
+    // -- the pump ------------------------------------------------------------
+    // Drain completed results and dispatch on the Vyto thread. Call once per
+    // event-loop turn. Returns how many fired, so a caller can repaint when
+    // it is > 0 — a callback that mutates widget state has no other way to
+    // signal that the frame is now stale.
+    //
+    // See the KNOWN GAP at the top: Window.run() does not call this yet.
+    fn pump(): int {
+        let fired = 0;
+        while (true) {
+            let id = vta_result_poll();
+            if (id < 0) { break; }
+            let ok = vta_result_ok() == 1;
+            let uris: string[] = [];
+            let n = vta_result_count();
+            for (let i in 0..n) {
+                let u = str(vta_result_uri(i as i32));
+                if (u != "") { uris.push(u); }
+            }
+            // Find and remove the pending entry before invoking, so a callback
+            // that arms a new request cannot see its own stale entry.
+            for (let i in 0..this.pending.len) {
+                if (this.pending[i].id == id) {
+                    let cb = this.pending[i].cb;
+                    this.pending[i] = this.pending[this.pending.len - 1];
+                    this.pending.pop();
+                    cb(new ActionResult(ok, uris));
+                    fired += 1;
+                    break;
+                }
+            }
+        }
+        return fired;
+    }
+
+    // Drop every pending callback without firing it. For teardown — a callback
+    // holding a widget reference would otherwise keep the tree alive past the
+    // Window's own dispose.
+    fn drop_handlers() {
+        this.pending = [];
+    }
+}

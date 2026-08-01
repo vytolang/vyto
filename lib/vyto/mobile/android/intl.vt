@@ -1,0 +1,417 @@
+// vyto/mobile/android/intl — internationalization for Android, through the
+// platform's own ICU instead of a linked one. The Android tier of vyto/intl,
+// and a drop-in for it:
+//
+//     import { locale, defaultLocale, formatNumber, formatCurrency,
+//              normalize, graphemes, Collator } from "vyto/mobile/android/intl";
+//
+//     let de = locale("de-DE");
+//     formatNumber(1234567.5, de)          // "1.234.567,5"
+//
+// vyto/intl splits across five files (intl, number, datefmt, unicode,
+// message); this is one module, because the Android tier is one shim and one
+// Java class and splitting it would only mirror a layout that exists over
+// there for linkage reasons.
+//
+// STATUS: written, never compiled — no NDK toolchain in this clone. The C shim
+// (native/src/aintl_shim.c) is wrapped in #ifdef __ANDROID__, so this module
+// *compiles* on the host but a host program that calls it will not link. Same
+// contract as painter.vt. Design of record: local/docs/ANDROID.md.
+//
+// -- why not the system libicuuc ---------------------------------------------
+//
+// Android ships ICU and every device has libicuuc.so — and linking it is
+// explicitly unsupported. Its symbols are version-suffixed private ones
+// (`u_strFoldCase_66`), the NDK does not expose the headers, and the suffix
+// changes with the platform release, so a binary that resolves them today gets
+// an UnsatisfiedLinkError on the next Android version. Apps have been broken
+// this way at scale before; the NDK blocklist exists because of it.
+//
+// The supported door to the same library is android.icu.* (ICU4J, API 24+),
+// which is what this module goes through. Cross-building a private ICU is the
+// other option and costs ~8MB of data for a second copy of tables the device
+// already has.
+//
+// -- what differs from vyto/intl ---------------------------------------------
+//
+// defaultLocale() reads java.util.Locale.getDefault(), not $LC_ALL/$LANG.
+// Android has no meaningful POSIX locale environment — the user's language is
+// a system setting, and it is per-app-overridable from Android 13. Reading the
+// environment there would report "en_US" on a device set to German.
+
+// ---- shared enums ---------------------------------------------------------
+// Same names and same int values as vyto/intl, so a `NFC` or `DT_SHORT` written
+// against the desktop module keeps meaning what it meant.
+
+export const NFC:  int = 0;
+export const NFD:  int = 1;
+export const NFKC: int = 2;
+export const NFKD: int = 3;
+
+export const NUM_DECIMAL:    int = 0;
+export const NUM_CURRENCY:   int = 1;
+export const NUM_PERCENT:    int = 2;
+export const NUM_SCIENTIFIC: int = 3;
+
+export const DT_FULL:   int = 0;
+export const DT_LONG:   int = 1;
+export const DT_MEDIUM: int = 2;
+export const DT_SHORT:  int = 3;
+export const DT_NONE:   int = 4;
+
+export const PLURAL_CARDINAL: int = 0;
+export const PLURAL_ORDINAL:  int = 1;
+
+// Break-iterator kinds, matching vyto/intl/unicode's internal numbering.
+const BRK_GRAPHEME: int = 0;
+const BRK_WORD:     int = 1;
+const BRK_LINE:     int = 2;
+
+// Case operations.
+const CASE_UPPER: int = 0;
+const CASE_LOWER: int = 1;
+const CASE_FOLD:  int = 2;
+
+// First guess for a formatted result. Long enough that a formatted number, a
+// date or a normalized word never needs the second call; the retry path is
+// still there because a case-mapped or normalized *document* can exceed it.
+const BUF0: int = 128;
+
+extern "C" {
+    fn vta_intl_default_locale(out: cstring, cap: i32): i32;
+
+    fn vta_intl_num_open(locale: cstring, style: i32): rawptr;
+    fn vta_intl_num_close(h: rawptr);
+    fn vta_intl_num_fmt_double(h: rawptr, v: f64, out: cstring, cap: i32): i32;
+    fn vta_intl_num_fmt_int(h: rawptr, v: i64, out: cstring, cap: i32): i32;
+    fn vta_intl_num_fmt_currency(h: rawptr, v: f64, iso3: cstring, out: cstring, cap: i32): i32;
+    fn vta_intl_num_set_fraction(h: rawptr, minFrac: i32, maxFrac: i32);
+
+    fn vta_intl_dat_open(locale: cstring, dateStyle: i32, timeStyle: i32, tz: cstring): rawptr;
+    fn vta_intl_dat_close(h: rawptr);
+    fn vta_intl_dat_fmt(h: rawptr, unix_ms: i64, out: cstring, cap: i32): i32;
+
+    fn vta_intl_normalize(s: cstring, mode: i32, out: cstring, cap: i32): i32;
+    fn vta_intl_case(s: cstring, locale: cstring, op: i32, out: cstring, cap: i32): i32;
+
+    fn vta_intl_brk_open(kind: i32, locale: cstring, s: cstring): rawptr;
+    fn vta_intl_brk_next(h: rawptr): i32;
+    fn vta_intl_brk_close(h: rawptr);
+
+    fn vta_intl_col_open(locale: cstring): rawptr;
+    fn vta_intl_col_compare(h: rawptr, a: cstring, b: cstring): i32;
+    fn vta_intl_col_sortkey(h: rawptr, s: cstring, out: cstring, cap: i32): i32;
+    fn vta_intl_col_close(h: rawptr);
+
+    fn vta_intl_plural_open(locale: cstring, kind: i32): rawptr;
+    fn vta_intl_plural_select(h: rawptr, v: f64, out: cstring, cap: i32): i32;
+    fn vta_intl_plural_close(h: rawptr);
+}
+
+// ---- Locale ---------------------------------------------------------------
+
+// A resolved locale. `id` is an ICU locale id ("de_DE", "fr", "ja_JP"); build
+// one with `locale(...)` rather than by hand so the id is normalized.
+export class Locale {
+    id: string;
+    fn init(id: string) { this.id = id; }
+}
+
+// Normalize a user-supplied tag ("de-DE", "de_DE", "de_DE.UTF-8") to an ICU id
+// ("de_DE"): drop a ".<charset>" suffix and map '-' to '_'.
+fn normalize_id(s: string): string {
+    let out = "";
+    let i = 0;
+    while (i < s.len) {
+        let c = s[i];
+        if (c == 46) { break; }                // '.' begins the charset
+        if (c == 45) { out = out + "_"; }      // '-' -> '_'
+        else { out = out + s.slice(i, i + 1); }
+        i += 1;
+    }
+    return out;
+}
+
+export fn locale(tag: string): Locale { return new Locale(normalize_id(tag)); }
+
+// The device locale, from java.util.Locale.getDefault(). Falls back to "en_US"
+// if the JVM is not up yet, which on the Vyto thread it always is.
+export fn defaultLocale(): Locale {
+    let buf = bytes(BUF0);
+    let n = vta_intl_default_locale(buf as cstring, BUF0 as i32) as int;
+    if (n <= 0) { return new Locale("en_US"); }
+    return new Locale(normalize_id(str(buf as cstring)));
+}
+
+// ---- shared buffer plumbing -----------------------------------------------
+//
+// Every formatter writes UTF-8 into a caller buffer and returns the length it
+// wanted. A first call at BUF0 covers the common case in one JNI hop; a result
+// that did not fit reports its true size and the call is repeated once at that
+// size. Two hops is the worst case, never a loop.
+
+// The shim reports `cap` back when it truncates, so `n >= cap` is the retry
+// signal rather than a distinct error code.
+fn fits(n: int, cap: int): bool { return n >= 0 && n < cap; }
+
+// ---- numbers --------------------------------------------------------------
+
+export class NumberFormat {
+    handle: rawptr;
+
+    fn init(loc: Locale, style: int) {
+        this.handle = vta_intl_num_open(loc.id.cstr(), style as i32);
+        if (this.handle == null) {
+            panic("vyto/mobile/android/intl: number formatter open failed for '" + loc.id + "'");
+        }
+    }
+    deinit { if (this.handle != null) { vta_intl_num_close(this.handle); this.handle = null; } }
+
+    // Clamp the fraction digits shown (min/max). Pass -1 to leave a side at its
+    // locale default. Applies to subsequent format() calls.
+    fn setFractionDigits(minFrac: int, maxFrac: int) {
+        vta_intl_num_set_fraction(this.handle, minFrac as i32, maxFrac as i32);
+    }
+
+    fn format(v: float): string {
+        let cap = BUF0;
+        let buf = bytes(cap);
+        let n = vta_intl_num_fmt_double(this.handle, v, buf as cstring, cap as i32) as int;
+        if (n < 0) { panic("vyto/mobile/android/intl: number format failed"); }
+        if (!fits(n, cap)) {
+            cap = n + 1; buf = bytes(cap);
+            vta_intl_num_fmt_double(this.handle, v, buf as cstring, cap as i32);
+        }
+        return str(buf as cstring);
+    }
+
+    fn formatInt(v: int): string {
+        let cap = BUF0;
+        let buf = bytes(cap);
+        let n = vta_intl_num_fmt_int(this.handle, v as i64, buf as cstring, cap as i32) as int;
+        if (n < 0) { panic("vyto/mobile/android/intl: integer format failed"); }
+        if (!fits(n, cap)) {
+            cap = n + 1; buf = bytes(cap);
+            vta_intl_num_fmt_int(this.handle, v as i64, buf as cstring, cap as i32);
+        }
+        return str(buf as cstring);
+    }
+
+    // Format `v` as money in `iso3` (ISO 4217, e.g. "EUR"). The formatter must
+    // have been opened with NUM_CURRENCY.
+    fn formatCurrency(v: float, iso3: string): string {
+        let cap = BUF0;
+        let buf = bytes(cap);
+        let n = vta_intl_num_fmt_currency(this.handle, v, iso3.cstr(),
+                                          buf as cstring, cap as i32) as int;
+        if (n < 0) { panic("vyto/mobile/android/intl: currency format failed"); }
+        if (!fits(n, cap)) {
+            cap = n + 1; buf = bytes(cap);
+            vta_intl_num_fmt_currency(this.handle, v, iso3.cstr(), buf as cstring, cap as i32);
+        }
+        return str(buf as cstring);
+    }
+}
+
+export fn formatNumber(v: float, loc: Locale): string {
+    return new NumberFormat(loc, NUM_DECIMAL).format(v);
+}
+export fn formatInt(v: int, loc: Locale): string {
+    return new NumberFormat(loc, NUM_DECIMAL).formatInt(v);
+}
+export fn formatPercent(v: float, loc: Locale): string {
+    return new NumberFormat(loc, NUM_PERCENT).format(v);
+}
+export fn formatCurrency(v: float, iso3: string, loc: Locale): string {
+    return new NumberFormat(loc, NUM_CURRENCY).formatCurrency(v, iso3);
+}
+
+// ---- dates ----------------------------------------------------------------
+
+export class DateFormat {
+    handle: rawptr;
+
+    // `tz` is an IANA zone ("Europe/Berlin"); "" means the device zone.
+    fn init(loc: Locale, dateStyle: int, timeStyle: int, tz: string) {
+        this.handle = vta_intl_dat_open(loc.id.cstr(), dateStyle as i32,
+                                        timeStyle as i32, tz.cstr());
+        if (this.handle == null) {
+            panic("vyto/mobile/android/intl: date formatter open failed for '" + loc.id + "'");
+        }
+    }
+    deinit { if (this.handle != null) { vta_intl_dat_close(this.handle); this.handle = null; } }
+
+    fn formatMillis(ms: i64): string {
+        let cap = BUF0;
+        let buf = bytes(cap);
+        let n = vta_intl_dat_fmt(this.handle, ms, buf as cstring, cap as i32) as int;
+        if (n < 0) { panic("vyto/mobile/android/intl: date format failed"); }
+        if (!fits(n, cap)) {
+            cap = n + 1; buf = bytes(cap);
+            vta_intl_dat_fmt(this.handle, ms, buf as cstring, cap as i32);
+        }
+        return str(buf as cstring);
+    }
+
+    fn formatUnix(secs: i64): string { return this.formatMillis(secs * 1000); }
+}
+
+// Format a unix timestamp in the device time zone.
+export fn formatDateUnix(secs: i64, loc: Locale, dateStyle: int, timeStyle: int): string {
+    return new DateFormat(loc, dateStyle, timeStyle, "").formatUnix(secs);
+}
+
+// ---- normalization and case ------------------------------------------------
+
+fn run_norm(s: string, form: int): string {
+    let cap = s.len + BUF0;
+    let buf = bytes(cap);
+    let n = vta_intl_normalize(s.cstr(), form as i32, buf as cstring, cap as i32) as int;
+    if (n < 0) { panic("vyto/mobile/android/intl: normalize failed"); }
+    if (!fits(n, cap)) {
+        cap = n + 1; buf = bytes(cap);
+        vta_intl_normalize(s.cstr(), form as i32, buf as cstring, cap as i32);
+    }
+    return str(buf as cstring);
+}
+
+fn run_case(s: string, loc_id: string, op: int): string {
+    // Case mapping can grow a string (ß -> SS), so the first guess allows for
+    // it rather than relying on the retry.
+    let cap = s.len * 2 + BUF0;
+    let buf = bytes(cap);
+    let n = vta_intl_case(s.cstr(), loc_id.cstr(), op as i32, buf as cstring, cap as i32) as int;
+    if (n < 0) { panic("vyto/mobile/android/intl: case mapping failed"); }
+    if (!fits(n, cap)) {
+        cap = n + 1; buf = bytes(cap);
+        vta_intl_case(s.cstr(), loc_id.cstr(), op as i32, buf as cstring, cap as i32);
+    }
+    return str(buf as cstring);
+}
+
+export fn normalize(s: string, form: int): string { return run_norm(s, form); }
+
+// Locale-sensitive case mapping — Turkish dotted/dotless i is the reason this
+// takes a Locale rather than being a plain string operation.
+export fn toUpper(s: string, loc: Locale): string { return run_case(s, loc.id, CASE_UPPER); }
+export fn toLower(s: string, loc: Locale): string { return run_case(s, loc.id, CASE_LOWER); }
+
+// Case folding is for comparison, not display, and is deliberately
+// locale-independent.
+export fn foldCase(s: string): string { return run_case(s, "", CASE_FOLD); }
+
+// ---- segmentation ----------------------------------------------------------
+
+// Walk a break iterator, slicing `s` at every boundary it reports.
+fn segments(s: string, kind: int, loc_id: string): string[] {
+    let out: string[] = [];
+    if (s.len == 0) { return out; }
+    let h = vta_intl_brk_open(kind as i32, loc_id.cstr(), s.cstr());
+    if (h == null) { return out; }
+    let prev = 0;
+    let i = vta_intl_brk_next(h) as int;
+    while (i > 0) {
+        if (i > prev && i <= s.len) { out.push(s.slice(prev, i)); }
+        prev = i;
+        i = vta_intl_brk_next(h) as int;
+    }
+    vta_intl_brk_close(h);
+    return out;
+}
+
+// User-perceived characters: "é" is one grapheme whether or not it is composed,
+// and a flag emoji is one rather than two code points.
+export fn graphemes(s: string): string[] { return segments(s, BRK_GRAPHEME, ""); }
+export fn charCount(s: string): int { return graphemes(s).len; }
+
+export fn words(s: string): string[] { return segments(s, BRK_WORD, ""); }
+export fn wordsIn(s: string, loc: Locale): string[] { return segments(s, BRK_WORD, loc.id); }
+
+// Byte offsets at which a line may be broken. Thai and Japanese have no spaces,
+// so this is the only correct way to wrap them.
+export fn lineBreaks(s: string): int[] {
+    let out: int[] = [];
+    if (s.len == 0) { return out; }
+    let h = vta_intl_brk_open(BRK_LINE as i32, "".cstr(), s.cstr());
+    if (h == null) { return out; }
+    let i = vta_intl_brk_next(h) as int;
+    while (i > 0) {
+        out.push(i);
+        i = vta_intl_brk_next(h) as int;
+    }
+    vta_intl_brk_close(h);
+    return out;
+}
+
+// ---- collation -------------------------------------------------------------
+
+// Locale-correct string ordering. Not the same as comparing bytes: "ä" sorts
+// with "a" in German and after "z" in Swedish, and no byte comparison gets
+// both right.
+export class Collator {
+    handle: rawptr;
+
+    fn init(loc: Locale) {
+        this.handle = vta_intl_col_open(loc.id.cstr());
+        if (this.handle == null) {
+            panic("vyto/mobile/android/intl: collator open failed for '" + loc.id + "'");
+        }
+    }
+    deinit { if (this.handle != null) { vta_intl_col_close(this.handle); this.handle = null; } }
+
+    // -1, 0 or 1, like every other comparator in the stdlib.
+    fn compare(a: string, b: string): int {
+        return vta_intl_col_compare(this.handle, a.cstr(), b.cstr()) as int;
+    }
+
+    // A binary key that sorts bytewise into collation order. Sorting a large
+    // list by key is O(n) collator calls; sorting by compare() is O(n log n) of
+    // them, and each one crosses JNI.
+    fn sortKey(s: string): byte[] {
+        let cap = s.len * 4 + BUF0;
+        let buf = bytes(cap);
+        let n = vta_intl_col_sortkey(this.handle, s.cstr(), buf as cstring, cap as i32) as int;
+        if (n < 0) { return bytes(0); }
+        if (!fits(n, cap)) {
+            cap = n + 1; buf = bytes(cap);
+            n = vta_intl_col_sortkey(this.handle, s.cstr(), buf as cstring, cap as i32) as int;
+            if (n < 0) { return bytes(0); }
+        }
+        // A sort key is binary and may contain no NUL, but it is not a C
+        // string — trim to the reported length rather than scanning for one.
+        let out = bytes(n);
+        for (let i in 0..n) { out[i] = buf[i]; }
+        return out;
+    }
+}
+
+export fn collator(loc: Locale): Collator { return new Collator(loc); }
+
+// ---- plurals ---------------------------------------------------------------
+
+// CLDR plural categories: "zero", "one", "two", "few", "many", "other". Which
+// exist and which a number falls into is per-language — English has one/other,
+// Arabic has all six — which is why a message catalog cannot hardcode them.
+export class PluralRules {
+    handle: rawptr;
+
+    fn init(loc: Locale, kind: int) {
+        this.handle = vta_intl_plural_open(loc.id.cstr(), kind as i32);
+        if (this.handle == null) {
+            panic("vyto/mobile/android/intl: plural rules open failed for '" + loc.id + "'");
+        }
+    }
+    deinit { if (this.handle != null) { vta_intl_plural_close(this.handle); this.handle = null; } }
+
+    fn select(v: float): string {
+        let cap = 32;
+        let buf = bytes(cap);
+        let n = vta_intl_plural_select(this.handle, v, buf as cstring, cap as i32) as int;
+        if (n < 0) { return "other"; }
+        return str(buf as cstring);
+    }
+}
+
+export fn pluralCategory(v: float, loc: Locale): string {
+    return new PluralRules(loc, PLURAL_CARDINAL).select(v);
+}

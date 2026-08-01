@@ -1,0 +1,1263 @@
+// vyto/mobile/android/ui — Android-shaped widgets that vyto/ui does not carry,
+// because they are mobile navigation patterns with no desktop equivalent:
+// the bottom nav bar, the bottom sheet, the navigation drawer, the FAB.
+//
+//     import { FloatingActionButton, BottomNavigationBar } from "vyto/mobile/android/ui";
+//
+// STATUS: complete and mouse-testable on X11 today, except for the one
+// gesture noted on PullToRefresh. The overlay widgets (BottomSheet,
+// NavigationDrawer) were unblocked by Track C item 1 — Window.on_mouse_ev now
+// captures the press for overlay content, so an overlay receives drag,
+// long-press, double-click and release like any other widget.
+// Design of record: local/docs/ANDROID.md.
+//
+// These live outside vyto/ui deliberately. vyto/ui is platform-neutral and
+// must stay so — an X11 app should not pull in a bottom sheet, and vyto/ui
+// carries desktop widgets (MenuBar, Breadcrumb, StatusBar) that are dead
+// weight here. Same boundary role vyto/gfx/painter plays for blend2d.
+//
+// Widgets only. System actions — camera, document picker, share sheet, and the
+// runtime-permission flow — are asynchronous platform calls with a different
+// shape entirely, and live in vyto/mobile/android/actions.
+//
+// Widgets here are drawn, not delegated to android.widget.*. Native *look*
+// comes from vyto/ui/skins/material.vt; native *widgets* are the thing
+// PORTABILITY.md says never to bind, and Compose Multiplatform agrees —
+// Material3 there is drawn with Compose primitives, not platform views.
+
+import { Widget, Painter, Theme, Size, Window,
+         EASE_OUT_CUBIC, WEIGHT_REG, WEIGHT_MED, WEIGHT_BOLD } from "vyto/ui";
+import { Rect, contains, rgb, with_alpha, mix,
+         KEY_LEFT, KEY_RIGHT, KEY_UP, KEY_DOWN, KEY_ENTER } from "vyto/surface";
+import { Tween } from "vyto/ui/anim";
+import { sin, cos, atan2, PI, TAU } from "vyto/math";
+
+// Material metrics, in dp. Every one of these is multiplied by ui_scale()
+// before it reaches a Rect — see there for why that is not optional.
+export const DP_FAB: float = 56.0;          // standard FAB diameter
+export const DP_FAB_MINI: float = 40.0;
+export const DP_BOTTOM_NAV_H: float = 80.0; // M3 nav bar height
+export const DP_TOUCH_MIN: float = 48.0;    // minimum tappable target
+export const DP_SHEET_HANDLE_W: float = 32.0;
+export const DP_SHEET_HANDLE_H: float = 24.0; // grab strip above sheet content
+export const DP_DRAWER_W: float = 320.0;
+export const DP_ROW_H: float = 48.0;        // drawer destination row
+
+// Enter/exit durations. M3 puts a sheet slightly faster than a drawer because
+// it travels less.
+const SHEET_MS: int = 220;
+const DRAWER_MS: int = 250;
+
+// Scrim opacity behind an open overlay, at full open (0-255).
+const SCRIM_ALPHA: float = 100.0;
+
+// Drag past this fraction of the widget's travel and the release dismisses
+// rather than snapping back; a flick faster than FLING_PX per move event
+// dismisses regardless of how far it got.
+const DISMISS_FRAC: float = 0.4;
+const FLING_PX: float = 12.0;
+
+// A non-looping Tween has no completion callback, so the end of a slide is
+// read off the animated value. Every EASE_* lands exactly on its target at
+// t=1, so this only guards float comparison, not easing overshoot.
+const ANIM_EPS: float = 0.001;
+
+// Device-pixel factor for a widget's window, or 1.0 before it is mounted.
+//
+// Theme.apply_scale multiplies the theme's own metrics (text sizes, spacing,
+// radii) by the display density, but it cannot reach a constant written in
+// this file. Leaving these unscaled is not a cosmetic bug: on a 2.75-density
+// phone a 48dp touch target became 48 *pixels*, i.e. 17dp — barely a third of
+// the Material minimum — and every hit target in this module was equally
+// undersized. It also produced scaled text inside unscaled boxes, which is
+// what made the date grid look cramped while its month title looked right.
+//
+// Read off the window rather than passed as an argument, because half the
+// geometry helpers here (row_rect, cell_rect) have no Theme in scope and
+// threading one through all of them would be noise. scale_applied is 0.0 until
+// Window.run applies it, hence the guard.
+fn ui_scale(w: Widget): float {
+    let win = w.win;
+    if (win == null) { return 1.0; }
+    let f = win.theme.scale_applied;
+    if (f > 0.0) { return f; }
+    return 1.0;
+}
+
+fn clampf(v: float, lo: float, hi: float): float {
+    if (v < lo) { return lo; }
+    if (v > hi) { return hi; }
+    return v;
+}
+
+// Zero-padded two-digit number, for clock and calendar text.
+fn pad2(n: int): string {
+    if (n < 10) { return "0" + str(n); }
+    return str(n);
+}
+
+// ---------------------------------------------------------------- FAB
+
+// Circular elevated action button. The one control an Android user reads as
+// "the main thing this screen does".
+//
+// Ripple is not implemented: it needs the press origin, which on_click already
+// carries (x, y), plus a clip-to-circle expanding overlay. That belongs in
+// skins/material.vt with the rest of the chrome, not here — this widget only
+// needs to hand the origin down once the skin can use it.
+export class FloatingActionButton extends Widget {
+    label: string;        // short glyph or 1-2 chars; M3 FABs are icon-only
+    onClick: fn(FloatingActionButton);
+    mini: bool;
+    lift: float;          // 0..1 press-lift, animated
+    lift_tw: Tween;
+
+    fn init(label: string) {
+        super.init();
+        this.label = label;
+        this.mini = false;
+        this.focusable = true;
+        this.lift = 0.0;
+    }
+
+    fn with_mini(m: bool): FloatingActionButton {
+        this.mini = m;
+        return this;
+    }
+
+    fn diameter(): float {
+        let k = ui_scale(this);
+        if (this.mini) { return DP_FAB_MINI * k; }
+        return DP_FAB * k;
+    }
+
+    fn fire() {
+        if (this.onClick != null) { this.onClick(this); }
+    }
+
+    override fn measure(s: Painter, th: Theme): Size {
+        let d = this.diameter();
+        return Size(d, d);
+    }
+
+    override fn render(s: Painter, th: Theme) {
+        let r = this.bounds;
+        let d = this.diameter();
+        let cx = r.x + d / 2.0;
+        let cy = r.y + d / 2.0;
+        // elevation rises on press, matching M3's 6dp -> 12dp
+        let k = ui_scale(this);
+        let blur = (6.0 + this.lift * 6.0) * k;
+        let dy = (3.0 + this.lift * 3.0) * k;
+        s.shadow(Rect(r.x, r.y, d, d), d / 2.0, blur, dy, th.shadow_color);
+        s.circle(cx, cy, d / 2.0, th.primary);
+        s.push_font(th.text_lg, WEIGHT_MED);
+        s.text_center(Rect(r.x, r.y, d, d), this.label, th.on_primary);
+        s.pop_font();
+    }
+
+    fn animate_lift(target: float) {
+        let b = this;
+        if (this.lift_tw != null) { this.lift_tw.cancel(); }
+        this.lift_tw = this.animate_value(this.lift, target, 150, false,
+                                          EASE_OUT_CUBIC, (v) => { b.lift = v; });
+    }
+
+    override fn on_hover_enter(): bool { this.animate_lift(1.0); return true; }
+    override fn on_hover_leave(): bool { this.animate_lift(0.0); return true; }
+
+    override fn on_click(x: int, y: int): bool {
+        this.fire();
+        return true;
+    }
+
+    override fn on_key(k: int, ch: string): bool {
+        if (k == 32) { this.fire(); return true; }
+        return false;
+    }
+
+    override fn drop_handlers() {
+        this.onClick = null;
+    }
+}
+
+// -------------------------------------------------- BottomNavigationBar
+
+// 3-5 destinations pinned to the bottom edge. The dominant Android nav
+// pattern, and the reason NavRail (a tablet/desktop side rail) is not a
+// substitute.
+export class BottomNavigationBar extends Widget {
+    items: string[];
+    selected: int;
+    onSelect: fn(int);
+
+    fn init(items: string[]) {
+        super.init();
+        this.items = items;
+        this.selected = 0;
+        this.focusable = true;
+    }
+
+    override fn measure(s: Painter, th: Theme): Size {
+        return Size(0.0, DP_BOTTOM_NAV_H * ui_scale(this));
+    }
+
+    // Index under a device-pixel x, or -1. Items divide the width evenly, so
+    // each target is width/n wide — comfortably above DP_TOUCH_MIN on any
+    // phone with <= 5 destinations, which is the M3 maximum anyway.
+    fn index_at(px: float): int {
+        if (this.items.len == 0) { return -1; }
+        let seg = this.bounds.w / (this.items.len as float);
+        let i = ((px - this.bounds.x) / seg) as int;
+        if (i < 0 || i >= this.items.len) { return -1; }
+        return i;
+    }
+
+    override fn render(s: Painter, th: Theme) {
+        let r = this.bounds;
+        s.fill(r, th.surface_raised);
+        s.line(r.x, r.y, r.x + r.w, r.y, th.divider);
+        if (this.items.len == 0) { return; }
+        let seg = r.w / (this.items.len as float);
+        for (let i in 0..this.items.len) {
+            let ir = Rect(r.x + (i as float) * seg, r.y, seg, r.h);
+            let fg = th.on_surface_muted;
+            if (i == this.selected) {
+                fg = th.primary;
+                // M3 active indicator: a filled pill behind the active item
+                let k = ui_scale(this);
+                let pw = seg * 0.6;
+                let ph = 32.0 * k;
+                let pr = Rect(ir.x + (seg - pw) / 2.0, ir.y + 12.0 * k, pw, ph);
+                s.fill_round(pr, ph / 2.0, with_alpha(th.primary, 40));
+            }
+            s.text_center(ir, this.items[i], fg);
+        }
+    }
+
+    override fn on_click(x: int, y: int): bool {
+        let i = this.index_at(x as float);
+        if (i < 0 || i == this.selected) { return false; }
+        this.selected = i;
+        if (this.onSelect != null) { this.onSelect(i); }
+        this.invalidate();
+        return true;
+    }
+
+    override fn drop_handlers() {
+        this.onSelect = null;
+    }
+}
+
+// ------------------------------------------------------------ BottomSheet
+
+// A panel that rises from the bottom edge, dismissed by dragging it back down
+// or tapping the scrim. Open it as an overlay, then slide it in:
+//
+//     let sheet = new BottomSheet(280.0);
+//     sheet.add(new Column([...]));
+//     win.open_overlay(sheet);
+//     sheet.open();
+//
+// `bounds` is the whole window, not the sheet — the scrim belongs to this
+// widget, so a tap on it must arrive as on_click. Window's own outside-click
+// branch dismisses immediately and cannot animate, which is the wrong exit for
+// a sheet. The sheet itself is `panel`.
+export class BottomSheet extends Widget {
+    peek_h: float;        // collapsed height; 0 = open fully
+    expanded: bool;
+    onDismiss: fn();
+    // Fraction of the sheet that is off-screen, 0 = fully open, 1 = hidden.
+    // Animated by open/close and driven directly by drag in between.
+    offset: float;
+    panel: Rect;          // the sheet; `bounds` is the whole window
+    anim: Tween;
+    last_dy: float;       // last drag delta — the fling-direction proxy
+    closing: bool;        // a close animation is running
+
+    fn init(peek_h: float) {
+        super.init();
+        this.peek_h = peek_h;
+        this.expanded = false;
+        this.offset = 1.0;
+        this.panel = Rect(0.0, 0.0, 0.0, 0.0);
+        this.last_dy = 0.0;
+        this.closing = false;
+        // This widget holds children AND paints its own content (scrim, panel,
+        // handle) in render(). The default partial-repaint path draws a
+        // container's chrome and then recurses into children — it never calls
+        // render() — so without this the scrim and the panel vanish on every
+        // partial repaint and come back on the next full redraw.
+        //
+        // On a device that reads as the whole screen strobing: measured off a
+        // screen recording as mean frame brightness alternating between 123
+        // (scrim drawn) and 190 (scrim missing) on consecutive frames, for as
+        // long as any animation kept partial repaints coming.
+        this.custom_paint = true;
+        // Redundant while bounds covers the window (nothing is ever "outside"),
+        // but it states the intent: this sheet exits through close(), never
+        // through Window's undecorated dismiss.
+        this.modal = true;
+    }
+
+    fn sheet_h(s: Painter): float {
+        if (this.expanded || this.peek_h <= 0.0) { return s.height() * 0.6; }
+        return this.peek_h;
+    }
+
+    override fn place(s: Painter, th: Theme) {
+        this.bounds = Rect(0.0, 0.0, s.width(), s.height());
+        let sh = this.sheet_h(s);
+        this.panel = Rect(0.0, s.height() - sh + this.offset * sh, s.width(), sh);
+        let strip = DP_SHEET_HANDLE_H * ui_scale(this);
+        let cy = this.panel.y + strip;
+        let content = Rect(this.panel.x, cy, this.panel.w, this.panel.h - strip);
+        // Stack semantics: every child gets the whole content rect. Pass a
+        // single Column when the sheet holds more than one widget — reusing the
+        // layout containers beats growing a second stacking rule here.
+        for (let c in this.children) { c.arrange(s, th, content); }
+    }
+
+    // Window.layout() calls place() on open, resize and dismiss — not per
+    // frame — so an animating sheet re-places its own subtree each tick rather
+    // than re-laying out the whole window.
+    fn relayout() {
+        let w = this.win;
+        if (w == null) { return; }
+        this.place(w.painter, w.theme);
+    }
+
+    override fn render(s: Painter, th: Theme) {
+        let a = ((1.0 - this.offset) * SCRIM_ALPHA) as int;
+        if (a > 0) { s.fill(this.bounds, with_alpha(rgb(0, 0, 0), a)); }
+        let r = this.panel;
+        s.shadow(r, th.radius_lg, 16.0, -2.0, th.shadow_color);
+        s.fill_round(r, th.radius_lg, th.surface_raised);
+        // drag handle
+        let k = ui_scale(this);
+        let hw = DP_SHEET_HANDLE_W * k;
+        s.fill_round(Rect(r.x + (r.w - hw) / 2.0, r.y + 8.0 * k, hw, 4.0 * k),
+                     2.0 * k, th.on_surface_subtle);
+        for (let c in this.children) { c.draw(s, th); }
+    }
+
+    // Slide in. Call after win.open_overlay(sheet).
+    fn open() {
+        this.closing = false;
+        this.slide_to(0.0);
+    }
+
+    // Slide out, then drop the overlay and fire onDismiss.
+    fn close() {
+        if (this.closing) { return; }
+        this.closing = true;
+        this.slide_to(1.0);
+    }
+
+    fn slide_to(target: float) {
+        if (this.anim != null) { this.anim.cancel(); }
+        let sheet = this;
+        this.anim = this.animate_value(this.offset, target, SHEET_MS, false,
+                                       EASE_OUT_CUBIC, (v) => {
+            sheet.offset = v;
+            sheet.relayout();
+            if (sheet.closing && v >= 1.0 - ANIM_EPS) { sheet.finish_close(); }
+        });
+    }
+
+    // Safe to run from inside the tween: the on_tick closure holds its own
+    // reference to the sheet, so dropping the Window's overlay reference here
+    // cannot free it mid-callback. Window.tick releases the closure afterwards.
+    fn finish_close() {
+        this.closing = false;
+        let w = this.win;
+        let cb = this.onDismiss;
+        if (w != null) { w.dismiss_overlay(); }
+        if (cb != null) { cb(); }
+    }
+
+    override fn on_click(x: int, y: int): bool {
+        if (!contains(this.panel, x, y)) { this.close(); return true; }
+        // Window dispatches on_click to the overlay root so each overlay can
+        // route its own; a sheet holds caller-supplied content, so the routing
+        // is the generic one.
+        let t = this.hit(x, y);
+        if (t != null && t != this) { return t.on_click(x, y); }
+        return false;
+    }
+
+    override fn on_drag_start(x: int, y: int): bool {
+        if (this.anim != null) { this.anim.cancel(); this.anim = null; }
+        this.closing = false;
+        this.last_dy = 0.0;
+        return true;
+    }
+
+    override fn on_drag(dx: int, dy: int): bool {
+        let w = this.win;
+        if (w == null) { return false; }
+        let sh = this.sheet_h(w.painter);
+        if (sh <= 0.0) { return false; }
+        this.last_dy = dy as float;
+        this.offset = clampf(this.offset + (dy as float) / sh, 0.0, 1.0);
+        this.relayout();
+        this.invalidate();
+        return true;
+    }
+
+    override fn on_drag_end(x: int, y: int): bool {
+        // A downward flick dismisses however far it travelled; otherwise the
+        // sheet settles to whichever end it is nearer.
+        if (this.last_dy >= FLING_PX || this.offset >= DISMISS_FRAC) { this.close(); }
+        else { this.open(); }
+        return true;
+    }
+
+    override fn drop_handlers() {
+        this.onDismiss = null;
+        if (this.anim != null) { this.anim.cancel(); this.anim = null; }
+    }
+}
+
+// -------------------------------------------------------- NavigationDrawer
+
+// The modal navigation drawer: a scrim plus a panel of destinations sliding in
+// from the left edge, opened by a button and closed by a tap on the scrim or a
+// drag back to the left.
+//
+//     let drawer = new NavigationDrawer(["Inbox", "Starred", "Sent"]);
+//     drawer.onSelect = (i) => { ...; drawer.close(); };
+//     win.open_overlay(drawer);
+//     drawer.open();
+//
+// Same full-window `bounds` as BottomSheet, for the same reason: the scrim is
+// part of the widget so its taps arrive as on_click.
+//
+// Opening by an edge swipe is deliberately not here. It is a gesture that
+// begins outside the widget that would handle it, and the surface event model
+// carries no notion of that — adding one is a toolkit-wide decision, not a
+// drawer feature. Button-opened is the common case and is complete.
+export class NavigationDrawer extends Widget {
+    items: string[];
+    selected: int;
+    onSelect: fn(int);
+    onDismiss: fn();
+    open_frac: float;     // 0 = closed, 1 = open; animated
+    panel: Rect;          // the drawer; `bounds` is the whole window
+    anim: Tween;
+    last_dx: float;
+    closing: bool;
+
+    fn init(items: string[]) {
+        super.init();
+        this.items = items;
+        this.selected = 0;
+        this.open_frac = 0.0;
+        this.panel = Rect(0.0, 0.0, 0.0, 0.0);
+        this.last_dx = 0.0;
+        this.closing = false;
+        this.modal = true;
+    }
+
+    fn drawer_w(s: Painter): float {
+        let w = DP_DRAWER_W * ui_scale(this);
+        // never let the panel swallow the whole screen — the scrim has to stay
+        // tappable, since it is the way out
+        if (w > s.width() * 0.85) { w = s.width() * 0.85; }
+        return w;
+    }
+
+    override fn place(s: Painter, th: Theme) {
+        this.bounds = Rect(0.0, 0.0, s.width(), s.height());
+        let w = this.drawer_w(s);
+        this.panel = Rect((this.open_frac - 1.0) * w, 0.0, w, s.height());
+    }
+
+    fn relayout() {
+        let w = this.win;
+        if (w == null) { return; }
+        this.place(w.painter, w.theme);
+    }
+
+    // Row rect for destination i, in absolute coordinates.
+    fn row_rect(i: int): Rect {
+        let k = ui_scale(this);
+        let pad = 12.0 * k;
+        let rh = DP_ROW_H * k;
+        return Rect(this.panel.x + pad, this.panel.y + pad + (i as float) * rh,
+                    this.panel.w - 2.0 * pad, rh);
+    }
+
+    // Destination index under an absolute point, or -1.
+    fn index_at(x: int, y: int): int {
+        for (let i in 0..this.items.len) {
+            if (contains(this.row_rect(i), x, y)) { return i; }
+        }
+        return -1;
+    }
+
+    override fn render(s: Painter, th: Theme) {
+        let a = (this.open_frac * SCRIM_ALPHA) as int;
+        if (a > 0) { s.fill(this.bounds, with_alpha(rgb(0, 0, 0), a)); }
+        let r = this.panel;
+        s.shadow(r, 0.0, 16.0, 0.0, th.shadow_color);
+        s.fill(r, th.surface_raised);
+        for (let i in 0..this.items.len) {
+            let rr = this.row_rect(i);
+            let fg = th.on_surface;
+            if (i == this.selected) {
+                fg = th.primary;
+                // M3 active indicator: a full-width pill behind the row
+                s.fill_round(rr, rr.h / 2.0, with_alpha(th.primary, 40));
+            }
+            s.text_in(rr, 16.0 * ui_scale(this), this.items[i], fg);
+        }
+    }
+
+    // Slide in. Call after win.open_overlay(drawer).
+    fn open() {
+        this.closing = false;
+        this.slide_to(1.0);
+    }
+
+    // Slide out, then drop the overlay and fire onDismiss.
+    fn close() {
+        if (this.closing) { return; }
+        this.closing = true;
+        this.slide_to(0.0);
+    }
+
+    fn slide_to(target: float) {
+        if (this.anim != null) { this.anim.cancel(); }
+        let d = this;
+        this.anim = this.animate_value(this.open_frac, target, DRAWER_MS, false,
+                                       EASE_OUT_CUBIC, (v) => {
+            d.open_frac = v;
+            d.relayout();
+            if (d.closing && v <= ANIM_EPS) { d.finish_close(); }
+        });
+    }
+
+    fn finish_close() {
+        this.closing = false;
+        let w = this.win;
+        let cb = this.onDismiss;
+        if (w != null) { w.dismiss_overlay(); }
+        if (cb != null) { cb(); }
+    }
+
+    override fn on_click(x: int, y: int): bool {
+        if (!contains(this.panel, x, y)) { this.close(); return true; }
+        let i = this.index_at(x, y);
+        if (i < 0) { return false; }
+        this.selected = i;
+        if (this.onSelect != null) { this.onSelect(i); }
+        this.invalidate();
+        return true;
+    }
+
+    override fn on_drag_start(x: int, y: int): bool {
+        if (this.anim != null) { this.anim.cancel(); this.anim = null; }
+        this.closing = false;
+        this.last_dx = 0.0;
+        return true;
+    }
+
+    override fn on_drag(dx: int, dy: int): bool {
+        let w = this.win;
+        if (w == null) { return false; }
+        let dw = this.drawer_w(w.painter);
+        if (dw <= 0.0) { return false; }
+        this.last_dx = dx as float;
+        this.open_frac = clampf(this.open_frac + (dx as float) / dw, 0.0, 1.0);
+        this.relayout();
+        this.invalidate();
+        return true;
+    }
+
+    override fn on_drag_end(x: int, y: int): bool {
+        if (this.last_dx <= -FLING_PX || this.open_frac <= 1.0 - DISMISS_FRAC) { this.close(); }
+        else { this.open(); }
+        return true;
+    }
+
+    override fn drop_handlers() {
+        this.onSelect = null;
+        this.onDismiss = null;
+        if (this.anim != null) { this.anim.cancel(); this.anim = null; }
+    }
+}
+
+// ---------------------------------------------------------- PullToRefresh
+
+// Wraps scrollable content with an overscroll spinner at the top edge.
+//
+// The indicator, the threshold and the refresh lifecycle are complete and
+// driven through set_pull/release_pull:
+//
+//     let ptr = new PullToRefresh();
+//     ptr.add(list);
+//     ptr.onRefresh = () => { reload(); ptr.end_refresh(); };
+//
+// The gesture composes out of Track C item 2 rather than being coded here.
+// Widget.on_drag walks up the parent chain, and a scrollable widget refuses a
+// drag it cannot act on — so a downward drag on a list that is already at its
+// top falls through the ScrollView to this widget. That refusal *is* the
+// definition of overscroll, so the wrapping order is the whole wiring:
+//
+//     let ptr = new PullToRefresh();
+//     ptr.add(new ScrollView(list));
+//     ptr.onRefresh = () => { reload(); ptr.end_refresh(); };
+//
+// begin_refresh() still works with no gesture at all, which is what a button or
+// a timer needs.
+const PTR_THRESHOLD: float = 64.0;   // pull distance that arms a refresh
+const PTR_RADIUS: float = 14.0;      // indicator radius
+const PTR_DOTS: int = 8;
+const PTR_TICK_MS: int = 16;
+const PTR_REV_MS: float = 900.0;     // one spinner revolution
+// The indicator follows the finger at less than 1:1, so the content cannot be
+// hauled arbitrarily far off its own top and the pull reads as elastic.
+const PTR_DRAG_RATE: float = 0.5;
+
+export class PullToRefresh extends Widget {
+    onRefresh: fn();
+    refreshing: bool;
+    pull: float;          // current overscroll distance in px
+    spin_angle: float;    // indeterminate rotation while refreshing
+    spin: Tween;
+
+    fn init() {
+        super.init();
+        this.refreshing = false;
+        this.pull = 0.0;
+        this.spin_angle = 0.0;
+        // Same reason as BottomSheet: children plus own content (the spinner)
+        // in render(), which the partial-repaint path would skip.
+        this.custom_paint = true;
+    }
+
+    override fn measure(s: Painter, th: Theme): Size {
+        if (this.children.len == 0) { return Size(0.0, 0.0); }
+        return this.children[0].measure(s, th);
+    }
+
+    override fn arrange(s: Painter, th: Theme, r: Rect) {
+        this.layout_to(r);
+        // single-child container: the content fills it, and the indicator is
+        // drawn over the top edge rather than taking layout space
+        for (let c in this.children) { c.arrange(s, th, r); }
+    }
+
+    // Report the current overscroll distance in px. Values past the threshold
+    // are kept (the indicator rubber-bands) but do not arm anything further.
+    fn set_pull(px: float) {
+        let p = px;
+        if (p < 0.0) { p = 0.0; }
+        if (p == this.pull) { return; }
+        this.pull = p;
+        this.invalidate();
+    }
+
+    // The pull gesture ended: past the threshold this starts a refresh,
+    // otherwise the indicator snaps away.
+    fn release_pull() {
+        if (this.pull >= PTR_THRESHOLD * ui_scale(this) && !this.refreshing) { this.begin_refresh(); }
+        else if (!this.refreshing) { this.set_pull(0.0); }
+    }
+
+    // Reached only when every scrollable widget below has refused the drag —
+    // i.e. the content is already at its top. See the note above the class.
+    override fn drag_scroll(dx: int, dy: int): bool {
+        if (this.refreshing) { return false; }
+        // Dragging up with nothing pulled is not this widget's gesture. Letting
+        // it fall through matters: the walk resumes at the next move event and
+        // the list scrolls normally again.
+        if (dy <= 0 && this.pull <= 0.0) { return false; }
+        this.set_pull(this.pull + (dy as float) * PTR_DRAG_RATE);
+        return true;
+    }
+
+    override fn drag_scroll_end(): bool {
+        if (this.pull <= 0.0) { return false; }
+        this.release_pull();
+        return true;
+    }
+
+    // Start the indeterminate spin and fire onRefresh. The callback owns the
+    // end of it — nothing here times out.
+    fn begin_refresh() {
+        if (this.refreshing) { return; }
+        this.refreshing = true;
+        this.pull = PTR_THRESHOLD * ui_scale(this);
+        let p = this;
+        // A ticker, not a looping animate(): a looping Tween ping-pongs, which
+        // would spin the indicator forwards then backwards, and it repaints the
+        // widget unconditionally. This advances one angle and invalidates, which
+        // is the documented shape for a tick that does change pixels.
+        if (this.spin == null) {
+            this.spin = this.ticker(PTR_TICK_MS, () => {
+                p.spin_angle = p.spin_angle + TAU * (PTR_TICK_MS as float) / PTR_REV_MS;
+                if (p.spin_angle > TAU) { p.spin_angle = p.spin_angle - TAU; }
+                p.invalidate();
+            });
+        }
+        if (this.onRefresh != null) { this.onRefresh(); }
+    }
+
+    // Stop the spin and retract the indicator.
+    fn end_refresh() {
+        if (!this.refreshing) { return; }
+        this.refreshing = false;
+        if (this.spin != null) { this.spin.cancel(); this.spin = null; }
+        this.pull = 0.0;
+        this.invalidate();
+    }
+
+    override fn render(s: Painter, th: Theme) {
+        for (let c in this.children) { c.draw(s, th); }
+        if (this.pull <= 0.0 && !this.refreshing) { return; }
+        // The indicator follows the finger to the threshold and then stops,
+        // so an overlong pull reads as "already armed" rather than as travel.
+        let k = ui_scale(this);
+        let thr = PTR_THRESHOLD * k;
+        let rad = PTR_RADIUS * k;
+        let travel = this.pull;
+        if (travel > thr) { travel = thr; }
+        let cx = this.bounds.cx();
+        let cy = this.bounds.y + travel;
+        s.circle(cx, cy, rad + 2.0 * k, th.surface_raised);
+        // Before the threshold the ring fills in proportion to the pull, which
+        // is the whole affordance; after it, the filled ring rotates. Dots
+        // rather than an arc because a stroked arc needs a Path, and dots are
+        // one base-tier primitive that degrades on every painter.
+        let frac = travel / thr;
+        let base = this.spin_angle - PI / 2.0;
+        for (let i in 0..PTR_DOTS) {
+            let f = (i as float) / (PTR_DOTS as float);
+            if (!this.refreshing && f > frac) { break; }
+            let a = base + f * TAU;
+            let dx = cx + cos(a) * rad;
+            let dy = cy + sin(a) * rad;
+            // trailing dots fade, which is what gives the ring a direction
+            let c = mix(th.surface_raised, th.primary, 0.25 + 0.75 * f);
+            s.circle(dx, dy, 2.5 * k, c);
+        }
+    }
+
+    override fn drop_handlers() {
+        this.onRefresh = null;
+        // The spin ticker loops forever, so unlike a finite Tween it never
+        // releases its own on_tick — and that closure captures this widget.
+        // Widget.release_all cancels only *pending* animations (ones declared
+        // before mount); a registered one has to be cancelled here or the
+        // widget stays alive on the Window clock.
+        if (this.spin != null) { this.spin.cancel(); this.spin = null; }
+    }
+}
+
+// --------------------------------------------------------------- pickers
+
+// No date/time widget exists anywhere in vyto/ui, so these are new rather than
+// adapted. Both are ordinary widgets — no overlay, no platform call — and work
+// wherever a Widget works, including inside a Dialog.
+//
+// The calendar arithmetic is done here rather than through vyto/util/date on
+// purpose: that package is an FFI shim over the C library, so importing it
+// would make a date picker depend on a native build, and on Android on a shim
+// arm that does not exist. Two dependency-free functions cost less.
+
+const DPK_CELL: float = 40.0;
+const DPK_HEADER_H: float = 48.0;
+const DPK_WEEK_H: float = 24.0;
+const DPK_PAD: float = 8.0;
+const DPK_ARROW_W: float = 44.0;
+
+fn is_leap(y: int): bool {
+    if (y % 4 != 0) { return false; }
+    if (y % 100 != 0) { return true; }
+    return y % 400 == 0;
+}
+
+fn days_in_month(y: int, m: int): int {
+    if (m == 2) {
+        if (is_leap(y)) { return 29; }
+        return 28;
+    }
+    if (m == 4 || m == 6 || m == 9 || m == 11) { return 30; }
+    return 31;
+}
+
+// Sakamoto's method: 0 = Sunday. Valid for any year >= 1, which is every year
+// a date picker will be asked about.
+fn day_of_week(y: int, m: int, d: int): int {
+    let t = [0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4];
+    let yy = y;
+    if (m < 3) { yy = yy - 1; }
+    return (yy + yy / 4 - yy / 100 + yy / 400 + t[m - 1] + d) % 7;
+}
+
+// A month grid with a year/month header. `onSelect(y, m, d)` fires on every
+// pick; `day` is 0 until one is made.
+//
+//     let dp = new DatePicker(2026, 8);
+//     dp.onSelect = (y, m, d) => { ... };
+//
+// There is no "today" ring by default, because nothing in this package knows
+// the date. Set today_y/today_m/today_d if the app does — that keeps the clock
+// dependency in the app, where it already exists.
+export class DatePicker extends Widget {
+    year: int;            // selected year; 0 until a day is picked
+    month: int;           // selected month, 1-12
+    day: int;             // selected day, 0 = none
+    view_year: int;       // month currently on screen
+    view_month: int;
+    min_year: int;
+    max_year: int;
+    today_y: int;
+    today_m: int;
+    today_d: int;
+    onSelect: fn(int, int, int);
+    month_names: string[];
+    weekday_names: string[];
+
+    fn init(year: int, month: int) {
+        super.init();
+        this.view_year = year;
+        this.view_month = month;
+        this.year = 0;
+        this.month = 0;
+        this.day = 0;
+        this.min_year = 1;
+        this.max_year = 9999;
+        this.today_y = 0;
+        this.today_m = 0;
+        this.today_d = 0;
+        this.focusable = true;
+        this.month_names = ["January", "February", "March", "April", "May", "June",
+                            "July", "August", "September", "October", "November",
+                            "December"];
+        this.weekday_names = ["S", "M", "T", "W", "T", "F", "S"];
+    }
+
+    builder fn range(lo: int, hi: int) { this.min_year = lo; this.max_year = hi; return this; }
+    builder fn today(y: int, m: int, d: int) {
+        this.today_y = y; this.today_m = m; this.today_d = d; return this;
+    }
+
+    fn cell(): float { return DPK_CELL * ui_scale(this); }
+
+    override fn measure(s: Painter, th: Theme): Size {
+        let k = ui_scale(this);
+        return Size(7.0 * DPK_CELL * k + 2.0 * DPK_PAD * k,
+                    (DPK_HEADER_H + DPK_WEEK_H + 6.0 * DPK_CELL + 2.0 * DPK_PAD) * k);
+    }
+
+    fn header_rect(): Rect {
+        let pad = DPK_PAD * ui_scale(this);
+        return Rect(this.bounds.x + pad, this.bounds.y + pad,
+                    this.bounds.w - 2.0 * pad, DPK_HEADER_H * ui_scale(this));
+    }
+    fn prev_rect(): Rect {
+        let h = this.header_rect();
+        return Rect(h.x, h.y, DPK_ARROW_W * ui_scale(this), h.h);
+    }
+    fn next_rect(): Rect {
+        let h = this.header_rect();
+        let aw = DPK_ARROW_W * ui_scale(this);
+        return Rect(h.right() - aw, h.y, aw, h.h);
+    }
+    fn grid_rect(): Rect {
+        let h = this.header_rect();
+        let k = ui_scale(this);
+        let c = this.cell();
+        return Rect(h.x, h.y + (DPK_HEADER_H + DPK_WEEK_H) * k, 7.0 * c, 6.0 * c);
+    }
+    fn cell_rect(col: int, row: int): Rect {
+        let g = this.grid_rect();
+        let c = this.cell();
+        return Rect(g.x + (col as float) * c, g.y + (row as float) * c, c, c);
+    }
+
+    // Grid slot of the 1st, i.e. how far the month is indented.
+    fn lead(): int { return day_of_week(this.view_year, this.view_month, 1); }
+
+    fn step_month(delta: int) {
+        let m = this.view_month + delta;
+        let y = this.view_year;
+        if (m < 1) { m = 12; y = y - 1; }
+        if (m > 12) { m = 1; y = y + 1; }
+        if (y < this.min_year || y > this.max_year) { return; }
+        this.view_month = m;
+        this.view_year = y;
+        this.invalidate();
+    }
+
+    fn pick(d: int) {
+        let n = days_in_month(this.view_year, this.view_month);
+        if (d < 1 || d > n) { return; }
+        this.year = this.view_year;
+        this.month = this.view_month;
+        this.day = d;
+        if (this.onSelect != null) { this.onSelect(this.year, this.month, this.day); }
+        this.invalidate();
+    }
+
+    // Move the selection by whole days, rolling into the neighbouring month and
+    // bringing the view with it.
+    fn move_selection(delta: int) {
+        let d = this.day;
+        if (d == 0) { d = 1; this.pick(1); return; }
+        let nd = d + delta;
+        let n = days_in_month(this.view_year, this.view_month);
+        if (nd < 1) {
+            this.step_month(-1);
+            nd = days_in_month(this.view_year, this.view_month) + nd;
+        } else if (nd > n) {
+            nd = nd - n;
+            this.step_month(1);
+        }
+        this.pick(nd);
+    }
+
+    override fn render(s: Painter, th: Theme) {
+        let h = this.header_rect();
+        s.push_font(th.text_lg, WEIGHT_MED);
+        s.text_center(h, this.month_names[this.view_month - 1] + " " + str(this.view_year),
+                      th.on_surface);
+        s.pop_font();
+        s.text_center(this.prev_rect(), "<", th.on_surface_muted);
+        s.text_center(this.next_rect(), ">", th.on_surface_muted);
+
+        let g = this.grid_rect();
+        let k = ui_scale(this);
+        let c = this.cell();
+        s.push_font(th.text_sm, WEIGHT_MED);
+        for (let i in 0..7) {
+            let wr = Rect(g.x + (i as float) * c, g.y - DPK_WEEK_H * k, c, DPK_WEEK_H * k);
+            s.text_center(wr, this.weekday_names[i], th.on_surface_muted);
+        }
+        s.pop_font();
+
+        let lead = this.lead();
+        let n = days_in_month(this.view_year, this.view_month);
+        for (let d in 1..n + 1) {
+            let idx = lead + d - 1;
+            let cr = this.cell_rect(idx % 7, idx / 7);
+            let fg = th.on_surface;
+            if (this.day == d && this.month == this.view_month && this.year == this.view_year) {
+                s.circle(cr.cx(), cr.cy(), c / 2.0 - 4.0 * k, th.primary);
+                fg = th.on_primary;
+            } else if (this.today_d == d && this.today_m == this.view_month
+                       && this.today_y == this.view_year) {
+                s.stroke_circle(cr.cx(), cr.cy(), c / 2.0 - 4.0 * k, 1.0, th.primary);
+                fg = th.primary;
+            }
+            s.text_center(cr, str(d), fg);
+        }
+    }
+
+    override fn on_click(x: int, y: int): bool {
+        if (contains(this.prev_rect(), x, y)) { this.step_month(-1); return true; }
+        if (contains(this.next_rect(), x, y)) { this.step_month(1); return true; }
+        let g = this.grid_rect();
+        if (!contains(g, x, y)) { return false; }
+        let c = this.cell();
+        let col = ((x as float - g.x) / c) as int;
+        let row = ((y as float - g.y) / c) as int;
+        let d = row * 7 + col - this.lead() + 1;
+        this.pick(d);
+        return true;
+    }
+
+    override fn on_key(k: int, ch: string): bool {
+        if (k == KEY_LEFT) { this.move_selection(-1); return true; }
+        if (k == KEY_RIGHT) { this.move_selection(1); return true; }
+        if (k == KEY_UP) { this.move_selection(-7); return true; }
+        if (k == KEY_DOWN) { this.move_selection(7); return true; }
+        if (k == KEY_ENTER && this.day > 0) {
+            if (this.onSelect != null) { this.onSelect(this.year, this.month, this.day); }
+            return true;
+        }
+        return false;
+    }
+
+    override fn drop_handlers() {
+        this.onSelect = null;
+    }
+}
+
+// ------------------------------------------------------------- TimePicker
+
+const TPK_HEADER_H: float = 56.0;
+const TPK_DIAL: float = 240.0;
+const TPK_PAD: float = 8.0;
+const TPK_TICK_R: float = 16.0;      // radius of a number's hit/draw circle
+const TPK_INNER: float = 0.64;       // inner ring radius, as a fraction
+const TPK_AMPM_W: float = 52.0;      // AM/PM strip, 12-hour mode only
+
+const TP_HOURS: int = 0;
+const TP_MINUTES: int = 1;
+
+// The M3 dial. Tap or drag the face to set the value; the header switches
+// between the hour and minute rings, and picking an hour advances to minutes
+// the way the platform picker does.
+//
+//     let tp = new TimePicker(9, 30);
+//     tp.onChange = (h, m) => { ... };
+//
+// Drag works because a non-overlay widget has always received it (Slider is
+// the precedent) — and since Track C item 1 it works inside a Dialog too.
+export class TimePicker extends Widget {
+    hour: int;            // 0-23, always stored as 24-hour
+    minute: int;          // 0-59
+    mode: int;            // TP_HOURS or TP_MINUTES — which ring is live
+    use_24h: bool;
+    onChange: fn(int, int);
+
+    fn init(hour: int, minute: int) {
+        super.init();
+        this.hour = hour;
+        this.minute = minute;
+        this.mode = TP_HOURS;
+        this.use_24h = false;
+        this.focusable = true;
+    }
+
+    builder fn h24(on: bool) { this.use_24h = on; return this; }
+
+    override fn measure(s: Painter, th: Theme): Size {
+        let k = ui_scale(this);
+        return Size((TPK_DIAL + 2.0 * TPK_PAD) * k,
+                    (TPK_HEADER_H + TPK_DIAL + 2.0 * TPK_PAD) * k);
+    }
+
+    fn header_rect(): Rect {
+        let k = ui_scale(this);
+        return Rect(this.bounds.x + TPK_PAD * k, this.bounds.y + TPK_PAD * k,
+                    this.bounds.w - 2.0 * TPK_PAD * k, TPK_HEADER_H * k);
+    }
+    // AM/PM is a sibling of the clock, not an overlay on it — the three header
+    // targets must not intersect, or the first hit test wins and the later ones
+    // become unreachable. Only 12-hour mode reserves the strip.
+    fn ampm_rect(): Rect {
+        let h = this.header_rect();
+        let aw = TPK_AMPM_W * ui_scale(this);
+        return Rect(h.right() - aw, h.y, aw, h.h);
+    }
+    fn time_rect(): Rect {
+        let h = this.header_rect();
+        let w = h.w;
+        if (!this.use_24h) { w = w - (TPK_AMPM_W + 8.0) * ui_scale(this); }
+        return Rect(h.x, h.y, w, h.h);
+    }
+    fn hour_rect(): Rect {
+        let t = this.time_rect();
+        return Rect(t.x, t.y, t.w / 2.0 - 12.0, t.h);
+    }
+    fn minute_rect(): Rect {
+        let t = this.time_rect();
+        return Rect(t.cx() + 12.0, t.y, t.w / 2.0 - 12.0, t.h);
+    }
+    fn dial_rect(): Rect {
+        let h = this.header_rect();
+        let k = ui_scale(this);
+        let d = this.bounds.h - (TPK_HEADER_H + 2.0 * TPK_PAD) * k;
+        if (this.bounds.w - 2.0 * TPK_PAD * k < d) { d = this.bounds.w - 2.0 * TPK_PAD * k; }
+        return Rect(this.bounds.cx() - d / 2.0, h.bottom(), d, d);
+    }
+    fn tick_r(): float { return TPK_TICK_R * ui_scale(this); }
+    fn dial_r(): float { return this.dial_rect().w / 2.0 - this.tick_r(); }
+
+    fn is_pm(): bool { return this.hour >= 12; }
+
+    fn set_time(h: int, m: int) {
+        if (h == this.hour && m == this.minute) { return; }
+        this.hour = h;
+        this.minute = m;
+        if (this.onChange != null) { this.onChange(h, m); }
+        this.invalidate();
+    }
+
+    // Where value `v` sits on a ring of `n` positions, 12 o'clock first.
+    fn ring_xy(v: int, n: int, radius: float, out_x: bool): float {
+        let d = this.dial_rect();
+        let a = (v as float) / (n as float) * TAU - PI / 2.0;
+        if (out_x) { return d.cx() + cos(a) * radius; }
+        return d.cy() + sin(a) * radius;
+    }
+
+    // Clock position of an absolute point: value on a ring of `n`, plus
+    // whether the point landed on the inner ring (24-hour hours only).
+    fn value_at(x: int, y: int, n: int): int {
+        let d = this.dial_rect();
+        let a = atan2(y as float - d.cy(), x as float - d.cx()) + PI / 2.0;
+        let frac = a / TAU;
+        while (frac < 0.0) { frac = frac + 1.0; }
+        while (frac >= 1.0) { frac = frac - 1.0; }
+        return ((frac * (n as float)).round() as int) % n;
+    }
+
+    fn on_inner_ring(x: int, y: int): bool {
+        let d = this.dial_rect();
+        let dx = x as float - d.cx();
+        let dy = y as float - d.cy();
+        let dist = (dx * dx + dy * dy);
+        let mid = this.dial_r() * (TPK_INNER + 1.0) / 2.0;
+        return dist < mid * mid;
+    }
+
+    // Apply a tap or drag at an absolute point to whichever ring is live.
+    fn apply_point(x: int, y: int) {
+        if (this.mode == TP_MINUTES) {
+            this.set_time(this.hour, this.value_at(x, y, 60));
+            return;
+        }
+        let v = this.value_at(x, y, 12);
+        if (this.use_24h) {
+            // outer ring is 1-12, inner is 13-23 and 0
+            if (this.on_inner_ring(x, y)) { this.set_time((v + 12) % 24, this.minute); }
+            else { let h = v; if (h == 0) { h = 12; } this.set_time(h % 24, this.minute); }
+            return;
+        }
+        let h = v;
+        if (h == 0) { h = 12; }
+        if (h == 12) { h = 0; }
+        if (this.is_pm()) { h = h + 12; }
+        this.set_time(h, this.minute);
+    }
+
+    // Hour as it is displayed: 1-12 in 12-hour mode, 0-23 otherwise.
+    fn shown_hour(): int {
+        if (this.use_24h) { return this.hour; }
+        let h = this.hour % 12;
+        if (h == 0) { return 12; }
+        return h;
+    }
+
+    override fn render(s: Painter, th: Theme) {
+        // --- header: HH : MM, the live half highlighted ---
+        let hr = this.hour_rect();
+        let mr = this.minute_rect();
+        s.push_font(th.text_2xl, WEIGHT_MED);
+        let hc = th.on_surface_muted;
+        let mc = th.on_surface_muted;
+        if (this.mode == TP_HOURS) { hc = th.primary; } else { mc = th.primary; }
+        s.text_right(hr, 0.0, pad2(this.shown_hour()), hc);
+        s.text_center(Rect(hr.right(), hr.y, mr.x - hr.right(), hr.h), ":", th.on_surface_muted);
+        s.text(mr.x, s.baseline_in(mr), pad2(this.minute), mc);
+        s.pop_font();
+        if (!this.use_24h) {
+            let ar = this.ampm_rect();
+            let label = "AM";
+            if (this.is_pm()) { label = "PM"; }
+            s.push_font(th.text_sm, WEIGHT_BOLD);
+            s.text_center(ar, label, th.primary);
+            s.pop_font();
+        }
+
+        // --- dial ---
+        let d = this.dial_rect();
+        let r = this.dial_r();
+        s.circle(d.cx(), d.cy(), d.w / 2.0, th.surface_sunken);
+
+        // the hand, drawn under the numbers so a selected number sits on top
+        let sel = 0;
+        let n = 12;
+        let hand_r = r;
+        if (this.mode == TP_MINUTES) {
+            sel = this.minute;
+            n = 60;
+        } else {
+            sel = this.shown_hour() % 12;
+            if (this.use_24h) {
+                sel = this.hour % 12;
+                // 0 and 13-23 live on the inner ring, so the hand is shorter
+                if (this.hour == 0 || this.hour > 12) { hand_r = r * TPK_INNER; }
+            }
+        }
+        let hx = this.ring_xy(sel, n, hand_r, true);
+        let hy = this.ring_xy(sel, n, hand_r, false);
+        s.line_w(d.cx(), d.cy(), hx, hy, 2.0, th.primary);
+        s.circle(d.cx(), d.cy(), 4.0, th.primary);
+        s.circle(hx, hy, this.tick_r(), th.primary);
+
+        // numbers
+        s.push_font(th.text_md, WEIGHT_REG);
+        if (this.mode == TP_MINUTES) {
+            // every fifth minute is labelled; the rest are unlabelled positions
+            for (let i in 0..12) {
+                let v = i * 5;
+                this.draw_tick(s, th, v, 60, r, str(v), v == this.minute);
+            }
+        } else {
+            for (let i in 0..12) {
+                let v = i;
+                let label = str(i);
+                if (i == 0) { label = "12"; }
+                this.draw_tick(s, th, v, 12, r, label, this.shown_hour() % 12 == v
+                                                      && !(this.use_24h && (this.hour == 0
+                                                                            || this.hour > 12)));
+            }
+            if (this.use_24h) {
+                for (let i in 0..12) {
+                    let hv = i + 12;
+                    let label = pad2(hv % 24);
+                    let on = this.hour == hv % 24 && (this.hour == 0 || this.hour > 12);
+                    this.draw_tick(s, th, i, 12, r * TPK_INNER, label, on);
+                }
+            }
+        }
+        s.pop_font();
+    }
+
+    fn draw_tick(s: Painter, th: Theme, v: int, n: int, radius: float,
+                 label: string, selected: bool) {
+        let x = this.ring_xy(v, n, radius, true);
+        let y = this.ring_xy(v, n, radius, false);
+        let fg = th.on_surface;
+        if (selected) { fg = th.on_primary; }
+        let tr = this.tick_r();
+        s.text_center(Rect(x - tr, y - tr, tr * 2.0, tr * 2.0), label, fg);
+    }
+
+    override fn on_click(x: int, y: int): bool {
+        if (contains(this.hour_rect(), x, y)) { this.mode = TP_HOURS; this.invalidate(); return true; }
+        if (contains(this.minute_rect(), x, y)) { this.mode = TP_MINUTES; this.invalidate(); return true; }
+        if (!this.use_24h && contains(this.ampm_rect(), x, y)) {
+            this.set_time((this.hour + 12) % 24, this.minute);
+            return true;
+        }
+        if (!contains(this.dial_rect(), x, y)) { return false; }
+        this.apply_point(x, y);
+        // picking an hour hands over to minutes, as the platform picker does
+        if (this.mode == TP_HOURS) { this.mode = TP_MINUTES; }
+        return true;
+    }
+
+    override fn on_drag(dx: int, dy: int): bool {
+        // The dial is absolute, not incremental: the finger's position is the
+        // value. Window tracks the live point, so read it rather than
+        // accumulating deltas that would drift over a long sweep.
+        let w = this.win;
+        if (w == null) { return false; }
+        this.apply_point(w.drag_x, w.drag_y);
+        return true;
+    }
+
+    override fn on_key(k: int, ch: string): bool {
+        let step = 1;
+        if (k == KEY_LEFT || k == KEY_DOWN) { step = -1; }
+        else if (k != KEY_RIGHT && k != KEY_UP) { return false; }
+        if (this.mode == TP_MINUTES) {
+            this.set_time(this.hour, (this.minute + step + 60) % 60);
+        } else {
+            this.set_time((this.hour + step + 24) % 24, this.minute);
+        }
+        return true;
+    }
+
+    override fn drop_handlers() {
+        this.onChange = null;
+    }
+}

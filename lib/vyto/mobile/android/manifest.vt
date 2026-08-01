@@ -1,0 +1,516 @@
+// vyto/mobile/android/manifest — declare an Android app's manifest in Vyto and
+// generate AndroidManifest.xml from it, instead of hand-rolling XML that
+// silently disagrees with what the app actually calls.
+//
+//     import { Manifest, ACT_CAMERA_IMAGE, ACT_PICK_MEDIA } from "vyto/mobile/android/manifest";
+//
+//     fn main() {
+//         let m = new Manifest("com.example.notes", "Notes");
+//         m.version(3, "1.2.0");
+//         m.uses(ACT_CAMERA_IMAGE);
+//         m.uses(ACT_PICK_MEDIA);
+//         print(m.render());
+//     }
+//
+// and in the packaging script:
+//
+//     vytoc run manifest_of_app.vt > build/AndroidManifest.xml
+//
+// STATUS: the emitted XML has been through `aapt2 link` and into a signed apk
+// (local/mobile/build-apk.sh), and `aapt2 dump badging` reads back the package,
+// label, minSdk, targetSdk and permissions this module declared. Unlike the
+// rest of the package it has no native shim and no Android dependency, so it
+// runs on the build host today. Never installed on a device.
+// Design of record: local/docs/ANDROID.md.
+//
+// -- why generate it ---------------------------------------------------------
+//
+// Three things in an Android manifest are load-bearing for a Vyto app and are
+// exactly the things a hand-written one gets wrong:
+//
+//   1. android:configChanges. Vyto's Window destroys its whole widget tree on
+//      EV_CLOSE (ui/core.vt:2486-2508) with no path back, so an Activity
+//      restart on rotation is unrecoverable. The Activity must therefore
+//      absorb config changes rather than being recreated. This is the single
+//      most important line in the file and it is defaulted, not optional.
+//   2. <queries>. On targetSdk 30+ package visibility is filtered, so the
+//      intents in actions.vt (view_url, dial, send_email, capture_image)
+//      resolve to null unless the app declares what it intends to query.
+//      Nothing warns you; the feature simply does nothing on a real device.
+//   3. FileProvider. ACTION_IMAGE_CAPTURE writes to a URI *you* supply, so a
+//      camera app without a provider entry crashes on capture.
+//
+// Deriving all three from one `uses(ACT_*)` call is the point of this module.
+
+import { PERM_CAMERA, PERM_RECORD_AUDIO, PERM_FINE_LOCATION,
+         PERM_COARSE_LOCATION, PERM_POST_NOTIFICATIONS,
+         PERM_READ_CONTACTS } from "vyto/mobile/android/actions";
+
+// Install-time, granted at install and never prompted — so unlike the PERM_*
+// names in actions.vt it is declared and forgotten. Lives here rather than in
+// net.vt because a manifest string belongs with the manifest, and because it
+// keeps this module free of a dependency on the network module.
+export const PERM_INTERNET: string = "android.permission.INTERNET";
+
+// Granted at install with no runtime prompt and no intent implications.
+// validate() excludes these from the <queries> check, which is about resolving
+// *other apps'* intents and has nothing to say about them.
+fn is_install_time_perm(p: string): bool {
+    return p == PERM_INTERNET
+        || p == "android.permission.ACCESS_NETWORK_STATE"
+        || p == "android.permission.ACCESS_WIFI_STATE"
+        || p == "android.permission.VIBRATE"
+        || p == "android.permission.WAKE_LOCK"
+        || p == "android.permission.FOREGROUND_SERVICE"
+        || p == "android.permission.RECEIVE_BOOT_COMPLETED";
+}
+
+// Capabilities an app declares it will use. Each expands to some combination
+// of permission, uses-feature, <queries> entry, and provider — see expand().
+export const ACT_CAMERA_IMAGE: int = 1;
+export const ACT_CAMERA_VIDEO: int = 2;
+export const ACT_PICK_DOCUMENT: int = 3;
+export const ACT_PICK_MEDIA: int = 4;
+export const ACT_SHARE: int = 5;
+export const ACT_VIEW_URL: int = 6;
+export const ACT_DIAL: int = 7;
+export const ACT_EMAIL: int = 8;
+export const ACT_RECORD_AUDIO: int = 9;
+export const ACT_LOCATION_FINE: int = 10;
+export const ACT_LOCATION_COARSE: int = 11;
+export const ACT_NOTIFICATIONS: int = 12;
+export const ACT_CONTACTS: int = 13;
+
+// The configuration changes the Activity must absorb rather than restart on.
+// See point 1 above — this is not a tuning knob.
+export const CONFIG_CHANGES_DEFAULT: string =
+    "orientation|screenSize|screenLayout|smallestScreenSize|density|keyboard|keyboardHidden|navigation|uiMode|locale|layoutDirection|fontScale";
+
+// XML attribute-value escaping. Values reach here from app-supplied strings
+// (labels, package names, provider authorities), so this is not optional —
+// an unescaped quote silently produces a malformed manifest, and aapt2's
+// error will point at the wrong place.
+fn xesc(s: string): string {
+    let out = "";
+    for (let i in 0..s.len) {
+        let c = s[i];
+        if (c == 38) { out = out + "&amp;"; }        // &
+        else if (c == 60) { out = out + "&lt;"; }    // <
+        else if (c == 62) { out = out + "&gt;"; }    // >
+        else if (c == 34) { out = out + "&quot;"; }  // "
+        else if (c == 39) { out = out + "&apos;"; }  // '
+        else { out = out + s.slice(i, i + 1); }
+    }
+    return out;
+}
+
+fn xbool(b: bool): string {
+    if (b) { return "true"; }
+    return "false";
+}
+
+fn contains(xs: string[], v: string): bool {
+    for (let x in xs) {
+        if (x == v) { return true; }
+    }
+    return false;
+}
+
+// A uses-feature line. required=false is almost always what you want: a
+// required feature removes the app from Play search results for every device
+// that lacks it, which is rarely the intent for an optional camera path.
+class Feature {
+    name: string;
+    required: bool;
+
+    fn init(name: string, required: bool) {
+        this.name = name;
+        this.required = required;
+    }
+}
+
+// One <intent> inside <queries>. scheme is "" when the intent has no data part.
+class Query {
+    action: string;
+    scheme: string;
+
+    fn init(action: string, scheme: string) {
+        this.action = action;
+        this.scheme = scheme;
+    }
+}
+
+class Meta {
+    name: string;
+    value: string;
+
+    fn init(name: string, value: string) {
+        this.name = name;
+        this.value = value;
+    }
+}
+
+export class Manifest {
+    package_name: string;
+    app_label: string;
+
+    version_code: int;
+    version_name: string;
+    min_sdk: int;
+    target_sdk: int;
+
+    app_icon: string;
+    app_theme: string;
+    debuggable: bool;
+    allow_backup: bool;
+    hardware_accelerated: bool;
+    // false keeps .so files uncompressed and page-mapped straight out of the
+    // APK, which is both faster to load and smaller on disk than extracting.
+    extract_native_libs: bool;
+
+    activity_name: string;
+    launch_mode: string;
+    orientation: string;
+    soft_input_mode: string;
+    config_changes: string;
+
+    permissions: string[];
+    features: Feature[];
+    queries: Query[];
+    meta: Meta[];
+    need_file_provider: bool;
+
+    fn init(package_name: string, app_label: string) {
+        this.package_name = package_name;
+        this.app_label = app_label;
+
+        this.version_code = 1;
+        this.version_name = "1.0";
+        // 24 is the floor for the NDK toolchain we target; 34 keeps the photo
+        // picker and the predictive-back APIs available.
+        this.min_sdk = 24;
+        this.target_sdk = 34;
+
+        this.app_icon = "@mipmap/ic_launcher";
+        this.app_theme = "@android:style/Theme.Material.NoActionBar";
+        this.debuggable = false;
+        this.allow_backup = true;
+        this.hardware_accelerated = true;
+        this.extract_native_libs = false;
+
+        // The runtime Activity, fully qualified because it lives in the Vyto
+        // package rather than the app's. Apps needing custom behaviour subclass
+        // it and set their own name here.
+        this.activity_name = "dev.vyto.android.VytoActivity";
+        this.launch_mode = "singleTop";
+        this.orientation = "unspecified";
+        // adjustResize makes the soft keyboard shrink the window, which fires
+        // EV_RESIZE and re-runs layout. It is the cheapest correct answer to
+        // keyboard insets — without it the keyboard simply covers the focused
+        // field and nothing in the toolkit notices.
+        this.soft_input_mode = "adjustResize";
+        this.config_changes = CONFIG_CHANGES_DEFAULT;
+
+        this.permissions = [];
+        this.features = [];
+        this.queries = [];
+        this.meta = [];
+        this.need_file_provider = false;
+    }
+
+    // -- fluent setters ------------------------------------------------------
+    fn version(code: int, name: string): Manifest {
+        this.version_code = code;
+        this.version_name = name;
+        return this;
+    }
+
+    fn sdk(min: int, target: int): Manifest {
+        this.min_sdk = min;
+        this.target_sdk = target;
+        return this;
+    }
+
+    fn icon(v: string): Manifest { this.app_icon = v; return this; }
+    fn theme(v: string): Manifest { this.app_theme = v; return this; }
+    fn debug(v: bool): Manifest { this.debuggable = v; return this; }
+    fn backup(v: bool): Manifest { this.allow_backup = v; return this; }
+    fn activity(v: string): Manifest { this.activity_name = v; return this; }
+
+    // "portrait", "landscape", "sensor", "unspecified". Locking orientation is
+    // still safe with configChanges set — the Activity is simply never asked.
+    fn lock_orientation(v: string): Manifest { this.orientation = v; return this; }
+
+    // Escape hatch for the Activity-restart default. Named to be conspicuous
+    // in a diff, because taking it means an unrecoverable teardown on every
+    // rotation until Window grows a non-terminal shutdown path. See point 1.
+    fn allow_activity_restart_UNSAFE(): Manifest {
+        this.config_changes = "";
+        return this;
+    }
+
+    fn permission(name: string): Manifest {
+        if (!contains(this.permissions, name)) { this.permissions.push(name); }
+        return this;
+    }
+
+    // vyto/mobile/android/net needs this and there is nothing to prompt for —
+    // INTERNET is install-time, not one of the dangerous runtime permissions in
+    // actions.vt, so declaring it here is the whole of the work. An app that
+    // forgets it gets a connection refused on every request with no hint why,
+    // which is why this is a named helper rather than a string to remember.
+    fn needs_net(): Manifest {
+        return this.permission(PERM_INTERNET);
+    }
+
+    fn feature(name: string, required: bool): Manifest {
+        for (let f in this.features) {
+            if (f.name == name) { return this; }
+        }
+        this.features.push(new Feature(name, required));
+        return this;
+    }
+
+    fn query(action: string, scheme: string): Manifest {
+        for (let q in this.queries) {
+            if (q.action == action && q.scheme == scheme) { return this; }
+        }
+        this.queries.push(new Query(action, scheme));
+        return this;
+    }
+
+    fn metadata(name: string, value: string): Manifest {
+        this.meta.push(new Meta(name, value));
+        return this;
+    }
+
+    fn file_provider(): Manifest {
+        this.need_file_provider = true;
+        return this;
+    }
+
+    fn provider_authority(): string {
+        return this.package_name + ".fileprovider";
+    }
+
+    // -- capability expansion ------------------------------------------------
+    // The point of the module: one declaration produces every manifest entry
+    // the capability needs, including the two nobody remembers (<queries> and
+    // the provider).
+    fn uses(act: int): Manifest {
+        if (act == ACT_CAMERA_IMAGE) {
+            this.permission(PERM_CAMERA);
+            this.feature("android.hardware.camera", false);
+            this.query("android.media.action.IMAGE_CAPTURE", "");
+            // ACTION_IMAGE_CAPTURE writes to a URI the app supplies, so the
+            // provider is a hard requirement, not a nicety.
+            this.file_provider();
+            return this;
+        }
+        if (act == ACT_CAMERA_VIDEO) {
+            this.permission(PERM_CAMERA);
+            this.feature("android.hardware.camera", false);
+            this.query("android.media.action.VIDEO_CAPTURE", "");
+            this.file_provider();
+            return this;
+        }
+        if (act == ACT_PICK_DOCUMENT) {
+            // SAF needs no permission at all — that is why actions.vt prefers
+            // it over direct file paths.
+            this.query("android.intent.action.OPEN_DOCUMENT", "");
+            this.query("android.intent.action.CREATE_DOCUMENT", "");
+            return this;
+        }
+        if (act == ACT_PICK_MEDIA) {
+            this.query("android.provider.action.PICK_IMAGES", "");
+            this.query("android.intent.action.PICK", "");
+            return this;
+        }
+        if (act == ACT_SHARE) {
+            this.query("android.intent.action.SEND", "");
+            // Sharing a file URI hands another app a grant on our content.
+            this.file_provider();
+            return this;
+        }
+        if (act == ACT_VIEW_URL) {
+            this.query("android.intent.action.VIEW", "https");
+            return this;
+        }
+        if (act == ACT_DIAL) {
+            this.query("android.intent.action.DIAL", "tel");
+            return this;
+        }
+        if (act == ACT_EMAIL) {
+            this.query("android.intent.action.SENDTO", "mailto");
+            return this;
+        }
+        if (act == ACT_RECORD_AUDIO) {
+            this.permission(PERM_RECORD_AUDIO);
+            this.feature("android.hardware.microphone", false);
+            return this;
+        }
+        if (act == ACT_LOCATION_FINE) {
+            this.permission(PERM_FINE_LOCATION);
+            this.feature("android.hardware.location.gps", false);
+            return this;
+        }
+        if (act == ACT_LOCATION_COARSE) {
+            this.permission(PERM_COARSE_LOCATION);
+            return this;
+        }
+        if (act == ACT_NOTIFICATIONS) {
+            this.permission(PERM_POST_NOTIFICATIONS);
+            return this;
+        }
+        if (act == ACT_CONTACTS) {
+            this.permission(PERM_READ_CONTACTS);
+            this.query("android.intent.action.PICK", "");
+            return this;
+        }
+        return this;
+    }
+
+    // -- validation ----------------------------------------------------------
+    // Problems that produce a manifest aapt2 accepts but a device rejects, or
+    // that break at runtime. Returns human-readable lines; empty means clean.
+    // Call this before render() in the build script and fail the build on any.
+    fn validate(): string[] {
+        let probs: string[] = [];
+        if (!this.package_name.contains(".")) {
+            probs.push("package name must have at least one dot: " + this.package_name);
+        }
+        if (this.min_sdk < 21) {
+            probs.push("minSdk " + str(this.min_sdk) +
+                       " is below 21; the NDK toolchain and jnigraphics assume 21+");
+        }
+        if (this.target_sdk < this.min_sdk) {
+            probs.push("targetSdk " + str(this.target_sdk) +
+                       " is below minSdk " + str(this.min_sdk));
+        }
+        if (this.config_changes == "") {
+            probs.push("configChanges is empty: rotation will restart the Activity, " +
+                       "and Window's teardown is terminal (ui/core.vt:2486). " +
+                       "Only allow_activity_restart_UNSAFE() should produce this.");
+        }
+        // Package visibility only bites permissions that pair with an outbound
+        // intent. Counting *every* permission flags an app that merely asked
+        // for INTERNET — which resolves no intents at all — and there is no way
+        // to silence it short of declaring a <queries> entry the app does not
+        // want. Install-time permissions are excluded for that reason.
+        let intent_perms = 0;
+        for (let p in this.permissions) {
+            if (!is_install_time_perm(p)) { intent_perms += 1; }
+        }
+        if (this.target_sdk >= 30 && this.queries.len == 0 && intent_perms > 0) {
+            probs.push("targetSdk >= 30 with permissions but no <queries>: " +
+                       "outbound intents will silently resolve to null. " +
+                       "Declare capabilities with uses(ACT_*) rather than " +
+                       "permission() alone.");
+        }
+        if (contains(this.permissions, PERM_CAMERA) && !this.need_file_provider) {
+            probs.push("CAMERA permission without a FileProvider: " +
+                       "ACTION_IMAGE_CAPTURE will crash on capture.");
+        }
+        return probs;
+    }
+
+    // -- rendering -----------------------------------------------------------
+    fn render(): string {
+        let x = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n";
+        x = x + "<manifest xmlns:android=\"http://schemas.android.com/apk/res/android\"\n";
+        x = x + "          package=\"" + xesc(this.package_name) + "\"\n";
+        x = x + "          android:versionCode=\"" + str(this.version_code) + "\"\n";
+        x = x + "          android:versionName=\"" + xesc(this.version_name) + "\">\n\n";
+
+        x = x + "    <uses-sdk android:minSdkVersion=\"" + str(this.min_sdk) +
+                "\" android:targetSdkVersion=\"" + str(this.target_sdk) + "\" />\n\n";
+
+        if (this.permissions.len > 0) {
+            for (let p in this.permissions) {
+                x = x + "    <uses-permission android:name=\"" + xesc(p) + "\" />\n";
+            }
+            x = x + "\n";
+        }
+
+        if (this.features.len > 0) {
+            for (let f in this.features) {
+                x = x + "    <uses-feature android:name=\"" + xesc(f.name) +
+                        "\" android:required=\"" + xbool(f.required) + "\" />\n";
+            }
+            x = x + "\n";
+        }
+
+        // Package visibility (API 30+). Without this the intents in actions.vt
+        // resolve to null on a real device and nothing reports why.
+        if (this.queries.len > 0) {
+            x = x + "    <queries>\n";
+            for (let q in this.queries) {
+                x = x + "        <intent>\n";
+                x = x + "            <action android:name=\"" + xesc(q.action) + "\" />\n";
+                if (q.scheme != "") {
+                    x = x + "            <data android:scheme=\"" + xesc(q.scheme) + "\" />\n";
+                }
+                x = x + "        </intent>\n";
+            }
+            x = x + "    </queries>\n\n";
+        }
+
+        x = x + "    <application\n";
+        x = x + "        android:label=\"" + xesc(this.app_label) + "\"\n";
+        x = x + "        android:icon=\"" + xesc(this.app_icon) + "\"\n";
+        x = x + "        android:theme=\"" + xesc(this.app_theme) + "\"\n";
+        x = x + "        android:allowBackup=\"" + xbool(this.allow_backup) + "\"\n";
+        x = x + "        android:debuggable=\"" + xbool(this.debuggable) + "\"\n";
+        x = x + "        android:hardwareAccelerated=\"" +
+                xbool(this.hardware_accelerated) + "\"\n";
+        x = x + "        android:extractNativeLibs=\"" +
+                xbool(this.extract_native_libs) + "\">\n\n";
+
+        x = x + "        <activity\n";
+        x = x + "            android:name=\"" + xesc(this.activity_name) + "\"\n";
+        // exported is mandatory on API 31+ for anything with an intent-filter,
+        // and the build fails rather than warns if it is missing.
+        x = x + "            android:exported=\"true\"\n";
+        x = x + "            android:launchMode=\"" + xesc(this.launch_mode) + "\"\n";
+        if (this.orientation != "unspecified") {
+            x = x + "            android:screenOrientation=\"" +
+                    xesc(this.orientation) + "\"\n";
+        }
+        x = x + "            android:windowSoftInputMode=\"" +
+                xesc(this.soft_input_mode) + "\"\n";
+        if (this.config_changes != "") {
+            x = x + "            android:configChanges=\"" +
+                    xesc(this.config_changes) + "\"\n";
+        }
+        x = x + "            >\n";
+        x = x + "            <intent-filter>\n";
+        x = x + "                <action android:name=\"android.intent.action.MAIN\" />\n";
+        x = x + "                <category android:name=\"android.intent.category.LAUNCHER\" />\n";
+        x = x + "            </intent-filter>\n";
+        x = x + "        </activity>\n";
+
+        if (this.need_file_provider) {
+            // dev.vyto.android.VytoProvider, not androidx FileProvider: AndroidX
+            // is an AAR, which is Maven resolution, which is Gradle, and the
+            // build path is deliberately Gradle-free (ANDROID.md, "No Gradle").
+            // Our provider serves only cache/shared and needs no file_paths.xml
+            // resource — the roots are not configurable, which is the point.
+            x = x + "\n        <provider\n";
+            x = x + "            android:name=\"dev.vyto.android.VytoProvider\"\n";
+            x = x + "            android:authorities=\"" +
+                    xesc(this.provider_authority()) + "\"\n";
+            x = x + "            android:exported=\"false\"\n";
+            x = x + "            android:grantUriPermissions=\"true\" />\n";
+        }
+
+        for (let m in this.meta) {
+            x = x + "\n        <meta-data android:name=\"" + xesc(m.name) +
+                    "\" android:value=\"" + xesc(m.value) + "\" />\n";
+        }
+
+        x = x + "\n    </application>\n";
+        x = x + "</manifest>\n";
+        return x;
+    }
+
+}

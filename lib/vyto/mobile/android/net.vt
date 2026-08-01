@@ -1,0 +1,372 @@
+// vyto/mobile/android/net — HTTP(S) for Android, through the platform stack
+// instead of libcurl. The Android tier of vyto/net/http, and a drop-in for it:
+//
+//     import { http_get, HttpPool } from "vyto/mobile/android/net";
+//
+//     let r = http_get("https://api.example.com/things")
+//                 .header("Authorization", "Bearer " + tok)
+//                 .query("limit", "10")
+//                 .timeoutMs(5000)
+//                 .send();
+//     if (r.ok()) { let j = r.json(); ... }
+//
+// The names, the builder chain and the soft-failure contract (a transport
+// failure gives status 0, never a panic) are the same as vyto/net/http, so
+// porting an app is an import swap.
+//
+// One thing deliberately does not port: http_set_ip_resolve / IP_V4 / IP_V6.
+// That exists to dodge a 5s AAAA-lookup stall on hosts with broken IPv6, and
+// it is a libcurl setting with no equivalent in the platform stack — Android
+// picks the family from the active network, which is the whole point of going
+// through it. An app that used it fails to compile here rather than silently
+// losing the behaviour.
+//
+// STATUS: written, never compiled — no NDK toolchain in this clone. The
+// C shim (native/src/anet_shim.c) is wrapped in #ifdef __ANDROID__, so this
+// module *compiles* on the host but a host program that actually calls it
+// will not link. Same contract as painter.vt. Design of record:
+// local/docs/ANDROID.md.
+//
+// -- why not libcurl ---------------------------------------------------------
+//
+// Android has no system libcurl, so vyto/net's backend would have to be
+// cross-built and shipped: curl plus a TLS library, plus a CA bundle, is 1-2MB
+// in the apk and — worse — a second trust store. An app doing that ignores the
+// device's Network Security Config, the user's installed CAs, the proxy the
+// device is configured with, and the VPN. Those are not niceties on Android;
+// they are what the platform guarantees about an app's traffic.
+//
+// HttpURLConnection gives all of it for free and costs one JNI hop per call,
+// which is nothing against a network round trip. Same trade the painter makes
+// against blend2d: use the platform's implementation, keep the Vyto API.
+//
+// -- threading ---------------------------------------------------------------
+//
+// Every call here blocks, exactly like vyto/net/http, and that is safe: the
+// Vyto thread is a background pthread attached to the JVM (jni_boot.c), never
+// the UI thread. Android would throw NetworkOnMainThreadException if it were
+// the other way around. HttpPool is the exception and runs a small Java
+// executor, because concurrency on one Vyto thread has to come from somewhere.
+//
+// The INTERNET permission is required and is not optional or promptable —
+// declare it with Manifest.permission(PERM_INTERNET), which needs_net() does
+// for you.
+
+import { json_parse, JsonValue } from "vyto/util/json";
+import { url_encode } from "vyto/util/url";
+
+extern "C" {
+    // Blocking request; returns an opaque response handle, or null on a
+    // transport failure. Never throws across the boundary — the Java side
+    // catches and reports status 0.
+    fn vta_http_perform(method: cstring, url: cstring, header_lines: cstring,
+                        body: cstring, body_len: i64, timeout_ms: i64): rawptr;
+    fn vta_http_status(h: rawptr): i64;
+    fn vta_http_body_data(h: rawptr): cstring;
+    fn vta_http_body_len(h: rawptr): i64;
+    fn vta_http_body_copy(h: rawptr, out: cstring, cap: i64): i64;
+    fn vta_http_headers(h: rawptr): cstring;
+    fn vta_http_free(h: rawptr);
+
+    // Streaming: the same request with the body left on the connection.
+    fn vta_http_open(method: cstring, url: cstring, header_lines: cstring,
+                     body: cstring, body_len: i64, timeout_ms: i64): rawptr;
+    fn vta_http_read(h: rawptr, buf: cstring, cap: i32): i32;
+    fn vta_http_chunk_copy(src: cstring, dst: cstring, len: i32);
+
+    // Concurrency, on a Java executor.
+    fn vta_http_pool_new(max_parallel: i32): rawptr;
+    fn vta_http_pool_add(p: rawptr, method: cstring, url: cstring, header_lines: cstring,
+                         body: cstring, body_len: i64, timeout_ms: i64): i32;
+    fn vta_http_pool_next(p: rawptr, timeout_ms: i32): i32;
+    fn vta_http_pool_take(p: rawptr, id: i32): rawptr;
+    fn vta_http_pool_free(p: rawptr);
+}
+
+// Chunk size for the streaming reader. One page: big enough that a large body
+// is not thousands of JNI hops, small enough that a slow trickle still reaches
+// the callback promptly.
+const STREAM_CHUNK: int = 4096;
+
+// A completed response. Owns the native buffer; freed on teardown.
+export class Response {
+    h: rawptr;
+    fn init(h: rawptr) { this.h = h; }
+
+    fn status(): int {
+        if (this.h == null) { return 0; }
+        return vta_http_status(this.h) as int;
+    }
+    fn ok(): bool { let s = this.status(); return s >= 200 && s < 300; }
+
+    // Body as text (NUL bytes truncate — use bytes() for binary).
+    fn text(): string {
+        if (this.h == null) { return ""; }
+        return str(vta_http_body_data(this.h));
+    }
+
+    // Body as raw bytes (binary-safe).
+    fn bytes(): byte[] {
+        if (this.h == null) { return bytes(0); }
+        let n = vta_http_body_len(this.h) as int;
+        if (n <= 0) { return bytes(0); }
+        let buf = bytes(n);
+        let got = vta_http_body_copy(this.h, buf as cstring, n as i64) as int;
+        if (got == n) { return buf; }
+        let out = bytes(got);
+        for (let i in 0..got) { out[i] = buf[i]; }
+        return out;
+    }
+
+    fn json(): JsonValue { return json_parse(this.text()); }
+
+    // Response headers, keys lowercased for case-insensitive lookup.
+    fn headers(): Map<string, string> {
+        let m = new Map<string, string>();
+        if (this.h == null) { return m; }
+        let raw = str(vta_http_headers(this.h));
+        let lines = raw.split("\n");
+        for (let line in lines) {
+            let ln = line.trim();
+            let c = ln.index_of(":");
+            if (c > 0) {
+                let k = ln.slice(0, c).trim().to_lower();
+                let v = ln.slice(c + 1, ln.len).trim();
+                m.set(k, v);
+            }
+        }
+        return m;
+    }
+
+    // A single header value (case-insensitive), or "" if absent.
+    fn header(k: string): string {
+        let m = this.headers();
+        let key = k.to_lower();
+        if (m.has(key)) { return m.get(key); }
+        return "";
+    }
+
+    deinit { if (this.h != null) { vta_http_free(this.h); this.h = null; } }
+}
+
+// A request under construction. Chain the builder methods, then `send`.
+export class Request {
+    method: string;
+    url: string;
+    hdrs: string;      // "Key: Value\n" accumulated
+    payload: string;
+    hasBody: bool;
+    timeout: int;
+    queried: bool;     // has the URL already gained a '?'
+
+    fn init(method: string, url: string) {
+        this.method = method;
+        this.url = url;
+        this.hdrs = "";
+        this.payload = "";
+        this.hasBody = false;
+        this.timeout = 0;
+        this.queried = url.index_of("?") >= 0;
+    }
+
+    fn header(k: string, v: string): Request {
+        this.hdrs = this.hdrs + k + ": " + v + "\n";
+        return this;
+    }
+    fn query(k: string, v: string): Request {
+        let sep = "?";
+        if (this.queried) { sep = "&"; }
+        this.url = this.url + sep + url_encode(k) + "=" + url_encode(v);
+        this.queried = true;
+        return this;
+    }
+    fn body(s: string): Request {
+        this.payload = s;
+        this.hasBody = true;
+        return this;
+    }
+    fn json(v: JsonValue): Request {
+        this.payload = v.stringify();
+        this.hasBody = true;
+        return this.header("Content-Type", "application/json");
+    }
+    fn timeoutMs(ms: int): Request { this.timeout = ms; return this; }
+
+    fn body_len(): int {
+        if (this.hasBody) { return this.payload.len; }
+        return 0;
+    }
+
+    fn send(): Response {
+        let h = vta_http_perform(this.method.cstr(), this.url.cstr(), this.hdrs.cstr(),
+                                 this.payload.cstr(), this.body_len() as i64,
+                                 this.timeout as i64);
+        return new Response(h);
+    }
+
+    // Run the request and hand the body to `onChunk` as it arrives, instead of
+    // buffering it whole. For a download that does not fit in memory, or a
+    // response that should start being processed before it ends. Returns the
+    // number of bytes delivered, or -1 if the connection never opened.
+    fn stream(onChunk: fn(cstring, i32)): int {
+        let h = vta_http_open(this.method.cstr(), this.url.cstr(), this.hdrs.cstr(),
+                              this.payload.cstr(), this.body_len() as i64,
+                              this.timeout as i64);
+        if (h == null) { return -1; }
+        let buf = bytes(STREAM_CHUNK);
+        let total = 0;
+        let n = vta_http_read(h, buf as cstring, STREAM_CHUNK as i32) as int;
+        while (n > 0) {
+            onChunk(buf as cstring, n as i32);
+            total = total + n;
+            n = vta_http_read(h, buf as cstring, STREAM_CHUNK as i32) as int;
+        }
+        // read returns -1 for both EOF and error; the handle owns the socket
+        // either way and freeing it is what closes the connection.
+        vta_http_free(h);
+        return total;
+    }
+
+    // A deterministic dump of the assembled request (no network) — handy for
+    // tests and debugging.
+    fn preview(): string {
+        let s = this.method + " " + this.url + "\n";
+        s = s + this.hdrs;
+        if (this.hasBody) { s = s + "body: " + this.payload; }
+        return s;
+    }
+}
+
+// ---- concurrent client ----------------------------------------------------
+//
+// Run many requests at once. Vyto has one thread, so the concurrency lives in
+// a Java executor; this side stays blocking and single-threaded.
+//
+//     let pool = new HttpPool();
+//     let a = pool.add(http_get("https://a/1"));
+//     let b = pool.add(http_get("https://a/2"));
+//     for (let p in pool.runAll(30000)) {
+//         print(p.id + " " + p.url + " -> " + p.resp.status());
+//     }
+//
+// Completions arrive in finish order, not submission order, which is why each
+// carries its id back.
+
+// Default parallelism. Matches what a phone radio and the platform's own
+// connection pool are happy with; more sockets on a mobile link makes every
+// request slower, not the batch faster.
+const POOL_PARALLEL: int = 4;
+
+export class PooledResponse {
+    id: int;
+    url: string;
+    resp: Response;
+    fn init(id: int, url: string, resp: Response) {
+        this.id = id;
+        this.url = url;
+        this.resp = resp;
+    }
+}
+
+export class HttpPool {
+    h: rawptr;
+    ids: int[];
+    urls: string[];
+    pending: int;
+
+    fn init() {
+        this.h = vta_http_pool_new(POOL_PARALLEL as i32);
+        this.ids = [];
+        this.urls = [];
+        this.pending = 0;
+    }
+
+    // Queue a request. Returns its id, which comes back on the PooledResponse.
+    fn add(req: Request): int {
+        if (this.h == null) { return -1; }
+        let id = vta_http_pool_add(this.h, req.method.cstr(), req.url.cstr(),
+                                   req.hdrs.cstr(), req.payload.cstr(),
+                                   req.body_len() as i64, req.timeout as i64) as int;
+        if (id < 0) { return -1; }
+        this.ids.push(id);
+        this.urls.push(req.url);
+        this.pending = this.pending + 1;
+        return id;
+    }
+
+    fn url_of(id: int): string {
+        for (let i in 0..this.ids.len) {
+            if (this.ids[i] == id) { return this.urls[i]; }
+        }
+        return "";
+    }
+
+    // Collect whatever has finished within timeoutMs. Returns an empty array
+    // when nothing completed in the window; the rest stay queued.
+    fn poll(timeoutMs: int): PooledResponse[] {
+        let out: PooledResponse[] = [];
+        if (this.h == null) { return out; }
+        let id = vta_http_pool_next(this.h, timeoutMs as i32) as int;
+        while (id >= 0) {
+            let rh = vta_http_pool_take(this.h, id as i32);
+            out.push(new PooledResponse(id, this.url_of(id), new Response(rh)));
+            this.pending = this.pending - 1;
+            // drain anything else already finished without waiting again
+            id = vta_http_pool_next(this.h, 0 as i32) as int;
+        }
+        return out;
+    }
+
+    // Drive every queued request to completion and return them all.
+    fn runAll(timeoutMs: int): PooledResponse[] {
+        let out: PooledResponse[] = [];
+        while (this.pending > 0) {
+            let got = this.poll(timeoutMs);
+            if (got.len == 0) { break; }   // timed out with work outstanding
+            for (let p in got) { out.push(p); }
+        }
+        return out;
+    }
+
+    deinit { if (this.h != null) { vta_http_pool_free(this.h); this.h = null; } }
+}
+
+// ---- entry points ---------------------------------------------------------
+// Same spellings as vyto/net/http, so the import is the only thing that
+// changes when an app moves to the Android tier.
+
+export fn http_request(method: string, url: string): Request { return new Request(method, url); }
+export fn http_get(url: string): Request { return new Request("GET", url); }
+export fn http_post(url: string): Request { return new Request("POST", url); }
+export fn http_put(url: string): Request { return new Request("PUT", url); }
+export fn http_delete(url: string): Request { return new Request("DELETE", url); }
+export fn http_head(url: string): Request { return new Request("HEAD", url); }
+export fn http_patch(url: string): Request { return new Request("PATCH", url); }
+
+// Convenience streaming forms, matching vyto/net/http's free functions.
+export fn http_stream_get(url: string, onChunk: fn(cstring, i32)): int {
+    return new Request("GET", url).stream(onChunk);
+}
+export fn http_stream_post(url: string, body: string, onChunk: fn(cstring, i32)): int {
+    return new Request("POST", url).body(body).stream(onChunk);
+}
+
+// Full control: any method, header lines ("Key: Value\n"-joined), body, and
+// an optional total timeout (0 = none).
+export fn http_stream_request(method: string, url: string, headers: string, body: string,
+                              timeoutMs: int, onChunk: fn(cstring, i32)): int {
+    let r = new Request(method, url);
+    r.hdrs = headers;
+    if (body.len > 0) { r.body(body); }
+    r.timeout = timeoutMs;
+    return r.stream(onChunk);
+}
+
+// Binary-safe copy of a streamed chunk into a Vyto byte[]. The chunk points
+// into the reader's reusable buffer and is only valid for the duration of the
+// callback, so anything kept past it must be copied.
+export fn http_chunk_bytes(chunk: cstring, len: int): byte[] {
+    let b = bytes(len);
+    vta_http_chunk_copy(chunk, b as cstring, len as i32);
+    return b;
+}
