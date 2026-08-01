@@ -1,0 +1,1141 @@
+// vyto/net/server — an HTTP/1.1 server. The other half of vyto/net/http.
+//
+//     let s = server(8080);
+//     s.get("/health", (req, res) => { res.text(200, "ok"); });
+//     s.get("/users/:id", (req, res) => { res.text(200, req.param("id")); });
+//     s.runSingle();
+//
+// Design of record: local/docs/FOC-APPS.md §10 (VytoWeb).
+//
+// -- what works today --------------------------------------------------------
+//
+// runSingle(): a blocking accept loop — parse, route, respond, keep-alive.
+// Correct and testable, one connection at a time. run() (pre-fork, one worker
+// per core over SO_REUSEPORT) is NOT implemented; the socket layer has no
+// SO_REUSEPORT yet (socket_shim.c sets SO_REUSEADDR only, line 139).
+//
+// -- why the shapes look like this -------------------------------------------
+//
+// THE REQUEST IS A VIEW, NOT A COPY. One recv into a per-connection buffer; the
+// parser records each header as an (offset, len) pair into that buffer and
+// allocates nothing per header. Reference counting means every object reaching
+// the request path costs inc/dec traffic an ownership language does not pay, so
+// the discipline is to keep objects OUT of the path rather than make them
+// cheaper. Accessors materialise a string only when a handler asks. See the
+// bulk-data rule in CLAUDE.md.
+//
+// -- and the part that is different from every other module in this repo -----
+//
+// THIS IS ATTACKER-FACING. Nothing else in vyto/ is. Every length in a request
+// is hostile input: Content-Length, header count, URI length, header size. Each
+// is capped BEFORE it reaches an allocation, and every cap lives in `Limits`
+// rather than inline, so the whole attack surface is auditable in one place.
+//
+// Slowloris is a design constraint, not a later fix: a server with no
+// per-connection timeout dies to a hundred idle sockets. setTimeoutMs on the
+// accepted socket is what bounds it.
+
+import { Socket, PollSet, POLL_READ, POLL_WRITE,
+         socket_listen_on, socket_listen_reuseport } from "vyto/net/socket";
+import { StringBuilder } from "vyto/util/text";
+import { monoMs, unixSec } from "vyto/util/time";
+import { date_from_unix, date_format } from "vyto/util/date";
+
+// Plain libc — no shim, nothing to #link. fork/waitpid are the whole pre-fork
+// mechanism; sysconf answers "how many cores".
+extern "C" {
+    fn fork(): i32;
+    fn waitpid(pid: i32, status: rawptr, options: i32): i32;
+    fn getpid(): i32;
+    fn sysconf(name: i32): i64;
+    fn _exit(code: i32);
+}
+const SC_NPROCESSORS_ONLN: int = 84;   // Linux value
+
+// Names are Server*-prefixed on purpose: vyto/net/http already exports Request
+// and Response for the *client* side, and an app that both calls and serves
+// would otherwise alias one of them at every import.
+
+// ---------------------------------------------------------------- limits
+//
+// The whole hostile-input surface, in one auditable block. Every field is a
+// hard cap enforced before allocation, not a hint.
+export class Limits {
+    max_request_line: int;   // bytes; method + URI + version
+    max_header_count: int;
+    max_header_bytes: int;   // total across all headers
+    max_body_bytes: int;
+
+    // Slowloris budget: the socket timeout bounds how long a peer may dribble.
+    recv_timeout_ms: int;
+
+    // Requests served on one connection before the server closes it. This is a
+    // resource bound, not a correctness one — it caps how long a single peer
+    // can hold a slot and forces periodic redistribution across pre-fork
+    // workers.
+    //
+    // It was 100, and that was measurably too low. Connection setup costs ~5.5x
+    // a request here, so at 70k req/s a cap of 100 forces ~700 reconnects per
+    // second. At 1,000 connections those are absorbed; at 10,000 they queue
+    // behind everything else and show up as client timeouts — three separate
+    // runs put timeouts at 0.93-0.96x the number of connections the cap closed.
+    // nginx moved its equivalent from 100 to 1000 for the same reason.
+    max_keepalive_reqs: int;
+
+    fn init() {
+        this.max_request_line   = 8 * 1024;
+        this.max_header_count   = 100;
+        this.max_header_bytes   = 32 * 1024;
+        this.max_body_bytes     = 1024 * 1024;
+        this.recv_timeout_ms    = 15 * 1000;
+        this.max_keepalive_reqs = 2048;
+    }
+}
+
+// ---------------------------------------------------------------- helpers
+
+fn hdr_name_is(a: string, b: string): bool {
+    if (a.len != b.len) { return false; }
+    for (let i in 0..a.len) {
+        if (lower_b(a[i]) != lower_b(b[i])) { return false; }
+    }
+    return true;
+}
+
+fn lower_b(c: int): int {
+    if (c >= 65 && c <= 90) { return c + 32; }
+    return c;
+}
+
+// Byte-wise case-insensitive compare of raw[off..off+len) against `name`.
+// Compares in place — the header name is never materialised to compare it.
+fn hdr_eq(raw: byte[], off: int, len: int, name: string): bool {
+    if (len != name.len) { return false; }
+    for (let i in 0..len) {
+        if (lower_b(raw[off + i]) != lower_b(name[i])) { return false; }
+    }
+    return true;
+}
+
+// Index of the next `\n` at or after `at`, or -1. (`from` is a keyword.)
+fn find_lf(raw: byte[], at: int, end: int): int {
+    let i = at;
+    while (i < end) {
+        if (raw[i] == 10) { return i; }
+        i += 1;
+    }
+    return -1;
+}
+
+fn slice_str(raw: byte[], off: int, len: int): string {
+    if (len <= 0 || off < 0 || off + len > raw.len) { return ""; }
+    let part = raw.slice(off, off + len);
+    return strbytes(part, len);
+}
+
+// Parse a non-negative decimal. -1 on empty, non-digit, or overflow past cap.
+fn parse_uint(raw: byte[], off: int, len: int, cap: int): int {
+    if (len <= 0) { return -1; }
+    let v = 0;
+    for (let i in 0..len) {
+        let c = raw[off + i];
+        if (c < 48 || c > 57) { return -1; }
+        v = v * 10 + (c - 48);
+        // Bound inside the loop, not after: a 40-digit Content-Length must not
+        // be allowed to overflow before the check happens.
+        if (v > cap) { return -1; }
+    }
+    return v;
+}
+
+// Scan for the end of the header block. Returns the offset just past the blank
+// line, or -1. Tolerates bare-LF line endings as well as CRLF.
+fn find_head_end(raw: byte[], used: int): int {
+    let i = 0;
+    while (i + 1 < used) {
+        if (raw[i] == 10 && raw[i + 1] == 10) { return i + 2; }
+        if (i + 3 < used && raw[i] == 13 && raw[i + 1] == 10
+            && raw[i + 2] == 13 && raw[i + 3] == 10) { return i + 4; }
+        i += 1;
+    }
+    return -1;
+}
+
+fn mono_ms(): int { return monoMs() as int; }
+
+
+fn core_count(): int {
+    let n = sysconf(SC_NPROCESSORS_ONLN as i32) as int;
+    if (n < 1) { return 1; }
+    return n;
+}
+
+// One live connection. The buffer lives as long as the connection and is reset
+// between keep-alive requests rather than reallocated — the arena rule from
+// CLAUDE.md, and also a correctness requirement: a pipelined client sends the
+// next request in the same packet as this one.
+// A connection's buffer starts SMALL and grows on demand toward `cap`.
+//
+// It used to be allocated at full size — max_request_line + max_header_bytes +
+// 1024, about 41 KB — on every accept. That is fine at a thousand connections
+// and a throughput cliff at ten thousand: 2500 conns/worker x 41 KB is a 102 MB
+// working set per worker, far past any cache. Measured: 82.6k req/s at 1k
+// connections, 56.1k at 10k, 41.0k at 20k, with timeouts appearing above 1k.
+//
+// A typical request here is ~120 bytes of headers, so starting at 2 KB covers
+// the common case in one allocation and never touches the rest. `cap` stays
+// exactly where it was — it is the security bound, and nothing about that
+// changes; it simply stops being the *allocation*.
+const CONN_INIT_BYTES: int = 2048;
+
+// How often the idle sweep runs. Dropping stalled connections is coarse work;
+// running it on every wakeup was pure overhead at high request rates.
+const SWEEP_INTERVAL_MS: int = 500;
+
+// Bytes requested per read. A short read means the socket is drained.
+const RECV_CHUNK: int = 4096;
+
+class Conn {
+    sock: Socket;
+    raw: byte[];
+    used: int;
+    cap: int;           // hard ceiling; raw.len grows toward this, never past
+    served: int;
+    deadline: int;      // monotonic ms; past this the connection is dropped
+
+    // Pending output. A non-blocking socket can accept only part of a response,
+    // and the unsent tail has to survive until the socket is writable again —
+    // otherwise it is simply lost, which shows up as a truncated body rather
+    // than as an error.
+    //
+    // Held in a reusable StringBuilder, sent directly from its internal buffer
+    // via trySendRaw. Nothing is materialised as a string per response.
+    //
+    // Two earlier attempts were worse. A byte[] copy cost 17.9% on a 900-byte
+    // body. A string still forced `out.toString()` — a full copy of headers
+    // plus body on every response. Sending from the builder removes both, and
+    // clear() keeps the capacity, so a connection allocates its output buffer
+    // once and reuses it for every request it ever serves.
+    out: StringBuilder;
+    out_off: int;
+    want_write: bool;   // registered for POLL_WRITE
+
+    fn init(sock: Socket, L: Limits) {
+        this.sock = sock;
+        this.cap = L.max_request_line + L.max_header_bytes + 1024;
+        let n = CONN_INIT_BYTES;
+        if (n > this.cap) { n = this.cap; }
+        this.raw = bytes(n);
+        this.used = 0;
+        this.served = 0;
+        this.deadline = mono_ms() + L.recv_timeout_ms;
+        this.out = new StringBuilder(1024);
+        this.out_off = 0;
+        this.want_write = false;
+    }
+
+    fn hasPending(): bool { return this.out_off < this.out.len(); }
+
+    // The builder responses are written into. Pipelined responses append to the
+    // same buffer, so they leave in order for free.
+    fn outBuf(): StringBuilder { return this.out; }
+
+    // Push as much pending output as the socket will take.
+    //  1 = everything flushed, 0 = partial (wait for writable), -1 = dead
+    fn flush(): int {
+        while (this.out_off < this.out.len()) {
+            let n = this.sock.trySendRaw(this.out.cstr(), this.out_off,
+                                         this.out.len() - this.out_off);
+            if (n == -1) { return 0; }          // would block
+            if (n < 0) { return -1; }           // error
+            this.out_off += n;
+        }
+        // clear() keeps the capacity — the buffer is allocated once per
+        // connection, not once per response.
+        this.out.clear();
+        this.out_off = 0;
+        return 1;
+    }
+
+    // Ensure raw holds at least `need` bytes. Doubles, clamped to cap.
+    // False means the request exceeds the cap — the caller answers 431/413.
+    fn reserve(need: int): bool {
+        if (need <= this.raw.len) { return true; }
+        if (need > this.cap) { return false; }
+        let n = this.raw.len;
+        while (n < need) { n = n * 2; }
+        if (n > this.cap) { n = this.cap; }
+        let nb = bytes(n);
+        for (let i in 0..this.used) { nb[i] = this.raw[i]; }
+        this.raw = nb;
+        return true;
+    }
+}
+
+// --------------------------------------------------------------- request
+//
+// A view over the connection's receive buffer. Nothing here owns a string:
+// `raw` is the buffer and every accessor slices on demand.
+export class ServerRequest {
+    raw: byte[];          // borrowed; owned by the connection
+
+    method_off: int;  method_len: int;
+    path_off: int;    path_len: int;
+    query_off: int;   query_len: int;
+
+    // Parallel arrays, not a Map: a Map allocates a node per header and hashes
+    // a string that already exists in the buffer. A linear scan over at most
+    // max_header_count entries beats hashing at this size and allocates nothing.
+    hname_off: int[];  hname_len: int[];
+    hval_off: int[];   hval_len: int[];
+
+    body_off: int;    body_len: int;
+    head_end: int;        // offset just past the blank line; where a body starts
+
+    keep_alive: bool;
+    version_minor: int;
+
+    param_names: string[];
+    param_vals: string[];
+
+    fn init(raw: byte[]) {
+        this.raw = raw;
+        this.method_off = -1; this.method_len = 0;
+        this.path_off = -1;   this.path_len = 0;
+        this.query_off = -1;  this.query_len = 0;
+        this.hname_off = []; this.hname_len = [];
+        this.hval_off = [];  this.hval_len = [];
+        this.body_off = -1;  this.body_len = 0;
+        this.head_end = -1;
+        this.keep_alive = true;
+        this.version_minor = 1;
+        this.param_names = []; this.param_vals = [];
+    }
+
+    fn method(): string { return slice_str(this.raw, this.method_off, this.method_len); }
+    fn path(): string { return slice_str(this.raw, this.path_off, this.path_len); }
+    fn query(): string { return slice_str(this.raw, this.query_off, this.query_len); }
+
+    fn header(name: string): string {
+        for (let i in 0..this.hname_off.len) {
+            if (hdr_eq(this.raw, this.hname_off[i], this.hname_len[i], name)) {
+                return slice_str(this.raw, this.hval_off[i], this.hval_len[i]);
+            }
+        }
+        return "";
+    }
+
+    fn hasHeader(name: string): bool {
+        for (let i in 0..this.hname_off.len) {
+            if (hdr_eq(this.raw, this.hname_off[i], this.hname_len[i], name)) { return true; }
+        }
+        return false;
+    }
+
+    fn headerCount(): int { return this.hname_off.len; }
+
+    fn param(name: string): string {
+        for (let i in 0..this.param_names.len) {
+            if (this.param_names[i] == name) { return this.param_vals[i]; }
+        }
+        return "";
+    }
+
+    // Query-string lookup, parsed on demand. Most handlers read none, so this
+    // stays out of the parse path.
+    fn queryParam(name: string): string {
+        let q = this.query();
+        if (q.len == 0) { return ""; }
+        let parts = q.split("&");
+        for (let p in parts) {
+            let eq = p.index_of("=");
+            if (eq < 0) {
+                if (p == name) { return ""; }
+                continue;
+            }
+            if (p.slice(0, eq) == name) { return p.slice(eq + 1, p.len); }
+        }
+        return "";
+    }
+
+    fn body(): byte[] {
+        if (this.body_len <= 0) { return bytes(0); }
+        return this.raw.slice(this.body_off, this.body_off + this.body_len);
+    }
+    fn bodyText(): string { return slice_str(this.raw, this.body_off, this.body_len); }
+}
+
+// -------------------------------------------------------------- response
+//
+// Built into a StringBuilder, then written once. Not a concat chain:
+// header-by-header concatenation is quadratic and this is the hot path — the
+// same reason the language has no `join` (docs/strings.md §3).
+export class ServerResponse {
+    status: int;
+    hdrs: StringBuilder;
+    body_str: string;
+    sent: bool;
+    keep_alive: bool;
+    has_date: bool;     // handler set its own Date; server must not add another
+
+    fn init() {
+        this.status = 200;
+        this.hdrs = new StringBuilder(256);
+        this.body_str = "";
+        this.sent = false;
+        this.keep_alive = true;
+        this.has_date = false;
+    }
+
+    // Rejects CR and LF in the value. A handler that echoes user input into a
+    // header is the classic response-splitting bug; refusing here means it
+    // cannot be written by accident.
+    fn header(name: string, value: string): ServerResponse {
+        for (let i in 0..value.len) {
+            if (value[i] == 13 || value[i] == 10) { return this; }
+        }
+        // RFC 7231 makes Date mandatory and the server emits it from a cache.
+        // Noting an explicit one here keeps a handler that sets its own from
+        // producing a duplicate header.
+        if (name.len == 4 && hdr_name_is(name, "Date")) { this.has_date = true; }
+        this.hdrs.append(name).append(": ").append(value).append("\r\n");
+        return this;
+    }
+
+    fn text(status: int, body: string): ServerResponse {
+        this.status = status;
+        this.body_str = body;
+        return this.header("Content-Type", "text/plain; charset=utf-8");
+    }
+
+    fn html(status: int, body: string): ServerResponse {
+        this.status = status;
+        this.body_str = body;
+        return this.header("Content-Type", "text/html; charset=utf-8");
+    }
+
+    // Takes serialized JSON. vyto/util/json builds a JsonValue tree, which is
+    // the wrong shape for a hot path — a pull parser over the buffer is the gap
+    // FOC-APPS §10 records — so the handler decides how its JSON is produced.
+    fn json(status: int, body: string): ServerResponse {
+        this.status = status;
+        this.body_str = body;
+        return this.header("Content-Type", "application/json");
+    }
+
+    fn redirect(status: int, location: string): ServerResponse {
+        this.status = status;
+        this.body_str = "";
+        return this.header("Location", location);
+    }
+}
+
+fn status_text(code: int): string {
+    if (code == 200) { return "OK"; }
+    if (code == 201) { return "Created"; }
+    if (code == 204) { return "No Content"; }
+    if (code == 301) { return "Moved Permanently"; }
+    if (code == 302) { return "Found"; }
+    if (code == 304) { return "Not Modified"; }
+    if (code == 400) { return "Bad Request"; }
+    if (code == 401) { return "Unauthorized"; }
+    if (code == 403) { return "Forbidden"; }
+    if (code == 404) { return "Not Found"; }
+    if (code == 405) { return "Method Not Allowed"; }
+    if (code == 408) { return "Request Timeout"; }
+    if (code == 413) { return "Payload Too Large"; }
+    if (code == 414) { return "URI Too Long"; }
+    if (code == 431) { return "Request Header Fields Too Large"; }
+    if (code == 500) { return "Internal Server Error"; }
+    if (code == 501) { return "Not Implemented"; }
+    if (code == 505) { return "HTTP Version Not Supported"; }
+    return "Unknown";
+}
+
+// ---------------------------------------------------------------- routing
+//
+// A linear scan is the correct v1: a radix tree is the target, but swap it in
+// when a profile says routing is measurable, not before.
+class Route {
+    method: string;
+    segs: string[];       // pattern split on "/", ":name" marks a param
+    handler: fn(ServerRequest, ServerResponse);
+
+    fn init(method: string, pattern: string, handler: fn(ServerRequest, ServerResponse)) {
+        this.method = method;
+        this.segs = pattern.split("/");
+        this.handler = handler;
+    }
+
+    // Match `path` against the pattern, filling req's params on success.
+    fn match_(path: string, req: ServerRequest): bool {
+        let ps = path.split("/");
+        if (ps.len != this.segs.len) { return false; }
+        for (let i in 0..this.segs.len) {
+            let s = this.segs[i];
+            if (s.len > 0 && s[0] == 58) {          // ':' — a param
+                req.param_names.push(s.slice(1, s.len));
+                req.param_vals.push(ps[i]);
+                continue;
+            }
+            if (s != ps[i]) { return false; }
+        }
+        return true;
+    }
+}
+
+// ----------------------------------------------------------------- server
+export class Server {
+    port: int;
+    host: string;
+    limits: Limits;
+    routes: Route[];
+    running: bool;
+    listener: Socket;
+    workers: int;        // 0 = one per core
+    max_conns: int;      // fd table size; a connection past this is refused
+    // Accept-queue depth passed to listen(2). The kernel clamps this to
+    // net.core.somaxconn (4096 on modern Linux), so anything smaller is a
+    // self-imposed limit. 512 was arbitrary and measurably wrong: a burst of
+    // 10k simultaneous connects overflowed it and the kernel dropped the SYNs,
+    // which surfaces as client-side connect errors and looks like a server
+    // fault. See local/docs/HTTP.md.
+    backlog: int;
+
+    // RFC 7231 requires a Date header on every response, and it changes once a
+    // second. Formatting it per request is a strftime plus a timezone lookup
+    // tens of thousands of times a second to produce the same string — measured
+    // as a real share of handler cost before this existed. Cached here and
+    // refreshed on the second, the way nginx does it.
+    date_cache: string;
+    date_sec: int;
+
+    fn init(port: int) {
+        this.port = port;
+        this.host = "";
+        this.limits = new Limits();
+        this.routes = [];
+        this.running = false;
+        this.workers = 0;
+        this.max_conns = 4096;
+        this.backlog = 4096;
+        this.date_cache = "";
+        this.date_sec = -1;
+    }
+
+    // IMF-fixdate in GMT, per RFC 7231. Reformatted at most once per second.
+    fn httpDate(): string {
+        let now = unixSec() as int;
+        if (now != this.date_sec) {
+            this.date_sec = now;
+            // Literal "GMT" rather than %Z: the value is UTC by construction and
+            // %Z would emit whatever the process timezone is called.
+            this.date_cache = date_format(date_from_unix(now as i64),
+                                          "%a, %d %b %Y %H:%M:%S GMT");
+        }
+        return this.date_cache;
+    }
+
+    fn bindHost(h: string): Server { this.host = h; return this; }
+    fn withLimits(l: Limits): Server { this.limits = l; return this; }
+    fn withWorkers(n: int): Server { this.workers = n; return this; }
+    fn withMaxConns(n: int): Server { this.max_conns = n; return this; }
+    fn withBacklog(n: int): Server { this.backlog = n; return this; }
+
+    fn route(method: string, pattern: string, h: fn(ServerRequest, ServerResponse)): Server {
+        this.routes.push(new Route(method, pattern, h));
+        return this;
+    }
+    fn get(p: string, h: fn(ServerRequest, ServerResponse)): Server { return this.route("GET", p, h); }
+    fn post(p: string, h: fn(ServerRequest, ServerResponse)): Server { return this.route("POST", p, h); }
+    fn put(p: string, h: fn(ServerRequest, ServerResponse)): Server { return this.route("PUT", p, h); }
+    fn del(p: string, h: fn(ServerRequest, ServerResponse)): Server { return this.route("DELETE", p, h); }
+    fn head(p: string, h: fn(ServerRequest, ServerResponse)): Server { return this.route("HEAD", p, h); }
+
+    // ---- parsing -----------------------------------------------------------
+    //
+    // Parses headers out of `raw[0..used)`. Returns the status code to send on
+    // failure, 0 on success, and sets req.head_end to where a body would start.
+    fn parse_head(raw: byte[], used: int, req: ServerRequest): int {
+        let L = this.limits;
+
+        // --- request line ---
+        let lf = find_lf(raw, 0, used);
+        if (lf < 0) { return 400; }
+        if (lf > L.max_request_line) { return 414; }
+        let eol = lf;
+        if (eol > 0 && raw[eol - 1] == 13) { eol -= 1; }   // strip CR
+
+        // METHOD SP TARGET SP HTTP/1.x
+        let sp1 = -1;
+        let i = 0;
+        while (i < eol) { if (raw[i] == 32) { sp1 = i; break; } i += 1; }
+        if (sp1 < 0) { return 400; }
+        let sp2 = -1;
+        i = sp1 + 1;
+        while (i < eol) { if (raw[i] == 32) { sp2 = i; break; } i += 1; }
+        if (sp2 < 0) { return 400; }
+
+        req.method_off = 0;
+        req.method_len = sp1;
+
+        // split target into path and query at '?'
+        let t_off = sp1 + 1;
+        let t_len = sp2 - t_off;
+        let qm = -1;
+        for (let k in 0..t_len) {
+            if (raw[t_off + k] == 63) { qm = k; break; }
+        }
+        if (qm < 0) {
+            req.path_off = t_off; req.path_len = t_len;
+            req.query_off = -1;   req.query_len = 0;
+        } else {
+            req.path_off = t_off;         req.path_len = qm;
+            req.query_off = t_off + qm + 1; req.query_len = t_len - qm - 1;
+        }
+
+        // version: only HTTP/1.0 and HTTP/1.1
+        let v_off = sp2 + 1;
+        let v_len = eol - v_off;
+        if (v_len < 8) { return 400; }
+        if (!hdr_eq(raw, v_off, 7, "HTTP/1.")) { return 505; }
+        let minor = raw[v_off + 7] - 48;
+        if (minor != 0 && minor != 1) { return 505; }
+        req.version_minor = minor;
+        req.keep_alive = minor == 1;      // 1.0 defaults to close
+
+        // --- headers ---
+        let pos = lf + 1;
+        let hdr_bytes = 0;
+        while (true) {
+            let e = find_lf(raw, pos, used);
+            if (e < 0) { return 400; }
+            let line_end = e;
+            if (line_end > pos && raw[line_end - 1] == 13) { line_end -= 1; }
+            if (line_end == pos) { pos = e + 1; break; }   // blank line: done
+
+            hdr_bytes += (e - pos) + 1;
+            if (hdr_bytes > L.max_header_bytes) { return 431; }
+            if (req.hname_off.len >= L.max_header_count) { return 431; }
+
+            let colon = -1;
+            let j = pos;
+            while (j < line_end) { if (raw[j] == 58) { colon = j; break; } j += 1; }
+            if (colon < 0) { return 400; }
+
+            let nlen = colon - pos;
+            if (nlen == 0) { return 400; }
+
+            // trim OWS around the value
+            let vs = colon + 1;
+            while (vs < line_end && (raw[vs] == 32 || raw[vs] == 9)) { vs += 1; }
+            let ve = line_end;
+            while (ve > vs && (raw[ve - 1] == 32 || raw[ve - 1] == 9)) { ve -= 1; }
+
+            req.hname_off.push(pos);   req.hname_len.push(nlen);
+            req.hval_off.push(vs);     req.hval_len.push(ve - vs);
+
+            pos = e + 1;
+        }
+
+        req.head_end = pos;
+
+        // Connection header overrides the version default.
+        if (req.hasHeader("Connection")) {
+            let cv = req.header("Connection").to_lower();
+            if (cv == "close") { req.keep_alive = false; }
+            else if (cv == "keep-alive") { req.keep_alive = true; }
+        }
+        return 0;
+    }
+
+    // ---- dispatch ----------------------------------------------------------
+    fn dispatch(req: ServerRequest, res: ServerResponse) {
+        let p = req.path();
+        let m = req.method();
+        let path_seen = false;
+        for (let r in this.routes) {
+            // Params accumulate across failed matches otherwise.
+            req.param_names = [];
+            req.param_vals = [];
+            if (!r.match_(p, req)) { continue; }
+            path_seen = true;
+            if (r.method != m) { continue; }
+            r.handler(req, res);
+            res.sent = true;
+            return;
+        }
+        req.param_names = [];
+        req.param_vals = [];
+        // A path that exists under a different verb is 405, not 404 — the
+        // distinction matters to any client that probes.
+        if (path_seen) { res.text(405, "method not allowed"); }
+        else { res.text(404, "not found"); }
+        res.sent = true;
+    }
+
+    // ---- wire --------------------------------------------------------------
+    // Append a complete response into `out`. Nothing is materialised as a
+    // string: the reactor passes the connection's reusable buffer and sends
+    // directly from it.
+    fn write_response(out: StringBuilder, res: ServerResponse, keep: bool) {
+        out.append("HTTP/1.1 ").appendInt(res.status).append(" ")
+           .append(status_text(res.status)).append("\r\n");
+        out.append(res.hdrs.toString());
+        if (!res.has_date) {
+            out.append("Date: ").append(this.httpDate()).append("\r\n");
+        }
+        out.append("Content-Length: ").appendInt(res.body_str.len).append("\r\n");
+        if (keep) { out.append("Connection: keep-alive\r\n"); }
+        else { out.append("Connection: close\r\n"); }
+        out.append("\r\n");
+        out.append(res.body_str);
+    }
+
+    // Blocking path (serveOnce / serve_conn); the reactor writes into the Conn.
+    fn send_response(c: Socket, res: ServerResponse, keep: bool) {
+        let out = new StringBuilder(res.body_str.len + 256);
+        this.write_response(out, res, keep);
+        c.sendText(out.toString());
+    }
+
+    fn send_error(c: Socket, code: int) {
+        let r = new ServerResponse();
+        r.text(code, status_text(code));
+        this.send_response(c, r, false);
+    }
+
+    // Serve one accepted connection to completion, honouring keep-alive.
+    fn serve_conn(c: Socket) {
+        let L = this.limits;
+        c.setTimeoutMs(L.recv_timeout_ms);
+        c.setNoDelay(true);
+
+        // ONE buffer for the whole connection, reset between keep-alive
+        // requests rather than reallocated — the arena rule from CLAUDE.md.
+        // It also has to be one buffer for correctness: a pipelined client
+        // sends request N+1 in the same packet as N, so those bytes are already
+        // here and a fresh buffer would silently drop them.
+        let cap = L.max_request_line + L.max_header_bytes + 1024;
+        let raw = bytes(cap);
+        let used = 0;
+
+        let served = 0;
+        while (served < L.max_keepalive_reqs) {
+            // Read until the blank line that ends the headers. `used` may
+            // already cover a whole request carried over from the last round.
+            let hdr_end = -1;
+            while (true) {
+                let scan = 0;
+                let seen = -1;
+                while (scan + 1 < used) {
+                    if (raw[scan] == 10 && raw[scan + 1] == 10) { seen = scan + 2; break; }
+                    if (scan + 3 < used && raw[scan] == 13 && raw[scan + 1] == 10
+                        && raw[scan + 2] == 13 && raw[scan + 3] == 10) { seen = scan + 4; break; }
+                    scan += 1;
+                }
+                if (seen >= 0) { hdr_end = seen; break; }
+                if (used >= cap) { this.send_error(c, 431); return; }
+
+                let chunk = c.recv(4096);
+                if (chunk.len == 0) { return; }          // EOF or timeout
+                if (used + chunk.len > cap) { this.send_error(c, 431); return; }
+                for (let k in 0..chunk.len) { raw[used + k] = chunk[k]; }
+                used += chunk.len;
+            }
+
+            let req = new ServerRequest(raw);
+            let bad = this.parse_head(raw, used, req);
+            if (bad != 0) { this.send_error(c, bad); return; }
+            let end_out = req.head_end;
+
+            // --- body, by Content-Length ---
+            let blen = 0;
+            if (req.hasHeader("Content-Length")) {
+                let i = 0;
+                let found = -1;
+                while (i < req.hname_off.len) {
+                    if (hdr_eq(raw, req.hname_off[i], req.hname_len[i], "Content-Length")) {
+                        found = i; break;
+                    }
+                    i += 1;
+                }
+                blen = parse_uint(raw, req.hval_off[found], req.hval_len[found], L.max_body_bytes);
+                if (blen < 0) { this.send_error(c, 413); return; }
+            }
+            // Chunked is not implemented; refusing is safer than mis-framing,
+            // which is the request-smuggling class of bug.
+            if (req.hasHeader("Transfer-Encoding")) { this.send_error(c, 501); return; }
+
+            if (blen > 0) {
+                // The body lands in `raw` directly after the head, so the
+                // request stays one buffer and body() is a view like everything
+                // else. If it will not fit, that is 413 before any read.
+                if (end_out + blen > cap) { this.send_error(c, 413); return; }
+
+                let have = used - end_out;          // arrived with the head
+                if (have > blen) { have = blen; }   // pipelined bytes are not ours
+                let got = have;
+                while (got < blen) {
+                    let more = c.recv(blen - got);
+                    if (more.len == 0) { return; }   // EOF or timeout mid-body
+                    for (let k in 0..more.len) { raw[end_out + got + k] = more[k]; }
+                    got += more.len;
+                }
+                req.body_off = end_out;
+                req.body_len = blen;
+            }
+
+            let res = new ServerResponse();
+            this.dispatch(req, res);
+
+            let keep = req.keep_alive && (served + 1 < L.max_keepalive_reqs);
+            this.send_response(c, res, keep);
+            served += 1;
+            if (!keep) { return; }
+
+            // Slide any pipelined bytes to the front and keep the buffer.
+            let consumed = end_out + blen;
+            let leftover = used - consumed;
+            if (leftover > 0) {
+                for (let k in 0..leftover) { raw[k] = raw[consumed + k]; }
+            }
+            used = leftover;
+        }
+    }
+
+    // Blocking accept loop, one connection at a time. Correct and testable.
+    // The pre-fork model lives in run().
+    // ------------------------------------------------------------- reactor
+    //
+    // One PollSet, many connections, no thread. A blocking accept loop serves
+    // one client at a time, which means a single slow peer is a denial of
+    // service — that is the reason this exists, ahead of any throughput
+    // argument.
+    //
+    // Connections are held in a table indexed by fd. fds are small integers
+    // bounded by the process limit, so this is a flat array rather than a Map:
+    // O(1), no hashing, no node per connection. A fd past the table is closed
+    // rather than grown into — an unbounded table is itself an attack.
+    fn reactor(listener: Socket, max_conns: int): bool {
+        // The listener must be non-blocking: the accept-drain loop below calls
+        // accept() until it fails, and on a blocking listener that last call
+        // parks the whole reactor forever.
+        listener.setNonBlocking(true);
+        let lfd = listener.fd as int;
+
+        let poll = new PollSet();
+        if (!poll.add(listener, POLL_READ)) { return false; }
+
+        let slots: Conn[] = [];
+        for (let i in 0..max_conns) { slots.push(null); }
+        let live = 0;              // connections currently held
+        let warned_fd = false;     // fd-exhaustion warning is one-shot
+        let last_sweep = mono_ms();
+        let hi_fd = 0;             // highest connection fd seen; bounds the sweep
+        let blocked: bool[] = [false];   // out-param for drive()
+
+        this.running = true;
+        while (this.running) {
+            let n = poll.wait(1000);
+            if (n < 0) { break; }
+
+            // Sweep idle connections. This is the Slowloris defence: a peer
+            // that opens a socket and never finishes its headers is dropped on
+            // its deadline, not never.
+            //
+            // Two bounds, both measured rather than guessed. It used to run on
+            // every wakeup over the whole table: at the peak configuration
+            // (16 workers, 200 connections) that scanned 4,096 slots to find
+            // ~12 live ones, 99.7% waste, tens of thousands of times a second.
+            // Dropping idle connections is inherently coarse work — once every
+            // SWEEP_INTERVAL_MS is ample — and the scan need only reach the
+            // highest fd ever handed out.
+            let now = mono_ms();
+            if (now - last_sweep >= SWEEP_INTERVAL_MS) {
+                last_sweep = now;
+                for (let f in 0..hi_fd + 1) {
+                    let cn = slots[f];
+                    if (cn == null) { continue; }
+                    if (now > cn.deadline) {
+                        poll.removeFd(f);
+                        cn.sock.close();
+                        slots[f] = null;
+                        live -= 1;
+                    }
+                }
+            }
+
+            for (let i in 0..n) {
+                let fd = poll.readyFd(i);
+                if (fd == lfd) {
+                    // Drain the accept queue; one wakeup can cover many.
+                    //
+                    // accept() returning null is ambiguous — it covers both
+                    // "queue empty" (normal) and "out of file descriptors"
+                    // (EMFILE, fatal to throughput). Those look identical here
+                    // and the second one is silent, which is how a server can
+                    // stall at ~1,019 connections per worker on a default
+                    // ulimit of 1024 while every metric says it is healthy:
+                    // connections stay ESTABLISHED, they just sit in the kernel
+                    // accept queue forever. Counting consecutive empty accepts
+                    // against connections held makes it visible.
+                    let accepted_now = 0;
+                    while (true) {
+                        let c = listener.accept();
+                        if (c == null) {
+                            // Nothing accepted this round while the table is
+                            // nearly full is the EMFILE signature. Warn once.
+                            if (accepted_now == 0 && live >= max_conns - 8 && !warned_fd) {
+                                warned_fd = true;
+                                print("vyto/net/server: accept() failing with "
+                                      + str(live) + " connections held — likely "
+                                      + "out of file descriptors (ulimit -n). "
+                                      + "Connections will queue unserved.");
+                            }
+                            break;
+                        }
+                        accepted_now += 1;
+                        let cfd = c.fd as int;
+                        // Table full. Close and stop draining this round rather
+                        // than continuing: once fds reach the table size every
+                        // further accept will too, so continuing would spin.
+                        // Breaking costs one wakeup, which is the cheap side.
+                        if (cfd >= max_conns) { c.close(); break; }
+                        c.setNonBlocking(true);
+                        c.setNoDelay(true);
+                        slots[cfd] = new Conn(c, this.limits);
+                        live += 1;
+                        if (cfd > hi_fd) { hi_fd = cfd; }
+                        poll.add(c, POLL_READ);
+                    }
+                    continue;
+                }
+
+                let cn = slots[fd];
+                if (cn == null) { poll.removeFd(fd); continue; }
+
+                let alive = this.drive(cn, blocked);
+                if (!alive) {
+                    poll.removeFd(fd);
+                    cn.sock.close();
+                    slots[fd] = null;
+                    live -= 1;
+                    continue;
+                }
+                // Track POLL_WRITE only while there is something to write.
+                // Leaving it armed would make every wakeup report this socket
+                // ready and spin the loop.
+                if (blocked[0] && !cn.want_write) {
+                    cn.want_write = true;
+                    poll.modify(cn.sock, POLL_READ | POLL_WRITE);
+                } else if (!blocked[0] && cn.want_write) {
+                    cn.want_write = false;
+                    poll.modify(cn.sock, POLL_READ);
+                }
+            }
+        }
+        return true;
+    }
+
+    // Advance one connection as far as it can go without blocking.
+    // Returns false when it should be closed.
+    // Returns false to close. `out_blocked` is set when the connection still
+    // has unsent output and needs POLL_WRITE.
+    fn drive(cn: Conn, out_blocked: bool[]): bool {
+        let L = this.limits;
+        out_blocked[0] = false;
+
+        // Anything left over from last time goes first: responses must leave in
+        // order, so no new request is parsed while output is pending.
+        if (cn.hasPending()) {
+            let f = cn.flush();
+            if (f < 0) { return false; }
+            if (f == 0) { out_blocked[0] = true; return true; }
+        }
+
+        while (true) {
+            let r = cn.sock.tryRecv(RECV_CHUNK);
+            if (r.wouldBlock()) { return true; }        // nothing more right now
+            if (r.status <= 0) { return false; }        // EOF or error
+
+            // A read shorter than the request means the socket is drained. The
+            // PollSet is level-triggered (no EPOLLET in socket_shim.c), so if
+            // more arrives epoll reports it again — there is no need to probe
+            // until EAGAIN. That probe was a wasted syscall on every request,
+            // one of the three the request path costs.
+            let drained = r.data.len < RECV_CHUNK;
+
+            if (!cn.reserve(cn.used + r.data.len)) { this.send_error(cn.sock, 431); return false; }
+            for (let k in 0..r.data.len) { cn.raw[cn.used + k] = r.data[k]; }
+            cn.used += r.data.len;
+            cn.deadline = mono_ms() + L.recv_timeout_ms;
+
+            // Drain every complete request sitting in the buffer (pipelining).
+            while (true) {
+                let hdr_end = find_head_end(cn.raw, cn.used);
+                if (hdr_end < 0) { break; }
+
+                let req = new ServerRequest(cn.raw);
+                let bad = this.parse_head(cn.raw, cn.used, req);
+                if (bad != 0) { this.send_error(cn.sock, bad); return false; }
+
+                let blen = this.body_len_of(req, cn.raw);
+                if (blen < 0) { this.send_error(cn.sock, 413); return false; }
+                if (req.hasHeader("Transfer-Encoding")) { this.send_error(cn.sock, 501); return false; }
+
+                let end_out = req.head_end;
+                // Growing here replaces cn.raw, so the request's view — taken
+                // before the body length was known — has to be re-pointed at
+                // the new buffer or every accessor reads the old one.
+                if (!cn.reserve(end_out + blen)) { this.send_error(cn.sock, 413); return false; }
+                req.raw = cn.raw;
+                // Body not fully arrived: wait for more, do not block.
+                if (cn.used < end_out + blen) { break; }
+                req.body_off = end_out;
+                req.body_len = blen;
+
+                let res = new ServerResponse();
+                this.dispatch(req, res);
+                cn.served += 1;
+                let keep = req.keep_alive && cn.served < L.max_keepalive_reqs;
+
+                this.write_response(cn.outBuf(), res, keep);
+
+                let consumed = end_out + blen;
+                let leftover = cn.used - consumed;
+                if (leftover > 0) {
+                    for (let k in 0..leftover) { cn.raw[k] = cn.raw[consumed + k]; }
+                }
+                cn.used = leftover;
+
+                let f = cn.flush();
+                if (f < 0) { return false; }
+                if (f == 0) {
+                    // Socket full. Stop parsing — a further response queued now
+                    // would be correct but unbounded memory under backpressure.
+                    out_blocked[0] = true;
+                    return true;
+                }
+                if (!keep) { return false; }
+            }
+            if (drained) { return true; }
+        }
+        return true;
+    }
+
+    // Content-Length, or 0 when absent. -1 when unparseable or over the cap.
+    fn body_len_of(req: ServerRequest, raw: byte[]): int {
+        let i = 0;
+        while (i < req.hname_off.len) {
+            if (hdr_eq(raw, req.hname_off[i], req.hname_len[i], "Content-Length")) {
+                return parse_uint(raw, req.hval_off[i], req.hval_len[i], this.limits.max_body_bytes);
+            }
+            i += 1;
+        }
+        return 0;
+    }
+
+    // ---------------------------------------------------------- entry points
+
+    // Single process, one reactor. Thousands of concurrent connections on one
+    // core. The right mode for tests, for a debugger, and for anything not
+    // CPU-bound.
+    fn runSingle(): bool {
+        this.listener = socket_listen_on(this.host, this.port, this.backlog);
+        if (this.listener == null) { return false; }
+        this.port = this.listener.localPort();
+        return this.reactor(this.listener, this.max_conns);
+    }
+
+    // Pre-fork: one worker per core, each with its own SO_REUSEPORT listener
+    // and its own reactor. The kernel hashes connections across workers, so
+    // there is no thundering herd and no shared accept lock.
+    //
+    // Two things this buys beyond cores, both of which matter more for Vyto
+    // than for most languages:
+    //   * Fault isolation. A panic kills one worker; the supervisor re-forks.
+    //     For a language whose error model is "panic hard", that is the
+    //     difference between losing a request and losing the service.
+    //   * No atomics. Workers share nothing, so refcounts stay non-atomic.
+    //     Threads would force atomic RC on every object in the program.
+    fn run(): bool {
+        let n = this.workers;
+        if (n <= 0) { n = core_count(); }
+        if (n < 1) { n = 1; }
+
+        // Bind once in the parent purely to fail loudly on a busy port before
+        // forking anything. Workers open their own.
+        let probe = socket_listen_reuseport(this.host, this.port, this.backlog);
+        if (probe == null) { return false; }
+        this.port = probe.localPort();
+        probe.close();
+
+        let kids: int[] = [];
+        for (let i in 0..n) {
+            let pid = fork() as int;
+            if (pid == 0) { this.worker_main(); _exit(0 as i32); }
+            if (pid < 0) { break; }
+            kids.push(pid);
+        }
+        if (kids.len == 0) { return false; }
+
+        // Supervisor: re-fork whatever dies. This loop is why a handler panic
+        // is survivable, so it exists from day one rather than later.
+        this.running = true;
+        while (this.running) {
+            let dead = waitpid(-1 as i32, null, 0 as i32) as int;
+            if (dead < 0) { break; }
+            let pid = fork() as int;
+            if (pid == 0) { this.worker_main(); _exit(0 as i32); }
+        }
+        return true;
+    }
+
+    fn worker_main() {
+        let lis = socket_listen_reuseport(this.host, this.port, this.backlog);
+        if (lis == null) { return; }
+        this.reactor(lis, this.max_conns);
+    }
+
+    // Bind and return the listener's port without looping — for tests that want
+    // an ephemeral port (pass 0) and drive accept themselves.
+    fn bind(): int {
+        this.listener = socket_listen_on(this.host, this.port, 128);
+        if (this.listener == null) { return -1; }
+        this.port = this.listener.localPort();
+        return this.port;
+    }
+
+    // Accept and serve exactly one connection to completion, blocking.
+    // Test affordance; the reactor is the real path.
+    fn serveOnce(): bool {
+        if (this.listener == null) { return false; }
+        let c = this.listener.accept();
+        if (c == null) { return false; }
+        this.serve_conn(c);
+        return true;
+    }
+
+    fn stop() { this.running = false; }
+}
+
+export fn server(port: int): Server { return new Server(port); }
+
+
+// ------------------------------------------------------------ still missing
+//
+//   * partial writes     — send_response assumes the whole response leaves in
+//                          one sendText. On a blocking socket that is true; on
+//                          the reactor's non-blocking ones a large body can
+//                          short-write, and the remainder is currently lost.
+//                          This is the next correctness bug to fix: buffer the
+//                          unwritten tail on the Conn and register POLL_WRITE.
+//   * chunked bodies     — currently 501. Mis-framing is request smuggling, so
+//                          refusing beats guessing
+//   * sendfile / writev  — static files and one-syscall responses
+//   * TLS                — terminate upstream for v1
+//   * shared state       — pre-fork workers share nothing, so any cache is
+//                          per-worker. Cross-worker state needs shared memory
+//
+// Out of scope: HTTP/2 (HPACK, multiplexing) and HTTP/3 (QUIC). Proxy in front.
