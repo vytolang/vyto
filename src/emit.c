@@ -1828,7 +1828,7 @@ static void emit_one_struct(StructDecl *sd, Module *m, SBuf *h, StructDecl **don
     sb_puts(h, "};\n");
 }
 
-void emit_module(Module *m, bool is_entry, bool checks, bool freestanding, SBuf *h, SBuf *c) {
+void emit_module(Module *m, bool is_entry, bool checks, EntryMode mode, SBuf *h, SBuf *c) {
     g_checks = checks;
     /* ---------- header ---------- */
     sb_printf(h, "#ifndef VYTO_MOD_%s_H\n#define VYTO_MOD_%s_H\n", m->name, m->name);
@@ -2015,13 +2015,26 @@ void emit_module(Module *m, bool is_entry, bool checks, bool freestanding, SBuf 
     sb_puts(c, "\n");
     sb_puts(c, code.data);
     if (is_entry) {
-        if (freestanding)
+        switch (mode) {
+        case ENTRY_FREESTANDING:
             /* Bare-metal has no argc/argv and owns its own startup: export an
                entry the reset handler / RTOS task calls. Args stay empty. */
             sb_printf(c, "void vt_main(void) {\n    v_%s_main();\n}\n", m->name);
-        else
+            break;
+        case ENTRY_SHARED:
+            /* A shared library is entered by its loader, not by a crt0, and has
+               no argc/argv either -- the Android JNI boot thread calls this and
+               expects it to return when the app's Window.run() exits. Default
+               visibility so the dynamic symbol table carries it (and so
+               --gc-sections treats it as a root). */
+            sb_printf(c, "__attribute__((visibility(\"default\")))\n"
+                         "void vyto_app_main(void) {\n    v_%s_main();\n}\n", m->name);
+            break;
+        case ENTRY_EXE:
             sb_printf(c, "int main(int argc, char **argv) {\n    vt_set_args(argc, argv);\n"
                          "    v_%s_main();\n    return 0;\n}\n", m->name);
+            break;
+        }
     }
     sb_free(&aux);
     sb_free(&code);

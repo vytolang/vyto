@@ -573,7 +573,7 @@ static void usage(void) {
             "usage:\n"
             "  vytoc build <file.vt> [-o out] [--release] [--bundle] [--verbose]\n"
             "              [--with-assets] [--target <triple>] [--cc <cmd>] [--clean]\n"
-            "              [--freestanding] [--no-float] [--no-fs]\n"
+            "              [--freestanding] [--shared] [--no-float] [--no-fs]\n"
             "    --bundle       statically link prebuilt native libs + the C++ runtime\n"
             "                   into one self-contained exe (no shipped .so)\n"
             "    --with-assets  embed the app's assets/, conf/ and storage/ dirs into\n"
@@ -582,13 +582,17 @@ static void usage(void) {
             "                   shared object cache is content-keyed, so it is left alone\n"
             "    --freestanding no libc: route alloc/print/abort through vt_host_* hooks\n"
             "                   the embedder supplies; output is lib<name>.a, not an exe\n"
+            "    --shared       build lib<name>.so instead of an exe: -fPIC throughout and\n"
+            "                   an exported vyto_app_main() the loader calls (Android/JNI)\n"
             "    --no-float     stub float-to-string (no soft-float formatter pulled in)\n"
             "    --no-fs        drop the filesystem layer (File ops become no-ops/panics)\n"
             "  vytoc run   <file.vt> [--release] [--verbose] [--clean] [-- args...]\n"
-            "targets: linux-x64 linux-arm64 macos-x64 macos-arm64 windows-x64\n"
+            "targets: linux-x64 linux-arm64 macos-x64 macos-arm64 windows-x64 android-arm64\n"
             "  --cc (or VYTO_CC) overrides the C compiler; put sysroots/flags inside it,\n"
             "  e.g. --cc 'zig cc -target aarch64-linux-gnu' or (freestanding)\n"
-            "  --cc 'arm-none-eabi-gcc -mcpu=cortex-m4 -ffreestanding'\n");
+            "  --cc 'arm-none-eabi-gcc -mcpu=cortex-m4 -ffreestanding' or (android)\n"
+            "  --cc \"$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/\"\n"
+            "        \"aarch64-linux-android24-clang\"\n");
     exit(2);
 }
 
@@ -598,6 +602,10 @@ static const struct { const char *triple; const char *cc; } cross_cc_table[] = {
     {"windows-x64", "x86_64-w64-mingw32-gcc"},
     {"macos-x64", NULL}, /* no conventional Linux-hosted default; require --cc */
     {"macos-arm64", NULL},
+    /* The NDK's clang lives under a versioned, user-chosen install root and
+       encodes the minSdk in its own name (aarch64-linux-android24-clang), so
+       there is nothing conventional to default to -- require --cc. */
+    {"android-arm64", NULL},
 };
 
 static bool known_triple(const char *t) {
@@ -617,7 +625,7 @@ int main(int argc, char **argv) {
     const char *cmd = argv[1];
     const char *input = argv[2];
     bool release = false, verbose = false, bundle = false, with_assets = false;
-    bool freestanding = false, no_float = false, no_fs = false, clean = false;
+    bool freestanding = false, shared = false, no_float = false, no_fs = false, clean = false;
     const char *outpath = NULL, *target = NULL, *cc_override = NULL;
     int prog_argc = 0;
     char **prog_argv = NULL;
@@ -627,6 +635,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--with-assets") == 0) with_assets = true;
         else if (strcmp(argv[i], "--verbose") == 0) verbose = true;
         else if (strcmp(argv[i], "--freestanding") == 0) freestanding = true;
+        else if (strcmp(argv[i], "--shared") == 0) shared = true;
         else if (strcmp(argv[i], "--no-float") == 0) no_float = true;
         else if (strcmp(argv[i], "--no-fs") == 0) no_fs = true;
         else if (strcmp(argv[i], "--clean") == 0) clean = true;
@@ -641,6 +650,12 @@ int main(int argc, char **argv) {
     if (freestanding && do_run)
         fatal("freestanding builds produce a library, not a runnable executable — "
               "link libvyto.a into your firmware and flash it");
+    if (shared && do_run)
+        fatal("--shared produces a library, not a runnable executable — load it from "
+              "a host process (on Android, package it into the apk)");
+    if (shared && freestanding)
+        fatal("--shared and --freestanding are different output shapes — "
+              "--freestanding archives to lib<name>.a, --shared links lib<name>.so");
     if (!cc_override) cc_override = getenv("VYTO_CC");
     if (target && !known_triple(target))
         fatal("unknown target '%s' (see vytoc --help for the list)", target);
@@ -648,6 +663,7 @@ int main(int argc, char **argv) {
     const char *triple = target ? target : host;
     bool cross = strcmp(triple, host) != 0;
     bool win_target = strncmp(triple, "windows", 7) == 0;
+    bool android_target = strncmp(triple, "android", 7) == 0;
     if (do_run && cross)
         fatal("built for %s but this host is %s — copy the binary to the target "
               "or run it under an emulator (qemu/wine)", triple, host);
@@ -682,6 +698,11 @@ int main(int argc, char **argv) {
         cc = cc_override;
     } else if (cross || (target && win_target)) {
         cc = default_cross_cc(triple);
+        if (!cc && android_target)
+            fatal("no default cross compiler for %s — pass the NDK clang with --cc or "
+                  "VYTO_CC, e.g. --cc "
+                  "\"$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/"
+                  "aarch64-linux-android24-clang\"", triple);
         if (!cc)
             fatal("no default cross compiler for %s — pass one with --cc or VYTO_CC", triple);
         char *probe = arena_printf(&g_arena, "command -v %s >/dev/null 2>&1", cc);
@@ -697,6 +718,12 @@ int main(int argc, char **argv) {
        plus the opt-in sub-profiles. Injected into every runtime+module compile. */
     const char *fsflags = "";
     if (freestanding) fsflags = " -ffreestanding -DVT_NO_LIBC -fno-builtin";
+    /* Shared objects must be position-independent, and that has to reach *every*
+       compile -- the runtime, each module and every package's native shim all
+       land in the same .so, so one non-PIC object fails the whole link. Putting
+       it here also keys the object caches (both hash the command line), so PIC
+       and non-PIC objects can never be mistaken for each other. */
+    if (shared) fsflags = arena_printf(&g_arena, "%s -fPIC", fsflags);
     if (no_float) fsflags = arena_printf(&g_arena, "%s -DVT_NO_FLOAT", fsflags);
     if (no_fs) fsflags = arena_printf(&g_arena, "%s -DVT_NO_FS", fsflags);
     /* Dead-code stripping. Vyto compiles each .vt file as one translation unit
@@ -723,9 +750,11 @@ int main(int argc, char **argv) {
     /* Object-cache key for module .o files. A ubsan-instrumented debug object
        cannot be reused for a --bundle/release link (which omits the ubsan
        runtime), so debug+san and plain builds must not share the same path;
-       the freestanding profile likewise needs its own objects. */
-    const char *prof = arena_printf(&g_arena, "%s%s%s", freestanding ? "_fs" : "",
-                                    no_float ? "_nf" : "", no_fs ? "_nofs" : "");
+       the freestanding profile likewise needs its own objects, and a PIC object
+       is not interchangeable with the non-PIC one built from the same C. */
+    const char *prof = arena_printf(&g_arena, "%s%s%s%s", freestanding ? "_fs" : "",
+                                    shared ? "_pic" : "", no_float ? "_nf" : "",
+                                    no_fs ? "_nofs" : "");
     const char *osuf = arena_printf(&g_arena, "%s%s", release ? "_rel" : (san[0] ? "_dbg" : ""),
                                     prof);
 
@@ -948,7 +977,9 @@ int main(int argc, char **argv) {
         SBuf h, c;
         sb_init(&h);
         sb_init(&c);
-        emit_module(m, m == entry, !release, freestanding, &h, &c);
+        emit_module(m, m == entry, !release,
+                    freestanding ? ENTRY_FREESTANDING : shared ? ENTRY_SHARED : ENTRY_EXE,
+                    &h, &c);
         const char *hpath = arena_printf(&g_arena, "%s/mod_%s.h", cache, m->name);
         const char *cpath = arena_printf(&g_arena, "%s/mod_%s.c", cache, m->name);
         bool hchanged = false, cchanged = false;
@@ -1030,14 +1061,19 @@ int main(int argc, char **argv) {
         return 0;
     }
 
-    /* ---- link ---- */
+    /* ---- link ----
+       --shared swaps the output shape but not the inputs: same objects, same
+       resolved -l set, plus -shared. The `lib` prefix is what a loader expects
+       to find (Android's System.loadLibrary("foo") opens libfoo.so). */
     const char *exe = outpath ? outpath
-                              : arena_printf(&g_arena, "%s/%s%s", cache, stem_of(input),
-                                             win_target ? ".exe" : "");
+                      : shared ? arena_printf(&g_arena, "%s/lib%s.so", cache, stem_of(input))
+                               : arena_printf(&g_arena, "%s/%s%s", cache, stem_of(input),
+                                              win_target ? ".exe" : "");
     const char *rpath_flag = "";
     if (need_rpath) {
         /* $ORIGIN / @loader_path must reach the linker unexpanded (single quotes) */
-        if (strncmp(triple, "linux", 5) == 0) rpath_flag = " '-Wl,-rpath,$ORIGIN'";
+        if (strncmp(triple, "linux", 5) == 0 || android_target)
+            rpath_flag = " '-Wl,-rpath,$ORIGIN'";
         else if (strncmp(triple, "macos", 5) == 0) rpath_flag = " '-Wl,-rpath,@loader_path'";
         /* windows: none — the exe directory is searched by default */
     }
@@ -1066,8 +1102,37 @@ int main(int argc, char **argv) {
            out of the final binary (see the -ffunction-sections note near the top
            of this function). Paired flag; skipped for tcc, which emits neither. */
         const char *gcsec = strcmp(cc, "tcc") != 0 ? " -Wl,--gc-sections" : "";
-        char *cmdline = arena_printf(&g_arena, "%s%s%s%s -o %s%s%s%s%s%s -lm", cc, san, bundle_flags,
-                                     gcsec, exe, objs.data, shlibs.data, libs.data, bundle_link,
+        /* -shared drops the crt0/main requirement. gc-sections still applies:
+           default-visibility symbols are roots via the dynamic symbol table, so
+           vyto_app_main() and every exported shim survive.
+
+           --no-undefined is the important half. A shared link tolerates
+           unresolved symbols by default, so a mistyped or missing FFI function
+           produces a .so that builds clean and then dies at load time on the
+           device — System.loadLibrary throwing UnsatisfiedLinkError with no
+           build-time warning of any kind. Requiring every symbol to resolve at
+           link time turns that into an error naming the symbol. Verified
+           against a deliberately missing extern.
+
+           Skipped for macOS, whose linker spells this -undefined error and
+           already defaults to it for dylibs. */
+        const char *shared_flag = "";
+        if (shared) {
+            shared_flag = strncmp(triple, "macos", 5) == 0
+                              ? " -shared"
+                              : " -shared -Wl,--no-undefined";
+        }
+        /* Android 15 ships devices with 16 KB memory pages, and a .so whose
+           LOAD segments are aligned to the old 4 KB simply will not load there
+           — the failure is at dlopen on the device, with nothing wrong at build
+           time. Padding the alignment costs a few KB of file and is backward
+           compatible, so it is unconditional for the triple rather than tied to
+           a target API level. */
+        const char *page_flag =
+            (shared && android_target) ? " -Wl,-z,max-page-size=16384" : "";
+        char *cmdline = arena_printf(&g_arena, "%s%s%s%s%s%s -o %s%s%s%s%s%s -lm", cc, san,
+                                     bundle_flags, gcsec, shared_flag, page_flag, exe,
+                                     objs.data, shlibs.data, libs.data, bundle_link,
                                      rpath_flag);
         if (run_cmd(cmdline, verbose) != 0) fatal("link failed");
     }
