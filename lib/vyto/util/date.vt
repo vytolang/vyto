@@ -10,6 +10,64 @@
 // crosses the boundary. Local-time variants use the process time zone; the
 // unsuffixed calls are UTC. `parse` returns a sentinel (year 0) on failure —
 // test it with date_is_valid.
+//
+// -- format specifiers -------------------------------------------------------
+//
+// `date_format` passes the string to C's strftime. Every output below is real,
+// produced from unix 1700000000 = Tue 14 Nov 2023 22:13:20 UTC.
+//
+//   YEAR                                  MONTH
+//     %Y  2023      full year               %m  11         01-12
+//     %y  23        2-digit                 %b  Nov        abbreviated name
+//     %C  20        century                 %B  November   full name
+//     %G  2023      ISO-8601 week-year      %h  Nov        same as %b
+//     %g  23        ISO 2-digit
+//
+//   DAY                                   WEEKDAY
+//     %d  14        01-31, zero-padded      %a  Tue        abbreviated name
+//     %e  14        1-31, space-padded      %A  Tuesday    full name
+//     %j  318       001-366, day of year    %u  2          1-7, Monday = 1
+//                                           %w  2          0-6, Sunday = 0
+//
+//   TIME                                  WEEK NUMBER
+//     %H  22        00-23                   %U  46         week of year, Sun-based
+//     %I  10        01-12                   %W  46         week of year, Mon-based
+//     %M  13        minute                  %V  46         ISO-8601 week
+//     %S  20        second
+//     %p  PM        AM/PM                 LITERAL
+//     %P  pm        am/pm (glibc)           %%  %          a percent sign
+//                                           %n  newline
+//   COMBINED                                %t  tab
+//     %F  2023-11-14           ISO date
+//     %T  22:13:20             24h time     TIME ZONE — read the warning below
+//     %R  22:13                hh:mm        %Z  GMT        zone name
+//     %D  11/14/23             US m/d/y     %z  +0000      UTC offset
+//     %r  10:13:20 PM          12h time
+//     %c  Tue Nov 14 22:13:20 2023          locale date+time
+//     %x  11/14/23                          locale date
+//     %X  22:13:20                          locale time
+//
+// **`%Z` and `%z` always say GMT / +0000, even for a local time.** Formatting
+// normalises the fields through timegm+gmtime_r so a hand-built DateTime gets
+// correct wday/yday, and that leaves the C struct tagged UTC regardless of
+// where the values came from. `date_format(date_now(), "%H:%M %Z")` prints the
+// local hour next to "GMT". If you need a real zone name, carry it yourself.
+//
+// **Do not use `%s`.** It is computed as if the fields were local time while
+// they are actually UTC, so it is wrong by the process's UTC offset — here it
+// returns 1699989200 for a value whose real epoch is 1700000000. Use
+// `date_to_unix(dt)`, which is correct.
+//
+// Portability: everything above is C99 strftime, available on Linux and macOS.
+// %P is a glibc extension. Windows (MSVCRT) supports a smaller set — %e, %F,
+// %T, %R, %D and %P are the ones most likely to be missing.
+//
+// `date_parse` is narrower than `date_format`, and much narrower on Windows,
+// which has no strptime at all: date_shim.c hand-implements
+//   %Y %y %C  %m %d %e  %H %I %M %S  %j  %p  %a %A %b %B %h
+//   %D %F %T %R  %n %t %%
+// Anything else fails, surfacing as date_is_valid(dt) == false rather than as a
+// silently wrong date.
 
 import { unixSec } from "vyto/util/time";
 

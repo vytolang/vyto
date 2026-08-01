@@ -131,6 +131,36 @@ int vsock_connect(const char *host, int port) {
     return VS_INT(s);
 }
 
+/* reuseport must be set BEFORE bind, so it is a listen parameter rather than
+   something a caller can apply to the returned Socket. -1 when reuseport was
+   asked for and the platform has no SO_REUSEPORT: a pre-fork server that
+   silently got a non-shared socket would look fine and serve on one worker. */
+int vsock_listen_ex(const char *host, int port, int backlog, int reuseport) {
+    if (vs_startup() != 0) return -1;
+    vsock_t s = socket(AF_INET, SOCK_STREAM, 0);
+    if (VS_INT(s) < 0) return -1;
+    int yes = 1;
+    setsockopt(s, SOL_SOCKET, SO_REUSEADDR, VS_OPTVAL(&yes), sizeof yes);
+    if (reuseport) {
+#ifdef SO_REUSEPORT
+        if (setsockopt(s, SOL_SOCKET, SO_REUSEPORT, VS_OPTVAL(&yes), sizeof yes) != 0) {
+            vs_closesocket(s); return -1;
+        }
+#else
+        vs_closesocket(s); return -1;
+#endif
+    }
+    struct sockaddr_in a;
+    memset(&a, 0, sizeof a);
+    a.sin_family = AF_INET;
+    a.sin_port = htons((unsigned short)port);
+    if (!host || !*host || inet_pton(AF_INET, host, &a.sin_addr) != 1)
+        a.sin_addr.s_addr = INADDR_ANY;
+    if (bind(s, (struct sockaddr *)&a, sizeof a) != 0) { vs_closesocket(s); return -1; }
+    if (listen(s, backlog) != 0) { vs_closesocket(s); return -1; }
+    return VS_INT(s);
+}
+
 int vsock_listen(const char *host, int port, int backlog) {
     if (vs_startup() != 0) return -1;
     vsock_t s = socket(AF_INET, SOCK_STREAM, 0);
@@ -182,6 +212,20 @@ int vsock_set_timeout(int fd, int ms) {
 int vsock_set_nodelay(int fd, int on) {
     return setsockopt(VS_FD(fd), IPPROTO_TCP, TCP_NODELAY, VS_OPTVAL(&on), sizeof on);
 }
+/* SO_REUSEPORT: every pre-fork worker opens its own listening socket on the
+   same port and the kernel hashes incoming connections across them. Without it
+   the workers must share one listen fd, which wakes every worker on every
+   connection (the thundering herd). Linux 3.9+ and the BSDs; the constant does
+   not exist on Windows, where this returns -1 rather than silently succeeding —
+   a caller that needs it must be able to tell. */
+int vsock_set_reuseport(int fd, int on) {
+#ifdef SO_REUSEPORT
+    return setsockopt(VS_FD(fd), SOL_SOCKET, SO_REUSEPORT, VS_OPTVAL(&on), sizeof on);
+#else
+    (void)fd; (void)on;
+    return -1;
+#endif
+}
 void vsock_close(int fd) { if (fd >= 0) vs_closesocket(VS_FD(fd)); }
 
 /* ---- non-blocking (async) --------------------------------------------------
@@ -214,6 +258,15 @@ long vsock_try_recv(int fd, char *buf, long cap) {
 }
 
 /* >=0 = bytes sent, -1 = would-block, -2 = error. */
+/* Send from an offset into a caller-owned buffer. Lets a writer resume a
+   partial send without slicing or copying the remainder — the buffer is
+   typically a StringBuilder's internal storage, which outlives the call. */
+long vsock_try_send_at(int fd, const char *buf, long off, long n) {
+    long r = (long)send(VS_FD(fd), buf + off, (vs_iolen_t)n, MSG_NOSIGNAL);
+    if (r >= 0) return r;
+    return vs_would_block(vs_lasterr()) ? -1 : -2;
+}
+
 long vsock_try_send(int fd, const char *buf, long n) {
     long r = (long)send(VS_FD(fd), buf, (vs_iolen_t)n, MSG_NOSIGNAL);
     if (r >= 0) return r;

@@ -1,0 +1,148 @@
+// vyto/net/server — an HTTP/1.1 server: routing, parsing, limits, keep-alive.
+//
+// Every case below drives a real socket against a real server on an ephemeral
+// port, in lockstep: the client sends, `serveOnce()` accepts and serves exactly
+// one connection, the client reads. No sleeps, no forked processes, no fixed
+// port — so this is deterministic enough to be a golden test, which the
+// reactor's concurrency cases (many simultaneous connections, a stalled client
+// not blocking a healthy one) are not. Those live outside the suite.
+//
+// The limits section is the point of the file. A server is the only
+// attacker-facing thing in this repository, so every length in a request —
+// header count, header bytes, Content-Length — is hostile input that must be
+// capped *before* it reaches an allocation. Those caps are asserted here rather
+// than assumed, along with the two framing rules that matter: CRLF is rejected
+// in response header values (response splitting), and `Transfer-Encoding` is
+// refused outright rather than mis-framed (request smuggling).
+
+import { server, Server, Limits } from "vyto/net/server";
+import { socket_connect } from "vyto/net/socket";
+import { StringBuilder } from "vyto/util/text";
+
+fn expect(name: string, hay: string, needle: string) {
+    if (hay.contains(needle)) { print("PASS " + name); }
+    else { print("FAIL " + name + " (want '" + needle + "')"); }
+}
+
+// Send one request on a fresh connection, serve it, return the reply.
+fn round_trip(port: int, raw: string, s: Server): string {
+    let c = socket_connect("127.0.0.1", port);
+    if (c == null) { return "<connect failed>"; }
+    c.setTimeoutMs(5000);
+    c.sendText(raw);
+    s.serveOnce();
+    return c.recvText(65536);
+}
+
+fn main() {
+    // ---- routing, parsing, errors ------------------------------------------
+    let s = server(0);
+    s.get("/health", (req, res) => { res.text(200, "ok"); });
+    s.get("/users/:id", (req, res) => { res.text(200, "user=" + req.param("id")); });
+    s.get("/q", (req, res) => { res.text(200, "n=" + req.queryParam("n")); });
+    s.get("/hdr", (req, res) => { res.text(200, "ua=" + req.header("User-Agent")); });
+    s.get("/count", (req, res) => { res.text(200, "h=" + str(req.headerCount())); });
+    s.post("/echo", (req, res) => { res.text(200, req.bodyText()); });
+    s.get("/inject", (req, res) => {
+        res.header("X-Bad", "a\r\nX-Evil: yes").text(200, "hi");
+    });
+    let port = s.bind();
+    if (port <= 0) { print("FAIL bind"); return; }
+
+    expect("health", round_trip(port,
+        "GET /health HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", s), "ok");
+    expect("route_param", round_trip(port,
+        "GET /users/42 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", s), "user=42");
+    expect("query_param", round_trip(port,
+        "GET /q?n=7&z=1 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", s), "n=7");
+    expect("request_header", round_trip(port,
+        "GET /hdr HTTP/1.1\r\nHost: x\r\nUser-Agent: vyto\r\nConnection: close\r\n\r\n", s), "ua=vyto");
+    expect("header_count", round_trip(port,
+        "GET /count HTTP/1.1\r\nHost: x\r\nA: 1\r\nB: 2\r\nConnection: close\r\n\r\n", s), "h=4");
+    expect("body_echo", round_trip(port,
+        "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello", s), "hello");
+    // A path that exists under another verb is 405, not 404 — the distinction
+    // matters to anything that probes.
+    expect("unknown_path_404", round_trip(port,
+        "GET /nope HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", s), "404 Not Found");
+    expect("wrong_method_405", round_trip(port,
+        "POST /health HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", s),
+        "405 Method Not Allowed");
+    expect("bad_version_505", round_trip(port,
+        "GET /health HTTP/9.9\r\nHost: x\r\n\r\n", s), "505 HTTP Version Not Supported");
+    // Refusing chunked beats guessing at the framing: a server and a proxy that
+    // disagree about where a request ends is the request-smuggling bug.
+    expect("chunked_refused_501", round_trip(port,
+        "GET /health HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n", s),
+        "501 Not Implemented");
+    // The server emits a Date on every response (RFC 7231) from a per-second
+    // cache, so a handler never has to.
+    expect("date_header", round_trip(port,
+        "GET /health HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", s), "Date: ");
+
+    // A CR or LF in a header value would let a handler that echoes user input
+    // inject a second header. The value is dropped, not escaped.
+    let inj = round_trip(port, "GET /inject HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", s);
+    if (inj.contains("X-Evil")) { print("FAIL header_injection_blocked"); }
+    else { print("PASS header_injection_blocked"); }
+
+    // ---- limits ------------------------------------------------------------
+    let g = server(0);
+    g.get("/ok", (req, res) => { res.text(200, "ok"); });
+    g.post("/echo", (req, res) => { res.text(200, "len=" + str(req.bodyText().len)); });
+    let L = new Limits();
+    L.max_header_count = 5;
+    L.max_body_bytes = 32;
+    g.withLimits(L);
+    let gp = g.bind();
+
+    let many = new StringBuilder(512);
+    many.append("GET /ok HTTP/1.1\r\nHost: x\r\n");
+    for (let i in 0..12) { many.append("X-P").appendInt(i).append(": v\r\n"); }
+    many.append("Connection: close\r\n\r\n");
+    expect("too_many_headers_431", round_trip(gp, many.toString(), g), "431");
+
+    expect("oversized_body_413", round_trip(gp,
+        "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 99999\r\nConnection: close\r\n\r\n", g),
+        "413");
+    // A non-numeric length must be refused, not coerced.
+    expect("bad_content_length_413", round_trip(gp,
+        "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 12x\r\nConnection: close\r\n\r\n", g),
+        "413");
+
+    // ---- buffer growth -----------------------------------------------------
+    // A connection's buffer starts at 2 KB and doubles toward the cap on
+    // demand; the cap stays the security bound. These cross that boundary,
+    // which nothing above does.
+    let b = server(0);
+    b.get("/big", (req, res) => { res.text(200, "n=" + str(req.header("X-Big").len)); });
+    b.post("/body", (req, res) => { res.text(200, "len=" + str(req.bodyText().len)); });
+    let bp = b.bind();
+
+    let big = new StringBuilder(8192);
+    for (let i in 0..300) { big.append("0123456789"); }        // 3000 bytes
+    expect("headers_grow_buffer", round_trip(bp,
+        "GET /big HTTP/1.1\r\nHost: x\r\nX-Big: " + big.toString()
+        + "\r\nConnection: close\r\n\r\n", b), "n=3000");
+
+    let body = new StringBuilder(8192);
+    for (let i in 0..500) { body.append("abcdefghij"); }       // 5000 bytes
+    expect("body_grows_buffer", round_trip(bp,
+        "POST /body HTTP/1.1\r\nHost: x\r\nContent-Length: 5000\r\n"
+        + "Connection: close\r\n\r\n" + body.toString(), b), "len=5000");
+
+    // Growth must not become an unbounded allocation: past the cap is still 431.
+    let cap = server(0);
+    cap.get("/ok", (req, res) => { res.text(200, "ok"); });
+    let CL = new Limits();
+    CL.max_header_bytes = 4096;
+    cap.withLimits(CL);
+    let cp = cap.bind();
+    let huge = new StringBuilder(65536);
+    for (let i in 0..6000) { huge.append("0123456789"); }      // 60 KB
+    expect("cap_still_enforced_431", round_trip(cp,
+        "GET /ok HTTP/1.1\r\nHost: x\r\nX-Huge: " + huge.toString()
+        + "\r\nConnection: close\r\n\r\n", cap), "431");
+
+    print("done");
+}
