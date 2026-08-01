@@ -13,6 +13,7 @@ import { Surface, Rect, contains, rgb, rgba, with_alpha, alpha_of, mix,
           EV_RESIZE, EV_CLOSE, EV_TIMER, MOD_SHIFT,
           KEY_ESC, KEY_TAB } from "vyto/surface";
 import { Animator, Tween, AnimatedFloat } from "vyto/ui/anim";
+import { Spring } from "vyto/anim";
 import { Scrollbar, SIDE_TOP, SIDE_RIGHT, SIDE_BOTTOM, SIDE_LEFT } from "vyto/ui/scrollbar";
 import { ease_linear, ease_in_quad, ease_out_quad, ease_in_out_quad,
          ease_in_cubic, ease_out_cubic, ease_in_out_cubic,
@@ -1095,6 +1096,96 @@ fn without(xs: Widget[], drop: Widget): Widget[] {
     return keep;
 }
 
+// -------------------------------------------------- drag-scroll and fling
+// Touch scrolling (ANDROID.md Track C item 2): the content follows the finger,
+// and a release with speed keeps it coasting. Both live on Widget rather than
+// on ScrollView, because the scroll *model* already does — scroll_offset /
+// set_scroll_offset / scroll_content_h are Widget virtuals, and every
+// scrollable widget already overrides them for its scrollbar. Wiring the
+// gesture to the same seam means ScrollView and ListView need no code at all.
+
+// Below this the release is a stop, not a flick (px/ms). One frame at 60Hz is
+// 16ms, so this is about 4px of travel in the last frame.
+const FLING_MIN_V: float = 0.25;
+// How long the flick is taken to "carry" — velocity times this is the coast
+// distance. The one number that sets how far a flick throws the content.
+const FLING_COAST_MS: float = 300.0;
+// Spring feel for the coast. Critically damped: no bounce-back at the landing
+// point, which on a list reads as a glitch rather than as bounce.
+const FLING_RESPONSE: float = 0.55;
+const FLING_DAMPING: float = 1.0;
+// Remaining travel below which the coast lands rather than creeping.
+const FLING_SNAP_PX: float = 0.5;
+// A release this long after the last movement is a stop, not a flick — about
+// four frames at 60Hz.
+const FLING_STALE_MS: int = 64;
+
+// Per-widget kinetic-scroll state. Null until a widget is actually
+// drag-scrolled — the same lazy shape as `scrollbars` and `pending_anims`, so
+// a tree of thousands of widgets that are never dragged pays one null pointer
+// each rather than three floats.
+class DragScroll {
+    vel: float;        // px/ms at the last move; signed like the scroll offset
+    last_ms: int;
+    anim: FlingScroll; // live coast, or null
+
+    fn init() {
+        this.vel = 0.0;
+        this.last_ms = 0;
+    }
+}
+
+// The coast itself. A Spring rather than an exponential friction decay because
+// it already carries velocity through retarget() and already settles exactly
+// (anim.vt snaps at rest), so a fling ends on a definite value instead of
+// asymptotically approaching one — which is what keeps the snapshot goldens
+// stable.
+class FlingScroll extends Animator {
+    spring: Spring;
+    // Back-reference. The Window's animation list owns this animator, so a
+    // strong ref here would keep the widget alive for as long as the coast
+    // runs — and a widget torn down mid-fling would never be freed. Weak means
+    // advance() simply finds null and drops itself.
+    target: weak Widget;
+
+    fn init(w: weak Widget, start: float, vel_px_ms: float, to: float) {
+        this.spring = new Spring(FLING_RESPONSE, FLING_DAMPING);
+        this.spring.reset(start);
+        // Spring integrates in seconds; the gesture measures px/ms.
+        this.spring.velocity = vel_px_ms * 1000.0;
+        this.spring.retarget(to);
+        this.target = w;
+        this.track_bounds = true;
+        this.bounds = w.bounds;
+        this.done = false;
+    }
+
+    override fn advance(dt_ms: int): bool {
+        let w = this.target;
+        if (w == null) { this.done = true; return false; }
+        if (!this.spring.step(dt_ms)) { this.done = true; return false; }
+        // Spring settles at 0.001, which is the right tolerance for a 0..1
+        // hover amount and far too fine for a pixel offset — the tail would
+        // repaint for hundreds of frames while moving less than a pixel.
+        // Land as soon as the remaining travel stops being visible.
+        let left = this.spring.target - this.spring.value;
+        if (left < 0.0) { left = 0.0 - left; }
+        if (left < FLING_SNAP_PX) {
+            w.set_scroll_v(this.spring.target);
+            this.bounds = w.bounds;
+            this.done = true;
+            return true;
+        }
+        w.set_scroll_v(this.spring.value);
+        this.bounds = w.bounds;
+        return true;
+    }
+
+    override fn retain(moved: bool): bool { return moved && !this.done; }
+
+    override fn release() { this.target = null; }
+}
+
 // ---------------------------------------------------------------- Widget
 
 export class Widget {
@@ -1154,6 +1245,7 @@ export class Widget {
     scroll_off_x: float; // content offset the horizontal bar reads/writes
     scroll_off_y: float; // content offset the vertical bar reads/writes
     scroll_active: int;
+    dragscroll: DragScroll; // touch-scroll state; null until first dragged
     scroll_children: bool;
 
     fn init() {
@@ -1450,6 +1542,124 @@ export class Widget {
 
     fn scrollbar_release() { this.scroll_active = -1; }
 
+    // ------------------------------------------- drag-scroll (Track C item 2)
+
+    // The vertical bar, or null. Drag-scroll goes through the same
+    // scroll_offset/set_scroll_offset seam the bar uses, so a widget that
+    // already feeds its bar (ScrollView, ListView) is drag-scrollable with no
+    // code of its own — including the relayout each does on the way through.
+    fn vscrollbar(): Scrollbar {
+        if (this.scrollbars == null) { return null; }
+        for (let sb in this.scrollbars) {
+            if (sb.vertical()) { return sb; }
+        }
+        return null;
+    }
+
+    fn scroll_v(): float {
+        let sb = this.vscrollbar();
+        if (sb == null) { return this.scroll_off_y; }
+        return this.scroll_offset(sb);
+    }
+
+    fn set_scroll_v(v: float) {
+        let sb = this.vscrollbar();
+        if (sb == null) {
+            this.scroll_off_y = v;
+            this.scroll_clamp();
+            return;
+        }
+        // every implementation of this clamps; none is trusted to have been
+        // given an in-range value
+        this.set_scroll_offset(sb, v);
+    }
+
+    fn scroll_v_max(): float {
+        let m = this.scroll_content_h() - this.scroll_viewport().h;
+        if (m < 0.0) { m = 0.0; }
+        return m;
+    }
+
+    fn scroll_now_ms(): int {
+        let w = this.win;
+        if (w == null) { return 0; }
+        return w.surf.now_ms();
+    }
+
+    // Stop a coast dead. Called when a new drag begins on this widget, which
+    // is what every touch platform does — grabbing a moving list pins it.
+    fn drag_scroll_stop() {
+        if (this.dragscroll == null) { return; }
+        let ds = this.dragscroll;
+        if (ds.anim != null) { ds.anim.cancel(); ds.anim = null; }
+        ds.vel = 0.0;
+        ds.last_ms = this.scroll_now_ms();
+    }
+
+    // Move the content with the finger. dy > 0 is a downward drag, which
+    // reveals earlier content and so *decreases* the offset. Returns true only
+    // when the offset actually moved, so a caller walking up the parent chain
+    // keeps looking past a widget that is already at its end.
+    //
+    // Virtual because "the drag reached the end of the content" is exactly the
+    // condition an overscroll gesture is defined by: an ancestor that overrides
+    // this (PullToRefresh) is handed the drag only once every scrollable widget
+    // below it has refused it.
+    virtual fn drag_scroll(dx: int, dy: int): bool {
+        if (this.scroll_v_max() <= 0.0) { return false; }
+        if (this.dragscroll == null) {
+            this.dragscroll = new DragScroll();
+            this.dragscroll.last_ms = this.scroll_now_ms();
+        }
+        let ds = this.dragscroll;
+        let before = this.scroll_v();
+        this.set_scroll_v(before - dy as float);
+        // What the clamp actually allowed, not what was asked for — otherwise
+        // a drag held against the end of the content banks phantom velocity and
+        // flings the moment it is released.
+        let moved = this.scroll_v() - before;
+        let now = this.scroll_now_ms();
+        let dt = now - ds.last_ms;
+        if (dt > 0) {
+            // Blend rather than replace, so one jittery sample cannot decide
+            // the fling on its own. (A pause before release is handled in
+            // drag_scroll_end, which times out a stale sample rather than
+            // decaying it here — nothing calls this while the finger is still.)
+            let inst = moved / (dt as float);
+            ds.vel = ds.vel * 0.3 + inst * 0.7;
+            ds.last_ms = now;
+        }
+        this.invalidate();
+        return moved != 0.0;
+    }
+
+    // Release. Coasts on if the flick was fast enough; returns true when a
+    // fling actually started.
+    virtual fn drag_scroll_end(): bool {
+        let ds = this.dragscroll;
+        if (ds == null) { return false; }
+        let v = ds.vel;
+        ds.vel = 0.0;
+        let speed = v;
+        if (speed < 0.0) { speed = 0.0 - speed; }
+        if (speed < FLING_MIN_V) { return false; }
+        // A finger that stopped moving before it lifted is not a flick, however
+        // fast it was travelling earlier. Velocity is only sampled on move
+        // events, so without this a drag that pauses and then releases would
+        // throw the content using a speed it no longer had.
+        if (this.scroll_now_ms() - ds.last_ms > FLING_STALE_MS) { return false; }
+        let start = this.scroll_v();
+        let to = start + v * FLING_COAST_MS;
+        let mx = this.scroll_v_max();
+        if (to < 0.0) { to = 0.0; }
+        if (to > mx) { to = mx; }
+        if (to == start) { return false; }
+        let f = new FlingScroll(this, start, v, to);
+        ds.anim = f;
+        this.register_anim(f);
+        return true;
+    }
+
     // True if (px,py) lands on a live bar. Widgets whose child covers the bar
     // area (ScrollView) call this in hit() to claim the press for themselves.
     fn scrollbar_hit(px: int, py: int): bool {
@@ -1659,17 +1869,39 @@ export class Widget {
     // state changed (needs redraw). Bracketed by on_drag_start / on_drag_end;
     // Slider is the first consumer.
     virtual fn on_drag(dx: int, dy: int): bool {
-        return this.scrollbar_drag(dx, dy);
+        if (this.scrollbar_drag(dx, dy)) { return true; }
+        // No bar captured, so this is a content drag. Walk up to the nearest
+        // scrollable ancestor and scroll that — the same parent-chain walk
+        // on_scroll_at does for the wheel. Without it a finger landing on a
+        // Label inside a ScrollView would do nothing at all, because Window
+        // dispatches on_drag only to the widget that took the press.
+        let w: Widget = this;
+        while (w != null) {
+            if (w.drag_scroll(dx, dy)) { return true; }
+            w = w.parent;
+        }
+        return false;
     }
 
     // Fired once when a press begins moving past the drag slop, before the
     // first on_drag. x/y are absolute. The companion on_drag_end fires on
     // release after a drag. Return true when consumed / state changed.
     virtual fn on_drag_start(x: int, y: int): bool {
+        // A new grab pins whatever is coasting above this widget.
+        let w: Widget = this;
+        while (w != null) {
+            w.drag_scroll_stop();
+            w = w.parent;
+        }
         return false;
     }
     virtual fn on_drag_end(x: int, y: int): bool {
         this.scrollbar_release();
+        let w: Widget = this;
+        while (w != null) {
+            if (w.drag_scroll_end()) { return true; }
+            w = w.parent;
+        }
         return false;
     }
 
@@ -1727,6 +1959,12 @@ export class Widget {
     // Cursor entered / left this widget's bounds — the callback companions to
     // the passively-maintained `hovered` flag. Return true when consumed /
     // state changed (needs redraw).
+    // Does this widget's appearance depend on `pressed`? Default yes, which is
+    // what every interactive widget wants. Containers override it to false:
+    // they exist to hold children, never draw a press state, and are large, so
+    // animating one is pure cost. See Window.set_press.
+    virtual fn shows_press(): bool { return true; }
+
     virtual fn on_hover_enter(): bool {
         return false;
     }
@@ -1948,15 +2186,33 @@ export class Window {
 
     fn close() { this.running = false; }
 
+    // Both of these redraw, and the redraw is not optional.
+    //
+    // An overlay covers an arbitrary region — a modal sheet's scrim is the
+    // whole window — and the backbuffer persists between frames on every tier.
+    // Laying out without painting therefore leaves the *previous* state on
+    // screen: a dismissed overlay's pixels stay until something unrelated
+    // happens to force a full redraw, and a freshly opened one is invisible
+    // until then. Whatever repaints next is usually a partial one driven by an
+    // animation's dirty rect, so the two states alternate frame to frame.
+    //
+    // That is exactly what this looked like on a device: at every open and
+    // close of a BottomSheet, single frames appeared with the full-screen scrim
+    // missing while the frames either side had it, and vice versa. Measured off
+    // a screen recording — mean frame brightness alternating 154/238/154 across
+    // consecutive frames, with the enter and exit fades themselves perfectly
+    // smooth on both sides of the glitch.
     fn open_overlay(o: Widget) {
         o.propagate_win(this);
         this.overlay = o;
         this.layout();
+        this.redraw();
     }
 
     fn dismiss_overlay() {
         this.overlay = null;
         this.layout();
+        this.redraw();
     }
 
     // Transient notifications (Toast/Snackbar). They live in a separate top-most
@@ -1987,14 +2243,19 @@ export class Window {
         return this.focusables[this.focus_i];
     }
 
-    fn set_focus(i: int) {
+    // Returns true only when the focus actually moved. Callers use that to
+    // decide whether anything needs repainting: a click that re-focuses the
+    // widget already focused changes nothing on screen, and treating it as a
+    // change cost a full-window redraw per tap.
+    fn set_focus(i: int): bool {
         // re-focusing the current widget is a no-op (don't fire blur/focus).
-        if (i == this.focus_i) { return; }
+        if (i == this.focus_i) { return false; }
         let old = this.focused_widget();
-        if (old != null) { old.focused = false; old.on_blur(); }
+        if (old != null) { old.focused = false; old.on_blur(); this.mark_dirty(old.bounds); }
         this.focus_i = i;
         let now = this.focused_widget();
-        if (now != null) { now.focused = true; now.on_focus(); }
+        if (now != null) { now.focused = true; now.on_focus(); this.mark_dirty(now.bounds); }
+        return true;
     }
 
     fn focus_next() {
@@ -2013,13 +2274,13 @@ export class Window {
         this.set_focus(i);
     }
 
-    fn focus_widget(w: Widget) {
+    fn focus_widget(w: Widget): bool {
         for (let i in 0..this.focusables.len) {
             if (this.focusables[i] == w) {
-                this.set_focus(i);
-                return;
+                return this.set_focus(i);
             }
         }
+        return false;
     }
 
     fn layout() {
@@ -2033,9 +2294,16 @@ export class Window {
             top = sh;
         }
         if (this.root != null) {
+            // propagate_win BEFORE measure, not after. A widget's measured size
+            // can depend on knowing its window — anything scaling a dp constant
+            // by the display density has to reach Window.theme to do it — and
+            // measuring first meant such a widget reported an unscaled size,
+            // was allotted a box for it, and then drew itself scaled. On a
+            // 2.75-density phone every widget painted at 2.75x its own layout
+            // rect and the whole column overlapped.
+            this.root.propagate_win(this);
             this.root.measure(this.painter, this.theme);
             this.root.arrange(this.painter, this.theme, Rect(0, top, w, h - top));
-            this.root.propagate_win(this);
         }
         if (this.overlay != null) {
             this.overlay.place(this.painter, this.theme);
@@ -2204,12 +2472,51 @@ export class Window {
             }
         }
         if (this.overlay != null) {
-            if (!contains(this.overlay.bounds, x, y) && !this.overlay.modal) {
-                this.dismiss_overlay();
-                this.redraw();
-            } else if (contains(this.overlay.bounds, x, y)) {
-                if (this.overlay.on_click(x, y)) { this.redraw(); }
+            if (!contains(this.overlay.bounds, x, y)) {
+                // outside a modal overlay: swallow. Outside a dismissable one:
+                // close it.
+                if (!this.overlay.modal) {
+                    this.dismiss_overlay();
+                    this.redraw();
+                }
+                return;
             }
+            // Overlays used to dispatch on_click and return right here, leaving
+            // press_w null — so no overlay ever saw a drag, a long-press, a
+            // double-click or a release, and anything whose interaction model is
+            // "drag this" (BottomSheet, NavigationDrawer) could not work at all.
+            // Capture the press exactly the way the root tree does below.
+            //
+            // on_click still goes to the overlay root rather than the hit
+            // widget: DropdownPopup, Dialog and ContextMenu each route their own
+            // clicks internally, and dispatching to the hit widget instead would
+            // reroute every overlay in the toolkit. The press capture goes to the
+            // hit widget, which is what drag and release need.
+            let ot = this.overlay.hit(x, y);
+            if (ot == null) { ot = this.overlay; }   // childless overlay hits itself
+            this.set_hover(ot);
+            this.set_press(ot);
+            this.press_ms = this.surf.now_ms();
+            this.press_x = x;
+            this.press_y = y;
+            this.dragging = false;
+            this.long_press_fired = false;
+            let ochanged = false;
+            if (this.overlay.on_click(x, y)) { ochanged = true; }
+            let onow = this.surf.now_ms();
+            if (this.last_click_w == ot
+                && onow - this.last_click_ms <= DOUBLE_CLICK_MS
+                && abs_i(x - this.last_click_x) <= DRAG_SLOP
+                && abs_i(y - this.last_click_y) <= DRAG_SLOP) {
+                if (ot.on_double_click(x, y)) { ochanged = true; }
+                this.last_click_w = null;
+            } else {
+                this.last_click_w = ot;
+                this.last_click_ms = onow;
+                this.last_click_x = x;
+                this.last_click_y = y;
+            }
+            if (ochanged) { this.redraw(); }
             return;
         }
         if (this.menubar != null && contains(this.menubar.bounds, x, y)) {
@@ -2230,10 +2537,7 @@ export class Window {
             this.dragging = false;
             this.long_press_fired = false;
             let changed = false;
-            if (target.focusable) {
-                this.focus_widget(target);
-                changed = true;
-            }
+            if (target.focusable && this.focus_widget(target)) { changed = true; }
             if (target.on_click(x, y)) { changed = true; }
             // double-click: a second press on the same widget within the time
             // window and inside the slop.
@@ -2374,12 +2678,18 @@ export class Window {
     fn set_press(w: Widget) {
         if (this.press_w != null) {
             this.press_w.pressed = false;
-            this.press_w.drive_press(0.0);
+            if (this.press_w.shows_press()) { this.press_w.drive_press(0.0); }
         }
         this.press_w = w;
         if (w != null) {
             w.pressed = true;
-            w.drive_press(1.0);
+            // The spring is only worth running if something draws from it. A
+            // press on a scroll container or a plain layout box animates a
+            // value nothing reads, while repainting that widget's bounds every
+            // frame for the spring's whole life — and a container's bounds are
+            // usually most of the screen. Tapping empty space cost ~36
+            // near-full-screen repaints before this check.
+            if (w.shows_press()) { w.drive_press(1.0); }
         }
     }
 
