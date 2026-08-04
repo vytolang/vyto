@@ -2198,4 +2198,15 @@ void *vs_native_gc(void *vs) { return ((VSurf *)vs)->gc; }
 
 #endif /* _WIN32 / X11 */
 
+/* No desktop arm drives a vsync clock: X11 has no portable frame callback
+ * without a compositor extension, and Win32's DwmFlush blocks rather than
+ * calling back. Returning 0 is not a stub — it is the contract that tells
+ * Window.run() to keep presenting eagerly, exactly as it did before vsync
+ * gating existed. Shared by the Win32, X11, fbdev and headless arms. */
+int vs_set_vsync(void *vs, int on) {
+    (void)vs;
+    (void)on;
+    return 0;
+}
+
 #endif /* !__ANDROID__ — Android is vsurf_android.c */

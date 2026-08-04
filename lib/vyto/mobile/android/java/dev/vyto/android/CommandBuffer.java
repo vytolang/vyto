@@ -203,6 +203,7 @@ public final class CommandBuffer {
      *
      * @param len byte length of valid data; the buffer itself may be larger.
      */
+
     public void replay(Canvas c, ByteBuffer buf, int len) {
         buf.order(ByteOrder.nativeOrder());
         buf.position(0);
@@ -303,8 +304,7 @@ public final class CommandBuffer {
                     rect(buf);
                     float r = buf.getFloat();
                     int top = buf.getInt(), bottom = buf.getInt();
-                    paint.setStyle(Paint.Style.FILL);
-                    paint.setShader(new LinearGradient(rf.left, rf.top, rf.left, rf.bottom,
+                    shaded(new LinearGradient(rf.left, rf.top, rf.left, rf.bottom,
                             top, bottom, Shader.TileMode.CLAMP));
                     c.drawRoundRect(rf, r, r, paint);
                     paint.setShader(null);
@@ -318,8 +318,7 @@ public final class CommandBuffer {
                     float[] pos = new float[n];
                     for (int i = 0; i < n; i++) colors[i] = buf.getInt();
                     for (int i = 0; i < n; i++) pos[i] = buf.getFloat();
-                    paint.setStyle(Paint.Style.FILL);
-                    paint.setShader(new LinearGradient(rf.left, rf.top, rf.left, rf.bottom,
+                    shaded(new LinearGradient(rf.left, rf.top, rf.left, rf.bottom,
                             colors, pos, Shader.TileMode.CLAMP));
                     c.drawRoundRect(rf, r, r, paint);
                     paint.setShader(null);
@@ -334,8 +333,7 @@ public final class CommandBuffer {
                     float[] pos = new float[n];
                     for (int i = 0; i < n; i++) colors[i] = buf.getInt();
                     for (int i = 0; i < n; i++) pos[i] = buf.getFloat();
-                    paint.setStyle(Paint.Style.FILL);
-                    paint.setShader(new RadialGradient(cx, cy, rad, colors, pos,
+                    shaded(new RadialGradient(cx, cy, rad, colors, pos,
                             Shader.TileMode.CLAMP));
                     c.drawRoundRect(rf, r, r, paint);
                     paint.setShader(null);
@@ -354,6 +352,11 @@ public final class CommandBuffer {
                     paint.setShadowLayer(Math.max(blur, 0.1f), 0f, dy, color);
                     c.drawRoundRect(rf, r, r, paint);
                     paint.clearShadowLayer();
+                    // Leave the paint opaque again. The alpha-0 above is what
+                    // makes the shape itself invisible so only its shadow lands,
+                    // but a Shader set by a later op is modulated by that same
+                    // alpha — see shaded().
+                    paint.setColor(0xFF000000);
                     break;
                 }
                 case OP_BEVEL: {
@@ -477,6 +480,25 @@ public final class CommandBuffer {
         paint.setStyle(Paint.Style.FILL);
         paint.setShader(null);
         paint.setColor(color);
+    }
+
+    /**
+     * Fill with a shader.
+     *
+     * <p>Resets the paint colour to opaque first, which is load-bearing: a
+     * Shader supplies the RGB but the paint's <b>alpha still modulates it</b>,
+     * and OP_SHADOW leaves the paint at {@code setColor(0)} — alpha 0. Any
+     * gradient replayed after a shadow therefore drew fully transparent.
+     *
+     * <p>That is not a hypothetical: a Button is {@code shadow()} immediately
+     * followed by {@code gradient_v()} (ui/core.vt:914-916), so on device it
+     * rendered as a bare blurred shadow with no fill, and flickered whenever a
+     * partial repaint happened to reorder what preceded it.
+     */
+    private void shaded(Shader s) {
+        paint.setStyle(Paint.Style.FILL);
+        paint.setColor(0xFF000000);
+        paint.setShader(s);
     }
 
     private void stroke(int color, float width) {

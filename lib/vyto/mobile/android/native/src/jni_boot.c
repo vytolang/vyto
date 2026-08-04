@@ -203,6 +203,12 @@ Java_dev_vyto_android_Native_resize(JNIEnv *env, jclass cls,
 }
 
 JNIEXPORT void JNICALL
+Java_dev_vyto_android_Native_vsync(JNIEnv *env, jclass cls) {
+    (void)env; (void)cls;
+    vs_android_push_vsync();
+}
+
+JNIEXPORT void JNICALL
 Java_dev_vyto_android_Native_touch(JNIEnv *env, jclass cls, jint action,
                                    jint pointer_id, jfloat x, jfloat y, jlong time_ms) {
     (void)env; (void)cls;

@@ -146,14 +146,29 @@ export class AndroidPainter extends Painter {
     size_stack: float[];  // push_font/pop_font, saved (size, weight) pairs
     weight_stack: int[];
 
+    // `fontSize` is in desktop px, like every other metric an app writes, and
+    // is scaled here by the display density.
+    //
+    // This is the DPI seam, and it has to be here rather than in the widgets.
+    // Label, Button and most others never select a font — they draw at the
+    // painter's *current* size (form.vt:35-46) — while Theme.apply_scale has
+    // already multiplied the type ramp, spacing and radii by the same density.
+    // So the theme was correctly scaled and nothing read it: on a 2.75x phone
+    // every unstyled string rendered at roughly a third of its intended size,
+    // which is what made the UI look like a shrunken desktop window.
+    //
+    // Only the *base* size is scaled. A widget that pushes th.text_md passes an
+    // absolute size that apply_scale already grew, so scaling that too would
+    // square the density.
     fn init(surf: Surface, fontSize: float) {
         this.surf = surf;
-        this.base_font_size = fontSize;
+        let px = fontSize * surf.scale();
+        this.base_font_size = px;
         this.size_stack = [];
         this.weight_stack = [];
         this.weight = WEIGHT_REG;
         this.p = vta_painter_new(surf.raw_handle(), surf.width() as i32,
-                                 surf.height() as i32, fontSize);
+                                 surf.height() as i32, px);
     }
 
     fn dispose() {

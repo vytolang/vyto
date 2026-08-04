@@ -9,7 +9,7 @@ import { vs_open, vs_close, vs_width, vs_height, vs_set_title,
           vs_fill_rect, vs_draw_rect, vs_draw_line, vs_draw_text, vs_blit, vs_present,
           vs_text_width, vs_font_ascent, vs_font_height,
           vs_wait, vs_poll, vs_wait_timeout, vs_key, vs_text, vs_x, vs_y, vs_wheel,
-          vs_mods, vs_now_ms, vs_scale_pct, vs_blit_rect, vs_present_rect,
+          vs_mods, vs_now_ms, vs_scale_pct, vs_set_vsync, vs_blit_rect, vs_present_rect,
           vs_clip_set, vs_clip_clear, vs_clipboard_get, vs_clipboard_set,
           vs_native_display, vs_native_window, vs_native_gc } from "vsurf";
 
@@ -27,6 +27,7 @@ export const EV_TIMER: int = 8;   // vs_wait_timeout elapsed with no input
 export const EV_KEY_UP: int = 9;  // a key was released; key() gives the code
 export const EV_MOUSE_WHEEL: int = 10; // mouse wheel scrolled; wheel() gives the delta
 export const EV_MOUSE_RDOWN: int = 11; // right button pressed; mouse_x()/mouse_y() give position
+export const EV_VSYNC: int = 12;  // the display is about to scan out; present now (see set_vsync)
 
 // Key codes from Surface.key(): printable ASCII, or one of these
 // (mirrors VS_KEY_* in vsurf.h). KEY_SPACE is plain ASCII 32, named for
@@ -303,6 +304,21 @@ export class Surface {
     // Blocks up to ms; returns EV_TIMER if it elapses with no input. The tick
     // source for game loops: draw, present, then wait_timeout(frame_ms).
     fn wait_timeout(ms: int): int { return vs_wait_timeout(this.h, ms as i32); }
+    // Ask the backend for an EV_VSYNC once per display refresh while `on`.
+    //
+    // Returns whether the backend really drives a vsync clock. **A caller that
+    // gates presentation on EV_VSYNC must present eagerly when this returns
+    // false, or it will never present at all** — only Android has a frame
+    // clock (Choreographer); X11, Win32, fbdev and headless all return false.
+    //
+    // Enable it only while something is animating. The clock is a wakeup per
+    // refresh, so leaving it on turns an idle event-driven loop into a 60Hz
+    // spin.
+    fn set_vsync(on: bool): bool {
+        let flag = 0;
+        if (on) { flag = 1; }
+        return vs_set_vsync(this.h, flag as i32) != 0;
+    }
     fn key(): int { return vs_key(); }
     fn text_ev(): string { return str(vs_text()); }
     fn mouse_x(): int { return vs_x(); }

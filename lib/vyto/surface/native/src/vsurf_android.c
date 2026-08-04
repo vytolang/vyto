@@ -150,7 +150,14 @@ static int deliver(Ev *e) {
 /* ------------------------------------------------------------ UI thread in */
 
 void vs_android_bind(int w, int h, float density) {
+    /* Insets outlive a bind. onApplyWindowInsets fires during the first
+     * traversal, which is *before* Native.start on every launch measured here,
+     * and Android then does not repeat it — so a plain memset delivers them
+     * once and throws them away. They describe the display, not the binding
+     * session. Zero on the first call, since S is a zeroed static. */
+    int il = S.ins_l, it = S.ins_t, ir = S.ins_r, ib = S.ins_b, iime = S.ins_ime;
     memset(&S, 0, sizeof S);
+    S.ins_l = il; S.ins_t = it; S.ins_r = ir; S.ins_b = ib; S.ins_ime = iime;
     pthread_mutex_init(&S.lock, NULL);
     pthread_cond_init(&S.cv, NULL);
     S.w = w;
@@ -273,6 +280,81 @@ void vs_android_push_key(int keycode, const char *utf8, int mods, int down) {
     push(&e);
 }
 
+/* ------------------------------------------------------------ vsync gating
+ *
+ * Android composites on its own clock and Canvas.drawBitmap re-uploads the
+ * whole bitmap whenever it changed, so presenting more often than the display
+ * refreshes is pure waste — and presenting on a 16ms software timer against a
+ * 16.67ms display beats, which is visible as periodic judder even when every
+ * frame lands inside budget. Choreographer is the only clock that is actually
+ * the display's, so the loop presents on it and nothing else.
+ *
+ * Enabled only while something animates: Vyto's loop blocks when idle, and a
+ * free-running frame callback would turn a parked app into a 60Hz wakeup. */
+
+static jmethodID m_set_vsync = NULL;
+
+/* UI thread (Choreographer callback) in, Vyto thread out. At most one
+ * VS_EV_VSYNC is ever queued: two would present the same frame twice, and when
+ * the Vyto thread is behind it is the *older* one that is stale. */
+void vs_android_push_vsync(void) {
+    pthread_mutex_lock(&S.lock);
+    /* A parked app must stay parked. Choreographer keeps firing for a frame or
+     * two after onPause, and queueing those would wake the loop that
+     * vs_android_set_paused just put to sleep. */
+    if (S.paused || !S.bound) {
+        pthread_mutex_unlock(&S.lock);
+        return;
+    }
+    int idx = S.head;
+    for (int i = 0; i < S.count; i++) {
+        if (S.q[idx].type == VS_EV_VSYNC) {
+            pthread_mutex_unlock(&S.lock);
+            return;
+        }
+        idx = (idx + 1) % QCAP;
+    }
+    Ev e = {0};
+    e.type = VS_EV_VSYNC;
+    push_locked(&e);
+    pthread_mutex_unlock(&S.lock);
+}
+
+int vs_set_vsync(void *s, int on) {
+    (void)s;
+    JNIEnv *env = vta_env();
+    jobject view = vta_view();
+    if (!env || !view) return 0;
+
+    if (!m_set_vsync) {
+        /* GetObjectClass, never FindClass: this runs on the Vyto thread, which
+         * AttachCurrentThread leaves with no Java frame, so FindClass would
+         * resolve against the system loader and never see an app class. Taking
+         * the class off an object Java already handed us sidesteps that
+         * entirely — same reason the painter and intent shims are safe. */
+        jclass c = (*env)->GetObjectClass(env, view);
+        m_set_vsync = (*env)->GetMethodID(env, c, "setVsyncEnabled", "(Z)Z");
+        (*env)->DeleteLocalRef(env, c);
+        if (!m_set_vsync) {
+            if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+            vta_logf("setVsyncEnabled missing; presenting eagerly");
+            return 0;
+        }
+    }
+
+    /* The View reports back whether it could schedule: it is not attached
+     * during teardown, and then there is no Handler to hop to the UI thread
+     * with. Passing that failure through is what keeps Window.run() from
+     * gating on a clock that will never tick. */
+    jboolean ok = (*env)->CallBooleanMethod(env, view, m_set_vsync,
+                                            on ? JNI_TRUE : JNI_FALSE);
+    if ((*env)->ExceptionCheck(env)) {
+        (*env)->ExceptionClear(env);
+        return 0;
+    }
+    return ok == JNI_TRUE ? 1 : 0;
+}
+
 void vs_android_push_resize(int w, int h, float density) {
     pthread_mutex_lock(&S.lock);
     S.w = w;
@@ -286,9 +368,41 @@ void vs_android_push_resize(int w, int h, float density) {
 
 void vs_android_push_insets(int l, int t, int r, int b, int ime_h) {
     pthread_mutex_lock(&S.lock);
+    int changed = S.ins_l != l || S.ins_t != t || S.ins_r != r
+               || S.ins_b != b || S.ins_ime != ime_h;
     S.ins_l = l; S.ins_t = t; S.ins_r = r; S.ins_b = b; S.ins_ime = ime_h;
+    /* Announce as a RESIZE. There is no VS_EV_INSETS — the event enum is a
+     * wire contract with three other backends — but a layout is exactly what
+     * an inset change needs, and RESIZE is already "re-run layout and redraw".
+     *
+     * Without this the values are dead on arrival: onApplyWindowInsets fires on
+     * the UI thread *after* the Vyto thread has already run its first and only
+     * layout, so a safe-area widget samples zeroes and nothing ever asks it
+     * again. That is why the first labels rendered behind the status bar even
+     * though the insets were being delivered correctly.
+     *
+     * Only on a real change, so the repeated inset callbacks Android issues
+     * during a traversal do not each cost a full relayout. */
+    if (changed && S.bound) {
+        Ev e = {0};
+        e.type = VS_EV_RESIZE;
+        push_locked(&e);
+    }
     pthread_mutex_unlock(&S.lock);
-    /* No event: see the note on the insets fields above. */
+}
+
+/* Read side, for the safe-area layout in vyto/mobile/android/ui. Still no
+ * event — a caller samples this during layout, which is exactly when it
+ * matters, and the IME case already arrives as a RESIZE because the manifest
+ * sets adjustResize. Any NULL out-param is skipped. */
+void vs_android_get_insets(int *l, int *t, int *r, int *b, int *ime_h) {
+    pthread_mutex_lock(&S.lock);
+    if (l)     *l     = S.ins_l;
+    if (t)     *t     = S.ins_t;
+    if (r)     *r     = S.ins_r;
+    if (b)     *b     = S.ins_b;
+    if (ime_h) *ime_h = S.ins_ime;
+    pthread_mutex_unlock(&S.lock);
 }
 
 void vs_android_set_paused(int paused) {

@@ -1261,3 +1261,148 @@ export class TimePicker extends Widget {
         this.onChange = null;
     }
 }
+
+// ---------------------------------------------------------------- safe area
+//
+// The platform insets, in px. Zero on every non-Android target — see
+// native/src/ainsets.c for why both arms exist rather than this being
+// android-only: this package's widget goldens run under X11.
+extern "C" {
+    fn vta_inset_left(): i32;
+    fn vta_inset_top(): i32;
+    fn vta_inset_right(): i32;
+    fn vta_inset_bottom(): i32;
+    fn vta_inset_ime(): i32;
+}
+
+export fn safeInsetLeft(): float { return vta_inset_left() as float; }
+export fn safeInsetTop(): float { return vta_inset_top() as float; }
+export fn safeInsetRight(): float { return vta_inset_right() as float; }
+export fn safeInsetBottom(): float { return vta_inset_bottom() as float; }
+// Soft-keyboard height. Usually NOT wanted: the manifest sets adjustResize, so
+// the window has already shrunk by this much and adding it again double-counts.
+export fn imeHeight(): float { return vta_inset_ime() as float; }
+
+// Keeps its child clear of the status bar, the notch and the gesture/nav bar.
+//
+// The Activity goes edge-to-edge (setDecorFitsSystemWindows(false)), which is
+// what lets an app paint under the bars deliberately — but it also means
+// nothing is inset for you, so the first widget in a Column renders *behind*
+// the clock. This is the widget that opts back in.
+//
+// Insets are re-read on every arrange rather than cached, so a rotation, a
+// gesture-mode change or an IME that resizes the window all land without any
+// invalidation protocol: Window.layout() re-arranges, and the fresh values are
+// read right there.
+//
+// Per-edge flags because the choice is per-design: a full-bleed image header
+// wants apply_top false while still keeping its buttons off the gesture bar.
+export class SafeArea extends Widget {
+    apply_left: bool;
+    apply_top: bool;
+    apply_right: bool;
+    apply_bottom: bool;
+    // Off by default: adjustResize already shrank the window for the IME.
+    // Turn it on only for a window that is NOT adjustResize.
+    apply_ime: bool;
+
+    fn init(child: Widget) {
+        super.init();
+        this.apply_left = true;
+        this.apply_top = true;
+        this.apply_right = true;
+        this.apply_bottom = true;
+        this.apply_ime = false;
+        if (child != null) { this.add(child); }
+    }
+
+    fn kid(): Widget {
+        if (this.children.len == 0) { return null; }
+        return this.children[0];
+    }
+
+    fn ins_l(): float {
+        if (!this.apply_left) { return 0.0; }
+        return safeInsetLeft();
+    }
+    fn ins_t(): float {
+        if (!this.apply_top) { return 0.0; }
+        return safeInsetTop();
+    }
+    fn ins_r(): float {
+        if (!this.apply_right) { return 0.0; }
+        return safeInsetRight();
+    }
+    fn ins_b(): float {
+        let b = 0.0;
+        if (this.apply_bottom) { b = safeInsetBottom(); }
+        if (this.apply_ime) {
+            let k = imeHeight();
+            if (k > b) { b = k; }
+        }
+        return b;
+    }
+
+    override fn measure(s: Painter, th: Theme): Size {
+        let c = this.kid();
+        let iw = this.ins_l() + this.ins_r();
+        let ih = this.ins_t() + this.ins_b();
+        if (c == null) { return Size(iw, ih); }
+        let cs = c.measure(s, th);
+        return Size(cs.w + iw, cs.h + ih);
+    }
+
+    override fn arrange(s: Painter, th: Theme, r: Rect) {
+        this.layout_to(r);
+        let c = this.kid();
+        if (c == null) { return; }
+        let l = this.ins_l();
+        let t = this.ins_t();
+        let w = r.w - l - this.ins_r();
+        let h = r.h - t - this.ins_b();
+        if (w < 0.0) { w = 0.0; }
+        if (h < 0.0) { h = 0.0; }
+        c.arrange(s, th, Rect(r.x + l, r.y + t, w, h));
+    }
+}
+
+// ------------------------------------------------------------ AndroidWindow
+//
+// A Window that already knows it is on a phone.
+//
+// Plain `Window` is correct but bare here: an Android app has to remember to
+// keep its content out from under the system bars, and forgetting is silent —
+// the top label simply renders behind the clock. `set_content` wraps the tree
+// in a SafeArea so that is the default rather than something to remember.
+//
+// It deliberately does NOT construct the painter. `AndroidPainter` lives in
+// vyto/mobile/android/painter, whose shim is android-only, and this package
+// still has to link on the desktop for its widget goldens — so app code keeps
+// calling `win.use_painter(new AndroidPainter(win.surface(), 15.0))` and this
+// class stays platform-neutral at link time.
+//
+//     let win = new AndroidWindow("Demo", 1080, 2160);
+//     win.use_painter(new AndroidPainter(win.surface(), 15.0));
+//     win.set_content(new Column([...]));
+//     win.run();
+export class AndroidWindow extends Window {
+    // The wrapper installed by set_content; reach for it to switch an edge off.
+    safe: SafeArea;
+
+    fn init(title: string, w: int, h: int) {
+        super.init(title, w, h);
+        // Touch UIs have no scrollbars: the content is the scroll handle, and a
+        // 6px track is not a finger target. Hiding also drops the hit test, so
+        // touches near the right edge reach the content instead of a bar nobody
+        // can see. Set it back on the theme if a screen really wants them.
+        this.theme.scrollbars_visible = false;
+    }
+
+    // Set the window's content, inset out of the system bars. Assign `root`
+    // directly instead when a screen genuinely wants to paint edge to edge.
+    fn set_content(content: Widget) {
+        let sa = new SafeArea(content);
+        this.safe = sa;
+        this.root = sa;
+    }
+}

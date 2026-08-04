@@ -10,7 +10,7 @@
 
 import { Surface, Rect, contains, rgb, rgba, with_alpha, alpha_of, mix,
           EV_EXPOSE, EV_KEY, EV_KEY_UP, EV_MOUSE_DOWN, EV_MOUSE_UP, EV_MOUSE_MOVE, EV_MOUSE_WHEEL, EV_MOUSE_RDOWN,
-          EV_RESIZE, EV_CLOSE, EV_TIMER, MOD_SHIFT,
+          EV_RESIZE, EV_CLOSE, EV_TIMER, EV_VSYNC, MOD_SHIFT,
           KEY_ESC, KEY_TAB } from "vyto/surface";
 import { Animator, Tween, AnimatedFloat } from "vyto/ui/anim";
 import { Spring } from "vyto/anim";
@@ -271,6 +271,19 @@ export class Theme {
     type_color_caption: int;
 
     scale_applied: float; // 0.0 = apply_scale not run yet (Window.run applies)
+    // Whether scrollbars are drawn and hit-testable at all.
+    //
+    // A policy, not a widget kind: `add_scrollbar` is a base-Widget facility
+    // and four call sites across ScrollView, ListView and DataTable already use
+    // it, so anything selective would have to be repeated per widget and again
+    // for every scrollable added later.
+    //
+    // Touch UIs do not have them — the content is the scroll handle, and a
+    // 6px-wide target is unhittable with a finger anyway. AndroidWindow turns
+    // this off. Hiding also disables the hit test (see Widget.scrollbars_shown),
+    // because an invisible bar that still swallows presses is worse than a
+    // visible one.
+    scrollbars_visible: bool;
 
     // Multiply every px-denominated scale by the UI scale factor (HiDPI).
     // Colors and weights are untouched. Idempotent per theme instance —
@@ -314,6 +327,7 @@ export class Theme {
     }
 
     fn init() {
+        this.scrollbars_visible = true;   // desktop default; AndroidWindow clears it
         // Refined light theme (the default).
         this.surface         = rgb(247, 247, 249);
         this.surface_raised  = rgb(255, 255, 255);
@@ -1498,8 +1512,19 @@ export class Widget {
     }
 
     // Paint every bar whose content overflows. Call at the end of draw().
+    // Whether this widget's scrollbars are live at all. Reads the window's
+    // theme rather than taking a Theme argument, because the hit-test path has
+    // no Theme in hand. Defaults to shown when there is no window yet, which
+    // keeps a detached widget behaving as it always did.
+    fn scrollbars_shown(): bool {
+        let w = this.win;
+        if (w == null) { return true; }
+        return w.theme.scrollbars_visible;
+    }
+
     fn paint_scrollbars(s: Painter, th: Theme) {
         if (this.scrollbars == null) { return; }
+        if (!th.scrollbars_visible) { return; }
         let vp = this.scroll_viewport();
         for (let sb in this.scrollbars) {
             let content = this.scroll_content_len(sb);
@@ -1513,6 +1538,10 @@ export class Widget {
     // a bar consumed the press (so callers skip their own click handling).
     fn scrollbar_press(x: int, y: int): bool {
         if (this.scrollbars == null) { return false; }
+        // Not just cosmetic: a hidden bar that still consumed the press would
+        // eat every touch landing near the right edge, and drag-scroll would
+        // die there for no visible reason.
+        if (!this.scrollbars_shown()) { return false; }
         let vp = this.scroll_viewport();
         for (let i in 0..this.scrollbars.len) {
             let sb = this.scrollbars[i];
@@ -2086,6 +2115,13 @@ export class Window {
     close_on_esc: bool;
     dirty: Rect;        // accumulated repaint region (valid when has_dirty)
     has_dirty: bool;
+    // Vsync gating. When vsync_on, redraw()/repaint() only record what is owed
+    // and the actual painting happens once per EV_VSYNC (flush_frame). Off on
+    // every backend without a frame clock, where both paint immediately as they
+    // always have. See Surface.set_vsync and run().
+    vsync_on: bool;
+    pending_full: bool;     // a full redraw is owed at the next vsync
+    pending_partial: bool;  // a dirty-rect repaint is owed (region is `dirty`)
     hover_w: Widget;     // WS6: widget currently under the cursor (draws hover state)
     press_w: Widget;    // WS6: widget capturing the current mouse press
     skin: Skin;          // pluggable widget shape; defaults to today's look
@@ -2331,6 +2367,19 @@ export class Window {
     }
 
     fn redraw() {
+        // Under vsync gating this only records the debt; draw_full() runs at
+        // the next EV_VSYNC. Coalescing is the point — several redraws inside
+        // one frame (a click handler that touches three widgets, an animation
+        // tick, then an expose) collapse into one paint and one present.
+        if (this.vsync_on) {
+            this.pending_full = true;
+            this.has_dirty = false;  // a full redraw supersedes any dirty rect
+            return;
+        }
+        this.draw_full();
+    }
+
+    fn draw_full() {
         this.painter.fill(Rect(0, 0, this.surf.width() as float, this.surf.height() as float), this.theme.bg);
         if (this.root != null) {
             this.root.draw(this.painter, this.theme);
@@ -2377,6 +2426,31 @@ export class Window {
 
     fn repaint() {
         if (!this.has_dirty) { return; }
+        if (this.vsync_on) {
+            // The region stays accumulated in `dirty`; mark_dirty keeps
+            // unioning into it until the flush, so a coalesced frame repaints
+            // the union of everything that changed rather than only the last.
+            this.pending_partial = true;
+            return;
+        }
+        this.draw_partial();
+    }
+
+    // Paint whatever presentation is owed. Called once per EV_VSYNC while
+    // gated, and when gating is turned off with a frame still pending.
+    fn flush_frame() {
+        if (this.pending_full) {
+            this.pending_full = false;
+            this.pending_partial = false;
+            this.has_dirty = false;
+            this.draw_full();
+        } else if (this.pending_partial) {
+            this.pending_partial = false;
+            if (this.has_dirty) { this.draw_partial(); }
+        }
+    }
+
+    fn draw_partial() {
         let w = this.surf.width() as float;
         let h = this.surf.height() as float;
         let ov = this.chrome_overhang();
@@ -2740,6 +2814,25 @@ export class Window {
             // idle long-press fires without further input.
             let pressing = this.press_w != null && !this.dragging
                            && !this.long_press_fired;
+            // Vsync gating follows the animation clock exactly: on while
+            // something animates, off the moment nothing does, so an idle app
+            // still blocks in wait() with no periodic wakeup. set_vsync reports
+            // whether the backend has a frame clock at all — when it does not
+            // (every desktop backend) vsync_on stays false and presentation is
+            // eager, byte for byte what it was before gating existed.
+            let want_vsync = this.animations.len > 0;
+            if (want_vsync != this.vsync_on) {
+                let got = this.surf.set_vsync(want_vsync);
+                if (want_vsync) {
+                    this.vsync_on = got;
+                } else {
+                    // Turning gating off: nothing will deliver another vsync,
+                    // so anything still owed has to be painted now or the last
+                    // frame of every animation would be dropped.
+                    this.vsync_on = false;
+                    this.flush_frame();
+                }
+            }
             let ev = 0;
             if (this.animations.len > 0) {
                 ev = this.surf.wait_timeout(16);
@@ -2768,6 +2861,11 @@ export class Window {
             }
             if (ev == EV_TIMER) {
                 // already ticked above; nothing else to dispatch
+            } else if (ev == EV_VSYNC) {
+                // The display is about to scan out. tick() already ran above
+                // with the real elapsed time, so the tree is as current as it
+                // can be; paint whatever that owed and present exactly once.
+                this.flush_frame();
             } else if (ev == EV_EXPOSE) {
                 this.redraw();
             } else if (ev == EV_RESIZE) {
@@ -2792,6 +2890,12 @@ export class Window {
             } else if (ev == EV_MOUSE_RDOWN) {
                 this.on_context_ev(this.surf.mouse_x(), this.surf.mouse_y());
             }
+        }
+        // Stop the frame clock before teardown. Nothing below presents, so a
+        // callback still running would only wake a loop that has already left.
+        if (this.vsync_on) {
+            this.surf.set_vsync(false);
+            this.vsync_on = false;
         }
         // break handler->owner->tree reference cycles so RC frees everything;
         // apps never need a manual teardown.

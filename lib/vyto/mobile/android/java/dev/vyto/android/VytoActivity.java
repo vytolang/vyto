@@ -29,8 +29,43 @@ import android.view.WindowManager;
  */
 public class VytoActivity extends Activity {
 
+    /**
+     * The render target, as a plain View. Exactly one of {@link #view} /
+     * {@link #surfaceView} is non-null; see {@link #useSurfaceView()}.
+     */
+    private View target;
     private VytoView view;
+    private VytoSurfaceView surfaceView;
     private Actions actions;
+
+    /**
+     * Which rendering target to build: {@link VytoSurfaceView} (the default) or
+     * {@link VytoView}.
+     *
+     * <p><b>SurfaceView is the default because it measurably fixed the stutter
+     * and flicker</b> that survived every other change — dp-scaled hit targets,
+     * removing the {@code custom_paint} strobe, Choreographer-gated present.
+     * On a Redmi Note 9S the two were compared back to back on the same build
+     * and the same finger: {@link VytoView} stuttered and flickered under
+     * touch, this one did neither. The cause is in that class's comment.
+     *
+     * <p>{@link VytoView} is kept, not deprecated. SurfaceView owns a separate
+     * compositor layer, which costs things a full-screen app does not miss but
+     * an embedded one would: it does not transform with the View hierarchy
+     * (no animating, scaling or shared-element transition of the surface), it
+     * does not interleave in z-order with sibling Views, and
+     * {@code dumpsys gfxinfo} no longer sees the drawing. An app that embeds
+     * Vyto inside a larger Android layout should override this to false.
+     *
+     * <p>Switchable per launch without a rebuild, which is how the two were
+     * compared and how a regression can be bisected:
+     *
+     * <pre>am start -n &lt;pkg&gt;/dev.vyto.android.VytoActivity --ez vyto.surfaceview false</pre>
+     */
+    protected boolean useSurfaceView() {
+        return getIntent() == null
+                || getIntent().getBooleanExtra("vyto.surfaceview", true);
+    }
 
     /**
      * The {@code vytoc -o} stem for this app's {@code .so}. Override in a
@@ -53,9 +88,17 @@ public class VytoActivity extends Activity {
             return;
         }
 
-        view = new VytoView(this);
+        if (useSurfaceView()) {
+            surfaceView = new VytoSurfaceView(this);
+            target = surfaceView;
+        } else {
+            view = new VytoView(this);
+            target = view;
+        }
+        android.util.Log.i("Vyto", "render target: "
+                + target.getClass().getSimpleName());
         actions = new Actions(this);
-        setContentView(view);
+        setContentView(target);
 
         // Bind before start(): the Vyto thread can reach for Actions as soon as
         // it is running, and a null there would drop the first launch.
@@ -64,7 +107,7 @@ public class VytoActivity extends Activity {
         // adjustResize (set in the manifest) shrinks the window for the IME,
         // which fires EV_RESIZE and re-runs layout. Ask for inset callbacks so
         // the app can also do safe-area work.
-        view.setFitsSystemWindows(false);
+        target.setFitsSystemWindows(false);
         if (Build.VERSION.SDK_INT >= 30) {
             getWindow().setDecorFitsSystemWindows(false);
         }
@@ -72,10 +115,10 @@ public class VytoActivity extends Activity {
         // The Vyto thread starts once the View has a size; onSizeChanged is the
         // first point where the backbuffer exists. Posting rather than starting
         // here avoids a 0x0 first frame.
-        view.post(new Runnable() {
+        target.post(new Runnable() {
             @Override public void run() {
                 float density = getResources().getDisplayMetrics().density;
-                Native.start(view, view.getWidth(), view.getHeight(), density);
+                Native.start(target, target.getWidth(), target.getHeight(), density);
             }
         });
     }
@@ -83,6 +126,7 @@ public class VytoActivity extends Activity {
     @Override
     protected void onResume() {
         super.onResume();
+        setVsyncPaused(false);
         if (Native.isLoaded()) Native.resume();
     }
 
@@ -92,6 +136,9 @@ public class VytoActivity extends Activity {
         // backbuffer are untouched — there is no surface to lose, which is the
         // main simplification the Bitmap design buys over SurfaceView.
         if (Native.isLoaded()) Native.pause();
+        // After Native.pause, so the loop is already parked: a frame callback
+        // that slips through in between is dropped natively rather than waking it.
+        setVsyncPaused(true);
         super.onPause();
     }
 
@@ -100,6 +147,7 @@ public class VytoActivity extends Activity {
         if (Native.isLoaded()) Native.stop();
         if (actions != null) actions.dispose();
         if (view != null) view.releaseBitmap();
+        if (surfaceView != null) surfaceView.releaseBitmap();
         super.onDestroy();
     }
 
@@ -134,7 +182,25 @@ public class VytoActivity extends Activity {
         if (actions != null) actions.onPermissionResult(requestCode, grantResults);
     }
 
+    /** Non-null only on the VytoView path; null when the SurfaceView is in use. */
     public VytoView vytoView() { return view; }
+
+    /** Non-null only on the VytoSurfaceView path. */
+    public VytoSurfaceView vytoSurfaceView() { return surfaceView; }
+
+    /** The active render target, whichever kind it is. */
+    public View renderTarget() { return target; }
+
+    /**
+     * Fan the pause flag out to whichever target exists. The two classes cannot
+     * share a supertype carrying this — one extends View, the other SurfaceView
+     * — and an interface for two methods is not worth the indirection while
+     * this is an experiment.
+     */
+    private void setVsyncPaused(boolean paused) {
+        if (view != null) view.setVsyncPaused(paused);
+        if (surfaceView != null) surfaceView.setVsyncPaused(paused);
+    }
     public Actions actions() { return actions; }
 
     /** Minimal failure screen; avoids pulling in any resource or layout file. */

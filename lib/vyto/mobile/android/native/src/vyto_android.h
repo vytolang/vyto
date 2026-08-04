@@ -61,7 +61,12 @@ void vs_android_push_touch(int action, int pointer_id, float x, float y, int64_t
 void vs_android_push_key(int keycode, const char *utf8, int mods, int down);
 void vs_android_push_resize(int w, int h, float density);
 void vs_android_push_insets(int l, int t, int r, int b, int ime_h);
+/* Read back the last insets pushed. Any out-param may be NULL. */
+void vs_android_get_insets(int *l, int *t, int *r, int *b, int *ime_h);
 void vs_android_set_paused(int paused);
+/* One display refresh elapsed; makes vs_wait return VS_EV_VSYNC. Pushed from
+ * the UI thread by the Choreographer callback, and dropped while paused. */
+void vs_android_push_vsync(void);
 /* Ask the loop to exit: makes vs_wait return VS_EV_CLOSE. */
 void vs_android_request_close(void);
 

@@ -5,7 +5,9 @@ import android.graphics.Bitmap;
 import android.graphics.Canvas;
 import android.graphics.Rect;
 import android.os.Build;
+import android.os.Handler;
 import android.text.InputType;
+import android.view.Choreographer;
 import android.view.KeyEvent;
 import android.view.MotionEvent;
 import android.view.View;
@@ -17,17 +19,37 @@ import android.view.inputmethod.InputMethodManager;
 import java.nio.ByteBuffer;
 
 /**
- * The View the Vyto app lives inside. Not a SurfaceView.
+ * A plain View the Vyto app can live inside. <b>No longer the default</b> —
+ * see {@link VytoSurfaceView} and {@link VytoActivity#useSurfaceView()}.
  *
  * <p>Vyto renders into a persistent {@link Bitmap} on its own thread; this View
- * does nothing but blit that Bitmap in {@link #onDraw}. That split is what
- * keeps Vyto's loop intact — a custom View drawing in {@code onDraw} with a
- * hardware canvas would invert loop ownership and, worse, lose the persistent
- * backbuffer that {@code Window.repaint()} depends on
- * ({@code ui/core.vt:2111-2146} redraws only the dirty rect and assumes the
- * rest is still there).
+ * does nothing but blit that Bitmap in {@link #onDraw}. That split keeps Vyto's
+ * loop intact and preserves the persistent backbuffer that
+ * {@code Window.repaint()} depends on ({@code ui/core.vt:2111-2146} redraws
+ * only the dirty rect and assumes the rest is still there).
  *
- * <p>STATUS: written, never compiled — see {@link Native}.
+ * <h2>Known defect: the compositor can sample a half-drawn frame</h2>
+ *
+ * {@link #bitmapLock} does not protect the pixels, and cannot. {@code onDraw}
+ * runs against a <b>hardware</b> canvas, where {@code drawBitmap} does not read
+ * the bitmap — it records a draw into a display list. The RenderThread uploads
+ * the pixels afterwards, once {@code onDraw} has returned and the lock has been
+ * released. The Vyto thread is then free to begin the next replay, whose first
+ * op fills the whole surface with the background colour, so the compositor can
+ * upload a bitmap that has been cleared but not yet repainted.
+ *
+ * <p>On a device that presents as stutter and flicker under touch. It is
+ * invisible to every obvious measurement — the command stream is complete and
+ * does not oscillate, presents land on the display clock, and frame pacing is
+ * clean — because it is a pixel-ownership bug, not a drawing or pacing one.
+ *
+ * <p>Fixing it here would mean never mutating a bitmap the compositor may still
+ * be reading, i.e. alternating present buffers and a full-screen copy per
+ * frame. {@link VytoSurfaceView} gets the same guarantee from a real swapchain
+ * for free, which is why it took the default instead.
+ *
+ * <p>Kept because SurfaceView owns a separate compositor layer and an app
+ * embedding Vyto in a larger View hierarchy may need this one anyway.
  * Design of record: {@code local/docs/ANDROID.md}.
  */
 public class VytoView extends View {
@@ -39,11 +61,17 @@ public class VytoView extends View {
      * Vyto thread writes it during replay while the UI thread reads it in
      * onDraw.
      *
-     * <p>One bitmap rather than two: double-buffering would hand Vyto a
-     * frame-stale surface every other frame, which breaks the partial-repaint
-     * invariant exactly the way a SurfaceView swapchain would. The lock is held
-     * for the duration of a replay, which is the longer hold, but a full-screen
-     * drawBitmap is ~1ms and the contention is acceptable.
+     * <p>One bitmap rather than two: a naive A/B swap would hand Vyto a
+     * frame-stale surface every other frame, breaking the partial-repaint
+     * invariant. That reasoning is still right about A/B swapping — but it does
+     * not follow that one bitmap is safe, and it was read that way for too
+     * long. See the defect in this class's header: the lock does not cover the
+     * RenderThread's upload, so the single bitmap is genuinely shared.
+     *
+     * <p>{@link VytoSurfaceView} resolves the same tension the other way: Vyto
+     * keeps this exact persistent bitmap, and the *swapchain* takes the full
+     * blit. Partial drawing stays valid because the swapchain was never the
+     * backbuffer.
      */
     private Bitmap bitmap;
     private Canvas bitmapCanvas;
@@ -75,6 +103,9 @@ public class VytoView extends View {
             if (bitmap != null) bitmap.recycle();
             // ARGB_8888 matches Vyto's 0xAARRGGBB packing directly.
             bitmap = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
+            // Always fully opaque — Vyto fills the background every frame. Lets
+            // the composite skip per-pixel blending. See VytoSurfaceView.
+            bitmap.setHasAlpha(false);
             bitmapCanvas = new Canvas(bitmap);
         }
         float density = getResources().getDisplayMetrics().density;
@@ -105,6 +136,89 @@ public class VytoView extends View {
         }
         // postInvalidate, never invalidate: this is not the UI thread.
         postInvalidate(dx, dy, dx + dw, dy + dh);
+    }
+
+    // ----------------------------------------------------------------- vsync
+
+    /**
+     * Whether Vyto currently wants a frame clock. Written on the UI thread only
+     * (setVsyncEnabled hops there first), so it needs no synchronization.
+     */
+    private boolean vsyncWanted = false;
+
+    /** Set between onPause and onResume; suppresses the clock without losing what Vyto asked for. */
+    private boolean vsyncPaused = false;
+
+    /** Whether a frame callback is currently outstanding. */
+    private boolean vsyncPosted = false;
+
+    private final Choreographer.FrameCallback frameCallback = new Choreographer.FrameCallback() {
+        @Override
+        public void doFrame(long frameTimeNanos) {
+            vsyncPosted = false;
+            // Re-post before signalling, so the clock keeps its cadence even if
+            // the Vyto thread takes the whole frame to respond.
+            syncVsync();
+            Native.vsync();
+        }
+    };
+
+    /**
+     * Start or stop the display frame clock. <b>Called from the Vyto thread</b>
+     * via {@code vs_set_vsync}, so it hops to the UI thread first —
+     * {@code Choreographer.getInstance()} is per-Looper and the Vyto thread has
+     * none.
+     *
+     * @return true when the clock was actually (un)scheduled. False means this
+     *     View is not attached and there is no Handler to hop with, which the
+     *     native side reports back to {@code Window.run()} so it presents
+     *     eagerly instead of waiting for a vsync that will never arrive.
+     */
+    public boolean setVsyncEnabled(final boolean on) {
+        Handler h = getHandler();
+        if (h == null) return false;
+        return h.post(new Runnable() {
+            @Override
+            public void run() {
+                vsyncWanted = on;
+                syncVsync();
+            }
+        });
+    }
+
+    @Override
+    protected void onDetachedFromWindow() {
+        // A frame callback outlives the View it was posted from, so a detached
+        // View would keep waking the UI thread at 60Hz for nothing. vsyncWanted
+        // is left alone: re-attaching re-posts from onAttachedToWindow without
+        // Vyto having to ask again.
+        vsyncPosted = false;
+        Choreographer.getInstance().removeFrameCallback(frameCallback);
+        super.onDetachedFromWindow();
+    }
+
+    @Override
+    protected void onAttachedToWindow() {
+        super.onAttachedToWindow();
+        syncVsync();
+    }
+
+    /** UI thread. Called by the Activity around onPause/onResume. */
+    public void setVsyncPaused(boolean paused) {
+        vsyncPaused = paused;
+        syncVsync();
+    }
+
+    /** UI thread only. Idempotent: brings the posted state in line with the wanted one. */
+    private void syncVsync() {
+        boolean want = vsyncWanted && !vsyncPaused;
+        if (want && !vsyncPosted) {
+            Choreographer.getInstance().postFrameCallback(frameCallback);
+            vsyncPosted = true;
+        } else if (!want && vsyncPosted) {
+            Choreographer.getInstance().removeFrameCallback(frameCallback);
+            vsyncPosted = false;
+        }
     }
 
     // ----------------------------------------------------------------- input
@@ -262,9 +376,11 @@ public class VytoView extends View {
     static final class VytoInputConnection
             extends android.view.inputmethod.BaseInputConnection {
 
-        private final VytoView view;
+        // Typed as View, not VytoView: BaseInputConnection only needs something
+        // to attach to, and VytoSurfaceView shares this connection verbatim.
+        private final View view;
 
-        VytoInputConnection(VytoView v) {
+        VytoInputConnection(View v) {
             super(v, false);   // false: no full editable, we forward events
             this.view = v;
         }

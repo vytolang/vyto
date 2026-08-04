@@ -73,7 +73,7 @@ public final class Native {
      * new concept. Note it is sampled once by {@code Window.init} today and
      * never re-read — see the live-density gap in ANDROID.md Track C.
      */
-    public static native void start(VytoView view, int width, int height, float density);
+    public static native void start(android.view.View view, int width, int height, float density);
 
     /**
      * Hand the intent shim the {@link Actions} instance to call up into.
@@ -114,6 +114,19 @@ public final class Native {
      * takes a time rather than reading a clock natively.
      */
     public static native void touch(int action, int pointerId, float x, float y, long timeMs);
+
+    /**
+     * One display refresh elapsed. Called from the UI thread by the
+     * Choreographer callback {@link VytoView} runs while Vyto asks for it, and
+     * it is what {@code Window.run()} presents on — not the 16ms software timer
+     * that drives {@code tick()}.
+     *
+     * <p>Separating the two is the point: ticking off-clock is harmless because
+     * animations advance by real elapsed time, but *presenting* off-clock beats
+     * against the display and shows up as judder. At most one vsync is queued
+     * natively, so a slow frame coalesces rather than backing up.
+     */
+    public static native void vsync();
 
     /**
      * A key event. {@code text} is the committed UTF-8 for an insertable key and

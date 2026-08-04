@@ -28,7 +28,8 @@ enum {
     VS_EV_TIMER = 8,      /* vs_wait_timeout elapsed with no input (game tick) */
     VS_EV_KEY_UP = 9,     /* a key was released (vs_key() gives the code) */
     VS_EV_MOUSE_WHEEL = 10, /* mouse wheel scrolled (vs_wheel() gives the delta) */
-    VS_EV_MOUSE_RDOWN = 11  /* right button pressed (vs_mouse_x/y() give position) */
+    VS_EV_MOUSE_RDOWN = 11, /* right button pressed (vs_mouse_x/y() give position) */
+    VS_EV_VSYNC = 12        /* display is about to scan out; present now (vs_set_vsync) */
 };
 
 /* simplified key codes from vs_key: printable ASCII, or one of these.
@@ -116,6 +117,12 @@ int vs_font_height(void *s);
 int vs_wait(void *s);              /* blocks until an event; returns VS_EV_* */
 int vs_poll(void *s);              /* non-blocking; VS_EV_NONE if none queued */
 int vs_wait_timeout(void *s, int ms); /* blocks <= ms; VS_EV_TIMER on timeout */
+/* Ask the backend to deliver VS_EV_VSYNC once per display refresh while `on`.
+ * Returns 1 when the backend really drives a vsync clock, 0 when it does not —
+ * a caller that gates presentation on VS_EV_VSYNC must present eagerly instead
+ * when this returns 0, or it will never present at all. Only the Android arm
+ * returns 1 today (Choreographer); X11/Win32/fbdev/headless return 0. */
+int vs_set_vsync(void *s, int on);
 int vs_key(void);         /* last VS_EV_KEY code */
 const char *vs_text(void);/* UTF-8 text of last key ("" if none) */
 int vs_mods(void);        /* VS_MOD_* bitmask at the last delivered event */
