@@ -1,0 +1,114 @@
+// Memory-mapped files: reading a file without loading it.
+//
+// `readfile()` on a 40 GB log needs 40 GB of RAM — twice, briefly, while it
+// copies its scratch buffer into a string. A mapping needs none of it: the OS
+// pages in what you touch and evicts what you stop touching, and `bytes()`
+// hands back a real `byte[]` — bounds-checked, indexable, accepted by every
+// function that takes one — whose buffer *is* the file.
+//
+// The trick that makes a huge log usable is below: index it sparsely. One pass
+// records where every Nth line starts, then any line is found by seeking to the
+// nearest anchor and scanning forward. The index is small, the file is never
+// copied, and nothing is ever turned into a string until it is displayed.
+
+import { Mapping, mmap_file, mmap_file_rw, mmap_anon,
+         ADVICE_SEQUENTIAL } from "vyto/mmap";
+import { readText, findByte, readU32LE } from "vyto/mmap/decode";
+
+const ANCHOR_EVERY: int = 4;   // in a real log this is 4096
+
+// Byte offsets of every ANCHOR_EVERY'th line. For a 40 GB file with 400M lines
+// this is 800 KB instead of the 3.2 GB a full index would need.
+fn sparseIndex(b: byte[]): int[] {
+    let anchors: int[] = [];
+    anchors.push(0);
+    let line = 0;
+    for (let i in 0..b.len) {
+        if (b[i] == 10 as byte) {
+            line += 1;
+            if (line % ANCHOR_EVERY == 0 && i + 1 < b.len) { anchors.push(i + 1); }
+        }
+    }
+    return anchors;
+}
+
+// Line `n`, found by jumping to its anchor and scanning forward. Only this one
+// line ever becomes a string.
+fn lineAt(b: byte[], anchors: int[], n: int): string {
+    let a = n / ANCHOR_EVERY;
+    if (a >= anchors.len) { return ""; }
+    let off = anchors[a];
+    let skip = n % ANCHOR_EVERY;
+    for (let k in 0..skip) {
+        let nl = findByte(b, 10, off);
+        if (nl < 0) { return ""; }
+        off = nl + 1;
+    }
+    let end = findByte(b, 10, off);
+    if (end < 0) { end = b.len; }
+    return readText(b, off, end - off);
+}
+
+fn main() {
+    // Build a log to read. In real use this file already exists and is huge.
+    let sb = "";
+    for (let i in 0..12) { sb = sb + "line " + str(i) + " of the log\n"; }
+    writefile("tests/tmp/97_log.txt", sb);
+
+    print("---- map it ----");
+    let m = mmap_file("tests/tmp/97_log.txt");
+    if (m == null) { print("could not map"); return; }
+    print("size " + str(m.size()) + " bytes, mapped without reading it");
+    m.advise(ADVICE_SEQUENTIAL);
+
+    let b = m.bytes();
+    print("view length " + str(b.len) + ", same buffer as the file");
+
+    print("---- sparse index ----");
+    let anchors = sparseIndex(b);
+    print(str(anchors.len) + " anchors for 12 lines (one every " + str(ANCHOR_EVERY) + ")");
+
+    print("---- random access, no copy ----");
+    print(lineAt(b, anchors, 0));
+    print(lineAt(b, anchors, 7));
+    print(lineAt(b, anchors, 11));
+
+    print("---- scanning is an ordinary loop ----");
+    // b is a byte[], so this is a bounds-checked array load per byte — the same
+    // code you would write over a buffer you had read yourself.
+    let newlines = 0;
+    let spaces = 0;
+    for (let x in b) {
+        if (x == 10 as byte) { newlines += 1; }
+        if (x == 32 as byte) { spaces += 1; }
+    }
+    print(str(newlines) + " lines, " + str(spaces) + " spaces");
+
+    print("---- a view is fixed length, and read-only here ----");
+    // Both of these would panic with a file:line, not corrupt the file:
+    //     b.push(0 as byte);   // push on a fixed-length array view
+    //     b[0] = 90 as byte;   // write to a read-only array view
+    // To change bytes, map for writing. To grow, take an owned copy.
+    let owned = m.copy();
+    owned.push(33 as byte);
+    print("copy() gives an ordinary array: " + str(owned.len) + " bytes, growable");
+
+    print("---- writing through a mapping ----");
+    writefile("tests/tmp/97_rw.bin", "aaaabbbb");
+    let w = mmap_file_rw("tests/tmp/97_rw.bin");
+    let wb = w.bytes();
+    for (let i in 0..4) { wb[i] = 65 as byte; }   // straight into the file's pages
+    w.flush();
+    print("after writing through the view: " + readfile("tests/tmp/97_rw.bin"));
+
+    print("---- anonymous memory ----");
+    let scratch = mmap_anon(65536);
+    let sb2 = scratch.bytes();
+    print("64 KB from the OS, zeroed: " + str(sb2[0] as int) + " " + str(sb2[65535] as int));
+
+    print("---- the mapping outlives nothing, and everything outlives it ----");
+    // A view retains its Mapping, so dropping the Mapping here does not unmap
+    // while `b` is still alive. The munmap happens when the last one goes.
+    m = null;
+    print("still readable after dropping the Mapping: " + readText(b, 0, 6));
+}

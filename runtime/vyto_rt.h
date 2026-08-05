@@ -171,11 +171,33 @@ typedef struct VtArray {
     int64_t len, cap;
     int32_t elem_size;
     bool elem_ref;
+    bool readonly;  /* view over pages we may not write; see vt_arr_view */
     char *data;
+    VtObj *owner;   /* NULL: data is owned, free it on deinit. non-NULL: data is
+                       borrowed from this retained object, which outlives the
+                       view. Mirrors VtClosure.env below. */
 } VtArray;
 
 VtArray *vt_arr_new(int32_t elem_size, bool elem_ref);
 VtArray *vt_arr_bytes(int64_t n); /* zeroed byte buffer, len = n */
+
+/* A fixed-length array whose buffer belongs to `owner` rather than to the
+   runtime -- an mmap'd file, an embedded asset, any region with a lifetime of
+   its own. `owner` is retained, so the lender cannot be destroyed while the
+   view is alive; deinit releases it instead of freeing `data`.
+      - The view is FIXED LENGTH: push/pop/insert/remove_at/extend/reserve/clear
+        panic on it, because there is nothing to realloc.
+      - elem_ref is always false. A borrowed region cannot hold VtObj*, and
+        pretending otherwise would make deinit release file bytes as pointers.
+      - readonly != 0 makes element writes panic instead of faulting.
+   This is deliberately reachable from an `extern "C"` block, which means Vyto
+   code can forge an array over arbitrary memory. That is not a new kind of hole
+   -- an extern block can already declare vt_host_free -- but it is the sharpest
+   one, so it is spelled out here rather than discovered. */
+VtArray *vt_arr_view(void *data, int64_t len, int32_t elem_size, void *owner, int readonly);
+/* Guards for the two things a view forbids. Both are no-ops on a normal array. */
+void vt_arr_no_resize(VtArray *a, const char *op, const char *file, int line);
+void vt_arr_no_write(VtArray *a, const char *file, int line);
 static inline void *vt_arr_data(VtArray *a) { return a ? a->data : NULL; }
 void vt_arr_push(VtArray *a, const void *elem);                        /* retains if ref */
 void vt_arr_push_at(VtArray *a, const void *elem, const char *file, int line); /* null-checked push */
@@ -188,6 +210,18 @@ VT_NORETURN void vt_arr_oob(VtArray *a, int64_t i, const char *file, int line);
    tight and the C compiler can hoist/vectorize around it. */
 static inline void *vt_arr_at(VtArray *a, int64_t i, const char *file, int line) {
     if (!a || (uint64_t)i >= (uint64_t)a->len) vt_arr_oob(a, i, file, line);
+    return a->data + i * a->elem_size;
+}
+/* Read-only-view failure path — cold, out-of-line, never returns. */
+VT_NORETURN void vt_arr_ro(const char *file, int line);
+/* The same slot, for a WRITE. One extra branch on a flag that shares a cache
+   line with len (already loaded for the bounds check) and is predicted
+   not-taken, so a store loop still inlines and vectorizes — while a write to a
+   view over read-only pages panics with a file:line instead of faulting with
+   nothing. */
+static inline void *vt_arr_wr(VtArray *a, int64_t i, const char *file, int line) {
+    if (!a || (uint64_t)i >= (uint64_t)a->len) vt_arr_oob(a, i, file, line);
+    if (a->readonly) vt_arr_ro(file, line);
     return a->data + i * a->elem_size;
 }
 void vt_arr_set(VtArray *a, int64_t i, const void *elem, const char *file, int line);

@@ -38,6 +38,7 @@ bool vt_arr_contains(VtArray *a, const void *elem, int eq, const char *file, int
 
 void vt_arr_reverse(VtArray *a, const char *file, int line) {
     if (!a) vt_panic_c(file, line, "reverse on null array");
+    vt_arr_no_write(a, file, line);
     if (a->len < 2) return;
     int32_t es = a->elem_size;
     char *tmp = vt_host_alloc((size_t)es);
@@ -53,6 +54,7 @@ void vt_arr_reverse(VtArray *a, const char *file, int line) {
 
 void vt_arr_clear(VtArray *a, const char *file, int line) {
     if (!a) vt_panic_c(file, line, "clear on null array");
+    vt_arr_no_resize(a, "clear", file, line);
     if (a->elem_ref)
         for (int64_t i = 0; i < a->len; i++) vt_release(*(void **)(a->data + i * a->elem_size));
     a->len = 0;
@@ -63,7 +65,8 @@ void vt_arr_clear(VtArray *a, const char *file, int line) {
  * added); n <= cap is a no-op. */
 void vt_arr_reserve(VtArray *a, int64_t n, const char *file, int line) {
     if (!a) vt_panic_c(file, line, "reserve on null array");
-    if (n <= a->cap) return;
+    if (n <= a->cap) return; /* a view has cap == len, so this is where it exits */
+    vt_arr_no_resize(a, "reserve", file, line);
     a->data = vt_host_realloc(a->data, (size_t)(n * a->elem_size));
     if (!a->data) vt_oom();
     a->cap = n;
@@ -71,6 +74,7 @@ void vt_arr_reserve(VtArray *a, int64_t n, const char *file, int line) {
 
 void vt_arr_insert(VtArray *a, int64_t i, const void *elem, const char *file, int line) {
     if (!a) vt_panic_c(file, line, "insert into null array");
+    vt_arr_no_resize(a, "insert", file, line);
     if (i < 0 || i > a->len) vt_panic_c(file, line, "insert index out of bounds");
     int32_t es = a->elem_size;
     if (a->len == a->cap) {
@@ -88,6 +92,7 @@ void vt_arr_insert(VtArray *a, int64_t i, const void *elem, const char *file, in
  * caller (no release), mirroring vt_arr_pop. */
 void vt_arr_remove_at(VtArray *a, int64_t i, void *out, const char *file, int line) {
     if (!a) vt_panic_c(file, line, "remove from null array");
+    vt_arr_no_resize(a, "remove_at", file, line);
     if (i < 0 || i >= a->len) vt_panic_c(file, line, "remove_at index out of bounds");
     int32_t es = a->elem_size;
     memcpy(out, a->data + i * es, (size_t)es);
@@ -97,6 +102,7 @@ void vt_arr_remove_at(VtArray *a, int64_t i, void *out, const char *file, int li
 
 void vt_arr_extend(VtArray *a, VtArray *o, const char *file, int line) {
     if (!a || !o) vt_panic_c(file, line, "extend on null array");
+    vt_arr_no_resize(a, "extend", file, line);
     /* snapshot the length (a.extend(a) must not chase its own growth) and
      * reserve capacity up front: push must never realloc mid-loop — when
      * a == o the element pointer passed to push aims into the shared buffer,
@@ -135,6 +141,7 @@ VtArray *vt_arr_slice(VtArray *a, int64_t lo, int64_t hi, const char *file, int 
 
 void vt_arr_fill(VtArray *a, const void *elem, const char *file, int line) {
     if (!a) vt_panic_c(file, line, "fill on null array");
+    vt_arr_no_write(a, file, line);
     int32_t es = a->elem_size;
     for (int64_t i = 0; i < a->len; i++) {
         void *slot = a->data + i * es;

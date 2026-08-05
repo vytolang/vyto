@@ -1,0 +1,221 @@
+// vyto/mmap — memory-mapped files, as zero-copy `byte[]` views.
+//
+//     let m = mmap_file("huge.log");          // null if it cannot be mapped
+//     if (m != null) {
+//         let b = m.bytes();                  // byte[] over the file's pages
+//         for (let i in 0..b.len) {           // ordinary bounds-checked indexing
+//             if (b[i] == 10) { lines.push(i + 1); }
+//         }
+//     }                                       // b drops, then m drops, then munmap
+//
+// The point is the absence of a copy. `readfile()` on a 40 GB file needs 40 GB
+// of RAM (twice, at the moment of its final copy) and fails. A mapping needs
+// none: the OS pages in what you touch and evicts what you stop touching, and
+// `bytes()` is a real `byte[]` — bounds-checked, indexable, accepted by every
+// function that takes one — whose buffer is the file itself.
+//
+// ── THE VIEW OWNS THE MAPPING ───────────────────────────────────────────────
+// A view retains its `Mapping`, so the pages cannot be unmapped while the view
+// is alive. That is why there is no public `close()`: unmapping happens only in
+// `deinit`, when the Mapping *and every view derived from it* are gone. This
+// deliberately departs from the `deinit { this.close(); }` shape that `File`
+// (io/file.vt) and every `hw/*` module use — here an explicit `close()` would
+// be a use-after-free primitive with a friendly name.
+//
+// To release early, drop the reference: `m = null;`. Reference counting is
+// deterministic, so the munmap happens on that line.
+//
+// ── NEVER STORE A VIEW IN A `Mapping` FIELD ─────────────────────────────────
+//     this.cache = this.bytes();     // DO NOT
+// That is a strong reference cycle — Mapping → view → owner → Mapping — and
+// nothing in Vyto detects one. The whole mapping leaks, silently, for the life
+// of the process. It looks like an obvious optimisation, which is exactly why
+// it is called out here. `bytes()` is cheap; call it again.
+//
+// ── A VIEW IS FIXED LENGTH ──────────────────────────────────────────────────
+// `push`, `pop`, `insert`, `remove_at`, `extend`, `reserve` and `clear` panic on
+// one: there is no buffer to grow. Element writes (`b[i] = v`, `fill`,
+// `reverse`) are allowed and land straight in the file — on a read-only mapping
+// they panic with a proper `file:line`. Use `mmap_file_rw` to write, or `copy()`
+// for an ordinary owned `byte[]` you can do anything to.
+//
+// One gap, and it is the only one: `.sort()` is inlined by the compiler and
+// writes through the buffer without consulting the runtime, so sorting a view
+// of a read-only mapping dies on a bare segfault with no Vyto diagnostic.
+//
+// ── OTHER THINGS THAT WILL BITE ─────────────────────────────────────────────
+//   • `view as cstring` is NOT NUL-terminated. The cast is legal and the
+//     vyto/io idiom leans on it, but any C function that calls `strlen` walks
+//     past the last mapped page. `strbytes(b, b.len)` is the safe conversion.
+//   • Do not map a file another process is writing. If it is truncated under
+//     you, POSIX raises SIGBUS on the next touch past the new end — unmaskable,
+//     past every Vyto safety net. Windows is the opposite: the mapping pins the
+//     file size, so nobody can truncate it, and nobody can delete it either.
+//   • On Android, files inside the APK are zip entries, not paths. `mmap_file`
+//     returns null for them; use `vyto/asset`.
+//   • `text()` on a 4 GB mapping copies 4 GB. Not doing that is the point.
+
+import { readU16LE } from "vyto/mmap/decode";
+
+extern "C" {
+    // The runtime, not the shim: mmap_shim.c has no -I to runtime/, so it
+    // cannot build a VtArray. Same shape as vyto/gfx's vt_vfs_ptr declaration.
+    fn vt_arr_view(data: rawptr, len: i64, elem_size: i32, owner: rawptr,
+                   readonly: i32): byte[];
+
+    fn vmm_open(path: cstring, writable: i32, off: i64, len: i64): rawptr;
+    fn vmm_anon(len: i64): rawptr;
+    fn vmm_base(h: rawptr): rawptr;
+    fn vmm_offset(h: rawptr, off: i64): rawptr;
+    fn vmm_len(h: rawptr): i64;
+    fn vmm_writable(h: rawptr): i32;
+    fn vmm_flush(h: rawptr, sync: i32): i32;
+    fn vmm_advise(h: rawptr, advice: i32): i32;
+    fn vmm_page_size(): i64;
+    fn vmm_granularity(): i64;
+    fn vmm_file_size(path: cstring): i64;
+    fn vmm_close(h: rawptr);
+}
+
+// Access hints. Advisory everywhere — a platform that cannot honour one
+// ignores it and still reports success. SEQUENTIAL before a full scan and
+// WILLNEED before a known jump are the two that measurably matter.
+export const ADVICE_NORMAL: int = 0;
+export const ADVICE_RANDOM: int = 1;
+export const ADVICE_SEQUENTIAL: int = 2;
+export const ADVICE_WILLNEED: int = 3;
+export const ADVICE_DONTNEED: int = 4;
+
+export class Mapping {
+    h: rawptr;
+    n: int;
+    rw: bool;
+    path: string;
+
+    // Takes an already-open handle; validation lives in the free functions
+    // below, which return null. Same split as `File` (io/file.vt).
+    fn init(h: rawptr, path: string) {
+        this.h = h;
+        this.path = path;
+        this.n = vmm_len(h) as int;
+        this.rw = vmm_writable(h) as int != 0;
+    }
+
+    fn size(): int { return this.n; }
+    fn writable(): bool { return this.rw; }
+    fn source(): string { return this.path; }
+    fn is_empty(): bool { return this.n == 0; }
+
+    // A zero-copy `byte[]` over the whole mapping. Retains this Mapping, so the
+    // pages outlive the view. Cheap — do not cache it in a field (see above).
+    fn bytes(): byte[] {
+        if (this.n == 0) { return bytes(0); }
+        let ro = 1;
+        if (this.rw) { ro = 0; }
+        return vt_arr_view(vmm_base(this.h), this.n as i64, 1,
+                           this as rawptr, ro as i32);
+    }
+
+    // A zero-copy view of [off, off + len). Same ownership rule as bytes().
+    fn view(off: int, len: int): byte[] {
+        if (off < 0 || len < 0 || off + len > this.n) {
+            panic("vyto/mmap: view out of bounds");
+        }
+        if (len == 0) { return bytes(0); }
+        let ro = 1;
+        if (this.rw) { ro = 0; }
+        return vt_arr_view(vmm_offset(this.h, off as i64), len as i64, 1,
+                           this as rawptr, ro as i32);
+    }
+
+    // An ordinary OWNED copy — the sanctioned way to outlive the mapping, and
+    // the way to get something you may grow or sort. Costs the copy.
+    fn copy(): byte[] {
+        let b = this.bytes();
+        return b.slice(0, b.len);
+    }
+
+    fn copyRange(off: int, len: int): byte[] {
+        let b = this.view(off, len);
+        return b.slice(0, b.len);
+    }
+
+    // The whole mapping as a string. Copies every byte — on a large file this
+    // is exactly what mapping was meant to avoid.
+    fn text(): string {
+        let b = this.bytes();
+        return strbytes(b, b.len);
+    }
+
+    // Push dirty pages to the file and wait for them. Returns false on error,
+    // true for a read-only or anonymous mapping (nothing to do).
+    fn flush(): bool { return vmm_flush(this.h, 1 as i32) as int == 0; }
+
+    // Schedule the write-back without waiting.
+    fn flushAsync(): bool { return vmm_flush(this.h, 0 as i32) as int == 0; }
+
+    fn advise(a: int): bool { return vmm_advise(this.h, a as i32) as int == 0; }
+
+    // No close(). Unmapping happens here and only here — after the last view is
+    // gone, which reference counting guarantees. See the header.
+    deinit {
+        vmm_close(this.h);
+        this.h = null;
+    }
+}
+
+// Map a file read-only. Returns null when it cannot be mapped — missing,
+// unreadable, or (on Android) an APK entry rather than a real path.
+export fn mmap_file(path: string): Mapping {
+    let h = vmm_open(path.cstr(), 0 as i32, 0 as i64, 0 as i64);
+    if (h == null) { return null; }
+    return new Mapping(h, path);
+}
+
+// Map a file read/write and shared: writes through a view land in the file,
+// and `flush()` makes them durable.
+export fn mmap_file_rw(path: string): Mapping {
+    let h = vmm_open(path.cstr(), 1 as i32, 0 as i64, 0 as i64);
+    if (h == null) { return null; }
+    return new Mapping(h, path);
+}
+
+// Map a window of a file. `len == 0` means "to the end". The offset needs no
+// alignment from you — the shim rounds it down to whatever the platform wants
+// (4 KiB on POSIX, 64 KiB on Windows) and hands back a base at your exact byte.
+export fn mmap_at(path: string, off: int, len: int, writable: bool): Mapping {
+    let w = 0;
+    if (writable) { w = 1; }
+    let h = vmm_open(path.cstr(), w as i32, off as i64, len as i64);
+    if (h == null) { return null; }
+    return new Mapping(h, path);
+}
+
+// A zero-filled anonymous region, straight from the OS.
+//
+// Not a faster `bytes(n)`: a large `bytes(n)` already lands on calloc, which
+// glibc serves from mmap with lazy zero pages. What this buys is guaranteed
+// page alignment, a working `advise()` (DONTNEED returns pages to the OS
+// without dropping the object), and somewhere for huge pages to go later.
+export fn mmap_anon(size: int): Mapping {
+    let h = vmm_anon(size as i64);
+    if (h == null) { return null; }
+    return new Mapping(h, "<anon>");
+}
+
+// Map, hand the bytes to `use`, and release both when it returns. The shape to
+// reach for when the mapping should not outlive one call.
+export fn mmap_read(path: string, use: fn(byte[])): bool {
+    let m = mmap_file(path);
+    if (m == null) { return false; }
+    use(m.bytes());
+    return true;
+}
+
+// Size of a file without mapping it; -1 if it cannot be stated.
+export fn mmap_file_size(path: string): int { return vmm_file_size(path.cstr()) as int; }
+
+// The system page size, and the offset granularity `mmap_at` rounds to. They
+// are the same on POSIX and differ on Windows (4 KiB vs 64 KiB).
+export fn mmap_page_size(): int { return vmm_page_size() as int; }
+export fn mmap_granularity(): int { return vmm_granularity() as int; }

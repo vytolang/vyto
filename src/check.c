@@ -2325,6 +2325,11 @@ static Type *check_expr(Ctx *c, Expr *e, Type *expected) {
             return e->type = dst; /* byte[]/i8[] as a borrowed C string view */
         if (src->kind == TY_FN && dst->kind == TY_RAWPTR)
             return e->type = dst; /* closure as userdata for cthunk callbacks (borrowed) */
+        if (src->kind == TY_CLASS && dst->kind == TY_RAWPTR)
+            return e->type = dst; /* instance as the VtObj* it already is: lets a
+                                     shim or the runtime retain it as an owner
+                                     (vt_arr_view). Borrowed — the cast itself
+                                     transfers nothing. */
         fatal_at(e->loc, "cannot cast %s to %s", type_str(src), type_str(dst));
     }
     case EX_STRCONV:

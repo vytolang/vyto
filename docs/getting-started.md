@@ -232,6 +232,15 @@ with `VYTO_WORKER_*` in the environment, re-running `main` until they reach
 around: **anything `main()` does before it builds the pool runs once per
 worker.** Keep setup that must happen once behind the pool's construction.
 
+**Memory mapping**: `vyto/mmap` builds everywhere. POSIX `mmap` covers Linux and
+Android; Windows goes through `CreateFileMapping`/`MapViewOfFile`. One thing the
+shim handles that a caller would otherwise get wrong: `mmap_at`'s offset is
+rounded down to the platform's granularity, which is 4 KiB on POSIX and **64 KiB
+on Windows** — you always get a base at the byte you asked for. `advise()` is
+honoured on POSIX; on Windows only `WILLNEED` does anything (via
+`PrefetchVirtualMemory`, resolved at runtime so the binary still loads on Win7)
+and the rest are successful no-ops.
+
 **Not portable**, and excluded from the Windows suite: `vyto/net/link`, `wifi`
 and `raw` (Linux netlink/AF_PACKET), all of `vyto/hw/*` (Linux device
 interfaces), and `vyto/intl` (ICU).

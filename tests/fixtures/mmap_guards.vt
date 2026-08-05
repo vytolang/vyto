@@ -1,0 +1,55 @@
+// vyto/mmap — the panics. Run once per case with the case name as an argument,
+// because a panic aborts the process and would truncate a golden file. The
+// runner greps stderr for the expected message; see run_tests.sh.
+//
+// Two families:
+//   fixed-length  a view has no buffer of its own, so anything that would grow,
+//                 shrink or realloc it is a mistake rather than a resize
+//   read-only     a view over PROT_READ pages. Without the check these would
+//                 fault with a bare SIGSEGV and no file, line or message.
+
+import { mmap_file, mmap_file_rw } from "vyto/mmap";
+
+fn main() {
+    writefile("tests/tmp/mmap_g.bin", "abcdefgh");
+    let which = args()[0];
+
+    let ro = mmap_file("tests/tmp/mmap_g.bin").bytes();
+    let rw = mmap_file_rw("tests/tmp/mmap_g.bin").bytes();
+
+    // --- fixed length ---
+    if (which == "push")      { rw.push(1 as byte); }
+    if (which == "pop")       { rw.pop(); }
+    if (which == "insert")    { rw.insert(0, 1 as byte); }
+    if (which == "remove_at") { rw.remove_at(0); }
+    if (which == "extend")    { rw.extend(bytes(2)); }
+    if (which == "reserve")   { rw.reserve(9999); }
+    if (which == "clear")     { rw.clear(); }
+
+    // --- read-only ---
+    if (which == "store")   { ro[0] = 90 as byte; }
+    if (which == "compound"){ ro[0] += 1 as byte; }
+    if (which == "fill")    { ro.fill(1 as byte); }
+    if (which == "reverse") { ro.reverse(); }
+
+    // --- bounds ---
+    if (which == "view_neg")  { mmap_file("tests/tmp/mmap_g.bin").view(-1, 2); }
+    if (which == "view_past") { mmap_file("tests/tmp/mmap_g.bin").view(4, 99); }
+
+    // --- everything a view IS allowed to do, so the guards are not overreach ---
+    if (which == "allowed") {
+        rw[0] = 90 as byte;          // in-place store on a writable view
+        rw[1] += 1 as byte;          // compound store
+        rw.fill(66 as byte);
+        rw.reverse();
+        rw.sort((x, y) => (x as int) - (y as int));
+        let owned = bytes(2);
+        owned.extend(ro);            // extending FROM a view only reads it
+        let cp = ro.slice(0, 4);     // slice allocates a fresh array
+        cp.push(7 as byte);          // ...which may then grow
+        let n = 0;
+        for (let x in ro) { n += x as int; }
+        print("allowed " + str(owned.len) + " " + str(cp.len) + " " + str(n > 0));
+    }
+    print("no panic for " + which);
+}

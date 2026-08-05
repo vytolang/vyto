@@ -84,6 +84,16 @@ else
     echo "FAIL freestanding_run_refused"
     fail=1
 fi
+# A package shim under --freestanding. 01_hello imports nothing, so it never
+# exercises a native/src at all; vyto/mmap is the first shim in the tree with a
+# VT_NO_LIBC arm, and without this nothing would notice if that arm rotted.
+if ./vytoc build tests/fixtures/mmap_freestanding.vt --freestanding --cc gcc \
+        -o examples/.vyto-cache/libmmap_fs.a >/dev/null 2>&1; then
+    echo "PASS freestanding_shim_stub"
+else
+    echo "FAIL freestanding_shim_stub (vyto/mmap's VT_NO_LIBC arm does not build)"
+    fail=1
+fi
 
 # --- stdlib search path: VYTO_HOME lib, stem-collision naming, local shadowing ---
 got=$(VYTO_HOME=tests/fixtures/volthome ./vytoc run tests/fixtures/libpath/main.vt 2>&1)
@@ -514,6 +524,61 @@ else
     echo "FAIL regex_extra_nojit"
     echo "--- expected ---"; cat tests/fixtures/regex_extra.expected
     echo "--- got ---"; printf '%s\n' "$got"
+    fail=1
+fi
+
+# --- vyto/mmap: mapping a file as a zero-copy byte[] view. The check that
+#     matters most is a view outliving its Mapping -- the view retains it, so
+#     the pages cannot be unmapped underneath. Also sub-views, windowed maps
+#     (the offset the shim rounds down), read/write + msync, anonymous
+#     mappings, and the LE/BE decoders ---
+got=$(./vytoc run tests/fixtures/mmap_basics.vt 2>&1)
+if [ "$got" = "$(cat tests/fixtures/mmap_basics.expected)" ]; then
+    echo "PASS mmap_basics"
+else
+    echo "FAIL mmap_basics"
+    echo "--- expected ---"; cat tests/fixtures/mmap_basics.expected
+    echo "--- got ---"; printf '%s\n' "$got"
+    fail=1
+fi
+
+# --- vyto/mmap guards: a view is fixed-length and (over a read-only mapping)
+#     unwritable. Grep-style rather than a golden, because a panic aborts the
+#     process and truncates stdout. Without these the read-only cases would be
+#     a bare SIGSEGV with no file, line or message. ---
+for c in push pop insert remove_at extend reserve clear; do
+    if ./vytoc run tests/fixtures/mmap_guards.vt -- "$c" 2>&1 |
+           grep -q "$c on a fixed-length array view"; then
+        echo "PASS mmap_guard_$c"
+    else
+        echo "FAIL mmap_guard_$c (expected a fixed-length panic)"
+        fail=1
+    fi
+done
+for c in store compound fill reverse; do
+    if ./vytoc run tests/fixtures/mmap_guards.vt -- "$c" 2>&1 |
+           grep -q "write to a read-only array view"; then
+        echo "PASS mmap_guard_$c"
+    else
+        echo "FAIL mmap_guard_$c (expected a read-only panic)"
+        fail=1
+    fi
+done
+for c in view_neg view_past; do
+    if ./vytoc run tests/fixtures/mmap_guards.vt -- "$c" 2>&1 | grep -q "view out of bounds"; then
+        echo "PASS mmap_guard_$c"
+    else
+        echo "FAIL mmap_guard_$c (expected a bounds panic)"
+        fail=1
+    fi
+done
+# ...and the operations a view IS allowed: in-place stores on a writable view,
+# fill/reverse/sort, extending FROM a view, slicing one. A guard that also
+# blocked these would be overreach.
+if ./vytoc run tests/fixtures/mmap_guards.vt -- allowed 2>&1 | grep -q "no panic for allowed"; then
+    echo "PASS mmap_guard_allowed"
+else
+    echo "FAIL mmap_guard_allowed (a permitted operation panicked)"
     fail=1
 fi
 

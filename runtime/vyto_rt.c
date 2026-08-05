@@ -961,6 +961,14 @@ bool vt_is_dir(VtString *path) { (void)path; return false; }
 
 static void arr_deinit(void *self) {
     VtArray *a = self;
+    if (a->owner) {
+        /* Borrowed pages: never touch the elements, never free the buffer --
+           just drop the lender. Views are elem_ref == false by construction
+           (vt_arr_view enforces it); the early return states that invariant
+           rather than relying on the loop below being dead by luck. */
+        vt_release(a->owner);
+        return;
+    }
     if (a->elem_ref)
         for (int64_t i = 0; i < a->len; i++)
             vt_release(*(void **)(a->data + i * a->elem_size));
@@ -984,6 +992,50 @@ VtArray *vt_arr_bytes(int64_t n) {
     return a;
 }
 
+VtArray *vt_arr_view(void *data, int64_t len, int32_t elem_size, void *owner, int readonly) {
+    /* Every precondition here is a memory-safety one: get any of them wrong and
+       the result is an array the runtime will happily index out of the mapping,
+       or free a pointer it does not own. Fail loudly at construction instead. */
+    /* No caller file/line: vt_arr_view is reached only through an extern "C"
+       declaration, so a failure here is a bug in the binding, not at a Vyto
+       source line. Name this file instead. */
+    if (elem_size <= 0)
+        vt_panic_c(__FILE__, __LINE__, "array view with a non-positive element size");
+    if (len < 0) vt_panic_c(__FILE__, __LINE__, "array view with a negative length");
+    if (!owner) vt_panic_c(__FILE__, __LINE__, "array view with no owner (it would dangle)");
+    /* vt_arr_at, the for-in load and the inlined sort all compute
+       i * elem_size unchecked, so the whole span must fit in an int64_t. */
+    if (len > (int64_t)9223372036854775807LL / elem_size)
+        vt_panic_c(__FILE__, __LINE__, "array view is too large to index");
+    if (!data && len > 0) vt_panic_c(__FILE__, __LINE__, "array view over a null pointer");
+    if (len == 0) return vt_arr_bytes(0); /* nothing to borrow; a real empty array */
+
+    VtArray *a = vt_arr_new(elem_size, false);
+    a->data = data;
+    a->len = a->cap = len;   /* cap == len is what makes reserve(n <= len) a no-op */
+    a->readonly = readonly != 0;
+    a->owner = owner;
+    vt_retain(owner);
+    return a;
+}
+
+/* A view has no buffer of its own, so anything that would grow, shrink or
+   realloc it is a mistake rather than a resize. Called from every such site. */
+void vt_arr_no_resize(VtArray *a, const char *op, const char *file, int line) {
+    if (a && a->owner) {
+        char buf[96];
+        vt_snprintf(buf, sizeof buf, "%s on a fixed-length array view", op);
+        vt_panic_c(file, line, buf);
+    }
+}
+
+/* Element writes to a view over read-only pages. Without this the store faults
+   with a bare SIGSEGV and no file, line or message -- unlike every other array
+   misuse in the language. */
+void vt_arr_no_write(VtArray *a, const char *file, int line) {
+    if (a && a->readonly) vt_arr_ro(file, line);
+}
+
 void vt_arr_push(VtArray *a, const void *elem) {
     if (a->len == a->cap) {
         a->cap = a->cap ? a->cap * 2 : 8;
@@ -997,15 +1049,24 @@ void vt_arr_push(VtArray *a, const void *elem) {
 
 void vt_arr_push_at(VtArray *a, const void *elem, const char *file, int line) {
     if (!a) vt_panic_c(file, line, "push to null array");
+    /* Guarded here and not in vt_arr_push, which has no file/line to report and
+       is reached only from array literals and the HOFs -- where the destination
+       is always a fresh vt_arr_new and can never be a view. */
+    vt_arr_no_resize(a, "push", file, line);
     vt_arr_push(a, elem);
 }
 
 void vt_arr_pop(VtArray *a, void *out, const char *file, int line) {
     if (!a) vt_panic_c(file, line, "pop from null array");
+    vt_arr_no_resize(a, "pop", file, line);
     if (a->len == 0) vt_panic_c(file, line, "pop from empty array");
     a->len--;
     memcpy(out, a->data + a->len * a->elem_size, (size_t)a->elem_size);
     /* ownership transfers to caller: no release, no retain */
+}
+
+VT_NORETURN void vt_arr_ro(const char *file, int line) {
+    vt_panic_c(file, line, "write to a read-only array view");
 }
 
 /* Cold failure path for the inlined vt_arr_at (see vyto_rt.h). */
@@ -1019,6 +1080,7 @@ VT_NORETURN void vt_arr_oob(VtArray *a, int64_t i, const char *file, int line) {
 
 void vt_arr_set(VtArray *a, int64_t i, const void *elem, const char *file, int line) {
     void *slot = vt_arr_at(a, i, file, line);
+    vt_arr_no_write(a, file, line);
     if (a->elem_ref) {
         vt_retain(*(void **)elem);
         vt_release(*(void **)slot);

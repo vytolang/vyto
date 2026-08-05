@@ -1,0 +1,206 @@
+// vyto/mmap — mapping, views, and the lifetime rule the whole design rests on.
+//
+// The panic cases live in mmap_guards.vt, run grep-style, because a panic
+// aborts the process and truncates stdout.
+//
+// Same style rule as the other fixtures: any call with a side effect gets its
+// own statement, because Vyto evaluates binary operands right to left.
+
+import { Mapping, mmap_file, mmap_file_rw, mmap_at, mmap_anon, mmap_read,
+         mmap_file_size, mmap_page_size, mmap_granularity,
+         ADVICE_SEQUENTIAL, ADVICE_WILLNEED, ADVICE_DONTNEED } from "vyto/mmap";
+import { readU8, readI8, readU16LE, readU16BE, readI16LE, readU32LE, readU32BE,
+         readI32LE, readI64LE, readI64BE, readF64LE, readF64BE,
+         readText, findByte, lineStarts } from "vyto/mmap/decode";
+
+fn check(name: string, got: string, want: string) {
+    if (got == want) { print("ok    " + name); }
+    else { print("FAIL  " + name + " got=" + got + " want=" + want); }
+}
+fn checkInt(name: string, got: int, want: int) { check(name, str(got), str(want)); }
+fn checkBool(name: string, got: bool) {
+    if (got) { print("ok    " + name); } else { print("FAIL  " + name); }
+}
+
+// A view whose Mapping has no other reference by the time it returns. If the
+// owner retain is wrong, everything the caller does with this is a
+// use-after-munmap.
+fn escapingView(path: string): byte[] {
+    let m = mmap_file(path);
+    return m.bytes();
+}
+
+fn main() {
+    writefile("tests/tmp/mmap_a.bin", "hello\nworld\nvyto\n");
+
+    print("---- open ----");
+    let m = mmap_file("tests/tmp/mmap_a.bin");
+    checkBool("mmap_file returns a Mapping", m != null);
+    checkInt("size", m.size(), 17);
+    checkBool("read-only by default", !m.writable());
+    check("source", m.source(), "tests/tmp/mmap_a.bin");
+    checkBool("not empty", !m.is_empty());
+    checkInt("file_size agrees", mmap_file_size("tests/tmp/mmap_a.bin"), 17);
+    checkBool("page size is positive", mmap_page_size() > 0);
+    checkBool("granularity is at least the page size",
+              mmap_granularity() >= mmap_page_size());
+
+    print("---- the view is an ordinary byte[] ----");
+    let b = m.bytes();
+    checkInt("view length", b.len, 17);
+    checkInt("first byte", b[0] as int, 104);
+    checkInt("newline where expected", b[5] as int, 10);
+    check("readText over the view", readText(b, 0, 5), "hello");
+    check("readText mid-file", readText(b, 6, 5), "world");
+    checkInt("findByte", findByte(b, 10, 0), 5);
+    checkInt("findByte from an offset", findByte(b, 10, 6), 11);
+    checkInt("findByte with no match", findByte(b, 200, 0), -1);
+
+    // Every builtin that only reads must work on a view unchanged.
+    checkInt("contains", b.index_of(118 as byte), 12);
+    checkBool("for-in visits every byte", true);
+    let total = 0;
+    for (let x in b) { total += x as int; }
+    checkInt("for-in checksum", total, 1580);
+    checkInt("slice of a view is an owned copy", b.slice(0, 5).len, 5);
+    check("slice contents", readText(b.slice(6, 11), 0, 5), "world");
+
+    // The sparse-index building block: one pass, one int per line, no copy.
+    let ls = lineStarts(b);
+    checkInt("line count", ls.len, 3);
+    checkInt("second line starts at", ls[1], 6);
+    checkInt("third line starts at", ls[2], 12);
+
+    print("---- sub-views ----");
+    let v = m.view(6, 5);
+    checkInt("sub-view length", v.len, 5);
+    check("sub-view contents", readText(v, 0, 5), "world");
+    checkInt("zero-length sub-view", m.view(3, 0).len, 0);
+
+    print("---- owned copies ----");
+    checkInt("copy length", m.copy().len, 17);
+    check("copyRange", readText(m.copyRange(6, 5), 0, 5), "world");
+    check("text", m.text(), "hello\nworld\nvyto\n");
+    // A copy is a normal array, so it may grow -- unlike the view it came from.
+    let owned = m.copy();
+    owned.push(33 as byte);
+    checkInt("a copy can grow", owned.len, 18);
+    // extend FROM a view is reading it, so it is allowed.
+    let sink = bytes(0);
+    sink.extend(b);
+    checkInt("extend from a view", sink.len, 17);
+
+    print("---- the view outlives the Mapping ----");
+    // This is the test the design exists for.
+    let esc = escapingView("tests/tmp/mmap_a.bin");
+    checkInt("escaped view still has its length", esc.len, 17);
+    check("escaped view still reads correctly", readText(esc, 0, 11), "hello\nworld");
+    let esc_total = 0;
+    for (let x in esc) { esc_total += x as int; }
+    checkInt("escaped view checksum matches", esc_total, 1580);
+
+    print("---- advice ----");
+    checkBool("SEQUENTIAL", m.advise(ADVICE_SEQUENTIAL));
+    checkBool("WILLNEED", m.advise(ADVICE_WILLNEED));
+    checkBool("DONTNEED", m.advise(ADVICE_DONTNEED));
+
+    print("---- edge cases ----");
+    checkBool("a missing file maps to null", mmap_file("tests/tmp/mmap_nope.bin") == null);
+    writefile("tests/tmp/mmap_empty.bin", "");
+    let e = mmap_file("tests/tmp/mmap_empty.bin");
+    checkBool("an empty file still maps", e != null);
+    checkInt("empty size", e.size(), 0);
+    checkInt("empty view", e.bytes().len, 0);
+    checkBool("is_empty", e.is_empty());
+    checkInt("empty copy", e.copy().len, 0);
+    check("empty text", e.text(), "");
+
+    print("---- windowed mapping ----");
+    // The offset needs no alignment from the caller; the shim rounds down.
+    let w = mmap_at("tests/tmp/mmap_a.bin", 6, 5, false);
+    checkBool("mmap_at maps", w != null);
+    checkInt("window size", w.size(), 5);
+    check("window contents", w.text(), "world");
+    let tail = mmap_at("tests/tmp/mmap_a.bin", 12, 0, false);
+    check("len 0 means to the end", tail.text(), "vyto\n");
+    checkBool("a window past the end is refused",
+              mmap_at("tests/tmp/mmap_a.bin", 0, 999, false) == null);
+
+    print("---- read/write ----");
+    writefile("tests/tmp/mmap_rw.bin", "AAAABBBB");
+    let rw = mmap_file_rw("tests/tmp/mmap_rw.bin");
+    checkBool("rw mapping is writable", rw.writable());
+    let rb = rw.bytes();
+    rb[0] = 90 as byte;
+    rb[7] = 90 as byte;
+    checkBool("flush succeeds", rw.flush());
+    check("the write reached the file", readfile("tests/tmp/mmap_rw.bin"), "ZAAABBBZ");
+    // fill and reverse are in-place, so they are allowed on a writable view.
+    let rw2 = mmap_file_rw("tests/tmp/mmap_rw.bin");
+    let rb2 = rw2.bytes();
+    rb2.fill(67 as byte);
+    checkBool("fill flush", rw2.flush());
+    check("fill reached the file", readfile("tests/tmp/mmap_rw.bin"), "CCCCCCCC");
+
+    print("---- anonymous ----");
+    let a = mmap_anon(4096);
+    checkBool("anon maps", a != null);
+    checkInt("anon size", a.size(), 4096);
+    checkBool("anon is writable", a.writable());
+    let ab = a.bytes();
+    checkInt("anon starts zeroed", ab[0] as int, 0);
+    checkInt("anon is zeroed throughout", ab[4095] as int, 0);
+    ab[0] = 65 as byte;
+    checkInt("anon write is visible through a fresh view", a.bytes()[0] as int, 65);
+    checkBool("anon flush is a no-op that succeeds", a.flush());
+    checkBool("anon rejects a zero size", mmap_anon(0) == null);
+
+    print("---- scoped read ----");
+    let scoped_len = [0];
+    let did = mmap_read("tests/tmp/mmap_a.bin", (x) => { scoped_len[0] = x.len; });
+    checkBool("mmap_read ran", did);
+    checkInt("mmap_read saw the bytes", scoped_len[0], 17);
+    checkBool("mmap_read on a missing file returns false",
+              !mmap_read("tests/tmp/mmap_nope.bin", (x) => { scoped_len[0] = -1; }));
+
+    print("---- decoders ----");
+    // A little-endian record, written by hand so the expected values are
+    // independent of this implementation.
+    let rec = bytes(24);
+    rec[0] = 0x78 as byte; rec[1] = 0x56 as byte;
+    rec[2] = 0x34 as byte; rec[3] = 0x12 as byte;      // u32 LE 0x12345678
+    rec[4] = 0xFF as byte; rec[5] = 0xFF as byte;
+    rec[6] = 0xFF as byte; rec[7] = 0xFF as byte;      // u16/i32 all ones
+    rec[8] = 0x01 as byte;                              // i64 LE 1
+    rec[16] = 0x00 as byte; rec[17] = 0x00 as byte;
+    rec[18] = 0x00 as byte; rec[19] = 0x00 as byte;
+    rec[20] = 0x00 as byte; rec[21] = 0x00 as byte;
+    rec[22] = 0xF0 as byte; rec[23] = 0x3F as byte;    // f64 LE 1.0
+    checkInt("readU8", readU8(rec, 0), 120);
+    checkInt("readI8 negative", readI8(rec, 4), -1);
+    checkInt("readU16LE", readU16LE(rec, 0), 22136);
+    checkInt("readU16BE", readU16BE(rec, 0), 30806);
+    checkInt("readI16LE negative", readI16LE(rec, 4), -1);
+    checkInt("readU32LE", readU32LE(rec, 0), 305419896);
+    checkInt("readU32BE", readU32BE(rec, 0), 2018915346);
+    checkInt("readI32LE", readI32LE(rec, 4), -1);
+    checkInt("readI64LE", readI64LE(rec, 8), 1);
+    checkInt("readI64BE", readI64BE(rec, 8), 72057594037927936);
+    checkBool("readF64LE 1.0", readF64LE(rec, 16) == 1.0);
+    checkBool("readF64LE of zero bits is 0.0", readF64LE(rec, 8) == 0.0);
+    // Negative and fractional, to exercise the sign and exponent paths.
+    let f = bytes(8);
+    f[6] = 0xF8 as byte; f[7] = 0xBF as byte;          // -1.5 LE
+    checkBool("readF64LE -1.5", readF64LE(f, 0) == -1.5);
+    let g = bytes(8);
+    g[7] = 0x40 as byte;                                // 2.0 LE
+    checkBool("readF64LE 2.0", readF64LE(g, 0) == 2.0);
+    let h = bytes(8);
+    h[0] = 0x40 as byte;                                // 2.0 BE
+    checkBool("readF64BE 2.0", readF64BE(h, 0) == 2.0);
+
+    // The decoders work over a mapping just as well as over an owned array.
+    writefile("tests/tmp/mmap_rec.bin", "");
+    let recmap = mmap_file_rw("tests/tmp/mmap_a.bin");
+    checkInt("decode straight off a mapping", readU16LE(recmap.bytes(), 0), 25960);
+}

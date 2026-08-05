@@ -1424,8 +1424,10 @@ static void emit_assign(Em *em, Expr *e) {
     if (!type_is_ref(et))
         /* non-ref element: no retain/release, so store inline through the
            inlined bounds-checked slot — lets the C compiler hoist/vectorize
-           instead of emitting an out-of-line vt_arr_set call per element. */
-        sb_printf(em->out, "*(%s*)vt_arr_at(%s, %s, %s) = %s;\n", c_type(et), ta, ti, fl, tv);
+           instead of emitting an out-of-line vt_arr_set call per element.
+           vt_arr_wr, not vt_arr_at: same compare plus one predicted-away branch
+           that turns a store into a read-only view into a panic. */
+        sb_printf(em->out, "*(%s*)vt_arr_wr(%s, %s, %s) = %s;\n", c_type(et), ta, ti, fl, tv);
     else
         sb_printf(em->out, "vt_arr_set(%s, %s, &%s, %s);\n", ta, ti, tv, fl);
     if (str_append) {

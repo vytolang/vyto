@@ -162,6 +162,16 @@ Never chain side effects in one expression.
 There is no per-file platform filter. A platform-specific source must wrap its
 whole body in `#ifdef`, e.g. `lib/vyto/surface/native/src/vsurf_android.c`.
 
+**A shim that reaches past the six `vt_host_*` hooks needs a `VT_NO_LIBC` arm.**
+`--freestanding` splices `-ffreestanding -DVT_NO_LIBC -fno-builtin` into every
+*package shim's* compile line, not just the runtime's (`src/main.c`), so an
+unguarded `#include <sys/mman.h>` breaks the freestanding build of any program
+that merely imports the package. The stub arm returns each entry point's
+documented failure sentinel, which keeps the `.vt` free of platform
+conditionals. First instance: `lib/vyto/mmap/native/src/mmap_shim.c`. Nothing
+catches this by accident — the freestanding test builds `01_hello.vt`, which
+imports nothing, so `tests/fixtures/mmap_freestanding.vt` exists to exercise it.
+
 **`#link` conditions are OS-*prefix* matches on the target triple.**
 `#link "X11" if "linux"` matches `linux-x64` and `linux-arm64` — and does *not*
 match `android-arm64`. A non-matching condition silently drops the library;

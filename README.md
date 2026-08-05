@@ -566,6 +566,7 @@ everything else is pure Vyto.
 | `vyto/os/worker` ⚙ | `fork()`-based `WorkerPool` — CPU parallelism, no shared state |
 | `vyto/coll` | containers: `Deque`, `RingBuffer`, `Heap`, `HashMap`/`HashSet` (any key type), `BitSet`, `LRU`, and `Slab` — an index-based arena whose handles are ints, so a graph of them cannot form a reference cycle |
 | `vyto/ds` | index structures: `Trie`, `Dsu` (union-find), `Fenwick`, `SegTree`, `Bloom`, `SkipList`/`SkipMap` (ordered set and map, with `ceiling`/`floor`), `Graph` (BFS/DFS/topo/Dijkstra), `IntervalTree` — all flat-array backed, no node objects |
+| `vyto/mmap` | memory-mapped files as zero-copy `byte[]` views — read a 40 GB file without loading it. Read-only, read/write, windowed and anonymous mappings; the view retains its `Mapping`, so the pages cannot be unmapped while it is alive |
 | `vyto/hash` | non-cryptographic hashing: FNV-1a, xxHash64, SipHash-2-4, CRC-32/32C, plus the `hash_str`/`hash_int` helpers a table wants |
 
 **Data formats** — all pure Vyto, all soft-failing (a parse error is a value, never a panic)

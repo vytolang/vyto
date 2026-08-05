@@ -1,0 +1,171 @@
+// vyto/mmap/decode — read fixed-width numbers out of a byte[].
+//
+//     let n = readU32LE(b, 4);
+//     let t = readI64BE(b, 16);
+//
+// These exist because a mapped file carries the *file's* byte order, which the
+// type system cannot know. The alternative — handing out an `int[]` view over
+// the same pages — is wrong twice over: it silently yields garbage on
+// mismatched endianness, and a view at an offset that is not a multiple of 8
+// is misaligned, which is undefined everywhere and an actual SIGBUS on 32-bit
+// ARM. Putting the byte order in the function name costs a shift-and-or chain
+// and is correct on every target.
+//
+// Separate module so `vyto/mmap` is not the only way to reach them: they are
+// just as useful over a `byte[]` from `File.read` or a socket.
+
+fn need(b: byte[], off: int, n: int) {
+    if (off < 0 || off + n > b.len) { panic("vyto/mmap: read past the end of the buffer"); }
+}
+
+export fn readU8(b: byte[], off: int): int {
+    need(b, off, 1);
+    return b[off] as int;
+}
+
+// Signed 8-bit: the high bit means negative.
+export fn readI8(b: byte[], off: int): int {
+    let v = readU8(b, off);
+    if (v >= 128) { return v - 256; }
+    return v;
+}
+
+export fn readU16LE(b: byte[], off: int): int {
+    need(b, off, 2);
+    return (b[off] as int) | ((b[off + 1] as int) << 8);
+}
+
+export fn readU16BE(b: byte[], off: int): int {
+    need(b, off, 2);
+    return ((b[off] as int) << 8) | (b[off + 1] as int);
+}
+
+export fn readI16LE(b: byte[], off: int): int {
+    let v = readU16LE(b, off);
+    if (v >= 32768) { return v - 65536; }
+    return v;
+}
+
+export fn readI16BE(b: byte[], off: int): int {
+    let v = readU16BE(b, off);
+    if (v >= 32768) { return v - 65536; }
+    return v;
+}
+
+export fn readU32LE(b: byte[], off: int): int {
+    need(b, off, 4);
+    return (b[off] as int) | ((b[off + 1] as int) << 8)
+         | ((b[off + 2] as int) << 16) | ((b[off + 3] as int) << 24);
+}
+
+export fn readU32BE(b: byte[], off: int): int {
+    need(b, off, 4);
+    return ((b[off] as int) << 24) | ((b[off + 1] as int) << 16)
+         | ((b[off + 2] as int) << 8) | (b[off + 3] as int);
+}
+
+export fn readI32LE(b: byte[], off: int): int {
+    let v = readU32LE(b, off);
+    if (v >= 2147483648) { return v - 4294967296; }
+    return v;
+}
+
+export fn readI32BE(b: byte[], off: int): int {
+    let v = readU32BE(b, off);
+    if (v >= 2147483648) { return v - 4294967296; }
+    return v;
+}
+
+// 64-bit reads go through u64 and come back as `int`, which is i64 — so a value
+// above 2^63 reads as negative. That is a reinterpretation, not a loss: the
+// bits are exact, and Vyto has no wider integer to widen into.
+export fn readI64LE(b: byte[], off: int): int {
+    need(b, off, 8);
+    let v: u64 = 0;
+    let i = 7;
+    while (i >= 0) { v = (v << 8) | (b[off + i] as u64); i -= 1; }
+    return v as int;
+}
+
+export fn readI64BE(b: byte[], off: int): int {
+    need(b, off, 8);
+    let v: u64 = 0;
+    for (let i in 0..8) { v = (v << 8) | (b[off + i] as u64); }
+    return v as int;
+}
+
+// IEEE-754 doubles. The bits are read as an integer and reinterpreted, which is
+// why these need no alignment: the load is byte-at-a-time either way.
+export fn readF64LE(b: byte[], off: int): float { return bitsToFloat(readI64LE(b, off)); }
+export fn readF64BE(b: byte[], off: int): float { return bitsToFloat(readI64BE(b, off)); }
+
+// Reinterpret 64 bits as a double, by hand: Vyto has no bit-cast, and a
+// one-element array is the only aliasing the language offers.
+fn bitsToFloat(bits: int): float {
+    let sign = 1.0;
+    if ((bits >> 63) & 1 == 1) { sign = -1.0; }
+    let exp = ((bits >> 52) & 0x7FF) as int;
+    let frac = bits & 0xFFFFFFFFFFFFF;
+
+    if (exp == 0) {                       // zero or subnormal
+        if (frac == 0) { return sign * 0.0; }
+        return sign * (frac as float) * pow2(-1074);
+    }
+    if (exp == 2047) {                    // inf or NaN — no literals for either
+        if (frac == 0) { return sign * 1.0e308 * 10.0; }
+        return 0.0 / 0.0;
+    }
+    let mant = 1.0 + (frac as float) * pow2(-52);
+    return sign * mant * pow2(exp - 1023);
+}
+
+// 2^n by squaring, so a wide exponent does not cost |n| multiplications and a
+// subnormal's -1074 does not underflow on the way down.
+fn pow2(n: int): float {
+    let e = n;
+    let neg = false;
+    if (e < 0) { neg = true; e = -e; }
+    let r = 1.0;
+    let base = 2.0;
+    while (e > 0) {
+        if (e & 1 == 1) { r = r * base; }
+        base = base * base;
+        e = e >> 1;
+    }
+    if (neg) { return 1.0 / r; }
+    return r;
+}
+
+// Bytes [off, off+len) as a string. Copies — the mapping stays untouched.
+export fn readText(b: byte[], off: int, len: int): string {
+    need(b, off, len);
+    let out = bytes(len);
+    for (let i in 0..len) { out[i] = b[off + i]; }
+    return strbytes(out, len);
+}
+
+// Index of the first `needle` at or after `start`, or -1. The scan a line index
+// is built from.
+export fn findByte(b: byte[], needle: int, start: int): int {
+    let i = start;
+    if (i < 0) { i = 0; }
+    let target = needle as byte;
+    while (i < b.len) {
+        if (b[i] == target) { return i; }
+        i += 1;
+    }
+    return -1;
+}
+
+// Offsets of every line start: 0, then one past each `\n`. Over a mapping this
+// is the sparse-index building block — one pass, one int per line, and the file
+// itself is never copied.
+export fn lineStarts(b: byte[]): int[] {
+    let out: int[] = [];
+    if (b.len == 0) { return out; }
+    out.push(0);
+    for (let i in 0..b.len) {
+        if (b[i] == 10 as byte && i + 1 < b.len) { out.push(i + 1); }
+    }
+    return out;
+}
