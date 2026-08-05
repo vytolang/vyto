@@ -11,10 +11,20 @@ vytoc: $(SRC) $(HDR)
 vytobind: src/vytobind.c src/util.c src/util.h
 	$(CC) $(CFLAGS) -o $@ src/vytobind.c src/util.c
 
-.PHONY: all test test-win clean clean-cache
+.PHONY: all test test-charts test-mobile test-win clean clean-cache
 
 test: vytoc vytobind
 	./tests/run_tests.sh
+
+# Split out of `make test`: both are leaf packages nothing else imports, and
+# both are expensive because every entry file compiles its own copy of the ui
+# stack. Run the matching one after touching lib/vyto/ui/chart.vt or
+# lib/vyto/mobile/android/ui.vt, and both before a release.
+test-charts: vytoc
+	./tests/run_tests_charts.sh
+
+test-mobile: vytoc
+	./tests/run_tests_mobile.sh
 
 # Cross-build the Windows-portable slice for windows-x64 and stage it, with its
 # goldens and a self-checking run.ps1, into tests/tmp/win-x64/. Runs nothing —
