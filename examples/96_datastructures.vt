@@ -1,0 +1,129 @@
+// vyto/ds — index structures, in the shape a program actually uses them.
+//
+// A tiny package manager: modules depend on each other, need building in the
+// right order, and have to be resolved by prefix. Every structure here is
+// backed by flat int arrays with no object per node, which is what makes them
+// both fast and impossible to leak.
+
+import { Trie, trie, Dsu, dsu, Fenwick, fenwick, SegTree, segtree_min,
+         Bloom, bloom_for, Graph, graph, INF, IntervalTree, intervalTree } from "vyto/ds";
+import { Slab } from "vyto/coll";
+
+class Module {
+    name: string;
+    size: int;
+    fn init(n: string, s: int) { this.name = n; this.size = s; }
+}
+
+fn main() {
+    let names = ["vyto/coll", "vyto/coll/deque", "vyto/ds", "vyto/hash",
+                 "vyto/util/sort", "vyto/util/text"];
+    let sizes = [40, 12, 55, 18, 7, 22];
+
+    // Objects live in a Slab; every structure below refers to them by int id.
+    let store = new Slab<Module>(16, null);
+    let ids: int[] = [];
+    for (let i in 0..names.len) { ids.push(store.alloc(new Module(names[i], sizes[i]))); }
+
+    // ---- Trie: resolve a module by prefix --------------------------------
+    print("---- trie ----");
+    let index = trie();
+    for (let i in 0..names.len) { index.put(names[i], ids[i]); }
+    print("modules under vyto/util: " + str(index.count_with_prefix("vyto/util/")));
+    let found = index.keys_with_prefix("vyto/coll");
+    found.sort((a, b) => a.len - b.len);
+    print(found.join(", "));
+    // Longest-prefix is the routing primitive: which package owns this path?
+    let owner = index.longest_prefix_value("vyto/coll/deque.vt", -1);
+    print("owner of vyto/coll/deque.vt: " + store.get(owner).name);
+
+    // ---- Graph: build order ----------------------------------------------
+    //
+    // A dependency graph with no node objects — vertices are ints, so a cycle
+    // is just a cycle in the data, not a reference cycle that leaks.
+    print("---- graph ----");
+    let deps = graph(names.len);
+    deps.add_edge(3, 0, 1);      // hash   -> coll
+    deps.add_edge(0, 1, 1);      // coll   -> coll/deque
+    deps.add_edge(0, 2, 1);      // coll   -> ds
+    deps.add_edge(1, 2, 4);      // deque  -> ds
+    deps.add_edge(4, 5, 2);      // sort   -> text
+
+    let order = deps.topo_sort();
+    let line = "";
+    for (let v in order) { line = line + store.get(ids[v]).name + " "; }
+    print("build order: " + line);
+    print("has a cycle: " + str(deps.has_cycle()));
+
+    let dist = deps.dijkstra(3);
+    print("cheapest path hash -> ds: " + str(dist[2]));
+    print("unreachable from hash: " + str(dist[4] == INF));
+
+    let comps = deps.components();
+    print("independent groups: " + str(comps[4] != comps[0]));
+
+    // A cycle is reported as an empty order rather than a partial one — a
+    // caller that ignored the length would build in the wrong sequence.
+    let bad = graph(2);
+    bad.add_edge(0, 1, 1);
+    bad.add_edge(1, 0, 1);
+    print("cyclic topo_sort length: " + str(bad.topo_sort().len));
+
+    // ---- Dsu: which modules ship together --------------------------------
+    print("---- dsu ----");
+    let groups = dsu(names.len);
+    groups.union(0, 1);          // coll and coll/deque
+    groups.union(0, 2);          // and ds
+    groups.union(4, 5);          // sort and text
+    print("distinct bundles: " + str(groups.groups()));
+    print("coll and ds together: " + str(groups.same(0, 2)));
+    print("coll and sort together: " + str(groups.same(0, 4)));
+
+    // ---- Fenwick: a running total that keeps changing --------------------
+    //
+    // A prefix-sum array answers in O(1) and costs O(n) per edit. This costs
+    // O(log n) for both, which is what a mutable series needs.
+    print("---- fenwick ----");
+    let total = fenwick(names.len);
+    total.build(sizes);
+    print("total size: " + str(total.total()) + " KB");
+    print("first three: " + str(total.prefix(3)) + " KB");
+    total.add(3, 100);                                  // vyto/hash grew
+    print("after hash grew: " + str(total.total()) + " KB");
+    // lower_bound is the "which item is at offset X" lookup, in one descent.
+    print("module at cumulative 50 KB: " + store.get(ids[total.lower_bound(50)]).name);
+
+    // ---- SegTree: the smallest in any window -----------------------------
+    print("---- segtree ----");
+    let smallest = segtree_min(names.len);
+    smallest.build(sizes);
+    print("smallest overall: " + str(smallest.query(0, names.len)) + " KB");
+    print("smallest of the first three: " + str(smallest.query(0, 3)) + " KB");
+    smallest.set(4, 200);                               // sort ballooned
+    print("smallest of the last three now: " + str(smallest.query(3, 6)) + " KB");
+
+    // ---- Bloom: have I fetched this already? -----------------------------
+    //
+    // "false" is certain, "true" is probable — so it is only ever a cheap
+    // filter in front of the real check, never the answer.
+    print("---- bloom ----");
+    let fetched = bloom_for(10000, 0.01);
+    for (let n in names) { fetched.add_str(n); }
+    print("definitely not fetched: " + str(!fetched.maybe_str("vyto/gfx")));
+    print("possibly fetched: " + str(fetched.maybe_str("vyto/hash")));
+    print("bits used: " + str(fetched.size_bytes()) + " bytes");
+
+    // ---- IntervalTree: which file owns this byte offset -------------------
+    print("---- interval tree ----");
+    let layout = intervalTree();
+    let off = 0;
+    for (let i in 0..names.len) {
+        layout.add(off, off + sizes[i], ids[i]);
+        off = off + sizes[i];
+    }
+    layout.build();
+    let at60 = layout.stab(60);
+    for (let h in at60) { print("byte 60 lives in " + store.get(h).name); }
+    print("ranges overlapping [40, 70): " + str(layout.overlap(40, 70).len));
+    print("anything at byte 9999: " + str(layout.covers(9999)));
+}

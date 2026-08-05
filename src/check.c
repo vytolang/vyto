@@ -502,6 +502,14 @@ static Type *check_expr(Ctx *c, Expr *e, Type *expected);
 static void check_block(Ctx *c, Stmt **body, int n);
 static void require_returns(FnDecl *fd);
 
+/* Compile-time constant value: kind 0=int, 1=float, 2=bool. */
+typedef struct { int kind; int64_t i; double f; bool b; } CVal;
+static CVal fold_const_expr(Module *m, Expr *e);
+
+/* What the constant folder is folding, for its two diagnostics. `const`
+   initializers were the only caller until `switch` case values arrived. */
+static const char *g_fold_what = "const initializer";
+
 static Expr *strconv(Expr *e) {
     if (e->type->kind == TY_STRING) return e;
     Expr *w = NEW(Expr);
@@ -803,8 +811,28 @@ static Stmt *clone_stmt(Stmt *st, Subst *s, Module *mod) {
     n->range_lo = clone_expr(st->range_lo, s, mod);
     n->range_hi = clone_expr(st->range_hi, s, mod);
     n->iter = clone_expr(st->iter, s, mod);
+    /* ST_FOR_ITER's desugaring is a checker output, not source: a template is
+       cloned pristine and re-checked, which rebuilds these from scratch. */
+    n->iter_local = NULL;
+    n->index_local = NULL;
+    n->len_call = NULL;
+    n->at_call = NULL;
     n->body = clone_stmt_list(st->body, st->nbody, s, mod);
     n->els = clone_stmt_list(st->els, st->nels, s, mod);
+    /* Arms must be deep-cloned, not shared: the checker re-annotates every Expr
+       per instantiation, so two instances sharing a case value's node would
+       fight over its type. */
+    if (st->narms > 0) {
+        n->arms = arena_alloc(&g_arena, sizeof(SwitchArm) * (size_t)st->narms);
+        for (int a = 0; a < st->narms; a++) {
+            n->arms[a] = st->arms[a];
+            n->arms[a].values = st->arms[a].nvalues
+                ? arena_alloc(&g_arena, sizeof(Expr *) * (size_t)st->arms[a].nvalues) : NULL;
+            for (int j = 0; j < st->arms[a].nvalues; j++)
+                n->arms[a].values[j] = clone_expr(st->arms[a].values[j], s, mod);
+            n->arms[a].body = clone_stmt_list(st->arms[a].body, st->arms[a].nbody, s, mod);
+        }
+    }
     return n;
 }
 
@@ -830,6 +858,57 @@ static void drain_pending(void) {
     }
 }
 
+/* ---- cross-module instantiation: what the defining module's header can spell
+ *
+ * A generic instance is emitted into the module that declared the generic, so
+ * its header spells the instance's field and signature types. A class is always
+ * a pointer in C and gets a forward typedef there (emit.c, emit_fwd_class), so
+ * a class type argument from any module is fine. A *struct* is by value and
+ * needs its complete definition, which the header only has if that module is
+ * already reachable through the imports it includes. Otherwise there is no
+ * legal include to add -- the user module includes ours, so ours including the
+ * user module's header is a cycle. Reject with the reason, not a C error.
+ *
+ * The rule deliberately keys on what reaches the *header*, not on "any foreign
+ * struct anywhere": sort_by<Point>(arr: T[], cmp) spells only pointer types in
+ * its signature and works, while binary_search<Point>(arr, key: T, cmp) takes
+ * T by value and cannot. */
+
+static bool mod_reaches(Module *from, Module *target, Module **seen, int *nseen, int depth) {
+    if (from == target) return true;
+    if (depth > 64) return false;
+    for (int i = 0; i < *nseen; i++) if (seen[i] == from) return false;
+    if (*nseen < 512) seen[(*nseen)++] = from;
+    for (int i = 0; i < from->ndecls; i++)
+        if (from->decls[i]->kind == D_IMPORT && from->decls[i]->import_module &&
+            mod_reaches(from->decls[i]->import_module, target, seen, nseen, depth + 1))
+            return true;
+    return false;
+}
+
+static void reject_foreign_struct(Module *decl_mod, Type *t, const char *what,
+                                  const char *name, Loc use) {
+    if (!t || t->kind != TY_STRUCT || !t->sdecl || t->sdecl->is_extern) return;
+    if (t->sdecl->module == decl_mod) return;
+    Module *seen[512];
+    int nseen = 0;
+    if (mod_reaches(decl_mod, t->sdecl->module, seen, &nseen, 0)) return;
+    fatal_at(use,
+             "generic %s '%s' is defined in module '%s' and cannot be instantiated with "
+             "struct '%s' from module '%s': a struct is a value type, so '%s' would need "
+             "the definition from '%s' (use a class, or move the generic into '%s')",
+             what, name, decl_mod->name, t->sdecl->name, t->sdecl->module->name,
+             decl_mod->name, t->sdecl->module->name, t->sdecl->module->name);
+}
+
+static void reject_foreign_sig(Module *decl_mod, FnDecl *fd, const char *what,
+                               const char *name, Loc use) {
+    if (!fd) return;
+    for (int i = 0; i < fd->nparams; i++)
+        reject_foreign_struct(decl_mod, fd->params[i].type, what, name, use);
+    reject_foreign_struct(decl_mod, fd->ret, what, name, use);
+}
+
 static FnDecl *instantiate_fn(FnDecl *g, Type **args, int nargs, Loc use) {
     for (FnDecl *it = g->next_inst; it; it = it->next_inst) {
         bool same = true;
@@ -848,6 +927,7 @@ static FnDecl *instantiate_fn(FnDecl *g, Type **args, int nargs, Loc use) {
     inst->next_inst = g->next_inst;
     g->next_inst = inst;
     resolve_fn_sig(inst, g->module);
+    reject_foreign_sig(g->module, inst, "function", g->name, use);
     Decl *d = NEW(Decl);
     d->kind = D_FN; d->loc = g->loc; d->name = g->name; d->module = g->module; d->fn = inst;
     inst->inst_decl = d;
@@ -895,9 +975,11 @@ static StructDecl *instantiate_struct(StructDecl *g, Type **args, int nargs, Loc
         if (type_is_ref(ft) || ft->kind == TY_VOID)
             fatal_at(use, "field '%s' of '%s' is a reference type; struct fields must be "
                           "value types (use a class)", inst->fields[f].name, inst->name);
+        reject_foreign_struct(g->module, ft, "struct", g->name, use);
     }
     for (int mi = 0; mi < inst->nmethods; mi++) {
         resolve_fn_sig(inst->methods[mi], g->module);
+        reject_foreign_sig(g->module, inst->methods[mi], "struct", g->name, use);
         enqueue_body(inst->methods[mi], NULL, g->module);
     }
     g_generic_depth--;
@@ -953,9 +1035,16 @@ static ClassDecl *instantiate_class(ClassDecl *g, Type **args, int nargs, Loc us
         resolve_type(inst->fields[f].type, g->module);
         if (inst->fields[f].type->kind == TY_VOID)
             fatal_at(inst->fields[f].loc, "field cannot be void");
+        reject_foreign_struct(g->module, inst->fields[f].type, "class", g->name, use);
     }
-    for (int mi = 0; mi < inst->nmethods; mi++) resolve_fn_sig(inst->methods[mi], g->module);
-    if (inst->ctor) resolve_fn_sig(inst->ctor, g->module);
+    for (int mi = 0; mi < inst->nmethods; mi++) {
+        resolve_fn_sig(inst->methods[mi], g->module);
+        reject_foreign_sig(g->module, inst->methods[mi], "class", g->name, use);
+    }
+    if (inst->ctor) {
+        resolve_fn_sig(inst->ctor, g->module);
+        reject_foreign_sig(g->module, inst->ctor, "class", g->name, use);
+    }
     layout_class(inst);
     /* enqueue instance bodies (methods, ctor, synthetic deinit) */
     for (int mi = 0; mi < inst->nmethods; mi++) enqueue_body(inst->methods[mi], inst, g->module);
@@ -2247,6 +2336,188 @@ static Type *check_expr(Ctx *c, Expr *e, Type *expected) {
 
 /* ---------------- statements ---------------- */
 
+/* ---- for-in over a user container ---------------------------------------
+ *
+ * `for (let x in c)` where c is a class with `fn len(): int` and
+ * `fn at(i: int): T` desugars to the index loop you would have written:
+ *
+ *     for (let $i in 0..$c.len()) { let x = $c.at($i); ... }
+ *
+ * Name-based, like `init` and `deinit` -- there is no iterator interface to
+ * declare and nothing new at runtime. The methods may be plain (the C compiler
+ * inlines them at -O2) or virtual (one indirect call, which the author opted
+ * into by writing `virtual`).
+ *
+ * The positional accessor is `at`, not `get`, deliberately: `get` is the
+ * natural name for an associative lookup, and a HashMap<int, V> would then
+ * match this shape structurally and silently iterate get(0)..get(len-1) as if
+ * those were keys. `at` cannot be mistaken for that, and matches vt_arr_at.
+ *
+ * Rather than hand-rolling method-call emission, this builds real AST for the
+ * two calls and runs the ordinary checker over it: resolution, arena rules and
+ * virtual dispatch all fall out unchanged. */
+
+static Local *hidden_local(Ctx *c, const char *name, Type *t, const char *prefix, Loc loc) {
+    Local *l = define_local(c, intern(name), t, false, loc);
+    /* define_local would build `l_$c_1`, which is not a C identifier. The
+       interned Vyto-side name keeps the `$` so no source can collide with it --
+       lex.c rejects `$` outright. */
+    l->cname = arena_printf(&g_arena, "%s%d", prefix, ++c->local_counter);
+    return l;
+}
+
+static Expr *mk_expr(ExprKind k, Loc loc) {
+    Expr *e = NEW(Expr);
+    e->kind = k;
+    e->loc = loc;
+    return e;
+}
+
+/* `<recv>.<name>(<args...>)` */
+static Expr *mk_method_call(const char *recv, const char *name, Expr **args, int nargs, Loc loc) {
+    Expr *r = mk_expr(EX_IDENT, loc);
+    r->name = intern(recv);
+    Expr *m = mk_expr(EX_MEMBER, loc);
+    m->lhs = r;
+    m->name = intern(name);
+    Expr *call = mk_expr(EX_CALL, loc);
+    call->lhs = m;
+    call->args = args;
+    call->nargs = nargs;
+    return call;
+}
+
+static void check_for_iter(Ctx *c, Stmt *s, Type *t) {
+    ClassDecl *cd = t->cdecl;
+    FnDecl *len = class_find_method(cd, intern("len"));
+    FnDecl *at = class_find_method(cd, intern("at"));
+    if (!len && !at)
+        fatal_at(s->iter->loc, "class %s cannot be iterated: for-in needs both "
+                               "'fn len(): int' and 'fn at(i: int): T'", cd->name);
+    if (!at)
+        fatal_at(s->iter->loc, "class %s has 'len' but no 'at': for-in needs "
+                               "'fn at(i: int): T'", cd->name);
+    if (!len)
+        fatal_at(s->iter->loc, "class %s has 'at' but no 'len': for-in needs "
+                               "'fn len(): int'", cd->name);
+    if (len->nparams != 0 || len->is_builder || norm_kind(len->ret->kind) != TY_INT)
+        fatal_at(s->iter->loc, "class %s cannot be iterated: 'len' must take no "
+                               "arguments and return int", cd->name);
+    if (at->nparams != 1 || at->is_builder || norm_kind(at->params[0].type->kind) != TY_INT ||
+        at->ret->kind == TY_VOID)
+        fatal_at(s->iter->loc, "class %s cannot be iterated: 'at' must take one int "
+                               "argument and return a value", cd->name);
+
+    c->loop_depth++;
+    scope_push(c);
+    /* The container is evaluated once and held for the whole loop. */
+    s->iter_local = hidden_local(c, "$c", t, "_fc", s->loc);
+    s->iter_local->region = region_of(s->iter);
+    s->index_local = hidden_local(c, "$i", ty_int(), "_fi", s->loc);
+
+    s->len_call = mk_method_call("$c", "len", NULL, 0, s->loc);
+    check_expr(c, s->len_call, ty_int());
+
+    Expr **args = arena_alloc(&g_arena, sizeof(Expr *));
+    args[0] = mk_expr(EX_IDENT, s->loc);
+    args[0]->name = intern("$i");
+    s->at_call = mk_method_call("$c", "at", args, 1, s->loc);
+    Type *et = check_expr(c, s->at_call, NULL);
+
+    s->local = define_local(c, s->name, et, false, s->loc);
+    s->kind = ST_FOR_ITER;
+    check_block(c, s->body, s->nbody);
+    scope_pop(c);
+    c->loop_depth--;
+}
+
+/* ---- switch ---------------------------------------------------------------
+ *
+ * `switch (e) { case A: {…} case B, C: {…} default: {…} }` over an int-family
+ * or string subject. No fallthrough, no arm-terminating break, no
+ * exhaustiveness check, no binding — this is a jump table for the `kind: int`
+ * tagged-class idiom that vyto/util/json, xml and markdown all hand-roll as
+ * if/else-if chains, not pattern matching.
+ *
+ * Case values must be compile-time constants, which is what lets the int form
+ * emit a real C switch. */
+
+/* The string literal behind a case value: an EX_STR, or a const that folds to
+   one. String consts are deliberately never folded (they stay EX_IDENT), so
+   this reaches through by hand. Returns false when it is neither. */
+static bool case_str(Ctx *c, Expr *e, const char **sval, size_t *slen) {
+    if (e->kind == EX_STR) { *sval = e->sval; *slen = e->slen; return true; }
+    if (e->kind == EX_IDENT && e->ref == REF_CONST) {
+        Decl *d = mod_lookup(c->mod, e->name);
+        if (d && d->kind == D_CONST && d->const_init && d->const_init->kind == EX_STR) {
+            *sval = d->const_init->sval;
+            *slen = d->const_init->slen;
+            return true;
+        }
+    }
+    return false;
+}
+
+static void check_switch(Ctx *c, Stmt *s) {
+    Type *t = check_expr(c, s->expr, NULL);
+    bool is_str = t->kind == TY_STRING;
+    if (t->kind == TY_BOOL) fatal_at(s->expr->loc, "switch on a bool: use if/else");
+    if (!is_str && !type_is_int(t))
+        fatal_at(s->expr->loc, "switch needs an int or a string (got %s)", type_str(t));
+    if (s->narms == 0) fatal_at(s->loc, "switch has no arms");
+
+    /* Values are folded and recorded here so duplicates can be compared and the
+       emitter can spell a label without re-deriving anything. */
+    int total = 0;
+    for (int a = 0; a < s->narms; a++) total += s->arms[a].nvalues;
+    int64_t *ints = arena_alloc(&g_arena, sizeof(int64_t) * (size_t)(total ? total : 1));
+    const char **strs = arena_alloc(&g_arena, sizeof(char *) * (size_t)(total ? total : 1));
+    size_t *slens = arena_alloc(&g_arena, sizeof(size_t) * (size_t)(total ? total : 1));
+    int nseen = 0;
+    bool seen_default = false;
+
+    for (int a = 0; a < s->narms; a++) {
+        SwitchArm *arm = &s->arms[a];
+        if (arm->is_default) {
+            if (seen_default) fatal_at(arm->loc, "switch already has a default arm");
+            seen_default = true;
+        }
+        for (int j = 0; j < arm->nvalues; j++) {
+            Expr *v = arm->values[j];
+            check_expr(c, v, t);
+            want(c, v, t, "case");
+            if (is_str) {
+                const char *sv; size_t sl;
+                if (!case_str(c, v, &sv, &sl))
+                    fatal_at(v->loc, "case value must be a string literal or a string constant");
+                for (int k = 0; k < nseen; k++)
+                    if (slens[k] == sl && memcmp(strs[k], sv, sl) == 0)
+                        fatal_at(v->loc, "duplicate case value \"%.*s\"", (int)sl, sv);
+                strs[nseen] = sv; slens[nseen] = sl; nseen++;
+            } else {
+                const char *save = g_fold_what;
+                g_fold_what = "case value";
+                CVal cv = fold_const_expr(c->mod, v);
+                g_fold_what = save;
+                if (cv.kind != 0) fatal_at(v->loc, "case value must be an integer constant");
+                for (int k = 0; k < nseen; k++)
+                    if (ints[k] == cv.i)
+                        fatal_at(v->loc, "duplicate case value %lld", (long long)cv.i);
+                ints[nseen++] = cv.i;
+                /* Rewrite to a bare literal so the emitter spells the C label
+                   straight from the node, exactly as fold_const_decl does. */
+                v->kind = EX_INT;
+                v->ival = cv.i;
+            }
+        }
+        /* Each arm is its own scope; `break` still targets the enclosing loop,
+           so loop_depth is deliberately untouched. */
+        scope_push(c);
+        check_block(c, arm->body, arm->nbody);
+        scope_pop(c);
+    }
+}
+
 static void check_stmt(Ctx *c, Stmt *s) {
     switch (s->kind) {
     case ST_LET: {
@@ -2305,7 +2576,10 @@ static void check_stmt(Ctx *c, Stmt *s) {
         return;
     case ST_FOR_EACH: {
         Type *t = check_expr(c, s->iter, NULL);
-        if (t->kind != TY_ARRAY) fatal_at(s->iter->loc, "for-in needs an array");
+        if (t->kind == TY_CLASS) { check_for_iter(c, s, t); return; }
+        if (t->kind != TY_ARRAY)
+            fatal_at(s->iter->loc, "for-in needs an array, or a class with "
+                                   "'fn len(): int' and 'fn at(i: int): T'");
         c->loop_depth++;
         scope_push(c);
         s->local = define_local(c, s->name, t->elem, false, s->loc);
@@ -2335,6 +2609,11 @@ static void check_stmt(Ctx *c, Stmt *s) {
             fatal_at(s->loc, "missing return value");
         }
         return;
+    case ST_FOR_ITER:
+        /* Never reached: check_for_iter rewrites ST_FOR_EACH into this after
+           checking the whole loop, and a statement is checked exactly once. */
+        return;
+    case ST_SWITCH: check_switch(c, s); return;
     case ST_BREAK: case ST_CONTINUE:
         if (!c->loop_depth) fatal_at(s->loc, "break/continue outside a loop");
         /* a break/continue that would jump out of an arena block (the loop it
@@ -2397,6 +2676,14 @@ static bool block_has_break(Stmt **body, int n) {
         case ST_ARENA:
             if (block_has_break(s->body, s->nbody)) return true;
             break;
+        case ST_SWITCH:
+            /* A `break` in an arm targets the enclosing *loop* — a switch is
+               not a break target in Vyto. Missing this would let
+               `while (true) { switch (x) { case 1: { break; } } }` look like an
+               infinite loop and silently accept a function with no return. */
+            for (int a = 0; a < s->narms; a++)
+                if (block_has_break(s->arms[a].body, s->arms[a].nbody)) return true;
+            break;
         default: break; /* nested loops own their breaks */
         }
     }
@@ -2418,6 +2705,17 @@ static bool stmt_returns(Stmt *s) {
     case ST_WHILE: /* while(true) with no break never falls through */
         return s->expr->kind == EX_BOOL && s->expr->ival &&
                !block_has_break(s->body, s->nbody);
+    case ST_SWITCH: {
+        /* A switch guarantees a return only with a default arm and every arm
+           returning — there is no exhaustiveness check, so a subject value
+           matching nothing must be assumed possible. */
+        bool has_default = false;
+        for (int a = 0; a < s->narms; a++) {
+            if (s->arms[a].is_default) has_default = true;
+            if (!stmts_return(s->arms[a].body, s->arms[a].nbody)) return false;
+        }
+        return has_default;
+    }
     default: return false;
     }
 }
@@ -2464,9 +2762,6 @@ static void check_fn_body(Module *m, FnDecl *fd, ClassDecl *cls) {
     require_returns(fd);
 }
 
-/* Compile-time constant value: kind 0=int, 1=float, 2=bool. */
-typedef struct { int kind; int64_t i; double f; bool b; } CVal;
-
 static CVal fold_const_decl(Decl *d);
 
 static CVal fold_const_expr(Module *m, Expr *e) {
@@ -2477,7 +2772,7 @@ static CVal fold_const_expr(Module *m, Expr *e) {
     case EX_IDENT: {
         Decl *d = mod_lookup(m, e->name);
         if (!d || d->kind != D_CONST)
-            fatal_at(e->loc, "const initializer may only reference other constants");
+            fatal_at(e->loc, "%s may only reference constants", g_fold_what);
         return fold_const_decl(d);
     }
     case EX_UN: {
@@ -2554,7 +2849,7 @@ static CVal fold_const_expr(Module *m, Expr *e) {
         return (CVal){0, r, 0, false};
     }
     default:
-        fatal_at(e->loc, "const initializer must be a constant expression");
+        fatal_at(e->loc, "%s must be a constant expression", g_fold_what);
     }
 }
 

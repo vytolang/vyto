@@ -217,12 +217,24 @@ the JIT cannot run it falls back to PCRE2's interpreter with identical results.
 prerequisite `vyto/gfx` has.
 
 **Networking**: `vyto/net/socket` builds on Winsock2 (`ws2_32`, linked
-conditionally), covering TCP, UDP and `PollSet`.
+conditionally), covering TCP, UDP and `PollSet`. `vyto/net/http` and
+`vyto/net/websocket` build too, against the prebuilt `libcurl-x64.dll` in
+`lib/vyto/net/native/windows-x64/` — the ordinary prebuilt-native-package path,
+so `vytoc` copies the DLL next to your executable. One caveat that is not
+Vyto's: that DLL imports `api-ms-win-crt-*`, so it needs the Universal CRT.
+Windows 10 and later ship it; Windows 7 needs KB2999226.
 
-**Not portable**, and excluded from the Windows suite: `vyto/net/http` and
-`vyto/net/websocket` (libcurl), `vyto/net/link`, `wifi` and `raw` (Linux
-netlink/AF_PACKET), `vyto/os/worker` (`fork` + `socketpair`), all of `vyto/hw/*`
-(Linux device interfaces), and `vyto/intl` (ICU).
+**Parallelism**: `vyto/os/worker` builds, but it is a **re-exec pool rather than
+`fork()`** — Windows has no `fork`. Workers are the same executable relaunched
+with `VYTO_WORKER_*` in the environment, re-running `main` until they reach
+`new WorkerPool(...)` and divert into serve mode, over a loopback socket with a
+`BCryptGenRandom` token handshake. The consequence is real and worth designing
+around: **anything `main()` does before it builds the pool runs once per
+worker.** Keep setup that must happen once behind the pool's construction.
+
+**Not portable**, and excluded from the Windows suite: `vyto/net/link`, `wifi`
+and `raw` (Linux netlink/AF_PACKET), all of `vyto/hw/*` (Linux device
+interfaces), and `vyto/intl` (ICU).
 
 Three Windows-specific behaviours worth knowing: `vyto/os`'s `run()` and
 `capture()` go through `cmd.exe`, not a POSIX shell, so shell built-ins differ;

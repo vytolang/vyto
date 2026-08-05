@@ -568,6 +568,48 @@ static Stmt *parse_stmt(Parser *p) {
         s->init = parse_expr(p);
         expect(p, T_SEMI);
         return s;
+    case T_SWITCH: {
+        /* switch (e) { case A: {…} case B, C: {…} default: {…} }
+         *
+         * Colon form, braces mandatory (parse_block enforces that), no
+         * fallthrough and no arm-terminating break. The `=>` arm form some
+         * languages use is deliberately not accepted: looks_like_arrow fires on
+         * `(` IDENT `)` `=>`, so `case (A) => {…}` would silently parse as an
+         * arrow closure. */
+        s = new_stmt(p, ST_SWITCH);
+        advance(p);
+        expect(p, T_LPAREN);
+        s->expr = parse_expr(p);
+        expect(p, T_RPAREN);
+        expect(p, T_LBRACE);
+        PtrVec arms = {0};
+        while (cur(p) != T_RBRACE) {
+            SwitchArm *arm = NEW(SwitchArm);
+            arm->loc = ploc(p);
+            if (accept(p, T_DEFAULT)) {
+                arm->is_default = true;
+            } else {
+                expect(p, T_CASE);
+                PtrVec vals = {0};
+                do { pv_push(&vals, parse_expr(p)); } while (accept(p, T_COMMA));
+                arm->nvalues = vals.len;
+                arm->values = (Expr **)vals.items;
+            }
+            expect(p, T_COLON);
+            /* `case 1: case 2: {…}` is C's stacked-label spelling, which only
+               means anything with fallthrough. The comma form replaces it. */
+            if (cur(p) == T_CASE || cur(p) == T_DEFAULT)
+                fatal_at(ploc(p), "a switch arm needs a body; write 'case a, b:' "
+                                  "to share one (there is no fallthrough)");
+            arm->body = parse_block(p, &arm->nbody);
+            pv_push(&arms, arm);
+        }
+        expect(p, T_RBRACE);
+        s->narms = arms.len;
+        s->arms = arena_alloc(&g_arena, sizeof(SwitchArm) * (size_t)(arms.len ? arms.len : 1));
+        for (int i = 0; i < arms.len; i++) s->arms[i] = *(SwitchArm *)arms.items[i];
+        return s;
+    }
     case T_IF: {
         s = new_stmt(p, ST_IF);
         advance(p);

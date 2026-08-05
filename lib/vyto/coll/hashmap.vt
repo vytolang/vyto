@@ -1,0 +1,226 @@
+// vyto/coll/hashmap — an open-addressed hash table with keys of any type.
+//
+//     let m = hashmap_int_str(64);
+//     m.put(42, "answer");
+//     if (m.has(42)) { print(m.get(42)); }
+//
+//     let by_node = new HashMap<Node, int>(64, null, 0,
+//                                          (k) => hash_int(k.id),
+//                                          (a, b) => a.id == b.id);
+//
+// The builtin `Map` is string-keyed only (`Map<string, V>`), which is a hard
+// limit in the language, not a library choice. This is the way to key on an
+// int, a struct's id, a pair, or your own class.
+//
+// ── HOW IT DIFFERS FROM THE BUILTIN `Map` ────────────────────────────────────
+//   • Any key type, via an explicit `hash` and `eq`.
+//   • Open addressing with linear probing, not separate chaining: keys, values
+//     and occupancy are three flat arrays, so a lookup is one cache line rather
+//     than a pointer chase per collision. The builtin Map allows an average
+//     chain depth of 4 before it grows; this grows at 0.75 load.
+//   • `get` on a missing key panics (same as `Map.get`), `get_or` does not.
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Deletion is backward-shift, not tombstones: on removal the following run is
+// walked and any element whose ideal slot lies at or before the hole is moved
+// back into it. That keeps every probe sequence contiguous, so a table that is
+// heavily churned never degrades — which is exactly what a tombstoned table
+// does, silently, until every lookup scans the whole run.
+//
+// `hash` may return any int, positive or negative; only the low bits are used.
+// vyto/hash's `hash_int` / `hash_str` / `hash_combine` are the intended source.
+// Use `siphash24` with a per-process key when the keys come from the network.
+
+import { next_pow2 } from "vyto/coll/util";
+import { hash_int, hash_str } from "vyto/hash";
+
+const SLOT_EMPTY: int = 0;
+const SLOT_FULL:  int = 1;
+
+export class HashMap<K, V> {
+    keys: K[];
+    vals: V[];
+    state: byte[];
+    zk: K;
+    zv: V;
+    hash: fn(K): int;
+    eq: fn(K, K): bool;
+    count: int;
+    mask: int;
+
+    fn init(cap: int, zk: K, zv: V, hash: fn(K): int, eq: fn(K, K): bool) {
+        // Size for `cap` entries at a 0.75 load, so a caller who sized the map
+        // correctly never rehashes.
+        let n = next_pow2(cap * 4 / 3 + 1);
+        this.zk = zk;
+        this.zv = zv;
+        this.hash = hash;
+        this.eq = eq;
+        this.count = 0;
+        this.mask = n - 1;
+        this.alloc(n);
+    }
+
+    fn len(): int { return this.count; }
+    fn is_empty(): bool { return this.count == 0; }
+
+    fn has(k: K): bool { return this.find(k) >= 0; }
+
+    // Panics on a missing key, matching the builtin `Map.get`. Reach for
+    // `get_or` when absence is normal.
+    fn get(k: K): V {
+        let i = this.find(k);
+        if (i < 0) { panic("HashMap.get: key not present"); }
+        return this.vals[i];
+    }
+
+    fn get_or(k: K, dflt: V): V {
+        let i = this.find(k);
+        if (i < 0) { return dflt; }
+        return this.vals[i];
+    }
+
+    // Insert or overwrite. Returns true when the key was new.
+    fn put(k: K, v: V): bool {
+        if ((this.count + 1) * 4 > (this.mask + 1) * 3) { this.grow(); }
+        let i = this.slot_for(k);
+        if (this.state[i] == SLOT_FULL as byte) {
+            this.vals[i] = v;
+            return false;
+        }
+        this.state[i] = SLOT_FULL as byte;
+        this.keys[i] = k;
+        this.vals[i] = v;
+        this.count += 1;
+        return true;
+    }
+
+    // Remove. Returns true when the key was present.
+    fn remove(k: K): bool {
+        let i = this.find(k);
+        if (i < 0) { return false; }
+        this.count -= 1;
+        // Backward shift. `hole` is the slot being vacated; walk the run after
+        // it and pull back any element that would become unreachable, i.e. one
+        // whose ideal slot is NOT cyclically in (hole, j].
+        let hole = i;
+        let j = i;
+        while (true) {
+            j = (j + 1) & this.mask;
+            if (this.state[j] == SLOT_EMPTY as byte) { break; }
+            let ideal = this.hash(this.keys[j]) & this.mask;
+            let protected_run = false;
+            if (hole <= j) { protected_run = hole < ideal && ideal <= j; }
+            else           { protected_run = hole < ideal || ideal <= j; }
+            if (!protected_run) {
+                this.keys[hole] = this.keys[j];
+                this.vals[hole] = this.vals[j];
+                hole = j;
+            }
+        }
+        this.state[hole] = SLOT_EMPTY as byte;
+        this.keys[hole] = this.zk;
+        this.vals[hole] = this.zv;
+        return true;
+    }
+
+    fn clear() {
+        for (let i in 0..(this.mask + 1)) {
+            this.state[i] = SLOT_EMPTY as byte;
+            this.keys[i] = this.zk;
+            this.vals[i] = this.zv;
+        }
+        this.count = 0;
+    }
+
+    // Snapshot of the keys. Slot order, which is unspecified and changes on
+    // rehash — the same guarantee (none) the builtin Map gives.
+    fn keyList(): K[] {
+        let out: K[] = [];
+        out.reserve(this.count);
+        for (let i in 0..(this.mask + 1)) {
+            if (this.state[i] == SLOT_FULL as byte) { out.push(this.keys[i]); }
+        }
+        return out;
+    }
+
+    fn valueList(): V[] {
+        let out: V[] = [];
+        out.reserve(this.count);
+        for (let i in 0..(this.mask + 1)) {
+            if (this.state[i] == SLOT_FULL as byte) { out.push(this.vals[i]); }
+        }
+        return out;
+    }
+
+    // Slot of `k`, or -1. The probe stops at the first empty slot, which is
+    // sound precisely because deletion never leaves a gap in a run.
+    fn find(k: K): int {
+        let i = this.hash(k) & this.mask;
+        while (this.state[i] != SLOT_EMPTY as byte) {
+            if (this.eq(this.keys[i], k)) { return i; }
+            i = (i + 1) & this.mask;
+        }
+        return -1;
+    }
+
+    // Slot holding `k`, or the first empty slot where it belongs.
+    fn slot_for(k: K): int {
+        let i = this.hash(k) & this.mask;
+        while (this.state[i] != SLOT_EMPTY as byte) {
+            if (this.eq(this.keys[i], k)) { return i; }
+            i = (i + 1) & this.mask;
+        }
+        return i;
+    }
+
+    fn alloc(n: int) {
+        this.keys = [];
+        this.vals = [];
+        this.keys.reserve(n);
+        this.vals.reserve(n);
+        for (let i in 0..n) { this.keys.push(this.zk); this.vals.push(this.zv); }
+        this.state = bytes(n);   // bytes() is zeroed, i.e. all SLOT_EMPTY
+    }
+
+    fn grow() {
+        let ok = this.keys;
+        let ov = this.vals;
+        let os = this.state;
+        let on = this.mask + 1;
+        this.mask = on * 2 - 1;
+        this.alloc(on * 2);
+        this.count = 0;
+        for (let i in 0..on) {
+            if (os[i] == SLOT_FULL as byte) {
+                let s = this.slot_for(ok[i]);
+                this.state[s] = SLOT_FULL as byte;
+                this.keys[s] = ok[i];
+                this.vals[s] = ov[i];
+                this.count += 1;
+            }
+        }
+    }
+}
+
+// ---- factories for the common key types -------------------------------------
+//
+// One per key type rather than a bound on K, the same shape as
+// vyto/reactive's sig_int / sig_str. Each bakes in the natural hash and
+// equality so a caller who does not need a custom key never writes one.
+
+export fn hashmap_int_int(cap: int): HashMap<int, int> {
+    return new HashMap<int, int>(cap, 0, 0, (k) => hash_int(k), (a, b) => a == b);
+}
+export fn hashmap_int_str(cap: int): HashMap<int, string> {
+    return new HashMap<int, string>(cap, 0, null, (k) => hash_int(k), (a, b) => a == b);
+}
+export fn hashmap_str_int(cap: int): HashMap<string, int> {
+    return new HashMap<string, int>(cap, null, 0, (k) => hash_str(k), (a, b) => a == b);
+}
+export fn hashmap_str_str(cap: int): HashMap<string, string> {
+    return new HashMap<string, string>(cap, null, null, (k) => hash_str(k), (a, b) => a == b);
+}
+export fn hashmap_str_float(cap: int): HashMap<string, float> {
+    return new HashMap<string, float>(cap, null, 0.0, (k) => hash_str(k), (a, b) => a == b);
+}

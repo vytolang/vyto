@@ -30,6 +30,7 @@
 // state reconstructible.
 
 import { PollSet, POLL_READ } from "vyto/net/socket";
+import { Deque } from "vyto/coll/deque";
 
 // Worker processes are spawned by re-launching this executable on Windows, and
 // they connect back over a loopback socket.
@@ -60,8 +61,11 @@ export class WorkerPool {
     pids: int[];        // child pids, for reaping
     busy: bool[];       // worker i currently running a job
     ticketOf: int[];    // worker i -> its running ticket (-1 when idle)
-    pending: byte[][];  // backlog inputs when all workers are busy
-    pendingTk: int[];   // tickets parallel to `pending`
+    // Backlog for when every worker is busy. Deques rather than arrays because
+    // this is a FIFO: `remove_at(0)` on an array shifts every remaining entry,
+    // so draining a backlog of n jobs was O(n^2). The two move in lockstep.
+    pending: Deque<byte[]>;    // backlog inputs
+    pendingTk: Deque<int>;     // their tickets
     nextTicket: int;
     ps: PollSet;        // internal loop for map/poll convenience
 
@@ -70,8 +74,8 @@ export class WorkerPool {
         this.pids = [];
         this.busy = [];
         this.ticketOf = [];
-        this.pending = [];
-        this.pendingTk = [];
+        this.pending = new Deque<byte[]>(16, null);
+        this.pendingTk = new Deque<int>(16, 0);
         this.nextTicket = 0;
         this.ps = new PollSet();
 
@@ -185,7 +189,7 @@ export class WorkerPool {
     }
 
     fn size(): int { return this.fds.len; }
-    fn pendingCount(): int { return this.pending.len; }
+    fn pendingCount(): int { return this.pending.len(); }
 
     fn dispatch(w: int, tk: int, input: byte[]) {
         this.busy[w] = true;
@@ -204,9 +208,9 @@ export class WorkerPool {
         this.ticketOf.remove_at(w);
     }
     fn drainOne(w: int) {
-        if (this.pending.len > 0) {
-            let inp = this.pending.remove_at(0);
-            let tk = this.pendingTk.remove_at(0);
+        if (!this.pending.is_empty()) {
+            let inp = this.pending.pop_front();
+            let tk = this.pendingTk.pop_front();
             this.dispatch(w, tk, inp);
         }
     }

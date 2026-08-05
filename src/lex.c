@@ -12,6 +12,7 @@ static const struct { const char *name; TokKind kind; } keywords[] = {
     {"break", T_BREAK}, {"continue", T_CONTINUE}, {"true", T_TRUE},
     {"false", T_FALSE}, {"null", T_NULL}, {"this", T_THIS}, {"as", T_AS},
     {"super", T_SUPER}, {"Map", T_MAP}, {"builder", T_BUILDER}, {"arena", T_ARENA},
+    {"switch", T_SWITCH}, {"case", T_CASE}, {"default", T_DEFAULT},
 };
 
 void lex_init(Lexer *lx, const char *file, const char *src) {

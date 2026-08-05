@@ -1,0 +1,140 @@
+// vyto/coll/deque — a double-ended queue over one ring buffer.
+//
+//     let q = new Deque<Task>(16, null);
+//     q.push(t);            q.push_front(t);
+//     let a = q.pop();      let b = q.pop_front();
+//     for (let t in q) { ... }
+//
+// The reason this exists: a `T[]` used as a queue dequeues with `remove_at(0)`,
+// which shifts every remaining element down. That is O(n) per dequeue and O(n²)
+// to drain — and it is what `vyto/reactive`'s flush loop and `vyto/os/worker`'s
+// backlog both do today. A ring makes both ends O(1) with one allocation.
+//
+// ── THE `zero` ARGUMENT ──────────────────────────────────────────────────────
+// Every container here takes a `zero: T` alongside its capacity. Vyto generics
+// have no bounds and no notion of a default value for `T`, so a ring buffer
+// cannot materialise its own empty slots — and it needs real slots, because it
+// writes at an index rather than pushing. `zero` is what an emptied slot is set
+// to: pass `null` for a class or string, `0` for a number, `false` for a bool.
+//
+// It is not decoration. Storing it is what lets `pop()` clear the vacated slot,
+// and clearing the slot is what stops a popped object living until the ring
+// wraps around to overwrite it. Use the `deque_int`/`deque_str` factories to
+// avoid writing it for the common primitives.
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Capacity is a power of two, so the wrap is a mask, not a modulo. The buffer is
+// never shrunk automatically: a queue that peaks at 10k and settles at 10 keeps
+// its slots on the assumption it will peak again. Call `compact()` if not.
+
+import { next_pow2 } from "vyto/coll/util";
+
+export class Deque<T> {
+    buf: T[];        // capacity slots; element k lives at (head + k) & mask
+    zero: T;
+    head: int;
+    count: int;
+    mask: int;
+
+    // `cap` is a hint, rounded up to a power of two with a floor of 8.
+    fn init(cap: int, zero: T) {
+        let n = next_pow2(cap);
+        this.zero = zero;
+        this.buf = [];
+        this.buf.reserve(n);
+        for (let i in 0..n) { this.buf.push(zero); }
+        this.head = 0;
+        this.count = 0;
+        this.mask = n - 1;
+    }
+
+    fn len(): int { return this.count; }
+    fn is_empty(): bool { return this.count == 0; }
+    fn cap(): int { return this.mask + 1; }
+
+    // The i'th element from the front. Panics outside [0, len), like `a[i]`.
+    fn at(i: int): T {
+        if (i < 0 || i >= this.count) { panic("Deque.at: index out of range"); }
+        return this.buf[(this.head + i) & this.mask];
+    }
+
+    fn set(i: int, v: T) {
+        if (i < 0 || i >= this.count) { panic("Deque.set: index out of range"); }
+        this.buf[(this.head + i) & this.mask] = v;
+    }
+
+    fn first(): T { return this.at(0); }
+    fn last(): T { return this.at(this.count - 1); }
+
+    fn push(v: T) {
+        if (this.count == this.mask + 1) { this.grow(); }
+        this.buf[(this.head + this.count) & this.mask] = v;
+        this.count += 1;
+    }
+
+    fn push_front(v: T) {
+        if (this.count == this.mask + 1) { this.grow(); }
+        this.head = (this.head - 1) & this.mask;
+        this.buf[this.head] = v;
+        this.count += 1;
+    }
+
+    // Remove and return the back. Panics when empty, the same contract as the
+    // `pop()` builtin on an array.
+    fn pop(): T {
+        if (this.count == 0) { panic("Deque.pop: empty"); }
+        let i = (this.head + this.count - 1) & this.mask;
+        let v = this.buf[i];
+        this.buf[i] = this.zero;   // a stale slot would hold the object alive
+        this.count -= 1;
+        return v;
+    }
+
+    fn pop_front(): T {
+        if (this.count == 0) { panic("Deque.pop_front: empty"); }
+        let v = this.buf[this.head];
+        this.buf[this.head] = this.zero;
+        this.head = (this.head + 1) & this.mask;
+        this.count -= 1;
+        return v;
+    }
+
+    fn clear() {
+        for (let i in 0..this.count) { this.buf[(this.head + i) & this.mask] = this.zero; }
+        this.head = 0;
+        this.count = 0;
+    }
+
+    // Snapshot in front-to-back order. Allocates; `for-in` does not.
+    fn toArray(): T[] {
+        let out: T[] = [];
+        out.reserve(this.count);
+        for (let i in 0..this.count) { out.push(this.buf[(this.head + i) & this.mask]); }
+        return out;
+    }
+
+    // Shrink the backing buffer to fit. Only worth calling after a peak you
+    // know will not repeat.
+    fn compact() {
+        let n = next_pow2(this.count);
+        if (n != this.mask + 1) { this.rebuild(n); }
+    }
+
+    fn grow() { this.rebuild((this.mask + 1) * 2); }
+
+    // Unroll the ring into a flat run, which also returns head to 0.
+    fn rebuild(n: int) {
+        let nb: T[] = [];
+        nb.reserve(n);
+        for (let i in 0..this.count) { nb.push(this.buf[(this.head + i) & this.mask]); }
+        for (let i in this.count..n) { nb.push(this.zero); }
+        this.buf = nb;
+        this.head = 0;
+        this.mask = n - 1;
+    }
+}
+
+export fn deque_int(cap: int): Deque<int>       { return new Deque<int>(cap, 0); }
+export fn deque_float(cap: int): Deque<float>   { return new Deque<float>(cap, 0.0); }
+export fn deque_str(cap: int): Deque<string>    { return new Deque<string>(cap, null); }
+export fn deque_bool(cap: int): Deque<bool>     { return new Deque<bool>(cap, false); }

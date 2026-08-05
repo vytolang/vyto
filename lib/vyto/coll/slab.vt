@@ -1,0 +1,165 @@
+// vyto/coll/slab — an index-based arena. The one in this package that is about
+// memory safety rather than speed.
+//
+//     let s = new Slab<Node>(1024, null);
+//     let h = s.alloc(new Node());       // h is an int, not a reference
+//     s.get(h).label = "root";
+//     s.free(h);
+//     s.alive(h)                          // false — and stays false
+//
+// ── WHY THIS MATTERS ─────────────────────────────────────────────────────────
+// Vyto is reference counted with no cycle collector, so a strong reference cycle
+// leaks and nothing detects it. `weak` breaks a tree — child to parent — but it
+// does not break a *graph*, and almost every interesting data structure is a
+// graph: a scene with constraints, a document with cross-links, a dependency
+// network, an undo history.
+//
+// A Slab is the Vyto-shaped answer. Nodes live in one array and refer to each
+// other by `int` handle. An integer is not a reference, so it holds nothing
+// alive and a cycle of handles is not a cycle at all — it cannot leak, by
+// construction rather than by discipline. This is what a Pascal programmer
+// would have done, and it is also what `lib/vyto/data/native/src/coltable.c`
+// does for a million rows.
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// ── GENERATIONS ──────────────────────────────────────────────────────────────
+// The obvious version of this idea has a real bug: free a handle, allocate
+// again, and the stale handle now silently addresses somebody else's object.
+// That is a use-after-free with the crash removed and the wrong answer left in.
+//
+// So a handle is `index | (generation << 32)`, and freeing a slot bumps its
+// generation. A stale handle fails `alive()` and panics in `get()` instead of
+// reading a live neighbour. Handle 0 is never valid — generations start at 1 —
+// so a zeroed field reads as "no handle" without a separate flag.
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Capacity grows by doubling; freed slots are reused through an intrusive free
+// list threaded through the `link` array, so allocation is O(1) and never
+// walks. See `deque.vt` for why there is a `zero: T`.
+
+export const NIL: int = 0;
+
+export class Slab<T> {
+    items: T[];
+    gen: int[];        // generation per slot; even = free, odd = live
+    link: int[];       // free-list next; only meaningful for a free slot
+    zero: T;
+    free_head: int;    // slot index, or -1
+    count: int;
+
+    fn init(cap: int, zero: T) {
+        this.zero = zero;
+        this.items = [];
+        this.gen = [];
+        this.link = [];
+        if (cap > 0) {
+            this.items.reserve(cap);
+            this.gen.reserve(cap);
+            this.link.reserve(cap);
+        }
+        this.free_head = -1;
+        this.count = 0;
+    }
+
+    // Live objects. Not the slot count — `capacity()` is that.
+    fn len(): int { return this.count; }
+    fn is_empty(): bool { return this.count == 0; }
+    fn capacity(): int { return this.items.len; }
+
+    fn alloc(v: T): int {
+        let slot = this.free_head;
+        if (slot >= 0) {
+            this.free_head = this.link[slot];
+            this.items[slot] = v;
+            this.gen[slot] += 1;        // even -> odd: the slot is live again
+        } else {
+            slot = this.items.len;
+            this.items.push(v);
+            this.gen.push(1);           // generations start at 1, so handle != 0
+            this.link.push(-1);        // free-list next; only meaningful when free
+        }
+        this.count += 1;
+        return slot | (this.gen[slot] << 32);
+    }
+
+    // Is this handle still the one that was handed out for its slot?
+    //
+    // The generation comparison alone is sufficient, and that is not an
+    // accident: `alloc` only ever returns an odd generation and `free` only
+    // ever leaves an even one, so a freed slot's generation cannot equal any
+    // handle in circulation. `link` is the free list and nothing else.
+    fn alive(h: int): bool {
+        if (h == NIL) { return false; }
+        let slot = h & 0xFFFFFFFF;
+        if (slot >= this.items.len) { return false; }
+        return this.gen[slot] == (h >> 32);
+    }
+
+    fn slot_live(slot: int): bool { return (this.gen[slot] & 1) == 1; }
+
+    // Panics on a stale or freed handle. That is the point: a use-after-free
+    // stops here with a message instead of returning a neighbour's object.
+    fn get(h: int): T {
+        if (!this.alive(h)) { panic("Slab.get: stale or freed handle"); }
+        return this.items[h & 0xFFFFFFFF];
+    }
+
+    fn get_or(h: int, dflt: T): T {
+        if (!this.alive(h)) { return dflt; }
+        return this.items[h & 0xFFFFFFFF];
+    }
+
+    fn set(h: int, v: T) {
+        if (!this.alive(h)) { panic("Slab.set: stale or freed handle"); }
+        this.items[h & 0xFFFFFFFF] = v;
+    }
+
+    // Free a handle. Returns false if it was already stale, so a double free is
+    // detectable rather than silently corrupting the free list.
+    fn free(h: int): bool {
+        if (!this.alive(h)) { return false; }
+        let slot = h & 0xFFFFFFFF;
+        this.items[slot] = this.zero;   // drop the reference now, not at reuse
+        this.gen[slot] += 1;            // odd -> even: every old handle is dead
+        this.link[slot] = this.free_head;
+        this.free_head = slot;
+        this.count -= 1;
+        return true;
+    }
+
+    // Free every live handle. Generations still advance, so handles taken
+    // before the clear stay dead afterwards.
+    fn clear() {
+        this.free_head = -1;
+        for (let i in 0..this.items.len) {
+            if (this.slot_live(i)) { this.items[i] = this.zero; this.gen[i] += 1; }
+            this.link[i] = this.free_head;
+            this.free_head = i;
+        }
+        this.count = 0;
+    }
+
+    // Every live handle, in slot order. Iterating a Slab goes through this —
+    // there is deliberately no `at(i)`, because "the i'th live slot" would be a
+    // scan and would read like an index when it is not one.
+    fn handles(): int[] {
+        let out: int[] = [];
+        out.reserve(this.count);
+        for (let i in 0..this.items.len) {
+            if (this.slot_live(i)) { out.push(i | (this.gen[i] << 32)); }
+        }
+        return out;
+    }
+
+    fn values(): T[] {
+        let out: T[] = [];
+        out.reserve(this.count);
+        for (let i in 0..this.items.len) {
+            if (this.slot_live(i)) { out.push(this.items[i]); }
+        }
+        return out;
+    }
+}
+
+export fn slab_int(cap: int): Slab<int>    { return new Slab<int>(cap, 0); }
+export fn slab_str(cap: int): Slab<string> { return new Slab<string>(cap, null); }

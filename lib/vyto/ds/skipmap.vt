@@ -1,0 +1,375 @@
+// vyto/ds/skipmap — an ordered map: key/value pairs kept sorted by key.
+//
+//     let m = skipmap_int_str();
+//     m.put(30, "backup");
+//     m.put(10, "compact");
+//     m.put(20, "flush");
+//     print(m.get(20));                          // "flush"
+//     print(str(m.ceiling_key(15, -1)));         // 20 — the next one at or after
+//     for (let k in m.keys_in_order()) { ... }   // 10, 20, 30
+//
+// What this does that `HashMap` cannot: keep the keys in order, and answer
+// questions *between* them. `ceiling_key`/`floor_key` are the point — "the next
+// scheduled event at or after t", "the style rule covering this offset", "the
+// last checkpoint before this timestamp". A hash table has no answer to any of
+// those, because it has no notion of adjacency.
+//
+// What it does that `SkipList` cannot: hold a value. `SkipList<T>` is an ordered
+// *set*; this is the map. They share the same tower structure and nothing else.
+//
+// ── WHEN A SORTED ARRAY IS BETTER ───────────────────────────────────────────
+// If the data is loaded once and then only read, build a sorted array and use
+// `binary_search` from `vyto/util/sort`. It is contiguous, has no per-element
+// overhead, and will beat this on every query. A skip map earns its keep when
+// **inserts and deletes are interleaved with queries** — an insert into a sorted
+// array is O(n) because everything after it shifts, and here it is O(log n).
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// ── NO NODE OBJECTS ─────────────────────────────────────────────────────────
+// A skip list is a tower of linked lists, and a linked list of objects under
+// reference counting is a leak waiting to happen. Every link here is an `int`
+// index into flat arrays, so there is no reference to leak and no `weak` to
+// remember. The forward pointers live in one contiguous `int[]` addressed as
+// `node * MAXLEVEL + lvl`.
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Ordering is a `cmp` closure over the *key*, not a bound — the same trade as
+// `Heap` and `vyto/util/sort`. See `vyto/coll/deque.vt` for why there is a
+// `zero` for each of K and V.
+//
+// There is deliberately no `at(i)`, so `for-in` does not work on a SkipMap: an
+// element is a pair, Vyto has no tuples, and "the i'th thing" would have to
+// silently pick keys or values. Iterate `keys_in_order()` and look up, exactly
+// as with `HashMap` and the builtin `Map`.
+
+const MAXLEVEL: int = 16;
+const NIL_NODE: int = -1;
+
+export class SkipMap<K, V> {
+    keys: K[];
+    vals: V[];
+    fwd: int[];        // node * MAXLEVEL + lvl -> next node, or -1
+    lvl: int[];        // tower height per node
+    zk: K;
+    zv: V;
+    cmp: fn(K, K): int;
+    head: int;         // sentinel node 0, holds no pair
+    level: int;        // current tower height in use
+    count: int;
+    rng: u64;
+
+    fn init(zk: K, zv: V, cmp: fn(K, K): int) {
+        this.zk = zk;
+        this.zv = zv;
+        this.cmp = cmp;
+        this.keys = [];
+        this.vals = [];
+        this.fwd = [];
+        this.lvl = [];
+        this.count = 0;
+        this.level = 1;
+        this.rng = 0x2545F4914F6CDD1D;
+        this.head = this.new_node(zk, zv, MAXLEVEL);
+    }
+
+    fn len(): int { return this.count; }
+    fn is_empty(): bool { return this.count == 0; }
+
+    fn new_node(k: K, v: V, height: int): int {
+        let id = this.keys.len;
+        this.keys.push(k);
+        this.vals.push(v);
+        this.lvl.push(height);
+        for (let i in 0..MAXLEVEL) { this.fwd.push(NIL_NODE); }
+        return id;
+    }
+
+    // xorshift64, then a geometric height: keep flipping while the low bit is
+    // set, which gives level L with probability 2^-L. Deterministic on purpose —
+    // reproducible runs matter more here than resisting a chosen insertion
+    // order, and nothing in this structure is a security boundary.
+    fn random_level(): int {
+        this.rng = this.rng ^ (this.rng << 13);
+        this.rng = this.rng ^ (this.rng >> 7);
+        this.rng = this.rng ^ (this.rng << 17);
+        let h = 1;
+        let bits = this.rng;
+        while ((bits & 1) == 1 && h < MAXLEVEL) { h += 1; bits = bits >> 1; }
+        return h;
+    }
+
+    fn next_of(node: int, l: int): int { return this.fwd[node * MAXLEVEL + l]; }
+    fn set_next(node: int, l: int, target: int) { this.fwd[node * MAXLEVEL + l] = target; }
+
+    // The last node before `k` at every level, written into `out`, which the
+    // caller owns — so a search allocates nothing per level.
+    fn descend(k: K, out: int[]) {
+        let x = this.head;
+        let l = this.level - 1;
+        while (l >= 0) {
+            let nx = this.next_of(x, l);
+            while (nx != NIL_NODE && this.cmp(this.keys[nx], k) < 0) {
+                x = nx;
+                nx = this.next_of(x, l);
+            }
+            out[l] = x;
+            l -= 1;
+        }
+    }
+
+    fn fresh_update(): int[] {
+        let update: int[] = [];
+        update.reserve(MAXLEVEL);
+        for (let i in 0..MAXLEVEL) { update.push(this.head); }
+        return update;
+    }
+
+    // Node whose key equals `k`, or -1.
+    fn find(k: K): int {
+        let update = this.fresh_update();
+        this.descend(k, update);
+        let cand = this.next_of(update[0], 0);
+        if (cand != NIL_NODE && this.cmp(this.keys[cand], k) == 0) { return cand; }
+        return NIL_NODE;
+    }
+
+    // Insert or overwrite. Returns true when the key was new.
+    fn put(k: K, v: V): bool {
+        let update = this.fresh_update();
+        this.descend(k, update);
+        let cand = this.next_of(update[0], 0);
+        if (cand != NIL_NODE && this.cmp(this.keys[cand], k) == 0) {
+            this.vals[cand] = v;
+            return false;
+        }
+        let h = this.random_level();
+        if (h > this.level) {
+            for (let l in this.level..h) { update[l] = this.head; }
+            this.level = h;
+        }
+        let n = this.new_node(k, v, h);
+        for (let l in 0..h) {
+            this.set_next(n, l, this.next_of(update[l], l));
+            this.set_next(update[l], l, n);
+        }
+        this.count += 1;
+        return true;
+    }
+
+    fn has(k: K): bool { return this.find(k) != NIL_NODE; }
+
+    // Panics on a missing key, matching `HashMap.get` and the builtin `Map`.
+    fn get(k: K): V {
+        let n = this.find(k);
+        if (n == NIL_NODE) { panic("SkipMap.get: key not present"); }
+        return this.vals[n];
+    }
+
+    fn get_or(k: K, dflt: V): V {
+        let n = this.find(k);
+        if (n == NIL_NODE) { return dflt; }
+        return this.vals[n];
+    }
+
+    // Remove. The node's slot is left behind rather than recycled: a map that is
+    // churned heavily wants a Slab underneath, and adding one here would cost
+    // more clarity than it buys.
+    fn remove(k: K): bool {
+        let update = this.fresh_update();
+        this.descend(k, update);
+        let target = this.next_of(update[0], 0);
+        if (target == NIL_NODE || this.cmp(this.keys[target], k) != 0) { return false; }
+        for (let l in 0..this.level) {
+            if (this.next_of(update[l], l) == target) {
+                this.set_next(update[l], l, this.next_of(target, l));
+            }
+        }
+        this.keys[target] = this.zk;
+        this.vals[target] = this.zv;
+        while (this.level > 1 && this.next_of(this.head, this.level - 1) == NIL_NODE) {
+            this.level -= 1;
+        }
+        this.count -= 1;
+        return true;
+    }
+
+    // ---- the ordered queries, which are the reason this exists -------------
+
+    // Smallest key >= `k`, or `dflt` when every key is smaller. One descent.
+    fn ceiling_key(k: K, dflt: K): K {
+        let update = this.fresh_update();
+        this.descend(k, update);
+        let x = this.next_of(update[0], 0);
+        if (x == NIL_NODE) { return dflt; }
+        return this.keys[x];
+    }
+
+    fn ceiling_value(k: K, dflt: V): V {
+        let update = this.fresh_update();
+        this.descend(k, update);
+        let x = this.next_of(update[0], 0);
+        if (x == NIL_NODE) { return dflt; }
+        return this.vals[x];
+    }
+
+    // Largest key <= `k`, or `dflt`. `descend` already stops on the last node
+    // strictly before `k`, so this only has to check for an exact match first.
+    fn floor_key(k: K, dflt: K): K {
+        let update = this.fresh_update();
+        this.descend(k, update);
+        let x = this.next_of(update[0], 0);
+        if (x != NIL_NODE && this.cmp(this.keys[x], k) == 0) { return this.keys[x]; }
+        if (update[0] == this.head) { return dflt; }
+        return this.keys[update[0]];
+    }
+
+    fn floor_value(k: K, dflt: V): V {
+        let update = this.fresh_update();
+        this.descend(k, update);
+        let x = this.next_of(update[0], 0);
+        if (x != NIL_NODE && this.cmp(this.keys[x], k) == 0) { return this.vals[x]; }
+        if (update[0] == this.head) { return dflt; }
+        return this.vals[update[0]];
+    }
+
+    fn first_key(): K {
+        if (this.count == 0) { panic("SkipMap.first_key: empty"); }
+        return this.keys[this.next_of(this.head, 0)];
+    }
+
+    fn first_value(): V {
+        if (this.count == 0) { panic("SkipMap.first_value: empty"); }
+        return this.vals[this.next_of(this.head, 0)];
+    }
+
+    fn last_key(): K {
+        if (this.count == 0) { panic("SkipMap.last_key: empty"); }
+        return this.keys[this.tail_node()];
+    }
+
+    fn last_value(): V {
+        if (this.count == 0) { panic("SkipMap.last_value: empty"); }
+        return this.vals[this.tail_node()];
+    }
+
+    // Walks down from the top level, so this is O(log n) rather than a scan.
+    fn tail_node(): int {
+        let x = this.head;
+        let l = this.level - 1;
+        while (l >= 0) {
+            let nx = this.next_of(x, l);
+            while (nx != NIL_NODE) { x = nx; nx = this.next_of(x, l); }
+            l -= 1;
+        }
+        return x;
+    }
+
+    // How many keys sort before `k`. O(n) — a counted skip list would make this
+    // O(log n) and is not what this one is.
+    fn rank_of(k: K): int {
+        let n = 0;
+        let x = this.next_of(this.head, 0);
+        while (x != NIL_NODE && this.cmp(this.keys[x], k) < 0) { n += 1; x = this.next_of(x, 0); }
+        return n;
+    }
+
+    // Keys in [lo, hi), in order. One descent to the start, then a walk — so
+    // this costs the number of hits, not the size of the map.
+    fn range_keys(lo: K, hi: K): K[] {
+        let out: K[] = [];
+        let update = this.fresh_update();
+        this.descend(lo, update);
+        let x = this.next_of(update[0], 0);
+        while (x != NIL_NODE && this.cmp(this.keys[x], hi) < 0) {
+            out.push(this.keys[x]);
+            x = this.next_of(x, 0);
+        }
+        return out;
+    }
+
+    fn range_values(lo: K, hi: K): V[] {
+        let out: V[] = [];
+        let update = this.fresh_update();
+        this.descend(lo, update);
+        let x = this.next_of(update[0], 0);
+        while (x != NIL_NODE && this.cmp(this.keys[x], hi) < 0) {
+            out.push(this.vals[x]);
+            x = this.next_of(x, 0);
+        }
+        return out;
+    }
+
+    // Positional access, deliberately NOT named `at` — see the header. O(i).
+    fn key_at(i: int): K {
+        if (i < 0 || i >= this.count) { panic("SkipMap.key_at: index out of range"); }
+        let x = this.next_of(this.head, 0);
+        for (let n in 0..i) { x = this.next_of(x, 0); }
+        return this.keys[x];
+    }
+
+    fn value_at(i: int): V {
+        if (i < 0 || i >= this.count) { panic("SkipMap.value_at: index out of range"); }
+        let x = this.next_of(this.head, 0);
+        for (let n in 0..i) { x = this.next_of(x, 0); }
+        return this.vals[x];
+    }
+
+    // One pass along the bottom list — much cheaper than key_at in a loop, and
+    // the intended way to iterate.
+    fn keys_in_order(): K[] {
+        let out: K[] = [];
+        out.reserve(this.count);
+        let x = this.next_of(this.head, 0);
+        while (x != NIL_NODE) { out.push(this.keys[x]); x = this.next_of(x, 0); }
+        return out;
+    }
+
+    fn values_in_order(): V[] {
+        let out: V[] = [];
+        out.reserve(this.count);
+        let x = this.next_of(this.head, 0);
+        while (x != NIL_NODE) { out.push(this.vals[x]); x = this.next_of(x, 0); }
+        return out;
+    }
+
+    fn clear() {
+        this.keys = [];
+        this.vals = [];
+        this.fwd = [];
+        this.lvl = [];
+        this.count = 0;
+        this.level = 1;
+        this.head = this.new_node(this.zk, this.zv, MAXLEVEL);
+    }
+}
+
+fn cmp_int(a: int, b: int): int {
+    if (a < b) { return -1; }
+    if (a > b) { return 1; }
+    return 0;
+}
+
+// Strings have no ordering operator in Vyto — `<` needs matching numeric types —
+// so an alphabetical map supplies its own comparator. Byte-wise, then length,
+// which is codepoint order for UTF-8.
+export fn cmp_str(a: string, b: string): int {
+    let n = a.len;
+    if (b.len < n) { n = b.len; }
+    for (let i in 0..n) {
+        if (a[i] != b[i]) { return a[i] - b[i]; }
+    }
+    return a.len - b.len;
+}
+
+export fn skipmap_int_int(): SkipMap<int, int> {
+    return new SkipMap<int, int>(0, 0, (a, b) => cmp_int(a, b));
+}
+export fn skipmap_int_str(): SkipMap<int, string> {
+    return new SkipMap<int, string>(0, null, (a, b) => cmp_int(a, b));
+}
+export fn skipmap_str_int(): SkipMap<string, int> {
+    return new SkipMap<string, int>(null, 0, (a, b) => cmp_str(a, b));
+}
+export fn skipmap_str_str(): SkipMap<string, string> {
+    return new SkipMap<string, string>(null, null, (a, b) => cmp_str(a, b));
+}

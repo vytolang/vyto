@@ -1,0 +1,150 @@
+// for-in over a user container: `for (let x in c)` where c is a class with
+// `fn len(): int` and `fn at(i: int): T`.
+//
+// Desugars to the index loop you would have written by hand — the container is
+// evaluated once and held for the loop, len() is re-evaluated each iteration,
+// and each element is released at the end of its iteration including on break,
+// continue and return. Those release paths are what this fixture is for; the
+// happy path is one line and would be covered by any example.
+
+class Words {
+    xs: string[];
+    fn init() { this.xs = []; }
+    fn add(s: string): int { this.xs.push(s); return this.xs.len; }
+    fn len(): int { return this.xs.len; }
+    fn at(i: int): string { return this.xs[i]; }
+}
+
+// A container whose elements are values, not refs — the no-RC path.
+class Squares {
+    n: int;
+    fn init(n: int) { this.n = n; }
+    fn len(): int { return this.n; }
+    virtual fn at(i: int): int { return i * i; }
+}
+
+class Cubes extends Squares {
+    fn init(n: int) { super.init(n); }
+    override fn at(i: int): int { return i * i * i; }
+}
+
+// Inherits len/at from a base — class_find_method walks parents.
+class NamedSquares extends Squares {
+    label: string;
+    fn init(n: int, l: string) { super.init(n); this.label = l; }
+}
+
+// Shrinks itself while being iterated. len() is re-read every iteration, so
+// this terminates early rather than reading past the end.
+class Melting {
+    xs: int[];
+    fn init() { this.xs = [10, 20, 30, 40, 50, 60]; }
+    fn len(): int { return this.xs.len; }
+    fn at(i: int): int { return this.xs[i]; }
+    fn drop_two() { this.xs.pop(); this.xs.pop(); }
+}
+
+// Grows while being iterated, bounded by the body.
+class Growing {
+    xs: int[];
+    fn init() { this.xs = [1]; }
+    fn len(): int { return this.xs.len; }
+    fn at(i: int): int { return this.xs[i]; }
+    fn push(v: int) { this.xs.push(v); }
+}
+
+// Generic, and holding refs — the case vyto/coll is made of.
+class Bag<T> {
+    items: T[];
+    fn init() { this.items = []; }
+    fn add(v: T) { this.items.push(v); }
+    fn len(): int { return this.items.len; }
+    fn at(i: int): T { return this.items[i]; }
+}
+
+fn total(s: Squares): int {
+    let t = 0;
+    for (let v in s) { t += v; }
+    return t;
+}
+
+// Returns from inside the loop: the container's release has to happen on the
+// return path, not only at the end of the block.
+fn first_long(w: Words, n: int): string {
+    for (let s in w) {
+        if (s.len >= n) { return s; }
+    }
+    return "-";
+}
+
+fn main() {
+    let w = new Words();
+    w.add("alpha"); w.add("be"); w.add("gamma"); w.add("d");
+
+    print("---- basic ----");
+    for (let s in w) { print(s); }
+
+    print("---- nested ----");
+    for (let a in w) {
+        for (let b in w) {
+            if (a.len + b.len == 3) { print(a + "|" + b); }
+        }
+    }
+
+    print("---- break, continue, return ----");
+    for (let s in w) {
+        if (s == "be") { continue; }
+        if (s == "gamma") { break; }
+        print("kept " + s);
+    }
+    print(first_long(w, 5));
+    print(first_long(w, 99));
+
+    print("---- value elements, virtual at() ----");
+    print(str(total(new Squares(5))));          // 0+1+4+9+16
+    print(str(total(new Cubes(4))));            // 0+1+8+27
+    print(str(total(new NamedSquares(3, "n")))); // inherited: 0+1+4
+
+    print("---- len() is re-read each iteration ----");
+    let m = new Melting();
+    let seen: int[] = [];
+    for (let v in m) {
+        seen.push(v);
+        m.drop_two();
+    }
+    print(str(seen.len));
+    for (let v in seen) { print(str(v)); }
+
+    let g = new Growing();
+    let count = 0;
+    for (let v in g) {
+        count += 1;
+        if (g.len() < 5) { g.push(v * 2); }
+    }
+    print(str(count) + " " + str(g.len()));
+
+    print("---- empty container ----");
+    let e = new Words();
+    let hit = false;
+    for (let s in e) { hit = true; }
+    print(str(hit));
+
+    print("---- generic container over a class ----");
+    let bw = new Bag<Words>();
+    bw.add(w);
+    bw.add(e);
+    for (let inner in bw) { print(str(inner.len())); }
+
+    let bs = new Bag<string>();
+    bs.add("one"); bs.add("two");
+    for (let s in bs) { print(s); }
+
+    print("---- the loop variable is a copy of the reference ----");
+    // Rebinding inside the body must not disturb the container.
+    for (let s in w) { s = "x"; }
+    print(str(w.len()));
+    for (let s in w) { print(s); }
+
+    print("---- an expression, not just a variable ----");
+    for (let v in new Squares(3)) { print(str(v)); }
+}

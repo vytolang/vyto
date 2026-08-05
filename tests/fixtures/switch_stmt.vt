@@ -1,0 +1,300 @@
+// `switch` — the jump-table form of the `kind: int` tagged dispatch that
+// vyto/util/json, xml and markdown all hand-roll as if/else-if chains.
+//
+// No fallthrough, no arm-terminating break, no exhaustiveness, no binding: this
+// is not pattern matching, which SPEC §13 rules out and this does not sneak in.
+//
+// The case that needs the most care is `break` inside an arm inside a loop. In
+// C, `break` binds to the innermost switch *or* loop; in Vyto it always means
+// the loop. The emitter turns such a break into a goto past the loop, and these
+// tests are what prove it.
+
+const TK_INT:  int = 1;
+const TK_STR:  int = 2;
+const TK_LIST: int = 3;
+const RED: string = "red";
+
+fn check(name: string, got: string, want: string) {
+    if (got == want) { print("ok    " + name); }
+    else { print("FAIL  " + name + " got=" + got + " want=" + want); }
+}
+fn checkInt(name: string, got: int, want: int) { check(name, str(got), str(want)); }
+fn checkBool(name: string, got: bool) {
+    if (got) { print("ok    " + name); } else { print("FAIL  " + name); }
+}
+
+// ---- int subjects ----------------------------------------------------------
+
+fn kindName(k: int): string {
+    switch (k) {
+        case TK_INT: { return "int"; }
+        case TK_STR, TK_LIST: { return "str-or-list"; }
+        default: { return "other"; }
+    }
+}
+
+// Every path returns, so the checker must accept this without a trailing
+// return — that needs stmt_returns to understand ST_SWITCH.
+fn classify(n: int): int {
+    switch (n) {
+        case 0: { return 100; }
+        case 1, 2: { return 200; }
+        default: { return 300; }
+    }
+}
+
+// No default: falls out of the switch and reaches the return below it.
+fn maybe(n: int): int {
+    let out = -1;
+    switch (n) {
+        case 1: { out = 10; }
+        case 2: { out = 20; }
+    }
+    return out;
+}
+
+// ---- string subjects -------------------------------------------------------
+
+fn colorCode(c: string): int {
+    switch (c) {
+        case RED: { return 1; }
+        case "green", "lime": { return 2; }
+        case "blue": { return 3; }
+        default: { return 0; }
+    }
+}
+
+// A default written first must still act as the fallback, not as a first match.
+fn defaultFirst(c: string): string {
+    switch (c) {
+        default: { return "fallback"; }
+        case "hit": { return "hit"; }
+    }
+}
+
+// ---- break and continue inside an arm --------------------------------------
+
+// `break` targets the while, not the switch.
+fn stopAt(xs: int[], sentinel: int): int {
+    let i = 0;
+    while (i < xs.len) {
+        switch (xs[i]) {
+            case 0: { i += 1; continue; }
+            default: {
+                if (xs[i] == sentinel) { break; }
+                i += 1;
+            }
+        }
+    }
+    return i;
+}
+
+// The same, in a for-in over an array, with a live string element that has to
+// be released on the way out.
+fn joinUntilStop(names: string[]): string {
+    let out = "";
+    for (let n in names) {
+        switch (n) {
+            case "stop": { break; }
+            case "skip": { continue; }
+            default: { out = out + n; }
+        }
+    }
+    return out;
+}
+
+// And in a for-in over a *container*, which is the ST_FOR_ITER path.
+class Words {
+    xs: string[];
+    fn init(xs: string[]) { this.xs = xs; }
+    fn len(): int { return this.xs.len; }
+    fn at(i: int): string { return this.xs[i]; }
+}
+
+fn joinContainerUntilStop(w: Words): string {
+    let out = "";
+    for (let n in w) {
+        switch (n) {
+            case "stop": { break; }
+            default: { out = out + n; }
+        }
+    }
+    return out;
+}
+
+// A nested switch: the inner break must still find the loop, not the outer
+// switch.
+fn nestedBreak(xs: int[]): int {
+    let seen = 0;
+    for (let x in xs) {
+        switch (x) {
+            case 1: {
+                switch (x) {
+                    case 1: { seen += 1; }
+                    default: { seen += 100; }
+                }
+            }
+            case 9: { break; }
+            default: { seen += 10; }
+        }
+    }
+    return seen;
+}
+
+// `return` out of an arm while a ref subject is live: the release has to happen
+// on the return path, not only at the end of the block.
+fn returnFromArm(k: string): int {
+    switch (k + "!") {
+        case "a!": { return 1; }
+        case "b!": { return 2; }
+        default: { return 0; }
+    }
+}
+
+// ---- switch inside a generic -----------------------------------------------
+//
+// Guards clone_stmt: the arms must be deep-cloned per instantiation, or two
+// instances share the case-value Expr nodes and fight over their types.
+
+fn describe<T>(v: T, mode: int): string {
+    switch (mode) {
+        case 0: { return "plain " + str(v); }
+        case 1: { return "loud " + str(v); }
+        default: { return "other " + str(v); }
+    }
+}
+
+// ---- unsigned subject ------------------------------------------------------
+
+fn bigTag(v: u64): string {
+    switch (v) {
+        case 0: { return "zero"; }
+        case 1: { return "one"; }
+        default: { return "big"; }
+    }
+}
+
+fn main() {
+    print("---- int subjects ----");
+    check("case by const", kindName(TK_INT), "int");
+    check("multi-value arm, first", kindName(TK_STR), "str-or-list");
+    check("multi-value arm, second", kindName(TK_LIST), "str-or-list");
+    check("default", kindName(99), "other");
+    checkInt("shared arm via the comma form", classify(2), 200);
+    checkInt("every arm returns, no trailing return needed", classify(0), 100);
+    checkInt("no default: falls through the switch", maybe(3), -1);
+    checkInt("no default: still matches", maybe(2), 20);
+
+    print("---- negative and boundary values ----");
+    let neg = "";
+    switch (-3) {
+        case -3: { neg = "neg"; }
+        default: { neg = "no"; }
+    }
+    check("negative case label", neg, "neg");
+
+    let zero = "";
+    switch (0) {
+        case 0: { zero = "zero"; }
+        default: { zero = "no"; }
+    }
+    check("zero case label", zero, "zero");
+
+    // A sparse switch (values far apart) must behave exactly like a dense one.
+    let sparse = 0;
+    switch (1000000) {
+        case 1: { sparse = 1; }
+        case 1000000: { sparse = 2; }
+        default: { sparse = 3; }
+    }
+    checkInt("sparse labels", sparse, 2);
+
+    print("---- string subjects ----");
+    checkInt("string const case", colorCode("red"), 1);
+    checkInt("multi-value string arm", colorCode("lime"), 2);
+    checkInt("later string arm", colorCode("blue"), 3);
+    checkInt("string default", colorCode("mauve"), 0);
+    check("default written first is still the fallback", defaultFirst("nope"), "fallback");
+    check("default written first does not shadow", defaultFirst("hit"), "hit");
+
+    // The subject is a temporary that must stay live across every arm.
+    let concat = "";
+    switch ("a" + "b") {
+        case "ab": { concat = "matched"; }
+        default: { concat = "missed"; }
+    }
+    check("temporary subject stays live", concat, "matched");
+
+    // An empty string is a value like any other, not a sentinel.
+    let empty = "";
+    switch ("") {
+        case "": { empty = "matched empty"; }
+        default: { empty = "missed"; }
+    }
+    check("empty string case", empty, "matched empty");
+
+    print("---- break and continue ----");
+    checkInt("break in an arm targets the while", stopAt([1, 2, 7, 9], 7), 2);
+    checkInt("continue in an arm targets the while", stopAt([0, 0, 5], 5), 2);
+    checkInt("no sentinel: loop runs out", stopAt([1, 2, 3], 99), 3);
+    check("break in a for-in arm", joinUntilStop(["a", "skip", "b", "stop", "c"]), "ab");
+    check("no break taken", joinUntilStop(["a", "b"]), "ab");
+    check("break in a container for-in arm",
+          joinContainerUntilStop(new Words(["x", "y", "stop", "z"])), "xy");
+    checkInt("nested switch, break still finds the loop", nestedBreak([1, 5, 9, 5]), 11);
+    checkInt("return from an arm with a live subject", returnFromArm("b"), 2);
+    checkInt("return from the default arm", returnFromArm("zzz"), 0);
+
+    print("---- scoping ----");
+    // Each arm is its own scope, so the same name in two arms is fine.
+    let scoped = 0;
+    switch (1) {
+        case 1: { let v = 10; scoped = v; }
+        default: { let v = 20; scoped = v; }
+    }
+    checkInt("arms are separate scopes", scoped, 10);
+
+    // A switch does not introduce a loop, so break outside one is still an
+    // error — covered by tests/errors, not here.
+
+    print("---- inside a generic ----");
+    check("generic instance 1", describe(42, 0), "plain 42");
+    check("generic instance 2", describe("hi", 1), "loud hi");
+    check("generic instance 3", describe(2.5, 7), "other 2.5");
+    check("generic reuses an instance", describe(7, 1), "loud 7");
+
+    print("---- integer widths ----");
+    check("u64 subject, zero", bigTag(0), "zero");
+    check("u64 subject, default", bigTag(4000000000), "big");
+
+    let b: byte = 3;
+    let bt = "";
+    switch (b) {
+        case 3: { bt = "three"; }
+        default: { bt = "other"; }
+    }
+    check("byte subject", bt, "three");
+
+    let i32v: i32 = -7;
+    let it = "";
+    switch (i32v) {
+        case -7: { it = "minus seven"; }
+        default: { it = "other"; }
+    }
+    check("i32 subject", it, "minus seven");
+
+    print("---- a switch is an ordinary statement ----");
+    // Inside an if, inside a loop, as the whole body of a block.
+    let acc = 0;
+    for (let i in 0..6) {
+        if (i % 2 == 0) {
+            switch (i) {
+                case 0: { acc += 1; }
+                case 2: { acc += 10; }
+                default: { acc += 100; }
+            }
+        }
+    }
+    checkInt("switch nested in if in for", acc, 111);
+    checkBool("nothing above threw", true);
+}

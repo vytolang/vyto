@@ -1,0 +1,104 @@
+// vyto/ds/dsu — disjoint-set union, a.k.a. union-find.
+//
+//     let d = new Dsu(n);
+//     d.union(a, b);
+//     if (d.same(a, b)) { ... }
+//     print(str(d.groups()));          // how many components are left
+//
+// Answers "are these two things in the same group?" in effectively constant
+// time, over any number of merges. That is the whole interface, and it is the
+// right shape more often than it looks: connected components in a graph,
+// Kruskal's minimum spanning tree, image flood-fill regions, "which cells are
+// part of the same merged range", incremental cycle detection.
+//
+// Two flat `int[]`s and no objects at all — elements are indices, so this is the
+// arena rule with nothing left over. Path halving on `find` plus union by rank
+// gives the inverse-Ackermann bound; in practice every operation is a few array
+// reads.
+
+export class Dsu {
+    parent: int[];
+    rank: byte[];
+    ngroups: int;
+
+    fn init(n: int) {
+        this.parent = [];
+        this.rank = bytes(n);
+        this.parent.reserve(n);
+        for (let i in 0..n) { this.parent.push(i); }
+        this.ngroups = n;
+    }
+
+    fn len(): int { return this.parent.len; }
+
+    // Number of distinct groups. Starts at n and drops by one per real merge.
+    fn groups(): int { return this.ngroups; }
+
+    fn check(x: int) {
+        if (x < 0 || x >= this.parent.len) { panic("Dsu: index out of range"); }
+    }
+
+    // Representative of x's group. Path halving — point every other node
+    // straight at its grandparent — flattens the tree as a side effect of
+    // looking, with no second pass and no recursion.
+    fn find(x: int): int {
+        this.check(x);
+        let i = x;
+        while (this.parent[i] != i) {
+            this.parent[i] = this.parent[this.parent[i]];
+            i = this.parent[i];
+        }
+        return i;
+    }
+
+    // Merge the groups of a and b. Returns false when they were already
+    // together, which is exactly the cycle test Kruskal needs.
+    fn union(a: int, b: int): bool {
+        let ra = this.find(a);
+        let rb = this.find(b);
+        if (ra == rb) { return false; }
+        // Union by rank: hang the shorter tree under the taller one, so depth
+        // only grows when both were equally tall.
+        if (this.rank[ra] < this.rank[rb]) { let t = ra; ra = rb; rb = t; }
+        this.parent[rb] = ra;
+        if (this.rank[ra] == this.rank[rb]) { this.rank[ra] = (this.rank[ra] + 1) as byte; }
+        this.ngroups -= 1;
+        return true;
+    }
+
+    fn same(a: int, b: int): bool { return this.find(a) == this.find(b); }
+
+    // Size of every group, indexed by representative. Zero for anything that is
+    // not a representative.
+    fn sizes(): int[] {
+        let out: int[] = [];
+        out.reserve(this.parent.len);
+        for (let i in 0..this.parent.len) { out.push(0); }
+        for (let i in 0..this.parent.len) { out[this.find(i)] += 1; }
+        return out;
+    }
+
+    // Group label per element, renumbered 0..groups-1 in order of first
+    // appearance — what a caller wants for colouring or bucketing.
+    fn labels(): int[] {
+        let seen: int[] = [];
+        let out: int[] = [];
+        seen.reserve(this.parent.len);
+        out.reserve(this.parent.len);
+        for (let i in 0..this.parent.len) { seen.push(-1); out.push(0); }
+        let next = 0;
+        for (let i in 0..this.parent.len) {
+            let r = this.find(i);
+            if (seen[r] < 0) { seen[r] = next; next += 1; }
+            out[i] = seen[r];
+        }
+        return out;
+    }
+
+    fn reset() {
+        for (let i in 0..this.parent.len) { this.parent[i] = i; this.rank[i] = 0 as byte; }
+        this.ngroups = this.parent.len;
+    }
+}
+
+export fn dsu(n: int): Dsu { return new Dsu(n); }

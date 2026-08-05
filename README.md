@@ -85,6 +85,11 @@ Cross-compile the same way with `--target` (see below):
 
 ```sh
 ./vytoc build app.vt --release --target linux-arm64 -o app-arm64
+
+# Android: a shared library the JNI layer loads, built with the NDK's clang
+NDK=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin
+./vytoc build app.vt --target android-arm64 --shared \
+    --cc "$NDK/aarch64-linux-android24-clang"
 ```
 
 Apps that use a **prebuilt native library** (e.g. `vyto/gfx`, which links
@@ -120,7 +125,9 @@ it then depends only on base system libraries (libc, libX11):
   `vytobind zlib.h --lib z --filter 'compress*' > zlib.vt`.
 - **C callbacks**: `cthunk(closure)` turns a Vyto closure into a C function
   pointer (userdata-first or `cthunk_last` for userdata-last APIs).
-- **Cross-compilation**: `vytoc build app.vt --target linux-arm64`
+- **Cross-compilation**: `vytoc build app.vt --target linux-arm64` (also
+  `windows-x64`, `android-arm64`, macOS triples — a non-host triple needs its
+  own toolchain via `--cc`)
   (`--cc`/`VYTO_CC` for custom toolchains, e.g. `zig cc`).
 - **Safety**: bounds-checked arrays, checked downcasts, `panic` with
   file:line.
@@ -557,6 +564,9 @@ everything else is pure Vyto.
 | `vyto/validator` | validation for input and literals — a check chain where coercion changes its type (`.asInt().between(1, 65535)`), one error per failing value, character-aware length rules |
 | `vyto/util/uuid` ⚙ | UUID v4 and v7, plus the CSPRNG they need (`rand_bytes`, `rand_int`) |
 | `vyto/os/worker` ⚙ | `fork()`-based `WorkerPool` — CPU parallelism, no shared state |
+| `vyto/coll` | containers: `Deque`, `RingBuffer`, `Heap`, `HashMap`/`HashSet` (any key type), `BitSet`, `LRU`, and `Slab` — an index-based arena whose handles are ints, so a graph of them cannot form a reference cycle |
+| `vyto/ds` | index structures: `Trie`, `Dsu` (union-find), `Fenwick`, `SegTree`, `Bloom`, `SkipList`/`SkipMap` (ordered set and map, with `ceiling`/`floor`), `Graph` (BFS/DFS/topo/Dijkstra), `IntervalTree` — all flat-array backed, no node objects |
+| `vyto/hash` | non-cryptographic hashing: FNV-1a, xxHash64, SipHash-2-4, CRC-32/32C, plus the `hash_str`/`hash_int` helpers a table wants |
 
 **Data formats** — all pure Vyto, all soft-failing (a parse error is a value, never a panic)
 
@@ -645,12 +655,31 @@ backend and stdlib native shims, which vary per target.
 |----------|--------|-------|
 | **Linux** (x86_64, arm64) | ✅ Fully supported | Primary dev + CI platform. X11 GUI backend, full stdlib, `make test` runs here. |
 | **Embedded / bare-metal** | ✅ Core supported | `--freestanding` builds the compiler and runtime with zero libc — six `vt_host_*` hooks (alloc/realloc/free/write/write_err/abort) are the entire platform seam, output is a linkable `.a`. Verified in the test suite. No display driver ships in-tree; that's embedder-supplied, as with any bare-metal C project. |
-| **Windows** | 🚧 Partial, untested | `--target windows-x64` cross-compile is wired (MinGW), and LLP64 type mapping (`clong`/`culong`) is done. A Win32 GDI surface backend exists in `vsurf.c` (WndProc → event queue) but has never been built or run — no Windows/MinGW toolchain in CI yet. Some stdlib shims (`util/fmt`, `math`) are Windows-clean as-is; others (`net/socket` via Winsock, `os/worker` which needs `fork()`) need adaptation. |
+| **Windows** (x86_64) | ✅ Supported | `--target windows-x64` cross-compiles with mingw-w64 (picked automatically), LLP64 mapping (`clong`/`culong`) done. Win32 GDI surface backend in `vsurf.c` (WndProc → event queue), **verified on real Windows 7 hardware**: a `vyto/surface` app, a `vyto/ui` + `GfxPainter` app and a raw-`Canvas` app all render — which also proves `__attribute__((constructor))` fires on PE, so the `--with-assets` VFS registry populates and bundled fonts resolve. Six shims carry `_WIN32` branches: `time` (kernel32, since mingw *declares* `clock_gettime` but it lives in libwinpthread), `date` (a hand-written `strptime` — Windows has none in any form), `os` (cmd.exe, not a POSIX shell), `file`, `net/socket` (Winsock), and `os/worker`. blend2d cross-builds too, so `vyto/gfx` works. **Not portable:** `vyto/hw/*` (Linux device interfaces) and `vyto/intl` (ICU). |
 | **macOS** (x86_64, arm64) | 🚧 Partial, untested | Cross-compile triples exist but need your own `--cc` (no bundled cross toolchain from Linux). CLI/stdlib should build as-is (POSIX + C99). GUI currently falls through to the X11 backend (needs XQuartz) — no native Cocoa/Metal surface shim yet. |
-| **Android** | 📋 Planned | No NDK integration or surface shim in the tree yet. |
+| **Android** (arm64) | ✅ Supported | NDK integration is wired: `--target android-arm64 --shared --cc <ndk-clang>` produces a `.so` exporting `vyto_app_main`, and `--shared` adds `-Wl,--no-undefined` (so a missing shim fails at link, not at `System.loadLibrary`) and `-Wl,-z,max-page-size=16384` (Android 15's 16 KB-page devices will not load a 4 KB-aligned `.so` at all). Surface backend is a `SurfaceView` — `lockCanvas`/`unlockCanvasAndPost` on the Vyto thread, no compositor race. `vyto/mobile/android` supplies the JNI shims, `SafeArea` insets, and Android-native `net`/`intl` (the desktop `vyto/net` and `vyto/intl` do **not** compile for this triple — their shims include curl and ICU headers unconditionally). Verified rendering on a real device (Android 12, API 31, arm64-v8a); a signed apk builds with no Gradle. Touch works but is human-driven only — MIUI blocks `adb` event injection, so it is not in any automated test. Build checks live in their own runner (`tests/run_tests_android.sh`, 9 checks incl. 59 diffed JNI descriptors), deliberately outside `make test` so CI never downloads an NDK. |
 | **iOS** | 📋 Planned | No native surface shim or Xcode project. `apps/iphone` is a themed UI simulator running on the desktop backend, not an actual iOS build. |
 
 Legend: ✅ works today · 🚧 partially wired, unverified · 📋 not started.
+
+**Testing a non-host target.** `make test` runs on Linux. The other targets have
+their own runners, kept out of `make test` so CI needs no cross toolchain:
+
+| Runner | What it does |
+|---|---|
+| `make test-win` | Cross-builds 54 executables plus their goldens and a `run.ps1` into `tests/tmp/win-x64/`. It **stages only — nothing Windows executes on the Linux box.** Copy the directory to a Windows machine, run `run.ps1`, copy `results.txt` back. Goldens resolve `<name>.expected.windows-x64` before `<name>.expected`. |
+| `sh tests/run_tests_android.sh` | Builds the `.so` and the Java against a real NDK/SDK and checks both directions of the JNI boundary — every descriptor `javap`-diffed against the compiled Java, and `Native.java`'s `native` methods against the `.so`'s exports. Needs `$ANDROID_NDK_HOME` / `$ANDROID_SDK_HOME`. |
+
+Two behavioural differences worth knowing before you port an app:
+
+- **`os/worker` on Windows is a re-exec pool, not `fork()`.** Workers are the
+  same executable relaunched with `VYTO_WORKER_*` in the environment, re-running
+  `main` until they reach `new WorkerPool(...)` and divert into serve mode. So
+  **anything `main()` does before building the pool runs once per worker.**
+- **`vyto/net` and `vyto/intl` do not compile for `android-arm64`** — their shims
+  include curl and the ICU headers unconditionally. Android apps use
+  `vyto/mobile/android/{net,intl}` instead, which is why nothing in the tree
+  trips over it.
 
 ## License
 

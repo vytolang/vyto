@@ -1,0 +1,90 @@
+// for-in over your own types.
+//
+// A class with `fn len(): int` and `fn at(i: int): T` can be iterated with
+// for-in. There is no interface to implement and no iterator object: the loop
+// compiles to exactly the index loop you would otherwise have written, with the
+// container evaluated once and held for the loop.
+//
+//     for (let x in c)   ==   for (let i in 0..c.len()) { let x = c.at(i); ... }
+//
+// The point is that a container written in Vyto reads at the call site the same
+// way a builtin array does, without the language growing a trait system to say
+// so.
+
+class Playlist {
+    titles: string[];
+    plays: int[];
+
+    fn init() { this.titles = []; this.plays = []; }
+
+    builder fn add(title: string, plays: int) {
+        this.titles.push(title);
+        this.plays.push(plays);
+        return this;
+    }
+
+    fn len(): int { return this.titles.len; }
+    fn at(i: int): string { return this.titles[i]; }
+    fn playsAt(i: int): int { return this.plays[i]; }
+}
+
+// A container that computes its elements instead of storing them. `at` is
+// virtual, so a subclass changes what the *same* loop iterates.
+class Steps {
+    n: int;
+    fn init(n: int) { this.n = n; }
+    fn len(): int { return this.n; }
+    virtual fn at(i: int): int { return i; }
+}
+
+class Evens extends Steps {
+    fn init(n: int) { super.init(n); }
+    override fn at(i: int): int { return i * 2; }
+}
+
+fn describe(s: Steps): string {
+    let out = "";
+    for (let v in s) { out = out + str(v) + " "; }
+    return out;
+}
+
+fn main() {
+    let p = new Playlist()
+        .add("Blue in Green", 412)
+        .add("So What", 1180)
+        .add("Flamenco Sketches", 96);
+
+    print("---- iterate ----");
+    for (let t in p) { print(t); }
+
+    print("---- the index form still works, and is the same loop ----");
+    for (let i in 0..p.len()) { print(p.at(i) + " (" + str(p.playsAt(i)) + ")"); }
+
+    print("---- break and continue ----");
+    for (let t in p) {
+        if (t.len < 10) { continue; }
+        if (t == "Flamenco Sketches") { break; }
+        print("long: " + t);
+    }
+
+    print("---- nested ----");
+    for (let a in p) {
+        for (let b in p) {
+            if (a.len == b.len && a != b) { print(a + " / " + b); }
+        }
+    }
+
+    print("---- virtual at(): one loop, two sequences ----");
+    print(describe(new Steps(5)));
+    print(describe(new Evens(5)));
+
+    print("---- len() is re-read, so this terminates ----");
+    // Not a trap: it is the hand-written loop's behaviour, spelled shorter.
+    let q = new Playlist().add("one", 1);
+    let seen = 0;
+    for (let t in q) {
+        seen += 1;
+        if (q.len() < 4) { q.add(t + "!", 0); }
+    }
+    print(str(seen) + " tracks visited, " + str(q.len()) + " in the list");
+}

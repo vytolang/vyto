@@ -167,10 +167,21 @@ typedef enum BuiltinKind {
 /* ---------------- statements ---------------- */
 
 typedef enum StmtKind {
-    ST_LET, ST_EXPR, ST_IF, ST_WHILE, ST_FOR_RANGE, ST_FOR_EACH,
-    ST_RETURN, ST_BREAK, ST_CONTINUE, ST_BLOCK,
+    ST_LET, ST_EXPR, ST_IF, ST_WHILE, ST_FOR_RANGE, ST_FOR_EACH, ST_FOR_ITER,
+    ST_RETURN, ST_BREAK, ST_CONTINUE, ST_BLOCK, ST_SWITCH,
     ST_ARENA,   /* arena [name] { body } — lexical region (uses Stmt.name/body) */
 } StmtKind;
+
+/* One arm of a switch. `nvalues == 0 && is_default` is the default arm; the
+   values of a multi-value arm (`case 2, 3:`) all run the same body. */
+typedef struct SwitchArm {
+    Loc loc;
+    Expr **values;
+    int nvalues;
+    bool is_default;
+    Stmt **body;
+    int nbody;
+} SwitchArm;
 
 struct Stmt {
     StmtKind kind;
@@ -188,7 +199,16 @@ struct Stmt {
     int nels;
     /* for */
     Expr *range_lo, *range_hi; /* ST_FOR_RANGE */
-    Expr *iter;                /* ST_FOR_EACH: array expr */
+    Expr *iter;                /* ST_FOR_EACH: array expr. ST_FOR_ITER: container expr */
+    /* ST_FOR_ITER: the desugared index loop, built and checked by the checker.
+       `for (let x in c)` becomes `c.len()` / `c.at(i)` over hidden locals. */
+    Local *iter_local;         /* holds the container for the whole loop */
+    Local *index_local;        /* the loop counter */
+    Expr *len_call;            /* $c.len() */
+    Expr *at_call;             /* $c.at($i) */
+    /* switch: subject is `expr` */
+    SwitchArm *arms;
+    int narms;
     int region;                /* ST_ARENA: region id assigned by checker (names _rgn<id>) */
 };
 

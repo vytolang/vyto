@@ -1,0 +1,96 @@
+// vyto/coll/ring — a fixed-capacity ring buffer that overwrites its oldest
+// element instead of growing.
+//
+//     let log = ring_str(256);
+//     log.push(line);              // when full, the oldest line is dropped
+//     for (let l in log) { ... }   // oldest to newest
+//
+// The difference from `Deque` is the whole point: a Deque grows, a RingBuffer
+// does not. That makes it the right shape for anything with a bounded memory
+// budget and an unbounded input — a scrollback buffer, the last N frame times,
+// a rolling window over a sensor, a crash-log tail. Nothing here allocates
+// after `init`, so it is safe in a render loop or an interrupt-adjacent path.
+//
+// See `deque.vt` for why every container takes a `zero: T`.
+
+import { next_pow2 } from "vyto/coll/util";
+
+export class RingBuffer<T> {
+    buf: T[];
+    zero: T;
+    head: int;       // index of the oldest element
+    count: int;
+    mask: int;
+    dropped: int;    // how many were overwritten, for the caller that cares
+
+    fn init(cap: int, zero: T) {
+        let n = next_pow2(cap);
+        this.zero = zero;
+        this.buf = [];
+        this.buf.reserve(n);
+        for (let i in 0..n) { this.buf.push(zero); }
+        this.head = 0;
+        this.count = 0;
+        this.mask = n - 1;
+        this.dropped = 0;
+    }
+
+    fn len(): int { return this.count; }
+    fn cap(): int { return this.mask + 1; }
+    fn is_empty(): bool { return this.count == 0; }
+    fn is_full(): bool { return this.count == this.mask + 1; }
+
+    // How many elements have been silently overwritten since construction.
+    // A log viewer showing "… 1,204 earlier lines dropped" reads this.
+    fn dropped_count(): int { return this.dropped; }
+
+    // Oldest first: at(0) is the oldest surviving element.
+    fn at(i: int): T {
+        if (i < 0 || i >= this.count) { panic("RingBuffer.at: index out of range"); }
+        return this.buf[(this.head + i) & this.mask];
+    }
+
+    fn first(): T { return this.at(0); }
+    fn last(): T { return this.at(this.count - 1); }
+
+    // Append. When full this overwrites the oldest element and counts it —
+    // it never grows and never panics, which is the contract.
+    fn push(v: T) {
+        if (this.count == this.mask + 1) {
+            this.buf[this.head] = v;
+            this.head = (this.head + 1) & this.mask;
+            this.dropped += 1;
+            return;
+        }
+        this.buf[(this.head + this.count) & this.mask] = v;
+        this.count += 1;
+    }
+
+    // Remove and return the oldest. Panics when empty.
+    fn pop(): T {
+        if (this.count == 0) { panic("RingBuffer.pop: empty"); }
+        let v = this.buf[this.head];
+        this.buf[this.head] = this.zero;
+        this.head = (this.head + 1) & this.mask;
+        this.count -= 1;
+        return v;
+    }
+
+    fn clear() {
+        for (let i in 0..this.count) { this.buf[(this.head + i) & this.mask] = this.zero; }
+        this.head = 0;
+        this.count = 0;
+    }
+
+    // Snapshot, oldest first. Allocates; `for-in` does not.
+    fn toArray(): T[] {
+        let out: T[] = [];
+        out.reserve(this.count);
+        for (let i in 0..this.count) { out.push(this.buf[(this.head + i) & this.mask]); }
+        return out;
+    }
+}
+
+export fn ring_int(cap: int): RingBuffer<int>     { return new RingBuffer<int>(cap, 0); }
+export fn ring_float(cap: int): RingBuffer<float> { return new RingBuffer<float>(cap, 0.0); }
+export fn ring_str(cap: int): RingBuffer<string>  { return new RingBuffer<string>(cap, null); }

@@ -1,0 +1,253 @@
+// vyto/ds/graph — a directed weighted graph with no node objects.
+//
+//     let g = new Graph(n);
+//     g.add_edge(a, b, w);
+//     g.add_edge2(a, b, w);            // both directions
+//     let d = g.bfs(src);              // hop counts, -1 for unreachable
+//     let order = g.topo_sort();       // empty when there is a cycle
+//     let dist = g.dijkstra(src);      // shortest paths, non-negative weights
+//
+// ── WHY THERE ARE NO NODE OBJECTS ───────────────────────────────────────────
+// A graph of objects under reference counting is the canonical leak: A points
+// at B, B points back, neither refcount ever reaches zero, and nothing in Vyto
+// detects it. `weak` breaks a tree; it does not break a graph.
+//
+// Here a vertex is an `int` and the adjacency is three flat arrays — an
+// intrusive linked list of edges per vertex, threaded through `next`. There is
+// no reference anywhere, so there is nothing to leak, and adding an edge is two
+// pushes with no allocation per edge beyond the arrays' own doubling.
+//
+// Vertices are 0..n-1. To attach payloads, keep them in a `vyto/coll` Slab (or
+// any parallel array) and use the vertex id as the index — that is what the
+// arena rule looks like when it is applied all the way down.
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Weights are `int`. Dijkstra rejects negative ones rather than returning a
+// quietly wrong answer.
+
+import { Deque, deque_int } from "vyto/coll/deque";
+import { Heap, heap_int_min } from "vyto/coll/heap";
+
+const G_NONE: int = -1;
+
+// Large enough to mean "unreachable" and small enough that adding a weight to
+// it cannot overflow — which a true INT64_MAX sentinel would.
+export const INF: int = 4611686018427387904;    // 2^62
+
+export class Graph {
+    head: int[];    // first outgoing edge per vertex, or -1
+    next: int[];    // next edge from the same vertex, or -1
+    to: int[];      // destination per edge
+    w: int[];       // weight per edge
+    n: int;
+
+    fn init(n: int) {
+        this.n = n;
+        this.head = [];
+        this.head.reserve(n);
+        for (let i in 0..n) { this.head.push(G_NONE); }
+        this.next = [];
+        this.to = [];
+        this.w = [];
+    }
+
+    fn len(): int { return this.n; }
+    fn nedges(): int { return this.to.len; }
+
+    fn check(v: int) {
+        if (v < 0 || v >= this.n) { panic("Graph: vertex out of range"); }
+    }
+
+    // Directed edge u -> v.
+    fn add_edge(u: int, v: int, weight: int) {
+        this.check(u);
+        this.check(v);
+        this.to.push(v);
+        this.w.push(weight);
+        this.next.push(this.head[u]);
+        this.head[u] = this.to.len - 1;
+    }
+
+    // Undirected: both directions, as two edges.
+    fn add_edge2(u: int, v: int, weight: int) {
+        this.add_edge(u, v, weight);
+        this.add_edge(v, u, weight);
+    }
+
+    // Neighbours of v. Allocates; the walk below does not, and the traversals
+    // here all use the raw head/next chain.
+    fn neighbors(v: int): int[] {
+        this.check(v);
+        let out: int[] = [];
+        let e = this.head[v];
+        while (e != G_NONE) { out.push(this.to[e]); e = this.next[e]; }
+        return out;
+    }
+
+    fn out_degree(v: int): int {
+        this.check(v);
+        let d = 0;
+        let e = this.head[v];
+        while (e != G_NONE) { d += 1; e = this.next[e]; }
+        return d;
+    }
+
+    fn in_degrees(): int[] {
+        let deg: int[] = [];
+        deg.reserve(this.n);
+        for (let i in 0..this.n) { deg.push(0); }
+        for (let e in 0..this.to.len) { deg[this.to[e]] += 1; }
+        return deg;
+    }
+
+    // Hop count from `src` to every vertex; -1 where unreachable. Ignores
+    // weights — that is what `dijkstra` is for.
+    fn bfs(src: int): int[] {
+        this.check(src);
+        let dist: int[] = [];
+        dist.reserve(this.n);
+        for (let i in 0..this.n) { dist.push(-1); }
+        dist[src] = 0;
+        let q = deque_int(this.n);
+        q.push(src);
+        while (!q.is_empty()) {
+            let u = q.pop_front();
+            let e = this.head[u];
+            while (e != G_NONE) {
+                let v = this.to[e];
+                if (dist[v] < 0) { dist[v] = dist[u] + 1; q.push(v); }
+                e = this.next[e];
+            }
+        }
+        return dist;
+    }
+
+    // Vertices in depth-first preorder from `src`. Iterative, so depth is
+    // bounded by the heap and not by the C stack.
+    fn dfs(src: int): int[] {
+        this.check(src);
+        let seen: byte[] = bytes(this.n);
+        let out: int[] = [];
+        let stack: int[] = [];
+        stack.push(src);
+        while (stack.len > 0) {
+            let u = stack.pop();
+            if (seen[u] != 0 as byte) { continue; }
+            seen[u] = 1 as byte;
+            out.push(u);
+            let e = this.head[u];
+            while (e != G_NONE) {
+                if (seen[this.to[e]] == 0 as byte) { stack.push(this.to[e]); }
+                e = this.next[e];
+            }
+        }
+        return out;
+    }
+
+    // Vertices reachable from `src`, as a flag per vertex.
+    fn reachable(src: int): byte[] {
+        let seen: byte[] = bytes(this.n);
+        for (let v in this.dfs(src)) { seen[v] = 1 as byte; }
+        return seen;
+    }
+
+    // Kahn's algorithm. Returns every vertex in dependency order, or an EMPTY
+    // array when the graph has a cycle — a partial order is worse than none,
+    // because a caller that ignores the length would build in the wrong order.
+    fn topo_sort(): int[] {
+        let deg = this.in_degrees();
+        let q = deque_int(this.n);
+        for (let v in 0..this.n) { if (deg[v] == 0) { q.push(v); } }
+        let out: int[] = [];
+        out.reserve(this.n);
+        while (!q.is_empty()) {
+            let u = q.pop_front();
+            out.push(u);
+            let e = this.head[u];
+            while (e != G_NONE) {
+                let v = this.to[e];
+                deg[v] -= 1;
+                if (deg[v] == 0) { q.push(v); }
+                e = this.next[e];
+            }
+        }
+        if (out.len != this.n) { return []; }
+        return out;
+    }
+
+    fn has_cycle(): bool { return this.topo_sort().len == 0 && this.n > 0; }
+
+    // Shortest path by weight. Non-negative weights only; a negative one gets a
+    // panic rather than a silently wrong answer, because Dijkstra's whole
+    // argument is that a settled vertex can never improve.
+    //
+    // The frontier is a Heap<int> of (dist, vertex) packed into one int, so it
+    // needs no comparator over a captured array — closures cannot capture
+    // `this`, and packing is both simpler and faster than the alternative.
+    fn dijkstra(src: int): int[] {
+        this.check(src);
+        if (this.n > 0xFFFFFFF) { panic("Graph.dijkstra: too many vertices to pack"); }
+        for (let e in 0..this.w.len) {
+            if (this.w[e] < 0) { panic("Graph.dijkstra: negative edge weight"); }
+        }
+        let dist: int[] = [];
+        dist.reserve(this.n);
+        for (let i in 0..this.n) { dist.push(INF); }
+        dist[src] = 0;
+        let pq = heap_int_min(this.n);
+        pq.push(src);                          // dist 0, so the packed key is src
+        while (!pq.is_empty()) {
+            let packed = pq.pop();
+            let u = packed & 0xFFFFFFF;
+            let d = packed >> 28;
+            if (d > dist[u]) { continue; }     // a stale entry; the real one won
+            let e = this.head[u];
+            while (e != G_NONE) {
+                let v = this.to[e];
+                let nd = d + this.w[e];
+                if (nd < dist[v]) {
+                    dist[v] = nd;
+                    if (nd > 0x7FFFFFFFF) { panic("Graph.dijkstra: distance too large to pack"); }
+                    pq.push((nd << 28) | v);
+                }
+                e = this.next[e];
+            }
+        }
+        return dist;
+    }
+
+    // Connected components of the *undirected* reading of this graph, as a
+    // label per vertex. For a directed graph this is weak connectivity.
+    fn components(): int[] {
+        let lab: int[] = [];
+        lab.reserve(this.n);
+        for (let i in 0..this.n) { lab.push(-1); }
+        let next = 0;
+        for (let s in 0..this.n) {
+            if (lab[s] >= 0) { continue; }
+            let stack: int[] = [];
+            stack.push(s);
+            lab[s] = next;
+            while (stack.len > 0) {
+                let u = stack.pop();
+                let e = this.head[u];
+                while (e != G_NONE) {
+                    let v = this.to[e];
+                    if (lab[v] < 0) { lab[v] = next; stack.push(v); }
+                    e = this.next[e];
+                }
+            }
+            next += 1;
+        }
+        return lab;
+    }
+
+    fn clear_edges() {
+        for (let i in 0..this.n) { this.head[i] = G_NONE; }
+        this.next = [];
+        this.to = [];
+        this.w = [];
+    }
+}
+
+export fn graph(n: int): Graph { return new Graph(n); }

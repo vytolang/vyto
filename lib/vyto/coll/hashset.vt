@@ -1,0 +1,163 @@
+// vyto/coll/hashset — a set with elements of any type.
+//
+//     let seen = hashset_str(64);
+//     if (seen.add(word)) { print("first time: " + word); }
+//
+//     let ids = hashset_int(1024);
+//     ids.add(7);  ids.contains(7);  ids.remove(7);
+//
+// Deliberately not `HashMap<T, bool>`: a set has no values, and a parallel
+// array of bools that are all `true` is a byte per element bought for nothing.
+// Same open-addressed table and same backward-shift deletion as `hashmap.vt` —
+// read that file for why deletion works the way it does.
+//
+// For a set of *small integers* — ids under a few million, a visited-mark, a
+// sieve — `BitSet` is a bit per element instead of a slot, and is the better
+// tool by two orders of magnitude. Use this one when the elements are sparse,
+// large, or not integers at all.
+
+import { next_pow2 } from "vyto/coll/util";
+import { hash_int, hash_str } from "vyto/hash";
+
+const SET_EMPTY: int = 0;
+const SET_FULL:  int = 1;
+
+export class HashSet<T> {
+    elems: T[];
+    state: byte[];
+    zero: T;
+    hash: fn(T): int;
+    eq: fn(T, T): bool;
+    count: int;
+    mask: int;
+
+    fn init(cap: int, zero: T, hash: fn(T): int, eq: fn(T, T): bool) {
+        let n = next_pow2(cap * 4 / 3 + 1);
+        this.zero = zero;
+        this.hash = hash;
+        this.eq = eq;
+        this.count = 0;
+        this.mask = n - 1;
+        this.alloc(n);
+    }
+
+    fn len(): int { return this.count; }
+    fn is_empty(): bool { return this.count == 0; }
+
+    fn contains(v: T): bool { return this.find(v) >= 0; }
+
+    // Returns true when the element was NOT already present — so
+    // `if (seen.add(x))` is the idiomatic first-time-seen test.
+    fn add(v: T): bool {
+        if ((this.count + 1) * 4 > (this.mask + 1) * 3) { this.grow(); }
+        let i = this.slot_for(v);
+        if (this.state[i] == SET_FULL as byte) { return false; }
+        this.state[i] = SET_FULL as byte;
+        this.elems[i] = v;
+        this.count += 1;
+        return true;
+    }
+
+    fn remove(v: T): bool {
+        let i = this.find(v);
+        if (i < 0) { return false; }
+        this.count -= 1;
+        let hole = i;
+        let j = i;
+        while (true) {
+            j = (j + 1) & this.mask;
+            if (this.state[j] == SET_EMPTY as byte) { break; }
+            let ideal = this.hash(this.elems[j]) & this.mask;
+            let protected_run = false;
+            if (hole <= j) { protected_run = hole < ideal && ideal <= j; }
+            else           { protected_run = hole < ideal || ideal <= j; }
+            if (!protected_run) {
+                this.elems[hole] = this.elems[j];
+                hole = j;
+            }
+        }
+        this.state[hole] = SET_EMPTY as byte;
+        this.elems[hole] = this.zero;
+        return true;
+    }
+
+    fn clear() {
+        for (let i in 0..(this.mask + 1)) {
+            this.state[i] = SET_EMPTY as byte;
+            this.elems[i] = this.zero;
+        }
+        this.count = 0;
+    }
+
+    // Slot order, which is unspecified and changes on rehash.
+    fn toArray(): T[] {
+        let out: T[] = [];
+        out.reserve(this.count);
+        for (let i in 0..(this.mask + 1)) {
+            if (this.state[i] == SET_FULL as byte) { out.push(this.elems[i]); }
+        }
+        return out;
+    }
+
+    // Set algebra, in place. `other` is only read.
+    fn union_with(other: HashSet<T>) {
+        for (let v in other.toArray()) { this.add(v); }
+    }
+
+    fn intersect_with(other: HashSet<T>) {
+        for (let v in this.toArray()) { if (!other.contains(v)) { this.remove(v); } }
+    }
+
+    fn subtract(other: HashSet<T>) {
+        for (let v in other.toArray()) { this.remove(v); }
+    }
+
+    fn find(v: T): int {
+        let i = this.hash(v) & this.mask;
+        while (this.state[i] != SET_EMPTY as byte) {
+            if (this.eq(this.elems[i], v)) { return i; }
+            i = (i + 1) & this.mask;
+        }
+        return -1;
+    }
+
+    fn slot_for(v: T): int {
+        let i = this.hash(v) & this.mask;
+        while (this.state[i] != SET_EMPTY as byte) {
+            if (this.eq(this.elems[i], v)) { return i; }
+            i = (i + 1) & this.mask;
+        }
+        return i;
+    }
+
+    fn alloc(n: int) {
+        this.elems = [];
+        this.elems.reserve(n);
+        for (let i in 0..n) { this.elems.push(this.zero); }
+        this.state = bytes(n);
+    }
+
+    fn grow() {
+        let oe = this.elems;
+        let os = this.state;
+        let on = this.mask + 1;
+        this.mask = on * 2 - 1;
+        this.alloc(on * 2);
+        this.count = 0;
+        for (let i in 0..on) {
+            if (os[i] == SET_FULL as byte) {
+                let s = this.slot_for(oe[i]);
+                this.state[s] = SET_FULL as byte;
+                this.elems[s] = oe[i];
+                this.count += 1;
+            }
+        }
+    }
+}
+
+export fn hashset_int(cap: int): HashSet<int> {
+    return new HashSet<int>(cap, 0, (v) => hash_int(v), (a, b) => a == b);
+}
+export fn hashset_str(cap: int): HashSet<string> {
+    return new HashSet<string>(cap, null, (v) => hash_str(v), (a, b) => a == b);
+}

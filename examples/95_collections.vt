@@ -1,0 +1,116 @@
+// vyto/coll — the containers, in the shape a program actually uses them.
+//
+// A small job scheduler: work arrives, gets prioritised, runs, and the results
+// are cached. Every container here is doing the job it exists for, and the two
+// that matter most are the ones about memory rather than speed:
+//
+//   Slab   handles are ints, so a graph of them cannot form a reference cycle
+//   LRU    a cache that evicts, instead of a Map that grows forever
+
+import { Slab, Heap, LRU, HashSet, BitSet, Deque, RingBuffer,
+         deque_str, ring_str, lru_str_int, hashset_str, bitset } from "vyto/coll";
+import { hash_str } from "vyto/hash";
+
+class Job {
+    name: string;
+    cost: int;
+    deps: int[];        // Slab handles, not references — see below
+    fn init(n: string, c: int) { this.name = n; this.cost = c; this.deps = []; }
+}
+
+fn main() {
+    // ---- Slab: an object graph that cannot leak -------------------------
+    //
+    // Jobs depend on other jobs, and a dependency graph is a graph: with plain
+    // references, one cycle and the whole thing leaks, because Vyto is
+    // reference counted with no cycle collector. Here a dependency is an `int`
+    // handle. An integer holds nothing alive, so a cycle of them is not a
+    // reference cycle at all — it cannot leak, by construction.
+    let jobs = new Slab<Job>(16, null);
+    let build = jobs.alloc(new Job("build", 5));
+    let test = jobs.alloc(new Job("test", 3));
+    let ship = jobs.alloc(new Job("ship", 1));
+    jobs.get(test).deps.push(build);
+    jobs.get(ship).deps.push(test);
+    jobs.get(build).deps.push(ship);        // a cycle, deliberately, and it is fine
+
+    print("---- slab ----");
+    print(str(jobs.len()) + " jobs, " + str(jobs.capacity()) + " slots");
+    print(jobs.get(jobs.get(ship).deps[0]).name);
+
+    // Freeing bumps a generation counter, so the old handle does not silently
+    // start addressing whoever gets the slot next.
+    let scratch = jobs.alloc(new Job("scratch", 0));
+    jobs.free(scratch);
+    let reused = jobs.alloc(new Job("reused", 0));
+    print("stale handle still valid? " + str(jobs.alive(scratch)));
+    print("same slot, different handle? " + str(reused != scratch));
+
+    // ---- Heap: run the cheapest job first --------------------------------
+    print("---- heap ----");
+    let queue = new Heap<Job>(16, null, (a, b) => a.cost - b.cost);
+    for (let h in jobs.handles()) { queue.push(jobs.get(h)); }
+    let order = "";
+    while (!queue.is_empty()) { order = order + queue.pop().name + " "; }
+    print(order);
+
+    // ---- Deque: a work queue with O(1) at both ends ----------------------
+    //
+    // A `T[]` used as a queue dequeues with remove_at(0), which shifts every
+    // remaining element. This does not.
+    print("---- deque ----");
+    let todo = deque_str(8);
+    todo.push("compile");
+    todo.push("link");
+    todo.push_front("fetch");          // an urgent one jumps the line
+    let ran = "";
+    while (!todo.is_empty()) { ran = ran + todo.pop_front() + " "; }
+    print(ran);
+
+    // ---- LRU: a cache that evicts ----------------------------------------
+    print("---- lru ----");
+    let cache = lru_str_int(3);
+    cache.put("build", 5);
+    cache.put("test", 3);
+    cache.put("ship", 1);
+    let hit = cache.get_or("build", -1);        // build becomes most-recent
+    cache.put("docs", 9);                        // evicts "test", the oldest use
+    print("build cached: " + str(hit));
+    print("test survived: " + str(cache.has("test")));
+    print("order: " + cache.keysByRecency().join(", "));
+    print("evictions: " + str(cache.evictions));
+
+    // ---- HashSet + BitSet: two ways to say "seen" ------------------------
+    print("---- sets ----");
+    let seen_names = hashset_str(16);
+    for (let h in jobs.handles()) { seen_names.add(jobs.get(h).name); }
+    print(str(seen_names.len()) + " distinct names");
+    let first = seen_names.add("build");
+    print("adding a duplicate: " + str(first));
+
+    // For dense small integers a BitSet is a bit each, not a slot each — a
+    // million flags is 125 KB rather than a megabyte.
+    let done = bitset(1000);
+    done.set(7);
+    done.set(11);
+    done.set(999);
+    print("done count: " + str(done.count()));
+    print("first done after 8: " + str(done.next_set(8)));
+
+    // ---- RingBuffer: a bounded log ---------------------------------------
+    //
+    // Unbounded input, bounded memory: it drops the oldest instead of growing,
+    // and tells you how many it dropped.
+    print("---- ring ----");
+    let log = ring_str(4);
+    for (let i in 0..10) { log.push("line " + str(i)); }
+    print(log.toArray().join(" | "));
+    print("dropped " + str(log.dropped_count()) + " earlier lines");
+
+    // ---- for-in works on all of them -------------------------------------
+    //
+    // A class with len() and at(i) iterates with for-in. No interface, no
+    // iterator object: it compiles to the index loop you would have written.
+    print("---- for-in ----");
+    for (let line in log) { print(line); }
+}

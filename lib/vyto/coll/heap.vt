@@ -1,0 +1,151 @@
+// vyto/coll/heap — a binary heap, i.e. a priority queue.
+//
+//     let h = heap_int_min(16);
+//     h.push(5); h.push(1); h.push(3);
+//     print(str(h.pop()));            // 1
+//
+//     let jobs = new Heap<Job>(16, null, (a, b) => a.due - b.due);
+//     while (!jobs.is_empty()) { run(jobs.pop()); }
+//
+// `cmp(a, b) < 0` means a comes out first, matching `vyto/util/sort`. So the
+// natural integer comparator `(a, b) => a - b` gives a *min*-heap; negate it for
+// a max-heap, or use the `heap_int_max` factory.
+//
+// Ordering is a closure field rather than a bound on T, for the same reason
+// `Signal<T>` carries an `eq`: v1 generics have no bounds, so ordering is
+// supplied, never inferred. See `deque.vt` for why there is a `zero: T`.
+//
+// One flat array, no nodes: the children of i are 2i+1 and 2i+2. push and pop
+// are O(log n) with one comparison chain each and no allocation beyond the
+// array's own doubling.
+
+export class Heap<T> {
+    xs: T[];
+    zero: T;
+    cmp: fn(T, T): int;
+
+    fn init(cap: int, zero: T, cmp: fn(T, T): int) {
+        this.xs = [];
+        if (cap > 0) { this.xs.reserve(cap); }
+        this.zero = zero;
+        this.cmp = cmp;
+    }
+
+    fn len(): int { return this.xs.len; }
+    fn is_empty(): bool { return this.xs.len == 0; }
+
+    // Heap order is not sort order: at(0) is the minimum, the rest is only
+    // partially ordered. Iterating a Heap visits every element exactly once, in
+    // no useful order — use `drain()` when order matters.
+    fn at(i: int): T { return this.xs[i]; }
+
+    fn peek(): T {
+        if (this.xs.len == 0) { panic("Heap.peek: empty"); }
+        return this.xs[0];
+    }
+
+    fn push(v: T) {
+        this.xs.push(v);
+        this.sift_up(this.xs.len - 1);
+    }
+
+    fn pop(): T {
+        let n = this.xs.len;
+        if (n == 0) { panic("Heap.pop: empty"); }
+        let top = this.xs[0];
+        let last = this.xs.pop();
+        if (n > 1) {
+            this.xs[0] = last;
+            this.sift_down(0);
+        }
+        return top;
+    }
+
+    // Replace the minimum in one pass instead of pop-then-push. Worth it in a
+    // merge or a top-k loop, which is where a heap earns its keep.
+    fn replace_top(v: T): T {
+        if (this.xs.len == 0) { panic("Heap.replace_top: empty"); }
+        let top = this.xs[0];
+        this.xs[0] = v;
+        this.sift_down(0);
+        return top;
+    }
+
+    // Push, then pop the minimum of (heap + v). Cheaper than push+pop when v is
+    // already the smallest, which is the common case in a bounded top-k.
+    fn push_pop(v: T): T {
+        if (this.xs.len == 0 || this.cmp(v, this.xs[0]) <= 0) { return v; }
+        return this.replace_top(v);
+    }
+
+    fn clear() { this.xs.clear(); }
+
+    // Rebuild from an arbitrary array in O(n) — Floyd's method, which beats n
+    // pushes at O(n log n). The array is copied, not adopted.
+    fn heapify(src: T[]) {
+        this.xs = [];
+        this.xs.reserve(src.len);
+        for (let v in src) { this.xs.push(v); }
+        let i = this.xs.len / 2 - 1;
+        while (i >= 0) { this.sift_down(i); i -= 1; }
+    }
+
+    // Everything in sorted order, emptying the heap. This is heapsort.
+    fn drain(): T[] {
+        let out: T[] = [];
+        out.reserve(this.xs.len);
+        while (this.xs.len > 0) { out.push(this.pop()); }
+        return out;
+    }
+
+    fn sift_up(start: int) {
+        let i = start;
+        let v = this.xs[i];
+        while (i > 0) {
+            let parent = (i - 1) / 2;
+            if (this.cmp(v, this.xs[parent]) >= 0) { break; }
+            this.xs[i] = this.xs[parent];
+            i = parent;
+        }
+        this.xs[i] = v;
+    }
+
+    fn sift_down(start: int) {
+        let n = this.xs.len;
+        let i = start;
+        let v = this.xs[i];
+        while (true) {
+            let child = 2 * i + 1;
+            if (child >= n) { break; }
+            // Take the smaller child, so the parent ends up below both.
+            if (child + 1 < n && this.cmp(this.xs[child + 1], this.xs[child]) < 0) {
+                child += 1;
+            }
+            if (this.cmp(this.xs[child], v) >= 0) { break; }
+            this.xs[i] = this.xs[child];
+            i = child;
+        }
+        this.xs[i] = v;
+    }
+}
+
+export fn heap_int_min(cap: int): Heap<int> {
+    return new Heap<int>(cap, 0, (a, b) => a - b);
+}
+export fn heap_int_max(cap: int): Heap<int> {
+    return new Heap<int>(cap, 0, (a, b) => b - a);
+}
+// Floats do not subtract into an int comparator safely — the difference can
+// overflow, round to zero, or be NaN — so ordering goes through a real compare.
+export fn cmp_float(a: float, b: float): int {
+    if (a < b) { return -1; }
+    if (a > b) { return 1; }
+    return 0;
+}
+
+export fn heap_float_min(cap: int): Heap<float> {
+    return new Heap<float>(cap, 0.0, (a, b) => cmp_float(a, b));
+}
+export fn heap_float_max(cap: int): Heap<float> {
+    return new Heap<float>(cap, 0.0, (a, b) => cmp_float(b, a));
+}

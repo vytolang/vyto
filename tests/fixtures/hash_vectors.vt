@@ -1,0 +1,202 @@
+// vyto/hash — known-answer tests.
+//
+// Every value below comes from somewhere other than this implementation:
+// FNV-1a and CRC-32/CRC-32C from their published test vectors, xxHash64 from
+// the reference implementation's documented values, and SipHash-2-4 from the
+// vectors in Aumasson & Bernstein's paper (key 000102…0f, message = the first
+// N bytes of 000102…). A hash that only agrees with itself proves nothing —
+// the whole point of a hash is that two programs compute the same number.
+//
+// The three exceptions, all self-consistency by nature rather than laziness:
+// mix64 (splitmix64's finalizer, checked against an independent transcription),
+// and hash_str / hash_combine, which are this library's own compositions and
+// are checked for the properties callers rely on rather than against a
+// published constant.
+
+import { fnv1a_32, fnv1a_64, fnv1a_32_str, fnv1a_64_str,
+         xxh64, xxh64_str, siphash24, siphash24_str,
+         crc32, crc32c, crc32_str, Crc, CRC32_IEEE, CRC32C,
+         mix64, hash_int, hash_str, hash_bytes, hash_combine, str_bytes } from "vyto/hash";
+import { hex } from "vyto/util/fmt";
+
+fn h64(v: u64): string { return hex(v as int).pad_start(16, "0"); }
+fn h32(v: int): string { return hex(v).pad_start(8, "0"); }
+
+fn check(name: string, got: string, want: string) {
+    if (got == want) { print("ok    " + name); }
+    else { print("FAIL  " + name + " got=" + got + " want=" + want); }
+}
+
+fn checkBool(name: string, got: bool) {
+    if (got) { print("ok    " + name); }
+    else { print("FAIL  " + name); }
+}
+
+// The paper's SipHash key: bytes 00..0f, read little-endian as two u64s.
+const SIP_K0: u64 = 0x0706050403020100;
+const SIP_K1: u64 = 0x0F0E0D0C0B0A0908;
+
+// bytes 00..n-1, the SipHash vector messages
+fn seq(n: int): byte[] {
+    let b = bytes(n);
+    for (let i in 0..n) { b[i] = i as byte; }
+    return b;
+}
+
+fn main() {
+    print("---- FNV-1a 32 ----");
+    check("fnv32 empty",   h32(fnv1a_32_str("")),       "811c9dc5");
+    check("fnv32 a",       h32(fnv1a_32_str("a")),      "e40c292c");
+    check("fnv32 abc",     h32(fnv1a_32_str("abc")),    "1a47e90b");
+    check("fnv32 foobar",  h32(fnv1a_32_str("foobar")), "bf9cf968");
+    check("fnv32 digest",  h32(fnv1a_32_str("message digest")), "b2c0f234");
+    check("fnv32 alpha",   h32(fnv1a_32_str("abcdefghijklmnopqrstuvwxyz")), "b0bc0c82");
+    check("fnv32 bytes==str", h32(fnv1a_32(str_bytes("foobar"))), h32(fnv1a_32_str("foobar")));
+
+    print("---- FNV-1a 64 ----");
+    check("fnv64 empty",   h64(fnv1a_64_str("")),       "cbf29ce484222325");
+    check("fnv64 a",       h64(fnv1a_64_str("a")),      "af63dc4c8601ec8c");
+    check("fnv64 abc",     h64(fnv1a_64_str("abc")),    "e71fa2190541574b");
+    check("fnv64 foobar",  h64(fnv1a_64_str("foobar")), "85944171f73967e8");
+    check("fnv64 digest",  h64(fnv1a_64_str("message digest")), "2dcbcce86fce9934");
+    check("fnv64 alpha",   h64(fnv1a_64_str("abcdefghijklmnopqrstuvwxyz")), "8450deb1cdc382a2");
+    check("fnv64 bytes==str", h64(fnv1a_64(str_bytes("foobar"))), h64(fnv1a_64_str("foobar")));
+
+    print("---- xxHash64, seed 0 ----");
+    // Short inputs take the tail-only path; the fox sentence (43 bytes) is the
+    // one that exercises the four-accumulator 32-byte stripe loop.
+    check("xxh64 empty",  h64(xxh64_str("", 0)),    "ef46db3751d8e999");
+    check("xxh64 a",      h64(xxh64_str("a", 0)),   "d24ec4f1a98c6e5b");
+    check("xxh64 abc",    h64(xxh64_str("abc", 0)), "44bc2cf5ad770999");
+    check("xxh64 digest", h64(xxh64_str("message digest", 0)), "066ed728fceeb3be");
+    check("xxh64 digits", h64(xxh64_str("123456789", 0)), "8cb841db40e6ae83");
+    check("xxh64 alpha",  h64(xxh64_str("abcdefghijklmnopqrstuvwxyz", 0)), "cfe1f278fa89835c");
+    check("xxh64 fox",    h64(xxh64_str("The quick brown fox jumps over the lazy dog", 0)),
+                          "0b242d361fda71bc");
+    check("xxh64 seq64",  h64(xxh64(seq(64), 0)), "f7c67301db6713f0");
+
+    print("---- xxHash64, seed 0x9E3779B1 ----");
+    check("xxh64s empty",  h64(xxh64_str("", 0x9E3779B1)),    "ac75fda2929b17ef");
+    check("xxh64s a",      h64(xxh64_str("a", 0x9E3779B1)),   "393da8b78992279b");
+    check("xxh64s abc",    h64(xxh64_str("abc", 0x9E3779B1)), "1318df30094a85fd");
+    check("xxh64s fox",    h64(xxh64_str("The quick brown fox jumps over the lazy dog", 0x9E3779B1)),
+                           "b31b9019ec176b0c");
+    check("xxh64s seq64",  h64(xxh64(seq(64), 0x9E3779B1)), "6e545403b828cf8b");
+    checkBool("xxh64 seed changes the hash", xxh64_str("abc", 0) != xxh64_str("abc", 1));
+
+    print("---- SipHash-2-4, paper vectors ----");
+    // Message = the first N bytes of 00..0f, for N = 0..15. Covers every
+    // tail length, which is where a length-padding bug hides.
+    check("sip len 0",  h64(siphash24(seq(0),  SIP_K0, SIP_K1)), "726fdb47dd0e0e31");
+    check("sip len 1",  h64(siphash24(seq(1),  SIP_K0, SIP_K1)), "74f839c593dc67fd");
+    check("sip len 2",  h64(siphash24(seq(2),  SIP_K0, SIP_K1)), "0d6c8009d9a94f5a");
+    check("sip len 3",  h64(siphash24(seq(3),  SIP_K0, SIP_K1)), "85676696d7fb7e2d");
+    check("sip len 4",  h64(siphash24(seq(4),  SIP_K0, SIP_K1)), "cf2794e0277187b7");
+    check("sip len 5",  h64(siphash24(seq(5),  SIP_K0, SIP_K1)), "18765564cd99a68d");
+    check("sip len 6",  h64(siphash24(seq(6),  SIP_K0, SIP_K1)), "cbc9466e58fee3ce");
+    check("sip len 7",  h64(siphash24(seq(7),  SIP_K0, SIP_K1)), "ab0200f58b01d137");
+    check("sip len 8",  h64(siphash24(seq(8),  SIP_K0, SIP_K1)), "93f5f5799a932462");
+    check("sip len 9",  h64(siphash24(seq(9),  SIP_K0, SIP_K1)), "9e0082df0ba9e4b0");
+    check("sip len 10", h64(siphash24(seq(10), SIP_K0, SIP_K1)), "7a5dbbc594ddb9f3");
+    check("sip len 11", h64(siphash24(seq(11), SIP_K0, SIP_K1)), "f4b32f46226bada7");
+    check("sip len 12", h64(siphash24(seq(12), SIP_K0, SIP_K1)), "751e8fbc860ee5fb");
+    check("sip len 13", h64(siphash24(seq(13), SIP_K0, SIP_K1)), "14ea5627c0843d90");
+    check("sip len 14", h64(siphash24(seq(14), SIP_K0, SIP_K1)), "f723ca908e7af2ee");
+    check("sip len 15", h64(siphash24(seq(15), SIP_K0, SIP_K1)), "a129ca6149be45e5");
+    check("sip abc",    h64(siphash24_str("abc", SIP_K0, SIP_K1)), "5dbcfa53aa2007a5");
+    check("sip fox",    h64(siphash24_str("The quick brown fox jumps over the lazy dog",
+                                          SIP_K0, SIP_K1)), "52276105dc1f6fe4");
+    checkBool("sip key changes the hash",
+              siphash24_str("abc", SIP_K0, SIP_K1) != siphash24_str("abc", SIP_K0, SIP_K1 + 1));
+
+    print("---- CRC-32 ----");
+    check("crc32 empty",  h32(crc32_str("")),          "00000000");
+    check("crc32 a",      h32(crc32_str("a")),         "e8b7be43");
+    check("crc32 abc",    h32(crc32_str("abc")),       "352441c2");
+    check("crc32 digest", h32(crc32_str("message digest")), "20159d7f");
+    check("crc32 check",  h32(crc32_str("123456789")), "cbf43926");
+    check("crc32 alpha",  h32(crc32_str("abcdefghijklmnopqrstuvwxyz")), "4c2750bd");
+    check("crc32 seq64",  h32(crc32(seq(64))),         "100ece8c");
+
+    print("---- CRC-32C ----");
+    check("crc32c empty",  h32(crc32c(str_bytes(""))),          "00000000");
+    check("crc32c a",      h32(crc32c(str_bytes("a"))),         "c1d04330");
+    check("crc32c abc",    h32(crc32c(str_bytes("abc"))),       "364b3fb7");
+    check("crc32c check",  h32(crc32c(str_bytes("123456789"))), "e3069283");
+    check("crc32c alpha",  h32(crc32c(str_bytes("abcdefghijklmnopqrstuvwxyz"))), "9ee6ef25");
+    check("crc32c seq64",  h32(crc32c(seq(64))),                "fb6d36eb");
+
+    print("---- Crc: the table agrees with the bitwise form ----");
+    let ieee = new Crc(CRC32_IEEE);
+    let cast = new Crc(CRC32C);
+    check("Crc ieee check", h32(ieee.of(str_bytes("123456789"))), "cbf43926");
+    check("Crc c check",    h32(cast.of(str_bytes("123456789"))), "e3069283");
+    check("Crc ieee seq64", h32(ieee.of(seq(64))), h32(crc32(seq(64))));
+    check("Crc c fox",      h32(cast.of(str_bytes("The quick brown fox jumps over the lazy dog"))),
+                            h32(crc32c(str_bytes("The quick brown fox jumps over the lazy dog"))));
+
+    // Streaming must equal the one-shot: this is what a file checksum relies on.
+    let acc = ieee.begin();
+    acc = ieee.update(acc, str_bytes("1234"));
+    acc = ieee.update(acc, str_bytes("56789"));
+    check("Crc streaming == one-shot", h32(ieee.finish(acc)), "cbf43926");
+    let empty_acc = ieee.begin();
+    check("Crc streaming empty", h32(ieee.finish(empty_acc)), "00000000");
+
+    print("---- mix64 ----");
+    check("mix64 0",   h64(mix64(0)),                  "e220a8397b1dcdaf");
+    check("mix64 1",   h64(mix64(1)),                  "910a2dec89025cc1");
+    check("mix64 2",   h64(mix64(2)),                  "975835de1c9756ce");
+    check("mix64 dead", h64(mix64(0xDEADBEEF)),        "4adfb90f68c9eb9b");
+    check("mix64 max", h64(mix64(0xFFFFFFFFFFFFFFFF)), "e4d971771b652c20");
+
+    print("---- table helpers ----");
+    // The properties a Map actually depends on, rather than a constant.
+    checkBool("hash_int non-negative",  hash_int(-1) >= 0 && hash_int(0) >= 0);
+    checkBool("hash_str non-negative",  hash_str("") >= 0 && hash_str("user:42") >= 0);
+    checkBool("hash_bytes non-negative", hash_bytes(seq(9)) >= 0);
+    checkBool("hash_int is a function", hash_int(7) == hash_int(7));
+    checkBool("hash_str is a function", hash_str("k") == hash_str("k"));
+    checkBool("hash_str agrees with hash_bytes",
+              hash_str("abcdef") == hash_bytes(str_bytes("abcdef")));
+
+    // Sequential ids must not land in adjacent low buckets — that is the whole
+    // reason hash_int is mix64 and not the identity.
+    let lowbits: int[] = [];
+    for (let i in 0..8) { lowbits.push(hash_int(i) & 7); }
+    let distinct = 0;
+    for (let i in 0..8) {
+        let seen = false;
+        for (let j in 0..i) { if (lowbits[j] == lowbits[i]) { seen = true; } }
+        if (!seen) { distinct += 1; }
+    }
+    checkBool("hash_int scatters sequential ids", distinct >= 5);
+
+    checkBool("hash_combine is order-dependent", hash_combine(1, 2) != hash_combine(2, 1));
+    checkBool("hash_combine non-negative", hash_combine(-3, -4) >= 0);
+    checkBool("hash_combine is a function", hash_combine(5, 9) == hash_combine(5, 9));
+
+    print("---- edge cases ----");
+    // An embedded NUL must be hashed, not treated as a terminator.
+    let nul = bytes(3);
+    nul[0] = 97 as byte; nul[1] = 0 as byte; nul[2] = 98 as byte;
+    let ab = str_bytes("ab");
+    checkBool("NUL is data, not a terminator", fnv1a_64(nul) != fnv1a_64(ab));
+    checkBool("xxh64 sees the NUL too", xxh64(nul, 0) != xxh64(ab, 0));
+
+    // Trailing zero bytes must change the hash — SipHash's length padding and
+    // xxHash's length mixing are exactly what guarantee this.
+    let z1 = bytes(1);
+    let z2 = bytes(2);
+    checkBool("length is mixed in (sip)", siphash24(z1, SIP_K0, SIP_K1) != siphash24(z2, SIP_K0, SIP_K1));
+    checkBool("length is mixed in (xxh)", xxh64(z1, 0) != xxh64(z2, 0));
+    checkBool("length is mixed in (crc)", crc32(z1) != crc32(z2));
+
+    // Every tail length through the xxHash 8/4/1 ladder.
+    for (let n in 0..40) {
+        let a = xxh64(seq(n), 0);
+        let b = xxh64(seq(n), 0);
+        if (a != b) { print("FAIL  xxh64 not deterministic at len " + str(n)); }
+    }
+    print("ok    xxh64 deterministic for lengths 0..39");
+}

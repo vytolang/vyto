@@ -1,0 +1,400 @@
+// vyto/coll — the containers, and the properties they promise.
+//
+// Note on style: every call with a side effect gets its own statement. Vyto
+// evaluates binary operands right to left (docs/strings.md:114), so
+// `str(s.add(x)) + str(s.contains(x))` runs `contains` first and reads
+// backwards. That is a language rule, not a container quirk, and a test that
+// trips over it reports a library bug that is not there.
+
+import { fmt_ints } from "collhelp";
+import { Deque, deque_int, deque_str,
+         RingBuffer, ring_int,
+         Heap, heap_int_min, heap_int_max, heap_float_min,
+         HashMap, hashmap_int_str, hashmap_str_int,
+         HashSet, hashset_int, hashset_str,
+         BitSet, bitset,
+         LRU, lru_str_int,
+         Slab, slab_str, NIL,
+         next_pow2, popcount64, ctz64 } from "vyto/coll";
+import { hash_int } from "vyto/hash";
+
+class Job {
+    name: string;
+    due: int;
+    fn init(n: string, d: int) { this.name = n; this.due = d; }
+}
+
+fn check(name: string, got: string, want: string) {
+    if (got == want) { print("ok    " + name); }
+    else { print("FAIL  " + name + " got=" + got + " want=" + want); }
+}
+
+fn checkInt(name: string, got: int, want: int) { check(name, str(got), str(want)); }
+fn checkBool(name: string, got: bool) {
+    if (got) { print("ok    " + name); } else { print("FAIL  " + name); }
+}
+
+fn main() {
+    print("---- util ----");
+    checkInt("next_pow2 floor is 8", next_pow2(1), 8);
+    checkInt("next_pow2 exact", next_pow2(64), 64);
+    checkInt("next_pow2 rounds up", next_pow2(65), 128);
+    checkInt("popcount 0", popcount64(0), 0);
+    checkInt("popcount all", popcount64(0xFFFFFFFFFFFFFFFF), 64);
+    checkInt("popcount sparse", popcount64(0x8000000000000001), 2);
+    checkInt("ctz 1", ctz64(1), 0);
+    checkInt("ctz high", ctz64(0x8000000000000000), 63);
+    checkInt("ctz zero is 64", ctz64(0), 64);
+
+    print("---- Deque ----");
+    let q = deque_int(4);
+    for (let i in 0..10) { q.push(i); }
+    checkInt("deque len after growth", q.len(), 10);
+    checkBool("deque grew past its hint", q.cap() >= 10);
+    checkInt("deque first", q.first(), 0);
+    checkInt("deque last", q.last(), 9);
+    checkInt("deque at", q.at(5), 5);
+    let popped_front = q.pop_front();
+    let popped_back = q.pop();
+    checkInt("deque pop_front", popped_front, 0);
+    checkInt("deque pop", popped_back, 9);
+    q.push_front(99);
+    checkInt("deque push_front", q.first(), 99);
+    checkInt("deque len after pops", q.len(), 9);
+    check("deque for-in order", fmt_ints(q.toArray()), "99,1,2,3,4,5,6,7,8");
+
+    // for-in must agree with toArray, element for element.
+    let via_loop: int[] = [];
+    for (let v in q) { via_loop.push(v); }
+    check("deque for-in == toArray", fmt_ints(via_loop), fmt_ints(q.toArray()));
+
+    // Wrapping: drive head past the end and back.
+    let w = deque_int(8);
+    for (let round in 0..5) {
+        for (let i in 0..6) { w.push(i); }
+        for (let i in 0..6) { w.pop_front(); }
+    }
+    checkInt("deque survives repeated wrap", w.len(), 0);
+    w.push(1); w.push(2);
+    check("deque still correct after wrap", fmt_ints(w.toArray()), "1,2");
+
+    q.compact();
+    checkInt("deque compact keeps contents", q.len(), 9);
+    check("deque compact order", fmt_ints(q.toArray()), "99,1,2,3,4,5,6,7,8");
+
+    let ds = deque_str(2);
+    ds.push("b"); ds.push_front("a"); ds.push("c");
+    check("deque of strings", ds.toArray().join("-"), "a-b-c");
+    ds.clear();
+    checkInt("deque clear", ds.len(), 0);
+
+    // A generic container over an app class — impossible before cross-module
+    // generic instantiation with class type arguments.
+    let dj = new Deque<Job>(2, null);
+    dj.push(new Job("a", 3));
+    dj.push(new Job("b", 1));
+    let names = "";
+    for (let j in dj) { names = names + j.name; }
+    check("deque of a user class", names, "ab");
+
+    print("---- RingBuffer ----");
+    let r = ring_int(4);
+    for (let i in 0..10) { r.push(i); }
+    checkInt("ring never exceeds capacity", r.len(), 8);
+    checkInt("ring counts what it dropped", r.dropped_count(), 2);
+    check("ring keeps the newest", fmt_ints(r.toArray()), "2,3,4,5,6,7,8,9");
+    checkInt("ring first is oldest", r.first(), 2);
+    checkInt("ring last is newest", r.last(), 9);
+    checkBool("ring is full", r.is_full());
+    let rp = r.pop();
+    checkInt("ring pop takes the oldest", rp, 2);
+    checkInt("ring len after pop", r.len(), 7);
+
+    print("---- Heap ----");
+    let h = heap_int_min(4);
+    for (let v in [5, 1, 9, 3, 7, 2, 8]) { h.push(v); }
+    checkInt("heap peek is the min", h.peek(), 1);
+    check("heap drains in order", fmt_ints(h.drain()), "1,2,3,5,7,8,9");
+    checkBool("heap is empty after drain", h.is_empty());
+
+    let mx = heap_int_max(4);
+    mx.heapify([5, 1, 9, 3, 7]);
+    check("heapify then drain, max order", fmt_ints(mx.drain()), "9,7,5,3,1");
+
+    let hp = heap_int_min(4);
+    hp.push(5); hp.push(3);
+    let pp1 = hp.push_pop(1);
+    checkInt("push_pop returns v when v is smallest", pp1, 1);
+    let pp2 = hp.push_pop(4);
+    checkInt("push_pop otherwise returns the top", pp2, 3);
+    check("push_pop leaves the heap sound", fmt_ints(hp.drain()), "4,5");
+
+    let hr = heap_int_min(4);
+    hr.push(2); hr.push(8);
+    let old = hr.replace_top(6);
+    checkInt("replace_top returns the old min", old, 2);
+    check("replace_top re-sifts", fmt_ints(hr.drain()), "6,8");
+
+    let hf = heap_float_min(4);
+    hf.push(2.5); hf.push(0.5); hf.push(1.5);
+    let f1 = hf.pop();
+    checkBool("float heap orders correctly", f1 == 0.5);
+
+    // Ordering by an explicit comparator over a user class.
+    let jobs = new Heap<Job>(4, null, (a, b) => a.due - b.due);
+    jobs.push(new Job("late", 30));
+    jobs.push(new Job("soon", 1));
+    jobs.push(new Job("mid", 10));
+    check("heap of a user class, by cmp", jobs.pop().name, "soon");
+
+    print("---- HashMap ----");
+    let m = hashmap_int_str(4);
+    for (let i in 0..200) { m.put(i, "v" + str(i)); }
+    checkInt("hashmap grows", m.len(), 200);
+    check("hashmap get", m.get(137), "v137");
+    check("hashmap get_or on a miss", m.get_or(9999, "none"), "none");
+    checkBool("hashmap has", m.has(199));
+    checkBool("hashmap has on a miss", !m.has(200));
+
+    let was_new = m.put(5, "five");
+    checkBool("put on an existing key returns false", !was_new);
+    check("put overwrites", m.get(5), "five");
+    checkInt("overwrite does not change len", m.len(), 200);
+    m.put(5, "v5");   // restore, so the sweep below can check every value
+
+    // Delete half, then verify every key: this is the backward-shift test. A
+    // tombstoned table passes lookups and degrades; a broken shift loses keys.
+    for (let i in 0..100) { m.remove(i * 2); }
+    checkInt("hashmap len after 100 removals", m.len(), 100);
+    let missing = 0;
+    let ghost = 0;
+    for (let i in 0..200) {
+        if (i % 2 == 1) {
+            if (!m.has(i)) { missing += 1; }
+            else { if (m.get(i) != "v" + str(i)) { ghost += 1; } }
+        } else {
+            if (m.has(i)) { ghost += 1; }
+        }
+    }
+    checkInt("no surviving key was lost", missing, 0);
+    checkInt("no removed key came back", ghost, 0);
+
+    let removed_again = m.remove(0);
+    checkBool("removing a missing key returns false", !removed_again);
+    checkInt("keyList matches len", m.keyList().len, 100);
+    checkInt("valueList matches len", m.valueList().len, 100);
+    m.clear();
+    checkInt("hashmap clear", m.len(), 0);
+    checkBool("hashmap clear really removes", !m.has(1));
+
+    let ms = hashmap_str_int(4);
+    ms.put("alpha", 1); ms.put("beta", 2); ms.put("gamma", 3);
+    checkInt("string keys", ms.get("beta"), 2);
+    ms.remove("beta");
+    checkBool("string key removed", !ms.has("beta"));
+    checkBool("neighbours survive", ms.has("alpha") && ms.has("gamma"));
+
+    // Keys of a user class, hashed and compared by a field.
+    let mj = new HashMap<Job, int>(8, null, 0, (k) => hash_int(k.due), (a, b) => a.due == b.due);
+    mj.put(new Job("a", 1), 10);
+    mj.put(new Job("b", 2), 20);
+    checkInt("user-class key looked up by value", mj.get(new Job("other", 2)), 20);
+
+    // Every key colliding: the probe sequence has to stay correct.
+    let coll = new HashMap<int, int>(8, 0, 0, (k) => 0, (a, b) => a == b);
+    for (let i in 0..40) { coll.put(i, i * i); }
+    checkInt("all-collide table holds everything", coll.len(), 40);
+    checkInt("all-collide lookup", coll.get(37), 1369);
+    for (let i in 0..20) { coll.remove(i); }
+    checkInt("all-collide after removals", coll.len(), 20);
+    let cbad = 0;
+    for (let i in 20..40) { if (coll.get_or(i, -1) != i * i) { cbad += 1; } }
+    checkInt("all-collide survivors intact", cbad, 0);
+
+    print("---- HashSet ----");
+    let s = hashset_str(4);
+    let first = s.add("a");
+    let second = s.add("a");
+    checkBool("add returns true when new", first);
+    checkBool("add returns false when present", !second);
+    checkBool("contains", s.contains("a"));
+    for (let i in 0..60) { s.add("k" + str(i)); }
+    checkInt("set len", s.len(), 61);
+    for (let i in 0..30) { s.remove("k" + str(i * 2)); }
+    checkInt("set len after removals", s.len(), 31);
+    let sbad = 0;
+    for (let i in 0..60) {
+        let want = i % 2 == 1;
+        if (s.contains("k" + str(i)) != want) { sbad += 1; }
+    }
+    checkInt("set membership exact after churn", sbad, 0);
+
+    let a = hashset_int(8);
+    let b = hashset_int(8);
+    for (let i in 0..10) { a.add(i); }
+    for (let i in 5..15) { b.add(i); }
+    let inter = hashset_int(8);
+    for (let i in 0..10) { inter.add(i); }
+    inter.intersect_with(b);
+    checkInt("intersection size", inter.len(), 5);
+    let uni = hashset_int(8);
+    for (let i in 0..10) { uni.add(i); }
+    uni.union_with(b);
+    checkInt("union size", uni.len(), 15);
+    let diff = hashset_int(8);
+    for (let i in 0..10) { diff.add(i); }
+    diff.subtract(b);
+    checkInt("difference size", diff.len(), 5);
+
+    print("---- BitSet ----");
+    let bs = bitset(200);
+    bs.set(0); bs.set(63); bs.set(64); bs.set(199);
+    checkInt("bitset count", bs.count(), 4);
+    checkBool("bitset test set", bs.test(64));
+    checkBool("bitset test clear", !bs.test(65));
+    check("bitset toArray", fmt_ints(bs.toArray()), "0,63,64,199");
+    checkInt("next_set from 1", bs.next_set(1), 63);
+    checkInt("next_set past the end", bs.next_set(200), -1);
+    checkInt("next_clear", bs.next_clear(63), 65);
+    bs.clear(63);
+    checkInt("bitset count after clear", bs.count(), 3);
+    bs.flip(63);
+    checkInt("flip sets", bs.count(), 4);
+    bs.flip(63);
+    checkInt("flip clears", bs.count(), 3);
+
+    // set_all must not set the padding bits past nbits.
+    let full = bitset(200);
+    full.set_all();
+    checkInt("set_all counts exactly nbits", full.count(), 200);
+    checkInt("set_all last bit", full.next_set(199), 199);
+    full.clear_all();
+    checkBool("clear_all empties", full.is_empty());
+
+    let x = bitset(100); x.set(1); x.set(2); x.set(3);
+    let y = bitset(100); y.set(3); y.set(4);
+    checkBool("intersects", x.intersects(y));
+    let xa = x.clone();
+    xa.and_with(y);
+    check("and", fmt_ints(xa.toArray()), "3");
+    let xo = x.clone();
+    xo.or_with(y);
+    check("or", fmt_ints(xo.toArray()), "1,2,3,4");
+    let xn = x.clone();
+    xn.andnot_with(y);
+    check("andnot", fmt_ints(xn.toArray()), "1,2");
+    let xx = x.clone();
+    xx.xor_with(y);
+    check("xor", fmt_ints(xx.toArray()), "1,2,4");
+    checkBool("clone is independent", x.count() == 3);
+
+    // A bitset whose size is not a multiple of 64.
+    let odd = bitset(70);
+    odd.set_all();
+    checkInt("odd-size set_all", odd.count(), 70);
+    checkInt("odd-size next_set past end", odd.next_set(70), -1);
+
+    print("---- LRU ----");
+    let l = lru_str_int(3);
+    l.put("a", 1); l.put("b", 2); l.put("c", 3);
+    checkInt("lru len", l.len(), 3);
+    let ga = l.get_or("a", -1);
+    checkInt("lru get", ga, 1);
+    l.put("d", 4);
+    checkBool("lru evicted the least recently used", !l.has("b"));
+    checkBool("lru kept the touched entry", l.has("a"));
+    checkBool("lru kept the untouched newer entries", l.has("c") && l.has("d"));
+    check("lru recency order", l.keysByRecency().join(","), "d,a,c");
+    checkInt("lru counted the eviction", l.evictions, 1);
+    checkInt("lru never exceeds capacity", l.len(), 3);
+
+    // peek must not disturb recency; has must not either.
+    let pk = l.peek("c", -1);
+    checkInt("peek reads", pk, 3);
+    let unused = l.has("c");
+    check("peek and has leave recency alone", l.keysByRecency().join(","), "d,a,c");
+
+    l.remove("a");
+    checkInt("lru remove", l.len(), 2);
+    checkBool("lru removed key is gone", !l.has("a"));
+    l.put("e", 5);
+    checkInt("lru reuses the freed slot without evicting", l.evictions, 1);
+
+    // Hammer it: far more keys than capacity, all distinct.
+    let big = lru_str_int(16);
+    for (let i in 0..500) { big.put("k" + str(i), i); }
+    checkInt("lru stays at capacity under churn", big.len(), 16);
+    checkInt("lru eviction count", big.evictions, 484);
+    checkBool("lru holds the most recent", big.has("k499"));
+    checkBool("lru dropped the oldest", !big.has("k0"));
+    let bad_recency = 0;
+    for (let k in big.keysByRecency()) { if (!big.has(k)) { bad_recency += 1; } }
+    checkInt("every key in the recency list is present", bad_recency, 0);
+    l.clear();
+    checkInt("lru clear", l.len(), 0);
+
+    print("---- Slab ----");
+    let sl = slab_str(4);
+    let h1 = sl.alloc("one");
+    let h2 = sl.alloc("two");
+    checkInt("slab len", sl.len(), 2);
+    check("slab get", sl.get(h1), "one");
+    checkBool("slab handles are never 0", h1 != NIL && h2 != NIL);
+    checkBool("slab handles are distinct", h1 != h2);
+    checkBool("slab alive", sl.alive(h1));
+
+    let freed = sl.free(h1);
+    checkBool("free returns true", freed);
+    let freed_again = sl.free(h1);
+    checkBool("double free is detected, not silent", !freed_again);
+    checkBool("freed handle is dead", !sl.alive(h1));
+    checkInt("slab len after free", sl.len(), 1);
+
+    // The whole point of the generation counter: the reused slot hands out a
+    // *different* handle, and the stale one stays dead instead of aliasing it.
+    let h3 = sl.alloc("three");
+    checkBool("reused slot yields a new handle", h3 != h1);
+    checkBool("stale handle stays dead after reuse", !sl.alive(h1));
+    check("new handle reads the new value", sl.get(h3), "three");
+    check("get_or on a stale handle", sl.get_or(h1, "gone"), "gone");
+    checkInt("slab len after reuse", sl.len(), 2);
+
+    sl.set(h3, "THREE");
+    check("slab set", sl.get(h3), "THREE");
+    checkInt("handles() length", sl.handles().len, 2);
+    checkInt("values() length", sl.values().len, 2);
+
+    // A graph of handles: a cycle here is not a reference cycle, so it cannot
+    // leak. This is the reason Slab exists.
+    let g = slab_str(4);
+    let n1 = g.alloc("n1");
+    let n2 = g.alloc("n2");
+    let n3 = g.alloc("n3");
+    let edges = hashmap_int_str(8);
+    edges.put(n1, "->n2");
+    edges.put(n2, "->n3");
+    edges.put(n3, "->n1");           // closes the cycle, in ints
+    checkInt("handle graph holds", edges.len(), 3);
+    check("handle graph walks", edges.get(n3), "->n1");
+
+    g.clear();
+    checkInt("slab clear", g.len(), 0);
+    checkBool("handles before a clear stay dead", !g.alive(n1));
+    let n4 = g.alloc("fresh");
+    checkBool("allocation works after clear", g.alive(n4));
+    checkBool("and the old handle still does not", !g.alive(n1));
+
+    // Churn: allocate and free repeatedly, and no stale handle may revive.
+    let ch = slab_str(4);
+    let stale: int[] = [];
+    for (let i in 0..50) {
+        let hh = ch.alloc("x" + str(i));
+        stale.push(hh);
+        ch.free(hh);
+    }
+    let revived = 0;
+    for (let hh in stale) { if (ch.alive(hh)) { revived += 1; } }
+    checkInt("no stale handle revives across 50 reuses", revived, 0);
+    checkInt("slab empty after churn", ch.len(), 0);
+    checkBool("slab reused its slots rather than growing", ch.capacity() <= 2);
+}

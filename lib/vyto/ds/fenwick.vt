@@ -1,0 +1,145 @@
+// vyto/ds/fenwick — a Fenwick tree (binary indexed tree): prefix sums that stay
+// correct while the underlying values change.
+//
+//     let f = new Fenwick(n);
+//     f.add(i, delta);              // O(log n)
+//     f.prefix(i)                    // sum of [0, i)          O(log n)
+//     f.range(lo, hi)                // sum of [lo, hi)        O(log n)
+//     f.lower_bound(target)          // first i with prefix(i+1) >= target
+//
+// The alternative is a plain prefix-sum array, which answers queries in O(1) and
+// costs O(n) per update — fine for static data and useless the moment anything
+// changes. A Fenwick is what you want for a running total over a mutable series:
+// a scrollbar over rows of varying height, a leaderboard, weighted sampling, a
+// count of "how many events before time t" that keeps taking new events.
+//
+// One `int[]`, no nodes, no recursion. The trick is that index i is responsible
+// for a run of `i & -i` elements, so a prefix walk visits one entry per set bit.
+//
+// `FenwickF` is the same tree over floats. Two types rather than a generic,
+// because a generic would need a `zero` and an `add` closure and would read
+// worse for exactly two instantiations.
+
+export class Fenwick {
+    t: int[];       // 1-based internally; t[0] is unused
+    n: int;
+
+    fn init(n: int) {
+        this.n = n;
+        this.t = [];
+        this.t.reserve(n + 1);
+        for (let i in 0..(n + 1)) { this.t.push(0); }
+    }
+
+    fn len(): int { return this.n; }
+
+    fn check(i: int, what: string) {
+        if (i < 0 || i >= this.n) { panic("Fenwick." + what + ": index out of range"); }
+    }
+
+    // Add `delta` at index i.
+    fn add(i: int, delta: int) {
+        this.check(i, "add");
+        let k = i + 1;
+        while (k <= this.n) {
+            this.t[k] += delta;
+            k += k & (-k);          // move to the next range that covers k
+        }
+    }
+
+    // Sum of [0, i). prefix(0) is 0, prefix(len) is the total.
+    fn prefix(i: int): int {
+        if (i <= 0) { return 0; }
+        let k = i;
+        if (k > this.n) { k = this.n; }
+        let s = 0;
+        while (k > 0) {
+            s += this.t[k];
+            k -= k & (-k);          // drop the lowest set bit
+        }
+        return s;
+    }
+
+    fn range(lo: int, hi: int): int { return this.prefix(hi) - this.prefix(lo); }
+    fn total(): int { return this.prefix(this.n); }
+
+    // The value at a single index, which a Fenwick does not store directly.
+    fn at(i: int): int {
+        this.check(i, "at");
+        return this.prefix(i + 1) - this.prefix(i);
+    }
+
+    fn set(i: int, v: int) { this.add(i, v - this.at(i)); }
+
+    // Smallest i such that prefix(i + 1) >= target, or len when the total is
+    // below target. Requires non-negative values, and is the operation that
+    // makes a Fenwick a weighted sampler or a "which row is at pixel y" lookup:
+    // it descends the tree instead of binary-searching over prefix() calls, so
+    // it is one O(log n) walk rather than log² .
+    fn lower_bound(target: int): int {
+        if (target <= 0) { return 0; }
+        let pos = 0;
+        let rest = target;
+        let step = 1;
+        while (step * 2 <= this.n) { step = step * 2; }
+        while (step > 0) {
+            if (pos + step <= this.n && this.t[pos + step] < rest) {
+                pos += step;
+                rest -= this.t[pos];
+            }
+            step = step / 2;
+        }
+        return pos;
+    }
+
+    // Bulk load in O(n) instead of n calls to add(). `src` must have len() n.
+    fn build(src: int[]) {
+        if (src.len != this.n) { panic("Fenwick.build: length mismatch"); }
+        for (let i in 0..(this.n + 1)) { this.t[i] = 0; }
+        for (let i in 0..this.n) { this.t[i + 1] = src[i]; }
+        for (let k in 1..(this.n + 1)) {
+            let up = k + (k & (-k));
+            if (up <= this.n) { this.t[up] += this.t[k]; }
+        }
+    }
+
+    fn clear() { for (let i in 0..(this.n + 1)) { this.t[i] = 0; } }
+}
+
+export class FenwickF {
+    t: float[];
+    n: int;
+
+    fn init(n: int) {
+        this.n = n;
+        this.t = [];
+        this.t.reserve(n + 1);
+        for (let i in 0..(n + 1)) { this.t.push(0.0); }
+    }
+
+    fn len(): int { return this.n; }
+
+    fn add(i: int, delta: float) {
+        if (i < 0 || i >= this.n) { panic("FenwickF.add: index out of range"); }
+        let k = i + 1;
+        while (k <= this.n) { this.t[k] += delta; k += k & (-k); }
+    }
+
+    fn prefix(i: int): float {
+        if (i <= 0) { return 0.0; }
+        let k = i;
+        if (k > this.n) { k = this.n; }
+        let s = 0.0;
+        while (k > 0) { s += this.t[k]; k -= k & (-k); }
+        return s;
+    }
+
+    fn range(lo: int, hi: int): float { return this.prefix(hi) - this.prefix(lo); }
+    fn total(): float { return this.prefix(this.n); }
+    fn at(i: int): float { return this.prefix(i + 1) - this.prefix(i); }
+    fn set(i: int, v: float) { this.add(i, v - this.at(i)); }
+    fn clear() { for (let i in 0..(this.n + 1)) { this.t[i] = 0.0; } }
+}
+
+export fn fenwick(n: int): Fenwick { return new Fenwick(n); }
+export fn fenwickF(n: int): FenwickF { return new FenwickF(n); }

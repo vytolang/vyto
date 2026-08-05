@@ -1,0 +1,134 @@
+// switch — a jump table for tagged dispatch.
+//
+// Vyto has no enums and no pattern matching, and both stay out. What it has is
+// the `kind: int` tagged class, which vyto/util/json, xml and markdown all use.
+// Dispatching on one used to mean an if/else-if chain: a linear string of
+// comparisons that the C compiler cannot turn into a jump table because it
+// cannot prove the tests are exclusive.
+//
+//   switch (n.kind) {
+//       case K_NUM: { ... }
+//       case K_STR, K_SYM: { ... }        // one arm, several values
+//       default: { ... }
+//   }
+//
+// No fallthrough — an arm ends where it ends, and there is no `break` to forget.
+// A `break` inside an arm means what it means everywhere else in Vyto: leave the
+// enclosing *loop*. That is the one place C's rule differs, and it is why the
+// interpreter loop below works.
+
+const K_NUM: int = 0;
+const K_STR: int = 1;
+const K_SYM: int = 2;
+const K_LIST: int = 3;
+
+// A tagged node — the shape the whole stdlib uses in place of a sum type.
+class Node {
+    kind: int;
+    num: float;
+    text: string;
+    items: Node[];
+
+    fn init(k: int) { this.kind = k; this.num = 0.0; this.text = ""; this.items = []; }
+}
+
+fn num(v: float): Node { let n = new Node(K_NUM); n.num = v; return n; }
+fn text(s: string): Node { let n = new Node(K_STR); n.text = s; return n; }
+fn sym(s: string): Node { let n = new Node(K_SYM); n.text = s; return n; }
+
+fn list(xs: Node[]): Node {
+    let n = new Node(K_LIST);
+    for (let x in xs) { n.items.push(x); }
+    return n;
+}
+
+// One switch replaces four chained comparisons, and every arm returns — the
+// checker accepts that without a trailing return.
+fn render(n: Node): string {
+    switch (n.kind) {
+        case K_NUM: { return str(n.num); }
+        case K_STR: { return "\"" + n.text + "\""; }
+        case K_SYM: { return n.text; }
+        case K_LIST: {
+            let parts = "";
+            for (let i in 0..n.items.len) {
+                if (i > 0) { parts = parts + " "; }
+                parts = parts + render(n.items[i]);
+            }
+            return "(" + parts + ")";
+        }
+        default: { return "?"; }
+    }
+}
+
+// A switch on a string is an if-chain over string equality — the same syntax,
+// and it stays readable where a hand-written chain would not.
+fn apply(op: string, a: float, b: float): float {
+    switch (op) {
+        case "+": { return a + b; }
+        case "-": { return a - b; }
+        case "*": { return a * b; }
+        case "/", "div": {
+            if (b == 0.0) { return 0.0; }
+            return a / b;
+        }
+        default: { return 0.0; }
+    }
+}
+
+fn eval(n: Node): float {
+    switch (n.kind) {
+        case K_NUM: { return n.num; }
+        case K_LIST: {
+            if (n.items.len == 0) { return 0.0; }
+            let head = n.items[0];
+            if (head.kind != K_SYM) { return 0.0; }
+            let acc = eval(n.items[1]);
+            for (let i in 2..n.items.len) { acc = apply(head.text, acc, eval(n.items[i])); }
+            return acc;
+        }
+        default: { return 0.0; }
+    }
+}
+
+// The break rule, spelled out. In C this `break` would leave the switch and the
+// loop would spin forever; in Vyto it leaves the loop, because a switch is not
+// a break target.
+fn untilHalt(program: string[]): string {
+    let trace = "";
+    for (let ins in program) {
+        switch (ins) {
+            case "halt": { break; }
+            case "nop": { continue; }
+            default: { trace = trace + ins + " "; }
+        }
+    }
+    return trace;
+}
+
+fn main() {
+    let expr = list([sym("+"), num(1.0), num(2.0),
+                     list([sym("*"), num(3.0), num(4.0)])]);
+
+    print("---- render ----");
+    print(render(expr));
+    print(render(text("hello")));
+    print(render(new Node(99)));
+
+    print("---- eval ----");
+    print(str(eval(expr)));                                   // 1 + 2 + 12
+    print(str(eval(list([sym("div"), num(9.0), num(2.0)]))));  // aliased case
+    print(str(eval(list([sym("/"), num(1.0), num(0.0)]))));    // guarded divide
+
+    print("---- break leaves the loop, not the switch ----");
+    print(untilHalt(["a", "nop", "b", "halt", "c"]));
+    print(untilHalt(["x", "y"]));
+
+    print("---- no default, no match: nothing happens ----");
+    let touched = "untouched";
+    switch (K_LIST) {
+        case K_NUM: { touched = "num"; }
+        case K_STR: { touched = "str"; }
+    }
+    print(touched);
+}

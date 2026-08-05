@@ -1,0 +1,230 @@
+// vyto/ds/trie — a prefix tree over byte strings, with an int payload.
+//
+//     let t = new Trie();
+//     t.put("carbon", 1);
+//     t.put("car", 2);
+//     print(str(t.get_or("car", -1)));         // 2
+//     print(str(t.has_prefix("carb")));        // true
+//     for (let k in t.keys_with_prefix("car")) { print(k); }
+//
+// What a Trie does that a HashMap cannot: answer "what keys start with this?"
+// and "how far does this input match?" in time proportional to the prefix, not
+// the table. That is autocomplete, routing tables, tokenizers, a word-break
+// dictionary, and longest-prefix lookup for anything hierarchical.
+//
+// ── NOT ONE OBJECT PER NODE ─────────────────────────────────────────────────
+// The textbook Trie allocates a node per character with a 256-entry child array,
+// which for a dictionary of any size is both an enormous allocation count and a
+// vast amount of empty space. Here the whole tree is five flat `int[]`s and
+// children are a first-child / next-sibling chain — so a node costs five ints
+// regardless of how many children it has, there is no per-node allocation, and
+// the RC never sees any of it. That is the CLAUDE.md bulk-data rule, and it is
+// the difference between a usable dictionary and a toy.
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Values are `int`. For objects, store a `vyto/coll` Slab handle.
+
+export const TRIE_NONE: int = -1;
+
+export class Trie {
+    label: int[];       // the byte this node was reached by; unused for the root
+    first: int[];       // first child, or -1
+    sib: int[];         // next sibling, or -1
+    value: int[];       // payload, meaningful only where has[] is 1
+    has: byte[];        // 1 when this node terminates a key
+    count: int;         // number of keys
+
+    fn init() {
+        this.label = [];
+        this.first = [];
+        this.sib = [];
+        this.value = [];
+        this.has = bytes(0);
+        this.new_node(0);   // the root, node 0
+        this.count = 0;
+    }
+
+    // Number of keys, not nodes — `nodes()` is that.
+    fn len(): int { return this.count; }
+    fn nodes(): int { return this.label.len; }
+    fn is_empty(): bool { return this.count == 0; }
+
+    fn new_node(lab: int): int {
+        this.label.push(lab);
+        this.first.push(TRIE_NONE);
+        this.sib.push(TRIE_NONE);
+        this.value.push(0);
+        // `has` is a byte[], which has no push, so it grows by copy. Nodes are
+        // added far less often than they are walked, and this keeps the
+        // occupancy flag one byte instead of eight.
+        let nh = bytes(this.label.len);
+        for (let i in 0..this.has.len) { nh[i] = this.has[i]; }
+        this.has = nh;
+        return this.label.len - 1;
+    }
+
+    // Existing child of `node` labelled `b`, or -1.
+    fn child(node: int, b: int): int {
+        let c = this.first[node];
+        while (c != TRIE_NONE) {
+            if (this.label[c] == b) { return c; }
+            c = this.sib[c];
+        }
+        return TRIE_NONE;
+    }
+
+    // Child labelled `b`, created if absent. New children go on the front of
+    // the sibling list — insertion order is not part of the contract, and this
+    // keeps insertion O(1) after the scan.
+    fn child_or_add(node: int, b: int): int {
+        let c = this.child(node, b);
+        if (c != TRIE_NONE) { return c; }
+        let n = this.new_node(b);
+        this.sib[n] = this.first[node];
+        this.first[node] = n;
+        return n;
+    }
+
+    // Node reached by walking `key`, or -1.
+    fn walk(key: string): int {
+        let node = 0;
+        for (let i in 0..key.len) {
+            node = this.child(node, key[i]);
+            if (node == TRIE_NONE) { return TRIE_NONE; }
+        }
+        return node;
+    }
+
+    // Insert or overwrite. Returns true when the key was new.
+    fn put(key: string, v: int): bool {
+        let node = 0;
+        for (let i in 0..key.len) { node = this.child_or_add(node, key[i]); }
+        let fresh = this.has[node] == 0 as byte;
+        if (fresh) { this.count += 1; }
+        this.has[node] = 1 as byte;
+        this.value[node] = v;
+        return fresh;
+    }
+
+    fn has_key(key: string): bool {
+        let n = this.walk(key);
+        return n != TRIE_NONE && this.has[n] != 0 as byte;
+    }
+
+    fn get(key: string): int {
+        let n = this.walk(key);
+        if (n == TRIE_NONE || this.has[n] == 0 as byte) { panic("Trie.get: key not present"); }
+        return this.value[n];
+    }
+
+    fn get_or(key: string, dflt: int): int {
+        let n = this.walk(key);
+        if (n == TRIE_NONE || this.has[n] == 0 as byte) { return dflt; }
+        return this.value[n];
+    }
+
+    // Unmark a key. The nodes stay — a Trie that is churned would otherwise
+    // need refcounts per node, and the space is reclaimed by the next insert
+    // that walks the same path.
+    fn remove(key: string): bool {
+        let n = this.walk(key);
+        if (n == TRIE_NONE || this.has[n] == 0 as byte) { return false; }
+        this.has[n] = 0 as byte;
+        this.count -= 1;
+        return true;
+    }
+
+    // Is any key prefixed by this? Cheaper than collecting them.
+    fn has_prefix(p: string): bool { return this.walk(p) != TRIE_NONE; }
+
+    // Length of the longest prefix of `s` that is a stored key, or -1. This is
+    // the routing / tokenizing primitive: one pass over the input, no backtrack.
+    fn longest_prefix(s: string): int {
+        let node = 0;
+        let best = -1;
+        if (this.has[0] != 0 as byte) { best = 0; }
+        for (let i in 0..s.len) {
+            node = this.child(node, s[i]);
+            if (node == TRIE_NONE) { return best; }
+            if (this.has[node] != 0 as byte) { best = i + 1; }
+        }
+        return best;
+    }
+
+    // The value of the longest stored prefix of `s`, or `dflt`.
+    fn longest_prefix_value(s: string, dflt: int): int {
+        let node = 0;
+        let best = dflt;
+        if (this.has[0] != 0 as byte) { best = this.value[0]; }
+        for (let i in 0..s.len) {
+            node = this.child(node, s[i]);
+            if (node == TRIE_NONE) { return best; }
+            if (this.has[node] != 0 as byte) { best = this.value[node]; }
+        }
+        return best;
+    }
+
+    // Every key under a prefix, in unspecified order. The prefix is prepended
+    // to each result, so these are whole keys and not suffixes.
+    fn keys_with_prefix(p: string): string[] {
+        let out: string[] = [];
+        let start = this.walk(p);
+        if (start == TRIE_NONE) { return out; }
+        // Explicit stacks rather than recursion: a deep trie would otherwise be
+        // bounded by the C stack, and the depth here is the key length.
+        let stack: int[] = [];
+        let suffix: string[] = [];
+        stack.push(start);
+        suffix.push("");
+        while (stack.len > 0) {
+            let node = stack.pop();
+            let sfx = suffix.pop();
+            if (this.has[node] != 0 as byte) { out.push(p + sfx); }
+            let c = this.first[node];
+            while (c != TRIE_NONE) {
+                stack.push(c);
+                suffix.push(sfx + chr(this.label[c]));
+                c = this.sib[c];
+            }
+        }
+        return out;
+    }
+
+    fn keys(): string[] { return this.keys_with_prefix(""); }
+
+    // How many stored keys start with `p`.
+    fn count_with_prefix(p: string): int {
+        let start = this.walk(p);
+        if (start == TRIE_NONE) { return 0; }
+        let n = 0;
+        let stack: int[] = [];
+        stack.push(start);
+        while (stack.len > 0) {
+            let node = stack.pop();
+            if (this.has[node] != 0 as byte) { n += 1; }
+            let c = this.first[node];
+            while (c != TRIE_NONE) { stack.push(c); c = this.sib[c]; }
+        }
+        return n;
+    }
+
+    fn clear() {
+        this.label = [];
+        this.first = [];
+        this.sib = [];
+        this.value = [];
+        this.has = bytes(0);
+        this.new_node(0);
+        this.count = 0;
+    }
+}
+
+// One byte as a one-character string. Local because the stdlib has no such
+// builtin and this is the only place in the package that needs it.
+fn chr(b: int): string {
+    let one = bytes(2);      // bytes() is zeroed, so [1] is the NUL terminator
+    one[0] = b as byte;
+    return str(one as cstring);
+}
+
+export fn trie(): Trie { return new Trie(); }

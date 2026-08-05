@@ -1,0 +1,226 @@
+// vyto/coll/lru — a fixed-capacity cache that evicts the least recently used
+// entry when it fills.
+//
+//     let c = lru_str_str(1000);
+//     c.put(url, body);
+//     let hit = c.get_or(url, null);      // also marks it most-recently-used
+//     print(str(c.hits) + "/" + str(c.hits + c.misses));
+//
+// The tree is full of hand-rolled caches that never evict — a memoised text
+// width here, a rendered date there — and every one of them is a slow leak on
+// unbounded input. `lib/vyto/mobile/android/native/src/atext_cache.c` says so
+// out loud in its header: "the eviction story is deferred, not solved". This is
+// that story.
+//
+// ── NO NODE OBJECTS ──────────────────────────────────────────────────────────
+// The recency list is a doubly-linked list, and a doubly-linked list of objects
+// under reference counting is a leak: every node points at its neighbour and
+// the neighbour points back. Here the links are `prev: int[]` and `next: int[]`
+// over slot indices. An integer holds nothing alive, so there is no cycle to
+// leak, no `weak` to remember, and no allocation per touch — a cache hit moves
+// four ints and touches no allocator at all.
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Key lookup is a HashMap<K, int> from key to slot, so any key type works with
+// an explicit hash and eq — see `hashmap.vt`.
+
+import { HashMap } from "vyto/coll/hashmap";
+import { hash_int, hash_str } from "vyto/hash";
+
+const LRU_NONE: int = -1;
+
+export class LRU<K, V> {
+    keys: K[];
+    vals: V[];
+    prev: int[];      // toward the most recently used
+    next: int[];      // toward the least recently used
+    index: HashMap<K, int>;
+    zk: K;
+    zv: V;
+    head: int;        // most recently used
+    tail: int;        // least recently used, the eviction victim
+    free_head: int;
+    count: int;
+    cap_: int;
+    hits: int;
+    misses: int;
+    evictions: int;
+
+    fn init(cap: int, zk: K, zv: V, hash: fn(K): int, eq: fn(K, K): bool) {
+        let n = cap;
+        if (n < 1) { n = 1; }
+        this.cap_ = n;
+        this.zk = zk;
+        this.zv = zv;
+        this.keys = [];
+        this.vals = [];
+        this.prev = [];
+        this.next = [];
+        this.keys.reserve(n);
+        this.vals.reserve(n);
+        this.prev.reserve(n);
+        this.next.reserve(n);
+        // Every slot starts on the free list, threaded through `next`.
+        for (let i in 0..n) {
+            this.keys.push(zk);
+            this.vals.push(zv);
+            this.prev.push(LRU_NONE);
+            this.next.push(i + 1);
+        }
+        this.next[n - 1] = LRU_NONE;
+        this.free_head = 0;
+        this.head = LRU_NONE;
+        this.tail = LRU_NONE;
+        this.count = 0;
+        this.index = new HashMap<K, int>(n, zk, LRU_NONE, hash, eq);
+        this.hits = 0;
+        this.misses = 0;
+        this.evictions = 0;
+    }
+
+    fn len(): int { return this.count; }
+    fn capacity(): int { return this.cap_; }
+    fn is_empty(): bool { return this.count == 0; }
+
+    // Does the cache hold this key? Does NOT count as a use, and does not move
+    // the entry — so a `has` in a logging path cannot change what gets evicted.
+    fn has(k: K): bool { return this.index.get_or(k, LRU_NONE) != LRU_NONE; }
+
+    // Look up and mark most-recently-used. Panics on a miss; `get_or` does not.
+    fn get(k: K): V {
+        let slot = this.index.get_or(k, LRU_NONE);
+        if (slot == LRU_NONE) { panic("LRU.get: key not present"); }
+        this.hits += 1;
+        this.touch(slot);
+        return this.vals[slot];
+    }
+
+    fn get_or(k: K, dflt: V): V {
+        let slot = this.index.get_or(k, LRU_NONE);
+        if (slot == LRU_NONE) { this.misses += 1; return dflt; }
+        this.hits += 1;
+        this.touch(slot);
+        return this.vals[slot];
+    }
+
+    // Read without disturbing recency, for a cache inspector or a metric.
+    fn peek(k: K, dflt: V): V {
+        let slot = this.index.get_or(k, LRU_NONE);
+        if (slot == LRU_NONE) { return dflt; }
+        return this.vals[slot];
+    }
+
+    // Insert or overwrite, marking most-recently-used. Evicts the least
+    // recently used entry first when the cache is full. Returns true when the
+    // key was new.
+    fn put(k: K, v: V): bool {
+        let slot = this.index.get_or(k, LRU_NONE);
+        if (slot != LRU_NONE) {
+            this.vals[slot] = v;
+            this.touch(slot);
+            return false;
+        }
+        if (this.count == this.cap_) { this.evict(); }
+        slot = this.free_head;
+        this.free_head = this.next[slot];
+        this.keys[slot] = k;
+        this.vals[slot] = v;
+        this.link_front(slot);
+        this.index.put(k, slot);
+        this.count += 1;
+        return true;
+    }
+
+    fn remove(k: K): bool {
+        let slot = this.index.get_or(k, LRU_NONE);
+        if (slot == LRU_NONE) { return false; }
+        this.unlink(slot);
+        this.index.remove(k);
+        this.keys[slot] = this.zk;
+        this.vals[slot] = this.zv;
+        this.next[slot] = this.free_head;
+        this.free_head = slot;
+        this.count -= 1;
+        return true;
+    }
+
+    // Drop the least recently used entry. Returns false when already empty.
+    fn evict(): bool {
+        if (this.tail == LRU_NONE) { return false; }
+        let slot = this.tail;
+        this.index.remove(this.keys[slot]);
+        this.unlink(slot);
+        this.keys[slot] = this.zk;
+        this.vals[slot] = this.zv;
+        this.next[slot] = this.free_head;
+        this.free_head = slot;
+        this.count -= 1;
+        this.evictions += 1;
+        return true;
+    }
+
+    fn clear() {
+        this.index.clear();
+        this.free_head = 0;
+        for (let i in 0..this.cap_) {
+            this.keys[i] = this.zk;
+            this.vals[i] = this.zv;
+            this.prev[i] = LRU_NONE;
+            this.next[i] = i + 1;
+        }
+        this.next[this.cap_ - 1] = LRU_NONE;
+        this.head = LRU_NONE;
+        this.tail = LRU_NONE;
+        this.count = 0;
+    }
+
+    fn reset_stats() { this.hits = 0; this.misses = 0; this.evictions = 0; }
+
+    // Keys from most to least recently used. The order is the point — this is
+    // what you print when a cache is misbehaving.
+    fn keysByRecency(): K[] {
+        let out: K[] = [];
+        out.reserve(this.count);
+        let i = this.head;
+        while (i != LRU_NONE) { out.push(this.keys[i]); i = this.next[i]; }
+        return out;
+    }
+
+    // ---- the intrusive list, in indices --------------------------------
+
+    fn touch(slot: int) {
+        if (this.head == slot) { return; }
+        this.unlink(slot);
+        this.link_front(slot);
+    }
+
+    fn link_front(slot: int) {
+        this.prev[slot] = LRU_NONE;
+        this.next[slot] = this.head;
+        if (this.head != LRU_NONE) { this.prev[this.head] = slot; }
+        this.head = slot;
+        if (this.tail == LRU_NONE) { this.tail = slot; }
+    }
+
+    fn unlink(slot: int) {
+        let p = this.prev[slot];
+        let n = this.next[slot];
+        if (p != LRU_NONE) { this.next[p] = n; } else { this.head = n; }
+        if (n != LRU_NONE) { this.prev[n] = p; } else { this.tail = p; }
+        this.prev[slot] = LRU_NONE;
+        this.next[slot] = LRU_NONE;
+    }
+}
+
+export fn lru_str_str(cap: int): LRU<string, string> {
+    return new LRU<string, string>(cap, null, null, (k) => hash_str(k), (a, b) => a == b);
+}
+export fn lru_str_int(cap: int): LRU<string, int> {
+    return new LRU<string, int>(cap, null, 0, (k) => hash_str(k), (a, b) => a == b);
+}
+export fn lru_int_str(cap: int): LRU<int, string> {
+    return new LRU<int, string>(cap, 0, null, (k) => hash_int(k), (a, b) => a == b);
+}
+export fn lru_int_int(cap: int): LRU<int, int> {
+    return new LRU<int, int>(cap, 0, 0, (k) => hash_int(k), (a, b) => a == b);
+}

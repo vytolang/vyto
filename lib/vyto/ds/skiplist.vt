@@ -1,0 +1,233 @@
+// vyto/ds/skiplist — an ordered set, kept sorted as it is built.
+//
+//     let s = new SkipList<Job>(null, (a, b) => a.due - b.due);
+//     s.insert(job);
+//     print(str(s.first()));           // the smallest
+//     for (let j in s) { ... }         // in order, cheaply
+//     let i = s.rank_of(job);          // how many come before it
+//
+// The alternative is a sorted array with `binary_search` from `vyto/util/sort`,
+// and for data that is loaded once and then only read, that is the better
+// choice — it is contiguous and has no per-element overhead at all. A SkipList
+// earns its keep when *inserts and deletes are interleaved with queries*: an
+// insert into a sorted array is O(n) because everything after it shifts, and
+// here it is O(log n) expected.
+//
+// ── NO NODE OBJECTS ─────────────────────────────────────────────────────────
+// A skip list is a tower of linked lists, and a linked list of objects under
+// reference counting is a cycle waiting to happen. Here every link is an `int`
+// index into flat arrays, so there is no reference to leak and no `weak` to
+// remember. `level` is stored per node and the forward pointers live in one
+// contiguous `int[]` addressed as `node * MAXLEVEL + lvl`.
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Ordering is a `cmp` closure field, not a bound — same trade as `Heap` and
+// `vyto/util/sort`. See `vyto/coll/deque.vt` for why there is a `zero: T`.
+//
+// The level of a new node comes from a deterministic xorshift, not from system
+// randomness: reproducible runs matter more here than resistance to an
+// adversary choosing insertion order, and nothing in this structure is a
+// security boundary.
+
+const MAXLEVEL: int = 16;
+const NIL_NODE: int = -1;
+
+export class SkipList<T> {
+    vals: T[];
+    fwd: int[];        // node * MAXLEVEL + lvl -> next node, or -1
+    lvl: int[];        // tower height per node
+    zero: T;
+    cmp: fn(T, T): int;
+    head: int;         // sentinel node 0, holds no value
+    level: int;        // current tower height in use
+    count: int;
+    rng: u64;
+
+    fn init(zero: T, cmp: fn(T, T): int) {
+        this.zero = zero;
+        this.cmp = cmp;
+        this.vals = [];
+        this.fwd = [];
+        this.lvl = [];
+        this.count = 0;
+        this.level = 1;
+        this.rng = 0x2545F4914F6CDD1D;
+        this.head = this.new_node(zero, MAXLEVEL);
+    }
+
+    fn len(): int { return this.count; }
+    fn is_empty(): bool { return this.count == 0; }
+
+    fn new_node(v: T, height: int): int {
+        let id = this.vals.len;
+        this.vals.push(v);
+        this.lvl.push(height);
+        for (let i in 0..MAXLEVEL) { this.fwd.push(NIL_NODE); }
+        return id;
+    }
+
+    // xorshift64, then a geometric height: keep flipping while the low bit is
+    // set, which gives level L with probability 2^-L, the standard shape.
+    fn random_level(): int {
+        this.rng = this.rng ^ (this.rng << 13);
+        this.rng = this.rng ^ (this.rng >> 7);
+        this.rng = this.rng ^ (this.rng << 17);
+        let h = 1;
+        let bits = this.rng;
+        while ((bits & 1) == 1 && h < MAXLEVEL) { h += 1; bits = bits >> 1; }
+        return h;
+    }
+
+    fn next_of(node: int, l: int): int { return this.fwd[node * MAXLEVEL + l]; }
+    fn set_next(node: int, l: int, target: int) { this.fwd[node * MAXLEVEL + l] = target; }
+
+    // The last node before `v` at every level. Written into `out`, which the
+    // caller owns, so a search allocates nothing per level.
+    fn descend(v: T, out: int[]) {
+        let x = this.head;
+        let l = this.level - 1;
+        while (l >= 0) {
+            let nx = this.next_of(x, l);
+            while (nx != NIL_NODE && this.cmp(this.vals[nx], v) < 0) {
+                x = nx;
+                nx = this.next_of(x, l);
+            }
+            out[l] = x;
+            l -= 1;
+        }
+    }
+
+    // Insert. Returns false when an equal element is already present — this is
+    // a set, so duplicates are rejected rather than stored twice.
+    fn insert(v: T): bool {
+        let update: int[] = [];
+        update.reserve(MAXLEVEL);
+        for (let i in 0..MAXLEVEL) { update.push(this.head); }
+        this.descend(v, update);
+        let cand = this.next_of(update[0], 0);
+        if (cand != NIL_NODE && this.cmp(this.vals[cand], v) == 0) { return false; }
+
+        let h = this.random_level();
+        if (h > this.level) {
+            for (let l in this.level..h) { update[l] = this.head; }
+            this.level = h;
+        }
+        let n = this.new_node(v, h);
+        for (let l in 0..h) {
+            this.set_next(n, l, this.next_of(update[l], l));
+            this.set_next(update[l], l, n);
+        }
+        this.count += 1;
+        return true;
+    }
+
+    fn contains(v: T): bool {
+        let update: int[] = [];
+        update.reserve(MAXLEVEL);
+        for (let i in 0..MAXLEVEL) { update.push(this.head); }
+        this.descend(v, update);
+        let cand = this.next_of(update[0], 0);
+        return cand != NIL_NODE && this.cmp(this.vals[cand], v) == 0;
+    }
+
+    // Remove. The node's slot is left behind rather than recycled: a skip list
+    // that is churned heavily wants a Slab underneath, and adding one here
+    // would cost more clarity than it buys.
+    fn remove(v: T): bool {
+        let update: int[] = [];
+        update.reserve(MAXLEVEL);
+        for (let i in 0..MAXLEVEL) { update.push(this.head); }
+        this.descend(v, update);
+        let target = this.next_of(update[0], 0);
+        if (target == NIL_NODE || this.cmp(this.vals[target], v) != 0) { return false; }
+        for (let l in 0..this.level) {
+            if (this.next_of(update[l], l) == target) {
+                this.set_next(update[l], l, this.next_of(target, l));
+            }
+        }
+        this.vals[target] = this.zero;
+        while (this.level > 1 && this.next_of(this.head, this.level - 1) == NIL_NODE) {
+            this.level -= 1;
+        }
+        this.count -= 1;
+        return true;
+    }
+
+    // The i'th element in order. O(i) — the bottom list is walked, because this
+    // list carries no span counts. Present so `for-in` works; do not use it as
+    // a random-access index in a loop over a large list.
+    fn at(i: int): T {
+        if (i < 0 || i >= this.count) { panic("SkipList.at: index out of range"); }
+        let x = this.next_of(this.head, 0);
+        for (let k in 0..i) { x = this.next_of(x, 0); }
+        return this.vals[x];
+    }
+
+    fn first(): T {
+        if (this.count == 0) { panic("SkipList.first: empty"); }
+        return this.vals[this.next_of(this.head, 0)];
+    }
+
+    fn last(): T {
+        if (this.count == 0) { panic("SkipList.last: empty"); }
+        let x = this.next_of(this.head, 0);
+        while (this.next_of(x, 0) != NIL_NODE) { x = this.next_of(x, 0); }
+        return this.vals[x];
+    }
+
+    // How many elements sort before `v`. O(n); a counted skip list would make
+    // this O(log n) and is not what this one is.
+    fn rank_of(v: T): int {
+        let n = 0;
+        let x = this.next_of(this.head, 0);
+        while (x != NIL_NODE && this.cmp(this.vals[x], v) < 0) { n += 1; x = this.next_of(x, 0); }
+        return n;
+    }
+
+    // Everything in [lo, hi) by the comparator, in order.
+    fn range(lo: T, hi: T): T[] {
+        let out: T[] = [];
+        let update: int[] = [];
+        update.reserve(MAXLEVEL);
+        for (let i in 0..MAXLEVEL) { update.push(this.head); }
+        this.descend(lo, update);
+        let x = this.next_of(update[0], 0);
+        while (x != NIL_NODE && this.cmp(this.vals[x], hi) < 0) {
+            out.push(this.vals[x]);
+            x = this.next_of(x, 0);
+        }
+        return out;
+    }
+
+    // Everything, in order. One pass along the bottom list, so this is the
+    // cheap way to read the whole list — much cheaper than at() in a loop.
+    fn toArray(): T[] {
+        let out: T[] = [];
+        out.reserve(this.count);
+        let x = this.next_of(this.head, 0);
+        while (x != NIL_NODE) { out.push(this.vals[x]); x = this.next_of(x, 0); }
+        return out;
+    }
+
+    fn clear() {
+        this.vals = [];
+        this.fwd = [];
+        this.lvl = [];
+        this.count = 0;
+        this.level = 1;
+        this.head = this.new_node(this.zero, MAXLEVEL);
+    }
+}
+
+export fn skiplist_int(): SkipList<int> {
+    return new SkipList<int>(0, (a, b) => a - b);
+}
+export fn skiplist_float(): SkipList<float> {
+    return new SkipList<float>(0.0, (a, b) => cmpf(a, b));
+}
+
+fn cmpf(a: float, b: float): int {
+    if (a < b) { return -1; }
+    if (a > b) { return 1; }
+    return 0;
+}

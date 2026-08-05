@@ -25,6 +25,8 @@
 //   * Single-threaded: matches the runtime's non-atomic RC and unguarded weak
 //     table. Cross-thread reactivity is future work.
 
+import { Deque } from "vyto/coll/deque";
+
 // Node lifecycle states.
 const CLEAN: int = 0;   // value is current
 const CHECK: int = 1;   // a transitive source *might* have changed — verify on pull
@@ -272,14 +274,17 @@ export class Effect extends ReactiveNode {
 // effect scheduler, and the set of live effects (which it roots).
 export class Reactive {
     stack: ReactiveNode[];         // current-observer stack (top = running node)
-    pending: ReactiveNode[];       // effects scheduled to run on flush
+    // Effects scheduled to run on flush. A Deque rather than an array because
+    // this is a FIFO: `remove_at(0)` on an array shifts every remaining element,
+    // which made a flush of n effects O(n^2) on the hot path.
+    pending: Deque<ReactiveNode>;
     all: ReactiveNode[];           // every node in the domain (roots them; enables dispose)
     batch_depth: int;
     on_flush: fn();                // optional hook fired after each flush (UI repaint)
 
     fn init() {
         this.stack = [];
-        this.pending = [];
+        this.pending = new Deque<ReactiveNode>(16, null);
         this.all = [];
         this.batch_depth = 0;
     }
@@ -305,14 +310,14 @@ export class Reactive {
     // Run all scheduled effects; re-scheduling during a run is drained too.
     fn flush() {
         let guard = 0;
-        while (this.pending.len > 0) {
+        while (!this.pending.is_empty()) {
             guard = guard + 1;
             if (guard > MAX_FLUSH) {
                 print("vyto/reactive: update cycle detected — aborting flush");
-                this.pending = [];
+                this.pending.clear();
                 return;
             }
-            let e = this.pending.remove_at(0);
+            let e = this.pending.pop_front();
             e.update();
         }
         if (this.on_flush != null) { this.on_flush(); }
@@ -329,7 +334,7 @@ export class Reactive {
     fn dispose() {
         for (let n in this.all) { n.dispose(); }
         this.all = [];
-        this.pending = [];
+        this.pending.clear();
         this.stack = [];
     }
 }

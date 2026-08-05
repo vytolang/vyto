@@ -6,9 +6,12 @@
 # copied to a real Windows machine and checked there with run.ps1 (which this
 # script generates). Copy results.txt back to see what passed.
 #
-# Scope: core language + runtime + the stdlib packages with no POSIX
-# dependencies. vyto/surface, vyto/ui, vyto/gfx, vyto/net/*, vyto/os/worker,
-# vyto/hw/* and vyto/intl are NOT portable yet and are deliberately excluded —
+# Scope: core language + runtime + every stdlib package that has a Windows
+# story. That is most of them: vyto/surface, vyto/ui and vyto/gfx (blend2d
+# cross-builds), vyto/net/* (Winsock + a staged libcurl DLL) and vyto/os/worker
+# (a re-exec pool rather than fork) are all staged here.
+#
+# Only vyto/hw/* (Linux device interfaces) and vyto/intl (ICU) are excluded —
 # see docs/getting-started.md.
 set -u
 cd "$(dirname "$0")/.."
@@ -322,8 +325,8 @@ from a prediction of cmd.exe's behaviour for run()/capture(), NOT from an
 observed run. If it fails, the observed output is very likely the correct
 golden — reconcile it on the build machine rather than assuming a code bug.
 
-Not covered here: vyto/surface, vyto/ui, vyto/gfx, vyto/net/*, vyto/os/worker,
-vyto/hw/* and vyto/intl are not portable to Windows yet.
+Not covered here: vyto/hw/* (Linux device interfaces) and vyto/intl (ICU) are
+not portable to Windows yet. Everything else in the stdlib is staged above.
 TXT
 
 if command -v zip >/dev/null 2>&1; then

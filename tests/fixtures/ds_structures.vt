@@ -1,0 +1,420 @@
+// vyto/ds — trees, graphs and index structures.
+//
+// Same style rule as coll_containers.vt: any call with a side effect gets its
+// own statement, because Vyto evaluates binary operands right to left
+// (docs/strings.md:114). `str(t.remove(k)) + str(t.has_key(k))` runs `has_key`
+// first and reads backwards.
+
+import { dshelp_ints } from "dshelp";
+import { Trie, trie,
+         Dsu, dsu,
+         Fenwick, FenwickF, fenwick, fenwickF,
+         SegTree, segtree_sum, segtree_min, segtree_max, segtree_or,
+         Bloom, bloom, bloom_for,
+         SkipList, skiplist_int,
+         SkipMap, skipmap_int_str, skipmap_str_int, cmp_str,
+         Graph, graph, INF,
+         IntervalTree, intervalTree } from "vyto/ds";
+
+fn check(name: string, got: string, want: string) {
+    if (got == want) { print("ok    " + name); }
+    else { print("FAIL  " + name + " got=" + got + " want=" + want); }
+}
+fn checkInt(name: string, got: int, want: int) { check(name, str(got), str(want)); }
+fn checkBool(name: string, got: bool) {
+    if (got) { print("ok    " + name); } else { print("FAIL  " + name); }
+}
+
+fn sorted_strs(xs: string[]): string {
+    let s = xs;
+    s.sort((a, b) => {
+        if (a.len != b.len) { return a.len - b.len; }
+        for (let i in 0..a.len) { if (a[i] != b[i]) { return a[i] - b[i]; } }
+        return 0;
+    });
+    return s.join(",");
+}
+
+fn main() {
+    print("---- Trie ----");
+    let t = trie();
+    t.put("carbon", 1);
+    t.put("car", 2);
+    t.put("cat", 3);
+    t.put("dog", 4);
+    t.put("do", 5);
+    checkInt("trie len counts keys, not nodes", t.len(), 5);
+    checkBool("trie has more nodes than keys", t.nodes() > t.len());
+    checkInt("trie get", t.get_or("car", -1), 2);
+    checkInt("trie get on a prefix that is not a key", t.get_or("ca", -1), -1);
+    checkInt("trie get on an absent key", t.get_or("zebra", -1), -1);
+    checkBool("trie has_key", t.has_key("carbon"));
+    checkBool("trie has_key is not has_prefix", !t.has_key("carb"));
+    checkBool("trie has_prefix", t.has_prefix("carb"));
+    checkBool("trie has_prefix on a miss", !t.has_prefix("cz"));
+    checkInt("count_with_prefix", t.count_with_prefix("ca"), 3);
+    checkInt("count_with_prefix on the empty prefix", t.count_with_prefix(""), 5);
+    check("keys_with_prefix", sorted_strs(t.keys_with_prefix("car")), "car,carbon");
+    check("all keys", sorted_strs(t.keys()), "do,car,cat,dog,carbon");
+
+    // Longest-prefix: the routing and tokenizing primitive.
+    checkInt("longest_prefix", t.longest_prefix("carbonate"), 6);
+    checkInt("longest_prefix value", t.longest_prefix_value("carbonate", -1), 1);
+    checkInt("longest_prefix stops at the last key", t.longest_prefix("cars"), 3);
+    checkInt("longest_prefix with no match", t.longest_prefix("zebra"), -1);
+    checkInt("longest_prefix prefers the longer key", t.longest_prefix("dog"), 3);
+    checkInt("longest_prefix value prefers the longer key",
+             t.longest_prefix_value("dog", -1), 4);
+
+    let overwrote = t.put("car", 22);
+    checkBool("put on an existing key returns false", !overwrote);
+    checkInt("put overwrites the value", t.get_or("car", -1), 22);
+    checkInt("overwrite does not change len", t.len(), 5);
+
+    let removed = t.remove("car");
+    checkBool("remove returns true", removed);
+    checkBool("removed key is gone", !t.has_key("car"));
+    checkBool("its extension survives", t.has_key("carbon"));
+    checkBool("its path is still walkable", t.has_prefix("car"));
+    checkInt("len after remove", t.len(), 4);
+    let removed_again = t.remove("car");
+    checkBool("removing twice returns false", !removed_again);
+
+    // The empty string is a key like any other.
+    let et = trie();
+    et.put("", 7);
+    checkInt("empty-string key", et.get_or("", -1), 7);
+    checkInt("longest_prefix finds the empty key", et.longest_prefix("anything"), 0);
+
+    // High bytes must not be confused with the sentinel.
+    let bt = trie();
+    bt.put("caf\xc3\xa9", 1);
+    checkBool("utf-8 key", bt.has_key("caf\xc3\xa9"));
+    checkInt("utf-8 value", bt.get_or("caf\xc3\xa9", -1), 1);
+
+    t.clear();
+    checkInt("trie clear", t.len(), 0);
+    checkBool("trie clear removes keys", !t.has_key("carbon"));
+
+    print("---- Dsu ----");
+    let d = dsu(10);
+    checkInt("dsu starts fully split", d.groups(), 10);
+    let merged = d.union(0, 1);
+    checkBool("union returns true on a real merge", merged);
+    d.union(1, 2);
+    d.union(5, 6);
+    checkInt("dsu groups after merges", d.groups(), 7);
+    checkBool("dsu same, transitively", d.same(0, 2));
+    checkBool("dsu not same", !d.same(0, 5));
+    let again = d.union(0, 2);
+    checkBool("union of an existing pair returns false", !again);
+    checkInt("a no-op union does not change the count", d.groups(), 7);
+    check("dsu labels", dshelp_ints(d.labels()), "0,0,0,1,2,3,3,4,5,6");
+    let sz = d.sizes();
+    checkInt("size at a representative", sz[d.find(0)], 3);
+    checkInt("size at a non-representative is zero", sz[1] + sz[2], 0);
+
+    // Chain everything together: one group, and find() must stay cheap.
+    let chain = dsu(1000);
+    for (let i in 0..999) { chain.union(i, i + 1); }
+    checkInt("a full chain is one group", chain.groups(), 1);
+    checkBool("ends of the chain are joined", chain.same(0, 999));
+    d.reset();
+    checkInt("dsu reset", d.groups(), 10);
+
+    print("---- Fenwick ----");
+    let f = fenwick(8);
+    f.build([1, 2, 3, 4, 5, 6, 7, 8]);
+    checkInt("fenwick total", f.total(), 36);
+    checkInt("fenwick prefix", f.prefix(4), 10);
+    checkInt("fenwick prefix(0) is zero", f.prefix(0), 0);
+    checkInt("fenwick prefix past the end clamps", f.prefix(99), 36);
+    checkInt("fenwick range", f.range(2, 5), 12);
+    checkInt("fenwick empty range", f.range(3, 3), 0);
+    checkInt("fenwick at", f.at(3), 4);
+    f.add(0, 10);
+    checkInt("fenwick after add, total", f.total(), 46);
+    checkInt("fenwick after add, element", f.at(0), 11);
+    f.set(0, 1);
+    checkInt("fenwick set", f.at(0), 1);
+    checkInt("fenwick total after set", f.total(), 36);
+
+    // build() must equal n calls to add().
+    let f2 = fenwick(8);
+    for (let i in 0..8) { f2.add(i, i + 1); }
+    let drift = 0;
+    for (let i in 0..9) { if (f2.prefix(i) != f.prefix(i)) { drift += 1; } }
+    checkInt("build equals repeated add", drift, 0);
+
+    checkInt("lower_bound exact", f.lower_bound(1), 0);
+    checkInt("lower_bound mid", f.lower_bound(10), 3);
+    checkInt("lower_bound of zero", f.lower_bound(0), 0);
+    checkInt("lower_bound past the total", f.lower_bound(1000), 8);
+    f.clear();
+    checkInt("fenwick clear", f.total(), 0);
+
+    let ff = fenwickF(4);
+    ff.add(0, 1.5);
+    ff.add(2, 2.5);
+    checkBool("float fenwick total", ff.total() == 4.0);
+    checkBool("float fenwick range", ff.range(0, 2) == 1.5);
+
+    print("---- SegTree ----");
+    let sg = segtree_min(8);
+    sg.build([5, 2, 9, 1, 7, 3, 8, 4]);
+    checkInt("segtree min over all", sg.query(0, 8), 1);
+    checkInt("segtree min over a prefix", sg.query(0, 3), 2);
+    checkInt("segtree min over a suffix", sg.query(4, 8), 3);
+    checkInt("segtree single element", sg.query(3, 4), 1);
+    checkInt("segtree empty range is the identity", sg.query(3, 3), sg.identity);
+    sg.set(3, 100);
+    checkInt("segtree after set, min", sg.query(0, 8), 2);
+    checkInt("segtree after set, at", sg.at(3), 100);
+
+    let ss = segtree_sum(4);
+    ss.build([1, 2, 3, 4]);
+    checkInt("segtree sum total", ss.total(), 10);
+    checkInt("segtree sum range", ss.query(1, 3), 5);
+    ss.update(0, 10);
+    checkInt("segtree update folds in", ss.at(0), 11);
+
+    let sm = segtree_max(4);
+    sm.build([3, 9, 1, 7]);
+    checkInt("segtree max", sm.query(0, 4), 9);
+    checkInt("segtree max on a sub-range", sm.query(2, 4), 7);
+
+    let so = segtree_or(4);
+    so.build([1, 2, 4, 8]);
+    checkInt("segtree or", so.query(0, 4), 15);
+    checkInt("segtree or on a sub-range", so.query(1, 3), 6);
+
+    // A non-commutative combine must not be reordered: this one keeps the
+    // left operand, so the fold is only correct if the walk preserves order.
+    let first = new SegTree(8, -1, (a, b) => { if (a == -1) { return b; } return a; });
+    first.build([10, 20, 30, 40, 50, 60, 70, 80]);
+    checkInt("non-commutative combine keeps order", first.query(2, 6), 30);
+    checkInt("non-commutative combine, whole range", first.query(0, 8), 10);
+
+    print("---- Bloom ----");
+    let b = bloom_for(1000, 0.01);
+    for (let i in 0..500) { b.add_str("k" + str(i)); }
+    checkInt("bloom counts what went in", b.len(), 500);
+    let false_neg = 0;
+    for (let i in 0..500) { if (!b.maybe_str("k" + str(i))) { false_neg += 1; } }
+    checkInt("bloom never gives a false negative", false_neg, 0);
+    let false_pos = 0;
+    for (let i in 1000..2000) { if (b.maybe_str("k" + str(i))) { false_pos += 1; } }
+    checkBool("bloom false positives are near the target rate", false_pos < 60);
+    checkBool("bloom is not saturated", b.fill_ratio() < 0.6);
+    checkBool("bloom sized itself for the request", b.size_bits() >= 1000);
+
+    let b2 = bloom_for(1000, 0.01);
+    b2.add_str("only-in-b2");
+    b.union_with(b2);
+    checkBool("union keeps the original members", b.maybe_str("k1"));
+    checkBool("union adds the other's members", b.maybe_str("only-in-b2"));
+    b.clear();
+    checkInt("bloom clear", b.len(), 0);
+    checkBool("bloom clear empties the bits", !b.maybe_str("k1"));
+
+    print("---- SkipList ----");
+    let sl = skiplist_int();
+    for (let v in [5, 1, 9, 3, 7]) { sl.insert(v); }
+    let dup = sl.insert(3);
+    checkBool("skiplist rejects a duplicate", !dup);
+    checkInt("skiplist len", sl.len(), 5);
+    check("skiplist is ordered", dshelp_ints(sl.toArray()), "1,3,5,7,9");
+    checkInt("skiplist first", sl.first(), 1);
+    checkInt("skiplist last", sl.last(), 9);
+    checkBool("skiplist contains", sl.contains(7));
+    checkBool("skiplist does not contain", !sl.contains(4));
+    checkInt("skiplist at", sl.at(2), 5);
+    checkInt("skiplist rank", sl.rank_of(5), 2);
+    checkInt("skiplist rank of an absent value", sl.rank_of(4), 2);
+    check("skiplist range", dshelp_ints(sl.range(2, 8)), "3,5,7");
+    check("skiplist range that matches nothing", dshelp_ints(sl.range(100, 200)), "");
+
+    // for-in goes through len()/at(i), so it must agree with toArray().
+    let via_loop: int[] = [];
+    for (let v in sl) { via_loop.push(v); }
+    check("skiplist for-in == toArray", dshelp_ints(via_loop), dshelp_ints(sl.toArray()));
+
+    let gone = sl.remove(9);
+    checkBool("skiplist remove returns true", gone);
+    check("skiplist after remove", dshelp_ints(sl.toArray()), "1,3,5,7");
+    let gone_again = sl.remove(9);
+    checkBool("removing twice returns false", !gone_again);
+
+    // Enough elements to exercise several tower levels.
+    let big = skiplist_int();
+    for (let i in 0..300) { big.insert((i * 37) % 300); }
+    checkInt("skiplist holds 300 distinct", big.len(), 300);
+    let arr = big.toArray();
+    let unordered = 0;
+    for (let i in 1..arr.len) { if (arr[i - 1] >= arr[i]) { unordered += 1; } }
+    checkInt("300 elements come out sorted", unordered, 0);
+    for (let i in 0..150) { big.remove(i * 2); }
+    checkInt("skiplist after 150 removals", big.len(), 150);
+    let still_there = 0;
+    for (let i in 0..300) { if (i % 2 == 1 && big.contains(i)) { still_there += 1; } }
+    checkInt("every survivor is still findable", still_there, 150);
+    sl.clear();
+    checkInt("skiplist clear", sl.len(), 0);
+
+    print("---- SkipMap ----");
+    let om = skipmap_int_str();
+    om.put(30, "backup");
+    om.put(10, "compact");
+    om.put(20, "flush");
+    om.put(40, "gc");
+    checkInt("skipmap len", om.len(), 4);
+    check("skipmap get", om.get(20), "flush");
+    check("skipmap get_or on a miss", om.get_or(99, "none"), "none");
+    checkBool("skipmap has", om.has(30));
+    checkBool("skipmap has on a miss", !om.has(31));
+    check("skipmap keys come out sorted", dshelp_ints(om.keys_in_order()), "10,20,30,40");
+    check("skipmap values follow key order",
+          om.values_in_order().join(","), "compact,flush,backup,gc");
+
+    // The reason this exists rather than a HashMap: adjacency.
+    checkInt("ceiling between keys", om.ceiling_key(15, -1), 20);
+    checkInt("ceiling on an exact key is itself", om.ceiling_key(20, -1), 20);
+    checkInt("ceiling below everything is the first", om.ceiling_key(0, -1), 10);
+    checkInt("ceiling above everything is the default", om.ceiling_key(99, -1), -1);
+    checkInt("floor between keys", om.floor_key(15, -1), 10);
+    checkInt("floor on an exact key is itself", om.floor_key(20, -1), 20);
+    checkInt("floor below everything is the default", om.floor_key(5, -1), -1);
+    checkInt("floor above everything is the last", om.floor_key(99, -1), 40);
+    check("ceiling_value", om.ceiling_value(15, "none"), "flush");
+    check("floor_value", om.floor_value(15, "none"), "compact");
+    check("floor_value below everything", om.floor_value(5, "none"), "none");
+
+    checkInt("skipmap first_key", om.first_key(), 10);
+    checkInt("skipmap last_key", om.last_key(), 40);
+    check("skipmap first_value", om.first_value(), "compact");
+    check("skipmap last_value", om.last_value(), "gc");
+    check("range_keys is half-open", dshelp_ints(om.range_keys(20, 40)), "20,30");
+    check("range_values matches", om.range_values(20, 40).join(","), "flush,backup");
+    check("range that matches nothing", dshelp_ints(om.range_keys(41, 99)), "");
+    checkInt("skipmap rank", om.rank_of(35), 3);
+    checkInt("skipmap key_at", om.key_at(1), 20);
+    check("skipmap value_at", om.value_at(1), "flush");
+
+    let om_dup = om.put(20, "FLUSH");
+    checkBool("put on an existing key returns false", !om_dup);
+    check("put overwrites the value", om.get(20), "FLUSH");
+    checkInt("overwrite does not change len", om.len(), 4);
+    check("overwrite does not disturb order", dshelp_ints(om.keys_in_order()), "10,20,30,40");
+
+    let om_rm = om.remove(20);
+    checkBool("skipmap remove returns true", om_rm);
+    checkInt("skipmap len after remove", om.len(), 3);
+    checkBool("removed key is gone", !om.has(20));
+    check("order survives a removal", dshelp_ints(om.keys_in_order()), "10,30,40");
+    checkInt("ceiling skips the hole", om.ceiling_key(20, -1), 30);
+    checkInt("floor skips the hole", om.floor_key(20, -1), 10);
+    let om_rm2 = om.remove(20);
+    checkBool("removing twice returns false", !om_rm2);
+
+    // String keys need an explicit comparator — `<` on strings is not a thing.
+    let oms = skipmap_str_int();
+    oms.put("pear", 3);
+    oms.put("apple", 1);
+    oms.put("fig", 2);
+    check("string keys sort", oms.keys_in_order().join(","), "apple,fig,pear");
+    check("string ceiling", oms.ceiling_key("b", "-"), "fig");
+    check("string floor", oms.floor_key("b", "-"), "apple");
+    checkInt("string lookup", oms.get("fig"), 2);
+    checkInt("cmp_str is a prefix-then-length order", cmp_str("ab", "abc"), -1);
+    checkBool("cmp_str equal", cmp_str("ab", "ab") == 0);
+
+    // Enough keys, inserted out of order, to build several tower levels.
+    let ombig = skipmap_int_str();
+    for (let i in 0..300) { ombig.put((i * 37) % 300, "v" + str((i * 37) % 300)); }
+    checkInt("skipmap holds 300 distinct keys", ombig.len(), 300);
+    let omk = ombig.keys_in_order();
+    let om_unordered = 0;
+    for (let i in 1..omk.len) { if (omk[i - 1] >= omk[i]) { om_unordered += 1; } }
+    checkInt("300 keys come out sorted", om_unordered, 0);
+    let om_wrong = 0;
+    for (let i in 0..300) { if (ombig.get_or(i, "") != "v" + str(i)) { om_wrong += 1; } }
+    checkInt("every key maps to its own value", om_wrong, 0);
+    for (let i in 0..150) { ombig.remove(i * 2); }
+    checkInt("skipmap after 150 removals", ombig.len(), 150);
+    let om_lost = 0;
+    for (let i in 0..300) { if (i % 2 == 1 && !ombig.has(i)) { om_lost += 1; } }
+    checkInt("every survivor is still findable", om_lost, 0);
+    checkInt("ceiling still works after churn", ombig.ceiling_key(100, -1), 101);
+    ombig.clear();
+    checkInt("skipmap clear", ombig.len(), 0);
+
+    print("---- Graph ----");
+    let g = graph(6);
+    g.add_edge(0, 1, 4);
+    g.add_edge(0, 2, 1);
+    g.add_edge(2, 1, 2);
+    g.add_edge(1, 3, 5);
+    g.add_edge(2, 3, 8);
+    g.add_edge(3, 4, 3);
+    checkInt("graph vertex count", g.len(), 6);
+    checkInt("graph edge count", g.nedges(), 6);
+    checkInt("out degree", g.out_degree(0), 2);
+    checkInt("out degree of a sink", g.out_degree(4), 0);
+    check("bfs hop counts, -1 unreachable", dshelp_ints(g.bfs(0)), "0,1,1,2,3,-1");
+
+    // Dijkstra must beat BFS here: 0->2->1 costs 3, while 0->1 direct costs 4.
+    let dist = g.dijkstra(0);
+    checkInt("dijkstra takes the cheaper two-hop path", dist[1], 3);
+    checkInt("dijkstra direct edge", dist[2], 1);
+    checkInt("dijkstra through the cheaper predecessor", dist[3], 8);
+    checkInt("dijkstra further on", dist[4], 11);
+    checkBool("dijkstra marks the unreachable", dist[5] == INF);
+
+    check("topological order", dshelp_ints(g.topo_sort()), "0,5,2,1,3,4");
+    checkBool("acyclic graph has no cycle", !g.has_cycle());
+    check("weak components", dshelp_ints(g.components()), "0,0,0,0,0,1");
+    checkInt("dfs visits every reachable vertex", g.dfs(0).len, 5);
+
+    let cyc = graph(3);
+    cyc.add_edge(0, 1, 1);
+    cyc.add_edge(1, 2, 1);
+    cyc.add_edge(2, 0, 1);
+    checkInt("a cyclic graph yields an empty topo sort", cyc.topo_sort().len, 0);
+    checkBool("has_cycle", cyc.has_cycle());
+
+    let und = graph(4);
+    und.add_edge2(0, 1, 1);
+    und.add_edge2(2, 3, 1);
+    checkInt("add_edge2 adds both directions", und.nedges(), 4);
+    check("undirected components", dshelp_ints(und.components()), "0,0,1,1");
+    checkBool("undirected reachability is symmetric", und.bfs(1)[0] == 1);
+
+    g.clear_edges();
+    checkInt("clear_edges", g.nedges(), 0);
+    checkInt("vertices survive clear_edges", g.len(), 6);
+
+    print("---- IntervalTree ----");
+    let iv = intervalTree();
+    iv.add(10, 20, 1);
+    iv.add(15, 25, 2);
+    iv.add(30, 40, 3);
+    iv.add(0, 100, 4);
+    iv.build();
+    checkInt("interval len", iv.len(), 4);
+    check("stab inside two ranges", dshelp_ints(iv.stab(17)), "4,1,2");
+    check("stab inside one range", dshelp_ints(iv.stab(35)), "4,3");
+    check("stab in the gap", dshelp_ints(iv.stab(27)), "4");
+    check("stab outside everything", dshelp_ints(iv.stab(-5)), "");
+    check("half-open: the end is excluded", dshelp_ints(iv.stab(20)), "4,2");
+    check("half-open: the start is included", dshelp_ints(iv.stab(10)), "4,1");
+    check("overlap spans several", dshelp_ints(iv.overlap(18, 32)), "4,1,2,3");
+    check("overlap touching only one", dshelp_ints(iv.overlap(38, 45)), "4,3");
+    check("overlap of an empty range", dshelp_ints(iv.overlap(5, 5)), "");
+    checkInt("count_at", iv.count_at(12), 2);
+    checkBool("covers", iv.covers(50));
+    checkBool("does not cover", !iv.covers(-5));
+
+    iv.clear();
+    checkInt("interval clear", iv.len(), 0);
+    check("querying an empty tree", dshelp_ints(iv.stab(1)), "");
+}

@@ -517,6 +517,111 @@ else
     fail=1
 fi
 
+# --- vyto/ds: 200 checks over the nine index structures. Trie's flat
+#     first-child/next-sibling layout and longest_prefix, Dsu over a 1000-long
+#     chain, Fenwick build()==repeated add() and lower_bound, SegTree with a
+#     deliberately non-commutative combine, Bloom's no-false-negative
+#     guarantee, SkipList over 300 elements with 150 removals, SkipMap's
+#     ceiling/floor across a hole left by a removal, Graph where
+#     Dijkstra must beat BFS, and IntervalTree's half-open boundaries ---
+got=$(./vytoc run tests/fixtures/ds_structures.vt 2>&1)
+if [ "$got" = "$(cat tests/fixtures/ds_structures.expected)" ]; then
+    echo "PASS ds_structures"
+else
+    echo "FAIL ds_structures"
+    echo "--- expected ---"; cat tests/fixtures/ds_structures.expected
+    echo "--- got ---"; printf '%s\n' "$got"
+    fail=1
+fi
+
+# --- switch: int subjects (a real C jump table) and string subjects (a
+#     vt_str_eq chain), multi-value arms, default written anywhere, and above
+#     all `break` inside an arm inside a loop — C binds that to the switch,
+#     Vyto binds it to the loop, so the emitter turns it into a goto. Also a
+#     switch inside a generic, which guards the arm deep-clone ---
+got=$(./vytoc run tests/fixtures/switch_stmt.vt 2>&1)
+if [ "$got" = "$(cat tests/fixtures/switch_stmt.expected)" ]; then
+    echo "PASS switch_stmt"
+else
+    echo "FAIL switch_stmt"
+    echo "--- expected ---"; cat tests/fixtures/switch_stmt.expected
+    echo "--- got ---"; printf '%s\n' "$got"
+    fail=1
+fi
+
+# --- vyto/coll: 145 checks over the eight containers. The ones that matter are
+#     HashMap/HashSet deletion (backward shift, verified by removing half a
+#     table and then checking every key, and again with every key colliding),
+#     Deque ring wrap, RingBuffer's drop accounting, LRU eviction order under
+#     churn, and Slab generations refusing to revive a stale handle ---
+got=$(./vytoc run tests/fixtures/coll_containers.vt 2>&1)
+if [ "$got" = "$(cat tests/fixtures/coll_containers.expected)" ]; then
+    echo "PASS coll_containers"
+else
+    echo "FAIL coll_containers"
+    echo "--- expected ---"; cat tests/fixtures/coll_containers.expected
+    echo "--- got ---"; printf '%s\n' "$got"
+    fail=1
+fi
+
+# --- for-in over a user container (a class with len()/at(i)): the release
+#     paths (break, continue, return), len() being re-read each iteration so a
+#     container that grows or shrinks in the body stays correct, virtual at(),
+#     inherited len/at, and a generic container holding refs ---
+got=$(./vytoc run tests/fixtures/forin_container.vt 2>&1)
+if [ "$got" = "$(cat tests/fixtures/forin_container.expected)" ]; then
+    echo "PASS forin_container"
+else
+    echo "FAIL forin_container"
+    echo "--- expected ---"; cat tests/fixtures/forin_container.expected
+    echo "--- got ---"; printf '%s\n' "$got"
+    fail=1
+fi
+
+# --- vyto/hash: 87 known-answer checks against other people's numbers —
+#     FNV-1a and CRC-32/32C published vectors, xxHash64 reference values, all
+#     sixteen SipHash-2-4 vectors from the paper, plus the properties the table
+#     helpers promise (non-negative, deterministic, scattering) ---
+got=$(./vytoc run tests/fixtures/hash_vectors.vt 2>&1)
+if [ "$got" = "$(cat tests/fixtures/hash_vectors.expected)" ]; then
+    echo "PASS hash_vectors"
+else
+    echo "FAIL hash_vectors"
+    echo "--- expected ---"; cat tests/fixtures/hash_vectors.expected
+    echo "--- got ---"; printf '%s\n' "$got"
+    fail=1
+fi
+
+# --- generics across modules: a generic declared in one module, instantiated
+#     in another with the *caller's* own class. The instance is emitted into
+#     the declaring module, which forward-declares the foreign class in its
+#     header and includes the caller's header from its .c. Covers generic
+#     classes, two type arguments, a subclass, an array-of-T field, and a
+#     generic fn taking T by value. ---
+got=$(./vytoc run tests/fixtures/generic_cross_class.vt 2>&1)
+if [ "$got" = "$(cat tests/fixtures/generic_cross_class.expected)" ]; then
+    echo "PASS generic_cross_class"
+else
+    echo "FAIL generic_cross_class"
+    echo "--- expected ---"; cat tests/fixtures/generic_cross_class.expected
+    echo "--- got ---"; printf '%s\n' "$got"
+    fail=1
+fi
+
+# --- generics across modules: holding another module's generic *struct*
+#     instance as a by-value field. emit_one_struct used to recurse into any
+#     struct with a generic_origin regardless of owning module, emitting a
+#     second copy of the body and failing the C compile. ---
+got=$(./vytoc run tests/fixtures/generic_cross_struct_field.vt 2>&1)
+if [ "$got" = "$(cat tests/fixtures/generic_cross_struct_field.expected)" ]; then
+    echo "PASS generic_cross_struct_field"
+else
+    echo "FAIL generic_cross_struct_field"
+    echo "--- expected ---"; cat tests/fixtures/generic_cross_struct_field.expected
+    echo "--- got ---"; printf '%s\n' "$got"
+    fail=1
+fi
+
 # --- vyto/gfx: blend2d Canvas -> blitPtr (gated on the prebuilt lib) ---
 if [ -f lib/vyto/gfx/native/linux-x64/libblend2d.so ]; then
     gfx_bin=apps/gfxdemo/.vyto-cache/gfxdemo_test
@@ -650,21 +755,58 @@ else
     fail=1
 fi
 
-# Start the UI section from a cold cache. These tests are the only ones that
-# assert on lib/vyto/ui behaviour, and a stale object here makes them validate
-# the previous build instead of the current one — observed in practice, with
-# the suite reporting results one edit-generation behind the source on disk.
-# A cold rebuild of the whole ui stack is ~3.5s and only the first test pays
-# it, which is a cheap price for the suite meaning what it says.
+# Start the UI section from a cold cache, but only when it would actually be
+# stale. These tests are the only ones that assert on lib/vyto/ui behaviour,
+# and a stale object here makes them validate the previous build instead of the
+# current one — observed in practice, with the suite reporting results one
+# edit-generation behind the source on disk. That risk is real and this guard
+# keeps it covered; what changed is the price.
 #
-# Cleared once here rather than passing --clean per test: --clean is the
-# equivalent for a single manual run, but using it in the loop below would
-# re-pay the cold build on every one of the ~50 cases.
-rm -rf tests/ui/.vyto-cache
+# The cost was badly underestimated. "Only the first test pays the cold build"
+# is not what happens: emitted Vyto C is per-entry-file (generics are
+# monomorphized into the module that declared them), so each of the ~55 UI
+# tests compiles its own copy of the whole toolkit. Measured on this tree,
+# the UI section takes 370s from cold and 16s warm — a 23x difference, and
+# most of the entire suite's runtime.
+#
+# So wipe on the condition that matters: something the cache was built from is
+# newer than the cache. A stamp file rather than the directory's mtime, because
+# a directory's mtime only moves when its entries change, and a fully-cached
+# run adds no entries. Nested .vyto-cache dirs under lib/ are pruned so a
+# stray one from a manual run in a package directory cannot trigger a wipe.
+#
+# Sources checked: src (the compiler), lib (the stdlib), runtime, and the vytoc
+# binary itself — a rebuilt compiler can change the emitted C for unchanged
+# input, so its mtime has to count.
+ui_stamp=tests/ui/.vyto-cache/.suite-stamp
+if [ ! -f "$ui_stamp" ]; then
+    rm -rf tests/ui/.vyto-cache
+elif [ -n "$(find src lib runtime vytoc -name .vyto-cache -prune -o \
+                  -newer "$ui_stamp" -type f -print -quit 2>/dev/null)" ]; then
+    rm -rf tests/ui/.vyto-cache
+fi
+mkdir -p tests/ui/.vyto-cache
+# Stamped before the loop, not after: the sources are not changing while the
+# suite runs, and a run that dies partway then leaves a stamp older than
+# nothing in particular — the next run rebuilds only if a source moved, which
+# is the same rule. Use `make clean-cache` to force a cold one.
+touch "$ui_stamp"
 
 # --- vyto/ui headless golden tests (VS_HEADLESS backend, scripted events) ---
 for src in tests/ui/[0-9]*.vt; do
     name=$(basename "$src" .vt)
+    # Charts live in tests/run_tests_charts.sh (make test-charts). They are 21
+    # of these cases and the most expensive third of the suite, and chart.vt is
+    # a leaf nothing else imports — so they are both the costliest and the
+    # least likely to be broken by a change elsewhere.
+    # Charts and mobile widgets each have their own runner (make test-charts,
+    # make test-mobile). Both are leaf packages nothing else imports, and both
+    # are expensive: every entry file compiles its own copy of the ui stack,
+    # because generics are monomorphized into the declaring module. Splitting
+    # them keeps `make test` usable as an inner-loop check without dropping any
+    # coverage. 53/54_dragscroll stay here — they exercise core.vt's on_drag,
+    # not the mobile package.
+    case "$name" in *_chart_*|*_mobile_*) continue ;; esac
     got=$(VS_HEADLESS=1 VS_EVENTS="tests/ui/$name.events" ./vytoc run "$src" 2>&1)
     if [ "$got" = "$(cat "tests/ui/$name.expected")" ]; then
         echo "PASS ui_$name"

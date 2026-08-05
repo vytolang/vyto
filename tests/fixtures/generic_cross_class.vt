@@ -1,0 +1,62 @@
+// Cross-module generic instantiation with a *class* declared here, in a module
+// the generic's own module has never heard of. The instance is emitted into
+// mod_genlib, which forward-declares Node and includes mod_generic_cross_class.h
+// from its .c -- see emit.c, emit_fwd_class / emit_module.
+
+import { Box, Pair, Bag, count_all, echo } from "genlib";
+
+class Node {
+    name: string;
+    rank: int;
+    fn init(n: string, r: int) { this.name = n; this.rank = r; }
+    virtual fn label(): string { return this.name + "/" + str(this.rank); }
+}
+
+class Tagged extends Node {
+    tag: string;
+    fn init(n: string, r: int, t: string) { super.init(n, r); this.tag = t; }
+    override fn label(): string { return this.tag + ":" + this.name; }
+}
+
+// A struct declared here. Legal as a type argument wherever the instance's
+// header spells only pointers; rejected where it would be spelled by value.
+struct Point { x: int; y: int; }
+
+fn main() {
+    // -- generic class over a foreign class -----------------------------
+    let b = new Box<Node>(new Node("alpha", 1));
+    print(b.get().label());
+    b.put(new Node("beta", 2));
+    print(b.get().label());
+
+    // -- two foreign type arguments, and a mixed one --------------------
+    let p = new Pair<Node, string>(new Node("gamma", 3), "note");
+    print(p.first().label() + " " + p.second());
+    let q = new Pair<int, Node>(7, new Node("delta", 4));
+    print(str(q.first()) + " " + q.second().label());
+
+    // -- subclass flows through as the base instantiation ---------------
+    let t = new Tagged("eps", 5, "T");
+    let b2 = new Box<Node>(t);
+    print(b2.get().label());
+
+    // -- array-of-foreign-class field never spells T in the header ------
+    let bag = new Bag<Node>();
+    bag.add(new Node("one", 10));
+    bag.add(new Node("two", 20));
+    print(str(bag.len()));
+    for (let i in 0..bag.len()) { print(bag.at(i).label()); }
+
+    // -- generic fn: pointer-only signature, foreign class and struct ---
+    let ns: Node[] = [new Node("x", 0), new Node("y", 0), new Node("z", 0)];
+    print(str(count_all(ns)));
+    let ps: Point[] = [Point(1, 2), Point(3, 4)];
+    print(str(count_all(ps)));
+
+    // -- T by value: a class is a pointer, so this is fine --------------
+    print(echo(new Node("echoed", 9)).label());
+
+    // -- the instance cache is keyed on the type args, not the use site --
+    let b3 = new Box<Node>(new Node("cached", 99));
+    print(b3.get().label());
+}

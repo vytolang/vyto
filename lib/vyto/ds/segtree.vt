@@ -1,0 +1,113 @@
+// vyto/ds/segtree — a segment tree: any associative range query, with updates.
+//
+//     let t = segtree_min(n);
+//     t.build(values);
+//     t.set(i, v);
+//     print(str(t.query(lo, hi)));        // min over [lo, hi)
+//
+//     // any associative operation, with its identity
+//     let g = new SegTree(n, 1, (a, b) => a * b);       // range product
+//
+// A Fenwick tree does prefix sums and only sums — it depends on subtraction to
+// answer a range. A segment tree drops that requirement, so it answers min, max,
+// gcd, bitwise-or, "leftmost non-empty" and anything else associative, at the
+// cost of about twice the memory and a slightly slower constant. Use `Fenwick`
+// for sums; use this for everything else.
+//
+// Iterative and flat: `2n` ints, no nodes, no recursion, leaves at t[n + i]. The
+// query walks up from both ends of the range at once, which is why there is no
+// tree structure to allocate.
+
+export class SegTree {
+    t: int[];
+    n: int;
+    identity: int;
+    combine: fn(int, int): int;
+
+    // `identity` must satisfy combine(identity, x) == x for every x: 0 for sum,
+    // a very large number for min, a very small one for max, 1 for product.
+    fn init(n: int, identity: int, combine: fn(int, int): int) {
+        this.n = n;
+        this.identity = identity;
+        this.combine = combine;
+        this.t = [];
+        this.t.reserve(2 * n);
+        for (let i in 0..(2 * n)) { this.t.push(identity); }
+    }
+
+    fn len(): int { return this.n; }
+
+    // Bulk load in O(n): fill the leaves, then fold every internal node once.
+    fn build(src: int[]) {
+        if (src.len != this.n) { panic("SegTree.build: length mismatch"); }
+        for (let i in 0..this.n) { this.t[this.n + i] = src[i]; }
+        let i = this.n - 1;
+        while (i > 0) {
+            this.t[i] = this.combine(this.t[2 * i], this.t[2 * i + 1]);
+            i -= 1;
+        }
+    }
+
+    fn at(i: int): int {
+        if (i < 0 || i >= this.n) { panic("SegTree.at: index out of range"); }
+        return this.t[this.n + i];
+    }
+
+    // Replace the value at i and refold the path to the root. O(log n).
+    fn set(i: int, v: int) {
+        if (i < 0 || i >= this.n) { panic("SegTree.set: index out of range"); }
+        let k = this.n + i;
+        this.t[k] = v;
+        k = k / 2;
+        while (k >= 1) {
+            this.t[k] = this.combine(this.t[2 * k], this.t[2 * k + 1]);
+            k = k / 2;
+        }
+    }
+
+    fn update(i: int, delta: int) { this.set(i, this.combine(this.at(i), delta)); }
+
+    // Fold over [lo, hi). Empty range yields the identity.
+    //
+    // Left and right accumulate separately and are combined at the end, because
+    // `combine` is only required to be associative -- not commutative. Folding
+    // them into one accumulator would silently reorder the operands, which is
+    // fine for min and wrong for, say, string-shaped or matrix-shaped combines.
+    fn query(lo: int, hi: int): int {
+        let l = lo;
+        let r = hi;
+        if (l < 0) { l = 0; }
+        if (r > this.n) { r = this.n; }
+        if (l >= r) { return this.identity; }
+        let resl = this.identity;
+        let resr = this.identity;
+        l += this.n;
+        r += this.n;
+        while (l < r) {
+            if ((l & 1) == 1) { resl = this.combine(resl, this.t[l]); l += 1; }
+            if ((r & 1) == 1) { r -= 1; resr = this.combine(this.t[r], resr); }
+            l = l / 2;
+            r = r / 2;
+        }
+        return this.combine(resl, resr);
+    }
+
+    fn total(): int { return this.query(0, this.n); }
+
+    fn clear() { for (let i in 0..(2 * this.n)) { this.t[i] = this.identity; } }
+}
+
+// A very large / very small sentinel rather than a true infinity: Vyto ints are
+// i64, and using INT64_MIN/MAX directly would overflow the moment a caller
+// combined it with anything.
+export const SEG_HI: int = 4611686018427387904;    // 2^62
+export const SEG_LO: int = -4611686018427387904;
+
+fn min_of(a: int, b: int): int { if (a < b) { return a; } return b; }
+fn max_of(a: int, b: int): int { if (a > b) { return a; } return b; }
+
+export fn segtree_sum(n: int): SegTree { return new SegTree(n, 0, (a, b) => a + b); }
+export fn segtree_min(n: int): SegTree { return new SegTree(n, SEG_HI, (a, b) => min_of(a, b)); }
+export fn segtree_max(n: int): SegTree { return new SegTree(n, SEG_LO, (a, b) => max_of(a, b)); }
+export fn segtree_or(n: int): SegTree { return new SegTree(n, 0, (a, b) => a | b); }
+export fn segtree_and(n: int): SegTree { return new SegTree(n, -1, (a, b) => a & b); }

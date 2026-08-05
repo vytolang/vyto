@@ -1,0 +1,69 @@
+// Stdlib generics over an application's own classes.
+//
+// A generic instance is emitted into the module that declared the generic, so
+// until now a stdlib `sort_by<T>` could only be instantiated with primitives —
+// sorting an array of your own type meant copying the helper into your module.
+//
+// That restriction was never about generics; it was about C headers. A class is
+// a pointer in the generated C, so vyto/util/sort's header needs only a forward
+// declaration of Task, and its .c includes this module outright. Structs are
+// still by value and still restricted where they'd be spelled in a signature.
+
+import { sort_by, index_of_by, contains_by } from "vyto/util/sort";
+import { array_repeat } from "vyto/util/array";
+
+class Task {
+    name: string;
+    priority: int;
+    done: bool;
+    fn init(n: string, p: int) { this.name = n; this.priority = p; this.done = false; }
+    fn line(): string {
+        let s = str(this.priority) + " " + this.name;
+        if (this.done) { s = s + " [x]"; }
+        return s;
+    }
+}
+
+// Vyto has no ordering on strings — `<` needs matching numeric types — so an
+// alphabetical sort supplies its own comparator, which is exactly what
+// sort_by is shaped for.
+fn str_cmp(a: string, b: string): int {
+    let n = a.len;
+    if (b.len < n) { n = b.len; }
+    for (let i in 0..n) {
+        if (a[i] != b[i]) { return a[i] - b[i]; }
+    }
+    return a.len - b.len;
+}
+
+fn main() {
+    let tasks: Task[] = [
+        new Task("ship the release", 2),
+        new Task("water the plants", 5),
+        new Task("fix the leak", 1),
+        new Task("answer email", 4),
+    ];
+    tasks[2].done = true;
+
+    print("---- by priority ----");
+    let byPri = sort_by(tasks, (a, b) => a.priority - b.priority);
+    for (let t in byPri) { print(t.line()); }
+
+    print("---- by name ----");
+    let byName = sort_by(tasks, (a, b) => str_cmp(a.name, b.name));
+    for (let t in byName) { print(t.line()); }
+
+    print("---- search ----");
+    print(str(index_of_by(tasks, (t) => t.done)));
+    print(str(index_of_by(tasks, (t) => t.priority > 9)));
+    print(str(contains_by(tasks, (t) => t.name == "answer email")));
+
+    print("---- repeat ----");
+    let two = array_repeat(byPri, 2);
+    print(str(two.len));
+    print(two[0].line());
+    print(two[4].line());
+
+    print("---- the original array is untouched ----");
+    for (let t in tasks) { print(t.line()); }
+}

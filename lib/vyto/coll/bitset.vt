@@ -1,0 +1,194 @@
+// vyto/coll/bitset — a set of small integers, one bit each.
+//
+//     let seen = new BitSet(1000000);
+//     seen.set(id);
+//     if (seen.test(id)) { ... }
+//     print(str(seen.count()));
+//
+// A million flags as a `bool[]` is a megabyte; here it is 125 KB, and the set
+// operations run 64 flags per instruction instead of one per iteration. That
+// ratio is the whole reason to reach for this: visited-marks in a graph walk,
+// a sieve, a free-slot map, per-row selection in a table with a million rows.
+//
+// Non-generic on purpose — the element type is always "an index" — so it needs
+// no `zero`, no comparator, and no generic instantiation at all.
+//
+// Backed by u64 words, because a signed shift into the sign bit is undefined in
+// C and this is transpiled C.
+
+import { popcount64, ctz64 } from "vyto/coll/util";
+
+// A bare hex literal types as `int`, so the all-ones mask needs to be named
+// to be a u64 in operand position.
+const ALL_ONES: u64 = 0xFFFFFFFFFFFFFFFF;
+const ONE: u64 = 1;
+
+export class BitSet {
+    words: u64[];
+    nbits: int;
+
+    fn init(nbits: int) {
+        let n = nbits;
+        if (n < 0) { n = 0; }
+        this.nbits = n;
+        let nw = (n + 63) / 64;
+        this.words = [];
+        this.words.reserve(nw);
+        for (let i in 0..nw) { this.words.push(0); }
+    }
+
+    // Capacity in bits, not the number set — `count()` is that.
+    fn size(): int { return this.nbits; }
+    fn nwords(): int { return this.words.len; }
+
+    fn check(i: int) {
+        if (i < 0 || i >= this.nbits) { panic("BitSet: index out of range"); }
+    }
+
+    fn set(i: int) {
+        this.check(i);
+        this.words[i / 64] = this.words[i / 64] | (ONE << (i & 63));
+    }
+
+    fn clear(i: int) {
+        this.check(i);
+        this.words[i / 64] = this.words[i / 64] & ~(ONE << (i & 63));
+    }
+
+    fn flip(i: int) {
+        this.check(i);
+        this.words[i / 64] = this.words[i / 64] ^ (ONE << (i & 63));
+    }
+
+    fn test(i: int): bool {
+        this.check(i);
+        return (this.words[i / 64] & (ONE << (i & 63))) != 0;
+    }
+
+    // Set or clear from a bool, for the caller holding a condition.
+    fn put(i: int, on: bool) {
+        if (on) { this.set(i); } else { this.clear(i); }
+    }
+
+    fn set_all() {
+        for (let w in 0..this.words.len) { this.words[w] = ALL_ONES; }
+        this.trim();
+    }
+
+    fn clear_all() {
+        for (let w in 0..this.words.len) { this.words[w] = 0; }
+    }
+
+    // How many bits are set. 64 at a time.
+    fn count(): int {
+        let n = 0;
+        for (let w in this.words) { n += popcount64(w); }
+        return n;
+    }
+
+    fn is_empty(): bool {
+        for (let w in this.words) { if (w != 0) { return false; } }
+        return true;
+    }
+
+    // The lowest set bit at or after `from`, or -1. This is what makes a
+    // BitSet iterable in time proportional to the number of set bits rather
+    // than the number of bits:
+    //
+    //     let i = s.next_set(0);
+    //     while (i >= 0) { visit(i); i = s.next_set(i + 1); }
+    fn next_set(start_at: int): int {
+        let start = start_at;
+        if (start < 0) { start = 0; }
+        if (start >= this.nbits) { return -1; }
+        let w = start / 64;
+        // Mask off the bits before `start` in the first word.
+        let cur = this.words[w] & (ALL_ONES << (start & 63));
+        while (true) {
+            if (cur != 0) {
+                let bit = w * 64 + ctz64(cur);
+                if (bit >= this.nbits) { return -1; }
+                return bit;
+            }
+            w += 1;
+            if (w >= this.words.len) { return -1; }
+            cur = this.words[w];
+        }
+        return -1;
+    }
+
+    fn next_clear(start_at: int): int {
+        let i = start_at;
+        if (i < 0) { i = 0; }
+        while (i < this.nbits) {
+            if (!this.test(i)) { return i; }
+            i += 1;
+        }
+        return -1;
+    }
+
+    // In-place set algebra. `other` may be a different size; the shorter one is
+    // treated as zero-extended, which is what makes `and` with a smaller mask
+    // do the obvious thing.
+    fn or_with(other: BitSet) {
+        let n = this.words.len;
+        if (other.words.len < n) { n = other.words.len; }
+        for (let i in 0..n) { this.words[i] = this.words[i] | other.words[i]; }
+        this.trim();
+    }
+
+    fn and_with(other: BitSet) {
+        for (let i in 0..this.words.len) {
+            let o: u64 = 0;
+            if (i < other.words.len) { o = other.words[i]; }
+            this.words[i] = this.words[i] & o;
+        }
+    }
+
+    fn andnot_with(other: BitSet) {
+        let n = this.words.len;
+        if (other.words.len < n) { n = other.words.len; }
+        for (let i in 0..n) { this.words[i] = this.words[i] & ~other.words[i]; }
+    }
+
+    fn xor_with(other: BitSet) {
+        let n = this.words.len;
+        if (other.words.len < n) { n = other.words.len; }
+        for (let i in 0..n) { this.words[i] = this.words[i] ^ other.words[i]; }
+        this.trim();
+    }
+
+    fn intersects(other: BitSet): bool {
+        let n = this.words.len;
+        if (other.words.len < n) { n = other.words.len; }
+        for (let i in 0..n) { if ((this.words[i] & other.words[i]) != 0) { return true; } }
+        return false;
+    }
+
+    fn clone(): BitSet {
+        let b = new BitSet(this.nbits);
+        for (let i in 0..this.words.len) { b.words[i] = this.words[i]; }
+        return b;
+    }
+
+    // The set bits as indices. Proportional to the count, not the capacity.
+    fn toArray(): int[] {
+        let out: int[] = [];
+        let i = this.next_set(0);
+        while (i >= 0) { out.push(i); i = this.next_set(i + 1); }
+        return out;
+    }
+
+    // Zero the bits past nbits in the last word. Every operation that can set
+    // them (set_all, or, xor) calls this, so count() and is_empty() never see
+    // a bit the caller cannot address.
+    fn trim() {
+        let extra = this.words.len * 64 - this.nbits;
+        if (extra > 0 && this.words.len > 0) {
+            let last = this.words.len - 1;
+            this.words[last] = this.words[last] & (ALL_ONES >> extra);
+        }
+    }
+}
+
+export fn bitset(nbits: int): BitSet { return new BitSet(nbits); }

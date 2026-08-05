@@ -184,6 +184,12 @@ typedef struct EScope {
     const char **names;
     int n, cap;
     bool is_loop;
+    /* A C `switch` captures `break`, but in Vyto `break` always means the
+       enclosing loop. When a break has to cross a switch scope it becomes a
+       goto, and the loop it targets grows a label. */
+    bool is_switch;
+    int loop_id;
+    bool needs_label;
     struct EScope *parent;
 } EScope;
 
@@ -198,8 +204,25 @@ typedef struct Em {
     int indent;
     const char **stmt_temps; /* owned temps awaiting release at stmt end */
     int nstmt, stmtcap;
+    int loopc;      /* ids for break-target labels */
     EScope *scope;
 } Em;
+
+static void ind(Em *em);
+static void epush(Em *em, bool is_loop);
+
+/* A loop scope carries an id so a `break` that has to cross a switch can jump
+   to a label after the loop. The label is only emitted if something asked. */
+static EScope *loop_begin(Em *em) {
+    epush(em, true);
+    em->scope->loop_id = ++em->loopc;
+    return em->scope;
+}
+
+/* The scope is arena-allocated, so it is still readable after epop. */
+static void loop_end(Em *em, EScope *ls) {
+    if (ls->needs_label) { ind(em); sb_printf(em->out, "_lb%d: ;\n", ls->loop_id); }
+}
 
 static void ind(Em *em) {
     for (int i = 0; i < em->indent; i++) sb_puts(em->out, "    ");
@@ -1486,7 +1509,7 @@ static void emit_stmt(Em *em, Stmt *s) {
         ind(em);
         sb_puts(em->out, "for (;;) {\n");
         em->indent++;
-        epush(em, true);
+        EScope *ls = loop_begin(em);
         int cwm = em->nstmt;
         const char *tc = newtemp(em, s->expr->type, false);
         ind(em);
@@ -1501,6 +1524,7 @@ static void emit_stmt(Em *em, Stmt *s) {
         em->indent--;
         ind(em);
         sb_puts(em->out, "}\n");
+        loop_end(em, ls);
         break;
     }
     case ST_FOR_RANGE: {
@@ -1515,12 +1539,13 @@ static void emit_stmt(Em *em, Stmt *s) {
         sb_printf(em->out, "for (int64_t %s = %s; %s < %s; %s++) {\n", s->local->cname, lo,
                   s->local->cname, hi, s->local->cname);
         em->indent++;
-        epush(em, true);
+        EScope *ls = loop_begin(em);
         emit_stmts(em, s->body, s->nbody);
         epop(em);
         em->indent--;
         ind(em);
         sb_puts(em->out, "}\n");
+        loop_end(em, ls);
         break;
     }
     case ST_FOR_EACH: {
@@ -1533,7 +1558,7 @@ static void emit_stmt(Em *em, Stmt *s) {
         sb_printf(em->out, "for (int64_t %s = 0; %s < vt_len(%s, \"%s\", %d); %s++) {\n", iv, iv,
                   ta, c_escape(s->loc.file, strlen(s->loc.file)), s->loc.line, iv);
         em->indent++;
-        epush(em, true);
+        EScope *ls = loop_begin(em);
         ind(em);
         /* iv runs [0, len) and the load sits right after the loop condition, so
            the index is in bounds by construction — skip the per-element bounds
@@ -1548,6 +1573,146 @@ static void emit_stmt(Em *em, Stmt *s) {
             ereg(em, s->local->cname, et);
         }
         emit_stmts(em, s->body, s->nbody);
+        epop(em);
+        em->indent--;
+        ind(em);
+        sb_puts(em->out, "}\n");
+        loop_end(em, ls);
+        break;
+    }
+    case ST_FOR_ITER: {
+        /* for (let x in c) over a class with len()/at(i). The checker built the
+           two calls as ordinary AST, so this is a plain index loop.
+
+           The container is held at +1 for the whole loop, which is stricter
+           than the array path (which borrows): unlike an array read, every
+           iteration re-enters user code, and at() can drop the caller's last
+           reference. ereg puts the release in the *enclosing* scope, so a
+           `return` releases it and a `break` correctly does not. */
+        Type *ct = s->iter_local->type, *et = s->local->type;
+        ind(em);
+        sb_printf(em->out, "%s %s = %s;\n", c_type(ct), s->iter_local->cname,
+                  ex_o(em, s->iter, ct));
+        ereg(em, s->iter_local->cname, ct);
+        flush_temps(em, wm, true);
+        int cwm = em->nstmt;
+        ind(em);
+        /* len() is re-evaluated each iteration, matching the array path above:
+           a body that grows the container stays correct, and hoisting would
+           run at(i) past the end for a body that shrinks it. */
+        sb_printf(em->out, "for (int64_t %s = 0; %s < %s; %s++) {\n", s->index_local->cname,
+                  s->index_local->cname, ex_b(em, s->len_call), s->index_local->cname);
+        em->indent++;
+        EScope *ls = loop_begin(em);
+        ind(em);
+        /* at() returns +1 for a ref (emit_call marks it fresh), so ex_o adds
+           nothing and epop's release below is the matching -1. */
+        sb_printf(em->out, "%s %s = %s;\n", c_type(et), s->local->cname,
+                  ex_o(em, s->at_call, et));
+        if (type_is_ref(et)) ereg(em, s->local->cname, et);
+        flush_temps(em, cwm, true);
+        emit_stmts(em, s->body, s->nbody);
+        epop(em);
+        em->indent--;
+        ind(em);
+        sb_puts(em->out, "}\n");
+        loop_end(em, ls);
+        break;
+    }
+    case ST_SWITCH: {
+        /* Ints get a real C switch, i.e. a jump table. Strings get an
+           if/else-if chain over vt_str_eq, because C cannot switch on one.
+           Either way there is no fallthrough: each arm ends with its own
+           break, and a Vyto `break` inside an arm was already rewritten to a
+           goto by ST_BREAK above. */
+        Type *st = s->expr->type;
+        bool is_str = st->kind == TY_STRING;
+        ind(em);
+        sb_puts(em->out, "{\n");
+        em->indent++;
+        epush(em, false);
+        em->scope->is_switch = true;
+        /* The subject goes in a scope-registered slot rather than a statement
+           temp: a `break` or `return` out of an arm jumps past the trailing
+           flush, and release_for_jump walks scopes. */
+        const char *sv = newtemp(em, st, false);
+        ind(em);
+        sb_printf(em->out, "%s = %s;\n", sv, ex_o(em, s->expr, st));
+        ereg(em, sv, st);
+        flush_temps(em, wm, true);
+
+        if (is_str) {
+            bool first = true;
+            SwitchArm *dflt = NULL;
+            for (int a = 0; a < s->narms; a++) {
+                SwitchArm *arm = &s->arms[a];
+                if (arm->is_default) { dflt = arm; continue; }
+                ind(em);
+                sb_printf(em->out, "%sif (", first ? "" : "else ");
+                for (int j = 0; j < arm->nvalues; j++)
+                    sb_printf(em->out, "%svt_str_eq(%s, %s)", j ? " || " : "", sv,
+                              ex_b(em, arm->values[j]));
+                sb_puts(em->out, ") {\n");
+                first = false;
+                em->indent++;
+                epush(em, false);
+                int awm = em->nstmt;
+                emit_stmts(em, arm->body, arm->nbody);
+                flush_temps(em, awm, true);
+                epop(em);
+                em->indent--;
+                ind(em);
+                sb_puts(em->out, "}\n");
+            }
+            /* The default arm becomes the trailing else, wherever it was
+               written. With no other arm it is an unconditional block. */
+            if (dflt) {
+                ind(em);
+                sb_printf(em->out, "%s{\n", first ? "" : "else ");
+                em->indent++;
+                epush(em, false);
+                int awm = em->nstmt;
+                emit_stmts(em, dflt->body, dflt->nbody);
+                flush_temps(em, awm, true);
+                epop(em);
+                em->indent--;
+                ind(em);
+                sb_puts(em->out, "}\n");
+            }
+        } else {
+            /* An unsigned subject needs an unsigned label, or the conversion
+               is implementation-defined for values above the signed max. */
+            const char *sfx = (st->kind == TY_U64 || st->kind == TY_CULONG) ? "ULL" : "LL";
+            ind(em);
+            sb_printf(em->out, "switch (%s) {\n", sv);
+            for (int a = 0; a < s->narms; a++) {
+                SwitchArm *arm = &s->arms[a];
+                if (arm->is_default) {
+                    ind(em);
+                    sb_puts(em->out, "default: {\n");
+                } else {
+                    for (int j = 0; j < arm->nvalues; j++) {
+                        ind(em);
+                        sb_printf(em->out, "case %lld%s:%s\n",
+                                  (long long)arm->values[j]->ival, sfx,
+                                  j == arm->nvalues - 1 ? " {" : "");
+                    }
+                }
+                em->indent++;
+                epush(em, false);
+                int awm = em->nstmt;
+                emit_stmts(em, arm->body, arm->nbody);
+                flush_temps(em, awm, true);
+                epop(em);
+                ind(em);
+                sb_puts(em->out, "break;\n");
+                em->indent--;
+                ind(em);
+                sb_puts(em->out, "}\n");
+            }
+            ind(em);
+            sb_puts(em->out, "}\n");
+        }
         epop(em);
         em->indent--;
         ind(em);
@@ -1586,11 +1751,26 @@ static void emit_stmt(Em *em, Stmt *s) {
         em->nstmt = wm;
         return;
     }
-    case ST_BREAK:
+    case ST_BREAK: {
         release_for_jump(em, true);
         ind(em);
-        sb_puts(em->out, "break;\n");
+        /* If a switch scope sits between here and the target loop, a plain C
+           `break` would leave the switch instead. Jump past the loop instead,
+           and mark it so the label gets emitted. `continue` needs none of this:
+           C's continue already binds to the loop. */
+        EScope *target = NULL;
+        for (EScope *sc = em->scope; sc; sc = sc->parent) {
+            if (sc->is_switch) target = target ? target : sc;   /* crossed one */
+            if (sc->is_loop) {
+                if (target) { target = sc; sc->needs_label = true; }
+                else target = NULL;
+                break;
+            }
+        }
+        if (target && target->is_loop) sb_printf(em->out, "goto _lb%d;\n", target->loop_id);
+        else sb_puts(em->out, "break;\n");
         return;
+    }
     case ST_CONTINUE:
         release_for_jump(em, true);
         ind(em);
@@ -1802,6 +1982,14 @@ static void emit_class_struct(ClassDecl *cd, SBuf *h, bool *emitted, ClassDecl *
     sb_puts(h, "};\n");
 }
 
+/* Guarded so a class named in two headers typedefs once per TU. A repeated
+   typedef is a C11 relaxation, not C99, and tcc is a supported backend. */
+static void emit_fwd_class(SBuf *h, ClassDecl *cd) {
+    const char *cn = class_cname(cd);
+    sb_printf(h, "#ifndef VT_FWD_%s\n#define VT_FWD_%s\ntypedef struct %s %s;\n#endif\n",
+              cn, cn, cn, cn);
+}
+
 static bool sd_seen(StructDecl **arr, int n, StructDecl *sd) {
     for (int i = 0; i < n; i++) if (arr[i] == sd) return true;
     return false;
@@ -1813,8 +2001,12 @@ static void emit_one_struct(StructDecl *sd, Module *m, SBuf *h, StructDecl **don
     if (sd_seen(done, *ndone, sd)) return;
     for (int f = 0; f < sd->nfields; f++) {
         Type *ft = sd->fields[f].type;
+        /* A generic instance is emitted by its *origin's* module, so only
+           recurse into one when that module is us -- otherwise the instance's
+           own header already defined it and we would redefine the struct. */
         if (ft->kind == TY_STRUCT && !ft->sdecl->is_extern &&
-            (ft->sdecl->module == m || ft->sdecl->generic_origin))
+            (ft->sdecl->module == m ||
+             (ft->sdecl->generic_origin && ft->sdecl->generic_origin->module == m)))
             emit_one_struct(ft->sdecl, m, h, done, ndone);
     }
     if (sd_seen(done, *ndone, sd)) return;
@@ -1828,8 +2020,126 @@ static void emit_one_struct(StructDecl *sd, Module *m, SBuf *h, StructDecl **don
     sb_puts(h, "};\n");
 }
 
+/* ---- cross-module generic instantiation ---------------------------------
+ *
+ * A generic instance is emitted into the module that *declared* the generic
+ * (check.c, instantiate_*), so `Deque<Node>` used from an app lands in
+ * mod_vyto_coll_deque even though Node lives in mod_app. Two properties make
+ * that legal without a header cycle:
+ *
+ *   - A class is always a pointer in C (c_type, TY_CLASS -> "%s*"), so the
+ *     defining module's *header* needs only a forward typedef of a foreign
+ *     class, never its definition. Foreign structs are by value and do need
+ *     the definition -- check.c rejects those up front.
+ *   - The defining module's *.c* may include the foreign header outright. A
+ *     .c including a header is not a cycle, and the include guards make the
+ *     back-edge (mod_app.h -> mod_coll.h) a no-op.
+ *
+ * Both typedefs and includes are idempotent, so a type reachable from two
+ * directions costs nothing. */
+
+typedef struct PtrVec {
+    void **v;
+    int n, cap;
+} PtrVec;
+
+static bool pv_has(PtrVec *pv, void *p) {
+    for (int i = 0; i < pv->n; i++) if (pv->v[i] == p) return true;
+    return false;
+}
+
+static void pv_add(PtrVec *pv, void *p) {
+    if (!p || pv_has(pv, p)) return;
+    if (pv->n == pv->cap) {
+        pv->cap = pv->cap ? pv->cap * 2 : 8;
+        pv->v = realloc(pv->v, sizeof(void *) * (size_t)pv->cap);
+        if (!pv->v) fatal("out of memory");
+    }
+    pv->v[pv->n++] = p;
+}
+
+/* A foreign class spelled in m's header: forward typedef only (see above).
+   Deliberately NOT recursive -- an array/map/fn type spells as VtArray* /
+   VtMap* / VtClosure*, so its element type never reaches the header. */
+static void note_hdr_type(PtrVec *out, Module *m, Type *t) {
+    if (t && t->kind == TY_CLASS && t->cdecl && t->cdecl->module != m)
+        pv_add(out, t->cdecl);
+}
+
+static void note_hdr_fn(PtrVec *out, Module *m, FnDecl *fd) {
+    if (!fd) return;
+    for (int i = 0; i < fd->nparams; i++) note_hdr_type(out, m, fd->params[i].type);
+    note_hdr_type(out, m, fd->ret);
+}
+
+/* Every module a generic instance's *body* may name. Recursive, unlike the
+   header walk: a body can spell sizeof(v_app_Point) for a `T = Point[]`
+   argument, and `x as T` emits &v_app_Point__type. */
+static void note_src_type(PtrVec *out, Module *m, Type *t, int depth) {
+    if (!t || depth > 16) return;
+    switch (t->kind) {
+    case TY_CLASS:
+        if (t->cdecl && t->cdecl->module != m) pv_add(out, t->cdecl->module);
+        break;
+    case TY_STRUCT:
+        if (t->sdecl && !t->sdecl->is_extern && t->sdecl->module != m)
+            pv_add(out, t->sdecl->module);
+        break;
+    case TY_ARRAY:
+    case TY_MAP:
+        note_src_type(out, m, t->elem, depth + 1);
+        break;
+    case TY_FN:
+        for (int i = 0; i < t->nparams; i++) note_src_type(out, m, t->params[i], depth + 1);
+        note_src_type(out, m, t->ret, depth + 1);
+        break;
+    default: break;
+    }
+}
+
+static void note_src_args(PtrVec *out, Module *m, Type **args, int n) {
+    for (int i = 0; i < n; i++) note_src_type(out, m, args[i], 0);
+}
+
 void emit_module(Module *m, bool is_entry, bool checks, EntryMode mode, SBuf *h, SBuf *c) {
     g_checks = checks;
+
+    /* Foreign types reached only through a generic instantiation: classes that
+       need a forward typedef in the header, modules that need an include in
+       the .c. Both are empty for a module that declares no generics. */
+    PtrVec fwd = {0}, inc = {0};
+    for (int i = 0; i < m->ndecls; i++) {
+        Decl *d = m->decls[i];
+        if (d->kind == D_FN && d->fn->ntyparams > 0) {
+            for (FnDecl *it = d->fn->next_inst; it; it = it->next_inst) {
+                note_hdr_fn(&fwd, m, it);
+                note_src_args(&inc, m, it->type_args, d->fn->ntyparams);
+            }
+        } else if (d->kind == D_STRUCT && d->sd->ntyparams > 0) {
+            for (StructDecl *it = d->sd->next_inst; it; it = it->next_inst) {
+                for (int f = 0; f < it->nfields; f++) note_hdr_type(&fwd, m, it->fields[f].type);
+                for (int mi = 0; mi < it->nmethods; mi++) note_hdr_fn(&fwd, m, it->methods[mi]);
+                note_src_args(&inc, m, it->type_args, d->sd->ntyparams);
+            }
+        } else if (d->kind == D_CLASS && d->cd->ntyparams > 0) {
+            for (ClassDecl *it = d->cd->next_inst; it; it = it->next_inst) {
+                for (int f = 0; f < it->nfields; f++) note_hdr_type(&fwd, m, it->fields[f].type);
+                note_hdr_fn(&fwd, m, it->ctor);
+                for (int mi = 0; mi < it->nmethods; mi++) note_hdr_fn(&fwd, m, it->methods[mi]);
+                note_src_args(&inc, m, it->type_args, d->cd->ntyparams);
+            }
+        }
+    }
+    /* A forward-declared class is still an incomplete type in the .c, where
+       method bodies dereference it -- so its module is needed there too. */
+    for (int i = 0; i < fwd.n; i++) pv_add(&inc, ((ClassDecl *)fwd.v[i])->module);
+    for (int i = 0; i < m->ndecls; i++)
+        if (m->decls[i]->kind == D_IMPORT) {
+            Module *im = m->decls[i]->import_module;
+            for (int k = 0; k < inc.n; k++)
+                if (inc.v[k] == im) { inc.v[k] = inc.v[--inc.n]; break; }
+        }
+
     /* ---------- header ---------- */
     sb_printf(h, "#ifndef VYTO_MOD_%s_H\n#define VYTO_MOD_%s_H\n", m->name, m->name);
     sb_puts(h, "#include \"vyto_rt.h\"\n");
@@ -1837,6 +2147,7 @@ void emit_module(Module *m, bool is_entry, bool checks, EntryMode mode, SBuf *h,
         if (m->decls[i]->kind == D_IMPORT)
             sb_printf(h, "#include \"mod_%s.h\"\n", m->decls[i]->import_module->name);
     sb_puts(h, "\n");
+    for (int i = 0; i < fwd.n; i++) emit_fwd_class(h, (ClassDecl *)fwd.v[i]);
 
     /* struct typedefs + bodies (deps-first; generic templates -> instances) */
     int nsd = 0;
@@ -1876,10 +2187,7 @@ void emit_module(Module *m, bool is_entry, bool checks, EntryMode mode, SBuf *h,
                 for (ClassDecl *it = m->decls[i]->cd->next_inst; it; it = it->next_inst) classes[ci++] = it;
             } else classes[ci++] = m->decls[i]->cd;
         }
-    for (int i = 0; i < nclasses; i++) {
-        const char *cn = class_cname(classes[i]);
-        sb_printf(h, "typedef struct %s %s;\n", cn, cn);
-    }
+    for (int i = 0; i < nclasses; i++) emit_fwd_class(h, classes[i]);
     for (int i = 0; i < nclasses; i++)
         emit_class_struct(classes[i], h, emitted, classes, nclasses);
     for (int i = 0; i < nclasses; i++) {
@@ -2010,7 +2318,10 @@ void emit_module(Module *m, bool is_entry, bool checks, EntryMode mode, SBuf *h,
         }
     }
 
-    sb_printf(c, "#include \"mod_%s.h\"\n\n", m->name);
+    sb_printf(c, "#include \"mod_%s.h\"\n", m->name);
+    for (int i = 0; i < inc.n; i++)
+        sb_printf(c, "#include \"mod_%s.h\"\n", ((Module *)inc.v[i])->name);
+    sb_puts(c, "\n");
     sb_puts(c, aux.data);
     sb_puts(c, "\n");
     sb_puts(c, code.data);
@@ -2038,4 +2349,6 @@ void emit_module(Module *m, bool is_entry, bool checks, EntryMode mode, SBuf *h,
     }
     sb_free(&aux);
     sb_free(&code);
+    free(fwd.v);
+    free(inc.v);
 }

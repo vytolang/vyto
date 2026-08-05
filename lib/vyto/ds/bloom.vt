@@ -1,0 +1,132 @@
+// vyto/ds/bloom — a Bloom filter: "definitely not present" in a fraction of the
+// memory a real set would need.
+//
+//     let b = bloom_for(1000000, 0.01);      // 1M items, 1% false positives
+//     b.add_str(url);
+//     if (!b.maybe_str(url)) { ... }         // certain: never added
+//
+// ── THE CONTRACT, AND IT IS ASYMMETRIC ──────────────────────────────────────
+//   `maybe()` false  →  the item was definitely never added.  Certain.
+//   `maybe()` true   →  it was probably added.  Might be wrong.
+//
+// So a Bloom filter is only ever useful as a *filter*: something cheap in front
+// of something expensive, where a false positive costs one wasted lookup and a
+// false negative would be a correctness bug. Have I already crawled this URL,
+// is this key possibly on disk, has this token been seen — always with the real
+// check behind it.
+//
+// There is no remove. Clearing a bit would clear it for every other item that
+// happened to set it, turning a false positive into a false negative and
+// breaking the one guarantee the structure makes.
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// One `byte[]` and k derived hashes from a single 64-bit hash by double hashing
+// (h1 + i*h2), which is provably as good as k independent hashes here and costs
+// one hash instead of k.
+
+import { xxh64, fnv1a_64, str_bytes } from "vyto/hash";
+
+export class Bloom {
+    bits: byte[];
+    nbits: int;
+    k: int;         // hashes per item
+    count: int;     // items added, for the estimator below
+
+    // `nbits` is rounded up to a byte. Prefer `bloom_for`, which sizes both
+    // this and `k` from the numbers you actually know.
+    fn init(nbits: int, k: int) {
+        let n = nbits;
+        if (n < 8) { n = 8; }
+        if (k < 1) { k = 1; }
+        this.nbits = (n + 7) / 8 * 8;
+        this.k = k;
+        this.bits = bytes(this.nbits / 8);
+        this.count = 0;
+    }
+
+    fn size_bits(): int { return this.nbits; }
+    fn size_bytes(): int { return this.bits.len; }
+    fn hashes(): int { return this.k; }
+    fn len(): int { return this.count; }
+
+    fn add(data: byte[]) { this.add_hash(xxh64(data, 0), fnv1a_64(data)); }
+    fn maybe(data: byte[]): bool { return this.maybe_hash(xxh64(data, 0), fnv1a_64(data)); }
+
+    // String forms read the bytes once. Two different hash families, so the
+    // double-hashing pair is genuinely independent.
+    fn add_str(s: string) { this.add(str_bytes(s)); }
+    fn maybe_str(s: string): bool { return this.maybe(str_bytes(s)); }
+
+    // For a caller who already has the hashes, or wants their own.
+    fn add_hash(h1: u64, h2: u64) {
+        for (let i in 0..this.k) {
+            let b = this.bit_of(h1, h2, i);
+            this.bits[b / 8] = this.bits[b / 8] | ((1 << (b & 7)) as byte);
+        }
+        this.count += 1;
+    }
+
+    fn maybe_hash(h1: u64, h2: u64): bool {
+        for (let i in 0..this.k) {
+            let b = this.bit_of(h1, h2, i);
+            if ((this.bits[b / 8] & ((1 << (b & 7)) as byte)) == 0 as byte) { return false; }
+        }
+        return true;
+    }
+
+    fn bit_of(h1: u64, h2: u64, i: int): int {
+        let h = h1 + (i as u64) * h2;
+        return ((h >> 1) as int) % this.nbits;   // >> 1 clears the sign bit
+    }
+
+    fn clear() {
+        this.bits = bytes(this.nbits / 8);
+        this.count = 0;
+    }
+
+    // Fraction of bits set. The honest health check: past about 0.5 the filter
+    // is saturated and the false-positive rate is far above what it was sized
+    // for, whatever `count` says.
+    fn fill_ratio(): float {
+        let set = 0;
+        for (let by in this.bits) {
+            let v = by as int;
+            for (let i in 0..8) { if ((v & (1 << i)) != 0) { set += 1; } }
+        }
+        return (set as float) / (this.nbits as float);
+    }
+
+    // Union of two filters of identical geometry — which is what makes a Bloom
+    // filter usable across shards or across a fork()ed worker pool.
+    fn union_with(other: Bloom) {
+        if (other.nbits != this.nbits || other.k != this.k) {
+            panic("Bloom.union_with: filters have different geometry");
+        }
+        for (let i in 0..this.bits.len) { this.bits[i] = this.bits[i] | other.bits[i]; }
+        this.count += other.count;
+    }
+}
+
+// Size a filter from the two numbers a caller actually knows: how many items
+// are going in, and what false-positive rate is tolerable.
+//
+//   m = -n ln(p) / (ln 2)^2      bits
+//   k = (m / n) ln 2             hashes
+//
+// The logarithm is done with a small integer approximation rather than by
+// importing vyto/math, so this module keeps its zero-dependency property. The
+// table covers the rates anyone actually asks for; anything else is rounded to
+// the nearest one, which changes the size by a few percent and nothing else.
+export fn bloom_for(n: int, p: float): Bloom {
+    let items = n;
+    if (items < 1) { items = 1; }
+    // bits per item for p = 10%, 1%, 0.1%, 0.01%, and the matching k
+    let bpi = 5;
+    let k = 3;
+    if (p <= 0.0001) { bpi = 20; k = 14; }
+    else if (p <= 0.001) { bpi = 15; k = 10; }
+    else if (p <= 0.01) { bpi = 10; k = 7; }
+    return new Bloom(items * bpi, k);
+}
+
+export fn bloom(nbits: int, k: int): Bloom { return new Bloom(nbits, k); }

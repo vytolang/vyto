@@ -1,0 +1,336 @@
+// vyto/hash — fast, non-cryptographic hashing: table hashes and checksums.
+//
+//     hash_str("user:42")                  // int, non-negative, no allocation
+//     hash_int(id)                         // scatter a sequential id
+//     xxh64(strBytes(s), 0)                // the general-purpose 64-bit hash
+//     siphash24(msg, k0, k1)               // keyed — use when keys are hostile
+//     crc32(bytes)                         // a checksum, not a table hash
+//
+// This is the *non-cryptographic* half of hashing. The digest half is
+// vyto/crypto (SHA-256, HMAC, HKDF, PBKDF2, and BLAKE2b inside
+// vyto/crypto/argon2). The two are not interchangeable in either direction:
+//
+//   • A cryptographic digest is the wrong tool for a hash-table bucket — SHA-256
+//     is roughly two orders of magnitude slower per byte than xxHash and buys a
+//     property (preimage resistance) that a bucket index does not need.
+//   • Nothing in this file is a MAC. SipHash is keyed and is the right answer to
+//     hash-flooding, but it is a 64-bit output and is not an authentication tag.
+//     Use hmac_sha256 for that.
+//
+// Pure Vyto, no dependency, no native code, no provisioning — so it compiles for
+// every target including freestanding, and a package manager can use it before
+// it can fetch anything.
+//
+// ── WHICH ONE ───────────────────────────────────────────────────────────────
+//   hash_str / hash_int / hash_bytes  the default for a Map or a HashMap key
+//   xxh64                             hashing a lot of bytes, fast, well spread
+//   siphash24                         the moment keys come from the network
+//   fnv1a_*                           tiny, no state, weakest avalanche
+//   crc32 / crc32c                    detecting corruption on the wire or disk
+// ────────────────────────────────────────────────────────────────────────────
+//
+// Endianness: xxHash64 and SipHash are defined over little-endian reads, and
+// this implementation does those reads byte by byte, so every function here
+// returns the same value on every platform.
+
+// ---- 64-bit primitives ------------------------------------------------------
+//
+// u64 arithmetic wraps (it is unsigned), which is what every hash below relies
+// on. Signed `int` traps on overflow in a debug build, so the 64-bit mixing
+// never touches it. The 32-bit functions do use `int` with an explicit
+// & 0xFFFFFFFF, the same idiom as vyto/crypto's SHA-256.
+
+fn rotl64(x: u64, n: int): u64 { return (x << n) | (x >> (64 - n)); }
+
+// Little-endian 64-bit load. Byte-at-a-time on purpose: it is endian-neutral
+// and the C compiler folds it back into a single load where it legally can.
+fn le64(b: byte[], off: int): u64 {
+    let v: u64 = 0;
+    let i = 7;
+    while (i >= 0) { v = (v << 8) | (b[off + i] as u64); i -= 1; }
+    return v;
+}
+
+fn le32(b: byte[], off: int): u64 {
+    let v: u64 = 0;
+    let i = 3;
+    while (i >= 0) { v = (v << 8) | (b[off + i] as u64); i -= 1; }
+    return v;
+}
+
+// splitmix64's finalizer. Takes a value with poor bit distribution — a small
+// integer, a pointer, an FNV digest — and spreads every input bit across all
+// 64 output bits. This is what makes a sequential id usable as a bucket index.
+export fn mix64(x: u64): u64 {
+    let z = x + 0x9E3779B97F4A7C15;
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EB;
+    return z ^ (z >> 31);
+}
+
+// ---- FNV-1a -----------------------------------------------------------------
+//
+// The smallest useful hash: no table, no state, one multiply and one xor per
+// byte. Its avalanche is weak — near-identical short strings land in nearby
+// buckets — so hash_str runs the result through mix64 rather than using it raw.
+
+const FNV32_OFFSET: int = 2166136261;
+const FNV32_PRIME:  int = 16777619;
+const FNV64_OFFSET: u64 = 0xCBF29CE484222325;
+const FNV64_PRIME:  u64 = 0x100000001B3;
+
+export fn fnv1a_32(data: byte[]): int {
+    let h = FNV32_OFFSET;
+    for (let c in data) { h = ((h ^ (c as int)) * FNV32_PRIME) & 0xFFFFFFFF; }
+    return h;
+}
+
+export fn fnv1a_64(data: byte[]): u64 {
+    let h = FNV64_OFFSET;
+    for (let c in data) { h = (h ^ (c as u64)) * FNV64_PRIME; }
+    return h;
+}
+
+// String variants read the string's bytes in place, so they allocate nothing.
+export fn fnv1a_32_str(s: string): int {
+    let h = FNV32_OFFSET;
+    for (let i in 0..s.len) { h = ((h ^ s[i]) * FNV32_PRIME) & 0xFFFFFFFF; }
+    return h;
+}
+
+export fn fnv1a_64_str(s: string): u64 {
+    let h = FNV64_OFFSET;
+    for (let i in 0..s.len) { h = (h ^ (s[i] as u64)) * FNV64_PRIME; }
+    return h;
+}
+
+// ---- xxHash64 ---------------------------------------------------------------
+//
+// The general-purpose choice: about an order of magnitude faster per byte than
+// FNV on long inputs, because it runs four independent accumulators over
+// 32-byte stripes, and it passes SMHasher where FNV does not.
+
+const XXP1: u64 = 0x9E3779B185EBCA87;
+const XXP2: u64 = 0xC2B2AE3D27D4EB4F;
+const XXP3: u64 = 0x165667B19E3779F9;
+const XXP4: u64 = 0x85EBCA77C2B2AE63;
+const XXP5: u64 = 0x27D4EB2F165667C5;
+
+fn xx_round(acc: u64, val: u64): u64 {
+    return rotl64(acc + val * XXP2, 31) * XXP1;
+}
+
+fn xx_merge(acc: u64, val: u64): u64 {
+    return (acc ^ xx_round(0, val)) * XXP1 + XXP4;
+}
+
+// `seed` varies the whole hash. Pass 0 for the canonical value; pass a
+// per-process random seed to a hash table that must not be flooded (though
+// siphash24 is the stronger answer to that).
+export fn xxh64(data: byte[], seed: u64): u64 {
+    let n = data.len;
+    let p = 0;
+    let h: u64 = 0;
+    if (n >= 32) {
+        let v1 = seed + XXP1 + XXP2;
+        let v2 = seed + XXP2;
+        let v3 = seed;
+        let v4 = seed - XXP1;
+        let limit = n - 32;
+        while (p <= limit) {
+            v1 = xx_round(v1, le64(data, p)); p += 8;
+            v2 = xx_round(v2, le64(data, p)); p += 8;
+            v3 = xx_round(v3, le64(data, p)); p += 8;
+            v4 = xx_round(v4, le64(data, p)); p += 8;
+        }
+        h = rotl64(v1, 1) + rotl64(v2, 7) + rotl64(v3, 12) + rotl64(v4, 18);
+        h = xx_merge(h, v1);
+        h = xx_merge(h, v2);
+        h = xx_merge(h, v3);
+        h = xx_merge(h, v4);
+    } else {
+        h = seed + XXP5;
+    }
+    h = h + (n as u64);
+    while (p + 8 <= n) {
+        h = rotl64(h ^ xx_round(0, le64(data, p)), 27) * XXP1 + XXP4;
+        p += 8;
+    }
+    if (p + 4 <= n) {
+        h = rotl64(h ^ (le32(data, p) * XXP1), 23) * XXP2 + XXP3;
+        p += 4;
+    }
+    while (p < n) {
+        h = rotl64(h ^ ((data[p] as u64) * XXP5), 11) * XXP1;
+        p += 1;
+    }
+    h = (h ^ (h >> 33)) * XXP2;
+    h = (h ^ (h >> 29)) * XXP3;
+    return h ^ (h >> 32);
+}
+
+// Convenience over a string. This copies the string's bytes first, so it is the
+// wrong call in a per-key hot loop — use hash_str there, which allocates
+// nothing.
+export fn xxh64_str(s: string, seed: u64): u64 { return xxh64(str_bytes(s), seed); }
+
+// ---- SipHash-2-4 ------------------------------------------------------------
+//
+// Keyed. The reason it exists: an attacker who can choose your Map's keys can,
+// with any unkeyed hash, pick thousands of keys that collide and turn every
+// lookup into a linear scan. That is a denial of service against a web server,
+// a DNS cache, or anything else keyed on request data. SipHash's output depends
+// on a secret key, so the collisions cannot be computed in advance.
+//
+// Draw (k0, k1) once at startup from vyto/util/uuid's rand_bytes and keep them
+// for the process. A hardcoded key is the same as no key.
+
+fn sip_round(v: u64[]) {
+    v[0] = v[0] + v[1];  v[1] = rotl64(v[1], 13);  v[1] = v[1] ^ v[0];  v[0] = rotl64(v[0], 32);
+    v[2] = v[2] + v[3];  v[3] = rotl64(v[3], 16);  v[3] = v[3] ^ v[2];
+    v[0] = v[0] + v[3];  v[3] = rotl64(v[3], 21);  v[3] = v[3] ^ v[0];
+    v[2] = v[2] + v[1];  v[1] = rotl64(v[1], 17);  v[1] = v[1] ^ v[2];  v[2] = rotl64(v[2], 32);
+}
+
+export fn siphash24(data: byte[], k0: u64, k1: u64): u64 {
+    let v: u64[] = [k0 ^ 0x736F6D6570736575, k1 ^ 0x646F72616E646F6D,
+                    k0 ^ 0x6C7967656E657261, k1 ^ 0x7465646279746573];
+    let n = data.len;
+    let blocks = n / 8;
+    for (let i in 0..blocks) {
+        let m = le64(data, i * 8);
+        v[3] = v[3] ^ m;
+        sip_round(v);
+        sip_round(v);
+        v[0] = v[0] ^ m;
+    }
+    // The final block carries the length in its top byte, which is what stops
+    // trailing zero bytes from being invisible.
+    let b = ((n & 0xFF) as u64) << 56;
+    let i = blocks * 8;
+    while (i < n) { b = b | ((data[i] as u64) << (8 * (i - blocks * 8))); i += 1; }
+    v[3] = v[3] ^ b;
+    sip_round(v);
+    sip_round(v);
+    v[0] = v[0] ^ b;
+    v[2] = v[2] ^ 0xFF;
+    sip_round(v);
+    sip_round(v);
+    sip_round(v);
+    sip_round(v);
+    return v[0] ^ v[1] ^ v[2] ^ v[3];
+}
+
+export fn siphash24_str(s: string, k0: u64, k1: u64): u64 {
+    return siphash24(str_bytes(s), k0, k1);
+}
+
+// ---- CRC-32 -----------------------------------------------------------------
+//
+// A checksum, not a hash: it detects accidental corruption (a flipped bit, a
+// truncated transfer) and is trivially forgeable, so it is never a substitute
+// for a MAC. Two polynomials ship because both are standard and incompatible:
+// CRC32_IEEE is what zip, gzip and PNG use; CRC32C is what iSCSI, ext4 and
+// SSE4.2's hardware instruction use.
+
+export const CRC32_IEEE: int = 0xEDB88320;
+export const CRC32C:     int = 0x82F63B78;
+
+// Table-free: eight shifts per byte. Correct everywhere and allocation-free,
+// which is what a one-shot checksum wants. For a hot loop over many buffers
+// build a `Crc` instead — its 256-entry table is roughly 4x faster per byte
+// and pays for itself somewhere around a few hundred bytes.
+fn crc_bitwise(data: byte[], poly: int): int {
+    let c = 0xFFFFFFFF;
+    for (let x in data) {
+        c = c ^ (x as int);
+        for (let k in 0..8) {
+            let lsb = c & 1;
+            c = c >> 1;
+            if (lsb != 0) { c = c ^ poly; }
+        }
+    }
+    return (c ^ 0xFFFFFFFF) & 0xFFFFFFFF;
+}
+
+export fn crc32(data: byte[]): int  { return crc_bitwise(data, CRC32_IEEE); }
+export fn crc32c(data: byte[]): int { return crc_bitwise(data, CRC32C); }
+export fn crc32_str(s: string): int { return crc32(str_bytes(s)); }
+
+// A CRC with its lookup table built once. Also the streaming form: `begin()`,
+// then `update` per chunk, then `finish` — for a file you are reading a block
+// at a time and never hold whole.
+//
+//     let c = new Crc(CRC32_IEEE);
+//     let acc = c.begin();
+//     while (f.readInto(buf) > 0) { acc = c.update(acc, buf); }
+//     print(str(c.finish(acc)));
+export class Crc {
+    table: int[];
+
+    fn init(poly: int) {
+        this.table = [];
+        this.table.reserve(256);
+        for (let i in 0..256) {
+            let c = i;
+            for (let k in 0..8) {
+                let lsb = c & 1;
+                c = c >> 1;
+                if (lsb != 0) { c = c ^ poly; }
+            }
+            this.table.push(c);
+        }
+    }
+
+    fn begin(): int { return 0xFFFFFFFF; }
+
+    fn update(acc: int, data: byte[]): int {
+        let c = acc;
+        for (let x in data) { c = this.table[(c ^ (x as int)) & 0xFF] ^ (c >> 8); }
+        return c;
+    }
+
+    fn finish(acc: int): int { return (acc ^ 0xFFFFFFFF) & 0xFFFFFFFF; }
+
+    // One-shot: begin, update, finish.
+    fn of(data: byte[]): int { return this.finish(this.update(this.begin(), data)); }
+}
+
+export fn crc(poly: int): Crc { return new Crc(poly); }
+
+// ---- table-ready helpers ----------------------------------------------------
+//
+// What a Map or a HashMap actually wants: a non-negative `int`, well spread,
+// cheap. The sign bit is cleared rather than the value being taken modulo
+// anything, so the caller is free to mask with a power-of-two table size.
+
+fn nonneg(x: u64): int { return (x as int) & 0x7FFFFFFFFFFFFFFF; }
+
+// Hash an integer key. mix64 alone, because a sequential id already contains
+// all its entropy — it just has it in the wrong bits.
+export fn hash_int(v: int): int { return nonneg(mix64(v as u64)); }
+
+// Hash a string key without allocating: FNV-1a over the bytes in place, then
+// mix64 to fix FNV's avalanche. Cheaper than xxh64 for short keys (no copy, no
+// 32-byte striping to set up) and better distributed than either alone.
+export fn hash_str(s: string): int { return nonneg(mix64(fnv1a_64_str(s))); }
+
+export fn hash_bytes(b: byte[]): int { return nonneg(mix64(fnv1a_64(b))); }
+
+// Combine two hashes order-dependently, for a composite key. Not commutative on
+// purpose: hash_combine(a, b) != hash_combine(b, a), so (row, col) and
+// (col, row) do not collide.
+export fn hash_combine(a: int, b: int): int {
+    return nonneg(mix64((a as u64) ^ (mix64(b as u64) + 0x9E3779B97F4A7C15)));
+}
+
+// ---- shared ------------------------------------------------------------------
+
+// The bytes of a string. Local rather than imported so this module keeps its
+// zero-dependency, freestanding-safe property; vyto/crypto's strBytes is the
+// same function and the two agree.
+export fn str_bytes(s: string): byte[] {
+    let b = bytes(s.len);
+    for (let i in 0..s.len) { b[i] = s[i] as byte; }
+    return b;
+}

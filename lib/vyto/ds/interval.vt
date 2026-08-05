@@ -1,0 +1,171 @@
+// vyto/ds/interval — which ranges cover this point, or overlap this range.
+//
+//     let t = new IntervalTree();
+//     t.add(10, 20, ruleId);
+//     t.build();                        // once, after the last add()
+//     for (let id in t.stab(15)) { ... }        // ranges containing 15
+//     for (let id in t.overlap(5, 12)) { ... }  // ranges meeting [5, 12)
+//
+// Ranges are half-open `[lo, hi)` and carry an `int` payload — a Slab handle, a
+// row index, a rule id. The reaching-for-it cases: which CSS rules apply at this
+// scroll offset, which reservations clash with this one, which log entries fall
+// in this window, which annotations cover this character.
+//
+// ── BUILD ONCE, THEN QUERY ──────────────────────────────────────────────────
+// `add` is O(1) and `build` sorts. Querying before `build`, or after adding
+// without rebuilding, panics rather than quietly answering from a stale index —
+// a range structure that silently misses a match is worse than one that stops.
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Three parallel `int[]`s sorted by `lo`, augmented with a running maximum of
+// `hi`. A query binary-searches for the last range that can start early enough,
+// then walks backwards and stops as soon as the running max says nothing
+// earlier can reach — which is what keeps it near the number of hits rather
+// than the number of ranges.
+
+export class IntervalTree {
+    lo: int[];
+    hi: int[];
+    id: int[];
+    maxhi: int[];     // maxhi[i] = max(hi[0..i]); only valid after build()
+    built: bool;
+
+    fn init() {
+        this.lo = [];
+        this.hi = [];
+        this.id = [];
+        this.maxhi = [];
+        this.built = true;    // an empty tree is trivially built
+    }
+
+    fn len(): int { return this.lo.len; }
+    fn is_empty(): bool { return this.lo.len == 0; }
+
+    // Add the half-open range [lo, hi) with payload `id`. An empty or reversed
+    // range is rejected: it can never match anything, so accepting it silently
+    // would hide the caller's bug.
+    fn add(lo: int, hi: int, id: int) {
+        if (hi <= lo) { panic("IntervalTree.add: empty or reversed range"); }
+        this.lo.push(lo);
+        this.hi.push(hi);
+        this.id.push(id);
+        this.built = false;
+    }
+
+    // Sort by `lo` and recompute the running maximum. Call after the last add.
+    fn build() {
+        let n = this.lo.len;
+        // Insertion sort on an index permutation, then apply it once. Ranges
+        // arrive nearly sorted often enough (a scan over a document, a log)
+        // that this is usually linear, and it never moves three arrays per swap.
+        let idx: int[] = [];
+        idx.reserve(n);
+        for (let i in 0..n) { idx.push(i); }
+        let i = 1;
+        while (i < n) {
+            let cur = idx[i];
+            let key = this.lo[cur];
+            let j = i - 1;
+            while (j >= 0 && this.lo[idx[j]] > key) {
+                idx[j + 1] = idx[j];
+                j -= 1;
+            }
+            idx[j + 1] = cur;
+            i += 1;
+        }
+        let nlo: int[] = [];
+        let nhi: int[] = [];
+        let nid: int[] = [];
+        nlo.reserve(n); nhi.reserve(n); nid.reserve(n);
+        for (let k in 0..n) {
+            nlo.push(this.lo[idx[k]]);
+            nhi.push(this.hi[idx[k]]);
+            nid.push(this.id[idx[k]]);
+        }
+        this.lo = nlo;
+        this.hi = nhi;
+        this.id = nid;
+        this.maxhi = [];
+        this.maxhi.reserve(n);
+        let running = 0;
+        for (let k in 0..n) {
+            if (k == 0 || this.hi[k] > running) { running = this.hi[k]; }
+            this.maxhi.push(running);
+        }
+        this.built = true;
+    }
+
+    fn require_built(what: string) {
+        if (!this.built) {
+            panic("IntervalTree." + what + ": call build() after the last add()");
+        }
+    }
+
+    // Index of the last range whose lo is <= x, or -1.
+    fn last_start_at_or_before(x: int): int {
+        let lo = 0;
+        let hi = this.lo.len - 1;
+        let best = -1;
+        while (lo <= hi) {
+            let mid = (lo + hi) / 2;
+            if (this.lo[mid] <= x) { best = mid; lo = mid + 1; }
+            else { hi = mid - 1; }
+        }
+        return best;
+    }
+
+    // Payloads of every range containing `x`. Order is by range start.
+    fn stab(x: int): int[] {
+        this.require_built("stab");
+        let out: int[] = [];
+        let k = this.last_start_at_or_before(x);
+        while (k >= 0) {
+            // Nothing at or before k can reach x, so stop rather than scan on.
+            if (this.maxhi[k] <= x) { break; }
+            if (this.hi[k] > x) { out.push(this.id[k]); }
+            k -= 1;
+        }
+        out.reverse();
+        return out;
+    }
+
+    // Payloads of every range overlapping the half-open [lo, hi).
+    fn overlap(lo: int, hi: int): int[] {
+        this.require_built("overlap");
+        let out: int[] = [];
+        if (hi <= lo) { return out; }
+        // A range overlaps iff it starts before hi and ends after lo.
+        let k = this.last_start_at_or_before(hi - 1);
+        while (k >= 0) {
+            if (this.maxhi[k] <= lo) { break; }
+            if (this.hi[k] > lo) { out.push(this.id[k]); }
+            k -= 1;
+        }
+        out.reverse();
+        return out;
+    }
+
+    fn count_at(x: int): int { return this.stab(x).len; }
+
+    // Does anything cover x? Cheaper than stab when the answer is all you want.
+    fn covers(x: int): bool {
+        this.require_built("covers");
+        let k = this.last_start_at_or_before(x);
+        while (k >= 0) {
+            if (this.maxhi[k] <= x) { return false; }
+            if (this.hi[k] > x) { return true; }
+            k -= 1;
+        }
+        return false;
+    }
+
+    fn clear() {
+        this.lo = [];
+        this.hi = [];
+        this.id = [];
+        this.maxhi = [];
+        this.built = true;
+    }
+}
+
+export fn intervalTree(): IntervalTree { return new IntervalTree(); }
