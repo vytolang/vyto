@@ -105,10 +105,15 @@ fn main() {
     expect("oversized_body_413", round_trip(gp,
         "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 99999\r\nConnection: close\r\n\r\n", g),
         "413");
-    // A non-numeric length must be refused, not coerced.
-    expect("bad_content_length_413", round_trip(gp,
+    // A non-numeric length must be refused, not coerced — and refused as 400,
+    // not 413. This asserted 413 until the framing rewrite, and 413 was wrong:
+    // "Payload Too Large" tells the client its body was rejected for size, so a
+    // client that believed it would shrink a body that was never the problem.
+    // Over-cap is still 413; the case above is what covers that, and the two
+    // must not collapse into one code.
+    expect("bad_content_length_400", round_trip(gp,
         "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 12x\r\nConnection: close\r\n\r\n", g),
-        "413");
+        "400");
 
     // ---- buffer growth -----------------------------------------------------
     // A connection's buffer starts at 2 KB and doubles toward the cap on
@@ -143,6 +148,76 @@ fn main() {
     expect("cap_still_enforced_431", round_trip(cp,
         "GET /ok HTTP/1.1\r\nHost: x\r\nX-Huge: " + huge.toString()
         + "\r\nConnection: close\r\n\r\n", cap), "431");
+
+    // ---- protocol correctness and the smuggling defences -------------------
+    //
+    // These are permanent on purpose. Every one of them corresponds to a defect
+    // that returned a SUCCESS status while being wrong — the dangerous kind,
+    // invisible to any test that only drives the happy path. A security fix
+    // whose only test lives in a gitignored directory is a security fix that
+    // will be silently reverted, so these live in the golden suite even at the
+    // cost of binding a port.
+    let p = server(0);
+    p.get("/ok", (req, res) => { res.text(200, "ok"); });
+    p.get("/b", (req, res) => { res.text(200, "b"); });
+    p.post("/echo2", (req, res) => { res.text(200, req.bodyText()); });
+    let pp = p.bind();
+
+    // HEAD keeps the Content-Length a GET would produce and sends no body.
+    let head = round_trip(pp, "HEAD /ok HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", p);
+    expect("head_keeps_length", head, "Content-Length: 2");
+    if (!head.contains("\r\n\r\nok")) { print("PASS head_sends_no_body"); }
+    else { print("FAIL head_sends_no_body"); }
+    // A HEAD on a GET-only route is served by it, or HEAD health checks are
+    // useless on every ordinary route.
+    expect("head_falls_back_to_get", round_trip(pp,
+        "HEAD /b HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", p), "200 OK");
+
+    // Conflicting Content-Length is the classic request-smuggling vector.
+    expect("cl_conflicting_400", round_trip(pp,
+        "POST /echo2 HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n"
+        + "Content-Length: 100\r\nConnection: close\r\n\r\nhello", p), "400");
+    // Identical duplicates too: a hop that folds them emits `5, 5`, so the two
+    // hops still disagree about the framing.
+    expect("cl_duplicate_400", round_trip(pp,
+        "POST /echo2 HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n"
+        + "Content-Length: 5\r\nConnection: close\r\n\r\nhello", p), "400");
+    // TE+CL is the desync, and must be 400 BEFORE the 501 chunked would draw.
+    expect("te_and_cl_400", round_trip(pp,
+        "POST /echo2 HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n"
+        + "Content-Length: 5\r\nConnection: close\r\n\r\nhello", p), "400");
+
+    // Host is mandatory on 1.1 and must appear exactly once.
+    expect("missing_host_400", round_trip(pp,
+        "GET /ok HTTP/1.1\r\nConnection: close\r\n\r\n", p), "400");
+    expect("duplicate_host_400", round_trip(pp,
+        "GET /ok HTTP/1.1\r\nHost: a\r\nHost: b\r\nConnection: close\r\n\r\n", p), "400");
+    // 1.0 predates Host and must still work.
+    expect("http10_no_host_ok", round_trip(pp,
+        "GET /ok HTTP/1.0\r\nConnection: close\r\n\r\n", p), "200 OK");
+
+    // Absolute-form is what a proxy sends; we used to match the whole URI
+    // against the route table and 404.
+    expect("absolute_form_ok", round_trip(pp,
+        "GET http://example.com/ok HTTP/1.1\r\nHost: example.com\r\n"
+        + "Connection: close\r\n\r\n", p), "200 OK");
+
+    // A permissive header parser is a desync primitive.
+    expect("hdr_space_in_name_400", round_trip(pp,
+        "GET /ok HTTP/1.1\r\nHost: x\r\nX Bad: v\r\nConnection: close\r\n\r\n", p), "400");
+    expect("hdr_space_before_colon_400", round_trip(pp,
+        "GET /ok HTTP/1.1\r\nHost: x\r\nX-Bad : v\r\nConnection: close\r\n\r\n", p), "400");
+
+    // The router matches a decoded, dot-free path, so `/a/%2e%2e/b`, `/a/../b`
+    // and `/b` are one resource rather than three.
+    expect("pct_dots_normalised", round_trip(pp,
+        "GET /a/%2e%2e/b HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", p), "200 OK");
+    expect("dot_segments_normalised", round_trip(pp,
+        "GET /a/../b HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", p), "200 OK");
+    // %00 must be refused on the RAW bytes: url_decode truncates at a decoded
+    // NUL, so `/a%00b` would otherwise silently become `/a`.
+    expect("pct_nul_400", round_trip(pp,
+        "GET /a%00b HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", p), "400");
 
     print("done");
 }

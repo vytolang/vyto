@@ -9,10 +9,13 @@
 //
 // -- what works today --------------------------------------------------------
 //
-// runSingle(): a blocking accept loop — parse, route, respond, keep-alive.
-// Correct and testable, one connection at a time. run() (pre-fork, one worker
-// per core over SO_REUSEPORT) is NOT implemented; the socket layer has no
-// SO_REUSEPORT yet (socket_shim.c sets SO_REUSEADDR only, line 139).
+// runSingle(): one reactor in this process — thousands of concurrent
+// connections on one core. The right mode for tests and for anything not
+// CPU-bound. run(): pre-fork over SO_REUSEPORT, one reactor per worker, with a
+// supervisor that re-forks whatever dies. Both are implemented.
+//
+// serveOnce()/serve_conn() are the blocking single-connection path, kept as a
+// test affordance; the reactor is the real one.
 //
 // -- why the shapes look like this -------------------------------------------
 //
@@ -38,8 +41,20 @@
 import { Socket, PollSet, POLL_READ, POLL_WRITE,
          socket_listen_on, socket_listen_reuseport } from "vyto/net/socket";
 import { StringBuilder } from "vyto/util/text";
-import { monoMs, unixSec } from "vyto/util/time";
+import { monoMs, monoUs, unixSec, sleepMs } from "vyto/util/time";
 import { date_from_unix, date_format } from "vyto/util/date";
+// Path normalisation. Both already exist and are already tested — a second
+// implementation here would be a second thing to get wrong, and traversal is
+// exactly the class of bug that punishes that.
+import { url_decode, remove_dot_segments } from "vyto/util/url";
+// Levels and a sink, instead of print(). Core keeps its own diagnostics
+// structured; the ACCESS log format stays user-space, via onRequest.
+import { Logger, logger } from "vyto/util/log";
+// core_count() reads the cgroup CPU quota; fromEnv() reads the deployment's
+// configuration. Both are the container asking for something sysconf and a
+// compile-time constant cannot answer.
+import { file_open, file_exists } from "vyto/io/file";
+import { getenv } from "vyto/os";
 
 // Plain libc — no shim, nothing to #link. fork/waitpid are the whole pre-fork
 // mechanism; sysconf answers "how many cores".
@@ -49,7 +64,21 @@ extern "C" {
     fn getpid(): i32;
     fn sysconf(name: i32): i64;
     fn _exit(code: i32);
+
+    // Static files. open/lseek/close/sendfile are plain libc, so no shim.
+    //
+    // The length comes from lseek(SEEK_END) rather than fstat DELIBERATELY:
+    // fstat needs a `struct stat` marshalled across the FFI boundary, and
+    // Vyto has no clean way to express one. Two lseeks cost nothing next to
+    // the open.
+    fn open(path: cstring, flags: i32): i32;
+    fn close(fd: i32): i32;
+    fn lseek(fd: i32, off: i64, whence: i32): i64;
+    fn sendfile(out_fd: i32, in_fd: i32, offset: rawptr, count: i64): i64;
 }
+const O_RDONLY: int = 0;
+const SEEK_SET: int = 0;
+const SEEK_END: int = 2;
 const SC_NPROCESSORS_ONLN: int = 84;   // Linux value
 
 // Names are Server*-prefixed on purpose: vyto/net/http already exports Request
@@ -69,6 +98,25 @@ export class Limits {
     // Slowloris budget: the socket timeout bounds how long a peer may dribble.
     recv_timeout_ms: int;
 
+    // Cap on a STREAMED body — one handed to a BodySink rather than buffered.
+    //
+    // There is deliberately no "unlimited". A server whose body size is bounded
+    // by nothing is bounded by the disk, and one config line should not be able
+    // to turn a bounded server into an unbounded one. Want 10 GB? Write 10 GB
+    // and own it.
+    //
+    // This does NOT relax max_body_bytes. A buffered body is still capped at
+    // that, because a buffered body costs memory; a streamed one does not.
+    max_streamed_bytes: int;
+
+    // Read size while streaming. Bounds the chunk a sink can be handed, so
+    // "how big is a chunk" has a structural answer rather than a hopeful one.
+    //
+    // 64 KB rather than RECV_CHUNK's 4 KB because the allocator pools only to
+    // 512 bytes (runtime/vyto_rt.c) — both sizes are a plain malloc, so the
+    // larger read is strictly fewer syscalls for the same allocation count.
+    stream_chunk_bytes: int;
+
     // Requests served on one connection before the server closes it. This is a
     // resource bound, not a correctness one — it caps how long a single peer
     // can hold a slot and forces periodic redistribution across pre-fork
@@ -87,8 +135,120 @@ export class Limits {
         this.max_header_count   = 100;
         this.max_header_bytes   = 32 * 1024;
         this.max_body_bytes     = 1024 * 1024;
+        this.max_streamed_bytes = 64 * 1024 * 1024;
+        this.stream_chunk_bytes = 64 * 1024;
         this.recv_timeout_ms    = 15 * 1000;
         this.max_keepalive_reqs = 2048;
+    }
+}
+
+// ------------------------------------------------------------- body sink
+//
+// A streamed request body. The handler for a route with a sink runs AFTER the
+// body has been consumed, and reads its result off the sink.
+//
+// -- why this is a class and not a callback ----------------------------------
+//
+// A connection can die mid-body six ways: EOF, reset, the idle sweep, drain
+// expiry, table eviction, and the worker itself dying. A callback-shaped sink
+// would need every one of those sites to remember to call a cleanup arm, and
+// the one that forgets leaves a half-written file and an open descriptor —
+// silently, because a truncated upload looks exactly like a short one.
+//
+// A refcounted object needs none of that. When the connection drops the sink,
+// `deinit` runs, and it runs on every path including the ones nobody thought
+// of. That guarantee is the entire reason for the shape.
+//
+// -- the ownership rule ------------------------------------------------------
+//
+// A chunk handed to on_chunk is YOURS. It is a freshly allocated, exactly-sized
+// array, never a view into the connection's buffer, so keeping it is safe and
+// keeping it forever is safe. This is enforced by construction — there is no
+// call in this API that returns a borrow — rather than by asking you to copy.
+//
+// Do NOT store the ServerRequest in a sink. It is passed to the factory and
+// nowhere else for exactly that reason; `ServerRequest.sink` is `weak` so that
+// storing it anyway cannot form a cycle, but a request is a view over a buffer
+// whose lifetime is the connection's, not yours.
+export const ABORT_CONNECTION_LOST: int = 1;   // EOF, reset, or the peer left
+export const ABORT_TIMEOUT: int = 2;           // idle sweep took the connection
+export const ABORT_TOO_LARGE: int = 3;         // more body arrived than declared
+export const ABORT_REJECTED: int = 4;          // this sink returned false
+export const ABORT_SHUTDOWN: int = 5;          // drain budget expired
+
+export fn abort_reason_name(r: int): string {
+    if (r == ABORT_CONNECTION_LOST) { return "connection-lost"; }
+    if (r == ABORT_TIMEOUT)         { return "timeout"; }
+    if (r == ABORT_TOO_LARGE)       { return "too-large"; }
+    if (r == ABORT_REJECTED)        { return "rejected"; }
+    if (r == ABORT_SHUTDOWN)        { return "shutdown"; }
+    return "unknown";
+}
+
+export class BodySink {
+    // Status sent when on_chunk or on_end returns false. Set it before
+    // returning false; a partially-read body cannot be resynchronised, so the
+    // connection is closed either way and this is the only thing the peer
+    // learns.
+    reject_status: int;
+
+    fn init() { this.reject_status = 400; }
+
+    // One fragment of the body, in order. Return false to refuse the rest.
+    // The chunk is yours to keep.
+    virtual fn on_chunk(chunk: byte[]): bool { return true; }
+
+    // Every byte of the declared Content-Length arrived. Return false to fail
+    // the request. The route handler runs after this returns true.
+    virtual fn on_end(): bool { return true; }
+
+    // The body will NOT complete. Always called exactly once on every failure
+    // path, before this object is released — including paths the reactor does
+    // not know it is on, via Conn's destructor.
+    virtual fn on_abort(reason: int) { }
+}
+
+// ---------------------------------------------------------------- stats
+//
+// PER WORKER. Pre-fork workers share nothing, so these are this process's
+// numbers and nothing else's — a supervisor with 16 workers has 16 of these
+// and no total. Aggregating them needs shared memory (MAP_SHARED), which is a
+// separate piece of work; do not read a single worker's counters as the
+// service's.
+//
+// Core counts and does not serve. Formatting these as a /metrics endpoint is
+// user-space, because the format is a matter of taste and the counting is not.
+export class ServerStats {
+    requests: int;
+    bytes_out: int;
+    bytes_in: int;              // streamed body bytes handed to sinks
+    streamed_requests: int;
+    res_2xx: int;
+    res_3xx: int;
+    res_4xx: int;
+    res_5xx: int;
+    conns_accepted: int;
+    conns_live: int;
+    conns_dropped_idle: int;      // Slowloris sweep
+    conns_refused_full: int;      // fd past the table
+    parse_errors: int;
+
+    fn init() {
+        this.requests = 0; this.bytes_out = 0;
+        this.bytes_in = 0; this.streamed_requests = 0;
+        this.res_2xx = 0; this.res_3xx = 0; this.res_4xx = 0; this.res_5xx = 0;
+        this.conns_accepted = 0; this.conns_live = 0;
+        this.conns_dropped_idle = 0; this.conns_refused_full = 0;
+        this.parse_errors = 0;
+    }
+
+    fn note(status: int, bytes: int) {
+        this.requests += 1;
+        this.bytes_out += bytes;
+        if (status >= 500) { this.res_5xx += 1; }
+        else if (status >= 400) { this.res_4xx += 1; }
+        else if (status >= 300) { this.res_3xx += 1; }
+        else if (status >= 200) { this.res_2xx += 1; }
     }
 }
 
@@ -117,6 +277,32 @@ fn hdr_eq(raw: byte[], off: int, len: int, name: string): bool {
     return true;
 }
 
+// RFC 7230 3.2.6 tchar — the only bytes legal in a header name.
+//
+// This exists because the permissive alternative is a smuggling primitive: a
+// proxy and an origin that disagree about whether `X-Foo\x00: bar` is one
+// header see two different requests. Refusing the whole request is the only
+// answer that cannot desync.
+fn is_tchar(c: int): bool {
+    if (c >= 48 && c <= 57)  { return true; }    // 0-9
+    if (c >= 65 && c <= 90)  { return true; }    // A-Z
+    if (c >= 97 && c <= 122) { return true; }    // a-z
+    // ! # $ % & ' * + - . ^ _ ` | ~
+    if (c == 33 || c == 35 || c == 36 || c == 37 || c == 38) { return true; }
+    if (c == 39 || c == 42 || c == 43 || c == 45 || c == 46) { return true; }
+    if (c == 94 || c == 95 || c == 96 || c == 124 || c == 126) { return true; }
+    return false;
+}
+
+// A header value may hold any visible byte plus SP and HTAB. Control characters
+// are how a CR or LF gets smuggled into the header block.
+fn is_hval_byte(c: int): bool {
+    if (c == 9) { return true; }                 // HTAB
+    if (c < 32) { return false; }                // CTL, including CR and LF
+    if (c == 127) { return false; }              // DEL
+    return true;
+}
+
 // Index of the next `\n` at or after `at`, or -1. (`from` is a keyword.)
 fn find_lf(raw: byte[], at: int, end: int): int {
     let i = at;
@@ -125,6 +311,46 @@ fn find_lf(raw: byte[], at: int, end: int): int {
         i += 1;
     }
     return -1;
+}
+
+// Byte-equality of two header values already in the buffer. Used to tell a
+// duplicate Content-Length from a conflicting one without materialising either.
+fn hval_same(raw: byte[], a_off: int, a_len: int, b_off: int, b_len: int): bool {
+    if (a_len != b_len) { return false; }
+    for (let i in 0..a_len) {
+        if (raw[a_off + i] != raw[b_off + i]) { return false; }
+    }
+    return true;
+}
+
+// A `%00` escape anywhere in the path.
+//
+// This has to be checked on the RAW bytes, before decoding, because
+// `url_decode` builds a C-terminated string and therefore TRUNCATES at a
+// decoded NUL — `/a%00b` comes back as `/a`, two bytes, with no NUL in it to
+// find. Truncation is the safe direction, but it is silent, and it means
+// `/a%00b` and `/a` become the same path: one request, two readings, which is
+// the property this whole block exists to deny.
+fn has_nul_escape(raw: byte[], off: int, len: int): bool {
+    for (let i in 0..len) {
+        if (raw[off + i] != 37) { continue; }             // '%'
+        if (i + 2 >= len) { continue; }
+        if (raw[off + i + 1] == 48 && raw[off + i + 2] == 48) { return true; }
+    }
+    return false;
+}
+
+// Does this path need decoding or dot-segment removal? A byte scan over a
+// buffer already in cache, so the common request pays a scan and no allocation.
+// `%` means an escape; a `.` at a segment boundary means a possible `.` or `..`.
+fn needs_normalising(raw: byte[], off: int, len: int): bool {
+    for (let i in 0..len) {
+        let c = raw[off + i];
+        if (c == 37) { return true; }                     // '%'
+        if (c == 46 && (i == 0 || raw[off + i - 1] == 47)) { return true; }
+        if (c == 47 && i > 0 && raw[off + i - 1] == 47) { return true; }  // "//"
+    }
+    return false;
 }
 
 fn slice_str(raw: byte[], off: int, len: int): string {
@@ -164,10 +390,136 @@ fn find_head_end(raw: byte[], used: int): int {
 fn mono_ms(): int { return monoMs() as int; }
 
 
-fn core_count(): int {
-    let n = sysconf(SC_NPROCESSORS_ONLN as i32) as int;
-    if (n < 1) { return 1; }
+// Read a whole small file, or "" if it is not there.
+//
+// Line-streamed, NOT readText(), and that is not a style choice. readText()
+// sizes a file by seeking to the end (`io/file.vt:74`), and every file this
+// function is used on — /proc/self/cgroup, /sys/fs/cgroup/*/cpu.max — is a
+// synthetic file that reports st_size 0 while having real content. readText()
+// returns "" for all of them.
+//
+// This bug shipped in the first version of core_count(): the quota was read as
+// absent every time, so it silently always returned the host core count, and
+// the failure was invisible because "no quota" is also the correct answer on a
+// normal machine. Found by writing a test that read /proc/self/status.
+fn read_small(path: string): string {
+    if (!file_exists(path)) { return ""; }
+    let f = file_open(path, "r");
+    if (f == null) { return ""; }
+    let sb = new StringBuilder(512);
+    // Bounded: these files are a handful of lines, and an unbounded loop over
+    // a synthetic file is a hang waiting for a kernel that disagrees.
+    let guard = 0;
+    while (!f.eof() && guard < 1024) {
+        let line = f.readLine();
+        if (line.len == 0 && f.eof()) { break; }
+        sb.append(line).append("\n");
+        guard += 1;
+    }
+    f.close();
+    return sb.toString();
+}
+
+fn parse_int_or(s: string, dflt: int): int {
+    if (s.len == 0) { return dflt; }
+    let v = 0;
+    for (let i in 0..s.len) {
+        let c = s[i];
+        if (c < 48 || c > 57) { return dflt; }
+        v = v * 10 + (c - 48);
+    }
+    return v;
+}
+
+// This process's own cgroup path, from /proc/self/cgroup.
+//
+// The v2 line is `0::/some/path`. Reading /sys/fs/cgroup/cpu.max directly —
+// which is what the first version of this did — reads the ROOT cgroup and
+// therefore always reports "no limit", because the limit is on the container's
+// own cgroup, not on the root.
+fn self_cgroup_path(): string {
+    let txt = read_small("/proc/self/cgroup");
+    if (txt.len == 0) { return ""; }
+    for (let line in txt.split("\n")) {
+        let l = line.trim();
+        if (l.len == 0) { continue; }
+        let f = l.split(":");
+        // v2: "0::/path". v1 cpu controller: "N:cpu,cpuacct:/path".
+        if (f.len == 3 && (f[0] == "0" || f[1].contains("cpu"))) { return f[2]; }
+    }
+    return "";
+}
+
+// Cores implied by a "QUOTA PERIOD" pair, or -1 for unlimited/unparseable.
+fn quota_cores(quota_s: string, period_s: string): int {
+    if (quota_s.len == 0 || quota_s == "max" || quota_s == "-1") { return -1; }
+    let quota = parse_int_or(quota_s, -1);
+    let period = parse_int_or(period_s, 100000);
+    if (quota <= 0 || period <= 0) { return -1; }
+    // Round UP: a 1.5-core quota should run 2 workers, not 1.
+    let n = (quota + period - 1) / period;
+    if (n < 1) { n = 1; }
     return n;
+}
+
+// How many cores may this process actually use?
+//
+// sysconf reports the HOST's cores, which is the wrong answer inside a
+// container: on a 64-core host with a 2-core quota, run() would fork 64 workers
+// into a 2-core budget and they would spend their time fighting each other.
+//
+// The quota can be set on this cgroup OR on any ancestor, and the effective
+// limit is the tightest one in the chain — so this walks from the leaf to the
+// root rather than reading one file. A limit on a parent slice is the normal
+// case under systemd, and looking only at the leaf finds nothing.
+//
+// VERIFIED: the no-quota path (walks the real hierarchy, finds no cpu.max,
+// returns the host count) and the missing-file handling.
+// NOT VERIFIED: the quota path itself. The dev box does not delegate the `cpu`
+// controller to user.slice — cgroup.subtree_control there is "memory pids" —
+// so a user-scope CPUQuota is silently not enforced and no cpu.max exists
+// anywhere in the chain to read. To verify properly:
+//
+//     docker run --cpus=2 ... ./srv_config      # expect core_count() == 2
+//
+// Until that runs, treat the quota branch as written-but-untested.
+export fn core_count(): int {
+    let host = sysconf(SC_NPROCESSORS_ONLN as i32) as int;
+    if (host < 1) { host = 1; }
+
+    let path = self_cgroup_path();
+    let best = host;
+
+    // Walk leaf -> root by trimming one path segment at a time.
+    let cur = path;
+    while (true) {
+        // cgroup v2: a single "QUOTA PERIOD" file.
+        let v2 = read_small("/sys/fs/cgroup" + cur + "/cpu.max").trim();
+        if (v2.len > 0) {
+            let parts = v2.split(" ");
+            let q = parts[0];
+            let per = "100000";
+            if (parts.len > 1) { per = parts[1]; }
+            let n = quota_cores(q, per);
+            if (n > 0 && n < best) { best = n; }
+        }
+        // cgroup v1: quota and period in separate files under the cpu
+        // controller, which is mounted at its own subdirectory.
+        let q1 = read_small("/sys/fs/cgroup/cpu" + cur + "/cpu.cfs_quota_us").trim();
+        if (q1.len > 0) {
+            let p1 = read_small("/sys/fs/cgroup/cpu" + cur + "/cpu.cfs_period_us").trim();
+            let n = quota_cores(q1, p1);
+            if (n > 0 && n < best) { best = n; }
+        }
+
+        if (cur.len == 0) { break; }
+        let slash = cur.last_index_of("/");
+        if (slash < 0) { break; }
+        cur = cur.slice(0, slash);
+    }
+
+    if (best < 1) { return 1; }
+    return best;
 }
 
 // One live connection. The buffer lives as long as the connection and is reset
@@ -195,6 +547,20 @@ const SWEEP_INTERVAL_MS: int = 500;
 // Bytes requested per read. A short read means the socket is drained.
 const RECV_CHUNK: int = 4096;
 
+// pump_stream outcomes.
+const PUMP_MORE: int = 0;   // body done, response written, resume parsing
+const PUMP_WAIT: int = 1;   // would block, or output is backed up
+const PUMP_DEAD: int = 2;   // close the connection
+
+// Crash-loop protection for the supervisor. A worker that dies sooner than
+// CRASH_FAST_MS after its own fork never got as far as serving, so replacing it
+// immediately just repeats the failure; anything longer-lived is treated as a
+// normal death and resets the counter.
+const CRASH_FAST_MS: int = 1000;
+const CRASH_GIVE_UP: int = 10;
+const CRASH_BACKOFF_MIN_MS: int = 100;
+const CRASH_BACKOFF_MAX_MS: int = 5000;
+
 class Conn {
     sock: Socket;
     raw: byte[];
@@ -202,6 +568,35 @@ class Conn {
     cap: int;           // hard ceiling; raw.len grows toward this, never past
     served: int;
     deadline: int;      // monotonic ms; past this the connection is dropped
+
+    // ---- streaming body state ---------------------------------------------
+    //
+    // stream_sink != null means "mid-body". In that state drive() does NOT
+    // parse: it routes every arriving byte to the sink until stream_left hits
+    // zero. That is what makes re-delivery impossible — drive() otherwise
+    // re-parses the same head on every wakeup, and a parse-based design would
+    // hand the same bytes over twice.
+    //
+    // While streaming, `raw` holds EXACTLY the head and `used` stays at
+    // head_end. The body never enters this buffer, so a connection streaming
+    // 10 GB costs the same memory as one serving /health. Parking the head also
+    // keeps stream_req — a view over `raw` — valid for the whole body.
+    stream_sink: BodySink;
+    stream_left: int;          // body bytes still owed
+    stream_req: ServerRequest; // parsed head, still a live view into `raw`
+    stream_tail: byte[];       // bytes read past the body: the next request
+    stream_aborted: bool;      // abort_stream is idempotent
+
+    // Pending static file. The header block leaves through `out` as usual and
+    // the body then goes straight from the page cache to the socket, resuming
+    // across POLL_WRITE through the machinery partial writes already needed.
+    file_fd: int;
+    file_left: int;
+
+    // Set when the handler called res.upgrade(). The reactor invokes it after
+    // the response has fully left, then forgets the connection without closing
+    // the socket.
+    upgrade_cb: fn(Socket);
 
     // Pending output. A non-blocking socket can accept only part of a response,
     // and the unsent tail has to survive until the socket is writable again —
@@ -220,6 +615,11 @@ class Conn {
     out_off: int;
     want_write: bool;   // registered for POLL_WRITE
 
+    // A 100-continue interim has been written for the request currently being
+    // assembled. drive() re-parses the same bytes every wakeup, so without this
+    // a slow body would draw one interim per readable event.
+    expect_sent: bool;
+
     fn init(sock: Socket, L: Limits) {
         this.sock = sock;
         this.cap = L.max_request_line + L.max_header_bytes + 1024;
@@ -232,9 +632,60 @@ class Conn {
         this.out = new StringBuilder(1024);
         this.out_off = 0;
         this.want_write = false;
+        this.expect_sent = false;
+        this.upgrade_cb = null;
+        this.file_fd = -1;
+        this.file_left = 0;
+        this.stream_sink = null;
+        this.stream_left = 0;
+        this.stream_req = null;
+        this.stream_tail = null;
+        this.stream_aborted = false;
     }
 
-    fn hasPending(): bool { return this.out_off < this.out.len(); }
+    // Tell the sink the body will not complete, then let it go.
+    //
+    // Idempotent: every close path may call this, and several legitimately do
+    // (the reactor knows the reason, the destructor is the backstop). Calling
+    // on_abort twice would make a sink that deletes its partial file on abort
+    // try to delete it again.
+    fn abort_stream(reason: int) {
+        if (this.stream_sink == null) { return; }
+        if (!this.stream_aborted) {
+            this.stream_aborted = true;
+            this.stream_sink.on_abort(reason);
+        }
+        this.clear_stream();
+    }
+
+    fn clear_stream() {
+        this.stream_sink = null;
+        this.stream_req = null;
+        this.stream_tail = null;
+        this.stream_left = 0;
+        this.stream_aborted = false;
+    }
+
+    // THE BACKSTOP. Refcounting runs this whenever the connection is released,
+    // including paths that never thought about streaming: the reactor dropping
+    // a slot, the idle sweep, drain expiry, an eviction, or the worker process
+    // unwinding. A sink therefore cannot be left believing its upload is still
+    // in progress, and cannot leak the descriptor it opened.
+    //
+    // The reason is the generic one because a destructor cannot know why it is
+    // running — every site that DOES know calls abort_stream first, and this
+    // only fires for the ones that did not.
+    deinit {
+        if (this.stream_sink != null && !this.stream_aborted) {
+            this.stream_aborted = true;
+            this.stream_sink.on_abort(ABORT_CONNECTION_LOST);
+        }
+        if (this.file_fd >= 0) { close(this.file_fd as i32); this.file_fd = -1; }
+    }
+
+    fn hasPending(): bool {
+        return this.out_off < this.out.len() || this.file_left > 0;
+    }
 
     // The builder responses are written into. Pipelined responses append to the
     // same buffer, so they leave in order for free.
@@ -254,6 +705,27 @@ class Conn {
         // connection, not once per response.
         this.out.clear();
         this.out_off = 0;
+
+        // Headers are gone; now the file body, if there is one. sendfile keeps
+        // its own file offset, so a partial send resumes simply by calling it
+        // again with what is left.
+        while (this.file_left > 0) {
+            let n = sendfile(this.sock.fd, this.file_fd as i32, null,
+                             this.file_left as i64) as int;
+            if (n < 0) {
+                // EAGAIN and a real error are indistinguishable here, so treat
+                // it as "would block" and let the reactor re-arm POLL_WRITE.
+                // A genuinely dead socket fails the next recv instead.
+                return 0;
+            }
+            if (n == 0) { break; }          // EOF earlier than advertised
+            this.file_left -= n;
+        }
+        if (this.file_fd >= 0) {
+            close(this.file_fd as i32);
+            this.file_fd = -1;
+            this.file_left = 0;
+        }
         return 1;
     }
 
@@ -283,6 +755,35 @@ export class ServerRequest {
     path_off: int;    path_len: int;
     query_off: int;   query_len: int;
 
+    // The request-target exactly as it arrived, before absolute-form was
+    // reduced and before any decoding. A proxy, a logger or a signature check
+    // needs the bytes the client sent, not our interpretation of them.
+    target_off: int;  target_len: int;
+
+    // Set only when the raw path was not already canonical — i.e. it held a
+    // percent-escape or a dot segment. Empty means the (offset, len) view is
+    // the answer and nothing was allocated, which is the common case.
+    norm_path: string;
+
+    // The sink that consumed this request's body, for the handler to read its
+    // result from. Null unless the body was streamed.
+    //
+    // WEAK, and that is load-bearing. The connection owns the sink; this is a
+    // borrow. Storing the request inside a sink is an obvious thing to write,
+    // and with a strong reference here that would form req -> sink -> req: a
+    // cycle, which under reference counting leaks silently and which nothing in
+    // this runtime detects. See the memory model in CLAUDE.md.
+    sink: weak BodySink;
+
+    // True when the body went to a sink. Distinguishes "no body" from "body
+    // handled elsewhere", which body_len alone cannot.
+    streamed: bool;
+
+    // Content-Length after framing has been validated. -1 = no body.
+    // Framing is decided once, in parse_head, because deciding it twice is how
+    // a request smuggles: two readers of the same bytes must never disagree.
+    content_len: int;
+
     // Parallel arrays, not a Map: a Map allocates a node per header and hashes
     // a string that already exists in the buffer. A linear scan over at most
     // max_header_count entries beats hashing at this size and allocates nothing.
@@ -303,6 +804,11 @@ export class ServerRequest {
         this.method_off = -1; this.method_len = 0;
         this.path_off = -1;   this.path_len = 0;
         this.query_off = -1;  this.query_len = 0;
+        this.target_off = -1; this.target_len = 0;
+        this.norm_path = "";
+        this.content_len = -1;
+        this.sink = null;
+        this.streamed = false;
         this.hname_off = []; this.hname_len = [];
         this.hval_off = [];  this.hval_len = [];
         this.body_off = -1;  this.body_len = 0;
@@ -313,7 +819,22 @@ export class ServerRequest {
     }
 
     fn method(): string { return slice_str(this.raw, this.method_off, this.method_len); }
-    fn path(): string { return slice_str(this.raw, this.path_off, this.path_len); }
+
+    // The path a route is matched against: percent-decoded and dot-segment
+    // free. `/a/%2e%2e/b` and `/a/../b` both arrive here as `/b`, so a handler
+    // and the router can never disagree about which resource was asked for.
+    fn path(): string {
+        if (this.norm_path.len > 0) { return this.norm_path; }
+        return slice_str(this.raw, this.path_off, this.path_len);
+    }
+
+    // The undecoded path, for anything that must see what the client wrote.
+    fn rawPath(): string { return slice_str(this.raw, this.path_off, this.path_len); }
+
+    // The whole request-target, including the query and including the
+    // absolute-form prefix if the client sent one.
+    fn target(): string { return slice_str(this.raw, this.target_off, this.target_len); }
+
     fn query(): string { return slice_str(this.raw, this.query_off, this.query_len); }
 
     fn header(name: string): string {
@@ -378,6 +899,26 @@ export class ServerResponse {
     keep_alive: bool;
     has_date: bool;     // handler set its own Date; server must not add another
 
+    // Cleared by the server for HEAD. A handler builds its response exactly as
+    // it would for a GET and never has to know — which is the point, since a
+    // handler that has to remember is a handler that will forget.
+    body_allowed: bool;
+
+    // Set by upgrade(). The reactor hands the socket to this callback and drops
+    // the connection from its tables WITHOUT closing it.
+    upgrade_cb: fn(Socket);
+
+    // Names the handler set explicitly. Only consulted for server-wide
+    // defaults, so it holds at most a few entries and usually none.
+    set_names: string[];
+
+    // Static file to send as the body, via sendfile(2). -1 when unused.
+    // The bytes never enter this process, so a static asset costs no
+    // allocation at all — which is the whole reason this is core and not a
+    // handler reading a file into a string.
+    file_fd: int;
+    file_len: int;
+
     fn init() {
         this.status = 200;
         this.hdrs = new StringBuilder(256);
@@ -385,6 +926,43 @@ export class ServerResponse {
         this.sent = false;
         this.keep_alive = true;
         this.has_date = false;
+        this.body_allowed = true;
+        this.upgrade_cb = null;
+        this.set_names = [];
+        this.file_fd = -1;
+        this.file_len = 0;
+    }
+
+    // Send `path` as the body. Returns false if it cannot be opened, leaving
+    // the response untouched so the caller can answer 404 itself — core does
+    // not know whether a missing file is an error or a fallthrough.
+    //
+    // MIME type, ETag, If-None-Match, Range and index files are all
+    // user-space. Core ships the syscall and the framing; the policy above it
+    // is somebody else's opinion.
+    fn sendFile(status: int, path: string): bool {
+        let fd = open(path.cstr(), O_RDONLY as i32) as int;
+        if (fd < 0) { return false; }
+        let n = lseek(fd as i32, 0 as i64, SEEK_END as i32) as int;
+        if (n < 0) { close(fd as i32); return false; }
+        lseek(fd as i32, 0 as i64, SEEK_SET as i32);
+        this.status = status;
+        this.file_fd = fd;
+        this.file_len = n;
+        return true;
+    }
+
+    // Hand this connection off after the response is sent. The reactor stops
+    // tracking the socket and does NOT close it — ownership passes to `cb`,
+    // which must close it when done.
+    //
+    // This is the seam WebSocket sits on: vyto/net/websocket already speaks
+    // the protocol, and core's only job is to stop owning the fd. Core does
+    // not know what protocol follows and must not.
+    fn upgrade(cb: fn(Socket)): ServerResponse {
+        this.upgrade_cb = cb;
+        this.keep_alive = false;
+        return this;
     }
 
     // Rejects CR and LF in the value. A handler that echoes user input into a
@@ -398,6 +976,7 @@ export class ServerResponse {
         // Noting an explicit one here keeps a handler that sets its own from
         // producing a duplicate header.
         if (name.len == 4 && hdr_name_is(name, "Date")) { this.has_date = true; }
+        this.set_names.push(name);
         this.hdrs.append(name).append(": ").append(value).append("\r\n");
         return this;
     }
@@ -431,6 +1010,7 @@ export class ServerResponse {
 }
 
 fn status_text(code: int): string {
+    if (code == 100) { return "Continue"; }
     if (code == 200) { return "OK"; }
     if (code == 201) { return "Created"; }
     if (code == 204) { return "No Content"; }
@@ -445,6 +1025,7 @@ fn status_text(code: int): string {
     if (code == 408) { return "Request Timeout"; }
     if (code == 413) { return "Payload Too Large"; }
     if (code == 414) { return "URI Too Long"; }
+    if (code == 417) { return "Expectation Failed"; }
     if (code == 431) { return "Request Header Fields Too Large"; }
     if (code == 500) { return "Internal Server Error"; }
     if (code == 501) { return "Not Implemented"; }
@@ -510,6 +1091,70 @@ export class Server {
     date_cache: string;
     date_sec: int;
 
+    // ---- seams ------------------------------------------------------------
+    //
+    // The whole extension surface, and deliberately small. Core ships the hook
+    // and none of the policy: see the scope note at the top of this file. Each
+    // is null until set and costs one null check when it is not.
+
+    // Total dispatch override. When set, the route table is NEVER consulted —
+    // a framework above owns routing entirely. Not a fallback: two routers
+    // with a precedence rule between them is worse than one router.
+    handler: fn(ServerRequest, ServerResponse);
+
+    // Replaces the built-in 404/405 body. The handler reads req.method() to
+    // tell them apart.
+    not_found: fn(ServerRequest, ServerResponse);
+
+    // Replaces the built-in error body for a request that never parsed, so
+    // there is no ServerRequest to hand over — only the status.
+    error_page: fn(int, ServerResponse);
+
+    // Called once per response with (request, status, bytes written, micros).
+    // The format, the sink, sampling and rotation are all user-space; core
+    // owns this callback only because a middleware cannot see bytes-written or
+    // the connection-close path.
+    on_request: fn(ServerRequest, int, int, int);
+
+    // Decides whether a request's body is streamed. Consulted once per request
+    // that HAS a body; returning null buffers it exactly as before.
+    //
+    // Registering a factory at all is what raises the parse-time cap from
+    // max_body_bytes to max_streamed_bytes, so a server with no factory keeps
+    // precisely today's bounds.
+    body_sink: fn(ServerRequest): BodySink;
+
+    // ---- operations -------------------------------------------------------
+    stats: ServerStats;
+
+    // Drain budget. stop() switches the reactor from serving to draining:
+    // it stops accepting and finishes what is in flight, up to this long.
+    drain_ms: int;
+
+    // True once the reactor has stopped accepting. Read by drive(), which must
+    // answer Connection: close while draining — keeping a connection alive
+    // during a drain is how a drain never finishes.
+    draining: bool;
+
+    // Structured output. Errors used to go to stdout via print, which has no
+    // level and no sink.
+    log: Logger;
+
+    // Crash-loop policy. Defaults are the constants above; they are settable
+    // because "how long is a startup" and "how many failures before this is
+    // hopeless" are properties of the deployment, not of HTTP. A worker that
+    // opens a slow database needs a larger fast_ms or every start looks like a
+    // crash; a critical service may want to keep trying for longer.
+    crash_fast_ms: int;
+    crash_give_up: int;
+    crash_backoff_max_ms: int;
+
+    // Default headers, as parallel arrays. A handful of entries, so a linear
+    // walk beats anything with a node per key — the same reasoning as the
+    // request's header arrays.
+    dflt_names: string[];
+    dflt_values: string[];
+
     fn init(port: int) {
         this.port = port;
         this.host = "";
@@ -521,6 +1166,20 @@ export class Server {
         this.backlog = 4096;
         this.date_cache = "";
         this.date_sec = -1;
+        this.handler = null;
+        this.not_found = null;
+        this.error_page = null;
+        this.on_request = null;
+        this.body_sink = null;
+        this.stats = new ServerStats();
+        this.drain_ms = 10000;
+        this.draining = false;
+        this.crash_fast_ms = CRASH_FAST_MS;
+        this.crash_give_up = CRASH_GIVE_UP;
+        this.crash_backoff_max_ms = CRASH_BACKOFF_MAX_MS;
+        this.dflt_names = [];
+        this.dflt_values = [];
+        this.log = logger("vyto/net/server");
     }
 
     // IMF-fixdate in GMT, per RFC 7231. Reformatted at most once per second.
@@ -534,6 +1193,67 @@ export class Server {
                                           "%a, %d %b %Y %H:%M:%S GMT");
         }
         return this.date_cache;
+    }
+
+    // Hand routing to a framework above. Every request goes to `h`; .get()/
+    // .post() and the built-in 404/405 stop being reachable.
+    fn withHandler(h: fn(ServerRequest, ServerResponse)): Server {
+        this.handler = h; return this;
+    }
+    fn withNotFound(h: fn(ServerRequest, ServerResponse)): Server {
+        this.not_found = h; return this;
+    }
+    fn withErrorPage(h: fn(int, ServerResponse)): Server {
+        this.error_page = h; return this;
+    }
+    // Installing this makes the server read the clock twice per request. That
+    // is why it is a hook and not a default — see local/docs/HTTP.md.
+    fn onRequest(h: fn(ServerRequest, int, int, int)): Server {
+        this.on_request = h; return this;
+    }
+
+    // Stream request bodies through a sink instead of buffering them.
+    //
+    // The factory sees the parsed request and returns a BodySink to stream it,
+    // or null to buffer it as usual. The route handler runs AFTER the body is
+    // consumed and reads the result from `req.sink`.
+    fn withBodySink(f: fn(ServerRequest): BodySink): Server {
+        this.body_sink = f; return this;
+    }
+
+    // A default header applied to every response — Server, HSTS,
+    // X-Content-Type-Options. Set once at startup instead of in every handler.
+    //
+    // A handler that sets the same name WINS: the default is skipped rather
+    // than emitted alongside, so there is never a duplicate. That is the same
+    // rule the cached Date already follows, and it is implemented the same way
+    // — a flag set when the name is seen — so the cost is one comparison per
+    // configured default, and never a scan of the handler's headers.
+    fn withHeader(name: string, value: string): Server {
+        for (let i in 0..value.len) {
+            if (value[i] == 13 || value[i] == 10) { return this; }
+        }
+        this.dflt_names.push(name);
+        this.dflt_values.push(value);
+        return this;
+    }
+
+    // Read PORT, WORKERS, MAX_CONNS and BACKLOG from the environment.
+    //
+    // Core, despite reading like app policy: a container cannot rebuild the
+    // binary to change a port. Only variables that are SET and parse are
+    // applied, so this never silently overwrites a deliberate programmatic
+    // value with a default.
+    fn fromEnv(): Server {
+        let p = parse_int_or(getenv("PORT"), -1);
+        if (p >= 0) { this.port = p; }
+        let w = parse_int_or(getenv("WORKERS"), -1);
+        if (w > 0) { this.workers = w; }
+        let m = parse_int_or(getenv("MAX_CONNS"), -1);
+        if (m > 0) { this.max_conns = m; }
+        let b = parse_int_or(getenv("BACKLOG"), -1);
+        if (b > 0) { this.backlog = b; }
+        return this;
     }
 
     fn bindHost(h: string): Server { this.host = h; return this; }
@@ -579,19 +1299,82 @@ export class Server {
         req.method_off = 0;
         req.method_len = sp1;
 
-        // split target into path and query at '?'
+        // The method is a token like any other name; a space or a control byte
+        // here is the same desync primitive as one in a header name.
+        for (let k in 0..sp1) {
+            if (!is_tchar(raw[k])) { return 400; }
+        }
+
         let t_off = sp1 + 1;
         let t_len = sp2 - t_off;
-        let qm = -1;
-        for (let k in 0..t_len) {
-            if (raw[t_off + k] == 63) { qm = k; break; }
-        }
-        if (qm < 0) {
-            req.path_off = t_off; req.path_len = t_len;
+        if (t_len <= 0) { return 400; }
+        req.target_off = t_off;
+        req.target_len = t_len;
+
+        // --- request-target form (RFC 7230 5.3) ---
+        //
+        // Four forms are legal and only one of them is the one everybody
+        // pictures. Reducing the others HERE means the router only ever sees
+        // origin-form, which is what makes "match the path" a safe thing to do.
+        let p_off = t_off;
+        let p_len = t_len;
+
+        if (t_len == 1 && raw[t_off] == 42) {
+            // asterisk-form: `OPTIONS * HTTP/1.1`. Legal, and not a path.
+            req.path_off = t_off; req.path_len = 1;
             req.query_off = -1;   req.query_len = 0;
-        } else {
-            req.path_off = t_off;         req.path_len = qm;
-            req.query_off = t_off + qm + 1; req.query_len = t_len - qm - 1;
+            p_len = 0;                       // nothing to normalise
+        } else if (raw[t_off] != 47) {
+            // Not origin-form. Absolute-form is what a proxy sends and what we
+            // used to 404 on, because the whole URI was matched against the
+            // route table.
+            let sch = -1;
+            if (t_len >= 3) {
+                for (let k in 0..t_len - 2) {
+                    if (raw[t_off + k] == 58 && raw[t_off + k + 1] == 47
+                        && raw[t_off + k + 2] == 47) { sch = k; break; }
+                }
+            }
+            // No `://` and it does not start with `/`: authority-form, which is
+            // CONNECT and which this server does not proxy.
+            if (sch < 0) { return 405; }
+
+            // Skip the authority. RFC 7230 5.4: when it is present it is
+            // authoritative and overrides Host, so a disagreement between the
+            // two is not our problem to resolve — the absolute-form wins.
+            let a = t_off + sch + 3;
+            let slash = -1;
+            let k2 = a;
+            while (k2 < t_off + t_len) {
+                if (raw[k2] == 47) { slash = k2; break; }
+                k2 += 1;
+            }
+            if (slash < 0) {
+                // `GET http://host HTTP/1.1` — the path is "/", which is not in
+                // the buffer anywhere. Materialise it; this form is rare.
+                req.path_off = -1; req.path_len = 0;
+                req.norm_path = "/";
+                req.query_off = -1; req.query_len = 0;
+                p_len = 0;
+            } else {
+                p_off = slash;
+                p_len = t_off + t_len - slash;
+            }
+        }
+
+        // split path and query at '?' — only for the forms that have one
+        if (p_len > 0) {
+            let qm = -1;
+            for (let k in 0..p_len) {
+                if (raw[p_off + k] == 63) { qm = k; break; }
+            }
+            if (qm < 0) {
+                req.path_off = p_off; req.path_len = p_len;
+                req.query_off = -1;   req.query_len = 0;
+            } else {
+                req.path_off = p_off;           req.path_len = qm;
+                req.query_off = p_off + qm + 1; req.query_len = p_len - qm - 1;
+            }
         }
 
         // version: only HTTP/1.0 and HTTP/1.1
@@ -618,6 +1401,13 @@ export class Server {
             if (hdr_bytes > L.max_header_bytes) { return 431; }
             if (req.hname_off.len >= L.max_header_count) { return 431; }
 
+            // obs-fold: a continuation line starting with SP or HTAB. Deprecated
+            // by RFC 7230 3.2.4, which says a server MUST reject it outside of
+            // message/http. Accepting it is a smuggling vector, because whether
+            // the fold joins to the previous header is exactly the thing two
+            // implementations disagree about.
+            if (raw[pos] == 32 || raw[pos] == 9) { return 400; }
+
             let colon = -1;
             let j = pos;
             while (j < line_end) { if (raw[j] == 58) { colon = j; break; } j += 1; }
@@ -626,11 +1416,22 @@ export class Server {
             let nlen = colon - pos;
             if (nlen == 0) { return 400; }
 
+            // Every name byte must be a tchar. This also rejects `Header : v`
+            // — whitespace before the colon — which the scan above would
+            // otherwise have accepted as part of the name.
+            for (let k in 0..nlen) {
+                if (!is_tchar(raw[pos + k])) { return 400; }
+            }
+
             // trim OWS around the value
             let vs = colon + 1;
             while (vs < line_end && (raw[vs] == 32 || raw[vs] == 9)) { vs += 1; }
             let ve = line_end;
             while (ve > vs && (raw[ve - 1] == 32 || raw[ve - 1] == 9)) { ve -= 1; }
+
+            for (let k in vs..ve) {
+                if (!is_hval_byte(raw[k])) { return 400; }
+            }
 
             req.hname_off.push(pos);   req.hname_len.push(nlen);
             req.hval_off.push(vs);     req.hval_len.push(ve - vs);
@@ -639,6 +1440,118 @@ export class Server {
         }
 
         req.head_end = pos;
+
+        // --- header survey: Host, Content-Length, Transfer-Encoding ---
+        //
+        // All three are found in ONE pass.
+        // Three separate scans read the same array three times to answer three
+        // questions about it, and this loop is per-request on the hot path.
+        // hdr_eq compares length first, so a name that cannot match costs one
+        // integer compare.
+        let hosts = 0;
+        let te = -1;
+        let cl_first = -1;
+        let cl_count = 0;
+        for (let i2 in 0..req.hname_off.len) {
+            let n_off = req.hname_off[i2];
+            let n_len = req.hname_len[i2];
+            if (hdr_eq(raw, n_off, n_len, "Content-Length")) {
+                cl_count += 1;
+                if (cl_first < 0) { cl_first = i2; }
+                else if (!hval_same(raw, req.hval_off[cl_first], req.hval_len[cl_first],
+                                    req.hval_off[i2], req.hval_len[i2])) {
+                    return 400;                    // conflicting — the vector
+                }
+            } else if (hdr_eq(raw, n_off, n_len, "Transfer-Encoding")) {
+                te = i2;
+            } else if (hdr_eq(raw, n_off, n_len, "Host")) {
+                hosts += 1;
+            }
+        }
+
+        // --- Host (RFC 7230 5.4) ---
+        if (hosts > 1) { return 400; }
+        if (req.version_minor == 1 && hosts == 0) { return 400; }
+
+        // --- message framing (RFC 7230 3.3.3) ---
+        //
+        // The single most important block in this file. If any two readers of
+        // this byte stream can disagree about where the body ends, a request
+        // can be smuggled past whichever of them is a security control. So the
+        // rule is not "pick the right length" — it is "refuse anything
+        // ambiguous", which is why identical duplicates are rejected too.
+        // Identical duplicates are still ambiguous to a hop that concatenates
+        // them into `5, 5`. Nothing legitimate sends two.
+        if (cl_count > 1) { return 400; }
+
+        if (te >= 0) {
+            // TE and CL together is the classic desync. It must be 400 before
+            // the 501 below, or the safest-looking response is the wrong one.
+            if (cl_count > 0) { return 400; }
+            let tv = slice_str(raw, req.hval_off[te], req.hval_len[te]).to_lower();
+            if (tv != "chunked" && tv != "identity") { return 400; }
+            // `chunked` is understood and deliberately refused — see the file
+            // header. Refusing beats guessing at the framing.
+            if (tv == "chunked") { return 501; }
+        }
+
+        if (cl_count == 1) {
+            // Which cap applies is not knowable here.
+            //
+            // A streamed body may be far larger than max_body_bytes, but only
+            // the SINK FACTORY decides whether this request streams, and it
+            // needs the parsed request to decide. So parse against the larger
+            // bound whenever streaming is possible at all, and re-check against
+            // max_body_bytes in drive() the moment the factory declines.
+            //
+            // This is the one bound in the file checked in two places. It is
+            // called out rather than hidden because a cap that moves is exactly
+            // the kind of thing that rots into no cap at all.
+            let cap = L.max_body_bytes;
+            if (this.body_sink != null && L.max_streamed_bytes > cap) {
+                cap = L.max_streamed_bytes;
+            }
+
+            // A single field may still hold a comma list. parse_uint rejects the
+            // comma, so this needs no separate check — but it must map to 400
+            // (malformed) rather than 413 (too large), which the caller cannot
+            // tell apart from one return value.
+            let n = parse_uint(raw, req.hval_off[cl_first], req.hval_len[cl_first],
+                               cap);
+            if (n < 0) {
+                // Distinguish "not a number" from "over the cap": scan for a
+                // non-digit. Only the second is a 413.
+                let digits = req.hval_len[cl_first] > 0;
+                for (let k in 0..req.hval_len[cl_first]) {
+                    let c = raw[req.hval_off[cl_first] + k];
+                    if (c < 48 || c > 57) { digits = false; break; }
+                }
+                if (digits) { return 413; }
+                return 400;
+            }
+            req.content_len = n;
+        }
+
+        // --- path normalisation ---
+        //
+        // Done last, and only when it is needed. The scan is bytes over a buffer
+        // we already hold; the decode allocates. A typical request has neither a
+        // percent-escape nor a dot segment, so the common path stays free — see
+        // the arena rule in CLAUDE.md.
+        if (req.path_len > 0 && needs_normalising(raw, req.path_off, req.path_len)) {
+            if (has_nul_escape(raw, req.path_off, req.path_len)) { return 400; }
+            let dec = url_decode(slice_str(raw, req.path_off, req.path_len));
+            // remove_dot_segments is RFC 3986 5.2.4, which DISCARDS a `..` that
+            // would climb above the root rather than honouring it. So
+            // `/../../etc/passwd` normalises to `/etc/passwd` and confinement is
+            // structural — there is no escaping path for a later check to catch.
+            // The guard below is belt-and-braces against that behaviour changing.
+            let norm = remove_dot_segments(dec);
+            if (norm.len >= 3 && norm[0] == 46 && norm[1] == 46 && norm[2] == 47) { return 400; }
+            if (norm == "..") { return 400; }
+            if (norm.len == 0) { norm = "/"; }
+            req.norm_path = norm;
+        }
 
         // Connection header overrides the version default.
         if (req.hasHeader("Connection")) {
@@ -651,8 +1564,27 @@ export class Server {
 
     // ---- dispatch ----------------------------------------------------------
     fn dispatch(req: ServerRequest, res: ServerResponse) {
-        let p = req.path();
         let m = req.method();
+        if (m == "HEAD") { res.body_allowed = false; }
+
+        // A framework above owns routing outright. Checked before anything
+        // else so nothing here can shadow it.
+        if (this.handler != null) {
+            this.handler(req, res);
+            res.sent = true;
+            return;
+        }
+
+        let p = req.path();
+
+        // A HEAD response must be byte-identical to the GET one minus the body,
+        // so it is served by the GET handler. Registering .head() explicitly
+        // still wins; without this a health check against a normal GET route
+        // gets a 405, which is why HEAD-based checks are worth almost nothing
+        // on most hand-rolled servers.
+        let is_head = m == "HEAD";
+        if (is_head) { res.body_allowed = false; }
+
         let path_seen = false;
         for (let r in this.routes) {
             // Params accumulate across failed matches otherwise.
@@ -665,12 +1597,30 @@ export class Server {
             res.sent = true;
             return;
         }
+        if (is_head) {
+            for (let r in this.routes) {
+                req.param_names = [];
+                req.param_vals = [];
+                if (!r.match_(p, req)) { continue; }
+                if (r.method != "GET") { continue; }
+                r.handler(req, res);
+                res.sent = true;
+                return;
+            }
+        }
         req.param_names = [];
         req.param_vals = [];
         // A path that exists under a different verb is 405, not 404 — the
-        // distinction matters to any client that probes.
-        if (path_seen) { res.text(405, "method not allowed"); }
-        else { res.text(404, "not found"); }
+        // distinction matters to any client that probes. The status is set
+        // before the hook so a custom page can read and keep it.
+        if (path_seen) { res.status = 405; } else { res.status = 404; }
+        if (this.not_found != null) {
+            this.not_found(req, res);
+        } else if (path_seen) {
+            res.text(405, "method not allowed");
+        } else {
+            res.text(404, "not found");
+        }
         res.sent = true;
     }
 
@@ -682,14 +1632,42 @@ export class Server {
         out.append("HTTP/1.1 ").appendInt(res.status).append(" ")
            .append(status_text(res.status)).append("\r\n");
         out.append(res.hdrs.toString());
+        // Server-wide defaults, each skipped if the handler set that name.
+        for (let i in 0..this.dflt_names.len) {
+            let taken = false;
+            for (let j in 0..res.set_names.len) {
+                if (hdr_name_is(res.set_names[j], this.dflt_names[i])) { taken = true; break; }
+            }
+            if (!taken) {
+                out.append(this.dflt_names[i]).append(": ")
+                   .append(this.dflt_values[i]).append("\r\n");
+            }
+        }
         if (!res.has_date) {
             out.append("Date: ").append(this.httpDate()).append("\r\n");
         }
-        out.append("Content-Length: ").appendInt(res.body_str.len).append("\r\n");
+
+        // 204 and 304 carry neither a body nor a Content-Length (RFC 7230
+        // 3.3.2). A HEAD response carries the Content-Length a GET would have
+        // produced, and no body — the length is the whole point of a HEAD, so
+        // it must be the real one and not zero.
+        let no_len = res.status == 204 || res.status == 304;
+        // A file body is framed by its own length, not by body_str.
+        let blen = res.body_str.len;
+        if (res.file_fd >= 0) { blen = res.file_len; }
+        if (!no_len) {
+            out.append("Content-Length: ").appendInt(blen).append("\r\n");
+        }
         if (keep) { out.append("Connection: keep-alive\r\n"); }
         else { out.append("Connection: close\r\n"); }
         out.append("\r\n");
-        out.append(res.body_str);
+        // Sending a body where the framing says there is none desynchronises
+        // the connection: the peer reads it as the head of the next response.
+        // A file body is not appended — it goes to the socket directly, after
+        // these headers have left.
+        if (res.body_allowed && !no_len && res.file_fd < 0) {
+            out.append(res.body_str);
+        }
     }
 
     // Blocking path (serveOnce / serve_conn); the reactor writes into the Conn.
@@ -697,11 +1675,28 @@ export class Server {
         let out = new StringBuilder(res.body_str.len + 256);
         this.write_response(out, res, keep);
         c.sendText(out.toString());
+        // The blocking path has no POLL_WRITE to resume on, so the file goes
+        // out in one loop right here.
+        if (res.file_fd >= 0) {
+            let left = res.file_len;
+            while (res.body_allowed && left > 0) {
+                let n = sendfile(c.fd, res.file_fd as i32, null, left as i64) as int;
+                if (n <= 0) { break; }
+                left -= n;
+            }
+            close(res.file_fd as i32);
+            res.file_fd = -1;
+        }
     }
 
+    // A request that never parsed. There is no ServerRequest to hand a custom
+    // page — the bytes were not a request — so the hook gets only the status.
     fn send_error(c: Socket, code: int) {
+        this.stats.parse_errors += 1;
         let r = new ServerResponse();
-        r.text(code, status_text(code));
+        r.status = code;
+        if (this.error_page != null) { this.error_page(code, r); }
+        else { r.text(code, status_text(code)); }
         this.send_response(c, r, false);
     }
 
@@ -749,23 +1744,20 @@ export class Server {
             if (bad != 0) { this.send_error(c, bad); return; }
             let end_out = req.head_end;
 
-            // --- body, by Content-Length ---
-            let blen = 0;
-            if (req.hasHeader("Content-Length")) {
-                let i = 0;
-                let found = -1;
-                while (i < req.hname_off.len) {
-                    if (hdr_eq(raw, req.hname_off[i], req.hname_len[i], "Content-Length")) {
-                        found = i; break;
-                    }
-                    i += 1;
+            // Framing was settled in parse_head, for both paths, from one
+            // reading of the bytes. Two readers is how a request smuggles.
+            let blen = req.content_len;
+            if (blen < 0) { blen = 0; }
+
+            // Expect: 100-continue. Blocking path, so this is a straight write
+            // before the body is awaited.
+            if (req.hasHeader("Expect")) {
+                let ev = req.header("Expect").to_lower();
+                if (ev != "100-continue") { this.send_error(c, 417); return; }
+                if (req.version_minor == 1 && used < end_out + blen) {
+                    c.sendText("HTTP/1.1 100 Continue\r\n\r\n");
                 }
-                blen = parse_uint(raw, req.hval_off[found], req.hval_len[found], L.max_body_bytes);
-                if (blen < 0) { this.send_error(c, 413); return; }
             }
-            // Chunked is not implemented; refusing is safer than mis-framing,
-            // which is the request-smuggling class of bug.
-            if (req.hasHeader("Transfer-Encoding")) { this.send_error(c, 501); return; }
 
             if (blen > 0) {
                 // The body lands in `raw` directly after the head, so the
@@ -818,6 +1810,13 @@ export class Server {
     // O(1), no hashing, no node per connection. A fd past the table is closed
     // rather than grown into — an unbounded table is itself an attack.
     fn reactor(listener: Socket, max_conns: int): bool {
+        // A table that cannot hold a connection is a misconfiguration, not a
+        // server. Fail loudly here rather than accepting and refusing every
+        // connection in silence.
+        if (max_conns < 1) {
+            this.log.error("max_conns must be at least 1, got " + str(max_conns));
+            return false;
+        }
         // The listener must be non-blocking: the accept-drain loop below calls
         // accept() until it fails, and on a blocking listener that last call
         // parks the whole reactor forever.
@@ -832,11 +1831,52 @@ export class Server {
         let live = 0;              // connections currently held
         let warned_fd = false;     // fd-exhaustion warning is one-shot
         let last_sweep = mono_ms();
-        let hi_fd = 0;             // highest connection fd seen; bounds the sweep
+        // -1, not 0: this bounds the sweep as `0..hi_fd+1`, so a 0 sentinel
+        // makes the sweep read slot 0 before any connection has ever been
+        // accepted. Harmless while the table is large, and an out-of-bounds
+        // panic the moment it is empty.
+        let hi_fd = -1;            // highest connection fd seen; bounds the sweep
         let blocked: bool[] = [false];   // out-param for drive()
 
         this.running = true;
-        while (this.running) {
+        // Drain state. stop() flips `running`; the loop then stops accepting
+        // and keeps serving what is already open until it is done or the
+        // budget expires. Exiting immediately, as this used to, loses every
+        // in-flight request — including the one whose handler called stop().
+        this.draining = false;
+        let drain_until = 0;
+
+        while (true) {
+            if (!this.running && !this.draining) {
+                this.draining = true;
+                drain_until = mono_ms() + this.drain_ms;
+                // Stop accepting first. The listener has to leave the PollSet
+                // too, or every wakeup reports it readable and the loop spins
+                // on a listener nobody will accept from.
+                poll.removeFd(lfd);
+                listener.close();
+                this.log.info("draining: " + str(live) + " connections, "
+                              + str(this.drain_ms) + "ms budget");
+            }
+            if (this.draining) {
+                if (live <= 0) {
+                    this.log.info("drain complete, all connections finished");
+                    break;
+                }
+                if (mono_ms() > drain_until) {
+                    this.log.warn("drain budget expired with " + str(live)
+                                  + " connections still open");
+                    // Uploads still in flight are abandoned by the shutdown,
+                    // not by the peer, and their sinks are told so before the
+                    // slots are dropped.
+                    for (let f2 in 0..hi_fd + 1) {
+                        let cn2 = slots[f2];
+                        if (cn2 != null) { cn2.abort_stream(ABORT_SHUTDOWN); }
+                    }
+                    break;
+                }
+            }
+
             let n = poll.wait(1000);
             if (n < 0) { break; }
 
@@ -858,17 +1898,21 @@ export class Server {
                     let cn = slots[f];
                     if (cn == null) { continue; }
                     if (now > cn.deadline) {
+                        // A sink mid-upload is told WHY, not merely dropped.
+                        cn.abort_stream(ABORT_TIMEOUT);
                         poll.removeFd(f);
                         cn.sock.close();
                         slots[f] = null;
                         live -= 1;
+                        this.stats.conns_dropped_idle += 1;
+                        this.stats.conns_live = live;
                     }
                 }
             }
 
             for (let i in 0..n) {
                 let fd = poll.readyFd(i);
-                if (fd == lfd) {
+                if (fd == lfd && !this.draining) {
                     // Drain the accept queue; one wakeup can cover many.
                     //
                     // accept() returning null is ambiguous — it covers both
@@ -888,7 +1932,7 @@ export class Server {
                             // nearly full is the EMFILE signature. Warn once.
                             if (accepted_now == 0 && live >= max_conns - 8 && !warned_fd) {
                                 warned_fd = true;
-                                print("vyto/net/server: accept() failing with "
+                                this.log.error("accept() failing with "
                                       + str(live) + " connections held — likely "
                                       + "out of file descriptors (ulimit -n). "
                                       + "Connections will queue unserved.");
@@ -901,11 +1945,16 @@ export class Server {
                         // than continuing: once fds reach the table size every
                         // further accept will too, so continuing would spin.
                         // Breaking costs one wakeup, which is the cheap side.
-                        if (cfd >= max_conns) { c.close(); break; }
+                        if (cfd >= max_conns) {
+                            this.stats.conns_refused_full += 1;
+                            c.close(); break;
+                        }
                         c.setNonBlocking(true);
                         c.setNoDelay(true);
                         slots[cfd] = new Conn(c, this.limits);
                         live += 1;
+                        this.stats.conns_accepted += 1;
+                        this.stats.conns_live = live;
                         if (cfd > hi_fd) { hi_fd = cfd; }
                         poll.add(c, POLL_READ);
                     }
@@ -917,10 +1966,37 @@ export class Server {
 
                 let alive = this.drive(cn, blocked);
                 if (!alive) {
+                    // Any sink still open here never got its body. The reason
+                    // is the peer going away — a rejection or a timeout already
+                    // aborted with its own reason, and abort_stream is
+                    // idempotent so this cannot double-fire.
+                    cn.abort_stream(ABORT_CONNECTION_LOST);
                     poll.removeFd(fd);
-                    cn.sock.close();
                     slots[fd] = null;
                     live -= 1;
+                    this.stats.conns_live = live;
+                    // An upgraded connection leaves the reactor ALIVE. Closing
+                    // it here would hand the callback a dead fd; ownership has
+                    // already passed, and closing it is now the callback's job.
+                    if (cn.upgrade_cb != null) {
+                        let cb = cn.upgrade_cb;
+                        cn.upgrade_cb = null;
+                        // Handed over BLOCKING. The reactor made it
+                        // non-blocking for its own use, and a callback that
+                        // does the obvious thing — recv, then reply — would
+                        // otherwise get an instant empty read and answer
+                        // before the peer had said anything.
+                        //
+                        // The callback runs on this worker's thread, so it
+                        // parks the whole reactor and every other connection
+                        // on it. That is the honest contract for a synchronous
+                        // handoff with no thread model: keep it short, or hand
+                        // the fd somewhere else and return.
+                        cn.sock.setNonBlocking(false);
+                        cb(cn.sock);
+                    } else {
+                        cn.sock.close();
+                    }
                     continue;
                 }
                 // Track POLL_WRITE only while there is something to write.
@@ -936,6 +2012,158 @@ export class Server {
             }
         }
         return true;
+    }
+
+    // Dispatch one parsed request and append its response to the connection.
+    // Returns the keep-alive decision.
+    //
+    // Shared by the buffered path and the streamed one on purpose: two copies
+    // of the response path is how a fix lands in one and not the other.
+    fn serve_request(cn: Conn, req: ServerRequest): bool {
+        let L = this.limits;
+        let res = new ServerResponse();
+        // The clock is read only when someone is listening. Two clock_gettime
+        // calls are cheap next to a 10 us request, but "cheap" is not "free" at
+        // this rate, and nothing should pay for a hook it did not install.
+        let t0 = 0;
+        if (this.on_request != null) { t0 = monoUs() as int; }
+
+        this.dispatch(req, res);
+        cn.served += 1;
+        // This request is complete, so the next one on this connection gets its
+        // own 100-continue budget.
+        cn.expect_sent = false;
+        let keep = req.keep_alive && cn.served < L.max_keepalive_reqs
+                   && !this.draining;
+
+        let out_before = cn.outBuf().len();
+        this.write_response(cn.outBuf(), res, keep);
+        if (res.file_fd >= 0) {
+            // HEAD advertises the length and sends no body, so the fd is closed
+            // here rather than handed over — otherwise it leaks one descriptor
+            // per HEAD of a static file.
+            if (res.body_allowed) {
+                cn.file_fd = res.file_fd;
+                cn.file_left = res.file_len;
+            } else {
+                close(res.file_fd as i32);
+            }
+            res.file_fd = -1;
+        }
+        // Recorded on the Conn: only the reactor can drop an fd from the
+        // PollSet, and neither this nor drive() has access to it.
+        if (res.upgrade_cb != null) { cn.upgrade_cb = res.upgrade_cb; }
+        this.stats.note(res.status, cn.outBuf().len() - out_before);
+
+        if (this.on_request != null) {
+            this.on_request(req, res.status, cn.outBuf().len() - out_before,
+                            (monoUs() as int) - t0);
+        }
+        return keep;
+    }
+
+    // Hand one fragment to the sink. Returns false if the sink refused, having
+    // already aborted it and queued the rejection status.
+    fn feed_sink(cn: Conn, chunk: byte[]): bool {
+        this.stats.bytes_in += chunk.len;
+        if (cn.stream_sink.on_chunk(chunk)) { return true; }
+        let st = cn.stream_sink.reject_status;
+        cn.abort_stream(ABORT_REJECTED);
+        this.send_error(cn.sock, st);
+        return false;
+    }
+
+    // Drive a streaming body. Called instead of parsing while a sink is open.
+    //
+    // PUMP_MORE  body finished, response written, parsing may resume
+    // PUMP_WAIT  nothing more readable right now, or output is blocked
+    // PUMP_DEAD  close the connection
+    fn pump_stream(cn: Conn, out_blocked: bool[]): int {
+        let L = this.limits;
+
+        while (cn.stream_left > 0) {
+            let r = cn.sock.tryRecv(L.stream_chunk_bytes);
+            if (r.wouldBlock()) { return PUMP_WAIT; }
+            if (r.status <= 0) {
+                // The peer left mid-body. The sink MUST learn this: a truncated
+                // upload is byte-for-byte a short one, and a sink that is not
+                // told will commit a partial file as if it were whole.
+                cn.abort_stream(ABORT_CONNECTION_LOST);
+                return PUMP_DEAD;
+            }
+            cn.deadline = mono_ms() + L.recv_timeout_ms;
+
+            let n = r.data.len;
+            let body_n = n;
+            // THE CLAMP. Never hand the sink a byte past Content-Length —
+            // everything after it belongs to the next pipelined request, and
+            // delivering it would both corrupt this body and desynchronise the
+            // connection.
+            if (body_n > cn.stream_left) { body_n = cn.stream_left; }
+
+            let chunk = r.data;
+            if (body_n < n) {
+                // Boundary case only, once per request: split the read. Both
+                // halves are fresh owned arrays (slice copies), so the sink
+                // still never sees a view.
+                chunk = r.data.slice(0, body_n);
+                cn.stream_tail = r.data.slice(body_n, n);
+            }
+            cn.stream_left -= body_n;
+            if (!this.feed_sink(cn, chunk)) { return PUMP_DEAD; }
+        }
+
+        // ---- body complete ----
+        let sink = cn.stream_sink;      // strong, keeps it alive past clear
+        let req = cn.stream_req;
+        if (!sink.on_end()) {
+            let st = sink.reject_status;
+            cn.abort_stream(ABORT_REJECTED);
+            this.send_error(cn.sock, st);
+            return PUMP_DEAD;
+        }
+
+        // The handler reads its result off the sink. body_off stays -1 so
+        // bodyText() returns "" rather than a stale slice of the head — a
+        // streamed request must not pretend to still hold its body.
+        req.sink = sink;
+        req.streamed = true;
+        req.body_off = -1;
+        req.body_len = 0;
+
+        let keep = this.serve_request(cn, req);
+
+        // Poison the request view IMMEDIATELY, before any path below can return
+        // early. Anything that retained the request now reads EMPTY rather than
+        // the bytes of whatever request comes next — a wrong answer that is
+        // obviously wrong beats one that is quietly plausible.
+        //
+        // Ordering matters: this used to sit after the tail handling, which has
+        // a `return PUMP_DEAD` in it, so a connection that failed to re-buffer
+        // its pipelined tail left the request un-poisoned.
+        req.raw = bytes(0);
+        req.sink = null;
+
+        // Reset. The head is no longer needed, so the buffer goes back to empty
+        // and any bytes read past the body become the next request.
+        let tail = cn.stream_tail;
+        cn.clear_stream();              // NOT abort: this one completed
+        cn.used = 0;
+        if (tail != null && tail.len > 0) {
+            if (!cn.reserve(tail.len)) { this.send_error(cn.sock, 431); return PUMP_DEAD; }
+            for (let k in 0..tail.len) { cn.raw[k] = tail[k]; }
+            cn.used = tail.len;
+        }
+
+        let f = cn.flush();
+        if (f < 0) { return PUMP_DEAD; }
+        if (f == 0) { out_blocked[0] = true; return PUMP_WAIT; }
+        // Leaving the reactor — either handed to an upgrade callback or closed.
+        // Both look the same from here; the reactor tells them apart by
+        // cn.upgrade_cb.
+        if (cn.upgrade_cb != null) { return PUMP_DEAD; }
+        if (!keep) { return PUMP_DEAD; }
+        return PUMP_MORE;
     }
 
     // Advance one connection as far as it can go without blocking.
@@ -954,22 +2182,44 @@ export class Server {
             if (f == 0) { out_blocked[0] = true; return true; }
         }
 
+        // After a streamed body completes, cn.raw may already hold the whole of
+        // the next pipelined request. Those bytes are out of the socket, so
+        // epoll will never report them again — recv'ing first would block and
+        // strand a request that has already arrived.
+        let skip_recv = false;
+
         while (true) {
-            let r = cn.sock.tryRecv(RECV_CHUNK);
-            if (r.wouldBlock()) { return true; }        // nothing more right now
-            if (r.status <= 0) { return false; }        // EOF or error
+            // STREAMING MODE. While a sink is open this connection does not
+            // parse at all: every arriving byte is body. That is what makes
+            // re-delivery impossible, since drive() otherwise re-parses the
+            // same head on every wakeup.
+            if (cn.stream_sink != null) {
+                let pumped = this.pump_stream(cn, out_blocked);
+                if (pumped == PUMP_DEAD) { return false; }
+                if (pumped == PUMP_WAIT) { return true; }
+                skip_recv = true;
+            }
 
-            // A read shorter than the request means the socket is drained. The
-            // PollSet is level-triggered (no EPOLLET in socket_shim.c), so if
-            // more arrives epoll reports it again — there is no need to probe
-            // until EAGAIN. That probe was a wasted syscall on every request,
-            // one of the three the request path costs.
-            let drained = r.data.len < RECV_CHUNK;
+            let drained = true;
+            if (!skip_recv) {
+                let r = cn.sock.tryRecv(RECV_CHUNK);
+                if (r.wouldBlock()) { return true; }    // nothing more right now
+                if (r.status <= 0) { return false; }    // EOF or error
 
-            if (!cn.reserve(cn.used + r.data.len)) { this.send_error(cn.sock, 431); return false; }
-            for (let k in 0..r.data.len) { cn.raw[cn.used + k] = r.data[k]; }
-            cn.used += r.data.len;
-            cn.deadline = mono_ms() + L.recv_timeout_ms;
+                // A read shorter than the request means the socket is drained.
+                // The PollSet is level-triggered (no EPOLLET in
+                // socket_shim.c), so if more arrives epoll reports it again —
+                // there is no need to probe until EAGAIN. That probe was a
+                // wasted syscall on every request, one of the three the
+                // request path costs.
+                drained = r.data.len < RECV_CHUNK;
+
+                if (!cn.reserve(cn.used + r.data.len)) { this.send_error(cn.sock, 431); return false; }
+                for (let k in 0..r.data.len) { cn.raw[cn.used + k] = r.data[k]; }
+                cn.used += r.data.len;
+                cn.deadline = mono_ms() + L.recv_timeout_ms;
+            }
+            skip_recv = false;
 
             // Drain every complete request sitting in the buffer (pipelining).
             while (true) {
@@ -980,11 +2230,83 @@ export class Server {
                 let bad = this.parse_head(cn.raw, cn.used, req);
                 if (bad != 0) { this.send_error(cn.sock, bad); return false; }
 
-                let blen = this.body_len_of(req, cn.raw);
-                if (blen < 0) { this.send_error(cn.sock, 413); return false; }
-                if (req.hasHeader("Transfer-Encoding")) { this.send_error(cn.sock, 501); return false; }
+                // Framing was settled in parse_head — duplicate and conflicting
+                // Content-Length, TE+CL, and unknown transfer codings are all
+                // rejected there, so there is exactly one answer here.
+                let blen = req.content_len;
+                if (blen < 0) { blen = 0; }
 
                 let end_out = req.head_end;
+
+                // Expect: 100-continue (RFC 7231 5.1.1). A client that sends
+                // this WAITS before writing its body — curl does it for bodies
+                // over 1 KB — so ignoring it stalls the request until the recv
+                // timeout rather than failing fast.
+                //
+                // drive() re-parses the same bytes on every wakeup, so the
+                // interim is guarded by a flag on the connection: sending it
+                // twice would put an extra response on the wire.
+                if (!cn.expect_sent && req.hasHeader("Expect")) {
+                    let ev = req.header("Expect").to_lower();
+                    if (ev != "100-continue") {
+                        this.send_error(cn.sock, 417); return false;
+                    }
+                    if (req.version_minor == 1 && cn.used < end_out + blen) {
+                        cn.expect_sent = true;
+                        cn.outBuf().append("HTTP/1.1 100 Continue\r\n\r\n");
+                        let fi = cn.flush();
+                        if (fi < 0) { return false; }
+                        if (fi == 0) { out_blocked[0] = true; return true; }
+                    }
+                }
+
+                // ---- stream or buffer? ----
+                //
+                // Decided HERE, before a single byte of body is reserved. That
+                // ordering is the whole memory property: a streamed body never
+                // sizes this buffer, so a connection streaming 10 GB costs
+                // exactly what one serving /health costs.
+                if (blen > 0 && this.body_sink != null) {
+                    let sink = this.body_sink(req);
+                    if (sink != null) {
+                        cn.stream_sink = sink;
+                        cn.stream_left = blen;
+                        cn.stream_req = req;
+                        cn.stream_aborted = false;
+                        this.stats.streamed_requests += 1;
+
+                        // The head stays parked in cn.raw for the whole body.
+                        // It has to: `req` is a view over this buffer, and
+                        // leaving it in place is what keeps every accessor
+                        // valid without materialising the request.
+                        let have = cn.used - end_out;
+                        cn.used = end_out;
+                        if (have > 0) {
+                            let take_n = have;
+                            if (take_n > blen) { take_n = blen; }
+                            // Copies, both of them — a sink is never handed a
+                            // view into a buffer the connection keeps writing.
+                            let first = cn.raw.slice(end_out, end_out + take_n);
+                            if (have > take_n) {
+                                cn.stream_tail = cn.raw.slice(end_out + take_n,
+                                                              end_out + have);
+                            }
+                            cn.stream_left -= take_n;
+                            if (!this.feed_sink(cn, first)) { return false; }
+                        }
+                        // Hand off to pump_stream on the next turn of the loop.
+                        break;
+                    }
+                }
+
+                // The factory declined, so this body will be BUFFERED and the
+                // buffered cap is the one that applies. parse_head had to
+                // measure against the larger streaming cap because it could not
+                // know this yet — see the note there. Re-checking is what stops
+                // registering a sink from silently raising the limit for every
+                // route that does not use one.
+                if (blen > L.max_body_bytes) { this.send_error(cn.sock, 413); return false; }
+
                 // Growing here replaces cn.raw, so the request's view — taken
                 // before the body length was known — has to be re-pointed at
                 // the new buffer or every accessor reads the old one.
@@ -995,12 +2317,7 @@ export class Server {
                 req.body_off = end_out;
                 req.body_len = blen;
 
-                let res = new ServerResponse();
-                this.dispatch(req, res);
-                cn.served += 1;
-                let keep = req.keep_alive && cn.served < L.max_keepalive_reqs;
-
-                this.write_response(cn.outBuf(), res, keep);
+                let keep = this.serve_request(cn, req);
 
                 let consumed = end_out + blen;
                 let leftover = cn.used - consumed;
@@ -1017,23 +2334,19 @@ export class Server {
                     out_blocked[0] = true;
                     return true;
                 }
+                // Handoff, only once the response has fully left: the peer must
+                // see the 101 before the new protocol starts. Recorded on the
+                // Conn so the reactor can drop the fd from its tables without
+                // closing it — drive() has no access to the PollSet.
+                if (cn.upgrade_cb != null) { return false; }
                 if (!keep) { return false; }
             }
+            // Entering stream mode breaks the parse loop; pump on the next turn
+            // rather than falling through to a read that would block.
+            if (cn.stream_sink != null) { continue; }
             if (drained) { return true; }
         }
         return true;
-    }
-
-    // Content-Length, or 0 when absent. -1 when unparseable or over the cap.
-    fn body_len_of(req: ServerRequest, raw: byte[]): int {
-        let i = 0;
-        while (i < req.hname_off.len) {
-            if (hdr_eq(raw, req.hname_off[i], req.hname_len[i], "Content-Length")) {
-                return parse_uint(raw, req.hval_off[i], req.hval_len[i], this.limits.max_body_bytes);
-            }
-            i += 1;
-        }
-        return 0;
     }
 
     // ---------------------------------------------------------- entry points
@@ -1072,22 +2385,76 @@ export class Server {
         probe.close();
 
         let kids: int[] = [];
+        let born: int[] = [];          // fork time per worker, for the backoff
         for (let i in 0..n) {
             let pid = fork() as int;
             if (pid == 0) { this.worker_main(); _exit(0 as i32); }
             if (pid < 0) { break; }
             kids.push(pid);
+            born.push(mono_ms());
         }
         if (kids.len == 0) { return false; }
+        this.log.info("started " + str(kids.len) + " workers on port " + str(this.port));
 
         // Supervisor: re-fork whatever dies. This loop is why a handler panic
         // is survivable, so it exists from day one rather than later.
+        //
+        // Unconditional re-forking is a crash loop waiting to happen: a worker
+        // that dies during startup — a bad bind, a panic in a constructor —
+        // gets replaced instantly, forever, as fast as the kernel allows. The
+        // backoff distinguishes "died after doing work" from "died on arrival"
+        // by how long it lived, and gives up rather than spinning.
+        let fast_deaths = 0;
+        let backoff = CRASH_BACKOFF_MIN_MS;
+
         this.running = true;
         while (this.running) {
             let dead = waitpid(-1 as i32, null, 0 as i32) as int;
             if (dead < 0) { break; }
+
+            let lived = -1;
+            for (let i in 0..kids.len) {
+                if (kids[i] == dead) { lived = mono_ms() - born[i]; break; }
+            }
+
+            if (lived >= 0 && lived < this.crash_fast_ms) {
+                fast_deaths += 1;
+                if (fast_deaths >= this.crash_give_up) {
+                    this.log.error("worker " + str(dead) + " died after "
+                        + str(lived) + "ms; " + str(fast_deaths)
+                        + " consecutive fast deaths — giving up rather than "
+                        + "crash-looping");
+                    this.running = false;
+                    return false;
+                }
+                this.log.warn("worker " + str(dead) + " died after " + str(lived)
+                    + "ms (fast death " + str(fast_deaths) + "/"
+                    + str(this.crash_give_up) + "); backing off " + str(backoff) + "ms");
+                sleepMs(backoff);
+                backoff = backoff * 2;
+                if (backoff > this.crash_backoff_max_ms) { backoff = this.crash_backoff_max_ms; }
+            } else {
+                // A worker that did real work before dying is not a crash loop.
+                // Resetting here is what keeps a long-running service from
+                // accumulating unrelated deaths into a give-up.
+                if (fast_deaths > 0) {
+                    this.log.info("worker " + str(dead) + " lived " + str(lived)
+                                  + "ms; crash-loop counter reset");
+                }
+                fast_deaths = 0;
+                backoff = CRASH_BACKOFF_MIN_MS;
+            }
+
             let pid = fork() as int;
             if (pid == 0) { this.worker_main(); _exit(0 as i32); }
+            if (pid > 0) {
+                let slot = -1;
+                for (let i in 0..kids.len) {
+                    if (kids[i] == dead) { slot = i; break; }
+                }
+                if (slot >= 0) { kids[slot] = pid; born[slot] = mono_ms(); }
+                else { kids.push(pid); born.push(mono_ms()); }
+            }
         }
         return true;
     }
@@ -1117,25 +2484,59 @@ export class Server {
         return true;
     }
 
+    // Ask the reactor to drain: stop accepting, finish what is in flight, then
+    // return. The budget is withDrainMs(); past it, remaining connections are
+    // dropped and that is logged rather than silent.
+    //
+    // NOTE there is no signal handling yet, so nothing triggers this from
+    // OUTSIDE the process — a SIGTERM still kills the workers where they
+    // stand. Usable today from a handler, or from an embedding process that
+    // runs runSingle() itself. See local/docs/HTTP.md P1.
     fn stop() { this.running = false; }
+
+    fn withDrainMs(ms: int): Server { this.drain_ms = ms; return this; }
+
+    // fast_ms: a worker dying sooner than this never got as far as serving.
+    // give_up: consecutive fast deaths before the supervisor stops.
+    // backoff_max_ms: ceiling on the doubling delay between re-forks.
+    fn withCrashPolicy(fast_ms: int, give_up: int, backoff_max_ms: int): Server {
+        this.crash_fast_ms = fast_ms;
+        this.crash_give_up = give_up;
+        this.crash_backoff_max_ms = backoff_max_ms;
+        return this;
+    }
 }
 
 export fn server(port: int): Server { return new Server(port); }
 
 
-// ------------------------------------------------------------ still missing
+// --------------------------------------------------------- scope of this file
 //
-//   * partial writes     — send_response assumes the whole response leaves in
-//                          one sendText. On a blocking socket that is true; on
-//                          the reactor's non-blocking ones a large body can
-//                          short-write, and the remainder is currently lost.
-//                          This is the next correctness bug to fix: buffer the
-//                          unwritten tail on the Conn and register POLL_WRITE.
+// This is the CORE. The framework — middleware, a radix router, cookies,
+// multipart, sessions, templates, static-file policy — is VytoWeb, and lives
+// above this. The line, argued in full in local/docs/HTTP.md:
+//
+//   core owns the wire, user-space owns the taste.
+//
+// A thing belongs here if getting it wrong is a vulnerability a higher layer
+// cannot repair, if it needs the reactor / the fd / the fork, or if it is a
+// seam that is free unused and impossible to add later. Anything whose
+// configuration is a matter of taste does not belong here at any size.
+//
+// Still missing, all core by that test:
+//
 //   * chunked bodies     — currently 501. Mis-framing is request smuggling, so
 //                          refusing beats guessing
-//   * sendfile / writev  — static files and one-syscall responses
-//   * TLS                — terminate upstream for v1
-//   * shared state       — pre-fork workers share nothing, so any cache is
-//                          per-worker. Cross-worker state needs shared memory
+//   * signals            — no SIGTERM/SIGINT handling, so the drain below has
+//                          no trigger from outside the process. Needs the
+//                          self-pipe pattern, which needs a C shim
+//   * sendfile           — static files without the bytes entering the process
+//   * body streaming     — the whole body is buffered before the handler runs
+//   * TLS                — terminate upstream for v1. If it ever runs in
+//                          process it is core: it wraps the fd in the reactor
+//   * shared state       — pre-fork workers share nothing, so any cache and any
+//                          counter is per-worker. Aggregation needs shared
+//                          memory
 //
 // Out of scope: HTTP/2 (HPACK, multiplexing) and HTTP/3 (QUIC). Proxy in front.
+// Note HTTP/2 would also be core, for the same reason TLS is — it is framing.
