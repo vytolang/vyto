@@ -38,7 +38,22 @@ export fn html_escape(s: string): string { return escape_into(s, false); }
 // `<a href=` with an unescaped value is the classic way in.
 export fn html_escape_attr(s: string): string { return escape_into(s, true); }
 
+// Most strings that reach a page contain nothing to escape — a title, a name, a
+// number. Scanning for that first and handing the original back costs one pass
+// and no allocation, where building the answer costs a StringBuilder plus the
+// string it materialises, every call, escapable content or not. Strings are
+// immutable, so returning `s` itself is safe.
+fn has_escapable(s: string, attr: bool): bool {
+    for (let i in 0..s.len) {
+        let c = s[i];
+        if (c == 38 || c == 60 || c == 62) { return true; }
+        if (attr && (c == 34 || c == 39)) { return true; }
+    }
+    return false;
+}
+
 fn escape_into(s: string, attr: bool): string {
+    if (!has_escapable(s, attr)) { return s; }
     let sb = new StringBuilder(s.len + 16);
     let runStart = 0;
     let i = 0;
@@ -170,21 +185,52 @@ fn named_entity(name: string): string {
 
 // ---- void elements ---------------------------------------------------------
 
+// Compare `a` against a known-lowercase ASCII literal without allocating.
+// `to_lower()` builds a fresh string, and the two predicates below run once per
+// element opened — so an allocation here is an allocation per tag in every
+// document HtmlBuilder writes.
+fn eq_lower_ascii(a: string, lit: string): bool {
+    if (a.len != lit.len) { return false; }
+    for (let i in 0..a.len) {
+        let c = a[i];
+        if (c >= 65 && c <= 90) { c = c + 32; }
+        if (c != lit[i]) { return false; }
+    }
+    return true;
+}
+
 // True for an element that has no closing tag. Writing `</br>` is a bug, and
 // HtmlBuilder uses this to refuse to.
+//
+// Dispatch is on length first: nearly every tag in a real document (div, td,
+// tr, a, span, table) is rejected by the length check alone, without comparing
+// a single character.
 export fn html_is_void(tag: string): bool {
-    let t = tag.to_lower();
-    return t == "area" || t == "base" || t == "br" || t == "col" ||
-           t == "embed" || t == "hr" || t == "img" || t == "input" ||
-           t == "link" || t == "meta" || t == "source" || t == "track" ||
-           t == "wbr";
+    let n = tag.len;
+    if (n < 2 || n > 6) { return false; }
+    if (n == 2) { return eq_lower_ascii(tag, "br") || eq_lower_ascii(tag, "hr"); }
+    if (n == 3) {
+        return eq_lower_ascii(tag, "col") || eq_lower_ascii(tag, "img")
+            || eq_lower_ascii(tag, "wbr");
+    }
+    if (n == 4) {
+        return eq_lower_ascii(tag, "area") || eq_lower_ascii(tag, "base")
+            || eq_lower_ascii(tag, "link") || eq_lower_ascii(tag, "meta");
+    }
+    if (n == 5) {
+        return eq_lower_ascii(tag, "embed") || eq_lower_ascii(tag, "input")
+            || eq_lower_ascii(tag, "track");
+    }
+    return eq_lower_ascii(tag, "source");
 }
 
 // True for an element whose content is raw text, not markup: a `<` inside
 // <script> or <style> is not a tag, and escaping it would break the content.
 export fn html_is_raw_text(tag: string): bool {
-    let t = tag.to_lower();
-    return t == "script" || t == "style";
+    let n = tag.len;
+    if (n == 5) { return eq_lower_ascii(tag, "style"); }
+    if (n == 6) { return eq_lower_ascii(tag, "script"); }
+    return false;
 }
 
 // ---- the builder -----------------------------------------------------------
@@ -220,9 +266,12 @@ export class HtmlBuilder {
     fn len(): int { return this.sb.len(); }
 
     // Finish the `<tag` currently being written, if any.
+    // Single characters go through appendByte rather than append: append(s)
+    // pays a string-object round trip per call, and the builder emits more
+    // one-character pieces ('<', '>', '"', ' ') than anything else.
     fn seal() {
         if (this.inTag) {
-            this.sb.append(">");
+            this.sb.appendByte(62);          // '>'
             this.inTag = false;
         }
     }
@@ -231,7 +280,7 @@ export class HtmlBuilder {
     // off automatically as soon as anything else is written.
     fn open(tag: string): HtmlBuilder {
         this.seal();
-        this.sb.append("<").append(tag);
+        this.sb.appendByte(60).append(tag);   // '<'
         this.inTag = true;
         // A void element never goes on the stack: there is nothing to close,
         // and seal() will finish its `<br` when the next thing is written.
@@ -245,8 +294,8 @@ export class HtmlBuilder {
             this.fail("attr('" + name + "') outside a tag");
             return this;
         }
-        this.sb.append(" ").append(name).append("=\"");
-        this.sb.append(html_escape_attr(value)).append("\"");
+        this.sb.appendByte(32).append(name).appendByte(61).appendByte(34);  // ' ' '=' '"'
+        this.sb.append(html_escape_attr(value)).appendByte(34);
         return this;
     }
     fn attrInt(name: string, value: int): HtmlBuilder {
@@ -254,7 +303,8 @@ export class HtmlBuilder {
             this.fail("attr('" + name + "') outside a tag");
             return this;
         }
-        this.sb.append(" ").append(name).append("=\"").appendInt(value).append("\"");
+        this.sb.appendByte(32).append(name).appendByte(61).appendByte(34);
+        this.sb.appendInt(value).appendByte(34);
         return this;
     }
     // A valueless attribute: `<input disabled>`.
@@ -263,7 +313,7 @@ export class HtmlBuilder {
             this.fail("flag('" + name + "') outside a tag");
             return this;
         }
-        this.sb.append(" ").append(name);
+        this.sb.appendByte(32).append(name);
         return this;
     }
 
@@ -294,9 +344,11 @@ export class HtmlBuilder {
             this.fail("close() with no open element");
             return this;
         }
-        let tag = this.stack[this.stack.len - 1];
-        this.stack.pop();
-        this.sb.append("</").append(tag).append(">");
+        // pop() returns the element, so this is one operation rather than an
+        // index followed by a discard — which is one retain/release pair per
+        // element closed.
+        let tag = this.stack.pop();
+        this.sb.appendByte(60).appendByte(47).append(tag).appendByte(62);  // '</' '>'
         return this;
     }
 
