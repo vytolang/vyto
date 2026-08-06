@@ -17,6 +17,7 @@
 extern "C" {
     fn sb_new(cap: i64): rawptr;
     fn sb_append(h: rawptr, s: cstring, n: i64);
+    fn sb_append_slice(h: rawptr, s: cstring, lo: i64, hi: i64);
     fn sb_append_i64(h: rawptr, v: i64);
     fn sb_append_f64(h: rawptr, v: f64);
     fn sb_append_byte(h: rawptr, b: i32);
@@ -37,6 +38,23 @@ export class StringBuilder {
 
     // Each append returns the receiver, so calls chain fluently.
     fn append(s: string): StringBuilder { sb_append(this.h, s.cstr(), s.len as i64); return this; }
+
+    // Append the byte range [lo, hi) of `s` without materialising it. The
+    // alternative -- `sb.append(s.slice(lo, hi))` -- allocates a string per
+    // call, which is the difference between a template engine or a parser
+    // costing one memcpy per chunk and costing an allocation per chunk.
+    //
+    // Bounds are clamped rather than checked, matching byte_comp: a miscomputed
+    // offset appends nothing instead of panicking or reading past the buffer.
+    fn appendSlice(s: string, lo: int, hi: int): StringBuilder {
+        let a = lo;
+        let b = hi;
+        if (a < 0) { a = 0; }
+        if (b > s.len) { b = s.len; }
+        if (b <= a) { return this; }
+        sb_append_slice(this.h, s.cstr(), a as i64, b as i64);
+        return this;
+    }
     fn appendInt(v: int): StringBuilder { sb_append_i64(this.h, v as i64); return this; }
     fn appendFloat(v: float): StringBuilder { sb_append_f64(this.h, v); return this; }
     fn appendByte(b: int): StringBuilder { sb_append_byte(this.h, b as i32); return this; }

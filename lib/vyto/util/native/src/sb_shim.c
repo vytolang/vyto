@@ -51,6 +51,15 @@ void sb_append(void *h, const char *s, long n) {
     b->buf[b->len] = 0;
 }
 
+/* Append the byte range [lo, hi) of `s`. The offset has to happen here because
+   Vyto has no pointer arithmetic on cstring, and without it appending part of a
+   string means slicing it first -- an allocation per chunk. Bounds are the
+   caller's to validate against the source length; hi <= lo is a no-op. */
+void sb_append_slice(void *h, const char *s, long lo, long hi) {
+    if (!h || !s || hi <= lo) return;
+    sb_append(h, s + lo, hi - lo);
+}
+
 void sb_append_i64(void *h, long long v) {
     if (!h) return;
     char tmp[32];
