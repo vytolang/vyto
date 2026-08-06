@@ -3,7 +3,7 @@
 A native HN reader: a feed with six tabs, a story screen with its full comment
 tree, links opened in the browser, pull-to-refresh, pagination and a working
 system Back key. Roughly 1000 lines of Vyto, no Java in the app itself, no
-Gradle, no Kotlin, no AndroidX. It builds to a 1.9 MB apk.
+Gradle, no Kotlin, no AndroidX. It builds to a 1.6 MB apk.
 
 It runs on a real device — verified on a Redmi Note 9S (Android 12, arm64-v8a).
 Screens are drawn by `vyto/ui` through `android.graphics.Canvas`; nothing here
@@ -37,6 +37,11 @@ sh apps/hn_android/build-apk.sh       # -> apps/hn_android/build/hn.apk
 Toolchains are found at `$ANDROID_NDK_HOME` / `$ANDROID_SDK_HOME`, falling back
 to `~/Android/Ndk` and `~/Android/Sdk`. Developed against NDK r27d. The script
 builds and verifies; it installs nothing.
+
+Step 2 passes `--release`, which is not optional for something that ships:
+`vytoc` compiles at `-O0` without it, so the apk would carry an unoptimized
+`.so` (1.9 MB against 1.6 MB here). It also keys the object cache separately,
+so a release build never reuses a debug build's objects.
 
 ```sh
 adb install -r apps/hn_android/build/hn.apk

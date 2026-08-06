@@ -71,8 +71,12 @@ grep -q '<queries>' "$BUILD/AndroidManifest.xml" \
 echo "ok  $(wc -l < "$BUILD/AndroidManifest.xml") lines"
 
 # --- 2. native ------------------------------------------------------------
-step "2  native (.so for android-arm64)"
-so=$(./vytoc build "$APP/$LIBNAME.vt" --target android-arm64 --shared --cc "$CC" | tail -1)
+# --release is not optional for something that ships: without it vytoc compiles
+# at -O0 (src/main.c), so the apk would carry an unoptimized .so. It also keys
+# the object cache differently (_rel), so this never reuses a debug build's
+# objects.
+step "2  native (.so for android-arm64, release)"
+so=$(./vytoc build "$APP/$LIBNAME.vt" --release --target android-arm64 --shared --cc "$CC" | tail -1)
 [ -f "$so" ] || die "no .so produced"
 cp "$so" "$BUILD/apk/lib/$ABI/lib$LIBNAME.so"
 echo "ok  $(du -h "$so" | cut -f1)  $so"
