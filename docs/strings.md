@@ -49,6 +49,44 @@ No import needed. `s` is the receiver throughout.
 | `s.last_index_of(sub)` | `int` | Last byte offset, or `-1`. |
 | `s.count(sub)` | `int` | **Non-overlapping**: `"aaa".count("aa") == 1`. Empty `sub` → `0`. |
 
+### Comparing and ordering
+
+`==` and `!=` compare strings by value. **There is no `<` on strings** — `a < b`
+is a type error, not a byte comparison. Ordering comes from `byte_comp`:
+
+```vyto
+byte_comp(a, alo, ahi, b, blo, bhi): int
+```
+
+It compares the byte ranges `a[alo, ahi)` and `b[blo, bhi)` lexicographically and
+returns a negative number, `0`, or a positive one. A prefix sorts before the
+string that extends it (`"fig"` before `"figs"`). Offsets are **clamped**, not
+checked — out-of-range or inverted bounds give a defined answer rather than a
+panic or an out-of-buffer read.
+
+For whole strings, reach for the wrapper instead of spelling out the bounds:
+
+```vyto
+import { str_cmp } from "vyto/util/sort";
+
+names.sort((a, b) => str_cmp(a, b));      // the way to sort a string[]
+```
+
+The range form earns its keep when the text you are comparing already lives
+inside a larger buffer. Slicing it out first would allocate two strings *per
+comparison* — and a sort makes `n log n` of them — whereas `byte_comp` reads the
+bytes where they are:
+
+```vyto
+// names held as (offset, len) into one big response buffer
+idx.sort((x, y) => byte_comp(raw, off[x], off[x] + len[x],
+                             raw, off[y], off[y] + len[y]));
+```
+
+Case-insensitive comparison is a different question: `text.equals_ignore_case`
+for ASCII, `unicode.foldCase` or a `Collator` for real text (§7, §9). `byte_comp`
+is bytes, so `"Z"` sorts before `"a"` and `"é"` sorts by its UTF-8 encoding.
+
 ### Slicing and shaping
 
 | Method | Returns | Notes |
@@ -165,7 +203,7 @@ Pure Vyto over the builtins, plus the native `StringBuilder`.
 | `center(s, width, fill)` | Pad both sides; extra padding goes right. |
 | `is_blank(s)` | Empty or whitespace-only. |
 | `equals_ignore_case(a, b)` | ASCII case-insensitive equality. |
-| `index_of_from(s, sub, at)` | First index at or after `at`, or `-1`. (`from` is a keyword.) |
+| `index_of_from(s, sub, at)` | First index at or after `at`, or `-1`. (`from` is a keyword.) **Copies the tail** — it is `s.slice(at, s.len).index_of(sub)`, so on a large `s` this allocates the remainder of the string on every call. Scan bytes yourself over big buffers. |
 | `chr(code)` / `ord(s, i)` | See §4. |
 | `stringBuilder(cap)` | See §3. |
 
@@ -432,6 +470,9 @@ Use `foldCase` or a `Collator` for case-insensitive comparison of real text;
 | Split into before/match/after | `re.partition(s)` |
 | Count characters for display | `unicode.graphemes(s).len` — **not** `s.len` |
 | Truncate for display | slice on a `graphemes` boundary, never on a byte index |
+| Order two strings | `sort.str_cmp(a, b)` — there is no `<` on strings |
+| Sort a `string[]` | `xs.sort((a, b) => str_cmp(a, b))` |
+| Order two ranges inside a buffer | `byte_comp(buf, alo, ahi, buf, blo, bhi)` — no allocation |
 | Case-insensitive compare, ASCII | `text.equals_ignore_case` |
 | Case-insensitive compare, real text | `unicode.foldCase` or a `Collator` |
 | Parse a number you trust | `s.to_int()` |

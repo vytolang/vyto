@@ -983,6 +983,97 @@ VtArray *vt_arr_new(int32_t elem_size, bool elem_ref) {
     return a;
 }
 
+/* Stable merge sort over an array's raw elements, with a caller-supplied
+   comparator. Bottom-up so there is no recursion, and stable because a merge
+   takes from the left run whenever the two compare equal.
+
+   This replaces an inline insertion sort that was emitted per call site. That
+   sort was stable and correct, and O(n^2): sorting a million-row column with it
+   is tens of seconds. Stability is a documented property of `arr.sort`, so the
+   fix is merge sort rather than quicksort — the promise is kept and the
+   complexity is not.
+
+   Falls back to insertion sort if the scratch buffer cannot be had, so sorting
+   never fails for want of memory; it only gets slow. */
+void vt_arr_msort(VtArray *a, VtCmpFn cmp, void *env) {
+    if (!a || a->len < 2) return;
+    int64_t n = a->len;
+    int32_t es = a->elem_size;
+    char *base = a->data;
+
+    char *buf = vt_host_alloc((size_t)n * (size_t)es);
+    if (!buf) {
+        for (int64_t i = 1; i < n; i++) {
+            int64_t j = i - 1;
+            while (j >= 0 && cmp(env, base + j * es, base + i * es) > 0) j--;
+            j++;
+            if (j != i) {
+                /* rotate element i down to j, one element at a time: no scratch
+                   is available, which is why we are on this path at all */
+                for (int64_t k = i; k > j; k--) {
+                    for (int32_t b = 0; b < es; b++) {
+                        char t = base[k * es + b];
+                        base[k * es + b] = base[(k - 1) * es + b];
+                        base[(k - 1) * es + b] = t;
+                    }
+                }
+            }
+        }
+        return;
+    }
+
+    char *from = base, *to = buf;
+    for (int64_t w = 1; w < n; w *= 2) {
+        for (int64_t lo = 0; lo < n; lo += 2 * w) {
+            int64_t mid = lo + w, hi = lo + 2 * w;
+            if (mid > n) mid = n;
+            if (hi > n) hi = n;
+            int64_t i = lo, j = mid, k = lo;
+            while (i < mid && j < hi) {
+                /* take the RIGHT run only when it is strictly smaller: ties go
+                   left, which is what makes this stable */
+                if (cmp(env, from + j * es, from + i * es) < 0)
+                    memcpy(to + k++ * es, from + j++ * es, (size_t)es);
+                else
+                    memcpy(to + k++ * es, from + i++ * es, (size_t)es);
+            }
+            while (i < mid) memcpy(to + k++ * es, from + i++ * es, (size_t)es);
+            while (j < hi)  memcpy(to + k++ * es, from + j++ * es, (size_t)es);
+        }
+        char *t = from; from = to; to = t;
+    }
+    if (from != base) memcpy(base, from, (size_t)n * (size_t)es);
+    vt_host_free(buf);
+}
+
+/* Lexicographic comparison of two byte ranges, in place. memcmp over the common
+   prefix, then the shorter range first.
+
+   Without this, comparing two substrings means materialising both — two
+   allocations per comparison, which in a sort is two per comparison times
+   n log n. Ranges are clamped rather than trusted: a caller that computes an
+   offset wrongly gets a defined answer, not a read outside the buffer. */
+int64_t vt_byte_comp(VtString *a, int64_t alo, int64_t ahi,
+                     VtString *b, int64_t blo, int64_t bhi) {
+    int64_t an = a ? a->len : 0, bn = b ? b->len : 0;
+    if (alo < 0) alo = 0;
+    if (blo < 0) blo = 0;
+    if (ahi > an) ahi = an;
+    if (bhi > bn) bhi = bn;
+    if (ahi < alo) ahi = alo;
+    if (bhi < blo) bhi = blo;
+
+    int64_t la = ahi - alo, lb = bhi - blo;
+    int64_t m = la < lb ? la : lb;
+    if (m > 0) {
+        int r = memcmp(a->data + alo, b->data + blo, (size_t)m);
+        if (r) return r < 0 ? -1 : 1;
+    }
+    if (la < lb) return -1;
+    if (la > lb) return 1;
+    return 0;
+}
+
 VtArray *vt_arr_bytes(int64_t n) {
     VtArray *a = vt_arr_new(1, false);
     if (n < 0) n = 0;

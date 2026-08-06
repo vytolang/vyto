@@ -139,6 +139,7 @@ typedef enum BuiltinKind {
     B_WRITEFILE,    /* writefile(path, data): bool */
     B_APPENDFILE,   /* appendfile(path, data): bool */
     B_BYTES,        /* bytes(n): byte[] — zeroed, sized buffer for FFI */
+    B_BYTE_COMP,    /* byte_comp(a, alo, ahi, b, blo, bhi): int — lexicographic, no alloc */
     B_STRBYTES,     /* strbytes(b, n): string — first n bytes of a byte[] (no strlen) */
     B_ARGS,         /* args(): string[] — command-line arguments (excl. program name) */
     /* int methods */

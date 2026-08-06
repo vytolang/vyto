@@ -1304,7 +1304,8 @@ static Type *check_call(Ctx *c, Expr *e, Type *expected) {
         if (e->arg_names) {
             static const char *positional_builtins[] = {
                 "print", "panic", "str", "cthunk", "cthunk_last", "readfile", "readlines",
-                "listdir", "isdir", "writefile", "appendfile", "bytes", "args", NULL};
+                "listdir", "isdir", "writefile", "appendfile", "bytes", "args",
+                "byte_comp", NULL};
             for (int i = 0; positional_builtins[i]; i++)
                 if (n == intern(positional_builtins[i]))
                     fatal_at(e->loc, "named arguments are not supported on builtin calls");
@@ -1390,6 +1391,27 @@ static Type *check_call(Ctx *c, Expr *e, Type *expected) {
             e->ref = REF_BUILTIN;
             e->builtin = n == intern("writefile") ? B_WRITEFILE : B_APPENDFILE;
             return e->type = ty_bool();
+        }
+        /* byte_comp(a, alo, ahi, b, blo, bhi): compare two byte ranges
+           lexicographically without materialising either. Vyto has no ordering
+           operator on strings at all, so this is also the only way to sort
+           them; and inside a sort, slicing to compare would allocate twice per
+           comparison. Ranges are half-open [lo, hi) and clamped at runtime. */
+        if (n == intern("byte_comp")) {
+            if (e->nargs != 6)
+                fatal_at(e->loc, "byte_comp takes 6 arguments (a, alo, ahi, b, blo, bhi)");
+            check_expr(c, e->args[0], ty_string());
+            want(c, e->args[0], ty_string(), "byte_comp haystack");
+            check_expr(c, e->args[3], ty_string());
+            want(c, e->args[3], ty_string(), "byte_comp haystack");
+            static const int off_args[4] = {1, 2, 4, 5};
+            for (int i = 0; i < 4; i++) {
+                check_expr(c, e->args[off_args[i]], ty_int());
+                want(c, e->args[off_args[i]], ty_int(), "byte_comp offset");
+            }
+            e->ref = REF_BUILTIN;
+            e->builtin = B_BYTE_COMP;
+            return e->type = ty_int();
         }
         if (n == intern("bytes")) {
             if (e->nargs != 1) fatal_at(e->loc, "bytes takes 1 argument");

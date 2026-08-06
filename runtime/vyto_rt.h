@@ -178,6 +178,16 @@ typedef struct VtArray {
                        view. Mirrors VtClosure.env below. */
 } VtArray;
 
+/* Comparator for vt_arr_msort: <0 if x sorts before y, 0 if equal, >0 after. */
+typedef int64_t (*VtCmpFn)(void *env, const void *x, const void *y);
+
+/* Stable O(n log n) sort of an array's elements in place. */
+void vt_arr_msort(VtArray *a, VtCmpFn cmp, void *env);
+
+/* Lexicographic comparison of two byte ranges without materialising them. */
+int64_t vt_byte_comp(VtString *a, int64_t alo, int64_t ahi,
+                     VtString *b, int64_t blo, int64_t bhi);
+
 VtArray *vt_arr_new(int32_t elem_size, bool elem_ref);
 VtArray *vt_arr_bytes(int64_t n); /* zeroed byte buffer, len = n */
 

@@ -492,25 +492,20 @@ static char *emit_hof(Em *em, Expr *e, Expr *recv, bool *fresh) {
         return arena_printf(&g_arena, "__vt_hof%d(%s, %s)", id, rv, ex_b(em, fn));
     }
     case B_ARR_SORT:
-        /* stable insertion sort: O(n^2) worst case, chosen over shell/qsort so
-           equal-comparing elements keep their order; fine at UI-scale lengths */
+        /* Stable O(n log n), via vt_arr_msort in the runtime. This used to be an
+           inline insertion sort — stable and correct, but O(n^2), which made
+           `arr.sort` unusable past a few thousand elements. The comparator is
+           wrapped in a shim that types the two raw element pointers, so the
+           runtime stays generic over elem_size. */
         sb_printf(ax,
+            "static int64_t __vt_cmp%d(void* env, const void* x, const void* y) {\n"
+            "    VtClosure* f = (VtClosure*)env;\n"
+            "    return (int64_t)((%s)f->fn)(f->env, *(%s*)x, *(%s*)y);\n"
+            "}\n"
             "static void __vt_hof%d(VtArray* src, VtClosure* f) {\n"
-            "    int32_t es = src->elem_size;\n"
-            "    for (int64_t i = 1; i < src->len; i++) {\n"
-            "        char tmp[es];\n"
-            "        memcpy(tmp, src->data + i*es, (size_t)es);\n"
-            "        %s key = *(%s*)tmp;\n"
-            "        int64_t j = i - 1;\n"
-            "        while (j >= 0) {\n"
-            "            %s ej = *(%s*)(src->data + j*es);\n"
-            "            if (((%s)f->fn)(f->env, ej, key) <= 0) break;\n"
-            "            memcpy(src->data + (j+1)*es, src->data + j*es, (size_t)es);\n"
-            "            j--;\n"
-            "        }\n"
-            "        memcpy(src->data + (j+1)*es, tmp, (size_t)es);\n"
-            "    }\n}\n",
-            id, T, T, T, T, sig);
+            "    vt_arr_msort(src, __vt_cmp%d, f);\n"
+            "}\n",
+            id, sig, T, T, id, id);
         *fresh = false;
         return arena_printf(&g_arena, "__vt_hof%d(%s, %s)", id, rv, ex_b(em, fn));
     default:
@@ -631,6 +626,11 @@ static char *emit_call(Em *em, Expr *e, bool *fresh) {
         case B_ISDIR:
             *fresh = false;
             return arena_printf(&g_arena, "vt_is_dir(%s)", ex_b(em, a[0]));
+        case B_BYTE_COMP:
+            *fresh = false;
+            return arena_printf(&g_arena, "vt_byte_comp(%s, %s, %s, %s, %s, %s)",
+                                ex_b(em, a[0]), ex_b(em, a[1]), ex_b(em, a[2]),
+                                ex_b(em, a[3]), ex_b(em, a[4]), ex_b(em, a[5]));
         case B_WRITEFILE:
         case B_APPENDFILE:
             *fresh = false;
