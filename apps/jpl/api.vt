@@ -1,0 +1,482 @@
+// api — a column store over NASA/JPL's Small-Body Database.
+//
+// The SBDB Query API returns every known asteroid in ONE response, as an
+// array-of-arrays with the keys hoisted out:
+//
+//   {"fields":["full_name","a","e",...],
+//    "data":[["     1 Ceres (A801 AA)","2.766","0.0797",...], ...],
+//    "count":1554215}
+//
+// That is already struct-of-arrays on the wire, and it is why this app exists.
+// At 9 fields it is ~1.55 million rows and ~130 MB.
+//
+// ── WHY NOT json_parse ───────────────────────────────────────────────────────
+// A JsonValue DOM over that document would allocate ~14 million nodes — five
+// values plus a row array, 1.55M times over. json.vt's own header warns about
+// exactly this ("~2.7 GB vs ~0.3 GB when parsing a million-object document").
+// So this file hand-scans the bytes into typed columns, which is CLAUDE.md's
+// rule for bulk data taken literally:
+//
+//   • one contiguous buffer per column; a cell is one indexed load
+//   • names are (offset, len) into the ORIGINAL response text, which stays
+//     alive — zero copy, no string per row
+//   • `class` is dictionary-encoded to a small int, since there are ~12 values
+//     across 1.55M rows
+//   • sort and filter never touch the columns; they permute an idx array
+//
+// Numbers go through `to_float_at(lo, hi)`, which parses a byte range in place
+// without allocating the substring first.
+//
+// The response is cached to disk, because JPL generates it at ~150 KB/s and a
+// full pull takes about a quarter of an hour. It is fetched once, ever.
+
+import { http_get } from "vyto/net/http";
+import { file_exists, file_size, file_mkdirs, path_dirname } from "vyto/io/file";
+
+const SBDB: string = "https://ssd-api.jpl.nasa.gov/sbdb_query.api";
+
+// Request order. The response echoes its own `fields`, which is parsed and
+// mapped rather than assumed — if JPL reorders them this still lands correctly.
+const FIELDS: string = "full_name,a,e,i,H,diameter,class,neo,pha";
+
+export const COL_NAME: int = 0;
+export const COL_A: int = 1;      // semi-major axis, AU
+export const COL_E: int = 2;      // eccentricity
+export const COL_I: int = 3;      // inclination, degrees
+export const COL_H: int = 4;      // absolute magnitude (smaller = bigger)
+export const COL_DIAM: int = 5;   // km, often absent
+export const COL_CLASS: int = 6;
+export const COL_NEO: int = 7;
+export const COL_PHA: int = 8;
+const NCOL: int = 9;
+
+export const FLAG_NEO: int = 1;
+export const FLAG_PHA: int = 2;
+
+// Absent numeric cell. Real values are never this, and it sorts to one end.
+export const NONE: float = -1.0e30;
+
+export class Belt {
+    // The whole response, kept alive: every name is a view into it.
+    raw: string;
+
+    name_off: int[];
+    name_len: int[];
+    a: float[];
+    e: float[];
+    inc: float[];
+    h: float[];
+    diam: float[];
+    cls: int[];         // index into cls_names
+    flags: int[];       // FLAG_NEO | FLAG_PHA
+
+    cls_names: string[];
+    n: int;
+    total: int;         // what JPL says exists, whether or not we asked for it all
+    bytes: int;
+    parse_ms: int;
+    err: string;
+
+    fn init() {
+        this.raw = "";
+        this.name_off = [];
+        this.name_len = [];
+        this.a = [];
+        this.e = [];
+        this.inc = [];
+        this.h = [];
+        this.diam = [];
+        this.cls = [];
+        this.flags = [];
+        this.cls_names = [];
+        this.n = 0;
+        this.total = 0;
+        this.bytes = 0;
+        this.parse_ms = 0;
+        this.err = "";
+    }
+
+    fn name_at(i: int): string {
+        return this.raw.slice(this.name_off[i], this.name_off[i] + this.name_len[i]);
+    }
+
+    fn class_at(i: int): string {
+        let c = this.cls[i];
+        if (c < 0 || c >= this.cls_names.len) { return ""; }
+        return this.cls_names[c];
+    }
+
+    fn is_neo(i: int): bool { return (this.flags[i] & FLAG_NEO) != 0; }
+    fn is_pha(i: int): bool { return (this.flags[i] & FLAG_PHA) != 0; }
+
+    // Dictionary lookup for `class`. Linear, but the dictionary holds about a
+    // dozen entries for the whole belt, so it never grows past a cache line's
+    // worth of comparisons.
+    fn class_code(s: string): int {
+        for (let i in 0..this.cls_names.len) {
+            if (this.cls_names[i] == s) { return i; }
+        }
+        this.cls_names.push(s);
+        return this.cls_names.len - 1;
+    }
+
+    fn col_float(col: int, i: int): float {
+        if (col == COL_A) { return this.a[i]; }
+        if (col == COL_E) { return this.e[i]; }
+        if (col == COL_I) { return this.inc[i]; }
+        if (col == COL_H) { return this.h[i]; }
+        if (col == COL_DIAM) { return this.diam[i]; }
+        return 0.0;
+    }
+}
+
+// ── scanning ─────────────────────────────────────────────────────────────────
+
+fn is_space(c: int): bool { return c == 32 || c == 9 || c == 10 || c == 13; }
+
+// Find a byte from an offset. Deliberately NOT vyto/util/text's index_of_from,
+// which is `s.slice(start, s.len).index_of(sub)` — that copies the whole tail of
+// the string, which on a 130 MB response is a 130 MB allocation per call.
+fn find_ch(s: string, at: int, ch: int): int {
+    let p = at;
+    if (p < 0) { p = 0; }
+    while (p < s.len) {
+        if (s[p] == ch) { return p; }
+        p += 1;
+    }
+    return -1;
+}
+
+fn skip_ws(s: string, i: int): int {
+    let p = i;
+    while (p < s.len && is_space(s[p])) { p += 1; }
+    return p;
+}
+
+// Parse the `"fields":[...]` header so column order comes from the response
+// rather than from an assumption about it.
+fn read_fields(s: string, names: string[]): int {
+    let key = s.index_of("\"fields\"");
+    if (key < 0) { return -1; }
+    let p = find_ch(s, key, 91);              // '['
+    if (p < 0) { return -1; }
+    p += 1;
+    while (p < s.len) {
+        p = skip_ws(s, p);
+        if (p >= s.len) { return -1; }
+        let c = s[p];
+        if (c == 93) { return p + 1; }        // ']'
+        if (c == 44) { p += 1; continue; }    // ','
+        if (c != 34) { return -1; }           // '"'
+        let lo = p + 1;
+        let q = lo;
+        while (q < s.len && s[q] != 34) { q += 1; }
+        names.push(s.slice(lo, q));
+        p = q + 1;
+    }
+    return -1;
+}
+
+export fn load_belt(text: string): Belt {
+    let b = new Belt();
+    b.raw = text;
+    b.bytes = text.len;
+
+    let names: string[] = [];
+    if (read_fields(text, names) < 0) {
+        b.err = "could not read the fields header";
+        return b;
+    }
+
+    // Map response column -> our column id. An unrequested field maps to -1 and
+    // is skipped without disturbing anything.
+    let map: int[] = [];
+    for (let i in 0..names.len) {
+        let f = names[i];
+        if (f == "full_name") { map.push(COL_NAME); }
+        else if (f == "a") { map.push(COL_A); }
+        else if (f == "e") { map.push(COL_E); }
+        else if (f == "i") { map.push(COL_I); }
+        else if (f == "H") { map.push(COL_H); }
+        else if (f == "diameter") { map.push(COL_DIAM); }
+        else if (f == "class") { map.push(COL_CLASS); }
+        else if (f == "neo") { map.push(COL_NEO); }
+        else if (f == "pha") { map.push(COL_PHA); }
+        else { map.push(-1); }
+    }
+
+    let dkey = text.index_of("\"data\"");
+    if (dkey < 0) { b.err = "no data array in the response"; return b; }
+    let p = find_ch(text, dkey, 91);         // '['
+    if (p < 0) { b.err = "malformed data array"; return b; }
+    p += 1;
+
+    let ncols = names.len;
+    while (p < text.len) {
+        p = skip_ws(text, p);
+        if (p >= text.len) { break; }
+        let c = text[p];
+        if (c == 93) { break; }                // ']' — end of data
+        if (c == 44) { p += 1; continue; }     // ',' between rows
+        if (c != 91) { break; }                // expected '[' to open a row
+        p += 1;
+
+        // One row. Columns absent from this response simply never get written,
+        // so the arrays are appended to in lockstep below.
+        let nm_off = 0;
+        let nm_len = 0;
+        let va = NONE;
+        let ve = NONE;
+        let vi = NONE;
+        let vh = NONE;
+        let vd = NONE;
+        let vc = -1;
+        let vf = 0;
+
+        let col = 0;
+        while (p < text.len && col < ncols) {
+            p = skip_ws(text, p);
+            if (p >= text.len) { break; }
+            let ch = text[p];
+            if (ch == 93) { break; }           // ']' ends the row early
+            if (ch == 44) { p += 1; continue; }
+
+            let lo = -1;
+            let hi = -1;
+            if (ch == 34) {                    // '"' — a quoted value
+                lo = p + 1;
+                let q = lo;
+                while (q < text.len) {
+                    let qc = text[q];
+                    if (qc == 92) { q += 2; continue; }   // '\' escape
+                    if (qc == 34) { break; }
+                    q += 1;
+                }
+                hi = q;
+                p = q + 1;
+            } else {                            // null, or a bare number
+                lo = p;
+                let q = p;
+                while (q < text.len && text[q] != 44 && text[q] != 93) { q += 1; }
+                hi = q;
+                p = q;
+                if (hi > lo && text[lo] == 110) { lo = -1; }   // 'n' of null
+            }
+
+            let target = map[col];
+            if (lo >= 0 && hi > lo) {
+                if (target == COL_NAME) { nm_off = lo; nm_len = hi - lo; }
+                else if (target == COL_A) { va = text.to_float_at(lo, hi); }
+                else if (target == COL_E) { ve = text.to_float_at(lo, hi); }
+                else if (target == COL_I) { vi = text.to_float_at(lo, hi); }
+                else if (target == COL_H) { vh = text.to_float_at(lo, hi); }
+                else if (target == COL_DIAM) { vd = text.to_float_at(lo, hi); }
+                else if (target == COL_CLASS) { vc = b.class_code(text.slice(lo, hi)); }
+                else if (target == COL_NEO) {
+                    if (text[lo] == 89) { vf = vf | FLAG_NEO; }        // 'Y'
+                } else if (target == COL_PHA) {
+                    if (text[lo] == 89) { vf = vf | FLAG_PHA; }
+                }
+            }
+            col += 1;
+        }
+
+        // Step past the row's closing ']'.
+        while (p < text.len && text[p] != 93) { p += 1; }
+        if (p < text.len) { p += 1; }
+
+        b.name_off.push(nm_off);
+        b.name_len.push(nm_len);
+        b.a.push(va);
+        b.e.push(ve);
+        b.inc.push(vi);
+        b.h.push(vh);
+        b.diam.push(vd);
+        b.cls.push(vc);
+        b.flags.push(vf);
+        b.n += 1;
+    }
+
+    let ck = text.index_of("\"count\"");
+    if (ck >= 0) {
+        let q = ck + 7;
+        while (q < text.len && (text[q] == 58 || is_space(text[q]))) { q += 1; }
+        let lo = q;
+        while (q < text.len && text[q] >= 48 && text[q] <= 57) { q += 1; }
+        if (q > lo) { b.total = text.to_float_at(lo, q) as int; }
+    }
+    if (b.total == 0) { b.total = b.n; }
+    return b;
+}
+
+// ── fetching ─────────────────────────────────────────────────────────────────
+
+// Where the downloaded response lives between runs. JPL serves this at roughly
+// 150 KB/s, so a full pull is a quarter of an hour and must happen exactly once.
+export fn cache_path(dir: string, limit: int): string {
+    if (limit <= 0) { return dir + "/sbdb-full.json"; }
+    return dir + "/sbdb-" + limit + ".json";
+}
+
+export fn fetch_sbdb(dir: string, limit: int): string {
+    let path = cache_path(dir, limit);
+    if (file_exists(path) && file_size(path) > 1024) {
+        return readfile(path);
+    }
+
+    let r = http_get(SBDB).query("fields", FIELDS).query("sb-kind", "a");
+    if (limit > 0) { r.query("limit", str(limit)); }
+    // Generous: the full set genuinely takes many minutes to generate.
+    let resp = r.timeoutMs(30 * 60 * 1000).send();
+    if (!resp.ok()) { return ""; }
+
+    let body = resp.text();
+    if (body.len < 1024) { return ""; }
+
+    file_mkdirs(path_dirname(path));
+    writefile(path, body);
+    return body;
+}
+
+// ── select and sort ──────────────────────────────────────────────────────────
+
+export class Filter {
+    cls: string;      // "" = any class
+    amin: float;      // NONE = unset
+    amax: float;
+    hmax: float;
+    neo: bool;
+    pha: bool;
+
+    fn init() {
+        this.cls = "";
+        this.amin = NONE;
+        this.amax = NONE;
+        this.hmax = NONE;
+        this.neo = false;
+        this.pha = false;
+    }
+
+    fn any(): bool {
+        return this.cls.len > 0 || this.amin > NONE || this.amax > NONE
+            || this.hmax > NONE || this.neo || this.pha;
+    }
+}
+
+// Compare two rows by name, reading bytes straight out of the response buffer.
+// Materialising the two strings to compare them would allocate twice per
+// comparison — about 60 million allocations for a full sort.
+fn cmp_name(b: Belt, x: int, y: int): int {
+    let xo = b.name_off[x];
+    let yo = b.name_off[y];
+    let n = b.name_len[x];
+    if (b.name_len[y] < n) { n = b.name_len[y]; }
+    for (let k in 0..n) {
+        let cx = b.raw[xo + k];
+        let cy = b.raw[yo + k];
+        if (cx < cy) { return -1; }
+        if (cx > cy) { return 1; }
+    }
+    if (b.name_len[x] < b.name_len[y]) { return -1; }
+    if (b.name_len[x] > b.name_len[y]) { return 1; }
+    return 0;
+}
+
+// The sort core used to live here: a hand-rolled three-way quicksort, written
+// because `arr.sort` was an O(n^2) insertion sort and `vyto/util/sort` was the
+// same. Both are now a stable merge sort in the runtime (vt_arr_msort), and
+// name comparison is the `byte_comp` builtin, so all of it is deleted.
+
+export fn select_rows(b: Belt, f: Filter): int[] {
+    let idx: int[] = [];
+    let want_cls = -1;
+    if (f.cls.len > 0) {
+        for (let i in 0..b.cls_names.len) {
+            if (b.cls_names[i] == f.cls) { want_cls = i; }
+        }
+        if (want_cls < 0) { return idx; }     // no such class: empty result
+    }
+
+    for (let i in 0..b.n) {
+        if (want_cls >= 0 && b.cls[i] != want_cls) { continue; }
+        if (f.neo && (b.flags[i] & FLAG_NEO) == 0) { continue; }
+        if (f.pha && (b.flags[i] & FLAG_PHA) == 0) { continue; }
+        if (f.amin > NONE) {
+            if (b.a[i] <= NONE || b.a[i] < f.amin) { continue; }
+        }
+        if (f.amax > NONE) {
+            if (b.a[i] <= NONE || b.a[i] > f.amax) { continue; }
+        }
+        if (f.hmax > NONE) {
+            if (b.h[i] <= NONE || b.h[i] > f.hmax) { continue; }
+        }
+        idx.push(i);
+    }
+    return idx;
+}
+
+// Rows with no value for the sort column go to the back and stay there, in both
+// directions — "missing" is not "smallest". Half the catalogue has no H, and
+// sorting ascending by H otherwise buries Ceres and Vesta under 700,000 rows
+// that simply have not been measured.
+//
+// Partitioning them out first is also what keeps the sort fast: it removes the
+// largest run of equal keys before the sort ever sees it.
+export fn sort_rows(b: Belt, idx: int[], col: int, desc: bool): int {
+    if (idx.len < 2) { return idx.len; }
+
+    if (col == COL_NAME) {
+        // Hoisted into locals so the closure captures three arrays once rather
+        // than reaching through `b` on every comparison.
+        let raw = b.raw;
+        let off = b.name_off;
+        let ln = b.name_len;
+        if (desc) {
+            idx.sort((x, y) => byte_comp(raw, off[y], off[y] + ln[y],
+                                         raw, off[x], off[x] + ln[x]));
+        } else {
+            idx.sort((x, y) => byte_comp(raw, off[x], off[x] + ln[x],
+                                         raw, off[y], off[y] + ln[y]));
+        }
+        return idx.len;
+    }
+
+    let vals = b.a;
+    if (col == COL_E) { vals = b.e; }
+    else if (col == COL_I) { vals = b.inc; }
+    else if (col == COL_H) { vals = b.h; }
+    else if (col == COL_DIAM) { vals = b.diam; }
+
+    // Rows with no value for this column sort last in BOTH directions —
+    // "missing" is not "smallest". Half the catalogue has no H, and sorting
+    // ascending by H otherwise buries Ceres under 700,000 unmeasured rows.
+    //
+    // They are split out rather than handled in the comparator because the
+    // builtin sort has no range form: sorting only the present rows means
+    // handing it an array of only those.
+    let present: int[] = [];
+    let absent: int[] = [];
+    for (let k in 0..idx.len) {
+        let r = idx[k];
+        if (vals[r] > NONE) { present.push(r); } else { absent.push(r); }
+    }
+
+    if (desc) {
+        present.sort((x, y) => {
+            if (vals[x] < vals[y]) { return 1; }
+            if (vals[x] > vals[y]) { return -1; }
+            return 0;
+        });
+    } else {
+        present.sort((x, y) => {
+            if (vals[x] < vals[y]) { return -1; }
+            if (vals[x] > vals[y]) { return 1; }
+            return 0;
+        });
+    }
+
+    let w = present.len;
+    for (let k in 0..present.len) { idx[k] = present[k]; }
+    for (let k in 0..absent.len) { idx[w + k] = absent[k]; }
+    return w;
+}

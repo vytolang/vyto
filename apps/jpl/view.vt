@@ -1,0 +1,428 @@
+// view — all HTML for apps/jpl.
+//
+// Two visualisations, both of which need the whole 1.55M-row set to mean
+// anything:
+//
+//   • the semi-major-axis histogram draws the KIRKWOOD GAPS — the holes Jupiter
+//     clears at its 4:1, 3:1, 5:2, 7:3 and 2:1 mean-motion resonances. They are
+//     invisible in a sample and unmistakable in the full belt.
+//   • the a-vs-e scatter is a DENSITY RASTER, not 1.55M <circle> elements. One
+//     <rect> per occupied grid cell, opacity by count: ~10,000 elements instead
+//     of 1,550,000, and the structure reads better for it.
+//
+// Nothing here is user-supplied except the query parameters, but names come
+// from JPL and go through html_escape anyway.
+
+import { Belt, NONE, COL_NAME, COL_A, COL_E, COL_I, COL_H, COL_DIAM } from "api";
+import { StringBuilder, stringBuilder } from "vyto/util/text";
+import { html_escape, html_escape_attr } from "vyto/util/html";
+import { fixed, commas } from "vyto/util/fmt";
+
+export const PER_PAGE: int = 50;
+
+const HIST_W: int = 900;
+const HIST_H: int = 260;
+const HIST_LO: float = 1.7;      // AU — inside the inner belt edge
+const HIST_HI: float = 5.5;      // AU — past the Hildas and Trojans
+const HIST_BINS: int = 380;      // 0.01 AU per bin, fine enough to resolve 5:2
+
+const SCAT_W: int = 900;
+const SCAT_H: int = 420;
+const SCAT_COLS: int = 300;
+const SCAT_ROWS: int = 140;
+
+export class Page {
+    status: int;
+    body: string;
+
+    fn init(status: int, body: string) {
+        this.status = status;
+        this.body = body;
+    }
+}
+
+fn num(v: float, prec: int): string {
+    if (v <= NONE) { return "—"; }
+    return fixed(v, prec);
+}
+
+// ── chrome ───────────────────────────────────────────────────────────────────
+
+fn head(sb: StringBuilder, title: string) {
+    sb.append("<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">");
+    sb.append("<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">");
+    sb.append("<title>").append(html_escape(title)).append("</title>");
+    sb.append("<link rel=\"stylesheet\" href=\"/style.css\"></head><body>");
+    sb.append("<nav><a class=\"brand\" href=\"/\">SBDB</a>");
+    sb.append("<a href=\"/\">belt</a><a href=\"/gaps\">kirkwood gaps</a>");
+    sb.append("<a href=\"/scatter\">a vs e</a>");
+    sb.append("<span class=\"src\">NASA/JPL Small-Body Database</span></nav><main>");
+}
+
+fn footer(sb: StringBuilder, belt: Belt, note: string) {
+    sb.append("</main><footer>");
+    sb.append(commas(belt.n)).append(" of ").append(commas(belt.total));
+    sb.append(" known asteroids &middot; ").append(commas(belt.bytes));
+    sb.append(" bytes scanned into columns in ").appendInt(belt.parse_ms).append(" ms");
+    if (note.len > 0) { sb.append(" &middot; ").append(note); }
+    sb.append(" &middot; served by <code>vyto/net/server</code>");
+    sb.append("</footer></body></html>\n");
+}
+
+export fn error_page(belt: Belt, status: int, title: string, detail: string): Page {
+    let sb = stringBuilder(1024);
+    head(sb, title);
+    sb.append("<h1>").append(html_escape(title)).append("</h1>");
+    sb.append("<p class=\"err\">").append(html_escape(detail)).append("</p>");
+    sb.append("<p><a href=\"/\">back to the belt</a></p>");
+    footer(sb, belt, "");
+    return new Page(status, sb.toString());
+}
+
+// ── Kirkwood gaps ────────────────────────────────────────────────────────────
+
+// Jupiter's mean-motion resonances, where an asteroid gets a repeated kick at
+// the same orbital phase until it leaves. Labelled on the chart so the holes are
+// identifiable rather than merely visible.
+fn resonance_a(k: int): float {
+    if (k == 0) { return 2.065; }   // 4:1
+    if (k == 1) { return 2.502; }   // 3:1
+    if (k == 2) { return 2.825; }   // 5:2
+    if (k == 3) { return 2.958; }   // 7:3
+    if (k == 4) { return 3.279; }   // 2:1
+    return 3.972;                   // 5:3 / outer edge region
+}
+
+fn resonance_label(k: int): string {
+    if (k == 0) { return "4:1"; }
+    if (k == 1) { return "3:1"; }
+    if (k == 2) { return "5:2"; }
+    if (k == 3) { return "7:3"; }
+    if (k == 4) { return "2:1"; }
+    return "";
+}
+
+export fn bin_semi_major(belt: Belt, bins: int[]) {
+    let span = HIST_HI - HIST_LO;
+    for (let i in 0..belt.n) {
+        let v = belt.a[i];
+        if (v <= NONE) { continue; }
+        if (v < HIST_LO || v >= HIST_HI) { continue; }
+        let b = ((v - HIST_LO) / span * (HIST_BINS as float)) as int;
+        if (b < 0) { b = 0; }
+        if (b >= HIST_BINS) { b = HIST_BINS - 1; }
+        bins[b] += 1;
+    }
+}
+
+fn gaps_chart(sb: StringBuilder, belt: Belt) {
+    let bins: int[] = [];
+    for (let i in 0..HIST_BINS) { bins.push(0); }
+    bin_semi_major(belt, bins);
+
+    let peak = 1;
+    for (let c in bins) { if (c > peak) { peak = c; } }
+
+    let bw = HIST_W / HIST_BINS;
+    if (bw < 1) { bw = 1; }
+
+    sb.append("<svg class=\"chart\" viewBox=\"0 0 ").appendInt(HIST_W).append(" ");
+    sb.appendInt(HIST_H + 34).append("\" role=\"img\" aria-label=\"asteroid count by semi-major axis\">");
+
+    // Resonance markers first, so the bars sit on top of them.
+    for (let k in 0..5) {
+        let ra = resonance_a(k);
+        let x = ((ra - HIST_LO) / (HIST_HI - HIST_LO) * (HIST_W as float)) as int;
+        sb.append("<line class=\"res\" x1=\"").appendInt(x).append("\" y1=\"0\" x2=\"");
+        sb.appendInt(x).append("\" y2=\"").appendInt(HIST_H).append("\"/>");
+        sb.append("<text class=\"reslab\" x=\"").appendInt(x + 3).append("\" y=\"12\">");
+        sb.append(resonance_label(k)).append("</text>");
+    }
+
+    for (let i in 0..HIST_BINS) {
+        if (bins[i] == 0) { continue; }
+        let h = bins[i] * HIST_H / peak;
+        if (h < 1) { h = 1; }
+        let x = i * HIST_W / HIST_BINS;
+        sb.append("<rect x=\"").appendInt(x).append("\" y=\"").appendInt(HIST_H - h);
+        sb.append("\" width=\"").appendInt(bw).append("\" height=\"").appendInt(h).append("\">");
+        sb.append("<title>a = ").append(fixed(HIST_LO + (i as float) * (HIST_HI - HIST_LO)
+                                              / (HIST_BINS as float), 3));
+        sb.append(" AU: ").appendInt(bins[i]).append("</title></rect>");
+    }
+
+    // Axis: one label per 0.5 AU.
+    let t = 2;
+    while (t <= 10) {
+        let av = (t as float) / 2.0;
+        if (av >= HIST_LO && av <= HIST_HI) {
+            let x = ((av - HIST_LO) / (HIST_HI - HIST_LO) * (HIST_W as float)) as int;
+            sb.append("<text x=\"").appendInt(x).append("\" y=\"").appendInt(HIST_H + 16);
+            sb.append("\" text-anchor=\"middle\">").append(fixed(av, 1)).append("</text>");
+        }
+        t += 1;
+    }
+    sb.append("<text x=\"").appendInt(HIST_W / 2).append("\" y=\"").appendInt(HIST_H + 31);
+    sb.append("\" text-anchor=\"middle\" class=\"axis\">semi-major axis (AU)</text>");
+    sb.append("</svg>");
+}
+
+export fn render_gaps(belt: Belt): Page {
+    let sb = stringBuilder(262144);
+    head(sb, "Kirkwood gaps");
+    sb.append("<h1>Kirkwood gaps</h1>");
+    sb.append("<p class=\"lede\">Asteroid count by semi-major axis, ");
+    sb.append(commas(belt.n)).append(" bodies binned into ").appendInt(HIST_BINS);
+    sb.append(" bins of 0.01 AU. The vertical lines are Jupiter's mean-motion ");
+    sb.append("resonances: an asteroid there gets the same gravitational kick at ");
+    sb.append("the same point in every orbit until it is driven out. The holes are ");
+    sb.append("not a sampling artefact &mdash; they are empty sky.</p>");
+    gaps_chart(sb, belt);
+    footer(sb, belt, "histogram computed over every row on each request");
+    return new Page(200, sb.toString());
+}
+
+// ── a vs e density raster ────────────────────────────────────────────────────
+
+fn render_scatter_svg(sb: StringBuilder, belt: Belt) {
+    let cells: int[] = [];
+    for (let i in 0..(SCAT_COLS * SCAT_ROWS)) { cells.push(0); }
+
+    let span = HIST_HI - HIST_LO;
+    let plotted = 0;
+    for (let i in 0..belt.n) {
+        let av = belt.a[i];
+        let ev = belt.e[i];
+        if (av <= NONE || ev <= NONE) { continue; }
+        if (av < HIST_LO || av >= HIST_HI) { continue; }
+        if (ev < 0.0 || ev >= 1.0) { continue; }
+        let cx = ((av - HIST_LO) / span * (SCAT_COLS as float)) as int;
+        let cy = ((1.0 - ev) * (SCAT_ROWS as float)) as int;
+        if (cx < 0 || cx >= SCAT_COLS || cy < 0 || cy >= SCAT_ROWS) { continue; }
+        cells[cy * SCAT_COLS + cx] += 1;
+        plotted += 1;
+    }
+
+    let peak = 1;
+    for (let c in cells) { if (c > peak) { peak = c; } }
+
+    let cw = SCAT_W / SCAT_COLS;
+    let chh = SCAT_H / SCAT_ROWS;
+    if (cw < 1) { cw = 1; }
+    if (chh < 1) { chh = 1; }
+
+    sb.append("<svg class=\"chart\" viewBox=\"0 0 ").appendInt(SCAT_W).append(" ");
+    sb.appendInt(SCAT_H + 34).append("\" role=\"img\" aria-label=\"eccentricity against semi-major axis\">");
+    sb.append("<rect class=\"plotbg\" x=\"0\" y=\"0\" width=\"").appendInt(SCAT_W);
+    sb.append("\" height=\"").appendInt(SCAT_H).append("\"/>");
+
+    for (let k in 0..5) {
+        let ra = resonance_a(k);
+        let x = ((ra - HIST_LO) / span * (SCAT_W as float)) as int;
+        sb.append("<line class=\"res\" x1=\"").appendInt(x).append("\" y1=\"0\" x2=\"");
+        sb.appendInt(x).append("\" y2=\"").appendInt(SCAT_H).append("\"/>");
+    }
+
+    // One rect per occupied cell. Opacity is bucketed to 5 levels so the markup
+    // stays small and the quantisation is honest about density.
+    let drawn = 0;
+    for (let r in 0..SCAT_ROWS) {
+        for (let c in 0..SCAT_COLS) {
+            let v = cells[r * SCAT_COLS + c];
+            if (v == 0) { continue; }
+            let lvl = 1;
+            if (v * 40 > peak) { lvl = 2; }
+            if (v * 12 > peak) { lvl = 3; }
+            if (v * 4 > peak) { lvl = 4; }
+            if (v * 2 > peak) { lvl = 5; }
+            sb.append("<rect class=\"d").appendInt(lvl).append("\" x=\"").appendInt(c * cw);
+            sb.append("\" y=\"").appendInt(r * chh).append("\" width=\"").appendInt(cw);
+            sb.append("\" height=\"").appendInt(chh).append("\"/>");
+            drawn += 1;
+        }
+    }
+
+    let t = 2;
+    while (t <= 10) {
+        let av = (t as float) / 2.0;
+        if (av >= HIST_LO && av <= HIST_HI) {
+            let x = ((av - HIST_LO) / span * (SCAT_W as float)) as int;
+            sb.append("<text x=\"").appendInt(x).append("\" y=\"").appendInt(SCAT_H + 16);
+            sb.append("\" text-anchor=\"middle\">").append(fixed(av, 1)).append("</text>");
+        }
+        t += 1;
+    }
+    sb.append("<text x=\"").appendInt(SCAT_W / 2).append("\" y=\"").appendInt(SCAT_H + 31);
+    sb.append("\" text-anchor=\"middle\" class=\"axis\">semi-major axis (AU) &mdash; vertical: eccentricity 1 at top, 0 at bottom</text>");
+    sb.append("</svg>");
+    sb.append("<p class=\"dim\">").append(commas(plotted)).append(" bodies rasterised into ");
+    sb.append(commas(drawn)).append(" cells of a ").appendInt(SCAT_COLS).append("&times;");
+    sb.appendInt(SCAT_ROWS).append(" grid. Drawing one element per body would be ");
+    sb.append(commas(plotted)).append(" of them.</p>");
+}
+
+export fn render_scatter(belt: Belt): Page {
+    let sb = stringBuilder(524288);
+    head(sb, "a vs e");
+    sb.append("<h1>Eccentricity against semi-major axis</h1>");
+    sb.append("<p class=\"lede\">Every asteroid as a density cell. The resonance ");
+    sb.append("lines cut vertical channels; the population above them at high ");
+    sb.append("eccentricity is what resonance scattering throws out of the belt.</p>");
+    render_scatter_svg(sb, belt);
+    footer(sb, belt, "raster recomputed over every row on each request");
+    return new Page(200, sb.toString());
+}
+
+// ── the table ────────────────────────────────────────────────────────────────
+
+fn col_name(col: int): string {
+    if (col == COL_A) { return "a (AU)"; }
+    if (col == COL_E) { return "e"; }
+    if (col == COL_I) { return "i (deg)"; }
+    if (col == COL_H) { return "H"; }
+    if (col == COL_DIAM) { return "diameter (km)"; }
+    return "name";
+}
+
+fn sort_link(sb: StringBuilder, col: int, cur: int, desc: bool, qs: string) {
+    let want_desc = true;
+    if (col == cur && desc) { want_desc = false; }
+    sb.append("<th><a href=\"/?sort=").appendInt(col);
+    if (want_desc) { sb.append("&dir=desc"); } else { sb.append("&dir=asc"); }
+    sb.append(qs).append("\">").append(col_name(col));
+    if (col == cur) {
+        if (desc) { sb.append(" &darr;"); } else { sb.append(" &uarr;"); }
+    }
+    sb.append("</a></th>");
+}
+
+export fn render_belt(belt: Belt, idx: int[], sort_col: int, desc: bool,
+                      page: int, filt_qs: string, filt_note: string,
+                      sort_ms: int): Page {
+    let sb = stringBuilder(131072);
+    head(sb, "the belt");
+
+    sb.append("<h1>").append(commas(idx.len)).append(" asteroids</h1>");
+    sb.append("<div class=\"meta\">");
+    if (filt_note.len > 0) { sb.append(html_escape(filt_note)).append(" &middot; "); }
+    sb.append("sorted by ").append(col_name(sort_col));
+    if (desc) { sb.append(" descending"); } else { sb.append(" ascending"); }
+    sb.append(" in ").appendInt(sort_ms).append(" ms</div>");
+
+    sb.append("<form class=\"q\" action=\"/\" method=\"get\">");
+    sb.append("<input type=\"hidden\" name=\"sort\" value=\"").appendInt(sort_col).append("\">");
+    sb.append("<input type=\"hidden\" name=\"dir\" value=\"");
+    if (desc) { sb.append("desc"); } else { sb.append("asc"); }
+    sb.append("\">");
+    sb.append("<label>class <input name=\"class\" size=\"5\" placeholder=\"MBA\"></label>");
+    sb.append("<label>a &ge; <input name=\"amin\" size=\"5\"></label>");
+    sb.append("<label>a &le; <input name=\"amax\" size=\"5\"></label>");
+    sb.append("<label>H &le; <input name=\"hmax\" size=\"5\"></label>");
+    sb.append("<label><input type=\"checkbox\" name=\"neo\" value=\"1\"> NEO</label>");
+    sb.append("<label><input type=\"checkbox\" name=\"pha\" value=\"1\"> hazardous</label>");
+    sb.append("<button>filter</button> <a class=\"clear\" href=\"/\">clear</a></form>");
+
+    let lo = (page - 1) * PER_PAGE;
+    if (lo < 0) { lo = 0; }
+    let hi = lo + PER_PAGE;
+    if (hi > idx.len) { hi = idx.len; }
+
+    sb.append("<table><thead><tr><th>#</th>");
+    sort_link(sb, COL_NAME, sort_col, desc, filt_qs);
+    sort_link(sb, COL_A, sort_col, desc, filt_qs);
+    sort_link(sb, COL_E, sort_col, desc, filt_qs);
+    sort_link(sb, COL_I, sort_col, desc, filt_qs);
+    sort_link(sb, COL_H, sort_col, desc, filt_qs);
+    sort_link(sb, COL_DIAM, sort_col, desc, filt_qs);
+    sb.append("<th>class</th></tr></thead><tbody>");
+
+    for (let k in lo..hi) {
+        let i = idx[k];
+        sb.append("<tr><td class=\"n dim\">").appendInt(k + 1).append("</td>");
+        sb.append("<td class=\"nm\">").append(html_escape(belt.name_at(i)));
+        if (belt.is_pha(i)) { sb.append(" <span class=\"pha\">PHA</span>"); }
+        else if (belt.is_neo(i)) { sb.append(" <span class=\"neo\">NEO</span>"); }
+        sb.append("</td>");
+        sb.append("<td class=\"n\">").append(num(belt.a[i], 3)).append("</td>");
+        sb.append("<td class=\"n\">").append(num(belt.e[i], 4)).append("</td>");
+        sb.append("<td class=\"n\">").append(num(belt.inc[i], 2)).append("</td>");
+        sb.append("<td class=\"n\">").append(num(belt.h[i], 2)).append("</td>");
+        sb.append("<td class=\"n\">").append(num(belt.diam[i], 1)).append("</td>");
+        sb.append("<td class=\"cls\">").append(html_escape(belt.class_at(i))).append("</td></tr>");
+    }
+    sb.append("</tbody></table>");
+
+    let last = (idx.len + PER_PAGE - 1) / PER_PAGE;
+    if (last < 1) { last = 1; }
+    let base = "/?sort=" + sort_col;
+    if (desc) { base = base + "&dir=desc"; } else { base = base + "&dir=asc"; }
+    base = base + filt_qs + "&p=";
+
+    sb.append("<div class=\"pager\">");
+    if (page > 1) { sb.append("<a href=\"").append(base).appendInt(page - 1).append("\">&larr; prev</a>"); }
+    sb.append("<span>page ").append(commas(page)).append(" of ").append(commas(last)).append("</span>");
+    if (page < last) { sb.append("<a href=\"").append(base).appendInt(page + 1).append("\">next &rarr;</a>"); }
+    sb.append("</div>");
+
+    footer(sb, belt, "names are (offset,len) views into the response, never copied");
+    return new Page(200, sb.toString());
+}
+
+// ── style ────────────────────────────────────────────────────────────────────
+
+export fn css(): string {
+    return ":root{--bg:#0b0d12;--fg:#e6e8ee;--dim:#858b99;--acc:#f0b429;--line:#1c2029;"
+         + "--card:#11141b;--plot:#080a0e}\n"
+         + "@media (prefers-color-scheme:light){:root{--bg:#fbfbf8;--fg:#1b1c20;--dim:#6b7080;"
+         + "--acc:#a86a00;--line:#e4e4dd;--card:#fff;--plot:#f2f2ec}}\n"
+         + "*{box-sizing:border-box}\n"
+         + "body{margin:0;background:var(--bg);color:var(--fg);"
+         + "font:15px/1.5 -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif}\n"
+         + "nav{display:flex;gap:.8rem;align-items:center;padding:.6rem 1rem;background:var(--card);"
+         + "border-bottom:1px solid var(--line);position:sticky;top:0;z-index:2;flex-wrap:wrap}\n"
+         + "nav a{color:var(--fg);text-decoration:none;font-size:13px}\n"
+         + "nav a:hover{color:var(--acc);text-decoration:underline}\n"
+         + "nav a.brand{font-weight:700;color:#000;background:var(--acc);padding:.1rem .45rem;border-radius:3px}\n"
+         + "nav .src{margin-left:auto;color:var(--dim);font-size:11.5px}\n"
+         + "main{max-width:62rem;margin:0 auto;padding:1.1rem 1rem 2rem}\n"
+         + "h1{font-size:21px;margin:0 0 .3rem}\n"
+         + ".lede{color:var(--dim);font-size:13.5px;max-width:46rem}\n"
+         + ".meta{color:var(--dim);font-size:12.5px;margin-bottom:.8rem}\n"
+         + ".dim{color:var(--dim)}\n"
+         + "svg.chart{width:100%;height:auto;display:block;margin:1rem 0;background:var(--plot);"
+         + "border:1px solid var(--line);border-radius:6px}\n"
+         + "svg.chart rect{fill:var(--acc)}\n"
+         + "svg.chart .plotbg{fill:var(--plot)}\n"
+         + "svg.chart .res{stroke:#e0533d;stroke-width:1;stroke-dasharray:3 3;opacity:.75}\n"
+         + "svg.chart text{fill:var(--dim);font-size:10px}\n"
+         + "svg.chart .reslab{fill:#e0533d;font-size:9px}\n"
+         + "svg.chart .axis{font-size:11px}\n"
+         + "svg.chart rect.d1{fill:var(--acc);fill-opacity:.14}\n"
+         + "svg.chart rect.d2{fill:var(--acc);fill-opacity:.3}\n"
+         + "svg.chart rect.d3{fill:var(--acc);fill-opacity:.52}\n"
+         + "svg.chart rect.d4{fill:var(--acc);fill-opacity:.76}\n"
+         + "svg.chart rect.d5{fill:#fff3d0;fill-opacity:.95}\n"
+         + "form.q{display:flex;gap:.55rem;flex-wrap:wrap;align-items:center;margin:1rem 0;"
+         + "padding:.6rem;background:var(--card);border:1px solid var(--line);border-radius:6px;font-size:12.5px}\n"
+         + "form.q label{display:flex;gap:.3rem;align-items:center;color:var(--dim)}\n"
+         + "input,button{font:inherit;font-size:12.5px;padding:.2rem .4rem;border:1px solid var(--line);"
+         + "border-radius:4px;background:var(--bg);color:var(--fg)}\n"
+         + "button{cursor:pointer;background:var(--acc);color:#000;border-color:var(--acc);font-weight:600}\n"
+         + "a.clear{color:var(--dim);font-size:12px}\n"
+         + "table{width:100%;border-collapse:collapse;font-size:13px}\n"
+         + "th{text-align:left;border-bottom:1px solid var(--line);padding:.35rem .5rem;"
+         + "font-size:11.5px;text-transform:uppercase;letter-spacing:.03em}\n"
+         + "th a{color:var(--dim);text-decoration:none}\n"
+         + "th a:hover{color:var(--acc)}\n"
+         + "td{padding:.28rem .5rem;border-bottom:1px solid var(--line)}\n"
+         + "td.n{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}\n"
+         + "td.nm{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12.5px;white-space:pre}\n"
+         + "td.cls{color:var(--dim);font-size:12px}\n"
+         + ".neo{background:#1d4f6b;color:#cfe9ff;font-size:10px;padding:0 .25rem;border-radius:3px}\n"
+         + ".pha{background:#7a1f1f;color:#ffd7d7;font-size:10px;padding:0 .25rem;border-radius:3px}\n"
+         + ".pager{display:flex;gap:1rem;justify-content:center;align-items:center;"
+         + "margin-top:1.2rem;font-size:13px;color:var(--dim)}\n"
+         + ".err{color:#e0533d}\n"
+         + "footer{max-width:62rem;margin:0 auto;padding:.9rem 1rem;border-top:1px solid var(--line);"
+         + "color:var(--dim);font-size:11.5px}\n";
+}

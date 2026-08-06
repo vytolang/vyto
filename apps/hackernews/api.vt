@@ -1,0 +1,240 @@
+// api — the Hacker News client behind apps/hackernews.
+//
+// Talks to the Algolia HN Search API (https://hn.algolia.com/api/v1), which is
+// where the public HN data actually lives; the old Firebase endpoint is gone.
+// Two calls are all this app ever makes:
+//
+//     /search, /search_by_date  ->  30 fully-populated stories in one response
+//     /items/:id                ->  a story plus its ENTIRE comment tree, nested
+//
+// That is worth stating because it decides the whole design. An API that
+// returned bare ids would need one request per item and a parallel fetcher to
+// stay usable; this one needs neither, so the fetch layer is a single blocking
+// http_get per page view and nothing more.
+//
+// Everything is funnelled through `Store.cached`, which is the only place that
+// touches the network. Algolia rate-limits per IP (~10k requests/hour), and a
+// browsing session re-reads the same feed constantly, so the cache is not an
+// optimisation here — it is what keeps the app polite.
+
+import { http_get, Request } from "vyto/net/http";
+import { json_parse, JsonValue } from "vyto/util/json";
+import { LRU, lru_str_str } from "vyto/coll/lru";
+import { url_encode } from "vyto/util/url";
+import { unixSec } from "vyto/util/time";
+import { parse_int } from "vyto/cli";
+
+const HN_API: string = "https://hn.algolia.com/api/v1";
+
+export const PER_PAGE: int = 30;
+
+// Seconds. Feeds move; a story's comment tree and a user's karma do not.
+const TTL_FEED: int = 60;
+const TTL_ITEM: int = 300;
+const TTL_USER: int = 600;
+
+const WEEK: int = 7 * 24 * 3600;
+
+// One row of a feed listing. Only /search hits become an Item — the story page
+// walks the /items/:id JSON directly, since a comment tree is already the shape
+// the renderer wants and copying it into objects would double the memory to say
+// the same thing twice.
+export class Item {
+    id: int;
+    kind: string;        // "story" | "job" | "comment" | "poll"
+    by: string;
+    title: string;
+    url: string;         // "" for text posts (Ask HN, polls)
+    text: string;        // story_text: already HTML, escaped by HN itself
+    score: int;
+    comments: int;
+    time: int;           // unix seconds
+
+    // Job hits carry neither points nor num_comments, and asInt() cannot tell
+    // "absent" from "zero" — so ask the JSON, once, here.
+    has_score: bool;
+    has_comments: bool;
+
+    fn init() {
+        this.id = 0;
+        this.kind = "story";
+        this.by = "";
+        this.title = "";
+        this.url = "";
+        this.text = "";
+        this.score = 0;
+        this.comments = 0;
+        this.time = 0;
+        this.has_score = false;
+        this.has_comments = false;
+    }
+}
+
+// A page of a feed, plus enough to draw the pager. `err` is "" when fine.
+export class Feed {
+    items: Item[];
+    page: int;           // 1-based, as it appears in the URL
+    nb_pages: int;
+    err: string;
+
+    fn init() {
+        this.items = [];
+        this.page = 1;
+        this.nb_pages = 1;
+        this.err = "";
+    }
+}
+
+// A search hit. Note `objectID` is a *string* here while /items/:id calls the
+// same field `id` and makes it an int — the two endpoints genuinely disagree.
+fn item_from_hit(v: JsonValue): Item {
+    let it = new Item();
+
+    let out: int[] = [0];
+    let ok = parse_int(v.get("objectID").asString(), out);
+    if (ok) { it.id = out[0]; }
+
+    it.by = v.get("author").asString();
+    it.title = v.get("title").asString();
+    it.url = v.get("url").asString();
+    it.text = v.get("story_text").asString();
+    it.time = v.get("created_at_i").asInt();
+
+    it.has_score = v.has("points") && !v.get("points").isNull();
+    if (it.has_score) { it.score = v.get("points").asInt(); }
+
+    it.has_comments = v.has("num_comments") && !v.get("num_comments").isNull();
+    if (it.has_comments) { it.comments = v.get("num_comments").asInt(); }
+
+    it.kind = "story";
+    let tags = v.get("_tags");
+    for (let i in 0..tags.len()) {
+        if (tags.at(i).asString() == "job") { it.kind = "job"; }
+    }
+    return it;
+}
+
+export class Store {
+    cache: LRU<string, string>;
+
+    // Status of the most recent upstream call, so a caller can tell "no such
+    // story" (404) from "the network is down" (0) — both of which arrive here
+    // as an empty body. A cache hit reports 200.
+    last_status: int;
+
+    fn init() {
+        this.cache = lru_str_str(512);
+        this.last_status = 0;
+    }
+
+    // The only method in the app that reaches the network. Returns "" on any
+    // failure — transport, non-2xx, or a body we could not stamp.
+    //
+    // LRU has no TTL of its own, so the stored value is "<unix seconds>\n<body>"
+    // and the stamp is checked on the way out. Keying on `r.url` works because
+    // Request.query() percent-encodes into the URL as it goes, so the assembled
+    // URL is available before send() — which is also what makes it safe to pass
+    // `created_at_i>...` through unencoded.
+    fn cached(r: Request, ttl: int): string {
+        let key = r.url;
+        let hit = this.cache.get_or(key, "");
+        if (hit.len > 0) {
+            let nl = hit.index_of("\n");
+            if (nl > 0) {
+                let out: int[] = [0];
+                let ok = parse_int(hit.slice(0, nl), out);
+                if (ok) {
+                    let age = (unixSec() as int) - out[0];
+                    if (age < ttl) {
+                        this.last_status = 200;
+                        return hit.slice(nl + 1, hit.len);
+                    }
+                }
+            }
+        }
+
+        let resp = r.timeoutMs(15000).send();
+        this.last_status = resp.status();
+        if (!resp.ok()) { return ""; }
+        let body = resp.text();
+        if (body.len == 0) { return ""; }
+        this.cache.put(key, str(unixSec() as int) + "\n" + body);
+        return body;
+    }
+
+    // The feed table. /search ranks by points, so the bare story/ask_hn/show_hn
+    // tags return all-time greatest hits — the created_at window is what turns
+    // them back into a feed. /search_by_date is already chronological and needs
+    // no window.
+    //
+    // The window is rounded down to the hour on purpose: an unrounded "now - 7d"
+    // would put a new timestamp in the URL every second, and since the URL is the
+    // cache key, the cache would never hit once.
+    fn feedReq(name: string, page: int): Request {
+        let cut = ((unixSec() as int) - WEEK) / 3600 * 3600;
+        let r = http_get(HN_API + "/search");
+
+        if (name == "new") {
+            r = http_get(HN_API + "/search_by_date").query("tags", "story");
+        } else if (name == "jobs") {
+            r = http_get(HN_API + "/search_by_date").query("tags", "job");
+        } else if (name == "best") {
+            r = r.query("tags", "story").query("numericFilters", "created_at_i>" + cut);
+        } else if (name == "ask") {
+            r = r.query("tags", "ask_hn").query("numericFilters", "created_at_i>" + cut);
+        } else if (name == "show") {
+            r = r.query("tags", "show_hn").query("numericFilters", "created_at_i>" + cut);
+        } else {
+            r = r.query("tags", "front_page");   // "top"
+        }
+
+        r.query("hitsPerPage", str(PER_PAGE));
+        r.query("page", str(page - 1));          // the API counts from 0
+        return r;
+    }
+
+    fn feed(name: string, page: int): Feed {
+        let f = new Feed();
+        f.page = page;
+
+        let body = this.cached(this.feedReq(name, page), TTL_FEED);
+        if (body.len == 0) {
+            f.err = "hn.algolia.com did not answer (status " + this.last_status + ")";
+            return f;
+        }
+
+        let doc = json_parse(body);
+        if (doc.parseError().len > 0) {
+            f.err = "bad JSON from hn.algolia.com: " + doc.parseError();
+            return f;
+        }
+
+        f.nb_pages = doc.get("nbPages").asInt();
+        if (f.nb_pages < 1) { f.nb_pages = 1; }
+
+        let hits = doc.get("hits");
+        for (let i in 0..hits.len()) {
+            f.items.push(item_from_hit(hits.at(i)));
+        }
+        return f;
+    }
+
+    // The story with its whole comment tree, as raw JSON. null when upstream
+    // said no — check `last_status` for 404 vs everything else.
+    fn story(id: int): JsonValue {
+        let body = this.cached(http_get(HN_API + "/items/" + id), TTL_ITEM);
+        if (body.len == 0) { return null; }
+        let v = json_parse(body);
+        if (v.parseError().len > 0) { return null; }
+        return v;
+    }
+
+    // {"about", "karma", "username"} — that is the entire user endpoint.
+    fn user(name: string): JsonValue {
+        let body = this.cached(http_get(HN_API + "/users/" + url_encode(name)), TTL_USER);
+        if (body.len == 0) { return null; }
+        let v = json_parse(body);
+        if (v.parseError().len > 0) { return null; }
+        return v;
+    }
+}

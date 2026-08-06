@@ -1,0 +1,167 @@
+// openalex — a browser for the OpenAlex scholarly graph, served as plain HTML
+// by vyto/net/server.
+//
+//   vytoc run apps/openalex/openalex.vt            # http://127.0.0.1:8080
+//   vytoc run apps/openalex/openalex.vt -- 9000    # custom port
+//
+// OpenAlex indexes ~323 million works. Anonymous access needs no key and gets a
+// $0.10/day budget, which the footer of every page reports against.
+//
+// It is also the heavy-payload test for vyto/util/json. A browse call at
+// per-page=200 returns ~8 MB of deeply nested JSON for $0.0001, and the `lean`
+// checkbox swaps in a `select` so the identical query comes back as ~5 KB —
+// same rows, same cost, 1/300th the bytes. Toggling it separates parser cost
+// from network cost with nothing to install:
+//
+//   /works?filter=publication_year:2024&per=200            ~8 MB parsed
+//   /works?filter=publication_year:2024&per=200&lean=1     ~40 KB parsed
+//
+// See api.vt for the cost model and view.vt for the escaping rules.
+
+import { server, ServerRequest, ServerResponse } from "vyto/net/server";
+import { Store, valid_id, PER_PAGE } from "api";
+import { Page, render_browse, render_search, render_work, render_author,
+         render_institution, error_page, css } from "view";
+import { url_decode, url_decode_form } from "vyto/util/url";
+import { parse_int } from "vyto/cli";
+
+const MAX_PER: int = 200;
+
+// Most-cited works of all time — a landing page that costs a filter call, not
+// a search call.
+const DEFAULT_SORT: string = "cited_by_count:desc";
+
+// queryParam does NOT percent-decode, and these values carry colons and spaces
+// straight from a form ("publication_year:2024", "cited_by_count:desc"), so
+// decoding here is required rather than cosmetic. Form encoding turns a space
+// into '+', which is why this is url_decode_form and not url_decode.
+fn text_param(req: ServerRequest, name: string, dflt: string): string {
+    let raw = req.queryParam(name);
+    if (raw.len == 0) { return dflt; }
+    return url_decode_form(raw);
+}
+
+fn int_param(req: ServerRequest, name: string, dflt: int, lo: int, hi: int): int {
+    let raw = req.queryParam(name);
+    if (raw.len == 0) { return dflt; }
+    let out: int[] = [0];
+    let ok = parse_int(url_decode(raw), out);
+    if (!ok) { return dflt; }
+    let v = out[0];
+    if (v < lo) { return lo; }
+    if (v > hi) { return hi; }
+    return v;
+}
+
+fn page_of(req: ServerRequest): int { return int_param(req, "p", 1, 1, 400); }
+fn per_of(req: ServerRequest): int { return int_param(req, "per", PER_PAGE, 1, MAX_PER); }
+fn lean_of(req: ServerRequest): bool { return req.queryParam("lean") == "1"; }
+
+// The server sets 405 when the path exists under another verb, and 404 when it
+// does not. Read it back rather than flattening both to 404.
+fn miss_page(store: Store, req: ServerRequest, status: int): Page {
+    if (status == 405) {
+        return error_page(store, 405, "method not allowed",
+                          req.method() + " is not allowed on " + req.path());
+    }
+    return error_page(store, 404, "not found", req.path() + " is not a page here");
+}
+
+// res.text()/res.html() append a Content-Type through header(), so pairing one
+// with an explicit header() would emit the field twice. Set the fields.
+fn send_css(res: ServerResponse) {
+    res.status = 200;
+    res.body_str = css();
+    res.header("Content-Type", "text/css; charset=utf-8");
+    res.header("Cache-Control", "max-age=3600");
+}
+
+fn main() {
+    let port = 8080;
+    let av = args();
+    if (av.len > 0) {
+        let out: int[] = [0];
+        let ok = parse_int(av[0], out);
+        if (!ok) { print("usage: openalex [port]"); return; }
+        port = out[0];
+    }
+
+    // One process, one cache. run() pre-forks a worker per core and workers
+    // share nothing, so each would keep a cold cache and spend the daily budget
+    // that many times over.
+    let store = new Store();
+
+    let s = server(port).fromEnv();
+    s.bindHost("127.0.0.1");
+    s.withHeader("Server", "vyto-openalex/0.1");
+    s.withHeader("X-Content-Type-Options", "nosniff");
+    s.withHeader("Referrer-Policy", "no-referrer");
+
+    s.get("/", (req, res) => { res.redirect(302, "/works?sort=" + DEFAULT_SORT); });
+
+    // Handler bodies stay one statement deep: Vyto v0.1 has no nested closures,
+    // so the work lives in view.vt's top-level functions.
+    s.get("/works", (req, res) => {
+        let p = render_browse(store, text_param(req, "filter", ""),
+                              text_param(req, "sort", DEFAULT_SORT),
+                              page_of(req), per_of(req), lean_of(req));
+        res.html(p.status, p.body);
+    });
+
+    s.get("/search", (req, res) => {
+        let p = render_search(store, text_param(req, "q", ""), page_of(req), per_of(req));
+        res.html(p.status, p.body);
+    });
+
+    // Ids go straight into an upstream URL, so they are validated rather than
+    // trusted — OpenAlex keys are alphanumeric and nothing else.
+    s.get("/work/:id", (req, res) => {
+        let id = req.param("id");
+        if (!valid_id(id)) {
+            let bad = error_page(store, 404, "no such work", "not an OpenAlex id");
+            res.html(bad.status, bad.body);
+        } else {
+            let p = render_work(store, id);
+            res.html(p.status, p.body);
+        }
+    });
+
+    s.get("/author/:id", (req, res) => {
+        let id = req.param("id");
+        if (!valid_id(id)) {
+            let bad = error_page(store, 404, "no such author", "not an OpenAlex id");
+            res.html(bad.status, bad.body);
+        } else {
+            let p = render_author(store, id);
+            res.html(p.status, p.body);
+        }
+    });
+
+    s.get("/institution/:id", (req, res) => {
+        let id = req.param("id");
+        if (!valid_id(id)) {
+            let bad = error_page(store, 404, "no such institution", "not an OpenAlex id");
+            res.html(bad.status, bad.body);
+        } else {
+            let p = render_institution(store, id);
+            res.html(p.status, p.body);
+        }
+    });
+
+    s.get("/style.css", (req, res) => { send_css(res); });
+
+    s.withNotFound((req, res) => {
+        let p = miss_page(store, req, res.status);
+        res.html(p.status, p.body);
+    });
+
+    // The instrument panel. Bytes-out and microseconds make the lean toggle's
+    // effect visible without any other tooling.
+    s.onRequest((req, status, bytes, us) => {
+        print(req.method() + " " + req.target() + " -> " + status
+              + "  " + bytes + "B  " + (us / 1000) + "ms");
+    });
+
+    print("openalex on http://127.0.0.1:" + port + "  (Ctrl-C to stop)");
+    s.runSingle();
+}

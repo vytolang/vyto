@@ -1,0 +1,133 @@
+// hackernews — a Hacker News reader served as plain HTML by vyto/net/server.
+//
+//   vytoc run apps/hackernews/hackernews.vt            # http://127.0.0.1:8080
+//   vytoc run apps/hackernews/hackernews.vt -- 9000    # custom port
+//
+// Then open http://127.0.0.1:8080 — feeds at /top /new /best /ask /show /jobs,
+// a story and its thread at /item/:id, a profile at /user/:name. No JavaScript,
+// no build step, no assets: the browser fetches one page and one stylesheet.
+//
+// Data comes from the Algolia HN Search API. See api.vt for why that shapes the
+// whole app (one upstream request per page view, cached).
+//
+// PORT, WORKERS, MAX_CONNS and BACKLOG are read from the environment by
+// fromEnv(); the positional argument wins over PORT only if PORT is unset,
+// since fromEnv() runs after it here.
+
+import { server, ServerRequest, ServerResponse } from "vyto/net/server";
+import { Store } from "api";
+import { Page, render_feed, render_item, render_user, error_page, css } from "view";
+import { parse_int } from "vyto/cli";
+
+const DEFAULT_DEPTH: int = 3;
+const MAX_DEPTH: int = 5;
+
+// queryParam returns "" for a missing key AND for a bare one, and does not
+// percent-decode. Both callers below want a small positive integer, so anything
+// else falls back rather than failing the request.
+fn int_param(req: ServerRequest, name: string, dflt: int, lo: int, hi: int): int {
+    let raw = req.queryParam(name);
+    if (raw.len == 0) { return dflt; }
+    let out: int[] = [0];
+    let ok = parse_int(raw, out);
+    if (!ok) { return dflt; }
+    let v = out[0];
+    if (v < lo) { return lo; }
+    if (v > hi) { return hi; }
+    return v;
+}
+
+fn page_of(req: ServerRequest): int { return int_param(req, "p", 1, 1, 1000); }
+fn depth_of(req: ServerRequest): int { return int_param(req, "d", DEFAULT_DEPTH, 0, MAX_DEPTH); }
+
+// The server distinguishes "no such path" (404) from "that path exists under
+// another verb" (405) and sets the status *before* handing over, so read it
+// back rather than hard-coding 404 and flattening the difference.
+fn miss_page(req: ServerRequest, status: int): Page {
+    if (status == 405) {
+        return error_page(405, "method not allowed",
+                          req.method() + " is not allowed on " + req.path());
+    }
+    return error_page(404, "not found", req.path() + " is not a page here");
+}
+
+// res.text()/res.html() *append* a Content-Type through header(), so calling
+// one of them and then header("Content-Type", ...) would emit the header twice.
+// Setting the fields directly is the way to serve a third type.
+fn send_css(res: ServerResponse) {
+    res.status = 200;
+    res.body_str = css();
+    res.header("Content-Type", "text/css; charset=utf-8");
+    res.header("Cache-Control", "max-age=3600");
+}
+
+fn main() {
+    let port = 8080;
+    let av = args();
+    if (av.len > 0) {
+        let out: int[] = [0];
+        let ok = parse_int(av[0], out);
+        if (!ok) { print("usage: hackernews [port]"); return; }
+        port = out[0];
+    }
+
+    // One process, one cache. run() would pre-fork a worker per core, and
+    // workers share nothing — each would keep its own cold cache and multiply
+    // the upstream traffic by the core count. This app waits on hn.algolia.com,
+    // not on the CPU, so there is nothing to parallelise.
+    let store = new Store();
+
+    let s = server(port).fromEnv();
+
+    // No TLS here, and the server's own README says it is not production-ready.
+    // Loopback only.
+    s.bindHost("127.0.0.1");
+    s.withHeader("Server", "vyto-hn/0.1");
+    s.withHeader("X-Content-Type-Options", "nosniff");
+    s.withHeader("Referrer-Policy", "no-referrer");
+
+    s.get("/", (req, res) => { res.redirect(302, "/top"); });
+
+    // Handler bodies are one statement deep on purpose: Vyto v0.1 has no nested
+    // closures, so all the real work lives in view.vt's top-level functions.
+    s.get("/top",  (req, res) => { let p = render_feed(store, "top",  page_of(req)); res.html(p.status, p.body); });
+    s.get("/new",  (req, res) => { let p = render_feed(store, "new",  page_of(req)); res.html(p.status, p.body); });
+    s.get("/best", (req, res) => { let p = render_feed(store, "best", page_of(req)); res.html(p.status, p.body); });
+    s.get("/ask",  (req, res) => { let p = render_feed(store, "ask",  page_of(req)); res.html(p.status, p.body); });
+    s.get("/show", (req, res) => { let p = render_feed(store, "show", page_of(req)); res.html(p.status, p.body); });
+    s.get("/jobs", (req, res) => { let p = render_feed(store, "jobs", page_of(req)); res.html(p.status, p.body); });
+
+    s.get("/item/:id", (req, res) => {
+        let id: int[] = [0];
+        let ok = parse_int(req.param("id"), id);
+        if (!ok) {
+            let bad = error_page(404, "no such item", "item ids are numbers");
+            res.html(bad.status, bad.body);
+        } else {
+            let p = render_item(store, id[0], depth_of(req));
+            res.html(p.status, p.body);
+        }
+    });
+
+    s.get("/user/:name", (req, res) => {
+        let p = render_user(store, req.param("name"));
+        res.html(p.status, p.body);
+    });
+
+    s.get("/style.css", (req, res) => { send_css(res); });
+
+    s.withNotFound((req, res) => {
+        let p = miss_page(req, res.status);
+        res.html(p.status, p.body);
+    });
+
+    // The access log. Also the only view onto the cache: a warm page answers in
+    // microseconds, a cold one waits on hn.algolia.com.
+    s.onRequest((req, status, bytes, us) => {
+        print(req.method() + " " + req.target() + " -> " + status
+              + "  " + bytes + "B  " + (us / 1000) + "ms");
+    });
+
+    print("hackernews on http://127.0.0.1:" + port + "  (Ctrl-C to stop)");
+    s.runSingle();
+}

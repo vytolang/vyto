@@ -1,0 +1,202 @@
+// jpl — a column store over every known asteroid, served as HTML by
+// vyto/net/server.
+//
+//   vytoc run apps/jpl/jpl.vt                        # 200,000 rows on :8080
+//   vytoc run apps/jpl/jpl.vt -- 9000                # custom port
+//   vytoc run apps/jpl/jpl.vt -- 8080 --limit 50000  # smaller, faster to fetch
+//   vytoc run apps/jpl/jpl.vt -- 8080 --full         # all 1,554,215 of them
+//
+// NASA/JPL's SBDB Query API hands back the whole small-body catalogue in one
+// response, as arrays-of-arrays with the field names hoisted out — struct-of-
+// arrays already, before we touch it. api.vt scans those bytes straight into
+// typed columns without ever building a JsonValue.
+//
+// ── THE SHAPE OF THIS APP IS DIFFERENT ───────────────────────────────────────
+// The other three API apps fetch per request and cache the response. This one
+// cannot: --full is ~130 MB that JPL generates at ~150 KB/s, a quarter of an
+// hour. So the catalogue is downloaded once to disk, parsed once at boot into
+// columns, and every request afterwards is pure computation over memory that is
+// already there — filter, sort, render. Nothing touches the network again.
+//
+// That is what makes the numbers in the footer worth reading: they are Vyto
+// sorting and scanning a million-row dataset, with no database and no I/O in
+// the measurement.
+
+import { server, ServerRequest, ServerResponse } from "vyto/net/server";
+import { Belt, Filter, load_belt, fetch_sbdb, select_rows, sort_rows,
+         cache_path, NONE, COL_NAME, COL_A, COL_E, COL_I, COL_H, COL_DIAM } from "api";
+import { Page, render_belt, render_gaps, render_scatter, error_page, css, PER_PAGE } from "view";
+import { url_decode, url_decode_form } from "vyto/util/url";
+import { monoMs } from "vyto/util/time";
+import { appDir } from "vyto/os";
+import { parse_int, parse_float } from "vyto/cli";
+
+const DEFAULT_LIMIT: int = 200000;
+
+fn int_param(req: ServerRequest, name: string, dflt: int, lo: int, hi: int): int {
+    let raw = req.queryParam(name);
+    if (raw.len == 0) { return dflt; }
+    let out: int[] = [0];
+    let ok = parse_int(url_decode(raw), out);
+    if (!ok) { return dflt; }
+    let v = out[0];
+    if (v < lo) { return lo; }
+    if (v > hi) { return hi; }
+    return v;
+}
+
+// NONE when absent or unparseable — 0 is a legitimate value for every one of
+// these fields, so it cannot double as "unset".
+fn float_param(req: ServerRequest, name: string): float {
+    let raw = req.queryParam(name);
+    if (raw.len == 0) { return NONE; }
+    let out: float[] = [0.0];
+    let ok = parse_float(url_decode_form(raw), out);
+    if (!ok) { return NONE; }
+    return out[0];
+}
+
+fn filter_of(req: ServerRequest): Filter {
+    let f = new Filter();
+    f.cls = url_decode_form(req.queryParam("class"));
+    f.amin = float_param(req, "amin");
+    f.amax = float_param(req, "amax");
+    f.hmax = float_param(req, "hmax");
+    f.neo = req.queryParam("neo") == "1";
+    f.pha = req.queryParam("pha") == "1";
+    return f;
+}
+
+// Rebuild the filter's own query string so paging and column sorting preserve
+// it without the handler having to thread every field through.
+fn filter_qs(f: Filter): string {
+    let s = "";
+    if (f.cls.len > 0) { s = s + "&class=" + f.cls; }
+    if (f.amin > NONE) { s = s + "&amin=" + f.amin; }
+    if (f.amax > NONE) { s = s + "&amax=" + f.amax; }
+    if (f.hmax > NONE) { s = s + "&hmax=" + f.hmax; }
+    if (f.neo) { s = s + "&neo=1"; }
+    if (f.pha) { s = s + "&pha=1"; }
+    return s;
+}
+
+fn filter_note(f: Filter): string {
+    if (!f.any()) { return ""; }
+    let s = "filtered";
+    if (f.cls.len > 0) { s = s + " class=" + f.cls; }
+    if (f.amin > NONE) { s = s + " a>=" + f.amin; }
+    if (f.amax > NONE) { s = s + " a<=" + f.amax; }
+    if (f.hmax > NONE) { s = s + " H<=" + f.hmax; }
+    if (f.neo) { s = s + " NEO"; }
+    if (f.pha) { s = s + " hazardous"; }
+    return s;
+}
+
+fn miss_page(belt: Belt, req: ServerRequest, status: int): Page {
+    if (status == 405) {
+        return error_page(belt, 405, "method not allowed",
+                          req.method() + " is not allowed on " + req.path());
+    }
+    return error_page(belt, 404, "not found", req.path() + " is not a page here");
+}
+
+fn send_css(res: ServerResponse) {
+    res.status = 200;
+    res.body_str = css();
+    res.header("Content-Type", "text/css; charset=utf-8");
+    res.header("Cache-Control", "max-age=3600");
+}
+
+// The whole request path for the table: select, sort, render. All three are
+// timed so the footer can report what a million-row operation actually costs.
+fn belt_page(belt: Belt, req: ServerRequest): Page {
+    let f = filter_of(req);
+    let col = int_param(req, "sort", COL_A, 0, 5);
+    let desc = req.queryParam("dir") == "desc";
+
+    let t0 = monoMs();
+    let idx = select_rows(belt, f);
+    sort_rows(belt, idx, col, desc);
+    let t1 = monoMs();
+
+    let page = int_param(req, "p", 1, 1, 1000000);
+    return render_belt(belt, idx, col, desc, page, filter_qs(f), filter_note(f),
+                       (t1 - t0) as int);
+}
+
+fn main() {
+    let port = 8080;
+    let limit = DEFAULT_LIMIT;
+
+    let av = args();
+    let i = 0;
+    while (i < av.len) {
+        let a = av[i];
+        if (a == "--full") {
+            limit = 0;
+        } else if (a == "--limit" && i + 1 < av.len) {
+            let out: int[] = [0];
+            let ok = parse_int(av[i + 1], out);
+            if (ok) { limit = out[0]; }
+            i += 1;
+        } else {
+            let out: int[] = [0];
+            let ok = parse_int(a, out);
+            if (ok) { port = out[0]; }
+        }
+        i += 1;
+    }
+
+    // NOT .vyto-cache: `make clean-cache` deletes every one of those in the
+    // tree, and this directory holds a 116 MB download that JPL serves at
+    // ~200 KB/s. Losing it costs ten minutes, so it lives somewhere whose
+    // documented purpose is not "safe to delete at any time".
+    let dir = appDir() + "/data";
+    let path = cache_path(dir, limit);
+    print("catalogue: " + path);
+
+    let t0 = monoMs();
+    let text = fetch_sbdb(dir, limit);
+    let t1 = monoMs();
+    if (text.len == 0) {
+        print("could not fetch the SBDB catalogue (network? disk?)");
+        return;
+    }
+    print("fetched/loaded " + text.len + " bytes in " + ((t1 - t0) as int) + " ms");
+
+    let t2 = monoMs();
+    let belt = load_belt(text);
+    let t3 = monoMs();
+    belt.parse_ms = (t3 - t2) as int;
+    if (belt.err.len > 0) {
+        print("parse failed: " + belt.err);
+        return;
+    }
+    print("scanned " + belt.n + " rows into columns in " + belt.parse_ms + " ms"
+          + "  (" + belt.cls_names.len + " orbit classes)");
+
+    let s = server(port).fromEnv();
+    s.bindHost("127.0.0.1");
+    s.withHeader("Server", "vyto-jpl/0.1");
+    s.withHeader("X-Content-Type-Options", "nosniff");
+    s.withHeader("Referrer-Policy", "no-referrer");
+
+    // Handlers stay one statement deep: Vyto v0.1 has no nested closures.
+    s.get("/", (req, res) => { let p = belt_page(belt, req); res.html(p.status, p.body); });
+    s.get("/gaps", (req, res) => { let p = render_gaps(belt); res.html(p.status, p.body); });
+    s.get("/scatter", (req, res) => { let p = render_scatter(belt); res.html(p.status, p.body); });
+    s.get("/style.css", (req, res) => { send_css(res); });
+
+    s.withNotFound((req, res) => {
+        let p = miss_page(belt, req, res.status);
+        res.html(p.status, p.body);
+    });
+
+    s.onRequest((req, status, bytes, us) => {
+        print(req.method() + " " + req.target() + " -> " + status
+              + "  " + bytes + "B  " + (us / 1000) + "ms");
+    });
+
+    print("jpl on http://127.0.0.1:" + port + "  (Ctrl-C to stop)");
+    s.runSingle();
+}

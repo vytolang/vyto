@@ -1,0 +1,305 @@
+// api — the USGS earthquake client behind apps/usgs.
+//
+// The USGS publishes GeoJSON summary feeds with no key, no rate limit and no
+// pagination: one static file per (magnitude band × time window), served from a
+// CDN. `all_month` is ~7.6 MB and ~13,000 quakes. Every field the app needs —
+// including everything a detail page shows — is already in that one document,
+// so a quake page costs no upstream call at all.
+//
+// ── WHY THIS APP SORTS ITSELF ────────────────────────────────────────────────
+// Vyto's two sorts are both insertion sort: `vyto/util/sort`'s `sort_by` says so
+// in its header, and the builtin `arr.sort(cmp)` is emitted as one too
+// (src/emit.c:494 — "O(n^2) worst case, chosen over shell/qsort so
+// equal-comparing elements keep their order; fine at UI-scale lengths").
+//
+// 13,000 quakes is not UI scale: n²/4 is ~42 million comparisons for one page
+// view. So sorting here is a quicksort over an `idx: int[]` permutation, which
+// is also the shape CLAUDE.md prescribes for bulk data — "sort and filter never
+// move column data; they permute an idx array that names the visible rows".
+// The quake objects never move.
+// ─────────────────────────────────────────────────────────────────────────────
+
+import { http_get, Request } from "vyto/net/http";
+import { json_parse, JsonValue } from "vyto/util/json";
+import { LRU, lru_str_str } from "vyto/coll/lru";
+import { unixSec } from "vyto/util/time";
+import { parse_int } from "vyto/cli";
+
+const USGS_BASE: string = "https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary";
+
+// The feeds refresh every minute or so; anything shorter just re-downloads.
+const TTL_FEED: int = 120;
+
+// Magnitude sentinel. USGS mags are genuinely negative for tiny events (-0.42
+// in a routine day), so 0 is a real value and cannot mean "absent".
+export const NO_MAG: float = -999.0;
+
+export const SORT_TIME: int = 0;
+export const SORT_MAG: int = 1;
+export const SORT_DEPTH: int = 2;
+export const SORT_SIG: int = 3;
+
+export class Quake {
+    id: string;
+    mag: float;          // NO_MAG when the feed omits it
+    place: string;
+    title: string;
+    time: int;           // milliseconds since the epoch, as USGS sends it
+    lon: float;
+    lat: float;
+    depth: float;        // km
+    sig: int;
+    tsunami: int;
+    felt: int;
+    magType: string;
+    kind: string;        // "earthquake", "quarry blast", "ice quake", ...
+    alert: string;
+    url: string;
+
+    fn init() {
+        this.id = "";
+        this.mag = NO_MAG;
+        this.place = "";
+        this.title = "";
+        this.time = 0;
+        this.lon = 0.0;
+        this.lat = 0.0;
+        this.depth = 0.0;
+        this.sig = 0;
+        this.tsunami = 0;
+        this.felt = 0;
+        this.magType = "";
+        this.kind = "";
+        this.alert = "";
+        this.url = "";
+    }
+}
+
+export class Feed {
+    quakes: Quake[];
+    title: string;
+    generated: int;      // ms
+    bytes: int;
+    err: string;
+
+    fn init() {
+        this.quakes = [];
+        this.title = "";
+        this.generated = 0;
+        this.bytes = 0;
+        this.err = "";
+    }
+}
+
+// The published feed matrix. Anything not on this list is refused rather than
+// pasted into an upstream URL.
+const FEED_NAMES: string = "all_hour,all_day,all_week,all_month,significant_hour,significant_day,significant_week,significant_month,4.5_day,4.5_week,4.5_month,2.5_day,2.5_week,2.5_month,1.0_day,1.0_week";
+
+export fn feed_names(): string[] { return FEED_NAMES.split(","); }
+
+export fn valid_feed(name: string): bool {
+    for (let n in feed_names()) { if (n == name) { return true; } }
+    return false;
+}
+
+// ── sorting ──────────────────────────────────────────────────────────────────
+
+// Compare two quakes by the chosen key. Returns <0, 0, >0. Kept as an int key
+// rather than a comparator closure so the hot loop makes no indirect call —
+// this runs ~180,000 times on a full month feed.
+fn cmp_key(a: Quake, b: Quake, key: int): int {
+    if (key == SORT_MAG) {
+        if (a.mag < b.mag) { return -1; }
+        if (a.mag > b.mag) { return 1; }
+        return 0;
+    }
+    if (key == SORT_DEPTH) {
+        if (a.depth < b.depth) { return -1; }
+        if (a.depth > b.depth) { return 1; }
+        return 0;
+    }
+    if (key == SORT_SIG) {
+        if (a.sig < b.sig) { return -1; }
+        if (a.sig > b.sig) { return 1; }
+        return 0;
+    }
+    if (a.time < b.time) { return -1; }
+    if (a.time > b.time) { return 1; }
+    return 0;
+}
+
+fn qsort_idx(qs: Quake[], idx: int[], lo: int, hi: int, key: int, desc: bool) {
+    // Small ranges finish faster under insertion sort than under more
+    // partitioning, and it keeps the recursion shallow.
+    if (hi - lo < 12) {
+        let i = lo + 1;
+        while (i <= hi) {
+            let v = idx[i];
+            let j = i - 1;
+            while (j >= lo) {
+                let c = cmp_key(qs[idx[j]], qs[v], key);
+                if (desc) { c = -c; }
+                if (c <= 0) { break; }
+                idx[j + 1] = idx[j];
+                j -= 1;
+            }
+            idx[j + 1] = v;
+            i += 1;
+        }
+        return;
+    }
+
+    // Median of three, to keep already-sorted input off the quadratic path —
+    // and these feeds arrive sorted by time, which is exactly that case.
+    let mid = lo + (hi - lo) / 2;
+    let pi = mid;
+    let a = cmp_key(qs[idx[lo]], qs[idx[mid]], key);
+    let b = cmp_key(qs[idx[mid]], qs[idx[hi]], key);
+    let c = cmp_key(qs[idx[lo]], qs[idx[hi]], key);
+    if ((a <= 0 && b <= 0) || (a >= 0 && b >= 0)) { pi = mid; }
+    else if ((c <= 0 && b >= 0) || (c >= 0 && b <= 0)) { pi = hi; }
+    else { pi = lo; }
+
+    let tmp = idx[pi];
+    idx[pi] = idx[hi];
+    idx[hi] = tmp;
+
+    let pivot = idx[hi];
+    let store = lo;
+    let i = lo;
+    while (i < hi) {
+        let cc = cmp_key(qs[idx[i]], qs[pivot], key);
+        if (desc) { cc = -cc; }
+        if (cc < 0) {
+            let t = idx[i];
+            idx[i] = idx[store];
+            idx[store] = t;
+            store += 1;
+        }
+        i += 1;
+    }
+    let t2 = idx[store];
+    idx[store] = idx[hi];
+    idx[hi] = t2;
+
+    if (store - 1 > lo) { qsort_idx(qs, idx, lo, store - 1, key, desc); }
+    if (store + 1 < hi) { qsort_idx(qs, idx, store + 1, hi, key, desc); }
+}
+
+// Returns a permutation naming the visible rows. The Quake objects are never
+// moved, so this costs one int per row however wide the record is.
+export fn order_by(qs: Quake[], key: int, desc: bool, min_mag: float): int[] {
+    let idx: int[] = [];
+    for (let i in 0..qs.len) {
+        if (min_mag > NO_MAG && qs[i].mag < min_mag) { continue; }
+        idx.push(i);
+    }
+    if (idx.len > 1) { qsort_idx(qs, idx, 0, idx.len - 1, key, desc); }
+    return idx;
+}
+
+// ── store ────────────────────────────────────────────────────────────────────
+
+export class Store {
+    cache: LRU<string, string>;
+    last_status: int;
+    last_bytes: int;
+    calls: int;
+
+    fn init() {
+        // A month feed is ~7.6 MB of JSON text; 16 of those is the ceiling this
+        // sets on cache memory, which is the point of a bounded cache.
+        this.cache = lru_str_str(16);
+        this.last_status = 0;
+        this.last_bytes = 0;
+        this.calls = 0;
+    }
+
+    fn cached(r: Request, ttl: int): string {
+        let key = r.url;
+        let hit = this.cache.get_or(key, "");
+        if (hit.len > 0) {
+            let nl = hit.index_of("\n");
+            if (nl > 0) {
+                let out: int[] = [0];
+                let ok = parse_int(hit.slice(0, nl), out);
+                if (ok) {
+                    let age = (unixSec() as int) - out[0];
+                    if (age < ttl) {
+                        this.last_status = 200;
+                        this.last_bytes = hit.len - nl - 1;
+                        return hit.slice(nl + 1, hit.len);
+                    }
+                }
+            }
+        }
+
+        let resp = r.timeoutMs(90000).send();
+        this.last_status = resp.status();
+        if (!resp.ok()) { return ""; }
+        let body = resp.text();
+        if (body.len == 0) { return ""; }
+        this.last_bytes = body.len;
+        this.calls += 1;
+        this.cache.put(key, str(unixSec() as int) + "\n" + body);
+        return body;
+    }
+
+    fn feed(name: string): Feed {
+        let f = new Feed();
+        if (!valid_feed(name)) {
+            f.err = "no such USGS feed: " + name;
+            return f;
+        }
+
+        let body = this.cached(http_get(USGS_BASE + "/" + name + ".geojson"), TTL_FEED);
+        if (body.len == 0) {
+            f.err = "earthquake.usgs.gov did not answer (status " + this.last_status + ")";
+            return f;
+        }
+        f.bytes = this.last_bytes;
+
+        let doc = json_parse(body);
+        if (doc.parseError().len > 0) {
+            f.err = "bad GeoJSON from earthquake.usgs.gov: " + doc.parseError();
+            return f;
+        }
+
+        let meta = doc.get("metadata");
+        f.title = meta.get("title").asString();
+        f.generated = meta.get("generated").asInt();
+
+        let fs = doc.get("features");
+        for (let i in 0..fs.len()) {
+            let ft = fs.at(i);
+            let p = ft.get("properties");
+            let q = new Quake();
+            q.id = ft.get("id").asString();
+
+            let m = p.get("mag");
+            if (!m.isNull()) { q.mag = m.asFloat(); }
+
+            q.place = p.get("place").asString();
+            q.title = p.get("title").asString();
+            q.time = p.get("time").asInt();
+            q.sig = p.get("sig").asInt();
+            q.tsunami = p.get("tsunami").asInt();
+            q.felt = p.get("felt").asInt();
+            q.magType = p.get("magType").asString();
+            q.kind = p.get("type").asString();
+            q.alert = p.get("alert").asString();
+            q.url = p.get("url").asString();
+
+            // GeoJSON point: [longitude, latitude, depth_km] — in that order,
+            // which is the reverse of how everyone says "lat, lon".
+            let co = ft.get("geometry").get("coordinates");
+            if (co.len() >= 3) {
+                q.lon = co.at(0).asFloat();
+                q.lat = co.at(1).asFloat();
+                q.depth = co.at(2).asFloat();
+            }
+            f.quakes.push(q);
+        }
+        return f;
+    }
+}

@@ -1,0 +1,344 @@
+// view — every byte of HTML this app serves.
+//
+// Pages are assembled with StringBuilder, never with `s = s + x` in a loop:
+// each `+` allocates a fresh string, so building a 30-story listing that way is
+// quadratic (docs/strings.md).
+//
+// ── ESCAPING: THE ONE RULE THAT MATTERS ──────────────────────────────────────
+// Titles, authors and URLs arrive as plain text and MUST go through
+// html_escape / html_escape_attr.
+//
+// `text` and `story_text` do NOT. They arrive as HTML that HN has already
+// escaped itself — "&#x27;" for an apostrophe, "<p>" between paragraphs — and
+// are limited to <p>, <a href>, <i>, <pre> and <code>. Escaping them a second
+// time renders the entities literally and turns every comment into soup, so
+// they are emitted raw. That is a deliberate trust in HN's sanitiser, and it is
+// the reason hackernews.vt binds 127.0.0.1 rather than every interface.
+// ─────────────────────────────────────────────────────────────────────────────
+
+import { Store, Item, Feed, PER_PAGE } from "api";
+import { JsonValue } from "vyto/util/json";
+import { StringBuilder, stringBuilder } from "vyto/util/text";
+import { html_escape, html_escape_attr } from "vyto/util/html";
+import { unixSec } from "vyto/util/time";
+
+// How many comments a single story page will draw, however deep the thread.
+// A 900-comment thread costs one request either way — this bounds the HTML, not
+// the network.
+const NODE_BUDGET: int = 600;
+
+const INDENT_PX: int = 20;
+
+// A rendered page and the status it should be served with, so a handler stays
+// one statement wide and a 404 does not have to be answered with a 200.
+export class Page {
+    status: int;
+    body: string;
+
+    fn init(status: int, body: string) {
+        this.status = status;
+        this.body = body;
+    }
+}
+
+// ── small helpers ────────────────────────────────────────────────────────────
+
+fn plural(n: int, unit: string): string {
+    if (n == 1) { return "1 " + unit + " ago"; }
+    return "" + n + " " + unit + "s ago";
+}
+
+export fn rel_time(t: int): string {
+    if (t <= 0) { return ""; }
+    let d = (unixSec() as int) - t;
+    if (d < 60) { return "just now"; }
+    if (d < 3600) { return plural(d / 60, "minute"); }
+    if (d < 86400) { return plural(d / 3600, "hour"); }
+    if (d < 2592000) { return plural(d / 86400, "day"); }
+    if (d < 31536000) { return plural(d / 2592000, "month"); }
+    return plural(d / 31536000, "year");
+}
+
+// "https://www.example.com/a/b?c" -> "example.com"
+export fn host_of(u: string): string {
+    if (u.len == 0) { return ""; }
+    let s = u;
+    let i = s.index_of("://");
+    if (i >= 0) { s = s.slice(i + 3, s.len); }
+    let sl = s.index_of("/");
+    if (sl >= 0) { s = s.slice(0, sl); }
+    if (s.starts_with("www.")) { s = s.slice(4, s.len); }
+    return s;
+}
+
+// Only http(s) reaches an href. The URL of a submission is whatever the
+// submitter typed, and "javascript:" is a link the browser would happily run.
+fn safe_url(u: string): bool {
+    return u.starts_with("http://") || u.starts_with("https://");
+}
+
+// ── chrome ───────────────────────────────────────────────────────────────────
+
+const FEEDS: string = "top,new,best,ask,show,jobs";
+
+fn nav(sb: StringBuilder, current: string) {
+    sb.append("<nav>");
+    sb.append("<a class=\"brand\" href=\"/top\">Y</a>");
+    for (let name in FEEDS.split(",")) {
+        sb.append("<a href=\"/").append(name).append("\"");
+        if (name == current) { sb.append(" class=\"on\""); }
+        sb.append(">").append(name).append("</a>");
+    }
+    sb.append("</nav>");
+}
+
+export fn page(title: string, current: string, body: string): string {
+    let sb = stringBuilder(body.len + 2048);
+    sb.append("<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">");
+    sb.append("<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">");
+    sb.append("<title>").append(html_escape(title)).append("</title>");
+    sb.append("<link rel=\"stylesheet\" href=\"/style.css\">");
+    sb.append("</head><body>");
+    nav(sb, current);
+    sb.append("<main>").append(body).append("</main>");
+    sb.append("<footer>served by <code>vyto/net/server</code> &middot; data from ");
+    sb.append("<a href=\"https://hn.algolia.com/api\">hn.algolia.com</a></footer>");
+    sb.append("</body></html>\n");
+    return sb.toString();
+}
+
+export fn error_page(status: int, title: string, detail: string): Page {
+    let sb = stringBuilder(512);
+    sb.append("<h1>").append(html_escape(title)).append("</h1>");
+    sb.append("<p class=\"err\">").append(html_escape(detail)).append("</p>");
+    sb.append("<p><a href=\"/top\">back to the front page</a></p>");
+    return new Page(status, page(title, "", sb.toString()));
+}
+
+// ── feed listing ─────────────────────────────────────────────────────────────
+
+fn story_row(sb: StringBuilder, it: Item) {
+    let external = it.url.len > 0 && safe_url(it.url);
+
+    sb.append("<li class=\"story\"><div class=\"title\">");
+    if (external) {
+        sb.append("<a href=\"").append(html_escape_attr(it.url)).append("\" rel=\"noreferrer\">");
+    } else {
+        sb.append("<a href=\"/item/").appendInt(it.id).append("\">");
+    }
+    sb.append(html_escape(it.title)).append("</a>");
+    if (external) {
+        sb.append(" <span class=\"host\">(").append(html_escape(host_of(it.url))).append(")</span>");
+    }
+    sb.append("</div><div class=\"meta\">");
+
+    if (it.has_score) { sb.append("").appendInt(it.score).append(" points &middot; "); }
+    if (it.by.len > 0) {
+        sb.append("by <a href=\"/user/").append(html_escape_attr(it.by)).append("\">");
+        sb.append(html_escape(it.by)).append("</a> &middot; ");
+    }
+    sb.append(rel_time(it.time));
+    if (it.has_comments) {
+        sb.append(" &middot; <a href=\"/item/").appendInt(it.id).append("\">");
+        if (it.comments == 1) { sb.append("1 comment"); }
+        else { sb.append("").appendInt(it.comments).append(" comments"); }
+        sb.append("</a>");
+    }
+    sb.append("</div></li>");
+}
+
+fn pager(sb: StringBuilder, feed: string, f: Feed) {
+    sb.append("<div class=\"pager\">");
+    if (f.page > 1) {
+        sb.append("<a href=\"/").append(feed).append("?p=").appendInt(f.page - 1).append("\">&larr; prev</a>");
+    }
+    sb.append("<span>page ").appendInt(f.page).append(" of ").appendInt(f.nb_pages).append("</span>");
+    if (f.page < f.nb_pages) {
+        sb.append("<a href=\"/").append(feed).append("?p=").appendInt(f.page + 1).append("\">next &rarr;</a>");
+    }
+    sb.append("</div>");
+}
+
+export fn render_feed(store: Store, feed: string, page_no: int): Page {
+    let f = store.feed(feed, page_no);
+    if (f.err.len > 0) {
+        return error_page(502, "upstream unavailable", f.err);
+    }
+    if (f.items.len == 0) {
+        return error_page(404, "nothing here", "page " + page_no + " of /" + feed + " is empty");
+    }
+
+    let sb = stringBuilder(16384);
+    sb.append("<ol class=\"list\" start=\"").appendInt((f.page - 1) * PER_PAGE + 1).append("\">");
+    for (let it in f.items) { story_row(sb, it); }
+    sb.append("</ol>");
+    pager(sb, feed, f);
+
+    return new Page(200, page("Hacker News — " + feed, feed, sb.toString()));
+}
+
+// ── one story and its thread ─────────────────────────────────────────────────
+
+// Walks the nested `children` arrays straight out of the API response. `budget`
+// is a one-element array because Vyto has no by-reference parameters, and the
+// cap has to be shared across every branch of the recursion rather than reset
+// per subtree.
+fn render_kids(sb: StringBuilder, node: JsonValue, depth: int, max_depth: int, budget: int[]) {
+    let kids = node.get("children");
+    for (let i in 0..kids.len()) {
+        if (budget[0] <= 0) { return; }
+        let c = kids.at(i);
+
+        // Dead and deleted comments come back with a null author. They still
+        // carry live children, so recurse past them rather than pruning.
+        let by = c.get("author").asString();
+        if (by.len > 0) {
+            budget[0] -= 1;
+            sb.append("<div class=\"c\" style=\"margin-left:").appendInt(depth * INDENT_PX).append("px\">");
+            sb.append("<div class=\"meta\"><a href=\"/user/").append(html_escape_attr(by)).append("\">");
+            sb.append(html_escape(by)).append("</a> &middot; ");
+            sb.append(rel_time(c.get("created_at_i").asInt()));
+            sb.append("</div><div class=\"text\">");
+            sb.append(c.get("text").asString());   // already HTML — see header
+            sb.append("</div></div>");
+        }
+
+        if (depth + 1 < max_depth) {
+            render_kids(sb, c, depth + 1, max_depth, budget);
+        }
+    }
+}
+
+export fn render_item(store: Store, id: int, max_depth: int): Page {
+    let root = store.story(id);
+    if (root == null) {
+        if (store.last_status == 404) {
+            return error_page(404, "no such item", "hn.algolia.com has no item " + id);
+        }
+        return error_page(502, "upstream unavailable",
+                          "hn.algolia.com did not answer (status " + store.last_status + ")");
+    }
+
+    let title = root.get("title").asString();
+    let url = root.get("url").asString();
+    let by = root.get("author").asString();
+    let text = root.get("text").asString();
+    let external = url.len > 0 && safe_url(url);
+
+    let sb = stringBuilder(32768);
+    sb.append("<article><h1>");
+    if (title.len == 0) { title = "comment"; }
+    if (external) {
+        sb.append("<a href=\"").append(html_escape_attr(url)).append("\" rel=\"noreferrer\">");
+        sb.append(html_escape(title)).append("</a>");
+        sb.append(" <span class=\"host\">(").append(html_escape(host_of(url))).append(")</span>");
+    } else {
+        sb.append(html_escape(title));
+    }
+    sb.append("</h1><div class=\"meta\">");
+    if (root.has("points") && !root.get("points").isNull()) {
+        sb.append("").appendInt(root.get("points").asInt()).append(" points &middot; ");
+    }
+    if (by.len > 0) {
+        sb.append("by <a href=\"/user/").append(html_escape_attr(by)).append("\">");
+        sb.append(html_escape(by)).append("</a> &middot; ");
+    }
+    sb.append(rel_time(root.get("created_at_i").asInt()));
+    sb.append(" &middot; <a href=\"https://news.ycombinator.com/item?id=").appendInt(id);
+    sb.append("\">on HN</a></div>");
+    if (text.len > 0) {
+        sb.append("<div class=\"text\">").append(text).append("</div>");   // already HTML
+    }
+    sb.append("</article>");
+
+    let budget: int[] = [NODE_BUDGET];
+    if (max_depth > 0) {
+        sb.append("<section class=\"comments\">");
+        render_kids(sb, root, 0, max_depth, budget);
+        sb.append("</section>");
+        if (budget[0] <= 0) {
+            sb.append("<p class=\"more\">thread truncated at ").appendInt(NODE_BUDGET);
+            sb.append(" comments &middot; <a href=\"https://news.ycombinator.com/item?id=");
+            sb.appendInt(id).append("\">read the rest on HN</a></p>");
+        }
+    }
+    sb.append("<p class=\"depth\">depth: ");
+    for (let d in 1..6) {
+        if (d == max_depth) { sb.append("<b>").appendInt(d).append("</b> "); }
+        else {
+            sb.append("<a href=\"/item/").appendInt(id).append("?d=").appendInt(d).append("\">");
+            sb.appendInt(d).append("</a> ");
+        }
+    }
+    sb.append("</p>");
+
+    return new Page(200, page(title, "", sb.toString()));
+}
+
+// ── user ─────────────────────────────────────────────────────────────────────
+
+export fn render_user(store: Store, name: string): Page {
+    let u = store.user(name);
+    if (u == null) {
+        if (store.last_status == 404) {
+            return error_page(404, "no such user", "hn.algolia.com has no user " + name);
+        }
+        return error_page(502, "upstream unavailable",
+                          "hn.algolia.com did not answer (status " + store.last_status + ")");
+    }
+
+    let sb = stringBuilder(2048);
+    sb.append("<h1>").append(html_escape(u.get("username").asString())).append("</h1>");
+    sb.append("<div class=\"meta\">").appendInt(u.get("karma").asInt()).append(" karma</div>");
+    let about = u.get("about").asString();
+    if (about.len > 0) {
+        sb.append("<div class=\"text\">").append(about).append("</div>");   // already HTML
+    }
+    sb.append("<p><a href=\"https://news.ycombinator.com/submitted?id=");
+    sb.append(html_escape_attr(name)).append("\">submissions on HN</a></p>");
+
+    return new Page(200, page(name, "", sb.toString()));
+}
+
+// ── style ────────────────────────────────────────────────────────────────────
+
+// Built rather than stored: a module-level const cannot hold a computed string,
+// and the browser fetches this once per hour anyway (see the Cache-Control in
+// hackernews.vt).
+export fn css(): string {
+    return ":root{--bg:#f6f6ef;--fg:#1a1a1a;--dim:#6b6b6b;--acc:#ff6600;--line:#e0e0d8;--card:#fff}\n"
+         + "@media (prefers-color-scheme:dark){:root{--bg:#12131a;--fg:#e6e6e6;--dim:#8a8f9a;--acc:#ff7a1a;--line:#262832;--card:#181a22}}\n"
+         + "*{box-sizing:border-box}\n"
+         + "body{margin:0;background:var(--bg);color:var(--fg);"
+         + "font:15px/1.5 -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif}\n"
+         + "nav{display:flex;gap:.9rem;align-items:center;flex-wrap:wrap;padding:.7rem 1rem;"
+         + "background:var(--acc);position:sticky;top:0;z-index:2}\n"
+         + "nav a{color:#fff;text-decoration:none;font-size:14px;opacity:.85}\n"
+         + "nav a:hover{opacity:1;text-decoration:underline}\n"
+         + "nav a.on{font-weight:700;opacity:1;text-decoration:underline}\n"
+         + "nav a.brand{font-weight:700;border:1px solid #fff;padding:0 .4rem;opacity:1}\n"
+         + "main{max-width:52rem;margin:0 auto;padding:1.2rem 1rem 3rem}\n"
+         + "a{color:inherit}\n"
+         + "ol.list{list-style:decimal;padding-left:2.2rem;margin:0}\n"
+         + "li.story{margin:0 0 1rem;padding-left:.2rem}\n"
+         + "li.story::marker{color:var(--dim);font-size:13px}\n"
+         + ".title a{text-decoration:none;font-size:16px}\n"
+         + ".title a:hover{text-decoration:underline}\n"
+         + ".host{color:var(--dim);font-size:12px}\n"
+         + ".meta{color:var(--dim);font-size:12.5px;margin-top:.15rem}\n"
+         + ".meta a{color:var(--dim)}\n"
+         + "h1{font-size:22px;line-height:1.3;margin:0 0 .3rem}\n"
+         + "h1 a{text-decoration:none}\n"
+         + "article{border-bottom:1px solid var(--line);padding-bottom:1rem;margin-bottom:1.2rem}\n"
+         + ".text{margin-top:.5rem;overflow-wrap:anywhere}\n"
+         + ".text p{margin:.5rem 0}\n"
+         + ".text pre{overflow-x:auto;background:var(--card);padding:.6rem;border-radius:4px}\n"
+         + ".c{border-left:2px solid var(--line);padding:.4rem 0 .4rem .7rem;margin:.35rem 0}\n"
+         + ".c .text{font-size:14px;margin-top:.2rem}\n"
+         + ".pager{display:flex;gap:1rem;align-items:center;justify-content:center;"
+         + "margin-top:1.5rem;font-size:14px;color:var(--dim)}\n"
+         + ".depth,.more{color:var(--dim);font-size:13px;margin-top:1.5rem}\n"
+         + ".err{color:#c0392b}\n"
+         + "footer{max-width:52rem;margin:0 auto;padding:1rem;border-top:1px solid var(--line);"
+         + "color:var(--dim);font-size:12px}\n";
+}

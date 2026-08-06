@@ -1,0 +1,141 @@
+// usgs — a browser for USGS earthquake feeds, served as plain HTML by
+// vyto/net/server.
+//
+//   vytoc run apps/usgs/usgs.vt            # http://127.0.0.1:8080
+//   vytoc run apps/usgs/usgs.vt -- 9000    # custom port
+//
+// Sixteen GeoJSON feeds, no key, no rate limit, no pagination — each one is a
+// single static document holding every quake in its window. `all_month` is
+// ~7.6 MB and ~13,000 quakes, which is what makes this the middle weight of the
+// three API apps: heavier than Hacker News, flatter and more uniform than
+// OpenAlex.
+//
+// Every page draws a world map and a magnitude histogram as inline SVG. The map
+// needs no basemap — a month of epicentres draws the plate boundaries by
+// itself — and the histogram is the Gutenberg–Richter law, log-linear decline
+// and all.
+//
+// Sorting is done here rather than upstream (the feeds have no query language),
+// which is the reason api.vt carries its own quicksort: both of Vyto's sorts
+// are insertion sort and 13,000 rows is well past where that is usable.
+
+import { server, ServerRequest, ServerResponse } from "vyto/net/server";
+import { Store, valid_feed, NO_MAG, SORT_TIME, SORT_MAG, SORT_DEPTH, SORT_SIG } from "api";
+import { Page, render_feed, render_quake, error_page, css } from "view";
+import { url_decode, url_decode_form } from "vyto/util/url";
+import { parse_int, parse_float } from "vyto/cli";
+
+const DEFAULT_FEED: string = "all_day";
+
+fn int_param(req: ServerRequest, name: string, dflt: int, lo: int, hi: int): int {
+    let raw = req.queryParam(name);
+    if (raw.len == 0) { return dflt; }
+    let out: int[] = [0];
+    let ok = parse_int(url_decode(raw), out);
+    if (!ok) { return dflt; }
+    let v = out[0];
+    if (v < lo) { return lo; }
+    if (v > hi) { return hi; }
+    return v;
+}
+
+// A blank or unparseable minimum means "no floor", which is NO_MAG rather than
+// 0 — USGS magnitudes are genuinely negative for the smallest events.
+fn min_mag_of(req: ServerRequest): float {
+    let raw = req.queryParam("min");
+    if (raw.len == 0) { return NO_MAG; }
+    let out: float[] = [0.0];
+    let ok = parse_float(url_decode_form(raw), out);
+    if (!ok) { return NO_MAG; }
+    return out[0];
+}
+
+fn sort_of(req: ServerRequest): int { return int_param(req, "sort", SORT_TIME, 0, 3); }
+fn page_of(req: ServerRequest): int { return int_param(req, "p", 1, 1, 10000); }
+
+fn desc_of(req: ServerRequest): bool {
+    let d = req.queryParam("dir");
+    if (d == "asc") { return false; }
+    return true;
+}
+
+fn miss_page(store: Store, req: ServerRequest, status: int): Page {
+    if (status == 405) {
+        return error_page(store, 405, "method not allowed",
+                          req.method() + " is not allowed on " + req.path());
+    }
+    return error_page(store, 404, "not found", req.path() + " is not a page here");
+}
+
+// res.text()/res.html() append a Content-Type through header(); pairing one with
+// an explicit header() would emit the field twice.
+fn send_css(res: ServerResponse) {
+    res.status = 200;
+    res.body_str = css();
+    res.header("Content-Type", "text/css; charset=utf-8");
+    res.header("Cache-Control", "max-age=3600");
+}
+
+fn main() {
+    let port = 8080;
+    let av = args();
+    if (av.len > 0) {
+        let out: int[] = [0];
+        let ok = parse_int(av[0], out);
+        if (!ok) { print("usage: usgs [port]"); return; }
+        port = out[0];
+    }
+
+    // One process, one cache. A month feed is 7.6 MB; pre-forked workers share
+    // nothing, so run() would hold one copy per core and re-download per core.
+    let store = new Store();
+
+    let s = server(port).fromEnv();
+    s.bindHost("127.0.0.1");
+    s.withHeader("Server", "vyto-usgs/0.1");
+    s.withHeader("X-Content-Type-Options", "nosniff");
+    s.withHeader("Referrer-Policy", "no-referrer");
+
+    s.get("/", (req, res) => { res.redirect(302, "/feed/" + DEFAULT_FEED); });
+
+    // Feed names are checked against the published matrix in api.vt rather than
+    // trusted, since they are pasted into an upstream URL.
+    s.get("/feed/:name", (req, res) => {
+        let name = req.param("name");
+        if (!valid_feed(name)) {
+            let bad = error_page(store, 404, "no such feed", name + " is not a USGS feed");
+            res.html(bad.status, bad.body);
+        } else {
+            let p = render_feed(store, name, sort_of(req), desc_of(req),
+                                min_mag_of(req), page_of(req));
+            res.html(p.status, p.body);
+        }
+    });
+
+    // Detail costs no upstream call — the feed already holds every field.
+    s.get("/quake/:feed/:id", (req, res) => {
+        let name = req.param("feed");
+        if (!valid_feed(name)) {
+            let bad = error_page(store, 404, "no such feed", name + " is not a USGS feed");
+            res.html(bad.status, bad.body);
+        } else {
+            let p = render_quake(store, name, req.param("id"));
+            res.html(p.status, p.body);
+        }
+    });
+
+    s.get("/style.css", (req, res) => { send_css(res); });
+
+    s.withNotFound((req, res) => {
+        let p = miss_page(store, req, res.status);
+        res.html(p.status, p.body);
+    });
+
+    s.onRequest((req, status, bytes, us) => {
+        print(req.method() + " " + req.target() + " -> " + status
+              + "  " + bytes + "B  " + (us / 1000) + "ms");
+    });
+
+    print("usgs on http://127.0.0.1:" + port + "  (Ctrl-C to stop)");
+    s.runSingle();
+}

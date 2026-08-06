@@ -1,0 +1,411 @@
+// api — the OpenAlex client behind apps/openalex.
+//
+// OpenAlex (https://api.openalex.org) indexes ~323 million scholarly works.
+// No key is needed; an anonymous caller gets a $0.10/day budget, and the API
+// reports what each call cost in `meta.cost_usd`. Measured:
+//
+//     search=      $0.001    ->   100 calls/day anonymous
+//     filter=      $0.0001   -> 1,000 calls/day anonymous
+//     group_by=    $0.0001
+//     one entity   free, unlimited, and carries no `meta` at all
+//
+// The cost is per CALL, not per byte: `filter=...&per-page=200` returns 8.1 MB
+// for one hundredth of a cent. That is why this app browses with `filter=` and
+// treats full-text `search=` as a deliberate, ten-times-dearer action — and
+// also why it is a good way to push megabytes through vyto/util/json without
+// being rude to anybody.
+//
+// Every response is cached. `Store.spent` accumulates the reported cost so the
+// footer can show what a browsing session actually burned.
+
+import { http_get, Request } from "vyto/net/http";
+import { json_parse, JsonValue } from "vyto/util/json";
+import { LRU, lru_str_str } from "vyto/coll/lru";
+import { url_encode } from "vyto/util/url";
+import { StringBuilder, stringBuilder } from "vyto/util/text";
+import { unixSec } from "vyto/util/time";
+import { parse_int } from "vyto/cli";
+
+const OA_API: string = "https://api.openalex.org";
+
+export const PER_PAGE: int = 25;
+
+// Entities are immutable enough to cache hard; a list is a query and moves.
+const TTL_LIST: int = 600;
+const TTL_ENTITY: int = 86400;
+
+// Some works carry thousands of authorships. Rendering all of them helps
+// nobody and costs a megabyte of HTML.
+const MAX_AUTHORS: int = 12;
+
+// ── model ────────────────────────────────────────────────────────────────────
+
+export class Author {
+    id: string;          // short form, "A5047516262"
+    name: string;
+    inst: string;        // first institution's display_name, "" if none
+
+    fn init() { this.id = ""; this.name = ""; this.inst = ""; }
+}
+
+export class Work {
+    id: string;          // short form, "W1491178396"
+    title: string;
+    year: int;
+    kind: string;        // "article", "book", ...
+    cited: int;
+    is_oa: bool;
+    oa_status: string;
+    venue: string;       // primary_location.source.display_name
+    topic: string;       // primary_topic.display_name
+    doi: string;
+    lang: string;
+    authors: Author[];
+    n_authors: int;      // real count, before MAX_AUTHORS truncation
+    n_refs: int;
+
+    // Detail only — left empty by the list path.
+    abstract: string;
+    years: int[];        // counts_by_year, oldest first
+    counts: int[];
+
+    fn init() {
+        this.id = "";
+        this.title = "";
+        this.year = 0;
+        this.kind = "";
+        this.cited = 0;
+        this.is_oa = false;
+        this.oa_status = "";
+        this.venue = "";
+        this.topic = "";
+        this.doi = "";
+        this.lang = "";
+        this.authors = [];
+        this.n_authors = 0;
+        this.n_refs = 0;
+        this.abstract = "";
+        this.years = [];
+        this.counts = [];
+    }
+}
+
+export class WorkList {
+    works: Work[];
+    total: int;          // meta.count — the whole matching set, not this page
+    page: int;
+    cost: float;         // meta.cost_usd for this call
+    bytes: int;          // size of the JSON we parsed, for the stress readout
+    err: string;
+
+    fn init() {
+        this.works = [];
+        this.total = 0;
+        this.page = 1;
+        this.cost = 0.0;
+        this.bytes = 0;
+        this.err = "";
+    }
+}
+
+export class Person {
+    id: string;
+    name: string;
+    orcid: string;
+    inst: string;
+    works_count: int;
+    cited: int;
+    h_index: int;
+    i10: int;
+    years: int[];
+    counts: int[];
+
+    fn init() {
+        this.id = "";
+        this.name = "";
+        this.orcid = "";
+        this.inst = "";
+        this.works_count = 0;
+        this.cited = 0;
+        this.h_index = 0;
+        this.i10 = 0;
+        this.years = [];
+        this.counts = [];
+    }
+}
+
+// ── id handling ──────────────────────────────────────────────────────────────
+
+// OpenAlex ids arrive as full URLs: "https://openalex.org/W1491178396". Routes
+// want the bare key.
+export fn short_id(url: string): string {
+    if (url.len == 0) { return ""; }
+    let i = url.index_of("openalex.org/");
+    if (i < 0) { return url; }
+    return url.slice(i + 13, url.len);
+}
+
+// Only [A-Za-z0-9] ever appears in an OpenAlex key. Anything else is somebody
+// probing, and it would otherwise be pasted straight into an upstream URL.
+export fn valid_id(s: string): bool {
+    if (s.len < 2 || s.len > 24) { return false; }
+    for (let i in 0..s.len) {
+        let c = s[i];
+        let ok = (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122);
+        if (!ok) { return false; }
+    }
+    return true;
+}
+
+// ── decoding ─────────────────────────────────────────────────────────────────
+
+fn authors_of(v: JsonValue, w: Work) {
+    let auths = v.get("authorships");
+    w.n_authors = auths.len();
+    let n = w.n_authors;
+    if (n > MAX_AUTHORS) { n = MAX_AUTHORS; }
+    for (let i in 0..n) {
+        let a = auths.at(i);
+        let p = new Author();
+        p.id = short_id(a.get("author").get("id").asString());
+        p.name = a.get("author").get("display_name").asString();
+        let insts = a.get("institutions");
+        if (insts.len() > 0) { p.inst = insts.at(0).get("display_name").asString(); }
+        w.authors.push(p);
+    }
+}
+
+fn counts_of(v: JsonValue, years: int[], counts: int[]) {
+    let cby = v.get("counts_by_year");
+    // The API hands these back newest first; a chart wants them oldest first.
+    let i = cby.len() - 1;
+    while (i >= 0) {
+        years.push(cby.at(i).get("year").asInt());
+        counts.push(cby.at(i).get("cited_by_count").asInt());
+        i -= 1;
+    }
+}
+
+// An OpenAlex abstract is not a string. It is an inverted index — a map from
+// each word to every position it occupies:
+//
+//     {"Introduction": [1, 49, 140], "1.1": [2], "Language": [3, 31]}
+//
+// Rebuilding it means scattering words into a slot array and joining. Note the
+// iteration goes through `keys`/`vals` directly rather than objKeys() + get():
+// get() is a linear scan over members, so keying through it would make this
+// quadratic in the length of the abstract.
+fn abstract_of(v: JsonValue): string {
+    let ii = v.get("abstract_inverted_index");
+    if (!ii.isObj()) { return ""; }
+
+    let n = ii.keys.len;
+    if (n == 0) { return ""; }
+
+    let hi = -1;
+    for (let k in 0..n) {
+        let pos = ii.vals[k];
+        for (let j in 0..pos.len()) {
+            let p = pos.at(j).asInt();
+            if (p > hi) { hi = p; }
+        }
+    }
+    if (hi < 0 || hi > 200000) { return ""; }
+
+    let slots: string[] = [];
+    for (let i in 0..(hi + 1)) { slots.push(""); }
+    for (let k in 0..n) {
+        let word = ii.keys[k];
+        let pos = ii.vals[k];
+        for (let j in 0..pos.len()) {
+            let p = pos.at(j).asInt();
+            if (p >= 0 && p <= hi) { slots[p] = word; }
+        }
+    }
+
+    let sb = stringBuilder(hi * 8 + 64);
+    for (let i in 0..slots.len) {
+        if (slots[i].len == 0) { continue; }
+        if (sb.len() > 0) { sb.append(" "); }
+        sb.append(slots[i]);
+    }
+    return sb.toString();
+}
+
+fn work_of(v: JsonValue, detail: bool): Work {
+    let w = new Work();
+    w.id = short_id(v.get("id").asString());
+    w.title = v.get("title").asString();
+    if (w.title.len == 0) { w.title = v.get("display_name").asString(); }
+    if (w.title.len == 0) { w.title = "(untitled)"; }
+    w.year = v.get("publication_year").asInt();
+    w.kind = v.get("type").asString();
+    w.cited = v.get("cited_by_count").asInt();
+    w.n_refs = v.get("referenced_works_count").asInt();
+    w.lang = v.get("language").asString();
+    w.doi = v.get("doi").asString();
+
+    let oa = v.get("open_access");
+    w.is_oa = oa.get("is_oa").asBool();
+    w.oa_status = oa.get("oa_status").asString();
+
+    w.venue = v.get("primary_location").get("source").get("display_name").asString();
+    w.topic = v.get("primary_topic").get("display_name").asString();
+
+    authors_of(v, w);
+
+    if (detail) {
+        w.abstract = abstract_of(v);
+        counts_of(v, w.years, w.counts);
+    }
+    return w;
+}
+
+// ── store ────────────────────────────────────────────────────────────────────
+
+export class Store {
+    cache: LRU<string, string>;
+    last_status: int;
+    last_bytes: int;      // size of the most recent body, cached or not
+    spent: float;         // running total of meta.cost_usd this process reported
+    calls: int;           // upstream calls actually made (cache misses)
+
+    fn init() {
+        this.cache = lru_str_str(256);
+        this.last_status = 0;
+        this.last_bytes = 0;
+        this.spent = 0.0;
+        this.calls = 0;
+    }
+
+    // The only method that reaches the network. Same shape as the hackernews
+    // store: LRU has no TTL, so the value is "<unix seconds>\n<body>".
+    fn cached(r: Request, ttl: int): string {
+        let key = r.url;
+        let hit = this.cache.get_or(key, "");
+        if (hit.len > 0) {
+            let nl = hit.index_of("\n");
+            if (nl > 0) {
+                let out: int[] = [0];
+                let ok = parse_int(hit.slice(0, nl), out);
+                if (ok) {
+                    let age = (unixSec() as int) - out[0];
+                    if (age < ttl) {
+                        this.last_status = 200;
+                        this.last_bytes = hit.len - nl - 1;
+                        return hit.slice(nl + 1, hit.len);
+                    }
+                }
+            }
+        }
+
+        let resp = r.timeoutMs(60000).send();
+        this.last_status = resp.status();
+        if (!resp.ok()) { return ""; }
+        let body = resp.text();
+        if (body.len == 0) { return ""; }
+        this.last_bytes = body.len;
+        this.calls += 1;
+        this.cache.put(key, str(unixSec() as int) + "\n" + body);
+        return body;
+    }
+
+    // `filter` browsing — a tenth the price of search. `lean` swaps in a
+    // `select` so the same query returns 5 KB instead of 1.5 MB, which is the
+    // knob for telling parser cost apart from network cost.
+    fn listReq(filter: string, sort: string, page: int, per: int, lean: bool): Request {
+        let r = http_get(OA_API + "/works");
+        if (filter.len > 0) { r.query("filter", filter); }
+        if (sort.len > 0) { r.query("sort", sort); }
+        r.query("per-page", str(per));
+        r.query("page", str(page));
+        if (lean) {
+            r.query("select", "id,title,publication_year,type,cited_by_count,open_access,authorships,primary_location,primary_topic,referenced_works_count,language,doi");
+        }
+        return r;
+    }
+
+    fn searchReq(q: string, page: int, per: int): Request {
+        let r = http_get(OA_API + "/works");
+        r.query("search", q);
+        r.query("per-page", str(per));
+        r.query("page", str(page));
+        return r;
+    }
+
+    fn runList(r: Request, page: int): WorkList {
+        let wl = new WorkList();
+        wl.page = page;
+
+        let body = this.cached(r, TTL_LIST);
+        if (body.len == 0) {
+            wl.err = "api.openalex.org did not answer (status " + this.last_status + ")";
+            return wl;
+        }
+        wl.bytes = this.last_bytes;
+
+        let doc = json_parse(body);
+        if (doc.parseError().len > 0) {
+            wl.err = "bad JSON from api.openalex.org: " + doc.parseError();
+            return wl;
+        }
+
+        let meta = doc.get("meta");
+        wl.total = meta.get("count").asInt();
+        wl.cost = meta.get("cost_usd").asFloat();
+        this.spent = this.spent + wl.cost;
+
+        let rs = doc.get("results");
+        for (let i in 0..rs.len()) { wl.works.push(work_of(rs.at(i), false)); }
+        return wl;
+    }
+
+    fn browse(filter: string, sort: string, page: int, per: int, lean: bool): WorkList {
+        return this.runList(this.listReq(filter, sort, page, per, lean), page);
+    }
+
+    fn search(q: string, page: int, per: int): WorkList {
+        return this.runList(this.searchReq(q, page, per), page);
+    }
+
+    // Single entities are free and unlimited, so these are never rationed.
+    fn work(id: string): Work {
+        let body = this.cached(http_get(OA_API + "/works/" + id), TTL_ENTITY);
+        if (body.len == 0) { return null; }
+        let v = json_parse(body);
+        if (v.parseError().len > 0) { return null; }
+        return work_of(v, true);
+    }
+
+    fn person(id: string): Person {
+        let body = this.cached(http_get(OA_API + "/authors/" + id), TTL_ENTITY);
+        if (body.len == 0) { return null; }
+        let v = json_parse(body);
+        if (v.parseError().len > 0) { return null; }
+
+        let p = new Person();
+        p.id = short_id(v.get("id").asString());
+        p.name = v.get("display_name").asString();
+        p.orcid = v.get("orcid").asString();
+        p.works_count = v.get("works_count").asInt();
+        p.cited = v.get("cited_by_count").asInt();
+
+        let ss = v.get("summary_stats");
+        p.h_index = ss.get("h_index").asInt();
+        p.i10 = ss.get("i10_index").asInt();
+
+        let li = v.get("last_known_institutions");
+        if (li.len() > 0) { p.inst = li.at(0).get("display_name").asString(); }
+
+        counts_of(v, p.years, p.counts);
+        return p;
+    }
+
+    fn institution(id: string): JsonValue {
+        let body = this.cached(http_get(OA_API + "/institutions/" + id), TTL_ENTITY);
+        if (body.len == 0) { return null; }
+        let v = json_parse(body);
+        if (v.parseError().len > 0) { return null; }
+        return v;
+    }
+}
