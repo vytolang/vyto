@@ -989,8 +989,11 @@ static char *ex(Em *em, Expr *e, bool *fresh) {
             if (!e->decl->wrapper_emitted) {
                 e->decl->wrapper_emitted = true;
                 SBuf *ax = em->aux;
-                sb_printf(ax, "static %s v_%s__w_%s(VtObj* _e", c_type(fd->ret), fd->module->name,
-                          fd->name);
+                /* Key the thunk on the mangled cname, not fd->name: every
+                   instantiation of a generic fn shares the source name, so
+                   `ident` at <int> and at <string> would otherwise emit two
+                   colliding definitions of v_MOD__w_ident. */
+                sb_printf(ax, "static %s %s__w(VtObj* _e", c_type(fd->ret), fn_cname(fd));
                 for (int i = 0; i < fd->nparams; i++)
                     sb_printf(ax, ", %s a%d", c_type(fd->params[i].type), i);
                 sb_puts(ax, ") { (void)_e; ");
@@ -998,18 +1001,74 @@ static char *ex(Em *em, Expr *e, bool *fresh) {
                 sb_printf(ax, "%s(", fn_cname(fd));
                 for (int i = 0; i < fd->nparams; i++) sb_printf(ax, "%sa%d", i ? ", " : "", i);
                 sb_puts(ax, "); }\n");
-                sb_printf(ax, "static VtClosure* v_%s__c_%s;\n", fd->module->name, fd->name);
+                sb_printf(ax, "static VtClosure* %s__c;\n", fn_cname(fd));
             }
             *fresh = false; /* the cache owns its reference; consumers retain */
-            const char *cv = arena_printf(&g_arena, "v_%s__c_%s", fd->module->name, fd->name);
-            return arena_printf(&g_arena, "(%s ? %s : (%s = vt_closure_new((void*)v_%s__w_%s, 0)))",
-                                cv, cv, cv, fd->module->name, fd->name);
+            const char *cv = arena_printf(&g_arena, "%s__c", fn_cname(fd));
+            return arena_printf(&g_arena, "(%s ? %s : (%s = vt_closure_new((void*)%s__w, 0)))",
+                                cv, cv, cv, fn_cname(fd));
         }
         default:
             fatal_at(e->loc, "internal: bad ident ref");
         }
         break;
     case EX_MEMBER: {
+        if (e->ref == REF_METHOD_VAL) {
+            /* Bound method: a closure carrying its receiver. Structurally this is
+               an arrow with exactly one capture, so it emits the same three
+               artifacts — env struct + deinit + VtType, thunk, maker — and shares
+               the module's arrow counter for a unique id.
+
+               Unlike a plain fn value there is no cached singleton: the closure
+               is per-receiver, so each evaluation allocates. */
+            FnDecl *m = e->method;
+            SBuf *ax = em->aux;
+            const char *mn = em->mod->name;
+            int id = ++em->mod->arrow_counter;
+            bool is_struct = m->sowner != NULL;
+            const char *rct = is_struct ? arena_printf(&g_arena, "%s", struct_cname(m->sowner))
+                                        : arena_printf(&g_arena, "%s*", class_cname(m->owner));
+
+            sb_printf(ax, "typedef struct { VtObj hdr; %s self; } v_%s__bm%d_env;\n", rct, mn, id);
+            sb_printf(ax, "static void v_%s__bm%d_deinit(void* p) {\n", mn, id);
+            if (is_struct)
+                sb_puts(ax, "    (void)p; /* struct receiver: copied by value */\n");
+            else
+                sb_printf(ax, "    vt_release(((v_%s__bm%d_env*)p)->self);\n", mn, id);
+            sb_puts(ax, "}\n");
+            sb_printf(ax, "static const VtType v_%s__bm%d_type = "
+                          "{\"bound\", v_%s__bm%d_deinit, 0, 0};\n", mn, id, mn, id);
+
+            sb_printf(ax, "static %s v_%s__bm%d(VtObj* _e", c_type(m->ret), mn, id);
+            for (int i = 0; i < m->nparams; i++)
+                sb_printf(ax, ", %s a%d", c_type(m->params[i].type), i);
+            sb_printf(ax, ") {\n    v_%s__bm%d_env* _b = (v_%s__bm%d_env*)_e;\n", mn, id, mn, id);
+            sb_puts(ax, "    ");
+            if (m->ret->kind != TY_VOID) sb_puts(ax, "return ");
+            if (!is_struct && m->vslot >= 0) {
+                /* Virtual: dispatch through the vtable. Calling fn_cname(m)
+                   directly here would bind the base implementation and silently
+                   skip every override. */
+                char *sig = fnptr_sig(m->ret, rct, NULL, m->nparams, m->params);
+                sb_printf(ax, "((%s)((VtObj*)_b->self)->type->vtbl[%d])(_b->self", sig, m->vslot);
+            } else {
+                sb_printf(ax, "%s(_b->self", fn_cname(m));
+            }
+            for (int i = 0; i < m->nparams; i++) sb_printf(ax, ", a%d", i);
+            sb_puts(ax, ");\n}\n");
+
+            sb_printf(ax, "static VtClosure* v_%s__mkbm%d(%s o) {\n", mn, id, rct);
+            sb_printf(ax, "    v_%s__bm%d_env* e = vt_alloc(sizeof *e, &v_%s__bm%d_type);\n",
+                      mn, id, mn, id);
+            if (is_struct)
+                sb_puts(ax, "    e->self = o;\n");
+            else
+                sb_printf(ax, "    e->self = (%s)vt_retain(o);\n", rct);
+            sb_printf(ax, "    return vt_closure_new((void*)v_%s__bm%d, (VtObj*)e);\n}\n", mn, id);
+
+            *fresh = true;
+            return arena_printf(&g_arena, "v_%s__mkbm%d(%s)", mn, id, ex_b(em, e->lhs));
+        }
         if (e->ref == REF_BUILTIN && e->builtin == B_LEN)
             return arena_printf(&g_arena, "vt_len(%s, \"%s\", %d)", ex_b(em, e->lhs),
                                 c_escape(e->loc.file, strlen(e->loc.file)), e->loc.line);

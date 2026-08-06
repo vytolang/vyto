@@ -146,6 +146,32 @@ To wire up interactivity (button clicks, text input, state), see
 widget (widgets are references) but cannot mutate a captured primitive and have
 it persist — hold changing state in an object or a top-level structure instead.
 
+A handler does not have to be a closure literal. Anywhere a `fn(...)` type is
+expected you can also pass a named function, a generic function (instantiated
+from the target type), or a **bound method** — `obj.method`, which carries its
+receiver, so the handler can reach that object's state without capturing
+anything:
+
+```vyto
+class App {
+    hits: int;
+    fn health(req: ServerRequest, res: ServerResponse) {
+        this.hits = this.hits + 1;
+        res.text(200, "ok");
+    }
+}
+
+let app = new App();
+s.get("/health", app.health);      // no arrow, and it still sees app.hits
+```
+
+See [examples/98_fn_values.vt](../examples/98_fn_values.vt) for all four forms.
+
+**A bound method holds its receiver alive.** Storing one back onto an object the
+receiver owns — `this.btn.onPress = this.handle` — makes a reference cycle, and
+Vyto has no cycle collector, so it leaks with nothing failing. Clear the field
+during teardown, or keep the back-reference `weak`.
+
 ## 6. Imports and the standard library
 
 - Your own files: `import { thing } from "other";` — a bare module stem,

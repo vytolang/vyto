@@ -1,0 +1,118 @@
+// Function values: what can be passed where a `fn(...)` type is expected.
+//
+// Three kinds, in increasing order of how much they carry with them:
+//
+//   1. a named fn      — nothing but the code
+//   2. a generic fn    — instantiated from the target type, then as (1)
+//   3. a bound method  — the code plus its receiver
+//
+// A closure literal `(x) => ...` is the fourth, and captures the enclosing
+// scope by value; see 04_closures.vt for that one.
+
+import { sort_by } from "vyto/util/sort";
+
+// ---- 1. named functions ----------------------------------------------------
+
+fn double(x: int): int { return x * 2; }
+
+fn apply(f: fn(int): int, v: int): int { return f(v); }
+
+// ---- 2. generic functions --------------------------------------------------
+
+// A generic fn has no single type, so as a value it is monomorphized against
+// whatever the target type says. The same source function below becomes two
+// different instantiations.
+fn ident<T>(x: T): T { return x; }
+
+fn tag<A, B>(a: A, b: B): string { return "" + a + ":" + b; }
+
+// ---- 3. bound methods ------------------------------------------------------
+
+class Shape {
+    label: string;
+
+    fn init(label: string) { this.label = label; }
+
+    // virtual: binding must dispatch through the vtable, not the base body
+    virtual fn area(scale: int): int { return 0; }
+
+    fn name(): string { return this.label; }
+}
+
+class Square extends Shape {
+    side: int;
+
+    fn init(side: int) {
+        super.init("square");
+        this.side = side;
+    }
+
+    override fn area(scale: int): int { return this.side * this.side * scale; }
+}
+
+// A struct receiver is copied when the method is bound, matching how structs
+// behave everywhere else.
+struct Point {
+    x: int;
+    y: int;
+
+    fn offset(by: int): int { return this.x + this.y + by; }
+}
+
+// A class holding a handler, the shape a callback registry actually takes.
+class Button {
+    onPress: fn(int);
+
+    fn init() { this.onPress = null; }
+    fn press(n: int) { if (this.onPress != null) { this.onPress(n); } }
+}
+
+class Counter {
+    total: int;
+
+    fn init() { this.total = 0; }
+    fn add(n: int) { this.total = this.total + n; }
+}
+
+fn main() {
+    // 1 — named fn as a value, and passed straight as an argument
+    let d: fn(int): int = double;
+    print("named        : " + d(21) + " " + apply(double, 5));
+
+    // 2 — one generic fn, two instantiations, in one program
+    let fi: fn(int): int = ident;
+    let fs: fn(string): string = ident;
+    print("generic      : " + fi(7) + " " + fs("seven"));
+
+    let t: fn(int, string): string = tag;
+    print("generic 2-arg: " + t(3, "x"));
+
+    // 3 — non-virtual method, bound to its receiver
+    let sq = new Square(3);
+    let nm: fn(): string = sq.name;
+    print("method       : " + nm());
+
+    // the important one: bound through a BASE-typed reference, the override wins
+    let base: Shape = sq;
+    let ar: fn(int): int = base.area;
+    print("virtual      : " + ar(2) + " " + apply(base.area, 10));
+
+    // struct receiver is copied at bind time, so later mutation does not show
+    let p = Point(1, 2);
+    let off: fn(int): int = p.offset;
+    p.x = 100;
+    print("struct copy  : " + off(10) + " (live x is " + p.x + ")");
+
+    // a bound method stored in a fn-typed field and invoked later
+    let c = new Counter();
+    let b = new Button();
+    b.onPress = c.add;
+    b.press(5);
+    b.press(37);
+    print("as a field   : " + c.total);
+
+    // bound methods compose with the rest of the library like any fn value
+    let nums: int[] = [3, 1, 2];
+    let sorted = sort_by(nums, (a, b) => a - b);
+    print("sorted       : " + sorted[0] + sorted[1] + sorted[2]);
+}

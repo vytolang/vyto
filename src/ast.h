@@ -86,6 +86,7 @@ typedef enum {
     /* resolved meaning of an EX_IDENT / EX_MEMBER / EX_CALL, set by checker */
     REF_NONE, REF_LOCAL, REF_PARAM, REF_GLOBAL_FN, REF_CONST, REF_FIELD,
     REF_METHOD, REF_BUILTIN, REF_CAPTURE, REF_EXTERN_FN,
+    REF_METHOD_VAL, /* obj.method as a value: closure bound to obj */
 } RefKind;
 
 typedef struct Local Local; /* defined in check.h */
@@ -112,7 +113,7 @@ struct Expr {
     Decl *decl;             /* REF_GLOBAL_FN/REF_CONST/REF_EXTERN_FN target */
     ClassDecl *cls;         /* EX_NEW class; REF_FIELD/REF_METHOD owner */
     StructDecl *sd;         /* REF_FIELD on struct */
-    FnDecl *method;         /* REF_METHOD target */
+    FnDecl *method;         /* REF_METHOD/REF_METHOD_VAL target */
     int builtin;            /* BuiltinKind for REF_BUILTIN */
     bool is_super_call;     /* super.init(...) */
     bool region_local;      /* EX_NEW resolved to arena allocation (region > 0) */

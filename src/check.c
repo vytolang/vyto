@@ -55,7 +55,21 @@ static const char *type_str(const Type *t) {
     case TY_CLASS: return t->cdecl->name;
     case TY_ARRAY: return arena_printf(&g_arena, "%s[]", type_str(t->elem));
     case TY_MAP: return arena_printf(&g_arena, "Map<string, %s>", type_str(t->elem));
-    case TY_FN: return "fn(...)";
+    case TY_FN: {
+        /* Render the real signature. This used to be the literal "fn(...)", which
+           made every mismatch read "expected fn(...), got fn(...)" — no
+           information at all, and fn values are about to be far more common. */
+        SBuf sb;
+        sb_init(&sb);
+        sb_puts(&sb, "fn(");
+        for (int i = 0; i < t->nparams; i++)
+            sb_printf(&sb, "%s%s", i ? ", " : "", type_str(t->params[i]));
+        sb_puts(&sb, ")");
+        if (t->ret && t->ret->kind != TY_VOID) sb_printf(&sb, ": %s", type_str(t->ret));
+        const char *out = arena_strdup(&g_arena, sb.data);
+        sb_free(&sb);
+        return out;
+    }
     case TY_NAMED: return t->name;
     case TY_TYPARAM: return t->name;
     }
@@ -1244,7 +1258,9 @@ static Local *lookup_value(Ctx *c, Expr *e, const char *name) {
     if (c->outer_scope) {
         l = scope_find(c->outer_scope, name);
         if (l) {
-            if (l->is_this) fatal_at(e->loc, "closures cannot capture 'this' in v0.1");
+            /* `this` never reaches here: it is T_THIS -> EX_THIS, which does not
+               route through lookup_value. The message that used to live here was
+               unreachable; it now fires from the EX_THIS case instead. */
             if (l->region > 0)
                 fatal_at(e->loc, "cannot capture arena value '%s' in a closure "
                                  "(the closure may outlive the arena)", name);
@@ -1978,12 +1994,38 @@ static Type *check_member(Ctx *c, Expr *e) {
                 e->sd = sd;
                 return e->type = sd->fields[i].type;
             }
-        fatal_at(e->loc, "struct %s has no field '%s'", sd->name, n);
+        /* not a field: a method name in a value position binds the receiver */
+        for (int i = 0; i < sd->nmethods; i++)
+            if (sd->methods[i]->name == n) {
+                e->ref = REF_METHOD_VAL;
+                e->method = sd->methods[i];
+                e->sd = sd;
+                return e->type = fn_type_of(sd->methods[i]);
+            }
+        fatal_at(e->loc, "struct %s has no field or method '%s'", sd->name, n);
     }
     if (recv->kind == TY_CLASS) {
         Field *f;
         ClassDecl *owner = class_find_field(recv->cdecl, n, &f);
-        if (!owner) fatal_at(e->loc, "class %s has no field '%s'", recv->cdecl->name, n);
+        if (!owner) {
+            /* Not a field: a method name here is a bound method — a closure
+               carrying the receiver. The receiver is retained into the closure's
+               env, so this is a real reference, and a bound method stored on the
+               receiver itself is a cycle that refcounting will not collect. */
+            FnDecl *m = class_find_method(recv->cdecl, n);
+            if (m) {
+                if (n == intern("init"))
+                    fatal_at(e->loc, "'init' cannot be used as a value (it is called via 'new')");
+                if (region_of(e->lhs) > 0)
+                    fatal_at(e->loc, "cannot bind method '%s' of an arena value "
+                                     "(the closure would outlive the arena)", n);
+                e->ref = REF_METHOD_VAL;
+                e->method = m;
+                e->cls = m->owner;
+                return e->type = fn_type_of(m);
+            }
+            fatal_at(e->loc, "class %s has no field or method '%s'", recv->cdecl->name, n);
+        }
         e->ref = REF_FIELD;
         e->cls = owner;
         Type *t = f->type;
@@ -2050,6 +2092,14 @@ static Type *check_expr(Ctx *c, Expr *e, Type *expected) {
         e->type = mk_type(TY_NULL);
         return e->type;
     case EX_THIS: {
+        /* Inside a closure body first: `this` is not in scope there, and the
+           generic "outside a method" message is actively misleading when the
+           closure sits in a method. c->outer_scope is non-NULL only in a ctx
+           built by check_arrow. */
+        if (c->outer_scope)
+            fatal_at(e->loc, "closures cannot capture 'this' in v0.1 "
+                             "(bind it first: `let self = this;` outside the closure, "
+                             "then use `self`)");
         if (!c->cls && !(c->fn && c->fn->sowner))
             fatal_at(e->loc, "'this' outside a method");
         Local *l = scope_find(c->scope, intern("this"));
@@ -2068,12 +2118,39 @@ static Type *check_expr(Ctx *c, Expr *e, Type *expected) {
             return e->type = d->const_type;
         }
         if (d->kind == D_FN) { /* function used as a closure value */
-            if (d->fn->ntyparams > 0)
-                fatal_at(e->loc, "cannot use generic function '%s' as a value; "
-                                 "call it, or wrap it in a closure", e->name);
+            FnDecl *g = d->fn;
+            if (g->ntyparams > 0) {
+                /* A generic fn as a value has to name one instantiation, and the
+                   only thing that can say which is the target type. Unify the
+                   whole signature against it, then monomorphize as a call site
+                   would — after which this is an ordinary REF_GLOBAL_FN and emit
+                   needs to know nothing about generics. */
+                if (!expected || expected->kind != TY_FN)
+                    fatal_at(e->loc, "cannot infer type arguments for generic function '%s' "
+                                     "used as a value; assign it to a typed target", e->name);
+                if (expected->nparams != g->nparams)
+                    fatal_at(e->loc, "generic function '%s' takes %d parameter(s), "
+                                     "but the target type expects %d",
+                             e->name, g->nparams, expected->nparams);
+                int ntp = g->ntyparams;
+                Type **bind = arena_alloc(&g_arena, sizeof(Type *) * (size_t)ntp);
+                for (int i = 0; i < ntp; i++) bind[i] = NULL;
+                for (int i = 0; i < g->nparams; i++)
+                    unify(g->typarams, ntp, g->params[i].type, expected->params[i], bind, e->loc);
+                unify(g->typarams, ntp, g->ret, expected->ret, bind, e->loc);
+                for (int i = 0; i < ntp; i++)
+                    if (!bind[i])
+                        fatal_at(e->loc, "cannot infer type parameter '%s' of '%s' from the "
+                                         "target type %s", g->typarams[i], e->name,
+                                 type_str(expected));
+                FnDecl *inst = instantiate_fn(g, bind, ntp, e->loc);
+                e->ref = REF_GLOBAL_FN;
+                e->decl = inst->inst_decl;
+                return e->type = fn_type_of(inst);
+            }
             e->ref = REF_GLOBAL_FN;
             e->decl = d;
-            return e->type = fn_type_of(d->fn);
+            return e->type = fn_type_of(g);
         }
         fatal_at(e->loc, "'%s' cannot be used as a value", e->name);
     }
