@@ -1118,21 +1118,102 @@ fn without(xs: Widget[], drop: Widget): Widget[] {
 // scrollable widget already overrides them for its scrollbar. Wiring the
 // gesture to the same seam means ScrollView and ListView need no code at all.
 
-// Below this the release is a stop, not a flick (px/ms). One frame at 60Hz is
-// 16ms, so this is about 4px of travel in the last frame.
-const FLING_MIN_V: float = 0.25;
+// Below this the release is a stop, not a flick (px/ms). 0.15 px/ms is 150px/s,
+// which is Android's own minimum fling velocity (50dp/s) at the density this
+// was tuned on. It used to be 0.25, and the gap was felt rather than seen: a
+// gentle flick fell under the threshold, did not coast at all, and the list
+// stopped dead under the finger.
+const FLING_MIN_V: float = 0.15;
 // How long the flick is taken to "carry" — velocity times this is the coast
 // distance. The one number that sets how far a flick throws the content.
-const FLING_COAST_MS: float = 300.0;
+//
+// Measured against Android rather than guessed. OverScroller carries a
+// 1250px/s flick about 550-650px on a 2.75-density phone; at 300ms this model
+// carried the same flick 340px, so a flick stopped roughly twice as early as
+// the platform's and scrolling a long list meant flicking over and over. That
+// is what "the drag scroll feels lazy" was. The coast *duration* was never the
+// problem — the spring already glides for about 1.1s, which is Android's
+// ballpark — so only the distance moved.
+//
+// Linear in velocity, where Android's curve is slightly super-linear, so a
+// very hard flick still travels a little less than the platform would. Within
+// the band a thumb actually produces, the two agree.
+const FLING_COAST_MS: float = 550.0;
 // Spring feel for the coast. Critically damped: no bounce-back at the landing
 // point, which on a list reads as a glitch rather than as bounce.
 const FLING_RESPONSE: float = 0.55;
 const FLING_DAMPING: float = 1.0;
 // Remaining travel below which the coast lands rather than creeping.
 const FLING_SNAP_PX: float = 0.5;
+// Overscroll bounce (opt-in, Widget.bounce). Critically damped for the same
+// reason the fling is: the content returns to the edge and stops there. An
+// underdamped return would wobble around the boundary, which reads as a bug
+// rather than as elasticity.
+const BOUNCE_RESPONSE: float = 0.4;
+const BOUNCE_DAMPING: float = 1.0;
+// Furthest the content can be pulled past its end, as a fraction of the
+// viewport. The rubber band reaches zero give here, so it is a hard stop that
+// is never actually arrived at.
+const BOUNCE_LIMIT_FRAC: float = 0.35;
+const BOUNCE_SNAP_PX: float = 0.5;
 // A release this long after the last movement is a stop, not a flick — about
 // four frames at 60Hz.
 const FLING_STALE_MS: int = 64;
+
+// The elastic return. Runs on `overscroll` rather than on the scroll offset,
+// so nothing that reads scroll_v — the scrollbars, ListView's row arithmetic,
+// max_scroll — ever sees a value outside its range.
+//
+// Critically damped from wherever the content was let go, aiming at 0. Given
+// an initial velocity (a flick that ran out of content) that is exactly the
+// overscroll shape: one excursion out, then a smooth return with no wobble at
+// the boundary.
+class BounceScroll extends Animator {
+    spring: Spring;
+    // Weak for the same reason FlingScroll's is: the Window's animation list
+    // owns this, and a strong ref would keep a torn-down widget alive.
+    target: weak Widget;
+
+    fn init(w: weak Widget, start: float, vel_px_ms: float) {
+        this.spring = new Spring(BOUNCE_RESPONSE, BOUNCE_DAMPING);
+        this.spring.reset(start);
+        this.spring.retarget(0.0);
+        // nudge, not `velocity = ...`. A handover from a fling starts at 0
+        // with a target of 0, and retarget() ignores a target a resting spring
+        // already holds — so the spring would never wake and the bounce would
+        // silently not happen. nudge() is the "shove it, same destination"
+        // primitive that says it out loud. Spring integrates in seconds; the
+        // gesture measures px/ms.
+        this.spring.nudge(vel_px_ms * 1000.0);
+        this.target = w;
+        this.track_bounds = true;
+        this.bounds = w.bounds;
+        this.done = false;
+    }
+
+    override fn advance(dt_ms: int): bool {
+        let w = this.target;
+        if (w == null) { this.done = true; return false; }
+        if (!this.spring.step(dt_ms)) { this.done = true; return false; }
+        let left = this.spring.value;
+        if (left < 0.0) { left = 0.0 - left; }
+        // Same reason as the fling's: a spring's tail is sub-pixel for hundreds
+        // of frames, and repainting through it buys nothing anyone can see.
+        if (left < BOUNCE_SNAP_PX) {
+            w.set_overscroll(0.0);
+            this.bounds = w.bounds;
+            this.done = true;
+            return true;
+        }
+        w.set_overscroll(this.spring.value);
+        this.bounds = w.bounds;
+        return true;
+    }
+
+    override fn retain(moved: bool): bool { return moved && !this.done; }
+
+    override fn release() { this.target = null; }
+}
 
 // Per-widget kinetic-scroll state. Null until a widget is actually
 // drag-scrolled — the same lazy shape as `scrollbars` and `pending_anims`, so
@@ -1162,6 +1243,10 @@ class FlingScroll extends Animator {
     // advance() simply finds null and drops itself.
     target: weak Widget;
 
+    // Speed to hand to the bounce when this coast lands, or 0 for none. Set
+    // when the requested target was clamped at an end and the widget bounces.
+    bounce_v: float;
+
     fn init(w: weak Widget, start: float, vel_px_ms: float, to: float) {
         this.spring = new Spring(FLING_RESPONSE, FLING_DAMPING);
         this.spring.reset(start);
@@ -1171,6 +1256,7 @@ class FlingScroll extends Animator {
         this.target = w;
         this.track_bounds = true;
         this.bounds = w.bounds;
+        this.bounce_v = 0.0;
         this.done = false;
     }
 
@@ -1188,6 +1274,14 @@ class FlingScroll extends Animator {
             w.set_scroll_v(this.spring.target);
             this.bounds = w.bounds;
             this.done = true;
+            // The coast was cut short by the end of the content and the widget
+            // bounces: carry what is left of the throw into the overscroll,
+            // which is the moment the two hand over.
+            if (this.bounce_v != 0.0) {
+                let bv = this.bounce_v;
+                this.bounce_v = 0.0;
+                w.bounce_kick(bv);
+            }
             return true;
         }
         w.set_scroll_v(this.spring.value);
@@ -1261,6 +1355,20 @@ export class Widget {
     scroll_active: int;
     dragscroll: DragScroll; // touch-scroll state; null until first dragged
     scroll_children: bool;
+    // Overscroll bounce. Off by default — desktop does not bounce, Android's
+    // platform gesture is an edge glow, and every existing golden assumes the
+    // hard clamp. Turn it on per scrollable widget:
+    //
+    //     let sv = new ScrollView(content);
+    //     sv.bounce = true;
+    //
+    // `overscroll` is a *display* offset in px, not part of the scroll offset:
+    // positive drags the content down past its top, negative up past its
+    // bottom. Keeping it separate is what lets scroll_v stay clamped, so the
+    // scrollbars and ListView's row arithmetic need no notion of it.
+    bounce: bool;
+    overscroll: float;
+    bounce_anim: BounceScroll;
 
     fn init() {
         this.children = [];
@@ -1678,15 +1786,121 @@ export class Widget {
         // throw the content using a speed it no longer had.
         if (this.scroll_now_ms() - ds.last_ms > FLING_STALE_MS) { return false; }
         let start = this.scroll_v();
-        let to = start + v * FLING_COAST_MS;
+        let want = start + v * FLING_COAST_MS;
         let mx = this.scroll_v_max();
+        let to = want;
         if (to < 0.0) { to = 0.0; }
         if (to > mx) { to = mx; }
         if (to == start) { return false; }
         let f = new FlingScroll(this, start, v, to);
+        // The throw asked for more content than there is. Carry the part that
+        // was clipped into the bounce, so a hard flick at the end of a list
+        // arrives with speed and rebounds instead of stopping flat.
+        //
+        // The share of the original speed is the share of the coast that was
+        // lost, which is an approximation — the spring does not travel at a
+        // constant rate, so this is not the speed the content would truly have
+        // had at the boundary. It is monotone in both the flick and the
+        // overshoot, which is what the gesture needs to feel proportionate.
+        if (this.bounce && want != to) {
+            let lost = want - to;
+            if (lost < 0.0) { lost = 0.0 - lost; }
+            let total = want - start;
+            if (total < 0.0) { total = 0.0 - total; }
+            if (total > 0.0) { f.bounce_v = 0.0 - v * (lost / total); }
+        }
         ds.anim = f;
         this.register_anim(f);
         return true;
+    }
+
+    // ---- overscroll bounce ------------------------------------------------
+
+    // How far past the end the content may be pulled. A fraction of the
+    // viewport, so it is proportionate on a phone and on a desktop pane alike.
+    virtual fn bounce_limit(): float {
+        return this.scroll_viewport().h * BOUNCE_LIMIT_FRAC;
+    }
+
+    // The rubber band: how much of a drag past the end becomes displacement.
+    //
+    // Give falls off linearly with how far out the content already is, so the
+    // first pixels follow the finger almost exactly and the last ones barely
+    // move — the content decelerates to a stop instead of hitting a wall, and
+    // the limit is approached without ever quite being reached.
+    //
+    // Override to change the feel. `pull` is the current displacement and `dy`
+    // the drag delta; return the displacement to add.
+    virtual fn bounce_resist(pull: float, dy: float): float {
+        // Coming back tracks the finger exactly. Resistance belongs to pulling
+        // away from the content, not to letting it go — a return that fought
+        // the finger would feel like the list was stuck.
+        if ((pull > 0.0 && dy < 0.0) || (pull < 0.0 && dy > 0.0)) { return dy; }
+        let lim = this.bounce_limit();
+        if (lim <= 0.0) { return 0.0; }
+        let out = pull;
+        if (out < 0.0) { out = 0.0 - out; }
+        let give = 1.0 - out / lim;
+        if (give < 0.0) { give = 0.0; }
+        return dy * give;
+    }
+
+    // Called whenever `overscroll` changes, to put the content where it now
+    // belongs. The default repaints; a widget that positions its content in
+    // arrange (ScrollView) overrides to re-arrange first.
+    virtual fn bounce_applied() { this.invalidate(); }
+
+    fn set_overscroll(v: float) {
+        if (this.overscroll == v) { return; }
+        this.overscroll = v;
+        this.bounce_applied();
+    }
+
+    // Take a drag that no scrollable widget could act on. True when this
+    // widget absorbed it as overscroll.
+    //
+    // Reached only after every widget in the chain has refused to scroll AND
+    // no ancestor gesture claimed the drag — see on_drag, where the ordering
+    // is what keeps PullToRefresh working: an overscroll at the top is that
+    // widget's whole gesture, and it gets first refusal.
+    fn bounce_pull(dy: int): bool {
+        if (!this.bounce) { return false; }
+        // Nothing to scroll is nothing to bounce off. A short list that does
+        // not fill its viewport stays put, which is also what iOS does unless
+        // an app explicitly asks otherwise.
+        if (this.scroll_v_max() <= 0.0) { return false; }
+        // A drag *back* toward the content is not overscroll; that is the
+        // finger returning, and it is handled by the same accumulation with
+        // full give.
+        let add = this.bounce_resist(this.overscroll, dy as float);
+        if (add == 0.0) { return false; }
+        let now = this.overscroll + add;
+        // A return that would carry straight through the edge stops at it: the
+        // content is back where it belongs, and anything further is a scroll,
+        // which the next move event will be handled as.
+        if ((this.overscroll > 0.0 && now < 0.0) || (this.overscroll < 0.0 && now > 0.0)) {
+            now = 0.0;
+        }
+        if (this.bounce_anim != null) { this.bounce_anim.cancel(); this.bounce_anim = null; }
+        this.set_overscroll(now);
+        return true;
+    }
+
+    // Let go: spring back to the edge. True when a return actually started.
+    fn bounce_release(): bool {
+        if (this.overscroll == 0.0) { return false; }
+        this.bounce_kick(0.0);
+        return true;
+    }
+
+    // Start (or restart) the elastic return from wherever the content is, with
+    // `v` px/ms of speed still in it. A flick that outruns the content hands
+    // its leftover speed here; a plain release passes 0.
+    fn bounce_kick(v: float) {
+        if (this.bounce_anim != null) { this.bounce_anim.cancel(); this.bounce_anim = null; }
+        let b = new BounceScroll(this, this.overscroll, v);
+        this.bounce_anim = b;
+        this.register_anim(b);
     }
 
     // True if (px,py) lands on a live bar. Widgets whose child covers the bar
@@ -1909,6 +2123,21 @@ export class Widget {
             if (w.drag_scroll(dx, dy)) { return true; }
             w = w.parent;
         }
+        // Nothing scrolled and no ancestor gesture wanted it, so this drag is
+        // pushing against an end. Bounce it, on the nearest widget that opted
+        // in.
+        //
+        // The ordering above is load-bearing, not incidental. PullToRefresh is
+        // *defined* by receiving the drag a ScrollView refused at its top, and
+        // it takes it by overriding drag_scroll — so it is already inside the
+        // first walk. Bouncing before that walk finished, or bouncing in it,
+        // would swallow the pull gesture and pull-to-refresh would silently
+        // stop working wherever bounce was switched on.
+        w = this;
+        while (w != null) {
+            if (w.bounce_pull(dy)) { return true; }
+            w = w.parent;
+        }
         return false;
     }
 
@@ -1926,7 +2155,15 @@ export class Widget {
     }
     virtual fn on_drag_end(x: int, y: int): bool {
         this.scrollbar_release();
+        // Content held past its end returns to it. Checked before the fling,
+        // because a widget that is overscrolled was not scrolling when the
+        // finger lifted — there is nothing to throw.
         let w: Widget = this;
+        while (w != null) {
+            if (w.bounce_release()) { return true; }
+            w = w.parent;
+        }
+        w = this;
         while (w != null) {
             if (w.drag_scroll_end()) { return true; }
             w = w.parent;
@@ -2186,7 +2423,16 @@ export class Window {
         let alive: Animator[] = [];
         let full = false;
         let partial = false;
-        for (let t in this.animations) {
+        // Walked by index against a length captured up front, because a
+        // callback may *register* an animator: FlingScroll hands its remainder
+        // to a BounceScroll at the moment its coast lands. add_animation
+        // appends to this very list, so without the capture the newcomer would
+        // be advanced in the same pass it was created (a frame it has not been
+        // shown yet), and — worse — dropped entirely by the assignment below,
+        // which rebuilds `animations` from `alive`. It simply never ran.
+        let n = this.animations.len;
+        for (let i in 0..n) {
+            let t = this.animations[i];
             let moved = t.advance(dt_ms);
             // A passive animator is a timer, not an animation: advance it, but
             // never repaint on its account. Its callback calls invalidate()
@@ -2204,6 +2450,10 @@ export class Window {
             if (t.retain(moved)) { alive.push(t); }
             else { t.release(); }  // break the closure/spring RC cycle
         }
+        // Carry over whatever the callbacks above registered. They start on the
+        // next pass, with a full dt.
+        let m = this.animations.len;
+        for (let i in n..m) { alive.push(this.animations[i]); }
         this.animations = alive;
         if (full) {
             this.has_dirty = false; // the full redraw covers everything
@@ -2243,13 +2493,37 @@ export class Window {
         this.overlay = o;
         this.layout();
         this.redraw();
+        this.nav_changed();
     }
 
     fn dismiss_overlay() {
         this.overlay = null;
         this.layout();
         this.redraw();
+        this.nav_changed();
     }
+
+    // "Undo the last navigation step" — Android's system Back key, and Escape
+    // with no overlay open, are the same gesture. Return true when the app
+    // consumed it (popped a screen, closed a panel); the hook owns its own
+    // repaint, same contract as PullToRefresh.onRefresh.
+    //
+    // A virtual rather than a callback field on purpose: a closure stored on
+    // the Window that captures the Window is a strong reference cycle, and
+    // there are no weak locals to break it with.
+    virtual fn on_back(): bool { return false; }
+
+    // The poppable-navigation state changed — an overlay opened or dismissed,
+    // or a platform Window pushed or popped a screen. A platform Window
+    // overrides this to publish how deep the stack is to whatever has to
+    // answer for it: Android's Native.back() runs on the UI thread and must
+    // say yes or no synchronously, without asking the Vyto thread.
+    //
+    // Overlays are the only thing the base Window knows about, so this fires
+    // from open_overlay/dismiss_overlay, which every overlay in the toolkit
+    // routes through. Toasts deliberately do not count — no platform pops a
+    // snackbar with Back.
+    virtual fn nav_changed() { }
 
     // Transient notifications (Toast/Snackbar). They live in a separate top-most
     // layer from `overlay`, so a toast can appear over a dialog and never blocks
@@ -2522,8 +2796,22 @@ export class Window {
             if (old != null) { this.mark_dirty(old.bounds); }
             if (now != null) { this.mark_dirty(now.bounds); }
             this.repaint();
-        } else if (k == KEY_ESC && this.close_on_esc) {
-            this.running = false;
+        } else if (k == KEY_ESC) {
+            // on_back gets first refusal: a pushed screen pops. Only then does
+            // Escape mean "close the window", and only then does it reach a
+            // widget that uses it locally — DataTable cancels an inline cell
+            // edit that way, and that fall-through has to survive.
+            if (this.on_back()) {
+                // consumed; the hook repainted
+            } else if (this.close_on_esc) {
+                this.running = false;
+            } else {
+                let f = this.focused_widget();
+                if (f != null && f.on_key(k, ch)) {
+                    this.mark_dirty(f.bounds);
+                    this.repaint();
+                }
+            }
         } else {
             let f = this.focused_widget();
             if (f != null && f.on_key(k, ch)) {

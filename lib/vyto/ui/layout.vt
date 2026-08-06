@@ -956,6 +956,14 @@ export class ScrollView extends Box {
         }
     }
 
+    // The child's position is decided in arrange, so a changed overscroll has
+    // to run through it again — repainting alone would draw the content at the
+    // bounds it was last given.
+    override fn bounce_applied() {
+        this.rearrange();
+        this.invalidate();
+    }
+
     // Report the child's width but 0 height — the ScrollView is meant to
     // fill whatever vertical space its parent gives it (via grow=1) and
     // scroll the child within that. Reporting the child's natural height
@@ -980,8 +988,10 @@ export class ScrollView extends Box {
         this.content_h = cs.h;
         // clamp scroll_y to valid range
         if (this.scroll_y > this.max_scroll()) { this.scroll_y = this.max_scroll(); }
-        // arrange child at natural height, offset by -scroll_y
-        c.arrange(s, th, Rect(r.x, r.y - this.scroll_y, r.w, cs.h));
+        // arrange child at natural height, offset by -scroll_y, plus any
+        // overscroll displacement (0 unless bounce is on and the content is
+        // being held past an end — see Widget.bounce).
+        c.arrange(s, th, Rect(r.x, r.y - this.scroll_y + this.overscroll, r.w, cs.h));
     }
 
     override fn render(s: Painter, th: Theme) {
@@ -1172,10 +1182,19 @@ export class ListView extends Widget {
 
     override fn render(s: Painter, th: Theme) {
         let n = this.count();
-        // first row index (truncates), then the sub-row pixel remainder —
-        // `%` is integer-only, so the remainder is derived instead.
-        let first = (this.scroll / this.row_h) as int;
-        let off = this.scroll - (first as float) * this.row_h;
+        // Overscroll displaces the whole run of rows, so it is folded into the
+        // scroll position the window is derived from rather than subtracted
+        // from the remainder afterwards. Subtracting it later shifts the rows
+        // without moving the window that decides which rows exist, and the
+        // list runs out of them at whichever edge it was pulled away from.
+        //
+        // Floor, not truncate: a bounce at the top makes this negative, and
+        // truncation rounds toward zero there, which would put `off` outside
+        // [0, row_h) and slide every row by up to a full row.
+        let eff = this.scroll - this.overscroll;
+        let firstf = (eff / this.row_h).floor();
+        let first = firstf as int;
+        let off = eff - firstf * this.row_h;
         let vis = (this.bounds.h / this.row_h) as int + 2;
         s.clip_push(this.bounds, 0.0);
         for (let i in 0..vis) {

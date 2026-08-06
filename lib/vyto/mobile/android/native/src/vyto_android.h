@@ -70,6 +70,16 @@ void vs_android_push_vsync(void);
 /* Ask the loop to exit: makes vs_wait return VS_EV_CLOSE. */
 void vs_android_request_close(void);
 
+/* ------------------------------------------------------------- back key
+ *
+ * Implemented by aback.c. Written from the Vyto thread by
+ * AndroidWindow.nav_changed, read from the UI thread by Native.back(), which
+ * has to answer "did the app consume that press?" without blocking on the
+ * Vyto thread. See aback.c for why a plain volatile int is enough.
+ */
+void vta_set_back_depth(int32_t n);
+int32_t vta_back_depth(void);
+
 /* ------------------------------------------------------------ intent queue
  *
  * Implemented by aintent_shim.c. Pushed from the UI thread by jni_boot.c,

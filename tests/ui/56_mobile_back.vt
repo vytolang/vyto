@@ -1,0 +1,42 @@
+// System Back with an overlay open: the overlay eats it, and the screen
+// underneath stays pushed.
+//
+// Escape is not a stand-in for Back here, it *is* the wire: Native.back()
+// answers the UI thread from the depth AndroidWindow published, then pushes a
+// KEY_ESC into the event queue (jni_boot.c). Everything below the JNI boundary
+// is what this file exercises.
+//
+// The end state is the whole point. Dismissing the overlay and popping the
+// screen both take the depth down by one, so a single golden that pressed Back
+// twice could not tell the right order from the wrong one — hence one press
+// here, and the exit path in 57_mobile_back_exit.
+import { Label } from "vyto/ui";
+import { AndroidWindow } from "vyto/mobile/android/ui";
+
+// The same integer Native.back() reads. Its desktop arm is not a stub — it is
+// the same one int (native/src/aback.c).
+extern "C" {
+    fn vta_back_depth(): i32;
+}
+
+fn show(tag: string, win: AndroidWindow) {
+    print(tag + " depth=" + vta_back_depth() + " screens=" + win.screens.len);
+}
+
+fn main() {
+    let win = new AndroidWindow("Back", 200, 400);
+    win.set_content(new Label("home"));
+    show("base", win);
+
+    win.push_screen(new Label("story"));
+    show("pushed", win);
+
+    // Counted too: Back pops an overlay as readily as a screen, so the depth
+    // has to include it or the first press would fall through to the Activity.
+    win.open_overlay(new Label("sheet"));
+    show("overlay", win);
+
+    win.run();
+
+    show("after", win);
+}

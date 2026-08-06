@@ -143,9 +143,14 @@ public final class Native {
      * System back. Returns true when Vyto consumed it (closed an overlay, popped
      * a screen) and false to let the Activity finish.
      *
-     * <p>NOTE: Vyto has no back-navigation concept yet — no {@code on_back}, no
-     * nav stack (ANDROID.md Track C item 3). Until that lands this always
-     * returns false, which is correct-but-useless: back always exits the app.
+     * <p>Answered without blocking: {@code AndroidWindow.nav_changed} publishes
+     * how many screens and overlays are poppable (aback.c) and this reads that
+     * integer, because the call runs on the UI thread and the Vyto thread is
+     * usually parked in {@code surf.wait()}. A true answer also pushes an
+     * Escape key event, which both wakes that loop and tells it what happened.
+     *
+     * <p>An app that never pushes a screen keeps the old behaviour exactly:
+     * depth stays 0, this returns false, and back exits.
      */
     public static native boolean back();
 

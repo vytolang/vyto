@@ -68,6 +68,10 @@ static void *vyto_thread_main(void *arg) {
 
     vta_logf("vyto thread up");
     vyto_app_main();      /* returns when Window.run() exits */
+    /* Nothing is left to pop. Without this a stale positive depth would make
+     * Native_back claim every press for a loop that is no longer running, and
+     * Back would be dead for as long as the Activity outlives the thread. */
+    vta_set_back_depth(0);
     vta_logf("vyto thread down");
 
     if (g_vm) (*g_vm)->DetachCurrentThread(g_vm);
@@ -230,12 +234,29 @@ Java_dev_vyto_android_Native_key(JNIEnv *env, jclass cls, jint keycode,
 JNIEXPORT jboolean JNICALL
 Java_dev_vyto_android_Native_back(JNIEnv *env, jclass cls) {
     (void)env; (void)cls;
-    /* Vyto has no back-navigation concept: no on_back, no nav stack
-     * (ANDROID.md Track C item 3). Returning false means back always exits the
-     * app, which is honest rather than correct. When the nav stack lands this
-     * becomes a queued event with a synchronous answer, which will need care —
-     * the UI thread is asking a question the Vyto thread has to answer. */
-    return JNI_FALSE;
+    /* The question the UI thread is asking is one only the Vyto thread can
+     * answer, and it must be answered now. So it is answered from a depth the
+     * Vyto thread published in advance (aback.c) rather than by waking it and
+     * waiting: AndroidWindow.nav_changed writes how many screens and overlays
+     * are poppable, and this reads it. Zero means nothing to pop — return
+     * false and let the Activity finish, which is the one path that ends the
+     * app.
+     *
+     * The press itself travels as Escape rather than a key code of its own,
+     * for three reasons. Window.on_key_ev already reads Escape as "dismiss the
+     * open overlay"; AndroidWindow.on_back turns the no-overlay case into "pop
+     * a screen"; and — the load-bearing one — the key push is also the
+     * *wakeup*. Window.run() blocks in surf.wait() whenever nothing is
+     * animating, which is exactly the state a Back press arrives in, so a bare
+     * flag store would not be seen until some unrelated touch happened to
+     * arrive. Pushing an event wakes the loop and carries the meaning at once.
+     *
+     * KEY_ESC is 1002 (vyto/surface/surface.vt) — a vsurf-level key code, not
+     * an Android one, since that is what the queue speaks. */
+    if (!g_thread_live || vta_back_depth() <= 0) return JNI_FALSE;
+    vs_android_push_key(1002 /* KEY_ESC */, "", 0, 1);
+    vs_android_push_key(1002 /* KEY_ESC */, "", 0, 0);
+    return JNI_TRUE;
 }
 
 JNIEXPORT void JNICALL

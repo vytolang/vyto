@@ -224,12 +224,27 @@ export class BottomNavigationBar extends Widget {
             let fg = th.on_surface_muted;
             if (i == this.selected) {
                 fg = th.primary;
-                // M3 active indicator: a filled pill behind the active item
+                // M3 active indicator: a filled pill behind the active item.
+                //
+                // Centred on the label, not offset from the top of the bar. M3
+                // puts the pill behind an *icon* with the label below it; this
+                // bar draws the label alone and centres it vertically, so a
+                // 12dp top offset left the pill floating above the word it was
+                // supposed to be highlighting.
+                //
+                // Width follows the text too. At six destinations a fixed
+                // fraction of the segment is narrower than "show" on some
+                // scales, which crops the pill to the middle of the word.
                 let k = ui_scale(this);
-                let pw = seg * 0.6;
                 let ph = 32.0 * k;
-                let pr = Rect(ir.x + (seg - pw) / 2.0, ir.y + 12.0 * k, pw, ph);
-                s.fill_round(pr, ph / 2.0, with_alpha(th.primary, 40));
+                let pw = s.text_width(this.items[i]) + 24.0 * k;
+                let cap = seg - 8.0 * k;
+                if (pw > cap) { pw = cap; }
+                let pr = Rect(ir.center_x(pw), ir.center_y(ph), pw, ph);
+                // Mixed rather than alpha-filled: the lean tier cannot blend
+                // and would paint this the full primary colour, burying the
+                // label it sits behind.
+                s.fill_round(pr, ph / 2.0, mix(th.surface_raised, th.primary, 0.16));
             }
             s.text_center(ir, this.items[i], fg);
         }
@@ -1273,6 +1288,11 @@ extern "C" {
     fn vta_inset_right(): i32;
     fn vta_inset_bottom(): i32;
     fn vta_inset_ime(): i32;
+    // How many things the system Back key could pop. Published by
+    // AndroidWindow.nav_changed, read by Native.back() on the UI thread —
+    // native/src/aback.c explains why an unsynchronised int is enough.
+    fn vta_set_back_depth(n: i32);
+    fn vta_back_depth(): i32;
 }
 
 export fn safeInsetLeft(): float { return vta_inset_left() as float; }
@@ -1385,9 +1405,23 @@ export class SafeArea extends Widget {
 //     win.use_painter(new AndroidPainter(win.surface(), 15.0));
 //     win.set_content(new Column([...]));
 //     win.run();
+//
+// It also owns the screen stack, which is what makes the system Back key work:
+//
+//     win.push_screen(story_screen);   // back returns to the feed
+//     win.push_screen(...);            // back at the base screen exits the app
+//
+// The stack and the depth published to Native.back() have to agree, so they
+// live in one class rather than being a convention every app re-honours.
 export class AndroidWindow extends Window {
     // The wrapper installed by set_content; reach for it to switch an edge off.
     safe: SafeArea;
+
+    // The screen stack, base first. Strong: this class owns the screens that
+    // are off-tree, and a popped-to screen keeps its scroll position and its
+    // widget state because it was never torn down. `root`/`safe` are the
+    // tree's own links to whichever one is showing.
+    screens: Widget[];
 
     fn init(title: string, w: int, h: int) {
         super.init(title, w, h);
@@ -1396,13 +1430,71 @@ export class AndroidWindow extends Window {
         // touches near the right edge reach the content instead of a bar nobody
         // can see. Set it back on the theme if a screen really wants them.
         this.theme.scrollbars_visible = false;
+        this.screens = [];
+        // Escape must never close the window here, because Escape is the wire
+        // the system Back key rides on (jni_boot.c) and the depth Native.back()
+        // reads can be one frame stale. That race is only benign while a
+        // spurious Escape is a no-op — with close_on_esc left true it would be
+        // an unexplained app exit instead. Exiting is Native.back() answering
+        // false and the Activity finishing, and nothing else.
+        this.close_on_esc = false;
+        vta_set_back_depth(0);
     }
 
-    // Set the window's content, inset out of the system bars. Assign `root`
-    // directly instead when a screen genuinely wants to paint edge to edge.
+    // Set the base screen, inset out of the system bars. Resets the stack, so
+    // calling it again is "go home". Assign `root` directly instead when a
+    // screen genuinely wants to paint edge to edge.
     fn set_content(content: Widget) {
+        this.screens = [content];
+        this.install(content);
+        this.nav_changed();
+    }
+
+    // Push a screen over the current one. The one underneath stays alive
+    // off-tree, so popping back to it costs nothing and restores it exactly.
+    fn push_screen(content: Widget) {
+        this.screens.push(content);
+        this.install(content);
+        // set_content only assigns root; after run() has started, re-measuring
+        // and repainting are ours to do.
+        this.layout();
+        this.redraw();
+        this.nav_changed();
+    }
+
+    // Pop back one screen. False at the base — which is what tells the system
+    // Back key to stop consuming presses and let the Activity finish.
+    fn pop_screen(): bool {
+        if (this.screens.len <= 1) { return false; }
+        this.screens.pop();
+        this.install(this.screens[this.screens.len - 1]);
+        this.layout();
+        this.redraw();
+        this.nav_changed();
+        return true;
+    }
+
+    fn install(content: Widget) {
         let sa = new SafeArea(content);
         this.safe = sa;
         this.root = sa;
     }
+
+    // Everything Back could pop: the screens above the base, plus an open
+    // overlay. Toasts are deliberately not counted — no platform pops a
+    // snackbar with Back.
+    fn back_depth(): int {
+        let d = this.screens.len - 1;
+        if (d < 0) { d = 0; }
+        if (this.overlay != null) { d = d + 1; }
+        return d;
+    }
+
+    override fn nav_changed() {
+        vta_set_back_depth(this.back_depth() as i32);
+    }
+
+    // Reached only once Window.on_key_ev has offered the Escape to an open
+    // overlay and found none, so by here "back" really does mean "pop".
+    override fn on_back(): bool { return this.pop_screen(); }
 }

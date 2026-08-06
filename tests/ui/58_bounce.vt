@@ -1,0 +1,51 @@
+// Overscroll bounce: dragging past an end, and the elastic return.
+//
+// The list is already at its top, so every drag_scroll in the chain refuses
+// the downward drag — which is what routes it to bounce_pull. Three things are
+// asserted by the trace:
+//
+//   1. the content moves past the end at all (it is pinned at 0 without
+//      bounce, and this whole file prints y=0 forever);
+//   2. resistance — the same 20px of finger buys less the further out the
+//      content already is. Asserted directly off bounce_resist rather than
+//      inferred from the trace, whose sampling cannot see individual moves;
+//   3. the return lands exactly on 0 and stops there, rather than wobbling
+//      around the edge. Critical damping is what that is for.
+//
+// `scroll` stays 0 throughout: overscroll is a display offset, deliberately
+// not part of the scroll position.
+import { Window, ScrollView, Column, Label } from "vyto/ui";
+
+class Trace {
+    n: int;
+    every: int;
+    fn init(every: int) { this.n = 0; this.every = every; }
+    fn tick(v: float, s: float) {
+        if (this.n % this.every == 0) { print("over=" + v + " scroll=" + s); }
+        this.n = this.n + 1;
+    }
+}
+
+fn main() {
+    let win = new Window("Bounce", 200, 200);
+    let col = new Column([]);
+    for (let i in 0..60) { col.add(new Label("row " + i)); }
+    let sv = new ScrollView(col);
+    sv.bounce = true;
+    win.root = sv;
+
+    let tr = new Trace(4);
+    sv.ticker(16, () => { tr.tick(sv.overscroll, sv.scroll_y); });
+    win.run();
+
+    print("final=" + sv.overscroll);
+    print("scroll=" + sv.scroll_y);
+    print("limit=" + sv.bounce_limit());
+    // The rubber band at three points: full give at the edge, less half way
+    // out, none at the limit. Monotone decreasing is the whole property.
+    print("give@0=" + sv.bounce_resist(0.0, 20.0));
+    print("give@35=" + sv.bounce_resist(35.0, 20.0));
+    print("give@70=" + sv.bounce_resist(70.0, 20.0));
+    // And the return tracks the finger exactly, at any displacement.
+    print("back@35=" + sv.bounce_resist(35.0, -20.0));
+}
