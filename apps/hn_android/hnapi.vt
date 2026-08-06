@@ -1,0 +1,212 @@
+// hnapi — the Hacker News client, Android tier.
+//
+// Lifted from apps/hackernews/api.vt, which talks to the Algolia HN Search API
+// (https://hn.algolia.com/api/v1) because the old Firebase endpoint is gone.
+// The two calls this app makes are unchanged:
+//
+//     /search, /search_by_date  ->  30 fully-populated stories in one response
+//     /items/:id                ->  a story plus its ENTIRE comment tree, nested
+//
+// Both are single round trips, so there is no N+1 fetch anywhere and no
+// request fan-out to manage.
+//
+// -- what changed from the server version, and why ---------------------------
+//
+// The import is vyto/mobile/android/net instead of vyto/net/http: same names,
+// same builder chain, same soft-failure contract, but through
+// HttpURLConnection rather than a libcurl this platform does not have.
+//
+// The bigger change is that Store no longer touches the network at all. On the
+// server, one blocking http_get per page view is exactly right — a request
+// handler has nothing else to do. Here the Vyto thread is also the render
+// thread, so a blocking send() freezes the UI for the length of a round trip.
+// So Store is reduced to a cache plus request builders, and the actual fetch
+// is App's HttpPool + a per-frame poll (hnapp.vt). What is left here is the
+// part that has no I/O in it: which URL, and what the JSON means.
+
+import { http_get, Request } from "vyto/mobile/android/net";
+import { json_parse, JsonValue } from "vyto/util/json";
+import { LRU, lru_str_str } from "vyto/coll/lru";
+import { unixSec } from "vyto/util/time";
+import { parse_int } from "vyto/cli";
+
+const HN_API: string = "https://hn.algolia.com/api/v1";
+
+export const PER_PAGE: int = 30;
+
+// Seconds. Feeds move; a story's comment tree does not, much.
+export const TTL_FEED: int = 60;
+export const TTL_ITEM: int = 300;
+
+const WEEK: int = 7 * 24 * 3600;
+
+// The six feeds, in bottom-nav order. A function rather than a const because
+// an array literal is not a constant expression.
+export fn feeds(): string[] { return ["top", "new", "best", "ask", "show", "jobs"]; }
+
+// One row of a feed listing. Only /search hits become an Item — the story
+// screen walks the /items/:id JSON directly, since a comment tree is already
+// the shape the renderer wants.
+export class Item {
+    id: int;
+    kind: string;        // "story" | "job"
+    by: string;
+    title: string;
+    url: string;         // "" for text posts (Ask HN, polls)
+    text: string;        // story_text: HTML, escaped by HN itself
+    score: int;
+    comments: int;
+    time: int;           // unix seconds
+
+    // Job hits carry neither points nor num_comments, and asInt() cannot tell
+    // "absent" from "zero" — so ask the JSON, once, here.
+    has_score: bool;
+    has_comments: bool;
+
+    fn init() {
+        this.id = 0;
+        this.kind = "story";
+        this.by = "";
+        this.title = "";
+        this.url = "";
+        this.text = "";
+        this.score = 0;
+        this.comments = 0;
+        this.time = 0;
+        this.has_score = false;
+        this.has_comments = false;
+    }
+}
+
+// A page of a feed. `err` is "" when fine.
+export class Feed {
+    items: Item[];
+    page: int;           // 1-based
+    nb_pages: int;
+    err: string;
+
+    fn init() {
+        this.items = [];
+        this.page = 1;
+        this.nb_pages = 1;
+        this.err = "";
+    }
+}
+
+// A search hit. Note `objectID` is a *string* here while /items/:id calls the
+// same field `id` and makes it an int — the two endpoints genuinely disagree.
+fn item_from_hit(v: JsonValue): Item {
+    let it = new Item();
+
+    let out: int[] = [0];
+    let ok = parse_int(v.get("objectID").asString(), out);
+    if (ok) { it.id = out[0]; }
+
+    it.by = v.get("author").asString();
+    it.title = v.get("title").asString();
+    it.url = v.get("url").asString();
+    it.text = v.get("story_text").asString();
+    it.time = v.get("created_at_i").asInt();
+
+    it.has_score = v.has("points") && !v.get("points").isNull();
+    if (it.has_score) { it.score = v.get("points").asInt(); }
+
+    it.has_comments = v.has("num_comments") && !v.get("num_comments").isNull();
+    if (it.has_comments) { it.comments = v.get("num_comments").asInt(); }
+
+    it.kind = "story";
+    let tags = v.get("_tags");
+    for (let i in 0..tags.len()) {
+        if (tags.at(i).asString() == "job") { it.kind = "job"; }
+    }
+    return it;
+}
+
+export class Store {
+    cache: LRU<string, string>;
+
+    fn init() { this.cache = lru_str_str(64); }
+
+    // "" on a miss or a stale entry.
+    //
+    // LRU has no TTL of its own, so the stored value is "<unix seconds>\n<body>"
+    // and the stamp is checked on the way out. The key is the assembled URL,
+    // which Request.query() percent-encodes as it goes — so it is available
+    // before send(), which is what lets the cache be consulted before a request
+    // is ever queued.
+    fn cached_body(key: string, ttl: int): string {
+        let hit = this.cache.get_or(key, "");
+        if (hit.len == 0) { return ""; }
+        let nl = hit.index_of("\n");
+        if (nl <= 0) { return ""; }
+        let out: int[] = [0];
+        if (!parse_int(hit.slice(0, nl), out)) { return ""; }
+        if ((unixSec() as int) - out[0] >= ttl) { return ""; }
+        return hit.slice(nl + 1, hit.len);
+    }
+
+    fn store_body(key: string, body: string) {
+        if (body.len == 0) { return; }
+        this.cache.put(key, str(unixSec() as int) + "\n" + body);
+    }
+
+    // The feed table. /search ranks by points, so the bare story/ask_hn/show_hn
+    // tags return all-time greatest hits — the created_at window is what turns
+    // them back into a feed. /search_by_date is already chronological.
+    //
+    // The window is rounded down to the hour on purpose: an unrounded "now - 7d"
+    // would put a new timestamp in the URL every second, and since the URL is the
+    // cache key, the cache would never hit once.
+    fn feed_req(name: string, page: int): Request {
+        let cut = ((unixSec() as int) - WEEK) / 3600 * 3600;
+        let r = http_get(HN_API + "/search");
+
+        if (name == "new") {
+            r = http_get(HN_API + "/search_by_date").query("tags", "story");
+        } else if (name == "jobs") {
+            r = http_get(HN_API + "/search_by_date").query("tags", "job");
+        } else if (name == "best") {
+            r = r.query("tags", "story").query("numericFilters", "created_at_i>" + cut);
+        } else if (name == "ask") {
+            r = r.query("tags", "ask_hn").query("numericFilters", "created_at_i>" + cut);
+        } else if (name == "show") {
+            r = r.query("tags", "show_hn").query("numericFilters", "created_at_i>" + cut);
+        } else {
+            r = r.query("tags", "front_page");   // "top"
+        }
+
+        r.query("hitsPerPage", str(PER_PAGE));
+        r.query("page", str(page - 1));          // the API counts from 0
+        return r;
+    }
+
+    fn story_req(id: int): Request { return http_get(HN_API + "/items/" + id); }
+
+    fn parse_feed(body: string, page: int): Feed {
+        let f = new Feed();
+        f.page = page;
+
+        let doc = json_parse(body);
+        if (doc.parseError().len > 0) {
+            f.err = "bad JSON from hn.algolia.com";
+            return f;
+        }
+
+        f.nb_pages = doc.get("nbPages").asInt();
+        if (f.nb_pages < 1) { f.nb_pages = 1; }
+
+        let hits = doc.get("hits");
+        for (let i in 0..hits.len()) {
+            f.items.push(item_from_hit(hits.at(i)));
+        }
+        return f;
+    }
+
+    // The story with its whole comment tree, as raw JSON. Null when the body
+    // was not JSON.
+    fn parse_story(body: string): JsonValue {
+        let v = json_parse(body);
+        if (v.parseError().len > 0) { return null; }
+        return v;
+    }
+}

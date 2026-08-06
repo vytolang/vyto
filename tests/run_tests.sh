@@ -1017,6 +1017,13 @@ if [ -f /usr/include/X11/Xlib.h ]; then
         --filter 'XDrawRectangle' --filter 'XDrawLine' --filter 'XDrawString' \
         --filter 'XSetForeground' --filter 'XFlush' --filter 'XFreeGC' \
         > apps/todo/x11/x11.vt || exit 1
+    # apps/hn_android is deliberately absent from every check in this file. It
+    # imports vyto/mobile/android/*, whose C shims are #ifdef __ANDROID__, so it
+    # does not link for the host at all — and building it for its own triple
+    # needs an NDK, which is exactly what this suite refuses to require so that
+    # CI never downloads one. Its pipeline is apps/hn_android/build-apk.sh, run
+    # by hand; the widgets underneath it are covered by tests/ui/*_mobile_*.vt
+    # (make test-mobile), which do run everywhere.
     if ./vytoc build apps/todo/todo.vt >/dev/null; then
         echo "PASS app_todo_builds"
     else

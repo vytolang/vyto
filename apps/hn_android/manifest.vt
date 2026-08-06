@@ -1,0 +1,41 @@
+// Emits AndroidManifest.xml for the HN reader, and refuses to emit a bad one.
+//
+// This runs on the *host* — it is a plain Vyto program with no shim behind it,
+// which is what lets the manifest be checked before anything expensive in the
+// apk pipeline runs. build-apk.sh calls it as step 1 for exactly that reason.
+//
+//     vytoc run manifest.vt > AndroidManifest.xml
+
+import { Manifest, PERM_INTERNET, ACT_VIEW_URL } from "vyto/mobile/android/manifest";
+
+fn main() {
+    let mf = new Manifest("dev.vyto.hn", "Vyto HN");
+    mf.version(1, "0.1");
+    // 24 is not a free choice: android.icu.* (the intl tier) needs it, and the
+    // NDK clang driver in build-apk.sh must be the matching android24 one or
+    // the app installs and then crashes on old devices.
+    mf.sdk(24, 34);
+    mf.needs_net();
+
+    // Opening a story's link is an intent to something else's activity, and on
+    // targetSdk >= 30 an app cannot even *see* a package it has not declared
+    // interest in. Without the <queries> block this emits, Actions.view_url
+    // returns false and says nothing — the link would simply do nothing.
+    mf.uses(ACT_VIEW_URL);
+
+    // VytoActivity.libraryName() defaults to "vytoapp", so the .so must be
+    // libvytoapp.so. Recorded here too so the manifest and the build agree in
+    // one visible place rather than by coincidence.
+    mf.metadata("vyto.lib", "vytoapp");
+
+    let probs = mf.validate();
+    if (probs.len > 0) {
+        // panic rather than print-and-continue: a caller redirecting stdout to
+        // AndroidManifest.xml must end up with an empty file and a non-zero
+        // exit, not a silently broken manifest that only fails at install time.
+        let msg = "manifest is invalid:";
+        for (let p in probs) { msg = msg + "\n  - " + p; }
+        panic(msg);
+    }
+    print(mf.render());
+}

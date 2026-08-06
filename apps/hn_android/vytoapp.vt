@@ -1,0 +1,84 @@
+// A Hacker News reader for Android, in Vyto.
+//
+// Two screens: a feed of stories with six tabs, and a story with its comment
+// tree. Tapping the host chip on a row opens the link in the browser; tapping
+// anywhere else opens the comments. The system Back key pops the story screen
+// and exits from the feed.
+//
+// Built into libvytoapp.so — the name matters, because VytoActivity's
+// libraryName() defaults to "vytoapp" and calls System.loadLibrary on it. That
+// is why this file is not called hn.vt.
+//
+// Build with apps/hn_android/build-apk.sh (needs an NDK and an SDK; no test
+// suite runs it). See README.md in this directory.
+
+import { Column, ScrollView, Padding, skin_material, theme_material } from "vyto/ui";
+import { AndroidPainter } from "vyto/mobile/android/painter";
+import { AndroidWindow, PullToRefresh, BottomNavigationBar } from "vyto/mobile/android/ui";
+import { feeds } from "hnapi";
+import { TopBar } from "hnrows";
+import { App } from "hnapp";
+
+fn main() {
+    let win = new AndroidWindow("Vyto HN", 1080, 2160);
+    // The Android tier: draw through android.graphics.Canvas rather than
+    // blend2d. AndroidWindow deliberately does not do this for you — its
+    // package has to keep linking on the desktop, where AndroidPainter's shim
+    // does not exist.
+    win.use_painter(new AndroidPainter(win.surface(), 15.0));
+
+    // Both before run(), which calls theme.apply_scale() with the display
+    // density: a theme swapped in afterwards would keep unscaled px metrics.
+    win.skin = skin_material();
+    win.theme = theme_material();
+
+    let app = new App();
+    app.win = win;
+
+    // The shell is the one widget that outlives every screen swap, which makes
+    // it the right home for the network poll ticker.
+    let shell = new Padding(0.0, null);
+    app.shell = shell;
+    win.set_content(shell);
+
+    // ---- the feed screen, built once ------------------------------------
+    //
+    // Only its scrolling content is rebuilt when data lands (App.render_feed),
+    // so the scroll offset, the pull gesture and the nav selection all survive
+    // a refresh.
+    let bar = new TopBar("HN · top", "");
+    app.bar = bar;
+
+    let list_host = new Padding(0.0, null);
+    app.list_host = list_host;
+
+    let sv = new ScrollView(list_host);
+    sv.grow = 1;
+    // Overscroll bounce. At the top this never fires: PullToRefresh is the
+    // parent and claims that drag first, which is exactly the precedence
+    // tests/ui/58_mobile_bounce_pull pins down. So on the feed it is the
+    // bottom edge that bounces, and a hard flick into the last story rebounds
+    // instead of stopping against a wall.
+    sv.bounce = true;
+
+    // Wrapping order is the wiring: a downward drag on content already at its
+    // top is refused by the ScrollView and falls through to PullToRefresh.
+    let ptr = new PullToRefresh();
+    ptr.add(sv);
+    ptr.grow = 1;
+    ptr.onRefresh = () => { app.refresh(); };
+    app.ptr = ptr;
+
+    let nav = new BottomNavigationBar(feeds());
+    nav.onSelect = (i) => { app.select_feed(i); };
+    app.nav = nav;
+
+    let feed = new Column([bar, ptr, nav]).pad(0.0).gap(0.0);
+    shell.add(feed);
+
+    // First fetch. It does not block: begin() queues into the HttpPool and the
+    // spinner is what run() paints until the response lands.
+    app.select_feed(0);
+
+    win.run();
+}

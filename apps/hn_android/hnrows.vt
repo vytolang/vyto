@@ -1,0 +1,544 @@
+// hnrows — the rows the two screens are made of.
+//
+// All five are childless Widgets that draw their own text, and that is the
+// design decision worth stating, because the obvious alternative does not
+// work: a row composed of Label/Text children hit-tests to the *child*
+// (Widget.hit walks to the deepest leaf), and neither Label nor Text handles
+// on_click — so the tap is silently swallowed. apps/iphone's AppTile solves
+// that with a hit() override; a widget with no children needs no override,
+// because the default hit() already returns itself.
+//
+// It is also much cheaper. A comment thread is 150 rows; as Text widgets that
+// would be 150 SelectionModels and 150 focusable nodes in the focus ring, for
+// text nobody is going to select on a phone.
+//
+// Type scale comes from the painter (push_font/pop_font), which AndroidPainter
+// implements. Note that text_width answers for the *currently pushed* font, so
+// wrapping has to happen inside the same push as the drawing.
+
+import { Widget, Painter, Theme, Size, BoxConstraints, WEIGHT_REG, WEIGHT_MED,
+         WEIGHT_BOLD } from "vyto/ui";
+import { Rect, contains, rgb, mix } from "vyto/surface";
+import { wrap } from "hnfmt";
+
+// The probe width Column.measure uses to ask "how tall, unbounded?".
+const PROBE_W: float = 100000.0;
+
+const TITLE_LINES: int = 3;
+
+// Row padding and the comment indent step, in unscaled px — Theme.apply_scale
+// has already multiplied the theme's own metrics by the display density, so
+// these are taken from the theme rather than written as constants where one
+// exists to take them from.
+
+// ---------------------------------------------------------------- story row
+
+export class StoryRow extends Widget {
+    sid: int;
+    title: string;
+    meta: string;
+    host: string;
+    onTap: fn(int);
+    onTapLink: fn(int);
+
+    // Where the host chip landed, so on_click can tell "open the link" from
+    // "open the comments". Zero-sized when there is no link (a text post).
+    link_rect: Rect;
+
+    // Wrap cache, keyed on the width it was computed at.
+    lines: string[];
+    meta_fit: string;   // meta, elided to the space the host chip leaves
+    host_w: float;
+    cached_w: float;
+    cached_h: float;
+
+    fn init(sid: int, title: string, meta: string, host: string) {
+        super.init();
+        this.sid = sid;
+        this.title = title;
+        this.meta = meta;
+        this.host = host;
+        this.lines = [];
+        this.meta_fit = "";
+        this.host_w = 0.0;
+        this.cached_w = -1.0;
+        this.cached_h = 0.0;
+        this.link_rect = Rect(0.0, 0.0, 0.0, 0.0);
+        this.focusable = false;
+    }
+
+    fn ensure_wrapped(s: Painter, th: Theme, w: float) {
+        if (this.cached_w == w) { return; }
+        s.push_font(th.text_md, WEIGHT_MED);
+        this.lines = wrap(s, this.title, w - th.space_4 * 2.0, TITLE_LINES);
+        let title_h = (this.lines.len as float) * s.font_height();
+        s.pop_font();
+
+        s.push_font(th.text_sm, WEIGHT_REG);
+        let meta_h = s.font_height();
+        // The meta line and the host chip share one baseline, and both are as
+        // long as the story makes them — "170 comments" against "artificial
+        // analysis.ai". Whoever is drawn second wins the pixels, so the meta is
+        // elided to what the chip leaves rather than being allowed to run under
+        // it. Done here, not in render: it is a text measurement, and render
+        // runs every frame.
+        this.host_w = 0.0;
+        if (this.host.len > 0) { this.host_w = s.text_width(this.host); }
+        let avail = w - th.space_4 * 2.0;
+        if (this.host_w > 0.0) { avail = avail - this.host_w - th.space_3; }
+        let ml = wrap(s, this.meta, avail, 1);
+        this.meta_fit = "";
+        if (ml.len > 0) { this.meta_fit = ml[0]; }
+        s.pop_font();
+
+        this.cached_w = w;
+        this.cached_h = th.space_3 * 2.0 + title_h + th.space_1 + meta_h;
+    }
+
+    override fn layout(s: Painter, th: Theme, bc: BoxConstraints): Size {
+        let w = bc.maxW;
+        // Answer the unbounded probe from the last real wrap instead of
+        // re-wrapping at an absurd width: that result is never used for
+        // painting, and computing it would evict the cache that the very next
+        // call — at the real width — is about to want. ScrollView.arrange runs
+        // measure *and* arrange on every scroll step, so this is per row per
+        // frame with a finger down.
+        if (w >= PROBE_W && this.cached_h > 0.0) { return Size(this.cached_w, this.cached_h); }
+        this.ensure_wrapped(s, th, w);
+        return Size(w, this.cached_h);
+    }
+
+    override fn measure(s: Painter, th: Theme): Size {
+        if (this.cached_h > 0.0) { return Size(this.cached_w, this.cached_h); }
+        return Size(0.0, 64.0);
+    }
+
+    override fn arrange(s: Painter, th: Theme, r: Rect) {
+        this.ensure_wrapped(s, th, r.w);
+        this.layout_to(r);
+    }
+
+    override fn render(s: Painter, th: Theme) {
+        let r = this.bounds;
+        if (this.pressed) { s.fill(r, th.press_overlay); }
+
+        let x = r.x + th.space_4;
+        let y = r.y + th.space_3;
+
+        s.push_font(th.text_md, WEIGHT_MED);
+        let lh = s.font_height();
+        let asc = s.font_ascent();
+        for (let line in this.lines) {
+            s.text(x, y + asc, line, th.type_color_title);
+            y = y + lh;
+        }
+        s.pop_font();
+
+        y = y + th.space_1;
+        s.push_font(th.text_sm, WEIGHT_REG);
+        let masc = s.font_ascent();
+        s.text(x, y + masc, this.meta_fit, th.on_surface_muted);
+        if (this.host.len > 0) {
+            let hw = this.host_w;
+            let hx = r.right() - th.space_4 - hw;
+            // The chip's tap target is padded well past the glyphs: at this
+            // size the text itself is nowhere near a finger.
+            this.link_rect = Rect(hx - th.space_2, y - th.space_2,
+                                  hw + th.space_2 * 2.0, s.font_height() + th.space_2 * 2.0);
+            s.text(hx, y + masc, this.host, th.primary);
+        } else {
+            this.link_rect = Rect(0.0, 0.0, 0.0, 0.0);
+        }
+        s.pop_font();
+
+        s.line(r.x, r.bottom() - 0.5, r.right(), r.bottom() - 0.5, th.divider);
+    }
+
+    // Take the press, navigate on nothing. on_click fires on mouse *down*
+    // (Window.on_mouse_ev), so navigating here means a finger that lands on a
+    // row to scroll the list has already left the screen — every row becomes a
+    // trap. Claiming the press is still necessary: it is what makes Window
+    // forward the drag, which on_drag walks up to the ScrollView.
+    override fn on_click(x: int, y: int): bool { return false; }
+
+    // A tap: released inside these bounds, without having dragged past the
+    // slop. Window only calls this when both are true, which is the whole
+    // gesture, so there is nothing to track here.
+    override fn on_release(x: int, y: int): bool {
+        if (this.link_rect.w > 0.0 && contains(this.link_rect, x, y)) {
+            if (this.onTapLink != null) { this.onTapLink(this.sid); }
+            return true;
+        }
+        if (this.onTap != null) { this.onTap(this.sid); }
+        return true;
+    }
+
+    override fn drop_handlers() {
+        this.onTap = null;
+        this.onTapLink = null;
+    }
+}
+
+// -------------------------------------------------------------- comment row
+
+export class CommentRow extends Widget {
+    depth: int;
+    who: string;      // "author · 4h"
+    body: string;
+
+    lines: string[];
+    cached_w: float;
+    cached_h: float;
+
+    fn init(depth: int, who: string, body: string) {
+        super.init();
+        this.depth = depth;
+        this.who = who;
+        this.body = body;
+        this.lines = [];
+        this.cached_w = -1.0;
+        this.cached_h = 0.0;
+        this.focusable = false;
+    }
+
+    // Past six levels the indent stops growing: a deep sub-thread would
+    // otherwise be a column two words wide.
+    fn indent(th: Theme): float {
+        let d = this.depth;
+        if (d > 6) { d = 6; }
+        return (d as float) * th.space_4;
+    }
+
+    fn ensure_wrapped(s: Painter, th: Theme, w: float) {
+        if (this.cached_w == w) { return; }
+        let inner = w - th.space_4 * 2.0 - this.indent(th);
+        s.push_font(th.text_sm, WEIGHT_REG);
+        this.lines = wrap(s, this.body, inner, 0);
+        let body_h = (this.lines.len as float) * s.font_height();
+        let who_h = s.font_height();
+        s.pop_font();
+        this.cached_w = w;
+        this.cached_h = th.space_3 * 2.0 + who_h + th.space_1 + body_h;
+    }
+
+    override fn layout(s: Painter, th: Theme, bc: BoxConstraints): Size {
+        let w = bc.maxW;
+        if (w >= PROBE_W && this.cached_h > 0.0) { return Size(this.cached_w, this.cached_h); }
+        this.ensure_wrapped(s, th, w);
+        return Size(w, this.cached_h);
+    }
+
+    override fn measure(s: Painter, th: Theme): Size {
+        if (this.cached_h > 0.0) { return Size(this.cached_w, this.cached_h); }
+        return Size(0.0, 48.0);
+    }
+
+    override fn arrange(s: Painter, th: Theme, r: Rect) {
+        this.ensure_wrapped(s, th, r.w);
+        this.layout_to(r);
+    }
+
+    override fn render(s: Painter, th: Theme) {
+        let r = this.bounds;
+        let ind = this.indent(th);
+        let x = r.x + th.space_4 + ind;
+        let y = r.y + th.space_3;
+
+        // One guide line per level of nesting, so the reply structure is
+        // readable without counting pixels of indent.
+        if (this.depth > 0) {
+            let gx = r.x + th.space_4 + ind - th.space_2;
+            s.line(gx, r.y, gx, r.bottom(), mix(th.surface, th.primary, 0.35));
+        }
+
+        s.push_font(th.text_sm, WEIGHT_MED);
+        s.text(x, y + s.font_ascent(), this.who, th.on_surface_muted);
+        y = y + s.font_height() + th.space_1;
+        s.pop_font();
+
+        s.push_font(th.text_sm, WEIGHT_REG);
+        let lh = s.font_height();
+        let asc = s.font_ascent();
+        for (let line in this.lines) {
+            s.text(x, y + asc, line, th.type_color_body);
+            y = y + lh;
+        }
+        s.pop_font();
+
+        s.line(r.x, r.bottom() - 0.5, r.right(), r.bottom() - 0.5, th.divider);
+    }
+}
+
+// --------------------------------------------------------------- story head
+
+export class HeaderCard extends Widget {
+    title: string;
+    meta: string;
+    body: string;      // story_text for an Ask HN, "" otherwise
+    link: string;      // "" when there is nothing to open
+    onOpen: fn();
+
+    open_rect: Rect;
+    lines: string[];
+    body_lines: string[];
+    cached_w: float;
+    cached_h: float;
+
+    fn init(title: string, meta: string, body: string, link: string) {
+        super.init();
+        this.title = title;
+        this.meta = meta;
+        this.body = body;
+        this.link = link;
+        this.lines = [];
+        this.body_lines = [];
+        this.cached_w = -1.0;
+        this.cached_h = 0.0;
+        this.open_rect = Rect(0.0, 0.0, 0.0, 0.0);
+        this.focusable = false;
+    }
+
+    fn ensure_wrapped(s: Painter, th: Theme, w: float) {
+        if (this.cached_w == w) { return; }
+        let inner = w - th.space_4 * 2.0;
+        s.push_font(th.text_lg, WEIGHT_BOLD);
+        this.lines = wrap(s, this.title, inner, 0);
+        let h = (this.lines.len as float) * s.font_height();
+        s.pop_font();
+        s.push_font(th.text_sm, WEIGHT_REG);
+        h = h + th.space_2 + s.font_height();
+        if (this.body.len > 0) {
+            this.body_lines = wrap(s, this.body, inner, 0);
+            h = h + th.space_3 + (this.body_lines.len as float) * s.font_height();
+        }
+        if (this.link.len > 0) { h = h + th.space_3 + s.font_height() + th.space_2 * 2.0; }
+        s.pop_font();
+        this.cached_w = w;
+        this.cached_h = th.space_4 * 2.0 + h;
+    }
+
+    override fn layout(s: Painter, th: Theme, bc: BoxConstraints): Size {
+        let w = bc.maxW;
+        if (w >= PROBE_W && this.cached_h > 0.0) { return Size(this.cached_w, this.cached_h); }
+        this.ensure_wrapped(s, th, w);
+        return Size(w, this.cached_h);
+    }
+
+    override fn measure(s: Painter, th: Theme): Size {
+        if (this.cached_h > 0.0) { return Size(this.cached_w, this.cached_h); }
+        return Size(0.0, 96.0);
+    }
+
+    override fn arrange(s: Painter, th: Theme, r: Rect) {
+        this.ensure_wrapped(s, th, r.w);
+        this.layout_to(r);
+    }
+
+    override fn render(s: Painter, th: Theme) {
+        let r = this.bounds;
+        let x = r.x + th.space_4;
+        let y = r.y + th.space_4;
+
+        s.push_font(th.text_lg, WEIGHT_BOLD);
+        let lh = s.font_height();
+        let asc = s.font_ascent();
+        for (let line in this.lines) {
+            s.text(x, y + asc, line, th.type_color_title);
+            y = y + lh;
+        }
+        s.pop_font();
+
+        y = y + th.space_2;
+        s.push_font(th.text_sm, WEIGHT_REG);
+        let sh = s.font_height();
+        let sasc = s.font_ascent();
+        s.text(x, y + sasc, this.meta, th.on_surface_muted);
+        y = y + sh;
+
+        if (this.body.len > 0) {
+            y = y + th.space_3;
+            for (let line in this.body_lines) {
+                s.text(x, y + sasc, line, th.type_color_body);
+                y = y + sh;
+            }
+        }
+
+        if (this.link.len > 0) {
+            y = y + th.space_3;
+            let label = "Open link  ↗";
+            let bw = s.text_width(label) + th.space_4 * 2.0;
+            this.open_rect = Rect(x, y, bw, sh + th.space_2 * 2.0);
+            // Mixed against the surface, not an alpha fill. The lean tier
+            // cannot alpha-blend and renders a translucent colour as the solid
+            // one, which turned this chip into a filled block with its own
+            // label invisible inside it — the toolkit's own remedy for that is
+            // to mix against the known background.
+            s.fill(this.open_rect, mix(th.surface, th.primary, 0.14));
+            s.text(x + th.space_4, y + th.space_2 + sasc, label, th.primary);
+        } else {
+            this.open_rect = Rect(0.0, 0.0, 0.0, 0.0);
+        }
+        s.pop_font();
+
+        s.line(r.x, r.bottom() - 0.5, r.right(), r.bottom() - 0.5, th.divider);
+    }
+
+    override fn on_click(x: int, y: int): bool { return false; }
+
+    override fn on_release(x: int, y: int): bool {
+        if (this.open_rect.w > 0.0 && contains(this.open_rect, x, y)) {
+            if (this.onOpen != null) { this.onOpen(); }
+            return true;
+        }
+        return false;
+    }
+
+    override fn drop_handlers() { this.onOpen = null; }
+}
+
+// ------------------------------------------------------- "load more" / notes
+
+// Doubles as the pagination button and as the truncation notice at the bottom
+// of a long thread; `onTap` null makes it inert text.
+export class MoreRow extends Widget {
+    label: string;
+    onTap: fn();
+
+    fn init(label: string) {
+        super.init();
+        this.label = label;
+        this.focusable = false;
+    }
+
+    override fn measure(s: Painter, th: Theme): Size {
+        return Size(0.0, th.space_4 * 2.0 + s.font_height());
+    }
+
+    override fn layout(s: Painter, th: Theme, bc: BoxConstraints): Size {
+        return Size(bc.maxW, th.space_4 * 2.0 + s.font_height());
+    }
+
+    override fn arrange(s: Painter, th: Theme, r: Rect) { this.layout_to(r); }
+
+    override fn render(s: Painter, th: Theme) {
+        let r = this.bounds;
+        if (this.pressed && this.onTap != null) { s.fill(r, th.press_overlay); }
+        let color = th.on_surface_muted;
+        if (this.onTap != null) { color = th.primary; }
+        s.push_font(th.text_sm, WEIGHT_MED);
+        s.text_center(r, this.label, color);
+        s.pop_font();
+    }
+
+    override fn on_click(x: int, y: int): bool { return false; }
+
+    override fn on_release(x: int, y: int): bool {
+        if (this.onTap != null) { this.onTap(); return true; }
+        return false;
+    }
+
+    override fn drop_handlers() { this.onTap = null; }
+}
+
+// ------------------------------------------------------------------ top bar
+
+// The toolkit has no AppBar, so this is one: a title, an optional back
+// chevron, and an optional right-hand caption (the page count on the feed).
+//
+// The chevron's tap target is the whole left band, not the glyph — a 12px
+// glyph is not a finger target, and the band is the standard 48dp.
+export class TopBar extends Widget {
+    title: string;
+    right: string;
+    onBack: fn();
+
+    // Width of the back band, in laid-out px. on_click gets no Theme, so the
+    // value is stashed the last time one was in hand.
+    band_w: float;
+
+    fn init(title: string, right: string) {
+        super.init();
+        this.title = title;
+        this.right = right;
+        this.band_w = 0.0;
+        this.focusable = false;
+    }
+
+    fn bar_h(th: Theme): float { return th.space_4 * 2.0 + th.text_lg + 6.0; }
+
+    // Density factor. Theme metrics are already scaled by Window.run; a glyph
+    // drawn from raw coordinates is not, and 24 *pixels* on a 2.75-density
+    // phone is a 9dp arrow — which is what "the icon is too small" looks like.
+    fn scale(th: Theme): float {
+        if (th.scale_applied > 0.0) { return th.scale_applied; }
+        return 1.0;
+    }
+
+    override fn measure(s: Painter, th: Theme): Size { return Size(0.0, this.bar_h(th)); }
+
+    override fn layout(s: Painter, th: Theme, bc: BoxConstraints): Size {
+        return Size(bc.maxW, this.bar_h(th));
+    }
+
+    override fn arrange(s: Painter, th: Theme, r: Rect) {
+        this.band_w = this.back_band(th);
+        this.layout_to(r);
+    }
+
+    // 48dp is the Material minimum tap target, and the band is the target —
+    // the arrow inside it is only paint.
+    fn back_band(th: Theme): float {
+        let b = th.space_4 * 2.0 + th.text_lg;
+        let min = 48.0 * this.scale(th);
+        if (b < min) { b = min; }
+        return b;
+    }
+
+    override fn render(s: Painter, th: Theme) {
+        let r = this.bounds;
+        s.fill(r, th.surface_raised);
+
+        let x = r.x + th.space_4;
+        if (this.onBack != null) {
+            // Drawn, not typed. A "‹" is whatever the font makes of it — here
+            // a thin 15px glyph — while Android's back affordance is a 24dp
+            // arrow with a shaft. Three strokes cost less than an Icon widget
+            // and scale with the display.
+            let k = this.scale(th);
+            let g = 24.0 * k;
+            let cx = r.x + this.back_band(th) / 2.0;
+            let cy = r.center_y(0.0);
+            let lw = 2.0 * k;
+            let tip = cx - g / 2.0;
+            let head = g * 0.34;
+            s.line_w(tip, cy, cx + g / 2.0, cy, lw, th.type_color_title);
+            s.line_w(tip, cy, tip + head, cy - head, lw, th.type_color_title);
+            s.line_w(tip, cy, tip + head, cy + head, lw, th.type_color_title);
+            x = r.x + this.back_band(th);
+        }
+
+        s.push_font(th.text_lg, WEIGHT_BOLD);
+        s.text(x, r.center_y(s.font_height()) + s.font_ascent(), this.title, th.type_color_title);
+        s.pop_font();
+
+        if (this.right.len > 0) {
+            s.push_font(th.text_sm, WEIGHT_REG);
+            s.text_right(r, th.space_4, this.right, th.on_surface_muted);
+            s.pop_font();
+        }
+
+        s.line(r.x, r.bottom() - 0.5, r.right(), r.bottom() - 0.5, th.divider);
+    }
+
+    override fn on_click(x: int, y: int): bool { return false; }
+
+    override fn on_release(x: int, y: int): bool {
+        if (this.onBack == null) { return false; }
+        // Only the left band goes back. A tap on the title is not a gesture —
+        // treating the whole bar as "back" makes the bar feel like a trap.
+        if ((x as float) <= this.bounds.x + this.band_w) { this.onBack(); }
+        return true;
+    }
+
+    override fn drop_handlers() { this.onBack = null; }
+}

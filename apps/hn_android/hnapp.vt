@@ -1,0 +1,492 @@
+// hnapp — all of the app's state and all of its logic.
+//
+// Everything lives on one class for a reason that is a language constraint, not
+// a preference: Vyto v0.1 has no nested closures, so a widget callback cannot
+// itself build a callback. Every handler is therefore one call into a method
+// here — `(i) => { app.select_feed(i); }` — and the branching lives on this
+// side of the arrow.
+//
+// -- fetching without freezing the frame -------------------------------------
+//
+// The Vyto thread is the render thread. Request.send() blocks it, so a tap that
+// fetched inline would stop the UI for a whole round trip. Instead every
+// request goes into an HttpPool and a ticker drains it with poll(0) once a
+// frame.
+//
+// That ticker only exists while requests are outstanding. A registered ticker
+// keeps Window.animations non-empty, which pins the loop to a 16ms wait and
+// leaves vsync gating on forever — an idle app would burn a core. So it is
+// started on the first in-flight request and cancelled the moment the last one
+// lands.
+
+import { Widget, Column, ScrollView, Padding, Center, SizedBox, Spinner, Theme,
+         show_snackbar, Tween, CROSS_STRETCH } from "vyto/ui";
+import { AndroidWindow, PullToRefresh, BottomNavigationBar } from "vyto/mobile/android/ui";
+import { Actions } from "vyto/mobile/android/actions";
+import { HttpPool, Request } from "vyto/mobile/android/net";
+import { JsonValue } from "vyto/util/json";
+import { Store, Feed, Item, feeds, PER_PAGE, TTL_FEED, TTL_ITEM } from "hnapi";
+import { StoryRow, CommentRow, HeaderCard, MoreRow, TopBar } from "hnrows";
+import { rel_time, host_of, safe_url, to_text, meta_line } from "hnfmt";
+
+const K_FEED: int = 1;
+const K_STORY: int = 2;
+
+// Real widgets, not string appends, so the cap is far below the server app's
+// 600. A thread this long is being skimmed, not read.
+const NODE_BUDGET: int = 150;
+const MAX_DEPTH: int = 8;
+
+const POLL_MS: int = 16;
+const REQ_TIMEOUT_MS: int = 15000;
+
+// One outstanding request. `key` is the assembled URL, which is both the cache
+// key and what makes a response identifiable after the fact.
+class Pending {
+    id: int;
+    kind: int;
+    key: string;
+    feed: string;
+    page: int;
+    story: int;
+    replace: bool;    // K_FEED: true = new feed or refresh, false = append
+
+    fn init() {
+        this.id = -1;
+        this.kind = 0;
+        this.key = "";
+        this.feed = "";
+        this.page = 1;
+        this.story = 0;
+        this.replace = true;
+    }
+}
+
+export class App {
+    // Back-references, all weak: the Window owns the widget tree, and a strong
+    // field here would close the cycle App -> widget -> onTap closure -> App,
+    // which nothing in the runtime detects.
+    win: weak AndroidWindow;
+    shell: weak Padding;      // the ticker's host; outlives every screen swap
+    list_host: weak Padding;  // the feed's scrolling content
+    ptr: weak PullToRefresh;
+    nav: weak BottomNavigationBar;
+    bar: weak TopBar;
+    story_host: weak Padding; // the story screen's scrolling content
+    story_bar: weak TopBar;
+
+    store: Store;
+    pool: HttpPool;
+    acts: Actions;
+
+    inflight: Pending[];
+    poll_tw: Tween;
+
+    // Feed state
+    names: string[];
+    feed_idx: int;
+    page: int;
+    nb_pages: int;
+    items: Item[];
+    loading: bool;
+
+    // Story state
+    open_id: int;
+
+    fn init() {
+        this.store = new Store();
+        this.pool = new HttpPool();
+        this.acts = new Actions();
+        this.inflight = [];
+        this.names = feeds();
+        this.feed_idx = 0;
+        this.page = 1;
+        this.nb_pages = 1;
+        this.items = [];
+        this.loading = false;
+        this.open_id = 0;
+    }
+
+    fn feed_name(): string { return this.names[this.feed_idx]; }
+
+    // ------------------------------------------------------------ networking
+
+    // Queue a request, unless the cache can answer it. Returns having either
+    // delivered synchronously (cache hit — a tab switch back is instant and
+    // starts no ticker) or left one more request in flight.
+    fn begin(p: Pending, req: Request, ttl: int) {
+        p.key = req.url;
+        let hit = this.store.cached_body(p.key, ttl);
+        if (hit.len > 0) { this.deliver(p, hit); return; }
+
+        p.id = this.pool.add(req.timeoutMs(REQ_TIMEOUT_MS));
+        if (p.id < 0) { this.fail(p, 0); return; }
+        this.inflight.push(p);
+        this.ensure_pump();
+    }
+
+    fn ensure_pump() {
+        if (this.poll_tw != null) { return; }
+        if (this.shell == null) { return; }
+        let a = this;
+        this.poll_tw = this.shell.ticker(POLL_MS, () => { a.pump(); });
+    }
+
+    // Drain whatever finished this frame. poll(0) does not block — it takes
+    // what the Java executor has already completed and returns.
+    fn pump() {
+        let got = this.pool.poll(0);
+        for (let r in got) {
+            let p = this.take(r.id);
+            if (p == null) { continue; }
+            if (r.resp.ok()) {
+                let body = r.resp.text();
+                this.store.store_body(p.key, body);
+                this.deliver(p, body);
+            } else {
+                this.fail(p, r.resp.status());
+            }
+        }
+        // Nothing left to wait for: stand the ticker down so an idle app is
+        // genuinely idle. Animator.cancel is safe from inside a tick.
+        if (this.inflight.len == 0 && this.poll_tw != null) {
+            this.poll_tw.cancel();
+            this.poll_tw = null;
+        }
+    }
+
+    fn take(id: int): Pending {
+        let keep: Pending[] = [];
+        let found: Pending = null;
+        for (let p in this.inflight) {
+            if (p.id == id && found == null) { found = p; } else { keep.push(p); }
+        }
+        this.inflight = keep;
+        return found;
+    }
+
+    fn deliver(p: Pending, body: string) {
+        if (p.kind == K_FEED) { this.deliver_feed(p, body); }
+        else if (p.kind == K_STORY) { this.deliver_story(p, body); }
+    }
+
+    fn fail(p: Pending, status: int) {
+        this.loading = false;
+        if (this.ptr != null) { this.ptr.end_refresh(); }
+        // A transport failure is status 0, never a panic — that is the contract
+        // of vyto/mobile/android/net, and 0 vs 404 is the only diagnosis the
+        // user can act on.
+        let why = "hn.algolia.com did not answer";
+        if (status > 0) { why = "hn.algolia.com said " + status; }
+        if (this.win != null) { show_snackbar(this.win, why, "", null); }
+        this.render_feed();
+    }
+
+    // ----------------------------------------------------------------- feeds
+
+    fn select_feed(i: int) {
+        if (i < 0 || i >= this.names.len) { return; }
+        this.feed_idx = i;
+        this.page = 1;
+        this.items = [];
+        this.loading = true;
+        if (this.nav != null) { this.nav.selected = i; }
+        if (this.bar != null) { this.bar.title = "HN · " + this.feed_name(); }
+        this.render_feed();
+        this.request_feed(1, true);
+    }
+
+    fn refresh() {
+        this.page = 1;
+        this.request_feed(1, true);
+    }
+
+    fn load_next() {
+        if (this.page >= this.nb_pages) { return; }
+        this.request_feed(this.page + 1, false);
+    }
+
+    fn request_feed(page: int, replace: bool) {
+        let p = new Pending();
+        p.kind = K_FEED;
+        p.feed = this.feed_name();
+        p.page = page;
+        p.replace = replace;
+        this.begin(p, this.store.feed_req(p.feed, page), TTL_FEED);
+    }
+
+    fn deliver_feed(p: Pending, body: string) {
+        // A response for a feed the user has already navigated away from is
+        // stale by definition; dropping it is what keeps a fast tab switch from
+        // painting the previous tab's stories.
+        if (p.feed != this.feed_name()) { return; }
+
+        let f = this.store.parse_feed(body, p.page);
+        this.loading = false;
+        if (this.ptr != null) { this.ptr.end_refresh(); }
+        if (f.err.len > 0) {
+            if (this.win != null) { show_snackbar(this.win, f.err, "", null); }
+            return;
+        }
+
+        this.nb_pages = f.nb_pages;
+        this.page = p.page;
+        if (p.replace) { this.items = f.items; }
+        else { for (let it in f.items) { this.items.push(it); } }
+        this.render_feed();
+    }
+
+    // Rebuild the feed's scrolling content in place. The screen's frame — top
+    // bar, pull-to-refresh, bottom nav — is built once and stays put, so this
+    // never disturbs the scroll offset or the nav's selection.
+    fn render_feed() {
+        if (this.list_host == null) { return; }
+        let col = new Column([]).pad(0.0).gap(0.0);
+        col.crossAlign = CROSS_STRETCH;
+
+        if (this.items.len == 0) {
+            if (this.loading) { col.add(this.loading_box()); }
+            else { col.add(new MoreRow("nothing here")); }
+        }
+
+        let a = this;
+        for (let it in this.items) {
+            let host = "";
+            if (safe_url(it.url)) { host = host_of(it.url); }
+            let row = new StoryRow(it.id, it.title,
+                                   meta_line(it.has_score, it.score, it.by, it.time,
+                                             it.has_comments, it.comments),
+                                   host);
+            row.onTap = (id) => { a.open_story(id); };
+            row.onTapLink = (id) => { a.open_link(id); };
+            col.add(row);
+        }
+
+        if (this.items.len > 0 && this.page < this.nb_pages) {
+            let more = new MoreRow("Load " + PER_PAGE + " more");
+            more.onTap = () => { a.load_next(); };
+            col.add(more);
+        }
+
+        this.swap(this.list_host, col);
+        if (this.bar != null) {
+            this.bar.right = "page " + this.page + "/" + this.nb_pages;
+        }
+        this.relayout();
+    }
+
+    // ---------------------------------------------------------------- story
+
+    fn open_story(id: int) {
+        if (this.win == null) { return; }
+        this.open_id = id;
+
+        let bar = new TopBar("Comments", "");
+        let a = this;
+        bar.onBack = () => { a.go_back(); };
+        this.story_bar = bar;
+
+        let host = new Padding(0.0, null);
+        host.add(this.loading_box());
+        this.story_host = host;
+
+        let sv = new ScrollView(host);
+        sv.grow = 1;
+        sv.bounce = true;   // no PullToRefresh here, so both ends bounce
+        this.win.push_screen(new Column([bar, sv]).pad(0.0).gap(0.0));
+
+        let p = new Pending();
+        p.kind = K_STORY;
+        p.story = id;
+        this.begin(p, this.store.story_req(id), TTL_ITEM);
+    }
+
+    fn go_back() {
+        if (this.win == null) { return; }
+        this.win.pop_screen();
+    }
+
+    fn deliver_story(p: Pending, body: string) {
+        // Same staleness rule as the feed: the user may have gone back before
+        // the tree arrived.
+        if (p.story != this.open_id) { return; }
+        if (this.story_host == null) { return; }
+
+        let v = this.store.parse_story(body);
+        let col = new Column([]).pad(0.0).gap(0.0);
+        col.crossAlign = CROSS_STRETCH;
+
+        if (v == null) {
+            col.add(new MoreRow("could not read that story"));
+            this.swap(this.story_host, col);
+            this.relayout();
+            return;
+        }
+
+        let title = v.get("title").asString();
+        let url = v.get("url").asString();
+        let text = to_text(v.get("text").asString());
+        let head = new HeaderCard(title,
+                                  meta_line(v.has("points"), v.get("points").asInt(),
+                                            v.get("author").asString(),
+                                            v.get("created_at_i").asInt(),
+                                            false, 0),
+                                  text,
+                                  url);
+        if (safe_url(url)) {
+            let a = this;
+            head.onOpen = () => { a.open_url(url); };
+        } else {
+            head.link = "";
+        }
+        col.add(head);
+
+        let budget: int[] = [NODE_BUDGET];
+        let kids = v.get("children");
+        for (let i in 0..kids.len()) {
+            this.flatten(kids.at(i), 0, col, budget);
+        }
+
+        if (budget[0] <= 0) {
+            let more = new MoreRow("thread truncated — read the rest on HN");
+            let a2 = this;
+            more.onTap = () => { a2.open_thread_on_hn(); };
+            col.add(more);
+        } else if (col.children.len == 1) {
+            col.add(new MoreRow("no comments yet"));
+        }
+
+        if (this.story_bar != null) { this.story_bar.title = "Comments"; }
+        this.swap(this.story_host, col);
+        this.relayout();
+    }
+
+    // Walk the nested comment tree depth-first, appending rows.
+    //
+    // The budget is a one-element array because Vyto has no by-reference
+    // params and the cap has to be shared across every branch of the recursion
+    // — the same idiom apps/hackernews/view.vt:186 uses for the same reason.
+    fn flatten(node: JsonValue, depth: int, out: Column, budget: int[]) {
+        if (budget[0] <= 0 || depth > MAX_DEPTH) { return; }
+
+        let by = node.get("author").asString();
+        let body = to_text(node.get("text").asString());
+        let next = depth;
+        // A dead or deleted comment has no author and no text, but its replies
+        // are still live — so it is skipped without being recursed past.
+        if (by.len > 0 && body.len > 0) {
+            budget[0] = budget[0] - 1;
+            out.add(new CommentRow(depth, by + " · " + rel_time(node.get("created_at_i").asInt()),
+                                   body));
+            next = depth + 1;
+        }
+
+        let kids = node.get("children");
+        for (let i in 0..kids.len()) {
+            this.flatten(kids.at(i), next, out, budget);
+        }
+    }
+
+    // ------------------------------------------------------------- platform
+
+    fn open_link(id: int) {
+        for (let it in this.items) {
+            if (it.id == id && safe_url(it.url)) { this.open_url(it.url); return; }
+        }
+    }
+
+    fn open_url(u: string) {
+        if (!safe_url(u)) { return; }
+        // Fire and forget: view_url takes no callback, so nothing has to be
+        // pumped afterwards. It returns false when no activity can handle the
+        // intent, which on targetSdk >= 30 means the manifest's <queries> block
+        // is missing — mf.uses(ACT_VIEW_URL) in manifest.vt is what supplies it.
+        if (!this.acts.view_url(u) && this.win != null) {
+            show_snackbar(this.win, "no browser could open that link", "", null);
+        }
+    }
+
+    fn open_thread_on_hn() {
+        this.open_url("https://news.ycombinator.com/item?id=" + this.open_id);
+    }
+
+    // A spinner in the middle of the view, rather than a 28px dot pinned to the
+    // top of it. Inside a ScrollView the content is arranged at its *natural*
+    // height, so a bare Spinner lands at the top edge and half of it sits under
+    // the bar — the box is what gives it a viewport's worth of height to centre
+    // in. The height is read off the shell, which is already laid out to the
+    // window's content area by the time anything can be loading.
+    fn loading_box(): Widget {
+        return new SizedBox(-1.0, this.view_h(), new Center(new Spinner(28.0 * this.dp())));
+    }
+
+    // Height to centre a placeholder in. The shell is laid out to the window's
+    // content area, so it is the honest answer — except on the very first
+    // build, which happens before run() has laid anything out. Two thirds of
+    // the window is the estimate for that one case, and it is replaced by the
+    // real value as soon as any data lands.
+    fn view_h(): float {
+        if (this.shell != null && this.shell.bounds.h > 0.0) { return this.shell.bounds.h; }
+        if (this.win != null && this.win.painter != null) {
+            return this.win.painter.height() * 0.66;
+        }
+        return 600.0;
+    }
+
+    // Density factor for a raw pixel size. Theme.apply_scale multiplies the
+    // theme's own metrics, but a Spinner takes its diameter as a constructor
+    // argument and nothing scales that — 28px on a 2.75-density phone is a
+    // 10dp spinner, which reads as a speck of dust rather than as progress.
+    //
+    // scale_applied is 0.0 until run() sets it, and the first spinner is built
+    // before that, so the window height stands in: phones this code targets are
+    // 1600-3200px tall, which lands the estimate within a hair of the real
+    // density.
+    fn dp(): float {
+        if (this.win == null) { return 1.0; }
+        let f = this.win.theme.scale_applied;
+        if (f > 0.0) { return f; }
+        if (this.win.painter != null) {
+            let g = this.win.painter.height() / 800.0;
+            if (g < 1.0) { g = 1.0; }
+            if (g > 4.0) { g = 4.0; }
+            return g;
+        }
+        return 1.0;
+    }
+
+    // ------------------------------------------------------------- plumbing
+
+    // Replace a host's single child. drop_child releases the old subtree's
+    // handlers, which is what breaks row -> closure -> App before the rows go.
+    //
+    // The hosts are Padding(0), not Box: a bare Box is the absolute-placement
+    // escape hatch — Widget.arrange leaves children at whatever bounds they
+    // already have, which for a freshly built subtree is nothing. Padding is
+    // the single-child container that actually hands its rect down.
+    fn swap(host: Padding, content: Widget) {
+        let old = host.child();
+        if (old != null) { host.drop_child(old); }
+        host.add(content);
+    }
+
+    // Twice, deliberately.
+    //
+    // A row's height depends on its width, and the only call that carries the
+    // real width is arrange. But ScrollView takes its content height from
+    // measure, which runs *before* arrange in the same pass and reaches the
+    // rows through Column.measure's unbounded probe — which a freshly built
+    // row cannot answer, having never been wrapped at any width. The first
+    // pass populates every row's wrap cache at its real width; the second
+    // reads those heights back, and the viewport learns how tall its content
+    // is. Without it a new list is unscrollable until something else happens
+    // to relayout it.
+    //
+    // It costs one extra measure/arrange over ~30 rows, once per data change.
+    fn relayout() {
+        if (this.win == null) { return; }
+        this.win.layout();
+        this.win.layout();
+        this.win.redraw();
+    }
+}
