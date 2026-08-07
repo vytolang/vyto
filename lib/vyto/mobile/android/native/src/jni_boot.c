@@ -15,6 +15,7 @@
 
 #include "vyto_android.h"
 
+#include <android/bitmap.h>
 #include <android/log.h>
 #include <pthread.h>
 #include <stdarg.h>
@@ -27,6 +28,7 @@ static jobject g_view = NULL;      /* global ref, VytoView */
 static jobject g_commands = NULL;  /* global ref, CommandBuffer */
 static jobject g_actions = NULL;   /* global ref, Actions */
 static jobject g_streams = NULL;   /* global ref, Streams */
+static jobject g_camera = NULL;    /* global ref, CameraSink */
 
 static pthread_t g_thread;
 static int g_thread_live = 0;
@@ -51,6 +53,7 @@ jobject vta_view(void)     { return g_view; }
 jobject vta_commands(void) { return g_commands; }
 jobject vta_actions(void)  { return g_actions; }
 jobject vta_streams(void)  { return g_streams; }
+jobject vta_camera(void)   { return g_camera; }
 
 void vta_logf(const char *fmt, ...) {
     va_list ap;
@@ -179,6 +182,45 @@ Java_dev_vyto_android_Native_bindStreams(JNIEnv *env, jclass cls, jobject stream
     g_streams = streams ? (*env)->NewGlobalRef(env, streams) : NULL;
 }
 
+JNIEXPORT void JNICALL
+Java_dev_vyto_android_Native_bindCamera(JNIEnv *env, jclass cls, jobject camera) {
+    (void)cls;
+    if (g_camera) (*env)->DeleteGlobalRef(env, g_camera);
+    g_camera = camera ? (*env)->NewGlobalRef(env, camera) : NULL;
+}
+
+/* One camera frame: YUV planes in, ARGB pixels into the destination Bitmap.
+ *
+ * Runs on CameraSink's reader thread, never the Vyto thread — the bitmap being
+ * written here is one the sink has already established nobody is drawing.
+ *
+ * The planes arrive as direct ByteBuffers, so this is a pointer fetch rather
+ * than a copy; the only copy in the whole path is the conversion's own write.
+ */
+JNIEXPORT void JNICALL
+Java_dev_vyto_android_Native_cameraFrame(JNIEnv *env, jclass cls, jobject bitmap,
+                                         jobject yBuf, jobject uBuf, jobject vBuf,
+                                         jint yStride, jint uStride, jint vStride,
+                                         jint uvPixelStride, jint w, jint h,
+                                         jint rotation, jboolean mirror) {
+    (void)cls;
+    const uint8_t *y = (const uint8_t *)(*env)->GetDirectBufferAddress(env, yBuf);
+    const uint8_t *u = (const uint8_t *)(*env)->GetDirectBufferAddress(env, uBuf);
+    const uint8_t *v = (const uint8_t *)(*env)->GetDirectBufferAddress(env, vBuf);
+    if (!y || !u || !v) return;
+
+    AndroidBitmapInfo info;
+    if (AndroidBitmap_getInfo(env, bitmap, &info) != ANDROID_BITMAP_RESULT_SUCCESS) return;
+    if (info.format != ANDROID_BITMAP_FORMAT_RGBA_8888) return;
+
+    void *pixels = NULL;
+    if (AndroidBitmap_lockPixels(env, bitmap, &pixels) != ANDROID_BITMAP_RESULT_SUCCESS) return;
+    vta_yuv420_to_argb((uint8_t *)pixels, (int32_t)info.stride, y, u, v,
+                       yStride, uStride, vStride, uvPixelStride,
+                       w, h, rotation, mirror ? 1 : 0);
+    AndroidBitmap_unlockPixels(env, bitmap);
+}
+
 /* One sensor sample or one location fix, from the Streams HandlerThread. Goes
  * straight into the slot table; nothing here allocates or blocks, because this
  * runs up to a couple of hundred times a second. */
@@ -241,6 +283,7 @@ Java_dev_vyto_android_Native_stop(JNIEnv *env, jclass cls) {
     if (g_commands) { (*env)->DeleteGlobalRef(env, g_commands); g_commands = NULL; }
     if (g_actions)  { (*env)->DeleteGlobalRef(env, g_actions);  g_actions  = NULL; }
     if (g_streams)  { (*env)->DeleteGlobalRef(env, g_streams);  g_streams  = NULL; }
+    if (g_camera)   { (*env)->DeleteGlobalRef(env, g_camera);   g_camera   = NULL; }
     if (g_view)     { (*env)->DeleteGlobalRef(env, g_view);     g_view     = NULL; }
 }
 

@@ -128,6 +128,17 @@ public final class CommandBuffer {
     public void putImage(int handle, Bitmap bmp) { images.put(handle, bmp); }
 
     /**
+     * Reserve a handle with no bitmap behind it yet, for a producer that
+     * supplies frames rather than decoding a file — the camera sink, and
+     * anything else that ends in {@link #putImage}.
+     *
+     * <p>Both this and {@code putImage} must be called from the Vyto thread:
+     * {@code images} is a plain map read during {@link #replay}, so a write
+     * from a producer thread would race the map as well as the pixels.
+     */
+    public int newImageHandle() { return nextImageHandle++; }
+
+    /**
      * Decode a file into a Bitmap and return its handle, or 0 on failure.
      * Called from the Vyto thread via {@code vta_load_image}.
      *

@@ -38,6 +38,7 @@ jobject vta_view(void);      /* dev.vyto.android.VytoView */
 jobject vta_commands(void);  /* dev.vyto.android.CommandBuffer */
 jobject vta_actions(void);   /* dev.vyto.android.Actions */
 jobject vta_streams(void);   /* dev.vyto.android.Streams */
+jobject vta_camera(void);    /* dev.vyto.android.CameraSink */
 
 /* Log helper; wraps __android_log_print so the shims do not each include it. */
 void vta_logf(const char *fmt, ...);
@@ -112,6 +113,29 @@ void vta_sensor_stop(int32_t kind);
 int32_t vta_sensor_has(int32_t kind);
 int32_t vta_location_start(int64_t min_ms, double min_m);
 void vta_location_stop(void);
+
+/* ---------------------------------------------------------- camera preview
+ *
+ * Implemented by acamera.c. The conversion is plain C over plane pointers, so
+ * it is built on every target; the up-calls have the usual desktop no-op arm.
+ * vta_camera_sync must be called from the Vyto thread — it publishes a Bitmap
+ * into the command buffer's image table, which replay reads on that thread.
+ */
+void vta_yuv420_to_argb(uint8_t *dst, int32_t dst_stride,
+                        const uint8_t *y, const uint8_t *u, const uint8_t *v,
+                        int32_t y_stride, int32_t u_stride, int32_t v_stride,
+                        int32_t uv_pixel_stride,
+                        int32_t w, int32_t h, int32_t rotation, int32_t mirror);
+void *vta_camera_start(int32_t facing, int32_t w, int32_t h);
+void vta_camera_stop(void);
+int32_t vta_camera_has(int32_t facing);
+int32_t vta_camera_sync(void);
+int32_t vta_camera_width(void);
+int32_t vta_camera_height(void);
+/* Converter self-check; 0 = clean, else a bitmask of which case failed. Built
+ * on every target, because the conversion is the one piece of logic here that
+ * a device would otherwise be needed to see. */
+int32_t vta_camera_selftest(void);
 
 /* ----------------------------------------------------------------- haptics
  *

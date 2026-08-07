@@ -1,0 +1,46 @@
+// Camera preview: the converter, and the widget's behaviour with no camera.
+//
+// The preview itself needs a phone. What does not is the arithmetic that turns
+// a camera's YUV planes into the ARGB pixels Vyto composites — and that is the
+// part worth pinning, because every way it can be wrong looks like broken
+// hardware rather than like a bug: a wrong rotation index is a sideways or
+// mirrored preview, a swapped chroma plane is a blue face, a full-range
+// coefficient on limited-range input is a washed-out one.
+//
+// So the shim checks itself against a synthetic 4x2 frame on every target, and
+// this asserts the answer. The bitmask names the case: 1|2|4 luma and alpha,
+// 8|16 the 90-degree rotation, 32 the 180, 64 the mirror, 128|256 chroma
+// dominance both ways round.
+//
+// The rest is what a CameraView does when there is no camera at all, which is
+// every desktop and every device before the permission is granted: a 4:3
+// placeholder rather than a zero-size hole, because "my camera widget did not
+// appear" and "the permission was denied" must not look the same.
+import { Window, Column, Label } from "vyto/ui";
+import { Camera, CameraView, CAMERA_BACK, CAMERA_FRONT,
+         PREVIEW_W, PREVIEW_H, converter_selftest } from "vyto/mobile/android/camera";
+
+fn main() {
+    print("converter_selftest=" + converter_selftest());
+
+    let cam = new Camera();
+    print("has_back=" + cam.has(CAMERA_BACK) + " has_front=" + cam.has(CAMERA_FRONT));
+    print("start=" + cam.start(CAMERA_BACK, PREVIEW_W, PREVIEW_H)
+          + " running=" + cam.running());
+    print("sync=" + cam.sync() + " size=" + cam.width() + "x" + cam.height());
+
+    let win = new Window("Cam", 300, 400);
+    let view = new CameraView(cam);
+    win.root = new Column([view]);
+    win.run();
+
+    // 4:3 of the offered width, since no frame has arrived to say otherwise.
+    print("view=" + view.bounds.w + "x" + view.bounds.h);
+    // With no frame, the draw rect is the whole widget — there is nothing to
+    // letterbox the placeholder against.
+    print("frame=" + view.frame_rect().w + "x" + view.frame_rect().h);
+    print("crop=" + view.crop);
+
+    cam.stop();
+    print("after stop running=" + cam.running());
+}

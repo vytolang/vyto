@@ -93,6 +93,30 @@ public final class Native {
     public static native void bindStreams(Streams streams);
 
     /**
+     * Hand the camera shim the {@link CameraSink} to call up into. Same
+     * ownership rule as {@link #bindStreams}: the Activity constructs it and
+     * closes it in {@code onPause}, because a held camera is denied to every
+     * other app on the device.
+     */
+    public static native void bindCamera(CameraSink camera);
+
+    /**
+     * Convert one camera frame into {@code dst}: YUV_420_888 planes in, ARGB
+     * out, rotated upright and mirrored for the front lens.
+     *
+     * <p>Runs on the sink's reader thread. The planes are direct ByteBuffers,
+     * so no copy happens crossing the boundary — the conversion's own write is
+     * the only one on the path.
+     */
+    public static native void cameraFrame(android.graphics.Bitmap dst,
+                                          java.nio.ByteBuffer y,
+                                          java.nio.ByteBuffer u,
+                                          java.nio.ByteBuffer v,
+                                          int yStride, int uStride, int vStride,
+                                          int uvPixelStride, int width, int height,
+                                          int rotation, boolean mirror);
+
+    /**
      * One sensor sample or one location fix, from the Streams HandlerThread.
      *
      * <p>Overwrites the channel's slot rather than queueing: a sensor is state,

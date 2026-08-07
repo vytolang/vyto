@@ -38,6 +38,7 @@ public class VytoActivity extends Activity {
     private VytoSurfaceView surfaceView;
     private Actions actions;
     private Streams streams;
+    private CameraSink camera;
 
     /**
      * Which rendering target to build: {@link VytoSurfaceView} (the default) or
@@ -100,12 +101,18 @@ public class VytoActivity extends Activity {
                 + target.getClass().getSimpleName());
         actions = new Actions(this);
         streams = new Streams(this);
+        // The sink needs the command buffer, because a camera frame is
+        // published as an ordinary image handle rather than through a surface
+        // of its own — see CameraSink for why the pixels come to us.
+        camera = new CameraSink(this,
+                surfaceView != null ? surfaceView.commands() : view.commands());
         setContentView(target);
 
         // Bind before start(): the Vyto thread can reach for Actions as soon as
         // it is running, and a null there would drop the first launch.
         Native.bindActions(actions);
         Native.bindStreams(streams);
+        Native.bindCamera(camera);
 
         // Also before start(), and for a sharper reason: os_app_dir() caches
         // its answer the first time anything asks, and the Vyto thread asks as
@@ -191,6 +198,9 @@ public class VytoActivity extends Activity {
         // registered listener keeps waking the device for an app the user has
         // left, and nothing else in the stack will notice.
         if (streams != null) streams.stopAll();
+        // Same rule, sharper consequence: a camera held in the background is
+        // denied to every other app, and newer Android revokes it anyway.
+        if (camera != null) camera.stop();
         // Park the loop so animations stop waking it. The widget tree and the
         // backbuffer are untouched — there is no surface to lose, which is the
         // main simplification the Bitmap design buys over SurfaceView.
@@ -206,6 +216,7 @@ public class VytoActivity extends Activity {
         if (Native.isLoaded()) Native.stop();
         if (actions != null) actions.dispose();
         if (streams != null) streams.dispose();
+        if (camera != null) camera.dispose();
         if (view != null) view.releaseBitmap();
         if (surfaceView != null) surfaceView.releaseBitmap();
         super.onDestroy();

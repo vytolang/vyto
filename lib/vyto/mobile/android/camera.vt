@@ -1,0 +1,225 @@
+// vyto/mobile/android/camera — a live camera preview as a *widget*.
+//
+//     import { Camera, CameraView, CAMERA_BACK } from "vyto/mobile/android/camera";
+//     import { PERM_CAMERA } from "vyto/mobile/android/actions";
+//
+//     let cam = new Camera();
+//     let view = new CameraView(cam);        // put it anywhere in the tree
+//
+//     acts.request_permission(PERM_CAMERA, (r) => {
+//         if (r.ok) { cam.start(CAMERA_BACK, 640, 480); }
+//     });
+//     // ... and when the screen goes away:
+//     cam.stop();
+//
+// Capture-by-intent (Actions.capture_image) is still the right answer when the
+// user's task *is* taking a photo: it gets the system camera UI, its
+// processing, and its permissions for free. This is for when the preview is
+// part of your screen — a scanner, a document framer, a viewfinder beside a
+// form — which an intent cannot do.
+//
+// -- how the pixels get here, and what it costs -------------------------------
+//
+// The usual Android preview is a SurfaceView or TextureView the compositor
+// places over your layout. That cannot be a Vyto widget: Vyto draws everything
+// into one bitmap it owns and blits the whole thing, so a foreign View is a
+// separate compositor layer — above or below the entire UI, never clipped to a
+// card, never interleaved with widgets, and repositioned a frame late on every
+// scroll.
+//
+// So the frames come to us. An ImageReader gives a Surface with no View at
+// all; each frame is converted from YUV to ARGB (native/src/acamera.c) and
+// handed to the painter as an ordinary image handle, which the existing image
+// op draws. Nothing new in the paint pipeline, no hole in the surface.
+//
+// The price is one conversion and one copy per frame, on the CPU, because the
+// compositing canvas is a software one. That is why the default is 640x480:
+// preview sizes are affordable, and a 1080p preview costs about four times as
+// much for detail a viewfinder does not use. Ask for more only when something
+// downstream (a barcode decoder) actually needs it.
+//
+// -- lifecycle is not optional -----------------------------------------------
+//
+// stop() when the preview leaves the screen. A held camera is denied to every
+// other app on the device, and newer Android revokes it from a backgrounded
+// app anyway. The Activity also stops it in onPause, which covers the case an
+// app forgets; it does not cover a screen the app itself navigated away from.
+//
+// Off Android everything is inert: has() and start() are false, and CameraView
+// paints a placeholder, so a program that also runs on the desktop needs no
+// conditionals.
+
+#link "log" if "android"
+#link "android" if "android"
+#link "jnigraphics" if "android"
+#link "camera2ndk" if "android"
+
+import { Widget, Painter, Theme, Size, BoxConstraints } from "vyto/ui";
+import { Rect, mix } from "vyto/surface";
+import { AndroidWidget } from "vyto/mobile/android/ui";
+
+extern "C" {
+    // The image handle, as an opaque rawptr — the same shape vta_load_image
+    // returns, and the shape draw_image takes.
+    fn vta_camera_start(facing: i32, w: i32, h: i32): rawptr;
+    fn vta_camera_stop();
+    fn vta_camera_has(facing: i32): i32;
+    fn vta_camera_sync(): i32;
+    fn vta_camera_width(): i32;
+    fn vta_camera_height(): i32;
+    // Converter self-check (native/src/acamera.c): 0 when clean, else a
+    // bitmask of the cases that failed.
+    fn vta_camera_selftest(): i32;
+}
+
+export const CAMERA_BACK: int = 0;
+export const CAMERA_FRONT: int = 1;
+
+// Default preview size. Big enough to frame with and to decode a QR from,
+// small enough that the per-frame conversion is not the app's biggest cost.
+export const PREVIEW_W: int = 640;
+export const PREVIEW_H: int = 480;
+
+// Check the YUV-to-ARGB converter against a synthetic frame. 0 is clean.
+//
+// Exported because it is the only part of this module that can be verified
+// without a phone — and the part most worth verifying, since a wrong rotation
+// index is a sideways preview and a wrong coefficient is a washed-out one,
+// both of which read as "the camera is broken".
+export fn converter_selftest(): int { return vta_camera_selftest() as int; }
+
+export class Camera {
+    handle: rawptr;    // image handle to draw; null when not running
+    facing: int;
+
+    fn init() {
+        this.handle = null;
+        this.facing = CAMERA_BACK;
+    }
+
+    // Is there a camera facing this way? Many tablets have no front one, and a
+    // device with none at all is a normal thing to design around.
+    fn has(facing: int): bool { return vta_camera_has(facing as i32) == 1; }
+
+    fn running(): bool { return this.handle != null; }
+
+    // Open it. False when the permission has not been granted, the camera does
+    // not exist, or the open failed — all states to handle, not errors. Ask for
+    // PERM_CAMERA through Actions.request_permission first; bundling the prompt
+    // in here would make a denial look like broken hardware.
+    fn start(facing: int, w: int, h: int): bool {
+        this.facing = facing;
+        this.handle = vta_camera_start(facing as i32, w as i32, h as i32);
+        return this.handle != null;
+    }
+
+    fn stop() {
+        vta_camera_stop();
+        this.handle = null;
+    }
+
+    // Publish the newest frame. True when it changed — which is what lets a
+    // preview repaint on the camera's clock instead of the display's, so a
+    // 30fps sensor does not drive 60 repaints and an idle one drives none.
+    //
+    // Must be called from the Vyto thread; CameraView does it in paint().
+    fn sync(): bool { return vta_camera_sync() == 1; }
+
+    // Size of the frame *after* rotation, so it is the aspect the widget must
+    // fit. 0 before the first successful start.
+    fn width(): int { return vta_camera_width() as int; }
+    fn height(): int { return vta_camera_height() as int; }
+}
+
+// Draws the live preview, letterboxed to preserve aspect. Owns no camera
+// lifecycle of its own on purpose: several widgets may show one camera, and a
+// screen usually wants to start it after a permission callback rather than
+// when a widget happens to be constructed.
+export class CameraView extends AndroidWidget {
+    cam: Camera;
+    // Fill the widget and crop, rather than letterbox. What a full-bleed
+    // viewfinder wants; a scanner that must not lose the edges wants false.
+    crop: bool;
+
+    fn init(cam: Camera) {
+        super.init();
+        this.cam = cam;
+        this.crop = false;
+        // A preview is not a target: no ripple, no 48dp clamp on something
+        // that is sized by its aspect.
+        this.ripple = false;
+        this.min_touch = 0.0;
+    }
+
+    builder fn fill(on: bool) { this.crop = on; return this; }
+
+    override fn content_size(s: Painter, th: Theme): Size {
+        // 0 width = fill the axis, the convention every container here uses.
+        // The height is decided in layout(), where the offered width is known.
+        return Size(0.0, 0.0);
+    }
+
+    // Width-dependent height, the way Text does it: a preview is an aspect,
+    // not a size. Before the first frame the aspect is 4:3 — a placeholder that
+    // measured 0 would be invisible, and "my camera widget did not appear" is
+    // then indistinguishable from a permission problem.
+    override fn layout(s: Painter, th: Theme, bc: BoxConstraints): Size {
+        let fw = this.cam.width() as float;
+        let fh = this.cam.height() as float;
+        let aspect = 0.75;
+        if (fw > 0.0 && fh > 0.0) { aspect = fh / fw; }
+        let h = bc.maxW * aspect;
+        if (h > bc.maxH) { h = bc.maxH; }
+        return Size(bc.maxW, h);
+    }
+
+    // Where the frame lands inside the widget, at the right aspect.
+    fn frame_rect(): Rect {
+        let r = this.bounds;
+        let fw = this.cam.width() as float;
+        let fh = this.cam.height() as float;
+        if (fw <= 0.0 || fh <= 0.0 || r.w <= 0.0 || r.h <= 0.0) { return r; }
+        let sx = r.w / fw;
+        let sy = r.h / fh;
+        let k = sx;
+        if (this.crop) {
+            if (sy > k) { k = sy; }
+        } else if (sy < k) {
+            k = sy;
+        }
+        let w = fw * k;
+        let h = fh * k;
+        return Rect(r.center_x(w), r.center_y(h), w, h);
+    }
+
+    override fn paint(s: Painter, th: Theme) {
+        // Publishing the frame here rather than from a ticker keeps every
+        // touch of the image table on the Vyto thread, which is the whole
+        // threading rule of this path.
+        this.cam.sync();
+        let h = this.cam.handle;
+        if (h == null) {
+            // No camera, no permission, or not started. A flat panel rather
+            // than a hole: an empty widget reads as a layout bug.
+            s.fill(this.bounds, mix(th.surface, th.on_surface, 0.08));
+            s.text_center(this.bounds, "no camera", th.on_surface_muted);
+            return;
+        }
+        if (!this.crop) { s.fill(this.bounds, th.surface_sunken); }
+        s.clip_push(this.bounds, 0.0);
+        s.draw_image(h, this.frame_rect());
+        s.clip_pop();
+    }
+
+    // Repaint when a frame actually arrived. Driven by the app's frame clock
+    // (a ticker or an animation) rather than owned here, because a widget that
+    // invalidates itself every frame would pin the event loop awake — the
+    // documented trap with looping Tweens.
+    fn poll(): bool {
+        if (this.cam.sync()) {
+            this.invalidate();
+            return true;
+        }
+        return false;
+    }
+}
