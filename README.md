@@ -19,17 +19,42 @@ fn main() {
 }   // deterministic teardown: deinit runs here
 ```
 
-## A real app: VytoTodo
+## Real apps
 
-[apps/todo](apps/todo/) is a working X11 GUI todo manager written entirely
-in Vyto — a mini widget toolkit (virtual dispatch, closure event handlers,
-weak parent refs), vytobind-generated Xlib bindings, two native packages,
-file persistence, and deterministic display teardown via `deinit`.
+**A desktop GUI** — [apps/todo](apps/todo/) is a working X11 todo manager
+written entirely in Vyto: a mini widget toolkit (virtual dispatch, closure
+event handlers, weak parent refs), vytobind-generated Xlib bindings, two native
+packages, file persistence, and deterministic display teardown via `deinit`.
 AddressSanitizer-clean across full interactive sessions.
 
 ```sh
 cd apps/todo && ../../vytoc run todo.vt
 ```
+
+**A web server** — [apps/hackernews](apps/hackernews/) serves a Hacker News
+reader as plain HTML over `vyto/net/server`: feeds, a story with its comment
+thread, user profiles. ~700 lines, no JavaScript, no build step, no assets —
+the browser fetches one page and one stylesheet. The server pre-forks over
+`SO_REUSEPORT` with one reactor per worker and a supervisor that re-forks
+whatever dies; upstream is the Algolia HN API behind a TTL cache, so a browsing
+session makes one request per *uncached* page view and no more.
+
+```sh
+./vytoc run apps/hackernews/hackernews.vt      # http://127.0.0.1:8080
+```
+
+**A phone app** — [apps/hn_android](apps/hn_android/) is the same reader as a
+native Android app, and it runs on a real device (Redmi Note 9S, Android 12,
+arm64-v8a). A feed with six tabs, a story screen with its full comment tree,
+links opened in the browser, pull-to-refresh, pagination and a working system
+Back key. ~1600 lines of Vyto, **no Java in the app itself, no Gradle, no
+Kotlin, no AndroidX** — a 1.6 MB apk from a twelve-step shell script. Every
+screen is drawn by `vyto/ui` through `android.graphics.Canvas`; nothing in it is
+an `android.widget`.
+
+The two Hacker News apps share an API client and nothing else, which is the
+point: one is a pre-forking HTTP server, the other a touch UI on a phone, and
+the same language and stdlib cover both.
 
 ## Quick start
 
@@ -115,8 +140,26 @@ it then depends only on base system libraries (libc, libX11):
 
 - **Memory**: automatic ref counting, `weak` for back-references, `deinit`
   destructors that fire deterministically — widget trees tear down top-down.
-- **Classes**: single inheritance, `virtual`/`override`, `new`, `super.init`.
-- **Closures**: `(x) => expr`, typed `fn(T): U`, captures by value.
+  No GC, no pauses, and frees happen where you can see them.
+- **Arenas**: `arena { }` is a lexical region where `new` bump-allocates and the
+  whole block is released at once — no refcount traffic per object, no
+  destructors to run. `new@name` targets an enclosing region by name. This is
+  the answer for bulk and short-lived data (a parse tree, a frame's worth of
+  geometry), where per-object counting is the cost that matters.
+- **Classes**: single inheritance, `virtual`/`override`, `new`, `super.init`
+  and `super.method()` so an override can extend rather than copy, `builder fn`
+  methods that return the receiver's own type for chaining, and `deinit`.
+- **Generics**: generic functions, structs and classes, monomorphized at the
+  call site — `Stack<T>`, `Map<string, T>`, a generic widget. No boxing and no
+  runtime type tags; each instantiation compiles to its own concrete C.
+- **Closures**: `(x) => expr`, typed `fn(T): U`, captures by value. A method
+  bound to its receiver (`obj.method`) and a generic function are both usable as
+  plain function values.
+- **Reactivity**: `vyto/reactive` gives fine-grained signals, computeds and
+  effects with automatic dependency tracking — reading a signal inside a
+  computed subscribes to it, so a change recomputes only what it actually
+  reaches. `Window.watch` binds that to widgets, and the domain is disposed with
+  the window, so a capture never leaks.
 - **FFI**: `extern "C"` blocks, exact-layout structs, `#link "lib"`.
 - **Native packages**: a module directory with `native/src/*.c` (compiled
   and linked automatically) or prebuilt `native/<platform>/*.so` (linked
@@ -129,10 +172,18 @@ it then depends only on base system libraries (libc, libX11):
   `windows-x64`, `android-arm64`, macOS triples — a non-host triple needs its
   own toolchain via `--cc`)
   (`--cc`/`VYTO_CC` for custom toolchains, e.g. `zig cc`).
+- **Asset bundling**: `--with-assets` embeds an app's `assets/`, `conf/` and
+  `storage/` directories into the binary as an in-memory VFS, and `vyto/asset`
+  reads through the same call either way — so a GUI app with fonts and images
+  ships as a single file, and the development build still reads them off disk.
+- **Freestanding**: `--freestanding` builds with **zero libc** behind six
+  `vt_host_*` hooks (alloc/realloc/free/write/write_err/abort) and emits a
+  linkable `.a` — the whole platform seam for bare metal, exercised in the test
+  suite.
 - **Safety**: bounds-checked arrays, checked downcasts, `panic` with
   file:line.
 
-See `examples/` (`01_hello` … `50_worker_pool`) for a tour of the language
+See `examples/` (`01_hello` … `99_super_method`) for a tour of the language
 and stdlib.
 
 ## In four snippets
@@ -596,8 +647,11 @@ everything else is pure Vyto.
 | Module | What it gives you |
 |--------|-------------------|
 | `vyto/net/http` ⚙ | HTTP client, `HttpPool` fan-out (libcurl multi) |
+| `vyto/net/server` | HTTP/1.1 server — routes with `:params`, one reactor (`runSingle`) or pre-forked over `SO_REUSEPORT` with a supervisor (`run`). Pure Vyto over `vyto/net/socket`; `apps/hackernews` is built on it |
 | `vyto/net/socket` ⚙ | TCP/UDP sockets, non-blocking mode, `PollSet` event loop |
 | `vyto/net/websocket` ⚙ | WebSocket client |
+| `vyto/net/link` · `vyto/net/wifi` ⚙ | interface status and the control plane · WiFi scan and connect |
+| `vyto/net/raw` ⚙ | link-layer Ethernet frames over `AF_PACKET` |
 
 **Graphics & UI**
 
@@ -606,15 +660,33 @@ everything else is pure Vyto.
 | `vyto/surface` ⚙ | windowing + event loop (X11 / Win32 / framebuffer / headless) |
 | `vyto/gfx` ⚙ | 2D canvas (blend2d): shapes, gradients, text, images |
 | `vyto/ui` | widget toolkit — layout, widgets, dialogs, nav, skins (iOS/macOS/Material) |
+| `vyto/mobile/android/ui` | the Android tier of the toolkit: `AndroidWidget` (taps on release, long-press to context or text selection, 48dp targets, ripple), `Scaffold`, `TopBar`, bottom nav, bottom sheet, drawer (either edge), FAB and speed dial, date/time pickers, pull-to-refresh, and `SafeArea` for the system bars |
+| `vyto/mobile/android` ⚙ | the platform behind it — a `Canvas` painter, storage, the soft keyboard, camera preview, sensors, location, notifications, haptics, share/deep-link intents, and a `Manifest` that generates `AndroidManifest.xml` from the capabilities the app declares |
 | `vyto/anim` · `vyto/geom` | animation/easing · vectors, `Mat4` transforms & vector paths |
 | `vyto/geo` | geodesy — coordinates, datums, ECEF/ENU, projections, tiles, GeoJSON |
 
-**Hardware** — `vyto/hw`
+**Hardware** — `vyto/hw` (Linux device interfaces; see
+[docs/hardware.md](docs/hardware.md))
+
+Every one of these is a file descriptor, a sysfs read or an ioctl — so they are
+thin shims over what the kernel already exposes, and they poll alongside sockets
+in the same event loop rather than needing a thread each.
 
 | Module | What it gives you |
 |--------|-------------------|
 | `vyto/hw/serial` ⚙ | serial / TTY ports as poll-able fds |
-| `vyto/hw/usb` ⚙ | USB device enumeration |
+| `vyto/hw/usb` ⚙ | USB device enumeration and control/bulk transfers |
+| `vyto/hw/input` ⚙ | keyboards, mice, gamepads and touch over `/dev/input` |
+| `vyto/hw/gpio` ⚙ | GPIO lines over the gpiochip character device (v2 uAPI) |
+| `vyto/hw/i2c` ⚙ · `vyto/hw/spi` ⚙ | I2C and SPI bus masters — register reads, full-duplex transfers |
+| `vyto/hw/sensors` | IIO sensors (accelerometer, gyro, magnetometer, light, temperature) via sysfs |
+| `vyto/hw/power` | battery, AC adapter and thermal zones — capacity, charge state, temperatures |
+| `vyto/hw/device` ⚙ | generic character-device byte I/O, for anything without its own module |
+| `vyto/hw/ioctl` ⚙ | the ioctl escape hatch, when a driver has no nicer interface |
+| `vyto/hw/uevent` | kernel device events — the push source hotplug needs |
+| `vyto/hw/camera` ⚙ | webcam capture over V4L2 |
+| `vyto/hw/location` | GPS: gpsd over a socket, or NMEA parsed from a serial stream — no shim at all |
+| `vyto/hw/sdr` ⚙ | software-defined radio capture |
 
 Some packages need a one-time native setup — see [Native dependencies](#native-dependencies).
 
@@ -624,7 +696,7 @@ Some packages need a one-time native setup — see [Native dependencies](#native
 src/       compiler (C99): lexer, recursive-descent parser, checker, C emitter
 runtime/   vyto_rt.{c,h}: RC objects, strings, arrays, maps, closures
 lib/vyto/  bundled stdlib modules (see "Standard library" above)
-examples/  01_hello … 50_worker_pool + golden .expected outputs
+examples/  01_hello … 99_super_method + golden .expected outputs
 ```
 
 ## Native dependencies
@@ -658,7 +730,7 @@ backend and stdlib native shims, which vary per target.
 | **Embedded / bare-metal** | ✅ Core supported | `--freestanding` builds the compiler and runtime with zero libc — six `vt_host_*` hooks (alloc/realloc/free/write/write_err/abort) are the entire platform seam, output is a linkable `.a`. Verified in the test suite. No display driver ships in-tree; that's embedder-supplied, as with any bare-metal C project. |
 | **Windows** (x86_64) | ✅ Supported | `--target windows-x64` cross-compiles with mingw-w64 (picked automatically), LLP64 mapping (`clong`/`culong`) done. Win32 GDI surface backend in `vsurf.c` (WndProc → event queue), **verified on real Windows 7 hardware**: a `vyto/surface` app, a `vyto/ui` + `GfxPainter` app and a raw-`Canvas` app all render — which also proves `__attribute__((constructor))` fires on PE, so the `--with-assets` VFS registry populates and bundled fonts resolve. Six shims carry `_WIN32` branches: `time` (kernel32, since mingw *declares* `clock_gettime` but it lives in libwinpthread), `date` (a hand-written `strptime` — Windows has none in any form), `os` (cmd.exe, not a POSIX shell), `file`, `net/socket` (Winsock), and `os/worker`. blend2d cross-builds too, so `vyto/gfx` works. **Not portable:** `vyto/hw/*` (Linux device interfaces) and `vyto/intl` (ICU). |
 | **macOS** (x86_64, arm64) | 🚧 Partial, untested | Cross-compile triples exist but need your own `--cc` (no bundled cross toolchain from Linux). CLI/stdlib should build as-is (POSIX + C99). GUI currently falls through to the X11 backend (needs XQuartz) — no native Cocoa/Metal surface shim yet. |
-| **Android** (arm64) | ✅ Supported | NDK integration is wired: `--target android-arm64 --shared --cc <ndk-clang>` produces a `.so` exporting `vyto_app_main`, and `--shared` adds `-Wl,--no-undefined` (so a missing shim fails at link, not at `System.loadLibrary`) and `-Wl,-z,max-page-size=16384` (Android 15's 16 KB-page devices will not load a 4 KB-aligned `.so` at all). Surface backend is a `SurfaceView` — `lockCanvas`/`unlockCanvasAndPost` on the Vyto thread, no compositor race. `vyto/mobile/android` supplies the JNI shims, `SafeArea` insets, and Android-native `net`/`intl` (the desktop `vyto/net` and `vyto/intl` do **not** compile for this triple — their shims include curl and ICU headers unconditionally). Verified rendering on a real device (Android 12, API 31, arm64-v8a); a signed apk builds with no Gradle. Touch works but is human-driven only — MIUI blocks `adb` event injection, so it is not in any automated test. Build checks live in their own runner (`tests/run_tests_android.sh`, 9 checks incl. 59 diffed JNI descriptors), deliberately outside `make test` so CI never downloads an NDK. |
+| **Android** (arm64) | ✅ Supported | NDK integration is wired: `--target android-arm64 --shared --cc <ndk-clang>` produces a `.so` exporting `vyto_app_main`, and `--shared` adds `-Wl,--no-undefined` (so a missing shim fails at link, not at `System.loadLibrary`) and `-Wl,-z,max-page-size=16384` (Android 15's 16 KB-page devices will not load a 4 KB-aligned `.so` at all). Surface backend is a `SurfaceView` — `lockCanvas`/`unlockCanvasAndPost` on the Vyto thread, no compositor race. `vyto/mobile/android` supplies the JNI shims, `SafeArea` insets, and Android-native `net`/`intl` (the desktop `vyto/net` and `vyto/intl` do **not** compile for this triple — their shims include curl and ICU headers unconditionally). Verified rendering on a real device (Android 12, API 31, arm64-v8a); a signed apk builds with no Gradle. Touch works but is human-driven only — MIUI blocks `adb` event injection, so it is not in any automated test; the widget-level behaviour it drives *is* covered, headlessly, by `make test-mobile`. Build checks live in their own runner (`tests/run_tests_android.sh`, 10 checks incl. 75 diffed JNI descriptors), deliberately outside `make test` so CI never downloads an NDK. |
 | **iOS** | 📋 Planned | No native surface shim or Xcode project. `apps/iphone` is a themed UI simulator running on the desktop backend, not an actual iOS build. |
 
 Legend: ✅ works today · 🚧 partially wired, unverified · 📋 not started.
