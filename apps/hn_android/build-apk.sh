@@ -134,12 +134,18 @@ echo "ok  $(wc -l < "$BUILD/declared.txt") native methods matched"
 # Catches a manifest naming an icon or theme that was never compiled — which
 # otherwise fails at *install* time, on a device, with a useless message.
 step "7  resources (aapt2 compile + link)"
+# Two res dirs, app last: aapt2 takes the last definition of a name, so an app
+# overrides the package's splash colour or adaptive-icon foreground simply by
+# defining the same name. The package dir carries @style/Vyto.Splash and the
+# adaptive icon; a manifest that names either and a build that forgets this
+# line fails here rather than at install time on a device.
+"$BT/aapt2" compile --dir lib/vyto/mobile/android/res -o "$BUILD/res/pkg.zip"
 "$BT/aapt2" compile --dir "$APP/res" -o "$BUILD/res/res.zip"
 "$BT/aapt2" link -o "$BUILD/base.apk" \
     -I "$ANDROID_JAR" \
     --manifest "$BUILD/AndroidManifest.xml" \
     --min-sdk-version "$API" --target-sdk-version 34 \
-    "$BUILD/res/res.zip"
+    "$BUILD/res/pkg.zip" "$BUILD/res/res.zip"
 [ -f "$BUILD/base.apk" ] || die "aapt2 link produced nothing"
 echo "ok  base.apk linked, every @reference resolved"
 

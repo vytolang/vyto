@@ -1,0 +1,41 @@
+// manifest.vt's XML, diffed. Nothing covered this module before: it is
+// exercised only by build-apk.sh, which needs an SDK, so a regression in the
+// generated manifest would surface on a device or not at all.
+//
+// It runs on the host with no toolchain and no shim behind it — that is the
+// point of generating the manifest in Vyto rather than hand-writing XML.
+//
+// Covers the three things that are load-bearing and silent when wrong:
+// configChanges (without which rotation kills the app), <queries> (without
+// which every outbound intent resolves to nothing on targetSdk 30+), and the
+// extra intent-filters, which must be appended AFTER the hardcoded
+// MAIN/LAUNCHER block and never replace it.
+import { Manifest, ACT_VIEW_URL, ACT_SHARE, ACT_HAPTICS,
+         ACT_NOTIFICATIONS } from "vyto/mobile/android/manifest";
+
+fn main() {
+    let m = new Manifest("dev.vyto.example", "Example");
+    m.version(7, "2.1.0").sdk(24, 34).splash();
+    m.uses(ACT_VIEW_URL);
+    m.uses(ACT_SHARE);
+    m.uses(ACT_HAPTICS);
+    m.uses(ACT_NOTIFICATIONS);
+
+    // A deep link with a host and a path, one with a bare custom scheme, and
+    // a share target.
+    m.deep_link("https", "example.dev", "/story");
+    m.deep_link("example", "", "");
+    m.share_target("text/plain");
+
+    let probs = m.validate();
+    for (let p in probs) { print("PROBLEM " + p); }
+    print(m.render());
+
+    // The two filters that produce a manifest aapt2 accepts and no intent ever
+    // matches. Checked on a throwaway manifest so the good one above stays
+    // clean.
+    let bad = new Manifest("dev.vyto.bad", "Bad");
+    bad.deep_link("", "example.dev", "");
+    bad.share_target("");
+    for (let p in bad.validate()) { print("BAD " + p); }
+}

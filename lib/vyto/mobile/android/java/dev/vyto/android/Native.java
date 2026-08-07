@@ -84,6 +84,26 @@ public final class Native {
     public static native void bindActions(Actions actions);
 
     /**
+     * Hand the stream shim the {@link Streams} instance to call up into
+     * (sensors, location). Same reason as {@link #bindActions}: the Activity
+     * constructs it and owns its lifecycle, because only the Activity can
+     * unregister the listeners in {@code onPause} — and a sensor left
+     * registered in the background is a battery bug nothing else catches.
+     */
+    public static native void bindStreams(Streams streams);
+
+    /**
+     * One sensor sample or one location fix, from the Streams HandlerThread.
+     *
+     * <p>Overwrites the channel's slot rather than queueing: a sensor is state,
+     * and an accelerometer at 200 Hz would otherwise build an unbounded queue
+     * between two reads. {@code timeMs} of 0 means "no sample", which is how
+     * Vyto tells an unstarted stream from a genuine reading of zero.
+     */
+    public static native void streamPut(int channel, double v0, double v1, double v2,
+                                        double v3, double v4, long timeMs);
+
+    /**
      * The app's private directories, from {@code Context.getFilesDir()} and
      * {@code getCacheDir()}.
      *
@@ -173,6 +193,18 @@ public final class Native {
     public static native void insets(int left, int top, int right, int bottom, int imeHeight);
 
     // ------------------------------------------------------------------ actions
+
+    /**
+     * An intent arriving *at* the app: a deep link, a share, or a tap on one
+     * of our own notifications ({@code notification} carries its id, else 0).
+     *
+     * <p>Queued natively and drained by {@code incoming.vt} on the Vyto thread.
+     * Safe to call before {@link #start}: the queue exists from process start,
+     * which is what keeps the intent that <em>launched</em> the app from being
+     * lost to a startup race — and that is the most common case of all.
+     */
+    public static native void incomingIntent(String action, String uri, String mime,
+                                             String text, int notification);
 
     /**
      * Deliver a completed intent or permission result. Queued natively and

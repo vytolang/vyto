@@ -1,0 +1,57 @@
+// vyto/mobile/android/notify — local notifications.
+//
+//     import { notify, notify_ongoing, cancel } from "vyto/mobile/android/notify";
+//     import { PERM_POST_NOTIFICATIONS } from "vyto/mobile/android/actions";
+//
+//     acts.request_permission(PERM_POST_NOTIFICATIONS, (r) => {
+//         if (r.ok) { notify(1, "Downloaded", "3 files ready"); }
+//     });
+//
+// Reusing an id replaces the notification already showing, which is how a
+// progress or status one updates rather than stacking. cancel(id) removes it.
+//
+// A tap re-launches the app with the id attached, and that arrives through
+// vyto/mobile/android/incoming as an Incoming with `notification` set — so an
+// app can open the screen the notification was about instead of just coming to
+// the foreground.
+//
+// -- local, not push ---------------------------------------------------------
+//
+// Push (FCM) needs the firebase-messaging AAR, which is Maven resolution,
+// which is Gradle, and this build path deliberately has none (ANDROID.md). A
+// Gradle-free app posts its own: alarms, timers, finished downloads, results
+// of work it did while in the foreground. Server-initiated push is the one
+// thing that genuinely needs the dependency.
+//
+// -- the two silent failures --------------------------------------------------
+//
+// Returns false, rather than throwing, in both of the cases that make a
+// notification vanish with no diagnostic anywhere:
+//
+//   * POST_NOTIFICATIONS not granted (API 33+). Ask for it first; the constant
+//     lives in actions.vt and manifest.vt's uses(ACT_NOTIFICATIONS) declares it.
+//   * No Actions bound yet — nothing has started, so there is nothing to post
+//     from.
+//
+// (A channel that does not exist is the third such trap on API 26+; the shim
+// creates one, so it cannot happen here.)
+
+extern "C" {
+    fn vta_notify(id: i32, title: cstring, text: cstring, ongoing: i32): i32;
+    fn vta_notify_cancel(id: i32);
+}
+
+// Post or replace notification `id`. Dismissable by the user; tapping it opens
+// the app and clears it.
+export fn notify(id: int, title: string, text: string): bool {
+    return vta_notify(id as i32, title.cstr(), text.cstr(), 0 as i32) == 0;
+}
+
+// Same, but not dismissable — for something still running. Remember to
+// cancel() it: an ongoing notification the app forgets is one the user cannot
+// get rid of without force-stopping.
+export fn notify_ongoing(id: int, title: string, text: string): bool {
+    return vta_notify(id as i32, title.cstr(), text.cstr(), 1 as i32) == 0;
+}
+
+export fn cancel(id: int) { vta_notify_cancel(id as i32); }

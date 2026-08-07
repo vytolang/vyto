@@ -37,6 +37,7 @@ public class VytoActivity extends Activity {
     private VytoView view;
     private VytoSurfaceView surfaceView;
     private Actions actions;
+    private Streams streams;
 
     /**
      * Which rendering target to build: {@link VytoSurfaceView} (the default) or
@@ -98,11 +99,13 @@ public class VytoActivity extends Activity {
         android.util.Log.i("Vyto", "render target: "
                 + target.getClass().getSimpleName());
         actions = new Actions(this);
+        streams = new Streams(this);
         setContentView(target);
 
         // Bind before start(): the Vyto thread can reach for Actions as soon as
         // it is running, and a null there would drop the first launch.
         Native.bindActions(actions);
+        Native.bindStreams(streams);
 
         // Also before start(), and for a sharper reason: os_app_dir() caches
         // its answer the first time anything asks, and the Vyto thread asks as
@@ -119,6 +122,12 @@ public class VytoActivity extends Activity {
             getWindow().setDecorFitsSystemWindows(false);
         }
 
+        // The intent that launched us: a deep link, a share, or a notification
+        // tap. Pushed before the thread starts, which the native queue is
+        // built to allow — losing this one would lose the most common way an
+        // app is opened by something other than its icon.
+        deliverIntent(getIntent());
+
         // The Vyto thread starts once the View has a size; onSizeChanged is the
         // first point where the backbuffer exists. Posting rather than starting
         // here avoids a 0x0 first frame.
@@ -130,6 +139,45 @@ public class VytoActivity extends Activity {
         });
     }
 
+    /**
+     * The app was already running when a link or a share arrived.
+     * {@code launchMode} is singleTop, so this fires instead of a second
+     * Activity being created — which is also why the widget tree survives it.
+     */
+    @Override
+    protected void onNewIntent(android.content.Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        deliverIntent(intent);
+    }
+
+    /** Flatten an Intent into the four strings Vyto reads, and queue it. */
+    private void deliverIntent(android.content.Intent i) {
+        if (i == null || !Native.isLoaded()) return;
+        String action = i.getAction() == null ? "" : i.getAction();
+        int notification = i.getIntExtra("vyto.notification", 0);
+        // MAIN with no data is the launcher icon: not an incoming intent, and
+        // queueing it would make every cold start look like a deep link.
+        if (notification == 0 && i.getData() == null
+                && android.content.Intent.ACTION_MAIN.equals(action)) {
+            return;
+        }
+        String uri = i.getData() == null ? "" : i.getData().toString();
+        String mime = i.getType() == null ? "" : i.getType();
+        String text = "";
+        CharSequence extra = i.getCharSequenceExtra(android.content.Intent.EXTRA_TEXT);
+        if (extra != null) {
+            text = extra.toString();
+        } else if (i.hasExtra(android.content.Intent.EXTRA_STREAM)) {
+            // A shared file arrives as a content:// URI in EXTRA_STREAM, not as
+            // data. Surfacing it as `uri` keeps one field to read, and it is
+            // the field Actions.open_fd already knows how to open.
+            Object stream = i.getParcelableExtra(android.content.Intent.EXTRA_STREAM);
+            if (stream != null && uri.isEmpty()) uri = stream.toString();
+        }
+        Native.incomingIntent(action, uri, mime, text, notification);
+    }
+
     @Override
     protected void onResume() {
         super.onResume();
@@ -139,6 +187,10 @@ public class VytoActivity extends Activity {
 
     @Override
     protected void onPause() {
+        // Every sensor and the location provider, off. Not a nicety: a
+        // registered listener keeps waking the device for an app the user has
+        // left, and nothing else in the stack will notice.
+        if (streams != null) streams.stopAll();
         // Park the loop so animations stop waking it. The widget tree and the
         // backbuffer are untouched — there is no surface to lose, which is the
         // main simplification the Bitmap design buys over SurfaceView.
@@ -153,6 +205,7 @@ public class VytoActivity extends Activity {
     protected void onDestroy() {
         if (Native.isLoaded()) Native.stop();
         if (actions != null) actions.dispose();
+        if (streams != null) streams.dispose();
         if (view != null) view.releaseBitmap();
         if (surfaceView != null) surfaceView.releaseBitmap();
         super.onDestroy();

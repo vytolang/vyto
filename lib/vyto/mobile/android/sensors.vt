@@ -1,0 +1,108 @@
+// vyto/mobile/android/sensors — the device's motion and environment sensors.
+//
+//     import { Sensors, SENSOR_ACCEL, Sample } from "vyto/mobile/android/sensors";
+//
+//     let s = new Sensors();
+//     s.start(SENSOR_ACCEL, RATE_UI);
+//     // ... once a frame, or whenever the app wants to look:
+//     let a = s.poll(SENSOR_ACCEL);
+//     if (a != null) { print(a.x + "," + a.y + "," + a.z); }
+//
+// -- polled, not pushed, and that is the design ------------------------------
+//
+// An accelerometer at RATE_GAME delivers 50-200 samples a second. A callback
+// per sample would run app code — and possibly a relayout — at that rate on
+// whatever thread the platform chose, and a queue would grow between reads for
+// values nobody will ever look at. So each sensor is one slot that the newest
+// sample overwrites (native/src/astream.c), and the app reads the current value
+// when it is ready to use one. `fresh()` answers "has it changed since I last
+// looked", so a widget can skip a repaint without keeping its own copy.
+//
+// -- what it does off Android ------------------------------------------------
+//
+// Nothing, honestly: start() returns false, has() returns false, poll() returns
+// null. The shim has a real desktop arm, so a program using this links and runs
+// on a laptop and simply never gets a sample. Linux sensors are a different
+// shape entirely (IIO under /sys) and are vyto/hw/sensors' business.
+//
+// -- lifecycle ---------------------------------------------------------------
+//
+// The Activity unregisters everything in onPause and re-registration is the
+// app's job on resume. That is not an oversight: a sensor left registered
+// while the app is in the background keeps the device awake, and the app is
+// the only thing that knows whether it still wants the stream.
+
+extern "C" {
+    fn vta_sensor_start(kind: i32, rate_us: i32): i32;
+    fn vta_sensor_stop(kind: i32);
+    fn vta_sensor_has(kind: i32): i32;
+    fn vta_stream_v(ch: i32, i: i32): f64;
+    fn vta_stream_t(ch: i32): i64;
+    fn vta_stream_take_fresh(ch: i32): i32;
+}
+
+// Channel ids. Shared with Streams.java and with location.vt (which owns
+// channel 0) — the numbering is the wire format between the three.
+export const SENSOR_ACCEL: int = 1;     // m/s^2, including gravity
+export const SENSOR_GYRO: int = 2;      // rad/s
+export const SENSOR_MAG: int = 3;       // microtesla
+export const SENSOR_LIGHT: int = 4;     // lux (x only)
+export const SENSOR_PRESSURE: int = 5;  // hPa (x only)
+export const SENSOR_STEPS: int = 6;     // steps since boot (x only)
+
+// Sampling periods, in microseconds — SensorManager's own four. A *hint*: the
+// platform delivers no faster than it feels like, and often slower.
+export const RATE_FASTEST: int = 0;
+export const RATE_GAME: int = 20000;     // ~50 Hz
+export const RATE_UI: int = 66667;       // ~15 Hz, the right default for a UI
+export const RATE_NORMAL: int = 200000;  // ~5 Hz
+
+// One reading. Single-value sensors (light, pressure, steps) use `x` and leave
+// the rest zero. `t` is a device-uptime millisecond stamp — comparable only
+// with other samples, never with a wall clock.
+export class Sample {
+    x: float;
+    y: float;
+    z: float;
+    t: int;
+
+    fn init(x: float, y: float, z: float, t: int) {
+        this.x = x;
+        this.y = y;
+        this.z = z;
+        this.t = t;
+    }
+}
+
+export class Sensors {
+    fn init() { }
+
+    // Does this device have the sensor at all? Many have no gyroscope, no
+    // barometer and no step counter, and a missing sensor is a normal state to
+    // design around rather than an error.
+    fn has(kind: int): bool { return vta_sensor_has(kind as i32) == 1; }
+
+    // Begin sampling. False when the sensor is absent or the platform refused.
+    fn start(kind: int, rate_us: int): bool {
+        return vta_sensor_start(kind as i32, rate_us as i32) == 1;
+    }
+
+    fn stop(kind: int) { vta_sensor_stop(kind as i32); }
+
+    // The most recent sample, or null when none has ever arrived — which is
+    // how "not started", "no permission", "no such sensor" and a genuine
+    // reading of zero stay distinguishable.
+    fn poll(kind: int): Sample {
+        let t = vta_stream_t(kind as i32);
+        if (t == 0) { return null; }
+        return new Sample(vta_stream_v(kind as i32, 0 as i32) as float,
+                          vta_stream_v(kind as i32, 1 as i32) as float,
+                          vta_stream_v(kind as i32, 2 as i32) as float,
+                          t as int);
+    }
+
+    // Has a new sample landed since the last time this was asked? Reading it
+    // clears the flag, so two callers cannot both be told "yes" for one sample
+    // — one owner per sensor.
+    fn fresh(kind: int): bool { return vta_stream_take_fresh(kind as i32) == 1; }
+}

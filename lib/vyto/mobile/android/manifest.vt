@@ -52,6 +52,10 @@ import { PERM_CAMERA, PERM_RECORD_AUDIO, PERM_FINE_LOCATION,
 // keeps this module free of a dependency on the network module.
 export const PERM_INTERNET: string = "android.permission.INTERNET";
 
+// Also install-time. vyto/mobile/android/haptics needs it; without it every
+// vibrate() is silently ignored, with no error and nothing in logcat.
+export const PERM_VIBRATE: string = "android.permission.VIBRATE";
+
 // Granted at install with no runtime prompt and no intent implications.
 // validate() excludes these from the <queries> check, which is about resolving
 // *other apps'* intents and has nothing to say about them.
@@ -80,6 +84,10 @@ export const ACT_LOCATION_FINE: int = 10;
 export const ACT_LOCATION_COARSE: int = 11;
 export const ACT_NOTIFICATIONS: int = 12;
 export const ACT_CONTACTS: int = 13;
+// Haptic feedback. VIBRATE is install-time, so this asks for no prompt and
+// resolves no intent — it is here so an app that buzzes says so in one place
+// rather than remembering a permission string.
+export const ACT_HAPTICS: int = 14;
 
 // The configuration changes the Activity must absorb rather than restart on.
 // See point 1 above — this is not a tuning knob.
@@ -140,6 +148,29 @@ class Query {
     }
 }
 
+// One extra <intent-filter> on the Activity, past the hardcoded
+// MAIN/LAUNCHER one. Two shapes, because two shapes cover what apps declare:
+// a VIEW filter (a deep link — a URL that opens this app) and a SEND filter
+// (a share target — this app appears in other apps' share sheets).
+class Filter {
+    kind: int;        // FILTER_VIEW or FILTER_SEND
+    scheme: string;   // "https", "myapp", …
+    host: string;     // "" = any host
+    path_prefix: string;
+    mime: string;     // SEND only
+
+    fn init(kind: int, scheme: string, host: string, path_prefix: string, mime: string) {
+        this.kind = kind;
+        this.scheme = scheme;
+        this.host = host;
+        this.path_prefix = path_prefix;
+        this.mime = mime;
+    }
+}
+
+const FILTER_VIEW: int = 0;
+const FILTER_SEND: int = 1;
+
 class Meta {
     name: string;
     value: string;
@@ -178,6 +209,7 @@ export class Manifest {
     features: Feature[];
     queries: Query[];
     meta: Meta[];
+    filters: Filter[];
     need_file_provider: bool;
 
     fn init(package_name: string, app_label: string) {
@@ -215,6 +247,7 @@ export class Manifest {
         this.features = [];
         this.queries = [];
         this.meta = [];
+        this.filters = [];
         this.need_file_provider = false;
     }
 
@@ -233,6 +266,19 @@ export class Manifest {
 
     fn icon(v: string): Manifest { this.app_icon = v; return this; }
     fn theme(v: string): Manifest { this.app_theme = v; return this; }
+
+    // Launch with the package's splash theme (lib/vyto/mobile/android/res).
+    //
+    // A Vyto app draws nothing until its thread is up and the first frame is
+    // blitted; until then the window shows whatever the theme's
+    // windowBackground is, which by default is white and reads as a hang. This
+    // makes that first frame deliberate.
+    //
+    // The theme lives in the package's res dir, so a build that calls this
+    // must compile that dir too — see apps/hn_android/build-apk.sh step 7.
+    // Without it aapt2 fails at link with "resource style/Vyto.Splash not
+    // found", which is the right time to find out.
+    fn splash(): Manifest { this.app_theme = "@style/Vyto.Splash"; return this; }
     fn debug(v: bool): Manifest { this.debuggable = v; return this; }
     fn backup(v: bool): Manifest { this.allow_backup = v; return this; }
     fn activity(v: string): Manifest { this.activity_name = v; return this; }
@@ -291,6 +337,37 @@ export class Manifest {
 
     fn provider_authority(): string {
         return this.package_name + ".fileprovider";
+    }
+
+    // -- incoming intents ----------------------------------------------------
+
+    // A deep link: a URL that opens this app instead of a browser.
+    //
+    //     m.deep_link("https", "example.com", "/story");
+    //     m.deep_link("myapp", "", "");          // a custom scheme
+    //
+    // Appended AFTER the MAIN/LAUNCHER filter, which stays exactly as it is —
+    // a second filter adds a way in, it does not replace the launcher.
+    //
+    // BROWSABLE is included, without which a link tapped in a browser or a
+    // messaging app will not resolve here; that omission is the single most
+    // common reason a deep link "does nothing".
+    //
+    // The receiving half is vyto/mobile/android/incoming: a filter with no
+    // reader puts the app in a chooser and then ignores what it is handed.
+    fn deep_link(scheme: string, host: string, path_prefix: string): Manifest {
+        this.filters.push(new Filter(FILTER_VIEW, scheme, host, path_prefix, ""));
+        return this;
+    }
+
+    // A share target: this app appears when the user shares matching content
+    // from another app.
+    //
+    //     m.share_target("text/plain");
+    //     m.share_target("image/*");
+    fn share_target(mime: string): Manifest {
+        this.filters.push(new Filter(FILTER_SEND, "", "", "", mime));
+        return this;
     }
 
     // -- capability expansion ------------------------------------------------
@@ -362,6 +439,10 @@ export class Manifest {
             this.permission(PERM_POST_NOTIFICATIONS);
             return this;
         }
+        if (act == ACT_HAPTICS) {
+            this.permission(PERM_VIBRATE);
+            return this;
+        }
         if (act == ACT_CONTACTS) {
             this.permission(PERM_READ_CONTACTS);
             this.query("android.intent.action.PICK", "");
@@ -391,6 +472,18 @@ export class Manifest {
             probs.push("configChanges is empty: rotation will restart the Activity, " +
                        "and Window's teardown is terminal (ui/core.vt:2486). " +
                        "Only allow_activity_restart_UNSAFE() should produce this.");
+        }
+        for (let f in this.filters) {
+            // A filter aapt2 accepts and no intent ever matches. Both of these
+            // produce an app that simply never appears where the author
+            // expected it, with nothing to debug.
+            if (f.kind == FILTER_VIEW && f.scheme == "") {
+                probs.push("deep_link with an empty scheme matches nothing");
+            }
+            if (f.kind == FILTER_SEND && f.mime == "") {
+                probs.push("share_target with an empty mime type matches nothing " +
+                           "(use \"*/*\" to mean everything)");
+            }
         }
         // Package visibility only bites permissions that pair with an outbound
         // intent. Counting *every* permission flags an app that merely asked
@@ -487,6 +580,32 @@ export class Manifest {
         x = x + "                <action android:name=\"android.intent.action.MAIN\" />\n";
         x = x + "                <category android:name=\"android.intent.category.LAUNCHER\" />\n";
         x = x + "            </intent-filter>\n";
+
+        // Extra filters, after the launcher one. Order is not significant to
+        // Android, but keeping MAIN/LAUNCHER first keeps the file readable and
+        // keeps a diff of this block small when an app adds a link.
+        for (let f in this.filters) {
+            x = x + "            <intent-filter>\n";
+            if (f.kind == FILTER_VIEW) {
+                x = x + "                <action android:name=\"android.intent.action.VIEW\" />\n";
+                x = x + "                <category android:name=\"android.intent.category.DEFAULT\" />\n";
+                // Without BROWSABLE a link tapped in a browser or a chat app
+                // never reaches here, with no error anywhere.
+                x = x + "                <category android:name=\"android.intent.category.BROWSABLE\" />\n";
+                x = x + "                <data android:scheme=\"" + xesc(f.scheme) + "\"";
+                if (f.host != "") { x = x + " android:host=\"" + xesc(f.host) + "\""; }
+                if (f.path_prefix != "") {
+                    x = x + " android:pathPrefix=\"" + xesc(f.path_prefix) + "\"";
+                }
+                x = x + " />\n";
+            } else {
+                x = x + "                <action android:name=\"android.intent.action.SEND\" />\n";
+                x = x + "                <category android:name=\"android.intent.category.DEFAULT\" />\n";
+                x = x + "                <data android:mimeType=\"" + xesc(f.mime) + "\" />\n";
+            }
+            x = x + "            </intent-filter>\n";
+        }
+
         x = x + "        </activity>\n";
 
         if (this.need_file_provider) {

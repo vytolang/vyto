@@ -273,6 +273,21 @@ else
     fail=1
 fi
 
+# --- vyto/mobile/android/manifest: the generated AndroidManifest.xml.
+#     Pure Vyto with no shim behind it, so it runs in the toolchain-free suite —
+#     which matters, because the only other thing that exercises this module is
+#     build-apk.sh, and that needs an SDK. A wrong manifest is caught on a
+#     device or not at all. ---
+got=$(./vytoc run tests/fixtures/android_manifest.vt 2>&1)
+if [ "$got" = "$(cat tests/fixtures/android_manifest.expected)" ]; then
+    echo "PASS android_manifest"
+else
+    echo "FAIL android_manifest"
+    echo "--- expected ---"; cat tests/fixtures/android_manifest.expected
+    echo "--- got ---"; printf '%s\n' "$got"
+    fail=1
+fi
+
 # --- vyto/cli: accepted flag/option/operand/subcommand syntax (pure Vyto) ---
 got=$(./vytoc run tests/fixtures/cli_parse.vt 2>&1)
 if [ "$got" = "$(cat tests/fixtures/cli_parse.expected)" ]; then

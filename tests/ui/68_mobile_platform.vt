@@ -1,0 +1,69 @@
+// The Tier-4 platform surfaces, tested where they can be: the decision each
+// one makes, and what each does when the platform is absent.
+//
+// None of the five can do its real work off a device — no vibrator, no
+// sensors, no notification manager, no intents — and all five have a real
+// desktop arm rather than being #ifdef-ed away, precisely so a program that
+// uses them still links and runs on a laptop. That degraded behaviour is a
+// contract, and this is what holds it:
+//
+//   * an unstarted sensor and an unstarted location both poll null, which is
+//     what distinguishes "no data" from a genuine reading of zero
+//   * a notification off-platform fails rather than pretending
+//   * the incoming-intent queue drains in order and reports empty as null
+//   * AndroidWidget asks for a haptic tick on a long-press and on nothing else
+import { Window, Painter, Theme, Size } from "vyto/ui";
+import { AndroidWidget } from "vyto/mobile/android/ui";
+import { Sensors, SENSOR_ACCEL, SENSOR_GYRO, RATE_UI } from "vyto/mobile/android/sensors";
+import { Location } from "vyto/mobile/android/location";
+import { notify, notify_ongoing, cancel } from "vyto/mobile/android/notify";
+import { incoming_poll } from "vyto/mobile/android/incoming";
+import { filesDir, cacheDir } from "vyto/mobile/android/storage";
+
+// AndroidWidget buzzes on a long-press and nowhere else. The buzz itself is a
+// no-op here, so the probe reports the decision — the same shape as the IME
+// golden, and for the same reason.
+class Probe extends AndroidWidget {
+    override fn content_size(s: Painter, th: Theme): Size { return Size(40.0, 40.0); }
+    override fn paint(s: Painter, th: Theme) { }
+
+    override fn on_tap(x: int, y: int): bool { print("tap"); return true; }
+    override fn on_long_press(x: int, y: int): bool {
+        let r = super.on_long_press(x, y);
+        print("long press, haptics=" + this.haptics);
+        return r;
+    }
+    override fn on_context(x: int, y: int): bool { print("context"); return true; }
+}
+
+fn main() {
+    let win = new Window("Platform", 200, 200);
+    let p = new Probe();
+    win.root = p;
+    win.run();
+
+    // Sensors: absent, so nothing starts and nothing polls.
+    let s = new Sensors();
+    print("accel has=" + s.has(SENSOR_ACCEL) + " start=" + s.start(SENSOR_ACCEL, RATE_UI));
+    print("accel poll_null=" + (s.poll(SENSOR_ACCEL) == null)
+          + " fresh=" + s.fresh(SENSOR_ACCEL));
+    s.stop(SENSOR_ACCEL);
+    print("gyro poll_null=" + (s.poll(SENSOR_GYRO) == null));
+
+    // Location: same, and a Fix is null rather than a zero position — a
+    // (0, 0) fix off West Africa is the classic version of this bug.
+    let loc = new Location();
+    print("loc start=" + loc.start(1000, 5.0) + " poll_null=" + (loc.poll() == null));
+    loc.stop();
+
+    // Notifications report failure rather than claiming success.
+    print("notify=" + notify(1, "Title", "Body")
+          + " ongoing=" + notify_ongoing(2, "Job", "running"));
+    cancel(1);
+
+    // The incoming queue is empty and says so.
+    print("incoming_null=" + (incoming_poll() == null));
+
+    // Storage falls back to nothing off Android; appDir() is the desktop path.
+    print("files=[" + filesDir() + "] cache=[" + cacheDir() + "]");
+}

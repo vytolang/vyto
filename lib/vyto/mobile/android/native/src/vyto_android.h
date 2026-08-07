@@ -37,6 +37,7 @@ JNIEnv *vta_env(void);
 jobject vta_view(void);      /* dev.vyto.android.VytoView */
 jobject vta_commands(void);  /* dev.vyto.android.CommandBuffer */
 jobject vta_actions(void);   /* dev.vyto.android.Actions */
+jobject vta_streams(void);   /* dev.vyto.android.Streams */
 
 /* Log helper; wraps __android_log_print so the shims do not each include it. */
 void vta_logf(const char *fmt, ...);
@@ -93,6 +94,42 @@ void vta_set_app_dirs(const char *files, const char *cache);
 const char *vta_files_dir(void);
 const char *vta_cache_dir(void);
 
+/* ------------------------------------------------------- sensors + location
+ *
+ * Implemented by astream.c: one slot per channel, overwritten by each sample,
+ * because a sensor is state and not a queue of events. Written from Java on a
+ * HandlerThread, read from the Vyto thread. Both arms exist, so sensors.vt and
+ * location.vt link and run (reporting no sample) on the desktop.
+ */
+void vta_stream_put(int32_t ch, double v0, double v1, double v2,
+                    double v3, double v4, int64_t t_ms);
+double vta_stream_v(int32_t ch, int32_t i);
+int64_t vta_stream_t(int32_t ch);
+int32_t vta_stream_take_fresh(int32_t ch);
+void vta_stream_clear(int32_t ch);
+int32_t vta_sensor_start(int32_t kind, int32_t rate_us);
+void vta_sensor_stop(int32_t kind);
+int32_t vta_sensor_has(int32_t kind);
+int32_t vta_location_start(int64_t min_ms, double min_m);
+void vta_location_stop(void);
+
+/* ----------------------------------------------------------------- haptics
+ *
+ * Implemented by ahaptics.c as an up-call on the bound Actions instance.
+ * `kind` is 0 for a plain `ms` buzz, or one of the predefined effects (see
+ * haptics.vt). A no-op off Android.
+ */
+void vta_haptic(int32_t ms, int32_t kind);
+
+/* ----------------------------------------------------------- notifications
+ *
+ * Implemented by anotify.c as an up-call on the bound Actions instance. Local
+ * only; push would need the Firebase AAR and therefore Gradle. Returns -1 off
+ * Android and when POST_NOTIFICATIONS has not been granted.
+ */
+int32_t vta_notify(int32_t id, const char *title, const char *text, int32_t ongoing);
+void vta_notify_cancel(int32_t id);
+
 /* ---------------------------------------------------------- soft keyboard
  *
  * Implemented by aime.c as an up-call to the view's setTextInputActive.
@@ -100,6 +137,22 @@ const char *vta_cache_dir(void);
  * Android, which is what keeps vyto/mobile/android/ui linkable on the desktop.
  */
 void vta_ime_set(int32_t on);
+
+/* --------------------------------------------------------- incoming intents
+ *
+ * Implemented by aincoming.c. Pushed from the UI thread (onCreate/onNewIntent),
+ * drained from the Vyto thread by incoming.vt. A queue rather than a slot: two
+ * shares must not overwrite each other. Exists before the Vyto thread does, so
+ * the intent that launched the app is not lost to a startup race.
+ */
+void vta_incoming_push(const char *action, const char *uri, const char *mime,
+                       const char *text, int32_t notification);
+int32_t vta_incoming_next(void);
+const char *vta_incoming_action(void);
+const char *vta_incoming_uri(void);
+const char *vta_incoming_mime(void);
+const char *vta_incoming_text(void);
+int32_t vta_incoming_notification(void);
 
 /* ------------------------------------------------------------ intent queue
  *

@@ -1,0 +1,103 @@
+// vyto/mobile/android/location — where the device is.
+//
+//     import { Location, Fix } from "vyto/mobile/android/location";
+//     import { PERM_FINE_LOCATION } from "vyto/mobile/android/actions";
+//
+//     acts.request_permission(PERM_FINE_LOCATION, (r) => {
+//         if (r.ok) { loc.start(2000, 5.0); }     // at most every 2s / 5m
+//     });
+//     // ... whenever the app wants a position:
+//     let fix = loc.poll();
+//     if (fix != null && fix.valid) { map.center(fix.lat, fix.lon); }
+//
+// `Fix` deliberately mirrors vyto/hw/location's field for field — lat, lon,
+// alt, speed, valid — so code that reads a position reads the same on a laptop
+// over gpsd and on a phone over LocationManager. `accuracy` is the one
+// addition, because Android always reports it and a fix without it invites
+// treating a 2 km cell-tower estimate as a GPS lock.
+//
+// -- permission is the app's step, not this module's --------------------------
+//
+// start() returns false when the permission has not been granted, when no
+// provider is enabled, or when location is off system-wide. It does not
+// request anything: the prompt is a user-visible moment an app should place
+// deliberately, and silently bundling it makes a denial look like broken
+// hardware. Ask through Actions.request_permission first.
+//
+// -- polled, and stopped with the app -----------------------------------------
+//
+// Same slot model as sensors (native/src/astream.c): the newest fix overwrites
+// the previous one and poll() reads it. stop() clears the slot, so a stopped
+// stream reports null rather than handing back an hour-old position — which is
+// the failure that makes a map look like it is working when it is not. The
+// Activity also stops location in onPause; a live GPS in the background is one
+// of the fastest ways to drain a phone.
+
+extern "C" {
+    fn vta_location_start(min_ms: i64, min_m: f64): i32;
+    fn vta_location_stop();
+    fn vta_stream_v(ch: i32, i: i32): f64;
+    fn vta_stream_t(ch: i32): i64;
+    fn vta_stream_take_fresh(ch: i32): i32;
+}
+
+// Channel 0 in the shared numbering; sensors.vt owns 1..6.
+const CH_LOCATION: int = 0;
+
+// A single position fix. Angles in degrees (negative = S / W), altitude in
+// metres, speed in metres per second, accuracy the radius in metres the
+// platform believes the position is within.
+export class Fix {
+    lat: float;
+    lon: float;
+    alt: float;
+    speed: float;
+    accuracy: float;
+    valid: bool;
+    source: string;   // "android", matching vyto/hw/location's "gpsd"/"nmea"
+
+    fn init() {
+        this.lat = 0.0;
+        this.lon = 0.0;
+        this.alt = 0.0;
+        this.speed = 0.0;
+        this.accuracy = 0.0;
+        this.valid = false;
+        this.source = "android";
+    }
+}
+
+export class Location {
+    fn init() { }
+
+    // Ask for updates no more often than `min_ms` apart and no closer together
+    // than `min_m` metres. Both are floors the platform may exceed, and both
+    // are battery: a 0/0 request keeps the GPS hot.
+    //
+    // False means not granted, no provider, or location switched off. It is a
+    // state to handle, not an error to report — see the note above.
+    fn start(min_ms: int, min_m: float): bool {
+        return vta_location_start(min_ms as i64, min_m as f64) == 1;
+    }
+
+    fn stop() { vta_location_stop(); }
+
+    // The most recent fix, or null when none has arrived. The last known
+    // position is pushed immediately at start(), so a screen that opens a map
+    // usually has something to draw before the first live update.
+    fn poll(): Fix {
+        let t = vta_stream_t(CH_LOCATION as i32);
+        if (t == 0) { return null; }
+        let f = new Fix();
+        f.lat = vta_stream_v(CH_LOCATION as i32, 0 as i32) as float;
+        f.lon = vta_stream_v(CH_LOCATION as i32, 1 as i32) as float;
+        f.alt = vta_stream_v(CH_LOCATION as i32, 2 as i32) as float;
+        f.speed = vta_stream_v(CH_LOCATION as i32, 3 as i32) as float;
+        f.accuracy = vta_stream_v(CH_LOCATION as i32, 4 as i32) as float;
+        f.valid = true;
+        return f;
+    }
+
+    // Has a new fix landed since this was last asked? Clears on read.
+    fn fresh(): bool { return vta_stream_take_fresh(CH_LOCATION as i32) == 1; }
+}

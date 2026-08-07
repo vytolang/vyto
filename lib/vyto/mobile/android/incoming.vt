@@ -1,0 +1,80 @@
+// vyto/mobile/android/incoming — intents arriving *at* the app: deep links,
+// shares, and taps on our own notifications.
+//
+//     import { incoming_poll } from "vyto/mobile/android/incoming";
+//
+//     // once per event-loop turn, next to Actions.pump():
+//     let inc = incoming_poll();
+//     while (inc != null) {
+//         if (inc.is_link()) { app.open_url(inc.uri); }
+//         if (inc.is_share()) { app.compose(inc.text); }
+//         if (inc.notification > 0) { app.open_from_notification(inc.notification); }
+//         inc = incoming_poll();
+//     }
+//
+// The declaring half is manifest.vt — `deep_link(scheme, host, prefix)` and
+// `share_target(mime)`, which append filters after the launcher one. Filters
+// without this reader put the app in a chooser and then ignore what it is
+// handed; this reader without filters never fires. Both halves or neither.
+//
+// -- a queue, and why it exists before the app does ---------------------------
+//
+// Each of these is a user action, so two must never overwrite each other —
+// unlike a sensor sample (see sensors.vt), where only the newest matters. The
+// native queue (native/src/aincoming.c) is also live from process start rather
+// than from Native.start, because the intent that *launched* the app is
+// delivered in onCreate, before the Vyto thread exists. That case — someone
+// tapping a link to open the app — is the common one, and a queue that only
+// began at thread start would drop precisely it.
+//
+// -- shared files -------------------------------------------------------------
+//
+// A shared image or document arrives as a content:// URI in `uri`. That is not
+// a path: fopen will fail on it. Open it with Actions.open_fd, exactly as for
+// a picked document — the same trap, the same bridge.
+//
+// Returns null off Android, so a program that also runs on the desktop needs
+// no conditionals around its drain loop.
+
+extern "C" {
+    fn vta_incoming_next(): i32;
+    fn vta_incoming_action(): cstring;
+    fn vta_incoming_uri(): cstring;
+    fn vta_incoming_mime(): cstring;
+    fn vta_incoming_text(): cstring;
+    fn vta_incoming_notification(): i32;
+}
+
+// One arriving intent, flattened to the four things an app reads.
+export class Incoming {
+    action: string;       // "android.intent.action.VIEW", ".SEND", …
+    uri: string;          // the link, or the content:// URI of a shared file
+    mime: string;         // "text/plain", "image/png", … or ""
+    text: string;         // EXTRA_TEXT of a share, or ""
+    notification: int;    // id of the notification tapped, or 0
+
+    fn init(action: string, uri: string, mime: string, text: string, notification: int) {
+        this.action = action;
+        this.uri = uri;
+        this.mime = mime;
+        this.text = text;
+        this.notification = notification;
+    }
+
+    // A deep link: someone opened a URL that belongs to this app.
+    fn is_link(): bool { return this.action == "android.intent.action.VIEW"; }
+
+    // A share: another app handed us content.
+    fn is_share(): bool { return this.action == "android.intent.action.SEND"; }
+}
+
+// The next arriving intent, or null when there are none. Drain in a loop —
+// several can be waiting after the app was in the background.
+export fn incoming_poll(): Incoming {
+    if (vta_incoming_next() != 1) { return null; }
+    return new Incoming(str(vta_incoming_action()),
+                        str(vta_incoming_uri()),
+                        str(vta_incoming_mime()),
+                        str(vta_incoming_text()),
+                        vta_incoming_notification() as int);
+}

@@ -229,6 +229,177 @@ public class Actions {
         return 0;
     }
 
+    // -------------------------------------------------------- notifications
+
+    /** One channel for everything. Apps that want more can post through NotificationManager directly. */
+    private static final String CHANNEL_ID = "vyto.default";
+    private boolean channelReady;
+
+    private void ensureChannel(android.app.NotificationManager nm) {
+        if (channelReady || Build.VERSION.SDK_INT < 26) { channelReady = true; return; }
+        // A notification posted to a channel that does not exist is dropped
+        // silently on API 26+ — no exception, nothing in logcat, just no
+        // notification. Creating it is idempotent, so this is cheap insurance.
+        android.app.NotificationChannel ch = new android.app.NotificationChannel(
+                CHANNEL_ID, "Notifications",
+                android.app.NotificationManager.IMPORTANCE_DEFAULT);
+        nm.createNotificationChannel(ch);
+        channelReady = true;
+    }
+
+    /**
+     * Post (or replace) a notification. Reusing an {@code id} updates the one
+     * already showing, which is how progress and status notifications work.
+     *
+     * <p>Tapping it re-launches the Activity with {@code vyto.notification}
+     * set to the id, which arrives in Vyto through the incoming-intent queue —
+     * so an app can route the tap to the screen the notification was about.
+     *
+     * <p>{@code ongoing} makes it non-dismissable, for a running task.
+     *
+     * <p>Returns -1 when POST_NOTIFICATIONS has not been granted (API 33+),
+     * which is a state to handle rather than an error: ask for it through
+     * {@link #requestPermission} first.
+     */
+    public int notify(int id, String title, String text, boolean ongoing) {
+        android.app.NotificationManager nm = (android.app.NotificationManager)
+                activity.getSystemService(android.content.Context.NOTIFICATION_SERVICE);
+        if (nm == null) return -1;
+        if (Build.VERSION.SDK_INT >= 33
+                && !hasPermission("android.permission.POST_NOTIFICATIONS")) {
+            return -1;
+        }
+        ensureChannel(nm);
+
+        Intent open = new Intent(activity, activity.getClass());
+        open.setFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+        open.putExtra("vyto.notification", id);
+        int flags = android.app.PendingIntent.FLAG_UPDATE_CURRENT;
+        if (Build.VERSION.SDK_INT >= 23) flags |= android.app.PendingIntent.FLAG_IMMUTABLE;
+        android.app.PendingIntent pi =
+                android.app.PendingIntent.getActivity(activity, id, open, flags);
+
+        android.app.Notification.Builder b = Build.VERSION.SDK_INT >= 26
+                ? new android.app.Notification.Builder(activity, CHANNEL_ID)
+                : new android.app.Notification.Builder(activity);
+        b.setContentTitle(title)
+         .setContentText(text)
+         .setSmallIcon(activity.getApplicationInfo().icon)
+         .setContentIntent(pi)
+         .setAutoCancel(!ongoing)
+         .setOngoing(ongoing);
+        try {
+            nm.notify(id, b.build());
+            return 0;
+        } catch (Exception e) {
+            android.util.Log.e("Vyto", "notify failed", e);
+            return -1;
+        }
+    }
+
+    public void cancelNotification(int id) {
+        android.app.NotificationManager nm = (android.app.NotificationManager)
+                activity.getSystemService(android.content.Context.NOTIFICATION_SERVICE);
+        if (nm != null) nm.cancel(id);
+    }
+
+    // ------------------------------------------------------ device credential
+
+    /**
+     * Ask the system to re-authenticate the user with the device credential —
+     * PIN, pattern, password, and on most devices the fingerprint the OEM wires
+     * to it.
+     *
+     * <p>This is {@code KeyguardManager}, not {@code BiometricPrompt}. The
+     * latter is AndroidX, which is an AAR, which is Maven, which is Gradle —
+     * and the build path is deliberately Gradle-free (ANDROID.md). The
+     * difference that matters to a caller: no biometric-only mode and no
+     * per-prompt crypto object. For "prove it is still you before showing this
+     * screen", which is what apps actually ask for, they are equivalent.
+     *
+     * <p>Returns -1 when the device has no lock set at all. That is not a
+     * failure to report later — there is nothing to prompt with, and a caller
+     * has to decide whether that means "allow" or "refuse".
+     */
+    public int confirmCredential(String title, String subtitle, int vytoId) {
+        android.app.KeyguardManager km = (android.app.KeyguardManager)
+                activity.getSystemService(android.content.Context.KEYGUARD_SERVICE);
+        if (km == null) return -1;
+        Intent i = km.createConfirmDeviceCredentialIntent(title, subtitle);
+        if (i == null) return -1;   // no PIN/pattern/password set on this device
+        final int code = codeFor(vytoId);
+        final Intent intent = i;
+        activity.runOnUiThread(new Runnable() {
+            @Override public void run() {
+                try {
+                    activity.startActivityForResult(intent, code);
+                } catch (Exception e) {
+                    android.util.Log.e("Vyto", "confirmCredential failed", e);
+                    if (Native.isLoaded()) {
+                        Native.actionResult(idFor(code), false, new String[0]);
+                    }
+                }
+            }
+        });
+        return 0;
+    }
+
+    // -------------------------------------------------------------- haptics
+
+    /** {@code kind} values, matching {@code lib/vyto/mobile/android/haptics.vt}. */
+    public static final int HAPTIC_MS = 0;      // plain buzz of `ms`
+    public static final int HAPTIC_TICK = 1;
+    public static final int HAPTIC_CLICK = 2;
+    public static final int HAPTIC_HEAVY = 3;
+
+    /**
+     * Buzz. Called from the Vyto thread through {@code native/src/ahaptics.c};
+     * {@code Vibrator} is thread-safe and does not need the UI thread, which is
+     * why this is a direct call rather than a post — a haptic that arrived a
+     * frame after the gesture would be worse than none.
+     *
+     * <p>The predefined effects are the platform's own and are what makes a
+     * buzz feel like the rest of the device rather than a generic rumble, but
+     * they are API 29+. Below that, and for {@code HAPTIC_MS}, this falls back
+     * to a one-shot of the given length — minSdk is 24, so that path is real.
+     *
+     * <p>Silent when the device has no vibrator, which includes most tablets.
+     * Requires {@code android.permission.VIBRATE}, an install-time permission
+     * {@code manifest.vt} adds with {@code uses(ACT_HAPTICS)}.
+     */
+    public void vibrate(int ms, int kind) {
+        android.os.Vibrator v;
+        if (Build.VERSION.SDK_INT >= 31) {
+            android.os.VibratorManager vm = (android.os.VibratorManager)
+                    activity.getSystemService(android.content.Context.VIBRATOR_MANAGER_SERVICE);
+            v = vm == null ? null : vm.getDefaultVibrator();
+        } else {
+            v = (android.os.Vibrator)
+                    activity.getSystemService(android.content.Context.VIBRATOR_SERVICE);
+        }
+        if (v == null || !v.hasVibrator()) return;
+
+        if (kind != HAPTIC_MS && Build.VERSION.SDK_INT >= 29) {
+            int effect = android.os.VibrationEffect.EFFECT_CLICK;
+            if (kind == HAPTIC_TICK) effect = android.os.VibrationEffect.EFFECT_TICK;
+            else if (kind == HAPTIC_HEAVY) effect = android.os.VibrationEffect.EFFECT_HEAVY_CLICK;
+            try {
+                v.vibrate(android.os.VibrationEffect.createPredefined(effect));
+                return;
+            } catch (Exception e) {
+                // Some OEMs ship a Vibrator that rejects predefined effects.
+                // Falling through to the one-shot is better than nothing at all.
+            }
+        }
+        int dur = ms > 0 ? ms : 10;
+        if (Build.VERSION.SDK_INT >= 26) {
+            v.vibrate(android.os.VibrationEffect.createOneShot(
+                    dur, android.os.VibrationEffect.DEFAULT_AMPLITUDE));
+        } else {
+            v.vibrate(dur);
+        }
+    }
+
     // ----------------------------------------------------------- permissions
 
     public boolean hasPermission(String name) {

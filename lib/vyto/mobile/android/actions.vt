@@ -78,6 +78,9 @@ extern "C" {
     // ACTION_IMAGE_CAPTURE / ACTION_VIDEO_CAPTURE. Needs PERM_CAMERA first.
     fn vta_capture_image(req: i32): i32;
     fn vta_capture_video(req: i32): i32;
+    // KeyguardManager's device-credential prompt. -1 when the device has no
+    // lock set, in which case no result will ever arrive.
+    fn vta_confirm_credential(title: cstring, subtitle: cstring, req: i32): i32;
 
     // Fire-and-forget: no result, so no request id and no callback.
     fn vta_share_text(text: cstring, title: cstring): i32;
@@ -235,6 +238,29 @@ export class Actions {
     fn capture_video(cb: fn(ActionResult)): bool {
         let id = this.arm(cb);
         return this.launched(id, vta_capture_video(id as i32), cb);
+    }
+
+    // -- device credential ---------------------------------------------------
+    // Re-authenticate the user: PIN, pattern, password, and on most devices
+    // the fingerprint the OEM wires to the same prompt. `r.ok` is true when
+    // they proved it, false when they cancelled or failed.
+    //
+    //     acts.confirm_credential("Unlock notes", "", (r) => {
+    //         if (r.ok) { app.show_private(); }
+    //     });
+    //
+    // This is KeyguardManager, NOT BiometricPrompt: the latter is AndroidX,
+    // which is an AAR, which is Maven, which is Gradle, and this build path is
+    // deliberately Gradle-free. No biometric-only mode and no crypto object;
+    // for "prove it is still you", which is what apps ask for, they match.
+    //
+    // Returns false immediately when the device has no lock screen at all —
+    // there is nothing to prompt with, and whether that means allow or refuse
+    // is the app's decision, not this module's.
+    fn confirm_credential(title: string, subtitle: string, cb: fn(ActionResult)): bool {
+        let id = this.arm(cb);
+        return this.launched(id, vta_confirm_credential(title.cstr(), subtitle.cstr(),
+                                                        id as i32), cb);
     }
 
     // -- permissions ---------------------------------------------------------

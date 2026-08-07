@@ -26,6 +26,7 @@ static JavaVM *g_vm = NULL;
 static jobject g_view = NULL;      /* global ref, VytoView */
 static jobject g_commands = NULL;  /* global ref, CommandBuffer */
 static jobject g_actions = NULL;   /* global ref, Actions */
+static jobject g_streams = NULL;   /* global ref, Streams */
 
 static pthread_t g_thread;
 static int g_thread_live = 0;
@@ -49,6 +50,7 @@ JNIEnv *vta_env(void) {
 jobject vta_view(void)     { return g_view; }
 jobject vta_commands(void) { return g_commands; }
 jobject vta_actions(void)  { return g_actions; }
+jobject vta_streams(void)  { return g_streams; }
 
 void vta_logf(const char *fmt, ...) {
     va_list ap;
@@ -167,6 +169,27 @@ Java_dev_vyto_android_Native_bindActions(JNIEnv *env, jclass cls, jobject action
     g_actions = actions ? (*env)->NewGlobalRef(env, actions) : NULL;
 }
 
+/* Same shape as bindActions, and for the same reason: the Activity constructs
+ * Streams (it owns the HandlerThread and has to stop the listeners in onPause)
+ * and hands it down. */
+JNIEXPORT void JNICALL
+Java_dev_vyto_android_Native_bindStreams(JNIEnv *env, jclass cls, jobject streams) {
+    (void)cls;
+    if (g_streams) (*env)->DeleteGlobalRef(env, g_streams);
+    g_streams = streams ? (*env)->NewGlobalRef(env, streams) : NULL;
+}
+
+/* One sensor sample or one location fix, from the Streams HandlerThread. Goes
+ * straight into the slot table; nothing here allocates or blocks, because this
+ * runs up to a couple of hundred times a second. */
+JNIEXPORT void JNICALL
+Java_dev_vyto_android_Native_streamPut(JNIEnv *env, jclass cls, jint ch,
+                                       jdouble v0, jdouble v1, jdouble v2,
+                                       jdouble v3, jdouble v4, jlong t_ms) {
+    (void)env; (void)cls;
+    vta_stream_put((int32_t)ch, v0, v1, v2, v3, v4, (int64_t)t_ms);
+}
+
 /* Called by VytoActivity before start(), with Context.getFilesDir() and
  * getCacheDir(). Before start() is not a style choice: os_app_dir() caches on
  * first use, and the Vyto thread reaches for it as soon as it is running. */
@@ -179,6 +202,25 @@ Java_dev_vyto_android_Native_setAppDirs(JNIEnv *env, jclass cls,
     vta_set_app_dirs(f, c);   /* copies both */
     if (f) (*env)->ReleaseStringUTFChars(env, files, f);
     if (c) (*env)->ReleaseStringUTFChars(env, cache, c);
+}
+
+/* A deep link, a share, or a tap on one of our notifications. From the UI
+ * thread, and possibly before the Vyto thread exists — the queue is there from
+ * process start precisely so the launching intent survives that. */
+JNIEXPORT void JNICALL
+Java_dev_vyto_android_Native_incomingIntent(JNIEnv *env, jclass cls, jstring action,
+                                            jstring uri, jstring mime, jstring text,
+                                            jint notification) {
+    (void)cls;
+    const char *a = action ? (*env)->GetStringUTFChars(env, action, NULL) : NULL;
+    const char *u = uri ? (*env)->GetStringUTFChars(env, uri, NULL) : NULL;
+    const char *m = mime ? (*env)->GetStringUTFChars(env, mime, NULL) : NULL;
+    const char *t = text ? (*env)->GetStringUTFChars(env, text, NULL) : NULL;
+    vta_incoming_push(a, u, m, t, (int32_t)notification);   /* copies all four */
+    if (a) (*env)->ReleaseStringUTFChars(env, action, a);
+    if (u) (*env)->ReleaseStringUTFChars(env, uri, u);
+    if (m) (*env)->ReleaseStringUTFChars(env, mime, m);
+    if (t) (*env)->ReleaseStringUTFChars(env, text, t);
 }
 
 JNIEXPORT void JNICALL
@@ -198,6 +240,7 @@ Java_dev_vyto_android_Native_stop(JNIEnv *env, jclass cls) {
 
     if (g_commands) { (*env)->DeleteGlobalRef(env, g_commands); g_commands = NULL; }
     if (g_actions)  { (*env)->DeleteGlobalRef(env, g_actions);  g_actions  = NULL; }
+    if (g_streams)  { (*env)->DeleteGlobalRef(env, g_streams);  g_streams  = NULL; }
     if (g_view)     { (*env)->DeleteGlobalRef(env, g_view);     g_view     = NULL; }
 }
 

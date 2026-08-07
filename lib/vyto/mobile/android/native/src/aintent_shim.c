@@ -127,7 +127,7 @@ static jmethodID m_pickDirectory = NULL, m_pickMedia = NULL;
 static jmethodID m_captureImage = NULL, m_captureVideo = NULL;
 static jmethodID m_shareText = NULL, m_shareUri = NULL;
 static jmethodID m_viewUrl = NULL, m_dial = NULL, m_sendEmail = NULL;
-static jmethodID m_openAppSettings = NULL;
+static jmethodID m_openAppSettings = NULL, m_confirmCredential = NULL;
 static jmethodID m_hasPermission = NULL, m_shouldExplain = NULL, m_requestPermission = NULL;
 static jmethodID m_openFd = NULL, m_displayName = NULL, m_sizeOf = NULL, m_takePersistable = NULL;
 static int ids_ready = 0;
@@ -150,6 +150,8 @@ static void resolve_ids(JNIEnv *env) {
     m_dial             = (*env)->GetMethodID(env, c, "dial", "(Ljava/lang/String;)I");
     m_sendEmail        = (*env)->GetMethodID(env, c, "sendEmail", "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)I");
     m_openAppSettings  = (*env)->GetMethodID(env, c, "openAppSettings", "()I");
+    m_confirmCredential= (*env)->GetMethodID(env, c, "confirmCredential",
+                                             "(Ljava/lang/String;Ljava/lang/String;I)I");
     m_hasPermission    = (*env)->GetMethodID(env, c, "hasPermission", "(Ljava/lang/String;)Z");
     m_shouldExplain    = (*env)->GetMethodID(env, c, "shouldExplain", "(Ljava/lang/String;)Z");
     m_requestPermission= (*env)->GetMethodID(env, c, "requestPermission", "(Ljava/lang/String;I)I");
@@ -218,6 +220,19 @@ int32_t vta_capture_image(int32_t req) {
 int32_t vta_capture_video(int32_t req) {
     ENV_OR(-1);
     return (*env)->CallIntMethod(env, vta_actions(), m_captureVideo, (jint)req);
+}
+
+/* KeyguardManager, not BiometricPrompt — see Actions.confirmCredential for
+ * why. -1 here means the device has no lock set, which is a synchronous answer
+ * because no prompt will ever appear and so no result will ever be queued. */
+int32_t vta_confirm_credential(const char *title, const char *subtitle, int32_t req) {
+    ENV_OR(-1);
+    jstring t = mkstr(env, title);
+    jstring s = mkstr(env, subtitle);
+    jint rc = (*env)->CallIntMethod(env, vta_actions(), m_confirmCredential, t, s, (jint)req);
+    (*env)->DeleteLocalRef(env, t);
+    (*env)->DeleteLocalRef(env, s);
+    return rc;
 }
 
 /* ------------------------------------------------------- fire and forget */
