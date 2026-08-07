@@ -211,6 +211,10 @@ export class Manifest {
     config_changes: string;
 
     permissions: string[];
+    // The subset an app declared with a bare permission() call, rather than
+    // through uses(ACT_*). Only these can be missing a <queries> entry the
+    // author did not know about — see validate().
+    direct_perms: string[];
     features: Feature[];
     queries: Query[];
     meta: Meta[];
@@ -249,6 +253,7 @@ export class Manifest {
         this.config_changes = CONFIG_CHANGES_DEFAULT;
 
         this.permissions = [];
+        this.direct_perms = [];
         this.features = [];
         this.queries = [];
         this.meta = [];
@@ -300,7 +305,16 @@ export class Manifest {
         return this;
     }
 
+    // Declare a permission directly. Prefer uses(ACT_*): a capability knows
+    // which <queries> and provider entries go with it, and this does not.
     fn permission(name: string): Manifest {
+        if (!contains(this.direct_perms, name)) { this.direct_perms.push(name); }
+        return this.add_perm(name);
+    }
+
+    // The internal one, used by uses(). Adds the permission without marking it
+    // as something the app declared blind.
+    fn add_perm(name: string): Manifest {
         if (!contains(this.permissions, name)) { this.permissions.push(name); }
         return this;
     }
@@ -381,7 +395,7 @@ export class Manifest {
     // the provider).
     fn uses(act: int): Manifest {
         if (act == ACT_CAMERA_IMAGE) {
-            this.permission(PERM_CAMERA);
+            this.add_perm(PERM_CAMERA);
             this.feature("android.hardware.camera", false);
             this.query("android.media.action.IMAGE_CAPTURE", "");
             // ACTION_IMAGE_CAPTURE writes to a URI the app supplies, so the
@@ -390,7 +404,7 @@ export class Manifest {
             return this;
         }
         if (act == ACT_CAMERA_VIDEO) {
-            this.permission(PERM_CAMERA);
+            this.add_perm(PERM_CAMERA);
             this.feature("android.hardware.camera", false);
             this.query("android.media.action.VIDEO_CAPTURE", "");
             this.file_provider();
@@ -427,34 +441,34 @@ export class Manifest {
             return this;
         }
         if (act == ACT_RECORD_AUDIO) {
-            this.permission(PERM_RECORD_AUDIO);
+            this.add_perm(PERM_RECORD_AUDIO);
             this.feature("android.hardware.microphone", false);
             return this;
         }
         if (act == ACT_LOCATION_FINE) {
-            this.permission(PERM_FINE_LOCATION);
+            this.add_perm(PERM_FINE_LOCATION);
             this.feature("android.hardware.location.gps", false);
             return this;
         }
         if (act == ACT_LOCATION_COARSE) {
-            this.permission(PERM_COARSE_LOCATION);
+            this.add_perm(PERM_COARSE_LOCATION);
             return this;
         }
         if (act == ACT_NOTIFICATIONS) {
-            this.permission(PERM_POST_NOTIFICATIONS);
+            this.add_perm(PERM_POST_NOTIFICATIONS);
             return this;
         }
         if (act == ACT_CAMERA_PREVIEW) {
-            this.permission(PERM_CAMERA);
+            this.add_perm(PERM_CAMERA);
             this.feature("android.hardware.camera", false);
             return this;
         }
         if (act == ACT_HAPTICS) {
-            this.permission(PERM_VIBRATE);
+            this.add_perm(PERM_VIBRATE);
             return this;
         }
         if (act == ACT_CONTACTS) {
-            this.permission(PERM_READ_CONTACTS);
+            this.add_perm(PERM_READ_CONTACTS);
             this.query("android.intent.action.PICK", "");
             return this;
         }
@@ -496,12 +510,18 @@ export class Manifest {
             }
         }
         // Package visibility only bites permissions that pair with an outbound
-        // intent. Counting *every* permission flags an app that merely asked
-        // for INTERNET — which resolves no intents at all — and there is no way
-        // to silence it short of declaring a <queries> entry the app does not
-        // want. Install-time permissions are excluded for that reason.
+        // intent, and only an app that declared one *blind* can be missing the
+        // <queries> that goes with it. A capability knows its own intents and
+        // emits them, so uses(ACT_*) is never the thing at fault — checking
+        // every permission instead flagged ACT_CAMERA_PREVIEW, ACT_LOCATION_*,
+        // ACT_RECORD_AUDIO and ACT_NOTIFICATIONS, none of which resolves an
+        // intent at all, and left the author no way to silence it short of
+        // declaring a <queries> entry the app does not want.
+        //
+        // Install-time permissions are excluded on top of that: INTERNET
+        // resolves nothing either.
         let intent_perms = 0;
-        for (let p in this.permissions) {
+        for (let p in this.direct_perms) {
             if (!is_install_time_perm(p)) { intent_perms += 1; }
         }
         if (this.target_sdk >= 30 && this.queries.len == 0 && intent_perms > 0) {
@@ -510,9 +530,13 @@ export class Manifest {
                        "Declare capabilities with uses(ACT_*) rather than " +
                        "permission() alone.");
         }
-        if (contains(this.permissions, PERM_CAMERA) && !this.need_file_provider) {
-            probs.push("CAMERA permission without a FileProvider: " +
-                       "ACTION_IMAGE_CAPTURE will crash on capture.");
+        // Same correction: it is ACTION_IMAGE_CAPTURE that writes to a URI the
+        // app supplies, so it is the *capture* capabilities that need the
+        // provider. A preview holds the same permission and writes nothing.
+        if (contains(this.direct_perms, PERM_CAMERA) && !this.need_file_provider) {
+            probs.push("CAMERA permission declared directly without a " +
+                       "FileProvider: ACTION_IMAGE_CAPTURE will crash on " +
+                       "capture. Use uses(ACT_CAMERA_IMAGE), which adds both.");
         }
         return probs;
     }

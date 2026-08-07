@@ -1,0 +1,65 @@
+// A passive ticker's invalidate() must reach the screen.
+//
+// Widget.ticker() is the documented way to drive something that changes pixels
+// on a clock rather than on input: PullToRefresh's spinner uses one, and so
+// does a camera preview. tick() deliberately does not repaint on a passive
+// animator's account — a timer is not an animation — and the contract, stated
+// in that comment, is that the callback calls invalidate() when it actually
+// changed something.
+//
+// invalidate() only *accumulates* a dirty rect, though. It does not ask for a
+// present. So every passive ticker updated state that never reached the
+// screen: the loop turned, the callback ran, the rect went dirty, and nothing
+// ever painted it.
+//
+// Found on a device by a camera preview publishing 28 frames a second into a
+// display that had not repainted since startup — and PullToRefresh's spinner
+// had been silently frozen the whole time. Nothing caught it because every
+// golden here asserts state rather than pixels, which is exactly what this one
+// does not do: it counts renders.
+import { Window, Painter, Theme, Size, Widget } from "vyto/ui";
+
+class Spinner extends Widget {
+    renders: int;
+    ticks: int;
+
+    fn init() {
+        super.init();
+        this.renders = 0;
+        this.ticks = 0;
+    }
+
+    override fn measure(s: Painter, th: Theme): Size { return Size(50.0, 50.0); }
+
+    override fn render(s: Painter, th: Theme) {
+        this.renders += 1;
+        s.fill(this.bounds, th.primary);
+    }
+
+    // The shape under test: a passive timer that changes something and says so.
+    fn start() {
+        let self = this;
+        this.ticker(16, () => {
+            self.ticks += 1;
+            self.invalidate();
+        });
+    }
+}
+
+fn main() {
+    let win = new Window("Ticker", 200, 200);
+    let w = new Spinner();
+    win.root = w;
+    w.start();
+    win.run();
+
+    // Every scripted tick is one loop turn, so the callback should have run
+    // once per turn and each one should have produced a paint.
+    print("ticks=" + w.ticks);
+    // Renders track ticks rather than sitting at the single startup paint.
+    // Compared as a floor, not an equality: the exact count includes the
+    // initial redraw and any coalescing, and pinning it would make this test
+    // about the frame schedule rather than about the bug.
+    print("rendered_per_tick=" + (w.renders >= w.ticks));
+    print("more_than_startup=" + (w.renders > 2));
+}

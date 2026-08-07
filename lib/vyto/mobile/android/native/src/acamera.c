@@ -221,6 +221,31 @@ int32_t vta_camera_sync(void) {
     return (*env)->CallBooleanMethod(env, cam, m) ? 1 : 0;
 }
 
+/* Whatever the sink knows about why it is not delivering. Read from Vyto and
+ * put on screen: on this ROM the app's own Log.i lines do not reach logcat, so
+ * a failure with no visible channel is a failure with no diagnosis. */
+const char *vta_camera_diagnostics(void) {
+    static char buf[256];
+    buf[0] = 0;
+    JNIEnv *env = vta_env();
+    jobject cam = vta_camera();
+    if (!env || !cam) return buf;
+    jmethodID m = cam_method(env, cam, "diagnostics", "()Ljava/lang/String;");
+    if (!m) return buf;
+    jstring js = (jstring)(*env)->CallObjectMethod(env, cam, m);
+    if (js) {
+        const char *s = (*env)->GetStringUTFChars(env, js, NULL);
+        if (s) {
+            size_t n = 0;
+            while (s[n] && n < sizeof buf - 1) { buf[n] = s[n]; n++; }
+            buf[n] = 0;
+            (*env)->ReleaseStringUTFChars(env, js, s);
+        }
+        (*env)->DeleteLocalRef(env, js);
+    }
+    return buf;
+}
+
 int32_t vta_camera_width(void) {
     CAMERA_OR(0);
     jmethodID m = cam_method(env, cam, "width", "()I");
@@ -243,6 +268,7 @@ void *vta_camera_start(int32_t facing, int32_t w, int32_t h) {
 void vta_camera_stop(void) { }
 int32_t vta_camera_has(int32_t facing) { (void)facing; return 0; }
 int32_t vta_camera_sync(void) { return 0; }
+const char *vta_camera_diagnostics(void) { return ""; }
 int32_t vta_camera_width(void) { return 0; }
 int32_t vta_camera_height(void) { return 0; }
 

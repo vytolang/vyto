@@ -130,6 +130,7 @@ void *vta_camera_start(int32_t facing, int32_t w, int32_t h);
 void vta_camera_stop(void);
 int32_t vta_camera_has(int32_t facing);
 int32_t vta_camera_sync(void);
+const char *vta_camera_diagnostics(void);
 int32_t vta_camera_width(void);
 int32_t vta_camera_height(void);
 /* Converter self-check; 0 = clean, else a bitmask of which case failed. Built

@@ -2536,6 +2536,25 @@ export class Window {
             this.redraw();
         } else if (partial) {
             this.repaint();
+        } else if (this.has_dirty) {
+            // A passive animator's callback invalidated something. `partial` is
+            // false by design — a timer must not repaint merely for existing —
+            // but invalidate() only *accumulates* a dirty rect, it does not ask
+            // for a present, so without this the region stays dirty forever and
+            // the screen never changes.
+            //
+            // Every other caller pairs mark_dirty with repaint() at the end of
+            // its dispatch (see on_mouse_up, set_hover); a ticker has no
+            // dispatch to end, so this is where its frame gets presented, once
+            // per tick and coalesced.
+            //
+            // Found by a camera preview whose frames were arriving at 28fps
+            // into a screen that had not repainted since startup: the loop was
+            // turning, the pixels were converted and published, and nothing
+            // presented them. PullToRefresh's spinner has the same shape and
+            // was equally frozen — no golden caught it, because they all assert
+            // state rather than pixels.
+            this.repaint();
         }
     }
 

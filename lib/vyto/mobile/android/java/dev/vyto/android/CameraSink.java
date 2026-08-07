@@ -80,6 +80,9 @@ public final class CameraSink {
 
     private int imageHandle;        // 0 until the first start()
     private int outWidth, outHeight;
+    private android.util.Range<Integer>[] fpsRanges;
+    private String lastError = "";
+    private String fpsChosen = "";
     private int rotation;           // degrees the frame must be turned by
     private boolean mirror;         // front camera: flip horizontally
 
@@ -137,6 +140,7 @@ public final class CameraSink {
             // The sensor is mounted at some fixed angle to the device's natural
             // orientation, so a preview drawn without this is sideways on every
             // phone — the single most visible camera bug there is.
+            fpsRanges = ch.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES);
             int displayDeg = displayRotationDegrees();
             mirror = facing == FACING_FRONT;
             rotation = mirror
@@ -213,11 +217,39 @@ public final class CameraSink {
                 b.addTarget(reader.getSurface());
                 b.set(CaptureRequest.CONTROL_AF_MODE,
                       CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE);
-                s.setRepeatingRequest(b.build(), null, handler);
-            } catch (CameraAccessException e) {
+
+                // Pin the frame rate, or auto-exposure lengthens the exposure
+                // indoors and quietly delivers a third of what the camera can
+                // do: measured at 8.6 published frames a second on a Redmi Note
+                // 9S in room light, from a loop turning at 60.
+                android.util.Range<Integer> fps = bestFpsRange();
+                if (fps != null) {
+                    b.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, fps);
+                }
+                try {
+                    s.setRepeatingRequest(b.build(), null, handler);
+                } catch (IllegalArgumentException e) {
+                    // A range out of the advertised list, or one this device
+                    // only honours in a mode we are not in. Retry without it:
+                    // a slow preview beats no preview, and this failure would
+                    // otherwise be a live camera delivering nothing — the
+                    // camera indicator lit, the widget blank, and no exception
+                    // anywhere the app can see.
+                    android.util.Log.w("Vyto", "fps range " + fps + " rejected", e);
+                    b.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, null);
+                    s.setRepeatingRequest(b.build(), null, handler);
+                }
+            } catch (Exception e) {
+                // Deliberately Exception, not CameraAccessException: everything
+                // in here can throw IllegalArgumentException or IllegalState,
+                // and an escape from this callback kills the camera thread
+                // rather than the app, which reads as "the preview just does
+                // not work" with nothing to go on.
                 android.util.Log.w("Vyto", "setRepeatingRequest failed", e);
+                lastError = String.valueOf(e);
             }
         }
+
         @Override public void onConfigureFailed(CameraCaptureSession s) {
             android.util.Log.w("Vyto", "camera session configure failed");
             stop();
@@ -253,6 +285,36 @@ public final class CameraSink {
             }
         }
     };
+
+    /**
+     * The advertised range that will actually deliver frames fastest.
+     *
+     * <p>Highest floor wins — a [10,30] range is precisely the one that drops
+     * to 10 in room light. Ranges above 30 are skipped: a device that lists
+     * [60,60] usually honours it only in a high-speed session, and asking for
+     * it in an ordinary one is one of the ways this call is rejected.
+     */
+    private android.util.Range<Integer> bestFpsRange() {
+        android.util.Range<Integer>[] rs = fpsRanges;
+        if (rs == null) return null;
+        android.util.Range<Integer> best = null;
+        for (android.util.Range<Integer> r : rs) {
+            if (r.getUpper() > 30) continue;
+            if (best == null
+                    || r.getLower() > best.getLower()
+                    || (r.getLower().equals(best.getLower())
+                        && r.getUpper() > best.getUpper())) {
+                best = r;
+            }
+        }
+        fpsChosen = String.valueOf(best);
+        return best;
+    }
+
+    /** What the last failure was, for an app that wants to show it. */
+    public String diagnostics() {
+        return "fps=" + fpsChosen + (lastError.isEmpty() ? "" : " err=" + lastError);
+    }
 
     /** A buffer that is neither on screen nor the newest ready one. */
     private int freeSlot() {
