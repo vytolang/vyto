@@ -1369,6 +1369,8 @@ export class Widget {
     bounce: bool;
     overscroll: float;
     bounce_anim: BounceScroll;
+    // Scroll-position listener; see notify_scrolled.
+    on_scrolled: fn(float);
 
     fn init() {
         this.children = [];
@@ -1699,11 +1701,27 @@ export class Widget {
         return this.scroll_offset(sb);
     }
 
+    // Called with the new offset whenever this widget's scroll position
+    // actually moves — wheel, drag, fling or a programmatic scroll_to, since
+    // all of them funnel through set_scroll_offset. Null by default and
+    // dropped by release_all, because it is the widget's only strong hold on
+    // whatever it notifies.
+    //
+    // Push rather than poll on purpose: a scroll dirties only the scrolling
+    // widget's own rect, so chrome that wants to react to it (a top bar
+    // raising its shadow) would otherwise not be repainted at the moment the
+    // offset changed. Scaffold in vyto/mobile/android/ui is the first consumer.
+    fn notify_scrolled(v: float) {
+        if (this.on_scrolled != null) { this.on_scrolled(v); }
+    }
+
     fn set_scroll_v(v: float) {
         let sb = this.vscrollbar();
         if (sb == null) {
+            let before = this.scroll_off_y;
             this.scroll_off_y = v;
             this.scroll_clamp();
+            if (this.scroll_off_y != before) { this.notify_scrolled(this.scroll_off_y); }
             return;
         }
         // every implementation of this clamps; none is trusted to have been
@@ -2264,6 +2282,10 @@ export class Widget {
 
     fn release_all() {
         this.drop_handlers();
+        // Not left to drop_handlers: this one is set by a *parent* (Scaffold
+        // wires it on its content), so the widget that owns the cycle is not
+        // the widget that would remember to null it.
+        this.on_scrolled = null;
         // Cancel any tween declared before this widget was mounted (its on_tick
         // closure captures the widget/tween, an RC cycle); cancel() nulls it.
         if (this.pending_anims != null) {
@@ -2373,6 +2395,12 @@ export class Window {
     press_y: int;
     dragging: bool;
     long_press_fired: bool;
+    // The pointer is a finger, not a mouse. Off by default (the desktop
+    // backends); AndroidWindow turns it on. Only on_mouse_up reads it, to clear
+    // the hover a touch leaves behind — see there. Widgets that need to branch
+    // on it can, but almost none should: the toolkit's job is to make the same
+    // widget work under both.
+    touch_mode: bool;
     last_click_ms: int;
     last_click_x: int;
     last_click_y: int;
@@ -3000,6 +3028,12 @@ export class Window {
         this.long_press_fired = false;
         if (pw != null) {
             pw.pressed = false;
+            // The press spring has to be driven back down here. set_press(null)
+            // is never called on a release, so nothing else ever retargets it —
+            // leaving anim_press resting at 1.0 and the widget painted pressed
+            // forever. Visible on desktop as a button that stays tinted; on a
+            // phone it is Track D item 15, a list row still lit after a tap.
+            if (pw.shows_press()) { pw.drive_press(0.0); }
             let changed = false;
             if (was_dragging) {
                 // a drag just ended
@@ -3014,6 +3048,13 @@ export class Window {
                 this.repaint();
             }
         }
+        // A finger has no hover: it presses and lifts with no move between, so
+        // the hover set on the press would stay on that widget until some other
+        // widget was touched — every hover-tinted control staying lit after a
+        // tap (Track C item 5). A mouse must NOT do this: it really is still
+        // over the widget after a click, and clearing would flicker every
+        // hovered button. Hence the flag rather than a behaviour change.
+        if (this.touch_mode) { this.set_hover(null); }
     }
 
     // Set the current hover widget, dirtying the previous and new one when

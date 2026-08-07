@@ -4,6 +4,15 @@
 //
 //     import { FloatingActionButton, BottomNavigationBar } from "vyto/mobile/android/ui";
 //
+// AndroidWidget is the base class the touch-shaped ones share, and the one an
+// app subclasses for its own screens: taps on release, long-press to context
+// or to a text selection, 48dp minimum targets, dp(), ripple, and no hover or
+// press state left behind by a finger. See its comment for what it replaces.
+//
+// Scaffold is the screen: it holds the TopBar, the content, the bottom bar and
+// the FAB, and it is what makes a FAB actually float — pinned to the screen
+// rect rather than scrolling away inside the content.
+//
 // STATUS: complete and mouse-testable on X11 today, except for the one
 // gesture noted on PullToRefresh. The overlay widgets (BottomSheet,
 // NavigationDrawer) were unblocked by Track C item 1 — Window.on_mouse_ev now
@@ -25,12 +34,14 @@
 // PORTABILITY.md says never to bind, and Compose Multiplatform agrees —
 // Material3 there is drawn with Compose primitives, not platform views.
 
-import { Widget, Painter, Theme, Size, Window,
+import { Widget, Painter, Theme, Size, Window, BoxConstraints, bcLoose,
          EASE_OUT_CUBIC, WEIGHT_REG, WEIGHT_MED, WEIGHT_BOLD } from "vyto/ui";
-import { Rect, contains, rgb, with_alpha, mix,
+import { Rect, contains, rgb, with_alpha, mix, MOD_CTRL,
          KEY_LEFT, KEY_RIGHT, KEY_UP, KEY_DOWN, KEY_ENTER } from "vyto/surface";
 import { Tween } from "vyto/ui/anim";
-import { sin, cos, atan2, PI, TAU } from "vyto/math";
+import { SelectionModel, SelectionAction, select_word,
+         open_selection_toolbar } from "vyto/ui/selection";
+import { sin, cos, sqrt, atan2, PI, TAU } from "vyto/math";
 
 // Material metrics, in dp. Every one of these is multiplied by ui_scale()
 // before it reaches a Rect — see there for why that is not optional.
@@ -41,6 +52,10 @@ export const DP_TOUCH_MIN: float = 48.0;    // minimum tappable target
 export const DP_SHEET_HANDLE_W: float = 32.0;
 export const DP_SHEET_HANDLE_H: float = 24.0; // grab strip above sheet content
 export const DP_DRAWER_W: float = 320.0;
+
+// Which edge a NavigationDrawer slides in from.
+export const DRAWER_LEFT: int = 0;
+export const DRAWER_RIGHT: int = 1;
 export const DP_ROW_H: float = 48.0;        // drawer destination row
 
 // Enter/exit durations. M3 puts a sheet slightly faster than a drawer because
@@ -96,16 +111,716 @@ fn pad2(n: int): string {
     return str(n);
 }
 
+// ------------------------------------------------------- AndroidWidget
+
+// Ripple timings. The expansion is what says "that registered"; the fade is
+// what gets it out of the way again.
+const RIPPLE_MS: int = 260;
+const RIPPLE_FADE_MS: int = 160;
+const RIPPLE_ALPHA: float = 46.0;   // peak overlay alpha, 0-255
+
+// The base class for a widget that will be touched rather than clicked.
+//
+// vyto/ui is a desktop toolkit: it fires clicks on press, keeps hover state a
+// finger cannot produce, and measures hit targets in raw pixels. Each of those
+// is wrong on a phone in the same way for every widget, so they are fixed once
+// here rather than per widget. Subclass this instead of Widget and the touch
+// behaviour comes with it:
+//
+//   * a tap fires on RELEASE (on_tap), not on touch-down
+//   * a long-press reaches on_context, or starts a text selection
+//   * hover and press state are cleared when the finger lifts
+//   * anything measured is at least min_touch dp
+//   * a press ripples, on painters that can clip
+//
+// Three hooks replace the Widget ones, because Vyto's `super` cannot be reached
+// from a grandchild's override of a method this class already overrides:
+//
+//   Widget.measure  ->  content_size(s, th)   (this class clamps the result)
+//   Widget.render   ->  paint(s, th)          (this class draws the ripple after)
+//   on_click        ->  on_tap(x, y)          (fires on release)
+//
+// Override measure/render/on_click directly and you opt out of exactly the
+// thing this class exists for, so don't.
+export class AndroidWidget extends Widget {
+    // Minimum tappable size in dp, applied to whatever content_size returns.
+    // 48dp is the Material floor; 0 disables the clamp for a widget that is
+    // deliberately small and not itself a target.
+    min_touch: float;
+    ripple: bool;
+    rip_x: float;         // press origin, in absolute px
+    rip_y: float;
+    rip_t: float;         // expansion 0..1
+    rip_a: float;         // opacity 0..1
+    rip_r: Rect;          // area it is clipped to, captured at press
+    rip_tw: Tween;
+    // A long-press already acted on this press, so the release must not also
+    // fire a tap. Window resets its own long_press_fired *before* dispatching
+    // the release (core.vt), so the widget has to remember this itself.
+    lp_fired: bool;
+    // Text selection, off unless enable_selection() was called. The model, the
+    // word expansion, the toolbar and the Copy/Select-All actions are all
+    // vyto/ui/selection — this class only supplies the touch gestures that
+    // drive them, the way Text supplies the mouse ones.
+    selectable: bool;
+    sel: SelectionModel;
+    selectionActions: SelectionAction[];  // extra toolbar buttons, app-supplied
+    sel_dragging: bool;   // a long-press started a selection this drag extends
+
+    fn init() {
+        super.init();
+        this.min_touch = DP_TOUCH_MIN;
+        this.ripple = true;
+        this.rip_t = 0.0;
+        this.rip_a = 0.0;
+        this.lp_fired = false;
+        this.selectable = false;
+        this.sel_dragging = false;
+        this.selectionActions = [];
+        // Mobile default. Harmless on a widget with nothing to scroll —
+        // bounce_pull refuses when there is no overflow.
+        this.bounce = true;
+    }
+
+    // dp -> device px, for anything written as a constant in app code. The
+    // Theme's own metrics are scaled by Theme.apply_scale; nothing else is,
+    // which is why a hand-written 28.0 is 10dp on a 2.75-density phone.
+    fn dp(v: float): float { return v * ui_scale(this); }
+
+    // ---------------------------------------------------------- sizing
+
+    // The widget's natural size, before the touch-target clamp. This is the
+    // one to override — measure() applies the minimum on top of it.
+    virtual fn content_size(s: Painter, th: Theme): Size { return Size(0.0, 0.0); }
+
+    override fn measure(s: Painter, th: Theme): Size {
+        let sz = this.content_size(s, th);
+        let m = this.dp(this.min_touch);
+        if (m <= 0.0) { return sz; }
+        let w = sz.w;
+        let h = sz.h;
+        // Only a positive dimension is clamped: 0.0 means "fill this axis"
+        // to every container in the toolkit, and raising it to 48 would turn a
+        // full-width bar into a 48px stub.
+        if (w > 0.0 && w < m) { w = m; }
+        if (h > 0.0 && h < m) { h = m; }
+        return Size(w, h);
+    }
+
+    // Grown at measure time rather than in hit(): Window gates on_release on
+    // contains(press_w.bounds, ...), so a hit area wider than the widget would
+    // take presses whose release then fires nothing at all — a dead margin
+    // around every control, which is worse than the small target.
+
+    // ---------------------------------------------------------- painting
+
+    // The widget's own drawing. Default is Widget.render (children, then any
+    // exiting ones); the ripple is composited over whatever this leaves.
+    virtual fn paint(s: Painter, th: Theme) { super.render(s, th); }
+
+    override fn render(s: Painter, th: Theme) {
+        this.paint(s, th);
+        this.draw_ripple(s, th);
+    }
+
+    // Ripple needs a clip (to stay inside the widget) and alpha (to not bury
+    // what it covers). can_clip() reports both — it is the rich tier's flag —
+    // so on the lean tier the ripple is simply absent rather than a solid disc.
+    fn ripple_ok(): bool {
+        if (!this.ripple) { return false; }
+        let w = this.win;
+        if (w == null) { return false; }
+        return w.painter.can_clip();
+    }
+
+    // The area the ripple is confined to, and the corner radius it is clipped
+    // with. Default is the whole widget, which is right for a control that IS
+    // the target; a widget holding several targets (a nav bar's segments, a
+    // calendar's cells) returns the one under rip_x/rip_y instead, or a ripple
+    // reads as the whole strip lighting up.
+    virtual fn ripple_bounds(): Rect { return this.bounds; }
+    virtual fn ripple_radius(): float { return 0.0; }
+
+    fn start_ripple(x: int, y: int) {
+        if (!this.ripple_ok()) { return; }
+        if (this.rip_tw != null) { this.rip_tw.cancel(); this.rip_tw = null; }
+        this.rip_x = x as float;
+        this.rip_y = y as float;
+        this.rip_r = this.ripple_bounds();
+        this.rip_a = 1.0;
+        let w = this;
+        this.rip_tw = this.animate_value(0.0, 1.0, RIPPLE_MS, false, EASE_OUT_CUBIC, (v) => {
+            w.rip_t = v;
+            w.invalidate();
+        });
+    }
+
+    // Fade out from wherever the expansion got to. A short press should not
+    // hold the ripple at 10% until it finishes growing, so the radius freezes
+    // and only the alpha runs — which is also what the platform does.
+    fn fade_ripple() {
+        if (this.rip_t <= 0.0 && this.rip_a <= 0.0) { return; }
+        if (this.rip_tw != null) { this.rip_tw.cancel(); this.rip_tw = null; }
+        let w = this;
+        this.rip_tw = this.animate_value(this.rip_a, 0.0, RIPPLE_FADE_MS, false,
+                                         EASE_OUT_CUBIC, (v) => {
+            w.rip_a = v;
+            if (v <= 0.0) { w.rip_t = 0.0; }
+            w.invalidate();
+        });
+    }
+
+    // Distance from the press origin to the furthest corner — the radius at
+    // which the ripple has covered the whole widget.
+    fn ripple_reach(): float {
+        let r = this.rip_r;
+        let dx = this.rip_x - r.x;
+        let ox = r.right() - this.rip_x;
+        if (ox > dx) { dx = ox; }
+        let dy = this.rip_y - r.y;
+        let oy = r.bottom() - this.rip_y;
+        if (oy > dy) { dy = oy; }
+        return sqrt(dx * dx + dy * dy);
+    }
+
+    fn draw_ripple(s: Painter, th: Theme) {
+        if (this.rip_t <= 0.0 || this.rip_a <= 0.0) { return; }
+        // A widget whose ripple_bounds() found no target under the press
+        // returns an empty rect: the press was on chrome, and chrome does not
+        // ripple.
+        if (this.rip_r.w <= 0.0 || this.rip_r.h <= 0.0) { return; }
+        if (!s.can_clip()) { return; }
+        let a = (RIPPLE_ALPHA * this.rip_a) as int;
+        if (a <= 0) { return; }
+        s.clip_push(this.rip_r, this.ripple_radius());
+        s.circle(this.rip_x, this.rip_y, this.rip_t * this.ripple_reach(),
+                 with_alpha(th.on_surface, a));
+        s.clip_pop();
+    }
+
+    // ---------------------------------------------------------- touch
+
+    // A tap: the finger landed on this widget and lifted on it without
+    // dragging. This is where an action goes — NOT on_click, which now fires
+    // on touch-down and does nothing but arm the press.
+    virtual fn on_tap(x: int, y: int): bool { return false; }
+
+    // Touch-down / touch-up affordances (a lift, a colour change). Not where
+    // actions go: a press that turns into a scroll still calls both.
+    virtual fn on_press_begin(x: int, y: int) { }
+    virtual fn on_press_end() { }
+
+    override fn on_click(x: int, y: int): bool {
+        this.start_ripple(x, y);
+        this.on_press_begin(x, y);
+        // Deliberately false. Window calls set_press *before* on_click
+        // (core.vt), so the capture — and therefore drag, long-press and
+        // release — is already ours; returning true would only force a
+        // full-window redraw on every touch-down.
+        return false;
+    }
+
+    override fn on_release(x: int, y: int): bool {
+        let changed = super.on_release(x, y);   // scrollbar_release
+        this.fade_ripple();
+        this.on_press_end();
+        this.clear_touch_state();
+        // A long-press already acted; the lift that ends it is not a tap.
+        if (this.lp_fired) { this.lp_fired = false; return true; }
+        // A tap with a live selection dismisses it, as the platform does, and
+        // does not also fire the widget's action.
+        if (this.selectable && this.sel != null && !this.sel.empty()) {
+            this.clear_selection();
+            return true;
+        }
+        if (this.on_tap(x, y)) { return true; }
+        return changed;
+    }
+
+    override fn on_long_press(x: int, y: int): bool {
+        this.lp_fired = true;
+        if (this.selectable && this.sel != null) {
+            select_word(this.sel, this.offset_at(x, y));
+            this.sel_dragging = true;
+            this.invalidate();
+            this.show_selection(x as float);
+            return true;
+        }
+        // The bridge Track C item 7 asks for: on a phone the long-press *is*
+        // the right click, so ContextMenu and the DataTable header menu become
+        // reachable without every widget wiring it.
+        return this.on_context(x, y);
+    }
+
+    override fn on_drag(dx: int, dy: int): bool {
+        if (this.selecting()) {
+            let w = this.win;
+            if (w != null) {
+                this.sel.focus = this.offset_at(w.drag_x, w.drag_y);
+                this.sel.active = true;
+                this.invalidate();
+                return true;
+            }
+        }
+        // Not selecting, so this is a scroll. super walks the parent chain —
+        // scrollable ancestor first, then overscroll bounce — and that order is
+        // what keeps pull-to-refresh alive. Re-implementing the walk here is
+        // how it gets broken.
+        return super.on_drag(dx, dy);
+    }
+
+    override fn on_drag_end(x: int, y: int): bool {
+        this.fade_ripple();
+        this.on_press_end();
+        this.clear_touch_state();
+        this.lp_fired = false;
+        if (this.selecting()) {
+            this.sel_dragging = false;
+            if (!this.sel.empty()) { this.show_selection(x as float); }
+            return true;
+        }
+        return super.on_drag_end(x, y);
+    }
+
+    // A finger leaves no cursor behind. Window clears `pressed` on release but
+    // nothing retargets the press spring, and hover was set by the press and
+    // never moves away — so a tapped widget stays lit until something else is
+    // touched. AndroidWindow sets Window.touch_mode, which does the hover half
+    // for every plain vyto/ui widget too; this covers the case where an
+    // AndroidWidget is used under a desktop Window (every golden in tests/ui).
+    fn clear_touch_state() {
+        if (this.anim_press != null) { this.drive_press(0.0); }
+        let w = this.win;
+        if (w != null && w.hover_w == this) { w.set_hover(null); }
+    }
+
+    // ---------------------------------------------------------- selection
+
+    // Turn on text selection. `text_fn` supplies the current display text —
+    // what the user sees and would copy — so a copy always reflects live
+    // content. The widget also supplies geometry via offset_at().
+    //
+    //     let self = this;
+    //     this.enable_selection(() => { return self.label; });
+    //
+    // Known limit: the Android clipboard is process-local today
+    // (surface/native/src/vsurf_android.c), so Copy works inside the app and a
+    // paste into another app gets nothing.
+    fn enable_selection(text_fn: fn(): string) {
+        if (this.sel == null) { this.sel = new SelectionModel(this); }
+        this.sel.text_fn = text_fn;
+        this.selectable = true;
+        this.focusable = true;   // so Ctrl+C / Ctrl+A reach it on a desktop
+    }
+
+    // Byte offset into the display text under an absolute point. A one-line
+    // widget answers with col_at_x(win.surf, line, x - line_x); the default
+    // makes selection a no-op rather than a wrong-offset mess.
+    virtual fn offset_at(x: int, y: int): int { return 0; }
+
+    // Top edge of the line holding `off`, for placing the toolbar above the
+    // selection. Single-line widgets keep the default.
+    virtual fn selection_line_top(off: int): float { return this.bounds.y; }
+
+    fn selecting(): bool {
+        return this.selectable && this.sel != null && this.sel_dragging;
+    }
+
+    fn show_selection(px: float) {
+        if (this.sel == null || this.sel.empty()) { return; }
+        open_selection_toolbar(this, this.sel, px,
+                               this.selection_line_top(this.sel.lo()),
+                               this.selectionActions);
+    }
+
+    fn clear_selection() {
+        if (this.sel == null) { return; }
+        this.sel.clear();
+        this.sel_dragging = false;
+        this.invalidate();
+    }
+
+    override fn on_key(k: int, ch: string): bool {
+        if (!this.selectable || this.sel == null || this.win == null) { return false; }
+        if ((this.win.mods & MOD_CTRL) != 0) {
+            if (k == 99) {   // Ctrl+C
+                let t = this.sel.selected_text();
+                if (t.len > 0) { this.win.surf.set_clipboard(t); }
+                return true;
+            }
+            if (k == 97) {   // Ctrl+A
+                this.sel.select_all();
+                this.invalidate();
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Subclasses that override this MUST call super.drop_handlers(): the
+    // ripple tween and the selection model's text_fn closure both capture the
+    // widget, and a missed call is a leak nothing reports.
+    override fn drop_handlers() {
+        if (this.rip_tw != null) { this.rip_tw.cancel(); this.rip_tw = null; }
+        if (this.sel != null) { this.sel.drop(); }
+        this.selectionActions = [];
+    }
+}
+
+// ---------------------------------------------------------------- TopBar
+
+export const NAV_NONE: int = 0;
+export const NAV_BACK: int = 1;   // drawn ‹— chevron, "go back"
+export const NAV_MENU: int = 2;   // drawn hamburger, "open the drawer"
+
+const DP_TOPBAR_H: float = 56.0;  // M3 small top app bar
+
+// One trailing action. Short label or glyph — this bar draws text, not icons,
+// for the same reason the rest of the package does: an icon set is a
+// dependency and a glyph is not.
+export class TopBarAction {
+    label: string;
+    run: fn();
+
+    fn init(label: string, run: fn()) {
+        this.label = label;
+        this.run = run;
+    }
+}
+
+// The app bar. `vyto/ui` has none — MenuBar and Toolbar are desktop shapes —
+// so every Android app has been hand-rolling this one (apps/hn_android does,
+// at hnrows.vt:450).
+//
+// Three slots and a stack of extra rows, each of which takes either the cheap
+// built-in form or any widget:
+//
+//     let bar = new TopBar("Inbox")
+//         .with_nav(NAV_MENU, () => { sc.open_drawer(); })
+//         .with_actions([new TopBarAction("⌕", () => { search(); })]);
+//
+//     let bar = new TopBar("")
+//         .leading(new Avatar("EM"))
+//         .middle(new SearchField())      // any widget
+//         .row(new TabView([...]));       // grows the bar by the row's height
+//
+// A widget in a slot is an ordinary child: it lays out, draws, hit-tests and
+// takes its own taps, so nothing here routes events into it.
+export class TopBar extends AndroidWidget {
+    title: string;
+    centered: bool;       // M3 centre-aligned variant
+    nav: int;             // NAV_* — the drawn leading glyph, when no lead widget
+    onNav: fn();
+    actions: TopBarAction[];
+    // Raise a shadow instead of a divider once the content below has scrolled.
+    // Scaffold drives `scrolled` off the content's scroll listener; without a
+    // Scaffold it stays false and the bar is flat, which is the M3 resting
+    // state anyway.
+    elevate_on_scroll: bool;
+    scrolled: bool;
+
+    lead: Widget;         // slot widgets; null = use the built-in form
+    mid: Widget;
+    trail: Widget;
+    rows: Widget[];       // extra full-width rows under the bar row
+
+    // Geometry cached from the last arrange, because on_tap gets no Painter
+    // and no Theme and still has to know where the targets are.
+    band_w: float;        // width of the leading nav band
+    bar_px: float;        // height of the bar row itself
+    total_px: float;      // bar row + every extra row
+    act_x: float[];       // per-action left edge / width, right to left
+    act_w: float[];
+
+    fn init(title: string) {
+        super.init();
+        this.title = title;
+        this.centered = false;
+        this.nav = NAV_NONE;
+        this.actions = [];
+        this.rows = [];
+        this.elevate_on_scroll = true;
+        this.scrolled = false;
+        this.band_w = 0.0;
+        this.bar_px = 0.0;
+        this.total_px = 0.0;
+        this.act_x = [];
+        this.act_w = [];
+        // The bar is chrome, not a target: only the nav band and the action
+        // cells ripple (see ripple_bounds), and the 48dp clamp would be
+        // meaningless on something that spans the screen.
+        this.min_touch = 0.0;
+    }
+
+    builder fn with_nav(kind: int, on: fn()) { this.nav = kind; this.onNav = on; return this; }
+    builder fn with_actions(a: TopBarAction[]) { this.actions = a; return this; }
+    builder fn center(on: bool) { this.centered = on; return this; }
+    builder fn elevate(on: bool) { this.elevate_on_scroll = on; return this; }
+    builder fn leading(w: Widget) { this.lead = w; this.add(w); return this; }
+    builder fn middle(w: Widget) { this.mid = w; this.add(w); return this; }
+    builder fn trailing(w: Widget) { this.trail = w; this.add(w); return this; }
+    builder fn row(w: Widget) { this.rows.push(w); this.add(w); return this; }
+
+    // Told by Scaffold. Repaints only on a change: this is called on every
+    // scroll event, and the bar's look only has two states.
+    fn set_scrolled(on: bool) {
+        if (on == this.scrolled) { return; }
+        this.scrolled = on;
+        this.invalidate();
+    }
+
+    // Raise this bar whenever `content` is scrolled off its top. The closure
+    // captures the bar, not the Scaffold — a Scaffold reachable from its own
+    // content's listener would be a reference cycle, and this bar is not
+    // reachable from the content.
+    fn watch_scroll(content: Widget) {
+        if (content == null) { return; }
+        let b = this;
+        content.on_scrolled = (y) => { b.set_scrolled(y > 0.0); };
+    }
+
+    // 48dp minimum, and wider if the theme's own metrics are: the band is the
+    // target, the glyph inside it is only paint.
+    fn nav_band(th: Theme): float {
+        if (this.nav == NAV_NONE) { return 0.0; }
+        let b = th.space_4 * 2.0 + th.text_lg;
+        let min = this.dp(DP_TOUCH_MIN);
+        if (b < min) { b = min; }
+        return b;
+    }
+
+    fn bar_height(s: Painter, th: Theme): float {
+        let h = this.dp(DP_TOPBAR_H);
+        let pad = th.space_4;
+        if (this.lead != null) {
+            let sz = this.lead.measure(s, th);
+            if (sz.h + pad > h) { h = sz.h + pad; }
+        }
+        if (this.mid != null) {
+            let sz = this.mid.measure(s, th);
+            if (sz.h + pad > h) { h = sz.h + pad; }
+        }
+        if (this.trail != null) {
+            let sz = this.trail.measure(s, th);
+            if (sz.h + pad > h) { h = sz.h + pad; }
+        }
+        return h;
+    }
+
+    override fn content_size(s: Painter, th: Theme): Size {
+        // 0 width = "fill the axis", the convention every container here uses.
+        return Size(0.0, this.bar_height(s, th));
+    }
+
+    // The bar fills the width it is offered and reports the height it needs,
+    // which a natural-size measure cannot express.
+    override fn layout(s: Painter, th: Theme, bc: BoxConstraints): Size {
+        let h = this.bar_height(s, th);
+        for (let r in this.rows) {
+            h = h + r.layout(s, th, bcLoose(bc.maxW, bc.maxH)).h;
+        }
+        return Size(bc.maxW, h);
+    }
+
+    override fn arrange(s: Painter, th: Theme, r: Rect) {
+        this.layout_to(r);
+        let pad = th.space_4;
+        let bh = this.bar_height(s, th);
+        this.bar_px = bh;
+        this.band_w = this.nav_band(th);
+        let bar = Rect(r.x, r.y, r.w, bh);
+
+        // --- leading ---
+        let left = r.x + this.band_w;
+        if (this.lead != null) {
+            let sz = this.lead.measure(s, th);
+            let lw = sz.w;
+            if (lw < this.dp(DP_TOUCH_MIN)) { lw = this.dp(DP_TOUCH_MIN); }
+            this.lead.arrange(s, th, Rect(r.x + pad, bar.center_y(sz.h), lw, sz.h));
+            left = r.x + pad + lw + pad;
+        } else if (this.band_w == 0.0) {
+            left = r.x + pad;
+        }
+
+        // --- trailing: a widget, or the action cells laid right to left ---
+        let right = r.right() - pad;
+        this.act_x = [];
+        this.act_w = [];
+        if (this.trail != null) {
+            let sz = this.trail.measure(s, th);
+            this.trail.arrange(s, th, Rect(right - sz.w, bar.center_y(sz.h), sz.w, sz.h));
+            right = right - sz.w - pad;
+        } else {
+            let n = this.actions.len;
+            for (let i in 0..n) {
+                // laid from the right edge inwards, so index 0 is outermost
+                let a = this.actions[n - 1 - i];
+                let aw = s.text_width(a.label) + 2.0 * pad;
+                let min = this.dp(DP_TOUCH_MIN);
+                if (aw < min) { aw = min; }
+                right = right - aw;
+                this.act_x.push(right);
+                this.act_w.push(aw);
+            }
+            // act_x/act_w were filled right to left; flip so index i matches
+            // actions[i] and the hit test needs no arithmetic.
+            let xs: float[] = [];
+            let ws: float[] = [];
+            for (let i in 0..this.act_x.len) {
+                xs.push(this.act_x[this.act_x.len - 1 - i]);
+                ws.push(this.act_w[this.act_w.len - 1 - i]);
+            }
+            this.act_x = xs;
+            this.act_w = ws;
+        }
+
+        // --- middle ---
+        if (this.mid != null) {
+            let sz = this.mid.measure(s, th);
+            let mw = right - left;
+            if (mw < 0.0) { mw = 0.0; }
+            let mx = left;
+            if (this.centered && sz.w < mw) { mx = bar.center_x(sz.w); }
+            let use_w = sz.w;
+            if (use_w > mw || sz.w == 0.0) { use_w = mw; }
+            this.mid.arrange(s, th, Rect(mx, bar.center_y(sz.h), use_w, sz.h));
+        }
+
+        // --- extra rows, stacked full width ---
+        let y = r.y + bh;
+        for (let rw in this.rows) {
+            let h = rw.layout(s, th, bcLoose(r.w, r.h)).h;
+            rw.arrange(s, th, Rect(r.x, y, r.w, h));
+            y = y + h;
+        }
+        this.total_px = y - r.y;
+    }
+
+    fn action_rect(i: int): Rect {
+        if (i < 0 || i >= this.act_x.len) { return Rect(0.0, 0.0, 0.0, 0.0); }
+        return Rect(this.act_x[i], this.bounds.y, this.act_w[i], this.bar_px);
+    }
+
+    fn band_rect(): Rect {
+        return Rect(this.bounds.x, this.bounds.y, this.band_w, this.bar_px);
+    }
+
+    // Only the two kinds of target ripple. A press on the title is a press on
+    // chrome and must not light the whole bar up.
+    override fn ripple_bounds(): Rect {
+        if (this.lead == null && this.band_w > 0.0
+            && this.rip_x < this.bounds.x + this.band_w) {
+            return this.band_rect();
+        }
+        for (let i in 0..this.act_x.len) {
+            let ar = this.action_rect(i);
+            if (this.rip_x >= ar.x && this.rip_x < ar.right()) { return ar; }
+        }
+        return Rect(0.0, 0.0, 0.0, 0.0);
+    }
+
+    override fn paint(s: Painter, th: Theme) {
+        let r = this.bounds;
+        if (this.elevate_on_scroll && this.scrolled) {
+            s.shadow(r, 0.0, this.dp(6.0), this.dp(2.0), th.shadow_color);
+        }
+        s.fill(r, th.surface_raised);
+        let bar = Rect(r.x, r.y, r.w, this.bar_px);
+
+        if (this.lead == null) { this.draw_nav(s, th, bar); }
+
+        if (this.mid == null && this.title.len > 0) {
+            let pad = th.space_4;
+            s.push_font(th.text_lg, WEIGHT_BOLD);
+            if (this.centered) {
+                s.text_center(bar, this.title, th.type_color_title);
+            } else {
+                let x = r.x + pad;
+                if (this.band_w > 0.0) { x = r.x + this.band_w; }
+                s.text(x, s.baseline_in(bar), this.title, th.type_color_title);
+            }
+            s.pop_font();
+        }
+
+        if (this.trail == null) {
+            for (let i in 0..this.actions.len) {
+                s.text_center(this.action_rect(i), this.actions[i].label, th.on_surface);
+            }
+        }
+
+        // slot widgets and extra rows are ordinary children
+        for (let c in this.children) { c.draw(s, th); }
+
+        // Flat bars carry a hairline; a raised one carries the shadow instead,
+        // and drawing both reads as a double edge.
+        if (!(this.elevate_on_scroll && this.scrolled)) {
+            s.line(r.x, r.bottom() - 0.5, r.right(), r.bottom() - 0.5, th.divider);
+        }
+    }
+
+    // Drawn from strokes, not typed. A font's "‹" is a thin glyph at body
+    // size where Android's back affordance is a 24dp arrow with a shaft, and
+    // the hamburger has no glyph at all. Three lines each, scaled with the
+    // display — the same shape apps/hn_android arrived at (hnrows.vt:501).
+    fn draw_nav(s: Painter, th: Theme, bar: Rect) {
+        if (this.nav == NAV_NONE) { return; }
+        let k = ui_scale(this);
+        let g = 24.0 * k;
+        let lw = 2.0 * k;
+        let cx = bar.x + this.band_w / 2.0;
+        let cy = bar.center_y(0.0);
+        let ink = th.type_color_title;
+        if (this.nav == NAV_BACK) {
+            let tip = cx - g / 2.0;
+            let head = g * 0.34;
+            s.line_w(tip, cy, cx + g / 2.0, cy, lw, ink);
+            s.line_w(tip, cy, tip + head, cy - head, lw, ink);
+            s.line_w(tip, cy, tip + head, cy + head, lw, ink);
+            return;
+        }
+        let half = g / 2.0;
+        let gap = g * 0.3;
+        s.line_w(cx - half, cy - gap, cx + half, cy - gap, lw, ink);
+        s.line_w(cx - half, cy, cx + half, cy, lw, ink);
+        s.line_w(cx - half, cy + gap, cx + half, cy + gap, lw, ink);
+    }
+
+    override fn on_tap(x: int, y: int): bool {
+        // Below the bar row is an extra row's business, and those are children
+        // that took their own press.
+        if ((y as float) > this.bounds.y + this.bar_px) { return false; }
+        if (this.lead == null && this.onNav != null && contains(this.band_rect(), x, y)) {
+            this.onNav();
+            return true;
+        }
+        for (let i in 0..this.actions.len) {
+            if (contains(this.action_rect(i), x, y)) {
+                let a = this.actions[i];
+                if (a.run != null) { a.run(); }
+                return true;
+            }
+        }
+        // A tap on the title is not a gesture. Consuming it would make the
+        // whole bar feel like a button.
+        return false;
+    }
+
+    override fn drop_handlers() {
+        this.onNav = null;
+        for (let a in this.actions) { a.run = null; }
+        this.actions = [];
+        super.drop_handlers();
+    }
+}
+
 // ---------------------------------------------------------------- FAB
 
 // Circular elevated action button. The one control an Android user reads as
 // "the main thing this screen does".
 //
-// Ripple is not implemented: it needs the press origin, which on_click already
-// carries (x, y), plus a clip-to-circle expanding overlay. That belongs in
-// skins/material.vt with the rest of the chrome, not here — this widget only
-// needs to hand the origin down once the skin can use it.
-export class FloatingActionButton extends Widget {
+// Ripple comes from AndroidWidget, clipped to the circle (ripple_bounds +
+// ripple_radius below) rather than to the square layout box.
+export class FloatingActionButton extends AndroidWidget {
     label: string;        // short glyph or 1-2 chars; M3 FABs are icon-only
     onClick: fn(FloatingActionButton);
     mini: bool;
@@ -135,26 +850,42 @@ export class FloatingActionButton extends Widget {
         if (this.onClick != null) { this.onClick(this); }
     }
 
-    override fn measure(s: Painter, th: Theme): Size {
+    override fn content_size(s: Painter, th: Theme): Size {
         let d = this.diameter();
         return Size(d, d);
     }
 
-    override fn render(s: Painter, th: Theme) {
-        let r = this.bounds;
+    // The circle inside the layout box. A mini FAB is 40dp, under the 48dp
+    // touch minimum, so measure() hands it a larger box — the button must then
+    // draw centred in it rather than pinned to the corner.
+    fn circle_rect(): Rect {
         let d = this.diameter();
-        let cx = r.x + d / 2.0;
-        let cy = r.y + d / 2.0;
+        let r = this.bounds;
+        return Rect(r.cx() - d / 2.0, r.cy() - d / 2.0, d, d);
+    }
+
+    override fn ripple_bounds(): Rect { return this.circle_rect(); }
+    override fn ripple_radius(): float { return this.diameter() / 2.0; }
+
+    override fn paint(s: Painter, th: Theme) {
+        let cr = this.circle_rect();
+        let d = cr.w;
         // elevation rises on press, matching M3's 6dp -> 12dp
         let k = ui_scale(this);
         let blur = (6.0 + this.lift * 6.0) * k;
         let dy = (3.0 + this.lift * 3.0) * k;
-        s.shadow(Rect(r.x, r.y, d, d), d / 2.0, blur, dy, th.shadow_color);
-        s.circle(cx, cy, d / 2.0, th.primary);
+        s.shadow(cr, d / 2.0, blur, dy, th.shadow_color);
+        s.circle(cr.cx(), cr.cy(), d / 2.0, th.primary);
         s.push_font(th.text_lg, WEIGHT_MED);
-        s.text_center(Rect(r.x, r.y, d, d), this.label, th.on_primary);
+        s.text_center(cr, this.glyph(), th.on_primary);
         s.pop_font();
     }
+
+    // What the button draws right now. A plain FAB draws its label forever;
+    // ActionsFab swaps it while its menu is open, and derives that from the
+    // Window rather than caching it, so an Escape-dismissed menu cannot leave
+    // the wrong glyph behind.
+    virtual fn glyph(): string { return this.label; }
 
     fn animate_lift(target: float) {
         let b = this;
@@ -163,21 +894,286 @@ export class FloatingActionButton extends Widget {
                                           EASE_OUT_CUBIC, (v) => { b.lift = v; });
     }
 
-    override fn on_hover_enter(): bool { this.animate_lift(1.0); return true; }
-    override fn on_hover_leave(): bool { this.animate_lift(0.0); return true; }
+    // The lift follows the finger, not a cursor: a touch UI never gets a hover
+    // enter, so driving it from hover left the FAB flat on a phone and lit on a
+    // desktop for as long as the pointer merely passed over it.
+    override fn on_press_begin(x: int, y: int) { this.animate_lift(1.0); }
+    override fn on_press_end() { this.animate_lift(0.0); }
 
-    override fn on_click(x: int, y: int): bool {
+    override fn on_tap(x: int, y: int): bool {
         this.fire();
         return true;
     }
 
     override fn on_key(k: int, ch: string): bool {
         if (k == 32) { this.fire(); return true; }
-        return false;
+        return super.on_key(k, ch);
     }
 
     override fn drop_handlers() {
         this.onClick = null;
+        if (this.lift_tw != null) { this.lift_tw.cancel(); this.lift_tw = null; }
+        super.drop_handlers();
+    }
+}
+
+// ------------------------------------------------------------- ActionsFab
+
+// Which way the revealed actions stack.
+export const FAB_MENU_AUTO: int = 0;   // up when the FAB is in the lower half
+export const FAB_MENU_UP: int = 1;
+export const FAB_MENU_DOWN: int = 2;
+
+const FAB_MENU_MS: int = 200;
+const DP_FAB_GAP: float = 12.0;        // between stacked mini FABs
+const DP_FAB_LABEL_GAP: float = 12.0;  // between a mini FAB and its label pill
+const DP_FAB_LABEL_H: float = 28.0;
+// Each action starts this much later than the one before it, as a fraction of
+// the whole reveal — the stagger that makes the stack read as unfolding.
+const FAB_STAGGER: float = 0.14;
+
+// One action in a speed dial: the glyph drawn in its mini FAB, the label
+// beside it, and what it does.
+export class FabAction {
+    glyph: string;
+    label: string;
+    run: fn();
+
+    fn init(glyph: string, label: string, run: fn()) {
+        this.glyph = glyph;
+        this.label = label;
+        this.run = run;
+    }
+}
+
+// A FAB that reveals more FABs — Material's speed dial, and the standard way
+// a screen offers two to four primary actions.
+//
+//     let fab = new ActionsFab("+");
+//     fab.actions = [new FabAction("✎", "Post", () => { compose(); }),
+//                    new FabAction("⌾", "Photo", () => { pick(); })];
+//     sc.with_fab(fab);
+//
+// The revealed FABs live in a Window overlay, not inside this widget. Two
+// reasons, both hard: a widget may not draw outside its own bounds and stay
+// tappable (hit-testing is bounds-based), and inside a Scaffold this widget's
+// slot is exactly one FAB tall. The overlay also brings the scrim, the
+// outside-tap dismissal and Back-to-close for free — AndroidWindow.back_depth
+// already counts an open overlay.
+export class ActionsFab extends FloatingActionButton {
+    actions: FabAction[];
+    dir: int;
+    open_label: string;    // glyph while the menu is open
+    // Weak: the Window owns the open overlay. An Escape dismisses it without
+    // telling anyone, so this must be allowed to go null on its own rather
+    // than pinning a menu that is no longer on screen.
+    menu: weak FabMenu;
+
+    fn init(label: string) {
+        super.init(label);
+        this.actions = [];
+        this.dir = FAB_MENU_AUTO;
+        this.open_label = "×";
+    }
+
+    builder fn with_actions(a: FabAction[]) { this.actions = a; return this; }
+    builder fn stack(d: int) { this.dir = d; return this; }
+
+    // Derived, never cached: the menu is open exactly while it is the
+    // Window's overlay.
+    fn is_open(): bool {
+        let w = this.win;
+        if (w == null || this.menu == null) { return false; }
+        return w.overlay == this.menu;
+    }
+
+    override fn glyph(): string {
+        if (this.is_open()) { return this.open_label; }
+        return this.label;
+    }
+
+    fn open_menu() {
+        let w = this.win;
+        if (w == null || this.actions.len == 0) { return; }
+        let m = new FabMenu(this);
+        this.menu = m;
+        w.open_overlay(m);
+        m.open();
+    }
+
+    fn close_menu() {
+        if (this.menu != null) { this.menu.close(); }
+    }
+
+    override fn on_tap(x: int, y: int): bool {
+        if (this.actions.len == 0) { return super.on_tap(x, y); }
+        if (this.is_open()) { this.close_menu(); } else { this.open_menu(); }
+        this.invalidate();
+        return true;
+    }
+
+    override fn drop_handlers() {
+        for (let a in this.actions) { a.run = null; }
+        this.actions = [];
+        super.drop_handlers();
+    }
+}
+
+// The revealed stack. Full-window bounds and its own click routing, the same
+// shape BottomSheet uses — see that class for why an overlay that paints its
+// own content needs custom_paint.
+//
+// The mini FABs are drawn, not child widgets. An overlay dispatches on_click
+// to its root, so children would each need routing back to here anyway to
+// close the menu after running — and a drawn circle costs one op where a
+// widget costs a subtree.
+export class FabMenu extends Widget {
+    owner: weak ActionsFab;
+    actions: FabAction[];
+    anchor: Rect;         // the FAB this unfolded from
+    up: bool;             // stack upwards
+    left_labels: bool;    // labels on the left of the mini FABs
+    t: float;             // reveal 0..1
+    anim: Tween;
+    closing: bool;
+
+    fn init(owner: ActionsFab) {
+        super.init();
+        this.owner = owner;
+        this.actions = owner.actions;
+        this.anchor = owner.bounds;
+        this.t = 0.0;
+        this.closing = false;
+        this.up = true;
+        this.left_labels = true;
+        this.modal = true;        // exits through close(), which animates
+        this.custom_paint = true; // draws its own content, not just children
+    }
+
+    override fn place(s: Painter, th: Theme) {
+        this.bounds = Rect(0.0, 0.0, s.width(), s.height());
+        // Whichever direction has room. A FAB is nearly always bottom-anchored,
+        // so this is nearly always "up".
+        this.up = this.anchor.cy() > s.height() / 2.0;
+        if (this.owner != null && this.owner.dir == FAB_MENU_UP) { this.up = true; }
+        if (this.owner != null && this.owner.dir == FAB_MENU_DOWN) { this.up = false; }
+        // Labels go on the roomier side of the column.
+        this.left_labels = this.anchor.cx() > s.width() / 2.0;
+    }
+
+    fn relayout() {
+        let w = this.win;
+        if (w == null) { return; }
+        this.place(w.painter, w.theme);
+    }
+
+    fn mini_d(): float { return DP_FAB_MINI * ui_scale(this); }
+
+    // How far action i has unfolded. The stagger is what makes the stack read
+    // as opening rather than appearing.
+    fn item_t(i: int): float {
+        let span = 1.0 - FAB_STAGGER * ((this.actions.len - 1) as float);
+        if (span < 0.2) { span = 0.2; }
+        return clampf((this.t - FAB_STAGGER * (i as float)) / span, 0.0, 1.0);
+    }
+
+    // Resting position of action i, fully open.
+    fn item_center_y(i: int): float {
+        let k = ui_scale(this);
+        let step = this.mini_d() + DP_FAB_GAP * k;
+        let first = this.anchor.y - DP_FAB_GAP * k - this.mini_d() / 2.0;
+        if (!this.up) { first = this.anchor.bottom() + DP_FAB_GAP * k + this.mini_d() / 2.0; }
+        if (this.up) { return first - (i as float) * step; }
+        return first + (i as float) * step;
+    }
+
+    // Where it is right now: it travels out of the anchor as it unfolds.
+    fn item_rect(i: int): Rect {
+        let p = this.item_t(i);
+        let d = this.mini_d() * p;
+        let cx = this.anchor.cx();
+        let cy = this.anchor.cy() + (this.item_center_y(i) - this.anchor.cy()) * p;
+        return Rect(cx - d / 2.0, cy - d / 2.0, d, d);
+    }
+
+    fn open() {
+        this.closing = false;
+        this.slide_to(1.0);
+    }
+
+    fn close() {
+        if (this.closing) { return; }
+        this.closing = true;
+        this.slide_to(0.0);
+    }
+
+    fn slide_to(target: float) {
+        if (this.anim != null) { this.anim.cancel(); }
+        let m = this;
+        this.anim = this.animate_value(this.t, target, FAB_MENU_MS, false,
+                                       EASE_OUT_CUBIC, (v) => {
+            m.t = v;
+            m.invalidate();
+            if (m.closing && v <= ANIM_EPS) { m.finish_close(); }
+        });
+    }
+
+    // Same shape as BottomSheet.finish_close: the tick closure holds its own
+    // reference, so dropping the Window's overlay here cannot free this
+    // mid-callback.
+    fn finish_close() {
+        this.closing = false;
+        let w = this.win;
+        if (w != null) { w.dismiss_overlay(); }
+        let o = this.owner;
+        if (o != null) { o.invalidate(); }
+    }
+
+    override fn render(s: Painter, th: Theme) {
+        let a = (this.t * SCRIM_ALPHA) as int;
+        if (a > 0) { s.fill(this.bounds, with_alpha(rgb(0, 0, 0), a)); }
+        let k = ui_scale(this);
+        for (let i in 0..this.actions.len) {
+            let p = this.item_t(i);
+            if (p <= 0.0) { continue; }
+            let r = this.item_rect(i);
+            let act = this.actions[i];
+            s.shadow(r, r.w / 2.0, 6.0 * k, 3.0 * k, th.shadow_color);
+            s.circle(r.cx(), r.cy(), r.w / 2.0, th.surface_raised);
+            s.text_center(r, act.glyph, th.on_surface);
+            if (act.label.len == 0) { continue; }
+            // Label pill, on the side with room, fading in with its FAB.
+            let lh = DP_FAB_LABEL_H * k;
+            let lw = s.text_width(act.label) + 16.0 * k;
+            let gap = DP_FAB_LABEL_GAP * k;
+            let lx = r.right() + gap;
+            if (this.left_labels) { lx = r.x - gap - lw; }
+            let pill = Rect(lx, r.cy() - lh / 2.0, lw, lh);
+            let av = (255.0 * p) as int;
+            s.fill_round(pill, lh / 2.0, with_alpha(th.surface_raised, av));
+            s.text_center(pill, act.label, with_alpha(th.on_surface, av));
+        }
+    }
+
+    override fn on_click(x: int, y: int): bool {
+        for (let i in 0..this.actions.len) {
+            if (contains(this.item_rect(i), x, y)) {
+                let a = this.actions[i];
+                // Close first: the action may push a screen or open another
+                // overlay, and dismissing afterwards would drop that one.
+                this.close();
+                if (a.run != null) { a.run(); }
+                return true;
+            }
+        }
+        // The anchor and the scrim both mean "put these away".
+        this.close();
+        return true;
+    }
+
+    override fn drop_handlers() {
+        this.actions = [];
+        if (this.anim != null) { this.anim.cancel(); this.anim = null; }
     }
 }
 
@@ -186,7 +1182,7 @@ export class FloatingActionButton extends Widget {
 // 3-5 destinations pinned to the bottom edge. The dominant Android nav
 // pattern, and the reason NavRail (a tablet/desktop side rail) is not a
 // substitute.
-export class BottomNavigationBar extends Widget {
+export class BottomNavigationBar extends AndroidWidget {
     items: string[];
     selected: int;
     onSelect: fn(int);
@@ -198,8 +1194,17 @@ export class BottomNavigationBar extends Widget {
         this.focusable = true;
     }
 
-    override fn measure(s: Painter, th: Theme): Size {
+    override fn content_size(s: Painter, th: Theme): Size {
         return Size(0.0, DP_BOTTOM_NAV_H * ui_scale(this));
+    }
+
+    // One destination, not the whole bar: a ripple spreading across all five
+    // segments is what a shared `bounds` would give.
+    override fn ripple_bounds(): Rect {
+        let i = this.index_at(this.rip_x);
+        if (i < 0) { return this.bounds; }
+        let seg = this.bounds.w / (this.items.len as float);
+        return Rect(this.bounds.x + (i as float) * seg, this.bounds.y, seg, this.bounds.h);
     }
 
     // Index under a device-pixel x, or -1. Items divide the width evenly, so
@@ -213,7 +1218,7 @@ export class BottomNavigationBar extends Widget {
         return i;
     }
 
-    override fn render(s: Painter, th: Theme) {
+    override fn paint(s: Painter, th: Theme) {
         let r = this.bounds;
         s.fill(r, th.surface_raised);
         s.line(r.x, r.y, r.x + r.w, r.y, th.divider);
@@ -250,7 +1255,7 @@ export class BottomNavigationBar extends Widget {
         }
     }
 
-    override fn on_click(x: int, y: int): bool {
+    override fn on_tap(x: int, y: int): bool {
         let i = this.index_at(x as float);
         if (i < 0 || i == this.selected) { return false; }
         this.selected = i;
@@ -261,6 +1266,7 @@ export class BottomNavigationBar extends Widget {
 
     override fn drop_handlers() {
         this.onSelect = null;
+        super.drop_handlers();
     }
 }
 
@@ -436,14 +1442,22 @@ export class BottomSheet extends Widget {
 
 // -------------------------------------------------------- NavigationDrawer
 
-// The modal navigation drawer: a scrim plus a panel of destinations sliding in
-// from the left edge, opened by a button and closed by a tap on the scrim or a
-// drag back to the left.
+// The modal navigation drawer: a scrim plus a panel sliding in from an edge,
+// opened by a button and closed by a tap on the scrim or a drag back out.
 //
 //     let drawer = new NavigationDrawer(["Inbox", "Starred", "Sent"]);
 //     drawer.onSelect = (i) => { ...; drawer.close(); };
 //     win.open_overlay(drawer);
 //     drawer.open();
+//
+// Either edge — an end drawer (filters, a cart, a profile) is the standard
+// right-hand counterpart to the navigation one:
+//
+//     new NavigationDrawer([]).from_side(DRAWER_RIGHT).add(my_panel_content)
+//
+// and either content: with children, the panel lays the first one out and the
+// string rows are not drawn at all. `items` stays the default because the row
+// list is what a navigation drawer usually is.
 //
 // Same full-window `bounds` as BottomSheet, for the same reason: the scrim is
 // part of the widget so its taps arrive as on_click.
@@ -462,6 +1476,10 @@ export class NavigationDrawer extends Widget {
     anim: Tween;
     last_dx: float;
     closing: bool;
+    // DRAWER_LEFT or DRAWER_RIGHT. Everything else about the drawer is
+    // symmetric; three places branch on it — where the panel sits, which drag
+    // direction opens it, and which one dismisses it.
+    side: int;
 
     fn init(items: string[]) {
         super.init();
@@ -471,7 +1489,22 @@ export class NavigationDrawer extends Widget {
         this.panel = Rect(0.0, 0.0, 0.0, 0.0);
         this.last_dx = 0.0;
         this.closing = false;
+        this.side = DRAWER_LEFT;
         this.modal = true;
+    }
+
+    builder fn from_side(s: int) { this.side = s; return this; }
+
+    // +1 when a rightward drag opens the drawer (left edge), -1 for the right
+    // edge. The whole mirror is this number.
+    fn drag_sign(): float {
+        if (this.side == DRAWER_RIGHT) { return -1.0; }
+        return 1.0;
+    }
+
+    fn content(): Widget {
+        if (this.children.len == 0) { return null; }
+        return this.children[0];
     }
 
     fn drawer_w(s: Painter): float {
@@ -485,7 +1518,12 @@ export class NavigationDrawer extends Widget {
     override fn place(s: Painter, th: Theme) {
         this.bounds = Rect(0.0, 0.0, s.width(), s.height());
         let w = this.drawer_w(s);
-        this.panel = Rect((this.open_frac - 1.0) * w, 0.0, w, s.height());
+        // Closed is one panel-width off its own edge; open is flush with it.
+        let x = (this.open_frac - 1.0) * w;
+        if (this.side == DRAWER_RIGHT) { x = s.width() - this.open_frac * w; }
+        this.panel = Rect(x, 0.0, w, s.height());
+        let c = this.content();
+        if (c != null) { c.arrange(s, th, this.panel); }
     }
 
     fn relayout() {
@@ -517,6 +1555,13 @@ export class NavigationDrawer extends Widget {
         let r = this.panel;
         s.shadow(r, 0.0, 16.0, 0.0, th.shadow_color);
         s.fill(r, th.surface_raised);
+        let c = this.content();
+        if (c != null) {
+            // Content mode: the panel is whatever was added, and the row list
+            // is not drawn even if `items` was also given.
+            c.draw(s, th);
+            return;
+        }
         for (let i in 0..this.items.len) {
             let rr = this.row_rect(i);
             let fg = th.on_surface;
@@ -563,6 +1608,9 @@ export class NavigationDrawer extends Widget {
 
     override fn on_click(x: int, y: int): bool {
         if (!contains(this.panel, x, y)) { this.close(); return true; }
+        // In content mode the panel's own widgets took the press and route
+        // their own clicks; there are no rows to select.
+        if (this.content() != null) { return false; }
         let i = this.index_at(x, y);
         if (i < 0) { return false; }
         this.selected = i;
@@ -578,20 +1626,43 @@ export class NavigationDrawer extends Widget {
         return true;
     }
 
+    // Reached when the press landed on the panel's own content rather than on
+    // the drawer: Widget.on_drag walks up the parent chain looking for someone
+    // who wants the gesture, and in content mode that is this drawer. Without
+    // it, a drawer holding widgets cannot be dragged shut at all — the child
+    // holds the capture and the drag dies in the walk.
+    //
+    // A scrollable widget inside the panel is reached first by that same walk,
+    // so a list in a drawer still scrolls vertically.
+    override fn drag_scroll(dx: int, dy: int): bool {
+        return this.on_drag(dx, dy);
+    }
+    override fn drag_scroll_end(): bool {
+        return this.on_drag_end(0, 0);
+    }
+
     override fn on_drag(dx: int, dy: int): bool {
         let w = this.win;
         if (w == null) { return false; }
         let dw = this.drawer_w(w.painter);
         if (dw <= 0.0) { return false; }
+        // The press may have been taken by a child, so the drag can begin
+        // without on_drag_start ever reaching this widget. Pinning a running
+        // slide here rather than there costs one null check.
+        if (this.anim != null) { this.anim.cancel(); this.anim = null; }
         this.last_dx = dx as float;
-        this.open_frac = clampf(this.open_frac + (dx as float) / dw, 0.0, 1.0);
+        this.open_frac = clampf(this.open_frac + (dx as float) * this.drag_sign() / dw,
+                                0.0, 1.0);
         this.relayout();
         this.invalidate();
         return true;
     }
 
     override fn on_drag_end(x: int, y: int): bool {
-        if (this.last_dx <= -FLING_PX || this.open_frac <= 1.0 - DISMISS_FRAC) { this.close(); }
+        // A flick back towards the drawer's own edge dismisses it, whichever
+        // edge that is; otherwise it settles to the nearer end.
+        let flick = this.last_dx * this.drag_sign();
+        if (flick <= 0.0 - FLING_PX || this.open_frac <= 1.0 - DISMISS_FRAC) { this.close(); }
         else { this.open(); }
         return true;
     }
@@ -600,6 +1671,126 @@ export class NavigationDrawer extends Widget {
         this.onSelect = null;
         this.onDismiss = null;
         if (this.anim != null) { this.anim.cancel(); this.anim = null; }
+    }
+}
+
+// ---------------------------------------------------------------- Scaffold
+
+// Where a Scaffold pins its FAB.
+export const FAB_BOTTOM_RIGHT: int = 0;
+export const FAB_BOTTOM_LEFT: int = 1;
+export const FAB_BOTTOM_CENTER: int = 2;
+
+const DP_FAB_MARGIN: float = 16.0;
+
+// Screen structure: fixed chrome, scrolling content, a floating FAB.
+//
+//     let sc = new Scaffold(new ScrollView(feed))
+//         .top(new TopBar("Feed").with_nav(NAV_MENU, () => { sc.open_drawer(); }))
+//         .bottom(new BottomNavigationBar(["Home", "Search", "Me"]))
+//         .with_fab(fab)
+//         .with_drawer(drawer);
+//     win.set_content(sc);
+//
+// The FAB is the reason this exists. A `FloatingActionButton` placed in a
+// Column inside a ScrollView is not floating — it scrolls away, which is what
+// the demo app did. Here it is positioned against the **Scaffold's own rect**,
+// and the Scaffold is the root child (inside AndroidWindow's SafeArea), so
+// that rect is the screen minus the system bars. It also sits above the bottom
+// bar without the app computing anything.
+//
+// A plain Widget, not an AndroidWidget: a full-screen container has no gesture
+// of its own, and a ripple or a 48dp minimum on it would be meaningless.
+export class Scaffold extends Widget {
+    top_bar: Widget;      // whatever fills the top slot
+    tbar: weak TopBar;    // the same object when it is a TopBar (elevation)
+    content: Widget;
+    bottom_bar: Widget;
+    fab: Widget;
+    // Held, not added: an open drawer lives in the Window's overlay slot, so it
+    // is not part of this subtree.
+    drawer: NavigationDrawer;
+    fab_corner: int;
+    fab_margin: float;    // dp
+    wired: bool;          // the content's scroll listener is hooked up
+
+    fn init(content: Widget) {
+        super.init();
+        this.fab_corner = FAB_BOTTOM_RIGHT;
+        this.fab_margin = DP_FAB_MARGIN;
+        this.wired = false;
+        if (content != null) {
+            this.content = content;
+            this.add(content);
+        }
+    }
+
+    // Slot order matters for hit-testing, not for painting: Widget.hit walks
+    // later siblings first, so bars and the FAB win over the content beneath
+    // them — which is why `content` is added first, in init.
+    builder fn top(b: TopBar) {
+        this.top_bar = b;
+        this.tbar = b;
+        this.add(b);
+        return this;
+    }
+    // Any other widget as the top slot. No scroll-elevation wiring, because
+    // that is a TopBar feature.
+    builder fn top_widget(w: Widget) { this.top_bar = w; this.add(w); return this; }
+    builder fn bottom(w: Widget) { this.bottom_bar = w; this.add(w); return this; }
+    builder fn with_fab(w: Widget) { this.fab = w; this.add(w); return this; }
+    builder fn fab_at(corner: int) { this.fab_corner = corner; return this; }
+    builder fn fab_inset(dp: float) { this.fab_margin = dp; return this; }
+    builder fn with_drawer(d: NavigationDrawer) { this.drawer = d; return this; }
+
+    fn open_drawer() {
+        let w = this.win;
+        if (w == null || this.drawer == null) { return; }
+        w.open_overlay(this.drawer);
+        this.drawer.open();
+    }
+
+    fn close_drawer() {
+        if (this.drawer != null) { this.drawer.close(); }
+    }
+
+    // Fills whatever it is given. The natural size is meaningless for a screen.
+    override fn layout(s: Painter, th: Theme, bc: BoxConstraints): Size {
+        return Size(bc.maxW, bc.maxH);
+    }
+
+    override fn arrange(s: Painter, th: Theme, r: Rect) {
+        this.layout_to(r);
+        if (!this.wired && this.tbar != null) {
+            this.tbar.watch_scroll(this.content);
+            this.wired = true;
+        }
+
+        let top_h = 0.0;
+        if (this.top_bar != null) {
+            top_h = this.top_bar.layout(s, th, bcLoose(r.w, r.h)).h;
+            this.top_bar.arrange(s, th, Rect(r.x, r.y, r.w, top_h));
+        }
+        let bot_h = 0.0;
+        if (this.bottom_bar != null) {
+            bot_h = this.bottom_bar.layout(s, th, bcLoose(r.w, r.h)).h;
+            this.bottom_bar.arrange(s, th, Rect(r.x, r.bottom() - bot_h, r.w, bot_h));
+        }
+        if (this.content != null) {
+            let ch = r.h - top_h - bot_h;
+            if (ch < 0.0) { ch = 0.0; }
+            this.content.arrange(s, th, Rect(r.x, r.y + top_h, r.w, ch));
+        }
+        if (this.fab != null) {
+            let fs = this.fab.measure(s, th);
+            let m = this.fab_margin * ui_scale(this);
+            let fx = r.right() - m - fs.w;
+            if (this.fab_corner == FAB_BOTTOM_LEFT) { fx = r.x + m; }
+            else if (this.fab_corner == FAB_BOTTOM_CENTER) { fx = r.center_x(fs.w); }
+            // Above the bottom bar, not behind it.
+            let fy = r.bottom() - bot_h - m - fs.h;
+            this.fab.arrange(s, th, Rect(fx, fy, fs.w, fs.h));
+        }
     }
 }
 
@@ -821,7 +2012,7 @@ fn day_of_week(y: int, m: int, d: int): int {
 // There is no "today" ring by default, because nothing in this package knows
 // the date. Set today_y/today_m/today_d if the app does — that keeps the clock
 // dependency in the app, where it already exists.
-export class DatePicker extends Widget {
+export class DatePicker extends AndroidWidget {
     year: int;            // selected year; 0 until a day is picked
     month: int;           // selected month, 1-12
     day: int;             // selected day, 0 = none
@@ -849,6 +2040,13 @@ export class DatePicker extends Widget {
         this.today_m = 0;
         this.today_d = 0;
         this.focusable = true;
+        // The grid is a field of small targets, and the selection ring already
+        // answers "did that register?" per cell. A ripple over the whole panel
+        // would say nothing about which day was hit.
+        this.ripple = false;
+        // The panel is far above the touch minimum; individual cells are DPK_CELL
+        // and sized by the grid, not by measure().
+        this.min_touch = 0.0;
         this.month_names = ["January", "February", "March", "April", "May", "June",
                             "July", "August", "September", "October", "November",
                             "December"];
@@ -862,7 +2060,7 @@ export class DatePicker extends Widget {
 
     fn cell(): float { return DPK_CELL * ui_scale(this); }
 
-    override fn measure(s: Painter, th: Theme): Size {
+    override fn content_size(s: Painter, th: Theme): Size {
         let k = ui_scale(this);
         return Size(7.0 * DPK_CELL * k + 2.0 * DPK_PAD * k,
                     (DPK_HEADER_H + DPK_WEEK_H + 6.0 * DPK_CELL + 2.0 * DPK_PAD) * k);
@@ -935,7 +2133,7 @@ export class DatePicker extends Widget {
         this.pick(nd);
     }
 
-    override fn render(s: Painter, th: Theme) {
+    override fn paint(s: Painter, th: Theme) {
         let h = this.header_rect();
         s.push_font(th.text_lg, WEIGHT_MED);
         s.text_center(h, this.month_names[this.view_month - 1] + " " + str(this.view_year),
@@ -972,7 +2170,7 @@ export class DatePicker extends Widget {
         }
     }
 
-    override fn on_click(x: int, y: int): bool {
+    override fn on_tap(x: int, y: int): bool {
         if (contains(this.prev_rect(), x, y)) { this.step_month(-1); return true; }
         if (contains(this.next_rect(), x, y)) { this.step_month(1); return true; }
         let g = this.grid_rect();
@@ -994,11 +2192,12 @@ export class DatePicker extends Widget {
             if (this.onSelect != null) { this.onSelect(this.year, this.month, this.day); }
             return true;
         }
-        return false;
+        return super.on_key(k, ch);
     }
 
     override fn drop_handlers() {
         this.onSelect = null;
+        super.drop_handlers();
     }
 }
 
@@ -1023,7 +2222,7 @@ const TP_MINUTES: int = 1;
 //
 // Drag works because a non-overlay widget has always received it (Slider is
 // the precedent) — and since Track C item 1 it works inside a Dialog too.
-export class TimePicker extends Widget {
+export class TimePicker extends AndroidWidget {
     hour: int;            // 0-23, always stored as 24-hour
     minute: int;          // 0-59
     mode: int;            // TP_HOURS or TP_MINUTES — which ring is live
@@ -1037,11 +2236,15 @@ export class TimePicker extends Widget {
         this.mode = TP_HOURS;
         this.use_24h = false;
         this.focusable = true;
+        // Same reason as DatePicker: the hand and the highlighted number are
+        // the feedback, per value. A ripple across the whole dial is not.
+        this.ripple = false;
+        this.min_touch = 0.0;
     }
 
     builder fn h24(on: bool) { this.use_24h = on; return this; }
 
-    override fn measure(s: Painter, th: Theme): Size {
+    override fn content_size(s: Painter, th: Theme): Size {
         let k = ui_scale(this);
         return Size((TPK_DIAL + 2.0 * TPK_PAD) * k,
                     (TPK_HEADER_H + TPK_DIAL + 2.0 * TPK_PAD) * k);
@@ -1150,7 +2353,7 @@ export class TimePicker extends Widget {
         return h;
     }
 
-    override fn render(s: Painter, th: Theme) {
+    override fn paint(s: Painter, th: Theme) {
         // --- header: HH : MM, the live half highlighted ---
         let hr = this.hour_rect();
         let mr = this.minute_rect();
@@ -1236,7 +2439,17 @@ export class TimePicker extends Widget {
         s.text_center(Rect(x - tr, y - tr, tr * 2.0, tr * 2.0), label, fg);
     }
 
+    // The dial is the exception to tap-on-release: dragging the hand IS the
+    // gesture, so the value has to be under the finger from the first frame,
+    // and a value the drag will overwrite is not the trap that a navigating
+    // row is. Only the handover to minutes waits — that part is navigation.
     override fn on_click(x: int, y: int): bool {
+        let base = super.on_click(x, y);
+        if (contains(this.dial_rect(), x, y)) { this.apply_point(x, y); }
+        return base;
+    }
+
+    override fn on_tap(x: int, y: int): bool {
         if (contains(this.hour_rect(), x, y)) { this.mode = TP_HOURS; this.invalidate(); return true; }
         if (contains(this.minute_rect(), x, y)) { this.mode = TP_MINUTES; this.invalidate(); return true; }
         if (!this.use_24h && contains(this.ampm_rect(), x, y)) {
@@ -1260,10 +2473,19 @@ export class TimePicker extends Widget {
         return true;
     }
 
+    // A swept hour hands over to minutes on release, exactly as a tapped one
+    // does — the sweep sets hours the whole way now that the handover no
+    // longer happens on the press that starts it.
+    override fn on_drag_end(x: int, y: int): bool {
+        let base = super.on_drag_end(x, y);
+        if (this.mode == TP_HOURS) { this.mode = TP_MINUTES; this.invalidate(); return true; }
+        return base;
+    }
+
     override fn on_key(k: int, ch: string): bool {
         let step = 1;
         if (k == KEY_LEFT || k == KEY_DOWN) { step = -1; }
-        else if (k != KEY_RIGHT && k != KEY_UP) { return false; }
+        else if (k != KEY_RIGHT && k != KEY_UP) { return super.on_key(k, ch); }
         if (this.mode == TP_MINUTES) {
             this.set_time(this.hour, (this.minute + step + 60) % 60);
         } else {
@@ -1274,6 +2496,7 @@ export class TimePicker extends Widget {
 
     override fn drop_handlers() {
         this.onChange = null;
+        super.drop_handlers();
     }
 }
 
@@ -1430,6 +2653,10 @@ export class AndroidWindow extends Window {
         // touches near the right edge reach the content instead of a bar nobody
         // can see. Set it back on the theme if a screen really wants them.
         this.theme.scrollbars_visible = false;
+        // The pointer is a finger: a release has to clear hover, or every
+        // hover-tinted widget stays lit after being tapped. Reaches plain
+        // vyto/ui widgets too, which is most of what an app's tree holds.
+        this.touch_mode = true;
         this.screens = [];
         // Escape must never close the window here, because Escape is the wire
         // the system Back key rides on (jni_boot.c) and the depth Native.back()

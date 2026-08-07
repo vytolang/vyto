@@ -1,0 +1,56 @@
+// AndroidWidget text selection: the touch gestures over vyto/ui/selection.
+//
+// The load-bearing assertion is the LAST one. Selection and scrolling are the
+// same finger movement, and the only thing separating them is that a selection
+// must be armed by a long-press first — get that backwards and a list becomes
+// unscrollable the moment any row is selectable. So the script drags twice:
+// once after a long-press (extends the selection) and once without one
+// (scrolls, selects nothing).
+//
+// Headless surface metrics are a fixed 9px/char, so x=30 lands in "hello"
+// (col 3) and x=100 is col 11, the end of "world".
+import { Window, Painter, Theme, Size, Widget, ScrollView, Column, SizedBox } from "vyto/ui";
+import { AndroidWidget } from "vyto/mobile/android/ui";
+import { col_at_x } from "vyto/ui/selection";
+
+class Line extends AndroidWidget {
+    text: string;
+
+    fn init(t: string) {
+        super.init();
+        this.text = t;
+        let self = this;
+        this.enable_selection(() => { return self.text; });
+    }
+
+    override fn content_size(s: Painter, th: Theme): Size {
+        return Size(s.text_width(this.text), 20.0);
+    }
+
+    override fn paint(s: Painter, th: Theme) {
+        s.text(this.bounds.x, this.bounds.y + 15.0, this.text, th.ink);
+    }
+
+    // Single line: the byte offset is the column under x.
+    override fn offset_at(x: int, y: int): int {
+        let w = this.win;
+        if (w == null) { return 0; }
+        return col_at_x(w.surf, this.text, (x as float - this.bounds.x) as int);
+    }
+}
+
+fn main() {
+    let win = new Window("Sel", 300, 120);
+    let line = new Line("hello world foo bar");
+    // Tall content so the ScrollView really can scroll.
+    let sv = new ScrollView(new Column([line, new SizedBox(-1.0, 400.0, null)]));
+    win.root = sv;
+    win.run();
+
+    // Sliced from the widget's own text, not through the model: Window
+    // teardown has already dropped the model's text_fn by the time run()
+    // returns (that drop is what breaks the widget<->closure cycle).
+    print("selected=[" + line.text.slice(line.sel.lo(), line.sel.hi()) + "]");
+    print("clip=[" + win.surf.clipboard() + "]");
+    print("scrolled=" + (sv.scroll_y > 0.0));
+}
