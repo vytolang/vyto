@@ -383,9 +383,13 @@ static Expr *parse_primary(Parser *p) {
         e = new_expr(p, EX_CALL);
         advance(p);
         expect(p, T_DOT);
-        if (!accept(p, T_INIT)) fatal_at(e->loc, "only 'super.init(...)' is supported");
+        /* super.init(...) chains the base constructor; super.<method>(...) calls
+           the base implementation of a method this class overrides, which is how
+           an override extends behaviour instead of copying it. `init` is its own
+           token, so it cannot come back from expect_ident. */
+        if (accept(p, T_INIT)) e->name = intern("init");
+        else                   e->name = expect_ident(p);
         e->is_super_call = true;
-        e->name = intern("init");
         /* named form must survive to the checker: dropping labels here would
            bind super.init(b: 2, a: 1) positionally and silently swap values */
         e->args = parse_args_named(p, &e->nargs, &e->arg_names);

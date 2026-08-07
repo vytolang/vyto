@@ -1296,6 +1296,30 @@ static void check_closure_call(Ctx *c, Expr *e, Type *fnty) {
 }
 
 static Type *check_call(Ctx *c, Expr *e, Type *expected) {
+    if (e->is_super_call && e->name != intern("init")) {
+        /* super.<method>(...): call the base implementation directly, so an
+           override can extend it instead of copying its body. Emitted as a
+           non-virtual call (emit_call), which is what stops it recursing back
+           into the override. */
+        if (c->outer_scope)
+            fatal_at(e->loc, "closures cannot use 'super' in v0.1 "
+                             "(call the base method outside the closure)");
+        if (!c->cls) fatal_at(e->loc, "'super' outside a method");
+        if (!c->cls->parent) fatal_at(e->loc, "class has no base class");
+        FnDecl *m = class_find_method(c->cls->parent, e->name);
+        if (!m) fatal_at(e->loc, "base class has no method '%s'", e->name);
+        e->ref = REF_METHOD;
+        e->method = m;
+        e->cls = m->owner;
+        check_args_against(c, e, m->params, m->nparams, e->name);
+        /* a builder returns the receiver, so super.b() has this class's type */
+        if (m->is_builder) {
+            Type *t = mk_type(TY_CLASS);
+            t->cdecl = c->cls;
+            return e->type = t;
+        }
+        return e->type = m->ret;
+    }
     if (e->is_super_call) {
         if (!c->cls || !c->fn || c->fn != c->cls->ctor)
             fatal_at(e->loc, "super.init() is only allowed inside init");

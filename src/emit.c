@@ -517,6 +517,15 @@ static char *emit_hof(Em *em, Expr *e, Expr *recv, bool *fresh) {
 static char *emit_call(Em *em, Expr *e, bool *fresh) {
     *fresh = type_is_ref(e->type);
 
+    if (e->is_super_call && e->method) {
+        /* super.<method>(...): a direct call to the base implementation, never
+           through the vtable — dispatching virtually here would land back in
+           the override that is asking for it. The checker resolved which one. */
+        FnDecl *m = e->method;
+        return arena_printf(&g_arena, "%s((%s*)self%s%s)", fn_cname(m), class_cname(m->owner),
+                            e->nargs ? ", " : "", args_list(em, e->args, e->nargs, m->params, NULL));
+    }
+
     if (e->is_super_call) {
         FnDecl *pc = NULL;
         for (ClassDecl *k = e->cls; k && !pc; k = k->parent) pc = k->ctor;
