@@ -167,6 +167,20 @@ Java_dev_vyto_android_Native_bindActions(JNIEnv *env, jclass cls, jobject action
     g_actions = actions ? (*env)->NewGlobalRef(env, actions) : NULL;
 }
 
+/* Called by VytoActivity before start(), with Context.getFilesDir() and
+ * getCacheDir(). Before start() is not a style choice: os_app_dir() caches on
+ * first use, and the Vyto thread reaches for it as soon as it is running. */
+JNIEXPORT void JNICALL
+Java_dev_vyto_android_Native_setAppDirs(JNIEnv *env, jclass cls,
+                                        jstring files, jstring cache) {
+    (void)cls;
+    const char *f = files ? (*env)->GetStringUTFChars(env, files, NULL) : NULL;
+    const char *c = cache ? (*env)->GetStringUTFChars(env, cache, NULL) : NULL;
+    vta_set_app_dirs(f, c);   /* copies both */
+    if (f) (*env)->ReleaseStringUTFChars(env, files, f);
+    if (c) (*env)->ReleaseStringUTFChars(env, cache, c);
+}
+
 JNIEXPORT void JNICALL
 Java_dev_vyto_android_Native_stop(JNIEnv *env, jclass cls) {
     (void)cls;

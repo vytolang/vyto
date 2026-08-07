@@ -80,6 +80,20 @@ void vs_android_request_close(void);
 void vta_set_back_depth(int32_t n);
 int32_t vta_back_depth(void);
 
+/* --------------------------------------------------- app storage + the IME
+ *
+ * Implemented by astorage.c, which carries a real desktop arm (empty strings,
+ * no IME) because that file compiles for every target.
+ *
+ * vta_set_app_dirs must run before the Vyto thread starts: os_app_dir() caches
+ * its answer on the first call, so a later setenv is invisible to anything
+ * that already asked.
+ */
+void vta_set_app_dirs(const char *files, const char *cache);
+const char *vta_files_dir(void);
+const char *vta_cache_dir(void);
+void vta_ime_set(int32_t on);
+
 /* ------------------------------------------------------------ intent queue
  *
  * Implemented by aintent_shim.c. Pushed from the UI thread by jni_boot.c,

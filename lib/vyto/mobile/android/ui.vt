@@ -2514,6 +2514,9 @@ extern "C" {
     // native/src/aback.c explains why an unsynchronised int is enough.
     fn vta_set_back_depth(n: i32);
     fn vta_back_depth(): i32;
+    // Raise or hide the soft keyboard (native/src/astorage.c). A no-op off
+    // Android, which is what keeps this package linkable on the desktop.
+    fn vta_ime_set(on: i32);
 }
 
 export fn safeInsetLeft(): float { return vta_inset_left() as float; }
@@ -2638,6 +2641,11 @@ export class AndroidWindow extends Window {
     // The wrapper installed by set_content; reach for it to switch an edge off.
     safe: SafeArea;
 
+    // Whether the soft keyboard is currently asked for (1) or not (0). Kept so
+    // a focus change between two non-text widgets — which is most of them —
+    // does not cross the JNI boundary at all.
+    ime_on: int;
+
     // The screen stack, base first. Strong: this class owns the screens that
     // are off-tree, and a popped-to screen keeps its scroll position and its
     // widget state because it was never torn down. `root`/`safe` are the
@@ -2663,6 +2671,7 @@ export class AndroidWindow extends Window {
         // an unexplained app exit instead. Exiting is Native.back() answering
         // false and the Activity finishing, and nothing else.
         this.close_on_esc = false;
+        this.ime_on = 0;
         vta_set_back_depth(0);
     }
 
@@ -2722,4 +2731,30 @@ export class AndroidWindow extends Window {
     // Reached only once Window.on_key_ev has offered the Escape to an open
     // overlay and found none, so by here "back" really does mean "pop".
     override fn on_back(): bool { return this.pop_screen(); }
+
+    // The soft keyboard follows the focus, because on a touch platform nothing
+    // else can raise it: there is no physical keyboard to start typing on, so
+    // the IME appears only when it is asked for, and only the focused widget
+    // knows whether it wants text.
+    //
+    // Window.set_focus calls this on every focus change (and layout() calls it
+    // when a rebuild drops the focus, which is the case that matters —
+    // otherwise pushing a screen over a focused TextField leaves the keyboard
+    // up over a screen with no field on it).
+    //
+    // Hiding on "focus moved to something that is not a text widget" is
+    // deliberate rather than leaving it up: a tap on a list behind the keyboard
+    // reads as "I am done typing", and that tap moves the focus.
+    //
+    // The Java half (VytoView/VytoSurfaceView.setTextInputActive, the
+    // InputConnection under it) was written long before this and had no caller
+    // at all — TextField, TextArea and SearchField were decorative on a device.
+    override fn focus_changed() {
+        let w = this.focused_widget();
+        let want = 0;
+        if (w != null && w.wants_text()) { want = 1; }
+        if (want == this.ime_on) { return; }
+        this.ime_on = want;
+        vta_ime_set(want as i32);
+    }
 }

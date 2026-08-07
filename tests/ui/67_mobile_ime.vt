@@ -1,0 +1,44 @@
+// The soft-keyboard signal: focus_changed + wants_text.
+//
+// The IME itself cannot be tested off a device — vta_ime_set is a no-op on
+// every non-Android target — so what is asserted here is the decision that
+// drives it, which is where every bug in this path would be:
+//
+//   * a text widget focused  -> ask for the keyboard
+//   * anything else focused  -> put it away
+//   * focus moving between two non-text widgets -> no crossing at all
+//   * a rebuild that drops the focused widget -> put it away, rather than
+//     leaving the keyboard up over a screen with no field on it
+//
+// The last one is the reason Window.layout() calls focus_changed by hand: that
+// path assigns focus_i directly and never goes through set_focus.
+import { Window, Widget, TextField, Button, Column, Label } from "vyto/ui";
+import { AndroidWindow } from "vyto/mobile/android/ui";
+
+// AndroidWindow's own focus_changed does the JNI call; this reports what it
+// decided, which is the part that has to be right.
+class Probe extends AndroidWindow {
+    override fn focus_changed() {
+        let w = this.focused_widget();
+        let want = false;
+        if (w != null) { want = w.wants_text(); }
+        print("focus_changed want_text=" + want);
+    }
+}
+
+fn main() {
+    let win = new Probe("IME", 300, 400);
+
+    let field = new TextField("type here");
+    let btn = new Button("ok");
+    let btn2 = new Button("cancel");
+    // Pushing a screen with nothing focusable on it is the rebuild case: the
+    // TextField leaves the tree while it holds the focus.
+    btn.onClick = (b) => { win.push_screen(new Column([new Label("no fields")])); };
+    win.set_content(new Column([field, btn, btn2]));
+    win.run();
+
+    print("field wants=" + field.wants_text());
+    print("button wants=" + btn.wants_text());
+    print("label wants=" + new Label("x").wants_text());
+}

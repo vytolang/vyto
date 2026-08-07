@@ -104,6 +104,13 @@ public class VytoActivity extends Activity {
         // it is running, and a null there would drop the first launch.
         Native.bindActions(actions);
 
+        // Also before start(), and for a sharper reason: os_app_dir() caches
+        // its answer the first time anything asks, and the Vyto thread asks as
+        // soon as it opens a file. Without this appDir() is a build-host path
+        // that does not exist here, and nothing an app writes survives.
+        Native.setAppDirs(getFilesDir().getAbsolutePath(),
+                          getCacheDir().getAbsolutePath());
+
         // adjustResize (set in the manifest) shrinks the window for the IME,
         // which fires EV_RESIZE and re-runs layout. Ask for inset callbacks so
         // the app can also do safe-area work.

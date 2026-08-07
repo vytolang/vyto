@@ -83,6 +83,21 @@ public final class Native {
      */
     public static native void bindActions(Actions actions);
 
+    /**
+     * The app's private directories, from {@code Context.getFilesDir()} and
+     * {@code getCacheDir()}.
+     *
+     * <p><b>Must be called before {@link #start}.</b> {@code appDir()} in Vyto
+     * resolves through {@code os_app_dir()}, which prefers {@code
+     * $VYTO_APP_DIR} and otherwise returns the path {@code vytoc} baked at
+     * build time — the entry file's directory on the <em>build host</em>, which
+     * does not exist on a device. This call sets the variable, correcting
+     * {@code vyto/io}, {@code vyto/asset} and everything else that opens a file
+     * in one line. {@code os_app_dir()} caches on first use, so calling it
+     * after the thread has started is too late.
+     */
+    public static native void setAppDirs(String filesDir, String cacheDir);
+
     /** Ask the Vyto loop to exit and join its thread. Safe to call twice. */
     public static native void stop();
 

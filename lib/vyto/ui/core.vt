@@ -2297,6 +2297,15 @@ export class Widget {
         return false;
     }
 
+    // Does focusing this widget mean the user wants to type into it?
+    //
+    // False for everything that merely takes focus — a Button, a Checkbox, a
+    // list. True for the three text widgets. On a desktop this is nothing; on a
+    // phone it is the whole difference between a soft keyboard appearing and a
+    // text field being decorative, because there is no other signal: a touch
+    // platform has to be *told* to raise the IME, and only the widget knows.
+    virtual fn wants_text(): bool { return false; }
+
     // Walk from this widget up the parent chain calling on_scroll until one
     // consumes it. Used by Window.on_wheel_ev.
     fn on_scroll_at(x: int, y: int, delta: int): bool {
@@ -2632,8 +2641,19 @@ export class Window {
         this.focus_i = i;
         let now = this.focused_widget();
         if (now != null) { now.focused = true; now.on_focus(); this.mark_dirty(now.bounds); }
+        this.focus_changed();
         return true;
     }
+
+    // The focused widget changed — including to nothing. The platform hook for
+    // anything that has to follow focus rather than be asked for: AndroidWindow
+    // raises the soft keyboard here when the newly focused widget
+    // wants_text(), and hides it otherwise. A no-op everywhere else, so no
+    // desktop behaviour depends on it.
+    //
+    // Called from set_focus, which every path (Tab, a click, focus_widget)
+    // funnels through, and from layout() when a tree rebuild drops the focus.
+    virtual fn focus_changed() { }
 
     fn focus_next() {
         let n = this.focusables.len;
@@ -2700,7 +2720,15 @@ export class Window {
             for (let i in 0..fresh.len) {
                 if (fresh[i] == old) { this.focus_i = i; }
             }
-            if (this.focus_i < 0) { old.focused = false; }
+            if (this.focus_i < 0) {
+                // The focused widget is no longer in the tree. set_focus is not
+                // the path here (focus_i was assigned directly), so anything
+                // following focus has to be told explicitly — otherwise a
+                // screen that replaces a focused TextField leaves the soft
+                // keyboard up over a screen with no field on it.
+                old.focused = false;
+                this.focus_changed();
+            }
         }
         if (this.focus_i < 0 && fresh.len > 0) {
             this.set_focus(0);

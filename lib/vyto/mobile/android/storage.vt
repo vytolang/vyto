@@ -1,0 +1,39 @@
+// vyto/mobile/android/storage — the app's private directories on a device.
+//
+//     import { filesDir, cacheDir } from "vyto/mobile/android/storage";
+//
+//     let db = filesDir() + "/stories.json";
+//     let thumb = cacheDir() + "/" + id + ".png";
+//
+// `appDir()` from vyto/os is corrected too, and by the same mechanism: the
+// Activity hands these paths down before the Vyto thread starts, and the shim
+// puts the files dir in $VYTO_APP_DIR, which os_app_dir() prefers over the
+// path vytoc baked at build time. That baked path is the entry file's
+// directory on the *build host* — a Linux directory that does not exist on the
+// phone — so before this, nothing an app wrote survived: no settings, no
+// cache, no offline data, no session token.
+//
+// These two are the explicit spelling, and the one to prefer in new code:
+// `appDir()` says "wherever this app lives", which on a desktop is where the
+// binary is and on Android is a private sandbox, while `filesDir()` and
+// `cacheDir()` say which of the two Android directories is meant. The
+// difference matters — the system deletes cacheDir under storage pressure and
+// never touches filesDir.
+//
+// Both return "" off Android (see native/src/astorage.c for why that arm is
+// real rather than #ifdef-ed away), so a caller that wants to run on the
+// desktop too should fall back to appDir().
+
+extern "C" {
+    fn vta_files_dir(): cstring;
+    fn vta_cache_dir(): cstring;
+}
+
+// Private, persistent, backed up, never reclaimed by the system.
+// Context.getFilesDir() — "" when not running on Android.
+export fn filesDir(): string { return str(vta_files_dir()); }
+
+// Private and discardable: the system deletes this under storage pressure, and
+// the user can clear it from Settings. Downloads-in-progress, thumbnails,
+// anything reconstructible. Context.getCacheDir() — "" when not on Android.
+export fn cacheDir(): string { return str(vta_cache_dir()); }
