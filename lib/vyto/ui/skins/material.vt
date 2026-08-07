@@ -12,6 +12,7 @@
 import { Painter, Theme, Skin, ButtonChrome, WidgetState, theme_dark, resolve_state_fill,
          WEIGHT_REG, WEIGHT_BOLD, rgb, rgba, mix } from "vyto/ui/core";
 import { Rect } from "vyto/surface";
+import { sqrt } from "vyto/math";
 
 class MaterialButtonChrome extends ButtonChrome {
     override fn paint(s: Painter, th: Theme, r: Rect, label: string,
@@ -22,16 +23,32 @@ class MaterialButtonChrome extends ButtonChrome {
         s.shadow(r, radius, el[0], el[1], th.shadow_color);
         // flat fill, no gradient
         s.fill_round(r, radius, resolve_state_fill(th.primary, st, th.primary_hover, th.primary_press));
-        // Material press ripple: a translucent circle growing from the centre
-        // with st.press, clipped to the button. Spring-driven, so it expands on
-        // press-down and recedes on release. Rich tier only — it needs the
+        // Material press ripple: a translucent circle growing from the point
+        // that was pressed, clipped to the button. Spring-driven, so it expands
+        // on press-down and recedes on release. Rich tier only — it needs the
         // rounded clip and real alpha the lean tier can't do, and st.press is 0
         // at rest, so a resting button draws none of it.
+        //
+        // The origin is the whole affordance. Material's ripple says "here is
+        // where you touched"; one growing from the centre of every button
+        // regardless is the tell that a control is drawn rather than native.
+        // st.ox/oy are (0,0) when the press did not come from a pointer — a
+        // keyboard Space, say — and the centre is right for that.
         if (st.press > 0.0 && s.can_clip()) {
             s.clip_push(r, radius);
-            let reach = (r.w + r.h) * 0.5;             // covers the button when full
             let cx = r.cx();
             let cy = r.cy();
+            if (st.ox > 0.0 || st.oy > 0.0) {
+                cx = st.ox;
+                cy = st.oy;
+            }
+            // Far enough to cover the button from wherever it started: the
+            // distance to the furthest corner, not half the button.
+            let dx = cx - r.x;
+            if (r.right() - cx > dx) { dx = r.right() - cx; }
+            let dy = cy - r.y;
+            if (r.bottom() - cy > dy) { dy = r.bottom() - cy; }
+            let reach = sqrt(dx * dx + dy * dy);
             let a = (60.0 + 40.0 * (1.0 - st.press)) * st.press;   // brightest early, fading
             s.circle(cx, cy, st.press * reach, rgba(255, 255, 255, a as int));
             s.clip_pop();

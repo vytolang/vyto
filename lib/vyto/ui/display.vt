@@ -18,6 +18,39 @@ const ALIGN_LEFT: int = 0;
 const ALIGN_CENTER: int = 1;
 const ALIGN_RIGHT: int = 2;
 
+// ------------------------------------------------------------------ eliding
+
+// Cut `line` down until it plus an ellipsis fits `max_w`, in place, on the
+// last entry of `lines`.
+//
+// Bytes, not characters: a multi-byte tail could be cut mid-sequence, so back
+// up to a lead byte (0b10xxxxxx is a continuation). Word wrapping alone cannot
+// do this — the line that has to be shortened is one the wrap already
+// accepted, and shortening it is what "…" means.
+export fn elide_last(s: Painter, lines: string[], max_w: float) {
+    if (lines.len == 0) { return; }
+    let line = lines[lines.len - 1];
+    let n = line.len;
+    while (n > 0 && s.text_width(line.slice(0, n) + "…") > max_w) {
+        n = n - 1;
+        while (n > 0 && (line[n] & 0xC0) == 0x80) { n = n - 1; }
+    }
+    lines[lines.len - 1] = line.slice(0, n).trim_end() + "…";
+}
+
+// One line, shortened with an ellipsis if it does not fit. Returns the text
+// unchanged when it does — the common case, and no allocation for it.
+//
+// The single-line half of maxLines: a Label, a table cell or a row title that
+// must not wrap still has to say that it was cut.
+export fn elide(s: Painter, text: string, max_w: float): string {
+    if (max_w <= 0.0) { return ""; }
+    if (s.text_width(text) <= max_w) { return text; }
+    let lines = [text];
+    elide_last(s, lines, max_w);
+    return lines[0];
+}
+
 // --------------------------------------------------------------- Text / Paragraph
 
 // Read-only, word-wrapped, multi-line text. The first widget whose height
@@ -30,6 +63,11 @@ export class Text extends Widget {
     cached_w: float;
     cached_count: int;
     cached_text: string; // content the cache was computed from
+    // Cap the wrap at this many lines, eliding the last one with "…".
+    // 0 (the default) is unlimited, so nothing that does not ask for it
+    // changes. Every list app writes this by hand otherwise — a story title
+    // over two lines, a comment preview over three.
+    max_lines: int;
     // Text selection (drag / double-click / long-press) + copy. Selection
     // offsets index the *display text* — the wrapped visual lines joined by
     // "\n" (display_text) — so a copy yields exactly what the user sees.
@@ -46,12 +84,23 @@ export class Text extends Widget {
         this.cached_w = -1;
         this.cached_count = 0;
         this.cached_text = "";
+        this.max_lines = 0;
         this.selectable = true;
         this.focusable = true;   // so Ctrl+C / Ctrl+A reach a focused paragraph
         this.sel = new SelectionModel(this);
         let self = this;
         this.sel.text_fn = () => { return self.display_text(); };
         this.selectionActions = [];
+    }
+
+    // Cap the wrap: `new Text(title).lines(2)` is a two-line title with an
+    // ellipsis. 0 restores unlimited.
+    builder fn lines(n: int) {
+        if (n != this.max_lines) {
+            this.max_lines = n;
+            this.cached_count = 0;   // force a re-wrap; the cache keys on width
+        }
+        return this;
     }
 
     // The wrapped visual lines joined by "\n": the selectable/copyable text.
@@ -123,11 +172,26 @@ export class Text extends Widget {
             if (s.text_width(trial) > max_w && line.len > 0) {
                 this.cached_lines.push(line);
                 line = w;
+                // Past the budget: the line just pushed is the last one, and
+                // the rest of the text is not laid out at all. Stopping here
+                // rather than wrapping everything and trimming is what keeps a
+                // 2-line summary of a long comment O(2 lines).
+                if (this.max_lines > 0 && this.cached_lines.len >= this.max_lines) {
+                    line = "";
+                    break;
+                }
             } else {
                 line = trial;
             }
         }
-        if (line.len > 0) { this.cached_lines.push(line); }
+        if (line.len > 0 && (this.max_lines <= 0 || this.cached_lines.len < this.max_lines)) {
+            this.cached_lines.push(line);
+        } else if (this.max_lines > 0 && this.cached_lines.len >= this.max_lines) {
+            // Text was cut short, so the last line that did land gets the
+            // ellipsis. (`line` empty here means the wrap ended exactly on a
+            // line break, which still means there was more text.)
+            elide_last(s, this.cached_lines, max_w);
+        }
         this.cached_count = this.cached_lines.len;
     }
 
@@ -862,8 +926,13 @@ export class Spinner extends Widget {
         this.phase = 0.0;
     }
 
+    // size/width are dp: a constructor argument is what Theme.apply_scale
+    // cannot reach, so `Spinner(28.0)` would otherwise be a 10dp spinner on a
+    // 2.75-density phone — the app writing its own dp() around every
+    // constructor is the workaround this removes.
     override fn measure(s: Painter, th: Theme): Size {
-        return Size(this.size, this.size);
+        let d = this.dp(this.size);
+        return Size(d, d);
     }
 
     override fn render(s: Painter, th: Theme) {
@@ -876,13 +945,14 @@ export class Spinner extends Widget {
         if (c < 0) { c = th.primary; }
         let cx = this.bounds.cx();
         let cy = this.bounds.cy();
-        let r = this.size / 2.0 - this.width;
+        let sw = this.dp(this.width);
+        let r = this.dp(this.size) / 2.0 - sw;
         if (r < 1.0) { r = 1.0; }
         let ms = 0;
         if (this.win != null) { ms = this.win.surf.now_ms(); }
         // ms is an integer clock; the arc start angle is geometric
         let start = ((ms / 3) % 360) as float;
-        s.stroke_arc(cx, cy, r, r, start, 270.0, this.width, c);
+        s.stroke_arc(cx, cy, r, r, start, 270.0, sw, c);
     }
 
     override fn drop_handlers() {

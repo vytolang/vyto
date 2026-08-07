@@ -1,0 +1,55 @@
+// The Tier-3 toolkit gaps, all four of which were "every app writes this
+// itself" rather than anything hard:
+//
+//   1. a bare Box left its child at 0x0 (Widget.arrange is the absolute-
+//      placement escape hatch), which is a whole screen collapsed into the
+//      top-left corner with nothing to say why
+//   2. Text could not be capped at N lines, so every list app carried its own
+//      wrap-and-elide
+//   3. a constructor argument is in device pixels whatever the author meant:
+//      Spinner(28.0) is a 10dp spinner at 2.75x, and a 6+8 scrollbar grab is
+//      5dp against a 48dp minimum
+//   4. the press origin never reached a Chrome, so Material's ripple could
+//      only grow from the centre of a control
+//
+// Scale is forced to 2.0 here rather than read off the surface: the headless
+// backend reports 1.0, at which every dp() is the identity and item 3 cannot
+// fail.
+import { Window, Box, Text, Label, Spinner, ScrollView, Column, elide } from "vyto/ui";
+
+fn main() {
+    let win = new Window("Tier3", 300, 400);
+    win.theme.apply_scale(2.0);
+
+    // 1. a bare Box hands its rect to its child
+    let inner = new Label("filled");
+    let box = new Box();
+    box.add(inner);
+
+    // 2. maxLines + ellipsis
+    let long = "the quick brown fox jumps over the lazy dog and keeps running";
+    let two = new Text(long).lines(2);
+    let uncapped = new Text(long);
+
+    // 3. a dp-sized widget, and a scrollbar whose metrics are not in the Theme
+    let spin = new Spinner(28.0);
+    let sv = new ScrollView(new Column([new Label("a"), new Label("b")]));
+
+    win.root = new Column([box, two, uncapped, spin, sv]);
+    win.run();
+
+    print("box=" + box.bounds.w + "x" + box.bounds.h);
+    print("child_fills=" + (inner.bounds.w == box.bounds.w && inner.bounds.h == box.bounds.h));
+
+    print("two_lines=" + two.cached_count + " uncapped=" + uncapped.cached_count);
+    print("elided=" + two.display_text().ends_with("…"));
+    print("elide_fn=[" + elide(win.painter, long, 90.0) + "]");
+
+    print("spinner=" + spin.bounds.w + "x" + spin.bounds.h);
+    print("scrollbar_k=" + sv.scrollbars[0].k
+          + " grab_px=" + (sv.scrollbars[0].px_thickness() + sv.scrollbars[0].px_grab()));
+
+    // 4. the press origin reaches the state a Chrome is handed
+    let st = spin.ui_state(false);
+    print("press_origin=" + st.ox + "," + st.oy);
+}

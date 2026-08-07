@@ -20,16 +20,28 @@ export const SIDE_LEFT: int = 3;
 
 export class Scrollbar {
     edge: int;         // SIDE_*
-    thickness: float;  // drawn track/thumb thickness in px
-    grab: float;       // extra px inward that still counts as a press on the bar
-    min_thumb: float;  // smallest thumb length so it stays grabbable
+    thickness: float;  // drawn track/thumb thickness, in dp
+    grab: float;       // extra dp inward that still counts as a press on the bar
+    min_thumb: float;  // smallest thumb length so it stays grabbable, in dp
+    // Display density. Set by the owning Widget on every layout
+    // (Widget.propagate_win), because these are the one set of metrics
+    // Theme.apply_scale cannot reach — they are not in the Theme. Without it a
+    // 6+8 dp grab really is 14 *pixels*, which on a 2.75-density phone is 5dp
+    // against a 48dp minimum: the bar is there, and no finger can catch it.
+    k: float;
 
     fn init(edge: int) {
         this.edge = edge;
         this.thickness = 6.0;
         this.grab = 8.0;
         this.min_thumb = 20.0;
+        this.k = 1.0;
     }
+
+    // The three metrics above, in device pixels.
+    fn px_thickness(): float { return this.thickness * this.k; }
+    fn px_grab(): float { return this.grab * this.k; }
+    fn px_min_thumb(): float { return this.min_thumb * this.k; }
 
     fn vertical(): bool { return this.edge == SIDE_LEFT || this.edge == SIDE_RIGHT; }
 
@@ -41,17 +53,18 @@ export class Scrollbar {
 
     // The track rect, snapped to the chosen edge of `vp`.
     fn track(vp: Rect): Rect {
-        if (this.edge == SIDE_RIGHT) { return vp.take_right(this.thickness); }
-        if (this.edge == SIDE_LEFT) { return vp.take_left(this.thickness); }
-        if (this.edge == SIDE_TOP) { return vp.take_top(this.thickness); }
-        return vp.take_bottom(this.thickness);
+        let t = this.px_thickness();
+        if (this.edge == SIDE_RIGHT) { return vp.take_right(t); }
+        if (this.edge == SIDE_LEFT) { return vp.take_left(t); }
+        if (this.edge == SIDE_TOP) { return vp.take_top(t); }
+        return vp.take_bottom(t);
     }
 
     fn thumb_len(vp: Rect, content: float): float {
         let vlen = this.vp_len(vp);
         if (content <= 0.0) { return vlen; }
         let t = vlen * vlen / content;
-        if (t < this.min_thumb) { t = this.min_thumb; }
+        if (t < this.px_min_thumb()) { t = this.px_min_thumb(); }
         if (t > vlen) { t = vlen; }
         return t;
     }
@@ -81,7 +94,7 @@ export class Scrollbar {
     // Press hit-region: the track widened inward by `grab` so the thin bar is
     // easy to grab.
     fn hit_rect(vp: Rect): Rect {
-        let t = this.thickness + this.grab;
+        let t = this.px_thickness() + this.px_grab();
         if (this.edge == SIDE_RIGHT) { return Rect(vp.right() - t, vp.y, t, vp.h); }
         if (this.edge == SIDE_LEFT) { return Rect(vp.x, vp.y, t, vp.h); }
         if (this.edge == SIDE_TOP) { return Rect(vp.x, vp.y, vp.w, t); }

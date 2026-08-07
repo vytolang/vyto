@@ -837,6 +837,12 @@ export struct WidgetState {
     focus: float;
     on: float;        // checked / selected / switched-on
     disabled: float;
+    // Where the press landed, in absolute px, or (0,0) for "not from a
+    // pointer" — a keyboard activation, or a discrete state built by ws().
+    // A Chrome that draws a ripple needs the origin: growing it from the
+    // centre is the giveaway that a control is drawn rather than native.
+    ox: float;
+    oy: float;
 }
 
 // Interaction-spring feel: snappy and critically damped (no overshoot on a
@@ -865,7 +871,7 @@ const ENTER_SPRING_DAMPING: float = 0.78;
 // been created yet. b2f keeps the bool->0/1 conversion in one place.
 export fn b2f(b: bool): float { if (b) { return 1.0; } return 0.0; }
 export fn ws(hover: bool, press: bool, focus: bool, on: bool, disabled: bool): WidgetState {
-    return WidgetState(b2f(hover), b2f(press), b2f(focus), b2f(on), b2f(disabled));
+    return WidgetState(b2f(hover), b2f(press), b2f(focus), b2f(on), b2f(disabled), 0.0, 0.0);
 }
 
 // Fade a color toward a muted target by the disabled amount. Partial (0.55) so
@@ -1369,6 +1375,11 @@ export class Widget {
     bounce: bool;
     overscroll: float;
     bounce_anim: BounceScroll;
+    // Absolute position of the press this widget is currently under, recorded
+    // by Window.set_press and handed to a Chrome through ui_state. Stale after
+    // the release, which is harmless: it is only read while press > 0.
+    press_ox: float;
+    press_oy: float;
     // Scroll-position listener; see notify_scrolled.
     on_scrolled: fn(float);
 
@@ -1392,6 +1403,26 @@ export class Widget {
     // (CSS align-self). Pass a CROSS_* constant from vyto/ui/layout; -1 resets
     // to inherit the container's `align`.
     builder fn selfAlign(n: int) { this.alignSelf = n; return this; }
+
+    // Density-independent pixels -> device pixels, for any measurement written
+    // as a constant in widget or app code.
+    //
+    // Theme.apply_scale multiplies the theme's own metrics (text sizes,
+    // spacing, radii) by the display density, and nothing else. A number
+    // written in a constructor or a hit test is therefore in *device* pixels
+    // whatever the author meant: on a 2.75-density phone `Spinner(28.0)` is a
+    // 10dp spinner and a 14px scrollbar grab is 5dp against a 48dp minimum.
+    // Multiply anything of that kind through here.
+    //
+    // 1.0 before the widget is mounted, and 1.0 on every ordinary desktop, so
+    // this is identity until a display actually has a scale.
+    fn dp(v: float): float {
+        let w = this.win;
+        if (w == null) { return v; }
+        let f = w.theme.scale_applied;
+        if (f > 0.0) { return v * f; }
+        return v;
+    }
 
     // Request a full-window repaint of just this widget's bounds. Relies on
     // Window.layout() having propagated `win` to the whole tree.
@@ -1448,7 +1479,7 @@ export class Widget {
         if (this.anim_press != null) { p = this.anim_press.value(); }
         if (this.anim_focus != null) { f = this.anim_focus.value(); }
         if (this.anim_on != null) { o = this.anim_on.value(); }
-        return WidgetState(h, p, f, o, b2f(this.disabled));
+        return WidgetState(h, p, f, o, b2f(this.disabled), this.press_ox, this.press_oy);
     }
 
     // Retarget an interaction spring, keeping its velocity, and (re)register it
@@ -1639,8 +1670,9 @@ export class Widget {
         for (let sb in this.scrollbars) {
             let content = this.scroll_content_len(sb);
             if (!sb.overflow(vp, content)) { continue; }
-            s.fill_round(sb.track(vp), sb.thickness / 2, th.surface_sunken);
-            s.fill_round(sb.thumb(vp, content, this.scroll_offset(sb)), sb.thickness / 2, th.on_surface_muted);
+            s.fill_round(sb.track(vp), sb.px_thickness() / 2, th.surface_sunken);
+            s.fill_round(sb.thumb(vp, content, this.scroll_offset(sb)),
+                         sb.px_thickness() / 2, th.on_surface_muted);
         }
     }
 
@@ -2301,6 +2333,13 @@ export class Widget {
     // like Dropdown can reach the Window to open overlays.
     fn propagate_win(w: weak Window) {
         this.win = w;
+        // A Scrollbar is pure geometry with no window of its own, and its
+        // metrics are dp. Refresh the density here — this runs on every
+        // layout, so a scale change (a fold, an external display) lands with
+        // no invalidation protocol.
+        if (this.scrollbars != null && w != null && w.theme.scale_applied > 0.0) {
+            for (let sb in this.scrollbars) { sb.k = w.theme.scale_applied; }
+        }
         // Flush animations declared before this widget was mounted onto the
         // now-known Window clock (see animate()/register_anim()).
         if (this.pending_anims != null && w != null) {
@@ -2885,7 +2924,7 @@ export class Window {
             let ot = this.overlay.hit(x, y);
             if (ot == null) { ot = this.overlay; }   // childless overlay hits itself
             this.set_hover(ot);
-            this.set_press(ot);
+            this.set_press_at(ot, x, y);
             this.press_ms = this.surf.now_ms();
             this.press_x = x;
             this.press_y = y;
@@ -2911,7 +2950,7 @@ export class Window {
         }
         if (this.menubar != null && contains(this.menubar.bounds, x, y)) {
             this.set_hover(this.menubar.hit(x, y));
-            this.set_press(this.hover_w);
+            this.set_press_at(this.hover_w, x, y);
             if (this.menubar.on_click(x, y)) { this.redraw(); }
             return;
         }
@@ -2919,7 +2958,7 @@ export class Window {
         if (this.root != null) { target = this.root.hit(x, y); }
         if (target != null) {
             this.set_hover(target);
-            this.set_press(target);
+            this.set_press_at(target, x, y);
             // anchor the press for long-press + drag-slop tracking
             this.press_ms = this.surf.now_ms();
             this.press_x = x;
@@ -3076,6 +3115,17 @@ export class Window {
             this.mark_dirty(w.bounds);
         }
         this.repaint();
+    }
+
+    // set_press plus the point it happened at, which is what a ripple needs.
+    // Separate from set_press so the many places that only clear the press do
+    // not have to invent coordinates.
+    fn set_press_at(w: Widget, px: int, py: int) {
+        if (w != null) {
+            w.press_ox = px as float;
+            w.press_oy = py as float;
+        }
+        this.set_press(w);
     }
 
     fn set_press(w: Widget) {
