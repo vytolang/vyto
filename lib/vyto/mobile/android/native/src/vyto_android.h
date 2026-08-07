@@ -80,10 +80,10 @@ void vs_android_request_close(void);
 void vta_set_back_depth(int32_t n);
 int32_t vta_back_depth(void);
 
-/* --------------------------------------------------- app storage + the IME
+/* ------------------------------------------------------------- app storage
  *
- * Implemented by astorage.c, which carries a real desktop arm (empty strings,
- * no IME) because that file compiles for every target.
+ * Implemented by astorage.c, which carries a real desktop arm (empty strings)
+ * because that file compiles for every target.
  *
  * vta_set_app_dirs must run before the Vyto thread starts: os_app_dir() caches
  * its answer on the first call, so a later setenv is invisible to anything
@@ -92,6 +92,13 @@ int32_t vta_back_depth(void);
 void vta_set_app_dirs(const char *files, const char *cache);
 const char *vta_files_dir(void);
 const char *vta_cache_dir(void);
+
+/* ---------------------------------------------------------- soft keyboard
+ *
+ * Implemented by aime.c as an up-call to the view's setTextInputActive.
+ * Called from AndroidWindow.focus_changed on the Vyto thread; a no-op off
+ * Android, which is what keeps vyto/mobile/android/ui linkable on the desktop.
+ */
 void vta_ime_set(int32_t on);
 
 /* ------------------------------------------------------------ intent queue
