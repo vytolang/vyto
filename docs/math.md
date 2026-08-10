@@ -14,10 +14,10 @@ currently draw with them.
 ## 0. Converting between `int` and `float`
 
 Vyto never auto-coerces between `int` and `float` — every conversion is an
-explicit `as` cast, the same rule the FFI table in the top-level `CLAUDE.md`
-documents for narrowing to `i32`/`i64`. Every function signature in this
-document is exact about which type it wants; mixing them without a cast is a
-type error, not a silent conversion.
+explicit `as` cast, the same rule that applies when narrowing to `i32`/`i64`
+for FFI calls (see [`docs/types.md`](types.md) §2). Every function signature
+in this document is exact about which type it wants; mixing them without a
+cast is a type error, not a silent conversion.
 
 ```vyto
 let n: int = 7;

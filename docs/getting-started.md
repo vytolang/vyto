@@ -373,6 +373,22 @@ as `examples/45_os.vt`) is handled.
   one place: the built-in methods and their exact edge cases, `vyto/util/text`,
   the `vyto/regex` engine, and the Unicode-aware operations in
   `vyto/intl/unicode`.
+- **[Types](types.md)** — every type in the language, value vs. reference,
+  the fixed-width FFI family, arrays, `Map`, `struct`, and casts.
+- **[Classes](classes.md)** — construction and `init` inheritance,
+  `virtual`/`override`, `super`, `builder` methods, `deinit`, `weak`, checked
+  downcasts, duck-typed `for-in`, and generic/arena-allocated classes.
+- **[Memory](memory.md)** — the refcounting model, what it costs, the
+  reference-cycle gotcha and `weak`, arenas, and the bulk-data allocation
+  trap.
+- **[Generating native bindings](native-bindings.md)** — turning a C header
+  into a Vyto `extern "C"` module with `vytobind`.
+- **[Math](math.md)** — `vyto/math` (constants, libm, integer helpers),
+  `vyto/math/stats` and `vyto/math/random` (statistics and seeded
+  randomness), and `vyto/math/algebra` (matrices, linear systems).
+- **[Graphics](graphics.md)** — the drawing stack top to bottom: `vyto/geom`
+  math, the `vyto/surface` and `vyto/gfx` rendering tiers, and what Vyto can
+  and can't currently draw.
 - **[Hardware & peripherals](hardware.md)** — cameras, sensors, GPIO, serial,
   USB and GPS through `vyto/hw/*`.
 - **[README](../README.md)** — language highlights, why it's fast, the standard

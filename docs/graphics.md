@@ -294,6 +294,12 @@ A `Window` defaults to `SurfacePainter`; swap tiers at runtime with
 `win.use_painter(gfxPainter)`. No library constructs a concrete `Painter` —
 only app code does, which is what keeps `vyto/ui` gfx-free.
 
+### See also: the widget stack
+
+This section is only the rendering seam. For the widget stack built on top of
+it — layout, focus, skins/themes, reactive binding, and the full module map
+— see [`lib/vyto/ui/README.md`](../lib/vyto/ui/README.md).
+
 **Real, working examples**: `apps/uigfx` (same widget tree, switch tiers by
 changing one `use_painter` line), `apps/skingallery` (every widget × all 5
 skins × light/dark), `apps/gallery`/`gallery2` (full widget showcase, both
