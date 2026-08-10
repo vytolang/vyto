@@ -1,0 +1,81 @@
+// Pure-Vyto coverage for vyto/math/algebra. Deterministic, golden-checked.
+//
+// Floats are never printed bare (see math_stats.vt / geom_vec.vt for why).
+// Matrix properties (M * M^-1 = I) are checked rather than hand-transcribed
+// determinant/inverse numbers, since a hand-rolled LU/Gauss-Jordan pass is
+// exactly the kind of code that looks right and isn't.
+//
+// The singular-matrix panic path can't share this file's golden diff (a
+// panic aborts the process and truncates stdout), so it's driven by an argv
+// switch and checked separately, grep-style — same pattern as
+// tests/fixtures/mmap_guards.vt.
+import { Matrix, matrixIdentity, matrixZeros, matrixFromRows,
+         vdot, vadd, vsub, vscale, vnorm, vnormalized } from "vyto/math/algebra";
+
+fn near(a: float, b: float, eps: float): bool {
+    let d = a - b;
+    if (d < 0.0) { d = -d; }
+    return d < eps;
+}
+
+fn main() {
+    if (args().len > 0 && args()[0] == "singular") {
+        let s = matrixFromRows([[1.0, 2.0], [2.0, 4.0]]);
+        s.inverted();
+        print("no panic for singular");
+        return;
+    }
+
+    let id3 = matrixIdentity(3);
+    print("id_trace=" + (id3.trace() as int));
+    print("id_det=" + (id3.determinant() as int));
+
+    // diag(2,4,5)^-1 = diag(0.5,0.25,0.2)
+    let diag = matrixFromRows([[2.0, 0.0, 0.0], [0.0, 4.0, 0.0], [0.0, 0.0, 5.0]]);
+    let dinv = diag.inverted();
+    print("diag_inv00=" + near(dinv.get(0, 0), 0.5, 1e-9));
+    print("diag_inv11=" + near(dinv.get(1, 1), 0.25, 1e-9));
+    print("diag_inv22=" + near(dinv.get(2, 2), 0.2, 1e-9));
+    print("diag_mul_inv_is_identity=" + diag.mul(dinv).approxEquals(matrixIdentity(3), 1e-9));
+
+    // general, non-symmetric 4x4 (det = 18, verified non-singular)
+    let g = matrixFromRows([
+        [4.0, 3.0, 2.0, 1.0],
+        [3.0, 3.0, 1.0, 2.0],
+        [2.0, 1.0, 5.0, 3.0],
+        [1.0, 2.0, 3.0, 7.0]
+    ]);
+    let ginv = g.inverted();
+    print("g_mul_ginv_is_identity=" + g.mul(ginv).approxEquals(matrixIdentity(4), 1e-6));
+    print("ginv_mul_g_is_identity=" + ginv.mul(g).approxEquals(matrixIdentity(4), 1e-6));
+
+    // solve: 2x+y=3, x+3y=5 -> x=0.8, y=1.4
+    let a = matrixFromRows([[2.0, 1.0], [1.0, 3.0]]);
+    let x = a.solve([3.0, 5.0]);
+    print("solve_x=" + near(x[0], 0.8, 1e-9));
+    print("solve_y=" + near(x[1], 1.4, 1e-9));
+
+    // determinant of a singular matrix is 0.0, not a panic
+    let sing = matrixFromRows([[1.0, 2.0], [2.0, 4.0]]);
+    print("sing_det=" + (sing.determinant() as int));
+
+    print("transpose=" + (a.transposed().get(0, 1) as int));
+    print("trace=" + (a.trace() as int));
+    print("add_doubles=" + (a.add(a).get(0, 0) as int));
+    print("sub_self_is_zero=" + (a.sub(a).get(1, 1) as int));
+    print("scale=" + (a.scale(3.0).get(1, 1) as int));
+
+    print("vdot=" + (vdot([1.0, 2.0, 3.0], [4.0, 5.0, 6.0]) as int));
+    print("vnorm=" + (vnorm([3.0, 4.0]) as int));
+    let vn = vnormalized([3.0, 4.0]);
+    print("vnormalized_is_unit=" + near(vnorm(vn), 1.0, 1e-9));
+    let vs = vadd([1.0, 2.0], [3.0, 4.0]);
+    print("vadd=" + (vs[0] as int) + "," + (vs[1] as int));
+    let vd = vsub([5.0, 5.0], [2.0, 1.0]);
+    print("vsub=" + (vd[0] as int) + "," + (vd[1] as int));
+    let vsc = vscale([1.0, 2.0, 3.0], 2.0);
+    print("vscale=" + (vsc[0] as int) + "," + (vsc[1] as int) + "," + (vsc[2] as int));
+
+    let z = matrixZeros(2, 3);
+    print("zeros_shape=" + z.rows + "x" + z.cols);
+}

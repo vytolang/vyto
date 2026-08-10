@@ -1,0 +1,237 @@
+// vyto/math/stats — descriptive statistics over float[]/int[] arrays: sum,
+// mean, variance/stddev (population and sample), median/percentile, mode,
+// covariance/correlation, and the two array-transform utilities cumsum and
+// normalize.
+//
+//   import { mean, stddev, correlation } from "vyto/math/stats";
+//
+//   let m = mean(readings);
+//   let r = correlation(temperature, humidity);
+//
+// vyto/geom's value types (Vec2/Mat4) silently fall back on degenerate input
+// — "there is no error channel on a value type" (geom/README.md). This module
+// makes the opposite call: every function here is a free function with
+// `panic` available, and a caller passing something genuinely invalid (an
+// empty array, mismatched lengths, a correlation against a constant series)
+// is a bug to surface immediately, not a case to paper over with a sentinel
+// the caller might not check. The two exceptions are `cumsum` and
+// `normalize`, which are array transforms rather than statistics — they
+// return a documented sane default on the one degenerate input they can have
+// (an empty array, or a constant array for `normalize`) instead of panicking.
+
+import { sqrt } from "vyto/math";
+
+export struct Summary {
+    n: int;
+    mean: float;
+    min: float;
+    max: float;
+    variance: float;   // population
+    stddev: float;      // population
+}
+
+// One Welford pass computing n/mean/min/max/variance/stddev together —
+// cheaper than calling the individual functions below when several are
+// needed at once, since each of those would re-walk the array.
+export fn summarize(xs: float[]): Summary {
+    if (xs.len == 0) { panic("summarize: empty array"); }
+    let n = 0;
+    let mean = 0.0;
+    let m2 = 0.0;
+    let mn = xs[0];
+    let mx = xs[0];
+    for (let x in xs) {
+        n += 1;
+        if (x < mn) { mn = x; }
+        if (x > mx) { mx = x; }
+        let delta = x - mean;
+        mean += delta / (n as float);
+        let delta2 = x - mean;
+        m2 += delta * delta2;
+    }
+    let variance = m2 / (n as float);
+    return Summary(n, mean, mn, mx, variance, sqrt(variance));
+}
+
+export fn sum(xs: float[]): float {
+    let acc = 0.0;
+    for (let x in xs) { acc += x; }
+    return acc;
+}
+
+export fn mean(xs: float[]): float {
+    if (xs.len == 0) { panic("mean: empty array"); }
+    return sum(xs) / (xs.len as float);
+}
+
+// Population variance (divides by n).
+export fn variance(xs: float[]): float {
+    if (xs.len == 0) { panic("variance: empty array"); }
+    let m = mean(xs);
+    let acc = 0.0;
+    for (let x in xs) { let d = x - m; acc += d * d; }
+    return acc / (xs.len as float);
+}
+
+// Sample variance (divides by n-1, Bessel-corrected) — needs at least 2 points.
+export fn varianceSample(xs: float[]): float {
+    if (xs.len < 2) { panic("varianceSample: need at least 2 elements"); }
+    let m = mean(xs);
+    let acc = 0.0;
+    for (let x in xs) { let d = x - m; acc += d * d; }
+    return acc / ((xs.len - 1) as float);
+}
+
+export fn stddev(xs: float[]): float { return sqrt(variance(xs)); }
+export fn stddevSample(xs: float[]): float { return sqrt(varianceSample(xs)); }
+
+export fn min(xs: float[]): float {
+    if (xs.len == 0) { panic("min: empty array"); }
+    let m = xs[0];
+    for (let x in xs) { if (x < m) { m = x; } }
+    return m;
+}
+
+export fn max(xs: float[]): float {
+    if (xs.len == 0) { panic("max: empty array"); }
+    let m = xs[0];
+    for (let x in xs) { if (x > m) { m = x; } }
+    return m;
+}
+
+export fn range(xs: float[]): float { return max(xs) - min(xs); }
+
+fn cmp_f(a: float, b: float): int {
+    if (a < b) { return -1; }
+    if (a > b) { return 1; }
+    return 0;
+}
+
+// A new sorted copy — never mutates xs.
+export fn sorted(xs: float[]): float[] {
+    let out: float[] = [];
+    for (let x in xs) { out.push(x); }
+    out.sort((a, b) => cmp_f(a, b));
+    return out;
+}
+
+// p in [0,1] (clamped), linear interpolation between the two nearest ranks —
+// the same convention as vyto/data's DataFrame.percentile.
+export fn percentile(xs: float[], p: float): float {
+    if (xs.len == 0) { panic("percentile: empty array"); }
+    let pp = p;
+    if (pp < 0.0) { pp = 0.0; }
+    if (pp > 1.0) { pp = 1.0; }
+    let s = sorted(xs);
+    let pos = pp * ((s.len - 1) as float);
+    let lo = pos as int;
+    let hi = lo + 1;
+    if (hi >= s.len) { hi = lo; }
+    let frac = pos - (lo as float);
+    return s[lo] + (s[hi] - s[lo]) * frac;
+}
+
+export fn median(xs: float[]): float { return percentile(xs, 0.5); }
+
+// Ties broken by sorted-first: the first-encountered run with the strictly
+// greatest count wins, so a tie resolves to the smaller value.
+export fn mode(xs: float[]): float {
+    if (xs.len == 0) { panic("mode: empty array"); }
+    let s = sorted(xs);
+    let bestVal = s[0];
+    let bestCount = 0;
+    let i = 0;
+    while (i < s.len) {
+        let j = i;
+        while (j < s.len && s[j] == s[i]) { j += 1; }
+        let count = j - i;
+        if (count > bestCount) { bestCount = count; bestVal = s[i]; }
+        i = j;
+    }
+    return bestVal;
+}
+
+export fn covariance(xs: float[], ys: float[]): float {
+    if (xs.len != ys.len) { panic("covariance: length mismatch"); }
+    if (xs.len == 0) { panic("covariance: empty array"); }
+    let mx = mean(xs);
+    let my = mean(ys);
+    let acc = 0.0;
+    for (let i in 0..xs.len) { acc += (xs[i] - mx) * (ys[i] - my); }
+    return acc / (xs.len as float);
+}
+
+// Pearson r. Panics if either series has zero variance (undefined, not 0).
+export fn correlation(xs: float[], ys: float[]): float {
+    let sx = stddev(xs);
+    let sy = stddev(ys);
+    if (sx == 0.0 || sy == 0.0) { panic("correlation: a constant series has no defined correlation"); }
+    return covariance(xs, ys) / (sx * sy);
+}
+
+// Panics on zero stddev (undefined, not 0) — same policy as correlation.
+export fn zscore(xs: float[], x: float): float {
+    let s = stddev(xs);
+    if (s == 0.0) { panic("zscore: a constant series has no defined z-score"); }
+    return (x - mean(xs)) / s;
+}
+
+// Running total, as a new array. Empty in, empty out — no panic; this is an
+// array transform, not a statistic.
+export fn cumsum(xs: float[]): float[] {
+    let out: float[] = [];
+    let acc = 0.0;
+    for (let x in xs) { acc += x; out.push(acc); }
+    return out;
+}
+
+// Min-max scale to [0,1], as a new array. If every element is equal (no
+// range to scale into), returns all 0.0 rather than dividing by zero — a
+// documented default, not a panic, since this is a utility, not a statistic.
+export fn normalize(xs: float[]): float[] {
+    let out: float[] = [];
+    if (xs.len == 0) { return out; }
+    let lo = min(xs);
+    let hi = max(xs);
+    let span = hi - lo;
+    for (let x in xs) {
+        if (span == 0.0) { out.push(0.0); }
+        else { out.push((x - lo) / span); }
+    }
+    return out;
+}
+
+// ---- int[] convenience -----------------------------------------------------
+// The handful most useful straight off an int array without a conversion
+// allocation; toFloatArray is the escape hatch to the rest of this module.
+
+export fn sumInt(xs: int[]): int {
+    let acc = 0;
+    for (let x in xs) { acc += x; }
+    return acc;
+}
+
+export fn meanInt(xs: int[]): float {
+    if (xs.len == 0) { panic("meanInt: empty array"); }
+    return (sumInt(xs) as float) / (xs.len as float);
+}
+
+export fn minInt(xs: int[]): int {
+    if (xs.len == 0) { panic("minInt: empty array"); }
+    let m = xs[0];
+    for (let x in xs) { if (x < m) { m = x; } }
+    return m;
+}
+
+export fn maxInt(xs: int[]): int {
+    if (xs.len == 0) { panic("maxInt: empty array"); }
+    let m = xs[0];
+    for (let x in xs) { if (x > m) { m = x; } }
+    return m;
+}
+
+export fn toFloatArray(xs: int[]): float[] {
+    let out: float[] = [];
+    for (let x in xs) { out.push(x as float); }
+    return out;
+}

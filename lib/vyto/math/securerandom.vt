@@ -1,0 +1,95 @@
+// vyto/math/securerandom — cryptographically secure randomness: real OS
+// entropy, not a reproducible PRNG stream.
+//
+//   import { secureBytes, secureBelow, secureToken } from "vyto/math/securerandom";
+//
+//   let key = secureBytes(32);
+//   let otp = secureBelow(1000000);
+//   let sessionId = secureToken(16);       // "a3f9c1..." 32 hex chars
+//
+// Contrast with `vyto/math/random`: that module is a seeded xorshift64 —
+// deterministic, reproducible, and explicitly NOT a security boundary. This
+// module is the opposite on every axis: no seed, not reproducible, and safe
+// to use for session tokens, keys, and anything else where predictability is
+// a vulnerability.
+//
+// No new native code here. `vyto/util/uuid` already reaches real OS entropy
+// (getrandom(2) on Linux, BCryptGenRandom on Windows, /dev/urandom
+// otherwise — lib/vyto/util/uuid/native/src/rand_shim.c) because a v4 UUID's
+// unguessability depends on it exactly as much as a session token's does.
+// Duplicating that ladder here would mean two copies of security-critical
+// code that could silently drift; this module instead re-exports it under a
+// name someone reaching for secure randomness would actually search for, and
+// adds what's missing: a bound that panics instead of silently clamping (the
+// policy `vyto/math/random` already uses), shuffle/choice, and a hex token
+// helper. Importing this module — not plain `vyto/math` — is what pulls in
+// the native shim and its Windows bcrypt link; every other file in this
+// package stays pure Vyto.
+
+import { rand_bytes, rand_u63, rand_float } from "vyto/util/uuid";
+import { stringBuilder } from "vyto/util/text";
+
+// `n` cryptographically random bytes. `n <= 0` yields an empty buffer.
+export fn secureBytes(n: int): byte[] { return rand_bytes(n); }
+
+// A random int in [0, 2^63).
+export fn secureInt(): int { return rand_u63(); }
+
+// A random int in [0, bound). Rejection-sampled against a power-of-two mask,
+// so no value is biased low. Panics if `bound <= 0`.
+export fn secureBelow(bound: int): int {
+    if (bound <= 0) { panic("secureBelow: bound must be positive"); }
+    let mask = 1;
+    while (mask < bound) { mask = (mask << 1) | 1; }
+    let v = rand_u63() & mask;
+    while (v >= bound) { v = rand_u63() & mask; }
+    return v;
+}
+
+// A random int in [lo, hi). Panics if `hi <= lo` — same policy as
+// vyto/math/random's Rng.nextRange, unlike vyto/util/uuid's rand_int, which
+// silently returns `lo` on an empty range.
+export fn secureRange(lo: int, hi: int): int {
+    if (hi <= lo) { panic("secureRange: hi must be greater than lo"); }
+    return lo + secureBelow(hi - lo);
+}
+
+// A random float in [0.0, 1.0), 53 bits of precision.
+export fn secureFloat(): float { return rand_float(); }
+
+// true with probability p.
+export fn secureBool(p: float): bool { return secureFloat() < p; }
+
+// Fisher-Yates, in place, O(n).
+export fn secureShuffle<T>(arr: T[]) {
+    let i = arr.len - 1;
+    while (i > 0) {
+        let j = secureBelow(i + 1);
+        let tmp = arr[i];
+        arr[i] = arr[j];
+        arr[j] = tmp;
+        i -= 1;
+    }
+}
+
+// Uniform pick. Panics on an empty array.
+export fn secureChoice<T>(arr: T[]): T {
+    if (arr.len == 0) { panic("secureChoice: empty array"); }
+    return arr[secureBelow(arr.len)];
+}
+
+const HEXD: string = "0123456789abcdef";
+
+// A random token, hex-encoded — `n` random bytes as a `2*n`-character
+// lowercase hex string. The common case for session ids / API keys / CSRF
+// tokens, where the caller wants text, not a byte[].
+export fn secureToken(n: int): string {
+    let b = secureBytes(n);
+    let sb = stringBuilder(n * 2);
+    for (let x in b) {
+        let v = x as int;
+        sb.appendByte(HEXD[(v >> 4) & 0xF]);
+        sb.appendByte(HEXD[v & 0xF]);
+    }
+    return sb.toString();
+}

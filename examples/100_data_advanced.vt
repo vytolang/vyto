@@ -1,0 +1,87 @@
+// vyto/data DataFrame — the analytics verbs added on top of the columnar
+// engine: null/missing cells (skipped by SUM/AVG, not by COUNT(*)), group-by
+// with richer aggregates (variance/stddev/percentile/count-distinct), and
+// hash join (inner and left). See examples/53_datatable.vt for the base
+// build/sort/filter/aggregate/derive/CSV-round-trip engine.
+import { DataFrame, CK_I64, CK_F64, CK_STR, CK_CAT, AGG_SUM, AGG_COUNT,
+         AGG_COUNT_DISTINCT, AGG_PERCENTILE, JOIN_INNER, JOIN_LEFT, loadCsv } from "vyto/data/frame";
+import { bufWriter, file_remove } from "vyto/io/file";
+
+fn main() {
+    // ---- nulls: missing is not the same as a real zero ----------------
+    let sales = new DataFrame(0);
+    let region = sales.addColumn("region", CK_CAT);
+    let rep = sales.addColumn("rep", CK_STR);
+    let amount = sales.addColumn("amount", CK_F64);
+
+    sales.beginRow().setStr(region, "East").setStr(rep, "Alice").setFloat(amount, 100.0).endRow();
+    sales.beginRow().setStr(region, "East").setStr(rep, "Bob").setFloat(amount, 150.0).endRow();
+    sales.beginRow().setStr(region, "East").setStr(rep, "Alice").setFloat(amount, 200.0).endRow();
+    sales.beginRow().setStr(region, "West").setStr(rep, "Cara").setFloat(amount, 300.0).endRow();
+    sales.beginRow().setStr(region, "West").setStr(rep, "Cara").setFloat(amount, 300.0).endRow();
+    sales.beginRow().setStr(region, "West").setStr(rep, "Dan").setNull(amount).endRow();
+
+    print("amount[5] isNull=" + str(sales.isNull(5, amount)) + " cellFloat=" + str(sales.cellFloat(5, amount)));
+    print("sum amount (skips null) = " + str(sales.agg(amount, AGG_SUM)));
+    print("count(*) rows = " + str(sales.agg(amount, AGG_COUNT) as int));
+
+    // ---- group by: two keys' worth of coverage in one pass -------------
+    // amount summed and its median (AGG_PERCENTILE, p=0.5) per region; rep
+    // counted distinct per region (non-CAT count-distinct path).
+    let byRegion = sales.groupBy([region], [amount, rep, amount],
+                                  [AGG_SUM, AGG_COUNT_DISTINCT, AGG_PERCENTILE], [0.0, 0.0, 0.5]);
+    print("byRegion rows=" + str(byRegion.viewLen()));
+    for (let i in 0..byRegion.viewLen()) {
+        print("  " + byRegion.cellStr(i, 0) + " sum=" + byRegion.cellStr(i, 1)
+              + " distinctReps=" + byRegion.cellStr(i, 2) + " medianAmount=" + byRegion.cellStr(i, 3));
+    }
+
+    // count-distinct on a CAT-typed value column: how many distinct regions
+    // does each rep appear in.
+    let byRep = sales.groupBy([rep], [region], [AGG_COUNT_DISTINCT], [0.0]);
+    print("byRep rows=" + str(byRep.viewLen()));
+    for (let i in 0..byRep.viewLen()) {
+        print("  " + byRep.cellStr(i, 0) + " distinctRegions=" + byRep.cellStr(i, 1));
+    }
+
+    // ---- join: inner drops unmatched, left keeps and nulls the gap -----
+    let reps = new DataFrame(0);
+    let repId = reps.addColumn("id", CK_I64);
+    let repName = reps.addColumn("name", CK_STR);
+    reps.beginRow().setInt(repId, 1).setStr(repName, "Alice").endRow();
+    reps.beginRow().setInt(repId, 2).setStr(repName, "Bob").endRow();
+    reps.beginRow().setInt(repId, 3).setStr(repName, "Cara").endRow();
+
+    let quotas = new DataFrame(0);
+    let qRepId = quotas.addColumn("repid", CK_I64);
+    let qAmount = quotas.addColumn("quota", CK_I64);
+    quotas.beginRow().setInt(qRepId, 2).setInt(qAmount, 1000).endRow();
+    quotas.beginRow().setInt(qRepId, 3).setInt(qAmount, 2000).endRow();
+    quotas.beginRow().setInt(qRepId, 3).setInt(qAmount, 2500).endRow();
+    // no row for repid 1 (Alice) — the unmatched case both joins have to handle
+
+    let inner = reps.join(quotas, repId, qRepId, JOIN_INNER);
+    print("inner rows=" + str(inner.viewLen()));
+    for (let i in 0..inner.viewLen()) {
+        print("  " + inner.cellStr(i, 1) + " quota=" + inner.cellStr(i, 3));
+    }
+
+    let left = reps.join(quotas, repId, qRepId, JOIN_LEFT);
+    print("left rows=" + str(left.viewLen()));
+    for (let i in 0..left.viewLen()) {
+        let q = "null";
+        if (!left.isNull(i, 3)) { q = left.cellStr(i, 3); }
+        print("  " + left.cellStr(i, 1) + " quota=" + q);
+    }
+
+    // ---- CSV round-trip: a genuinely short row is null, not "0" --------
+    let w = bufWriter("advanced_example.csv", 4096);
+    w.write("a,b,c\n");
+    w.write("1,2,3\n");
+    w.write("4,5\n");   // short row: c is missing, not empty
+    w.close();
+    let reloaded = loadCsv("advanced_example.csv", true);
+    print("csv row1 c isNull=" + str(reloaded.isNull(1, 2)));
+    print("csv row0 c isNull=" + str(reloaded.isNull(0, 2)));
+    file_remove("advanced_example.csv");
+}

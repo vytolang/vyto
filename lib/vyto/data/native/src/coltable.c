@@ -22,6 +22,7 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <ctype.h>
+#include <math.h>
 
 enum { CT_I64 = 0, CT_F64 = 1, CT_BOOL = 2, CT_STR = 3, CT_CAT = 4,
        CT_I32 = 5, CT_I16 = 6, CT_F32 = 7, CT_AUTO = 8 };
@@ -54,6 +55,10 @@ typedef struct {
     int32_t *dhash;    /* open-addressed intern index (entry+1; 0 = empty) */
     int dhmask;        /* dhash size - 1 (power of two), 0 = unallocated */
     uint8_t promotable; /* CK_AUTO: self-widen `kind` as values arrive */
+    uint8_t *nullbits; /* NULL = no nulls yet (the common case costs nothing).
+                           Lazily calloc'd to (cap+7)/8 bytes on first null
+                           write; bit=1 means that row is null in this column.
+                           Independent of `kind`, so widening never touches it. */
 } Col;
 
 typedef struct {
@@ -162,6 +167,14 @@ static int ct_grow(CT *t, int64_t need) {
             if (!nd) return 0;
             col->data = nd;
         }
+        if (col->nullbits) {
+            size_t oldbytes = (size_t)((t->cap + 7) / 8);
+            size_t newbytes = (size_t)((nc + 7) / 8);
+            uint8_t *nb = (uint8_t *)realloc(col->nullbits, newbytes);
+            if (!nb) return 0;
+            if (newbytes > oldbytes) memset(nb + oldbytes, 0, newbytes - oldbytes);
+            col->nullbits = nb;
+        }
     }
     int32_t *ni = (int32_t *)realloc(t->idx, (size_t)nc * sizeof(int32_t));
     if (!ni) return 0;
@@ -217,6 +230,37 @@ int ct_add_col(void *h, const char *name, int kind) {
         else scalar_put_i(col, r, 0);
     }
     return t->ncol++;
+}
+
+/* -------------------------------------------------------------- nulls */
+
+/* Lazily allocate a column's validity bitmap, sized to `cap` rows and
+   zero-filled (not null). No-op if already allocated -- ct_grow keeps an
+   existing bitmap sized to t->cap, same as every other column buffer. */
+static int col_ensure_nullbits(Col *c, int64_t cap) {
+    if (c->nullbits) return 1;
+    size_t need = (size_t)((cap + 7) / 8);
+    uint8_t *nb = (uint8_t *)calloc(need > 0 ? need : 1, 1);
+    if (!nb) return 0;
+    c->nullbits = nb;
+    return 1;
+}
+
+/* Mark row `row` null/non-null, growing the bitmap on first null write.
+   Clearing a bit when nullbits is still unallocated is a deliberate no-op:
+   a column that has never had a null has nothing to clear. */
+static void col_set_null(Col *c, int64_t row, int64_t cap, int isnull) {
+    if (!isnull && !c->nullbits) return;
+    if (!col_ensure_nullbits(c, cap)) return;
+    size_t byte = (size_t)(row / 8);
+    uint8_t bit = (uint8_t)(1u << (row % 8));
+    if (isnull) c->nullbits[byte] |= bit;
+    else c->nullbits[byte] &= (uint8_t)~bit;
+}
+
+static int col_is_null(const Col *c, int64_t row) {
+    if (!c->nullbits) return 0;
+    return (c->nullbits[row / 8] >> (row % 8)) & 1;
 }
 
 /* ------------------------------------------------------------- row build */
@@ -433,6 +477,7 @@ void ct_set_i64(void *h, int col, long long v) {
     CT *t = (CT *)h;
     if (!t || col < 0 || col >= t->ncol) return;
     Col *c = &t->cols[col];
+    if (c->nullbits) col_set_null(c, t->nrow, t->cap, 0);
     if (c->promotable) auto_feed_i(c, t->nrow, t->nrow, t->cap, (int64_t)v);
     else scalar_put_i(c, t->nrow, (int64_t)v);
 }
@@ -441,6 +486,7 @@ void ct_set_f64(void *h, int col, double v) {
     CT *t = (CT *)h;
     if (!t || col < 0 || col >= t->ncol) return;
     Col *c = &t->cols[col];
+    if (c->nullbits) col_set_null(c, t->nrow, t->cap, 0);
     if (c->promotable) auto_feed_f(c, t->nrow, t->nrow, t->cap, v);
     else scalar_put_f(c, t->nrow, v);
 }
@@ -449,6 +495,7 @@ void ct_set_bool(void *h, int col, int v) {
     CT *t = (CT *)h;
     if (!t || col < 0 || col >= t->ncol) return;
     Col *c = &t->cols[col];
+    if (c->nullbits) col_set_null(c, t->nrow, t->cap, 0);
     if (c->promotable) auto_feed_i(c, t->nrow, t->nrow, t->cap, v ? 1 : 0);
     else scalar_put_i(c, t->nrow, v ? 1 : 0);
 }
@@ -458,6 +505,7 @@ void ct_set_str(void *h, int col, const char *s, long n) {
     if (!t || col < 0 || col >= t->ncol) return;
     Col *c = &t->cols[col];
     if (!s || n < 0) return;
+    if (c->nullbits) col_set_null(c, t->nrow, t->cap, 0);
     if (c->promotable) { auto_feed_str(c, t->nrow, t->nrow, t->cap, s, (int32_t)n); return; }
     if (c->kind == CT_CAT) {
         int code = cat_intern(c, s, (int32_t)n);
@@ -466,6 +514,15 @@ void ct_set_str(void *h, int col, const char *s, long n) {
     }
     if (c->kind != CT_STR) return;
     str_append(c, t->nrow, s, (int32_t)n);
+}
+
+/* Mark the row-builder's CURRENT row (t->nrow, not yet committed by
+   ct_end_row) as null in `col`. Call instead of ct_set_* for a missing field;
+   any later ct_set_* on the same row/col clears it again. */
+void ct_set_null(void *h, int col) {
+    CT *t = (CT *)h;
+    if (!t || col < 0 || col >= t->ncol) return;
+    col_set_null(&t->cols[col], t->nrow, t->cap, 1);
 }
 
 void ct_end_row(void *h) {
@@ -486,6 +543,7 @@ void ct_set_cell_i64(void *h, long vrow, int col, long long v) {
     if (!t || vrow < 0 || vrow >= t->vlen || col < 0 || col >= t->ncol) return;
     int64_t row = t->idx[vrow];
     Col *c = &t->cols[col];
+    if (c->nullbits) col_set_null(c, row, t->cap, 0);
     if (c->promotable) auto_feed_i(c, row, t->nrow, t->cap, (int64_t)v);
     else scalar_put_i(c, row, (int64_t)v);
 }
@@ -495,6 +553,7 @@ void ct_set_cell_f64(void *h, long vrow, int col, double v) {
     if (!t || vrow < 0 || vrow >= t->vlen || col < 0 || col >= t->ncol) return;
     int64_t row = t->idx[vrow];
     Col *c = &t->cols[col];
+    if (c->nullbits) col_set_null(c, row, t->cap, 0);
     if (c->promotable) auto_feed_f(c, row, t->nrow, t->cap, v);
     else scalar_put_f(c, row, v);
 }
@@ -504,6 +563,7 @@ void ct_set_cell_str(void *h, long vrow, int col, const char *s, long n) {
     if (!t || vrow < 0 || vrow >= t->vlen || col < 0 || col >= t->ncol || !s || n < 0) return;
     int64_t row = t->idx[vrow];
     Col *c = &t->cols[col];
+    if (c->nullbits) col_set_null(c, row, t->cap, 0);
     if (c->promotable) { auto_feed_str(c, row, t->nrow, t->cap, s, (int32_t)n); return; }
     if (c->kind == CT_CAT) {
         int code = cat_intern(c, s, (int32_t)n);
@@ -512,6 +572,22 @@ void ct_set_cell_str(void *h, long vrow, int col, const char *s, long n) {
     }
     if (c->kind != CT_STR) return;
     str_append(c, row, s, (int32_t)n);
+}
+
+/* Whether visible row `vrow`, column `col` is null. */
+int ct_is_null(void *h, long vrow, int col) {
+    CT *t = (CT *)h;
+    if (!t || vrow < 0 || vrow >= t->vlen || col < 0 || col >= t->ncol) return 0;
+    return col_is_null(&t->cols[col], t->idx[vrow]);
+}
+
+/* Random-access null toggle (by VISIBLE row). Setting isnull=0 does not
+   restore any prior value -- the cell keeps whatever scalar/text it last
+   held; only ct_is_null's answer changes. */
+void ct_set_cell_null(void *h, long vrow, int col, int isnull) {
+    CT *t = (CT *)h;
+    if (!t || vrow < 0 || vrow >= t->vlen || col < 0 || col >= t->ncol) return;
+    col_set_null(&t->cols[col], t->idx[vrow], t->cap, isnull);
 }
 
 /* ------------------------------------------------------------- shape */
@@ -573,6 +649,7 @@ long ct_cell_str(void *h, long vrow, int col, char *buf, long cap) {
     }
     int64_t row = t->idx[vrow];
     Col *c = &t->cols[col];
+    if (col_is_null(c, row)) { buf[0] = 0; return 0; }
     if (c->kind == CT_STR || c->kind == CT_CAT) {
         long n;
         const char *p;
@@ -639,14 +716,16 @@ static int cmp_rows(const SortCtx *s, int64_t a, int64_t b) {
     return 0;
 }
 
-/* Bottom-up stable merge sort of the visible idx window by the key list.
-   Stable so multi-key ties keep their prior order; O(n log n), one temp buffer.
-   1M rows sort well under a second. */
-static void ct_msort(CT *t, const int *cols, const int *dirs, int nk) {
-    int64_t n = t->vlen;
+/* Bottom-up stable merge sort of an arbitrary row-index buffer by the key
+   list. Stable so multi-key ties keep their prior order; O(n log n), one temp
+   buffer. 1M rows sort well under a second. `arr`/`n` need not be t->idx/
+   t->vlen — group-by sorts a scratch copy (to cluster keys without disturbing
+   the view) and per-group subranges (to order a value column for median/
+   percentile) through this same primitive. */
+static void ct_msort_buf(CT *t, int32_t *arr, int64_t n, const int *cols, const int *dirs, int nk) {
     if (n < 2) return;
     SortCtx s = { t, cols, dirs, nk };
-    int32_t *src = t->idx;
+    int32_t *src = arr;
     int32_t *tmp = (int32_t *)malloc((size_t)n * sizeof(int32_t));
     if (!tmp) return;
     int32_t *buf = tmp, *cur = src;
@@ -671,7 +750,7 @@ void ct_sort(void *h, int col, int dir) {
     CT *t = (CT *)h;
     if (!t) return;
     int cols[1] = { col }, dirs[1] = { dir };
-    ct_msort(t, cols, dirs, 1);
+    ct_msort_buf(t, t->idx, t->vlen, cols, dirs, 1);
 }
 
 /* Multi-column: cols[0] is the primary key. Vyto passes the two int[] buffers. */
@@ -681,7 +760,7 @@ void ct_sort_keys(void *h, const long long *cols, const long long *dirs, int nk)
     int cbuf[64], dbuf[64];
     if (nk > 64) nk = 64;
     for (int i = 0; i < nk; i++) { cbuf[i] = (int)cols[i]; dbuf[i] = (int)dirs[i]; }
-    ct_msort(t, cbuf, dbuf, nk);
+    ct_msort_buf(t, t->idx, t->vlen, cbuf, dbuf, nk);
 }
 
 /* ------------------------------------------------------------- filter */
@@ -788,39 +867,165 @@ void ct_search(void *h, const char *needle) {
 
 /* ------------------------------------------------------------- aggregate */
 
-/* kind: 0 sum, 1 min, 2 max, 3 avg, 4 count. Over the visible rows. */
+/* Short label for a synthesized "<label>_<column>" group-by result name. */
+static const char *agg_label(int kind) {
+    switch (kind) {
+        case 0: return "sum";
+        case 1: return "min";
+        case 2: return "max";
+        case 3: return "avg";
+        case 4: return "count";
+        case 5: return "varpop";
+        case 6: return "var";
+        case 7: return "stdpop";
+        case 8: return "std";
+        case 9: return "pct";
+        case 10: return "distinct";
+        default: return "agg";
+    }
+}
+
+/* Reduce column `col` over an already-permuted row range [start,end) of
+   `rows` (absolute row indices), skipping null cells. kind: 0 sum, 1 min,
+   2 max, 3 avg, 4 count(*), 5 population variance, 6 sample variance
+   (Bessel-corrected, n-1), 7 population stddev, 8 sample stddev, 9
+   percentile (p read from `p`, 0..1, linear interpolation), 10 count
+   distinct. AVG/VAR/STD denominators are the non-null count, not the range
+   length; COUNT(*) (4) is the range length regardless of nulls. Variance/
+   stddev are one Welford pass, no second read of the range. Percentile and
+   count-distinct copy the non-null rows of the range into a small scratch
+   buffer and sort it (via ct_msort_buf) -- cost bounded by the range's size,
+   never the whole table, and `rows` itself is left untouched so a caller
+   scanning group boundaries in it is unaffected. */
+static double reduce_range(CT *t, const int32_t *rows, int64_t start, int64_t end,
+                            int col, int kind, double p) {
+    Col *c = &t->cols[col];
+    if (kind == 4) return (double)(end - start);
+    if (kind == 0 || kind == 3) {
+        double acc = 0.0; int64_t n = 0;
+        for (int64_t k = start; k < end; k++) {
+            if (col_is_null(c, rows[k])) continue;
+            acc += cell_num(c, rows[k]);
+            n++;
+        }
+        if (kind == 3) return n > 0 ? acc / (double)n : 0.0;
+        return acc;
+    }
+    if (kind == 1 || kind == 2) {
+        double acc = 0.0; int have = 0;
+        for (int64_t k = start; k < end; k++) {
+            if (col_is_null(c, rows[k])) continue;
+            double v = cell_num(c, rows[k]);
+            if (!have) { acc = v; have = 1; continue; }
+            if (kind == 1 && v < acc) acc = v;
+            if (kind == 2 && v > acc) acc = v;
+        }
+        return acc;
+    }
+    if (kind == 5 || kind == 6 || kind == 7 || kind == 8) {
+        double mean = 0.0, m2 = 0.0; int64_t n = 0;
+        for (int64_t k = start; k < end; k++) {
+            if (col_is_null(c, rows[k])) continue;
+            n++;
+            double v = cell_num(c, rows[k]);
+            double delta = v - mean;
+            mean += delta / (double)n;
+            m2 += delta * (v - mean);
+        }
+        double var;
+        if (kind == 5 || kind == 7) var = n > 0 ? m2 / (double)n : 0.0;
+        else var = n > 1 ? m2 / (double)(n - 1) : 0.0;
+        if (kind == 7 || kind == 8) return sqrt(var);
+        return var;
+    }
+    if (kind == 9 || kind == 10) {
+        int64_t rn = end - start;
+        int32_t *tmp = (int32_t *)malloc((size_t)(rn > 0 ? rn : 1) * sizeof(int32_t));
+        if (!tmp) return 0.0;
+        int64_t m = 0;
+        for (int64_t k = start; k < end; k++) {
+            if (!col_is_null(c, rows[k])) tmp[m++] = rows[k];
+        }
+        if (m == 0) { free(tmp); return 0.0; }
+        int cols1[1] = { col }, dirs1[1] = { 1 };
+        ct_msort_buf(t, tmp, m, cols1, dirs1, 1);
+        double result;
+        if (kind == 10) {
+            int64_t distinct = 0; int have = 0; int64_t prev = 0;
+            for (int64_t k = 0; k < m; k++) {
+                if (!have || cmp_col(c, prev, tmp[k]) != 0) { distinct++; prev = tmp[k]; have = 1; }
+            }
+            result = (double)distinct;
+        } else {
+            double pp = p; if (pp < 0.0) pp = 0.0; if (pp > 1.0) pp = 1.0;
+            double pos = pp * (double)(m - 1);
+            int64_t lo = (int64_t)pos;
+            int64_t hi = lo + 1 < m ? lo + 1 : lo;
+            double frac = pos - (double)lo;
+            double vlo = cell_num(c, tmp[lo]), vhi = cell_num(c, tmp[hi]);
+            result = vlo + (vhi - vlo) * frac;
+        }
+        free(tmp);
+        return result;
+    }
+    return 0.0;
+}
+
+/* Write one source cell (absolute `row` of `src`) into the row currently
+   being built on `out`, at output column `outcol`. Shared by ct_group_by
+   (emitting a group's key columns) and ct_join (emitting both sides' source
+   columns) -- both build their result via the same row-builder API a normal
+   load uses. A CT_CAT source materializes as text on the output side, same
+   reasoning as everywhere else a fresh table can't share another table's
+   dictionary. */
+static void emit_cell(void *out, int outcol, Col *src, int64_t row) {
+    if (src->kind == CT_STR) {
+        ct_set_str(out, outcol, src->arena + src->soff[row], src->slen[row]);
+    } else if (src->kind == CT_CAT) {
+        int32_t l; const char *p = cat_str(src, row, &l);
+        ct_set_str(out, outcol, p, l);
+    } else if (kind_is_int(src->kind) || src->kind == CT_BOOL) {
+        ct_set_i64(out, outcol, (long long)cell_num(src, row));
+    } else {
+        ct_set_f64(out, outcol, cell_num(src, row));
+    }
+}
+
+/* AGG_* kind, over the visible rows -- see reduce_range for the exact
+   semantics of each kind. */
 double ct_agg(void *h, int col, int kind) {
     CT *t = (CT *)h;
     if (!t || col < 0 || col >= t->ncol) return 0.0;
-    if (kind == 4) return (double)t->vlen;
-    Col *c = &t->cols[col];
-    if (t->vlen == 0) return 0.0;
-    double acc = cell_num(c, t->idx[0]);
-    if (kind == 0 || kind == 3) {
-        acc = 0.0;
-        for (int64_t k = 0; k < t->vlen; k++) acc += cell_num(c, t->idx[k]);
-        if (kind == 3) return acc / (double)t->vlen;
-        return acc;
-    }
-    for (int64_t k = 1; k < t->vlen; k++) {
-        double v = cell_num(c, t->idx[k]);
-        if (kind == 1 && v < acc) acc = v;
-        if (kind == 2 && v > acc) acc = v;
-    }
-    return acc;
+    return reduce_range(t, t->idx, 0, t->vlen, col, kind, 0.0);
+}
+
+/* Percentile p (0..1, linear interpolation) of `col` over the visible rows.
+   Not reachable through ct_agg's single-int-kind signature since it needs an
+   extra argument. median(col) is percentile(col, 0.5) on the Vyto side. */
+double ct_percentile(void *h, int col, double p) {
+    CT *t = (CT *)h;
+    if (!t || col < 0 || col >= t->ncol) return 0.0;
+    return reduce_range(t, t->idx, 0, t->vlen, col, 9, p);
 }
 
 /* Derive a new f64 column `name` = (col a) <op> (col b), computed over every
-   row (not just the visible ones). op: 0 +, 1 -, 2 *, 3 /. Returns the new
-   column index, or -1. */
+   row (not just the visible ones). op: 0 +, 1 -, 2 *, 3 /. If either operand
+   is null, the output cell is null too, rather than computing a value from a
+   default 0. Returns the new column index, or -1. */
 int ct_derive(void *h, const char *name, int op, int a, int b) {
     CT *t = (CT *)h;
     if (!t || a < 0 || a >= t->ncol || b < 0 || b >= t->ncol) return -1;
     int nc = ct_add_col(h, name, CT_F64);
     if (nc < 0) return -1;
     Col *ca = &t->cols[a], *cb = &t->cols[b];
-    double *out = (double *)t->cols[nc].data;
+    Col *co = &t->cols[nc];
+    double *out = (double *)co->data;
     for (int64_t r = 0; r < t->nrow; r++) {
+        if (col_is_null(ca, r) || col_is_null(cb, r)) {
+            col_set_null(co, r, t->cap, 1);
+            out[r] = 0.0;
+            continue;
+        }
         double x = cell_num(ca, r), y = cell_num(cb, r), v = 0.0;
         if (op == 0) v = x + y;
         else if (op == 1) v = x - y;
@@ -829,6 +1034,260 @@ int ct_derive(void *h, const char *name, int op, int a, int b) {
         out[r] = v;
     }
     return nc;
+}
+
+/* ------------------------------------------------------------- group by */
+
+/* Group the visible rows by nkeys key columns; for each group compute nagg
+   aggregates (aggcols[i]/aggkinds[i] = an AGG_* kind, aggargs[i] read only
+   for AGG_PERCENTILE, p in 0..1). Returns a NEW CT*: the key columns (a
+   CT_CAT key materializes as CT_STR -- a fresh table can't share either
+   side's dictionary) followed by nagg CT_F64 result columns, one row per
+   distinct key combination, ascending by key. Key columns keep the source
+   name; aggregate columns are named "<agglabel>_<srccolname>", which is what
+   lets the DataFrame-adoption bridge on the Vyto side populate names[]/
+   kinds[] purely by reflecting on the returned handle.
+
+   Never mutates the source table's view: `t->idx` is copied to a scratch
+   buffer before being sorted by the key columns (via ct_msort_buf) to cluster
+   identical keys contiguously, then a single linear scan over that scratch
+   buffer finds each group's [start,end) range via cmp_col. Each range is
+   reduced with reduce_range, which independently handles its own subrange
+   sort for the percentile/count-distinct kinds -- no second grouping pass. */
+void *ct_group_by(void *h, const long long *keycols, int nkeys,
+                   const long long *aggcols, const long long *aggkinds,
+                   const double *aggargs, int nagg) {
+    CT *t = (CT *)h;
+    if (!t || nkeys <= 0 || nkeys > 64 || nagg < 0) return NULL;
+
+    int kbuf[64], kdirs[64];
+    for (int i = 0; i < nkeys; i++) {
+        kbuf[i] = (int)keycols[i];
+        kdirs[i] = 1;
+        if (kbuf[i] < 0 || kbuf[i] >= t->ncol) return NULL;
+    }
+    for (int i = 0; i < nagg; i++) {
+        int ac = (int)aggcols[i];
+        if (ac < 0 || ac >= t->ncol) return NULL;
+    }
+
+    void *out = ct_new(0);
+    if (!out) return NULL;
+
+    for (int i = 0; i < nkeys; i++) {
+        Col *kc = &t->cols[kbuf[i]];
+        int okind = kc->kind == CT_CAT ? CT_STR : kc->kind;
+        ct_add_col(out, kc->name ? kc->name : "", okind);
+    }
+    char nmbuf[128];
+    for (int i = 0; i < nagg; i++) {
+        Col *vc = &t->cols[(int)aggcols[i]];
+        snprintf(nmbuf, sizeof nmbuf, "%s_%s", agg_label((int)aggkinds[i]), vc->name ? vc->name : "");
+        ct_add_col(out, nmbuf, CT_F64);
+    }
+
+    if (t->vlen == 0) return out;
+
+    int32_t *grp = (int32_t *)malloc((size_t)t->vlen * sizeof(int32_t));
+    if (!grp) return out;
+    memcpy(grp, t->idx, (size_t)t->vlen * sizeof(int32_t));
+    ct_msort_buf(t, grp, t->vlen, kbuf, kdirs, nkeys);
+
+    int64_t start = 0;
+    while (start < t->vlen) {
+        int64_t end = start + 1;
+        while (end < t->vlen) {
+            int diff = 0;
+            for (int i = 0; i < nkeys; i++) {
+                if (cmp_col(&t->cols[kbuf[i]], grp[start], grp[end]) != 0) { diff = 1; break; }
+            }
+            if (diff) break;
+            end++;
+        }
+
+        ct_begin_row(out);
+        for (int i = 0; i < nkeys; i++) {
+            emit_cell(out, i, &t->cols[kbuf[i]], grp[start]);
+        }
+        for (int i = 0; i < nagg; i++) {
+            double p = aggargs ? aggargs[i] : 0.0;
+            double v = reduce_range(t, grp, start, end, (int)aggcols[i], (int)aggkinds[i], p);
+            ct_set_f64(out, nkeys + i, v);
+        }
+        ct_end_row(out);
+
+        start = end;
+    }
+    free(grp);
+    return out;
+}
+
+/* ------------------------------------------------------------- join */
+
+/* True for the two column kinds a join key compares as text (STR/CAT) rather
+   than numeric (through cell_num). Comparing across the two classes is
+   meaningless, so a mismatched pair short-circuits to an empty result. */
+static int col_is_text(int kind) { return kind == CT_STR || kind == CT_CAT; }
+
+static const char *key_text(const Col *c, int64_t row, int32_t *len_out) {
+    if (c->kind == CT_CAT) return cat_str(c, row, len_out);
+    *len_out = c->slen[row];
+    return c->arena + c->soff[row];
+}
+
+/* FNV-1a over a text key's bytes, or over a numeric key's double bit pattern
+   -- cell_num already normalizes every numeric kind to double, so two
+   numerically-equal cells of different kinds (i32 vs f64) hash and compare
+   equal. */
+static uint32_t key_hash(const Col *c, int64_t row) {
+    if (col_is_text(c->kind)) {
+        int32_t n; const char *p = key_text(c, row, &n);
+        return cat_h(p, n);
+    }
+    double v = cell_num(c, row);
+    return cat_h((const char *)&v, (int32_t)sizeof v);
+}
+
+static int key_eq(const Col *ca, int64_t a, const Col *cb, int64_t b) {
+    if (col_is_text(ca->kind)) {
+        int32_t la, lb;
+        const char *pa = key_text(ca, a, &la);
+        const char *pb = key_text(cb, b, &lb);
+        return la == lb && (la == 0 || memcmp(pa, pb, (size_t)la) == 0);
+    }
+    return cell_num(ca, a) == cell_num(cb, b);
+}
+
+/* Open-chained hash multimap over one column's visible rows -- a join key can
+   repeat, so each bucket is a singly-linked list of row slots rather than one
+   slot. `rowid[i]`/`next[i]` describe slot i; `head[b]` is the first slot in
+   bucket b, or -1. */
+typedef struct {
+    int64_t *head;
+    int64_t *next;
+    int32_t *rowid;
+    int64_t nb;
+    int64_t mask;
+} JHash;
+
+static int jhash_build(JHash *jh, Col *c, const int32_t *rows, int64_t n) {
+    int64_t nb = 16;
+    while (nb < n * 2) nb *= 2;
+    jh->head = (int64_t *)malloc((size_t)nb * sizeof(int64_t));
+    jh->next = (int64_t *)malloc((size_t)(n > 0 ? n : 1) * sizeof(int64_t));
+    jh->rowid = (int32_t *)malloc((size_t)(n > 0 ? n : 1) * sizeof(int32_t));
+    if (!jh->head || !jh->next || !jh->rowid) {
+        free(jh->head); free(jh->next); free(jh->rowid);
+        return 0;
+    }
+    for (int64_t i = 0; i < nb; i++) jh->head[i] = -1;
+    jh->nb = nb; jh->mask = nb - 1;
+    for (int64_t i = 0; i < n; i++) {
+        int64_t row = rows[i];
+        int64_t b = (int64_t)(key_hash(c, row) & (uint32_t)jh->mask);
+        jh->rowid[i] = (int32_t)row;
+        jh->next[i] = jh->head[b];
+        jh->head[b] = i;
+    }
+    return 1;
+}
+
+static void jhash_free(JHash *jh) { free(jh->head); free(jh->next); free(jh->rowid); }
+
+/* Hash-join `h` (left) against `other` (right) on one key column each. Keys
+   must be same-class comparable (both numeric or both text via key_eq); a
+   mismatched pair returns an empty (0-row, correctly-shaped) result rather
+   than erroring, matching the file's no-error-channel-on-a-read style.
+   kind: 0 inner (unmatched left rows dropped), 1 left (every visible left row
+   kept; unmatched right-side columns are null).
+   For INNER the hash table is built over whichever side has fewer visible
+   rows and probed from the other, so cost tracks the larger input's scan, not
+   its hash-build cost. For LEFT the hash table is ALWAYS built on the right
+   side and probed from the left, regardless of relative size -- that is what
+   makes "no match" trivial to detect at probe time (emit one row with the
+   right side null) instead of a separate visited-bitmap pass afterward.
+   Operates on the VISIBLE rows of both tables, so a prior filter on either
+   side narrows what gets joined -- same as ct_group_by.
+   Result: a NEW CT* -- every left column then every right column (right's own
+   key column included), names/kinds copied from each source; a CT_CAT source
+   column materializes as CT_STR, same reasoning as ct_group_by's keys. */
+void *ct_join(void *h, void *other, int leftkey, int rightkey, int kind) {
+    CT *tl = (CT *)h;
+    CT *tr = (CT *)other;
+    if (!tl || !tr || leftkey < 0 || leftkey >= tl->ncol || rightkey < 0 || rightkey >= tr->ncol) return NULL;
+    Col *lc = &tl->cols[leftkey];
+    Col *rc = &tr->cols[rightkey];
+
+    void *out = ct_new(0);
+    if (!out) return NULL;
+    int nl = tl->ncol, nr = tr->ncol;
+    for (int i = 0; i < nl; i++) {
+        Col *c = &tl->cols[i];
+        ct_add_col(out, c->name ? c->name : "", c->kind == CT_CAT ? CT_STR : c->kind);
+    }
+    for (int i = 0; i < nr; i++) {
+        Col *c = &tr->cols[i];
+        ct_add_col(out, c->name ? c->name : "", c->kind == CT_CAT ? CT_STR : c->kind);
+    }
+
+    if (col_is_text(lc->kind) != col_is_text(rc->kind)) return out;  /* mismatched key classes -> empty */
+
+    if (kind == 1) {
+        /* LEFT: hash the right side, probe from the left. */
+        JHash jh;
+        if (!jhash_build(&jh, rc, tr->idx, tr->vlen)) return out;
+        for (int64_t k = 0; k < tl->vlen; k++) {
+            int64_t lrow = tl->idx[k];
+            int found = 0;
+            if (!col_is_null(lc, lrow)) {
+                int64_t b = (int64_t)(key_hash(lc, lrow) & (uint32_t)jh.mask);
+                for (int64_t s = jh.head[b]; s >= 0; s = jh.next[s]) {
+                    int64_t rrow = jh.rowid[s];
+                    if (col_is_null(rc, rrow) || !key_eq(lc, lrow, rc, rrow)) continue;
+                    found = 1;
+                    ct_begin_row(out);
+                    for (int i = 0; i < nl; i++) emit_cell(out, i, &tl->cols[i], lrow);
+                    for (int i = 0; i < nr; i++) emit_cell(out, nl + i, &tr->cols[i], rrow);
+                    ct_end_row(out);
+                }
+            }
+            if (!found) {
+                ct_begin_row(out);
+                for (int i = 0; i < nl; i++) emit_cell(out, i, &tl->cols[i], lrow);
+                for (int i = 0; i < nr; i++) ct_set_null(out, nl + i);
+                ct_end_row(out);
+            }
+        }
+        jhash_free(&jh);
+        return out;
+    }
+
+    /* INNER: hash the smaller visible side, probe from the larger. */
+    int hash_left = tl->vlen <= tr->vlen;
+    JHash jh;
+    if (hash_left) { if (!jhash_build(&jh, lc, tl->idx, tl->vlen)) return out; }
+    else { if (!jhash_build(&jh, rc, tr->idx, tr->vlen)) return out; }
+
+    CT *probe_t = hash_left ? tr : tl;
+    Col *probe_c = hash_left ? rc : lc;
+    Col *hash_c = hash_left ? lc : rc;
+    for (int64_t k = 0; k < probe_t->vlen; k++) {
+        int64_t prow = probe_t->idx[k];
+        if (col_is_null(probe_c, prow)) continue;
+        int64_t b = (int64_t)(key_hash(probe_c, prow) & (uint32_t)jh.mask);
+        for (int64_t s = jh.head[b]; s >= 0; s = jh.next[s]) {
+            int64_t hrow = jh.rowid[s];
+            if (col_is_null(hash_c, hrow) || !key_eq(probe_c, prow, hash_c, hrow)) continue;
+            int64_t lrow = hash_left ? hrow : prow;
+            int64_t rrow = hash_left ? prow : hrow;
+            ct_begin_row(out);
+            for (int i = 0; i < nl; i++) emit_cell(out, i, &tl->cols[i], lrow);
+            for (int i = 0; i < nr; i++) emit_cell(out, nl + i, &tr->cols[i], rrow);
+            ct_end_row(out);
+        }
+    }
+    jhash_free(&jh);
+    return out;
 }
 
 /* ------------------------------------------------------------- free */
@@ -845,6 +1304,7 @@ void ct_free(void *h) {
         free(t->cols[c].doff);
         free(t->cols[c].dlen);
         free(t->cols[c].dhash);
+        free(t->cols[c].nullbits);
     }
     free(t->cols);
     free(t->idx);

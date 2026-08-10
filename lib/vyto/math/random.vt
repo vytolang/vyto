@@ -1,0 +1,113 @@
+// vyto/math/random — a small seedable pseudo-random generator: xorshift64,
+// the same generator vyto/ds/skiplist.vt uses internally for tower heights,
+// generalized here into a public, explicitly-seeded API.
+//
+//   import { rng, shuffle } from "vyto/math/random";
+//
+//   let r = rng(42);
+//   let x = r.nextRange(0, 100);
+//   shuffle(deck, r);
+//
+// Seeding is REQUIRED and there is no hidden global instance or wall-clock
+// auto-seed: two Rng values constructed with the same seed produce the exact
+// same sequence, which is the point — reproducible runs matter more here than
+// resistance to an adversary who can watch the sequence and predict it, and
+// nothing in this module is a security boundary. If real, unpredictable
+// entropy is what's needed (session tokens, keys), that's a different
+// problem; see vyto/util/uuid, which deliberately isolates its own entropy
+// source rather than exposing it as a general RNG.
+//
+// Rng is a class, not a struct: every self-mutating-state type in the stdlib
+// is a class (this mirrors skiplist's own `this.rng` field) — a struct's
+// methods all return new values instead (Vec2/Vec3/Vec4/Mat4 in vyto/geom),
+// which is the wrong shape for "call next() twice, get two different values".
+
+import { sqrt, log, cos, TAU } from "vyto/math";
+
+export class Rng {
+    state: u64;
+
+    fn init(seed: u64) { this.reseed(seed); }
+
+    // Reseed in place — e.g. to replay a run from the start.
+    fn reseed(seed: u64) {
+        // xorshift64 locks at 0 forever if seeded with 0, so substitute a
+        // fixed nonzero constant rather than silently producing a dead stream.
+        if (seed == 0) { this.state = 0x9E3779B97F4A7C15; }
+        else { this.state = seed; }
+    }
+
+    // xorshift64, Marsaglia's 13/7/17 triplet — same shifts as
+    // vyto/ds/skiplist.vt's random_level, generalized to return the raw word.
+    fn nextU64(): u64 {
+        this.state = this.state ^ (this.state << 13);
+        this.state = this.state ^ (this.state >> 7);
+        this.state = this.state ^ (this.state << 17);
+        return this.state;
+    }
+
+    // Uniform in [0, 2^63) — the top bit of the raw word masked off so the
+    // result is never negative once read as a signed int.
+    fn nextInt(): int { return (this.nextU64() >> 1) as int; }
+
+    // Uniform in [0, bound). Rejection-sampled against the largest multiple
+    // of `bound` that fits in 64 bits, so every result is equally likely
+    // regardless of whether `bound` divides 2^64 evenly (a plain modulo
+    // would bias the low end for a bound that doesn't).
+    fn nextBelow(bound: int): int {
+        if (bound <= 0) { panic("Rng.nextBelow: bound must be positive"); }
+        let b: u64 = bound as u64;
+        let u64max: u64 = 0xFFFFFFFFFFFFFFFF;
+        let limit: u64 = u64max - (u64max % b);
+        let r = this.nextU64();
+        while (r >= limit) { r = this.nextU64(); }
+        return (r % b) as int;
+    }
+
+    // Uniform in [lo, hi).
+    fn nextRange(lo: int, hi: int): int {
+        if (hi <= lo) { panic("Rng.nextRange: hi must be greater than lo"); }
+        return lo + this.nextBelow(hi - lo);
+    }
+
+    // Uniform in [0.0, 1.0) — the top 53 bits of the raw word (a double's
+    // full mantissa) scaled down.
+    fn nextFloat(): float {
+        let bits = this.nextU64() >> 11;
+        return (bits as float) * (1.0 / 9007199254740992.0);   // / 2^53
+    }
+
+    fn nextFloatRange(lo: float, hi: float): float { return lo + (hi - lo) * this.nextFloat(); }
+
+    // true with probability p (p outside [0,1] clamps).
+    fn nextBool(p: float): bool { return this.nextFloat() < p; }
+
+    // Standard normal (mean 0, stddev 1) via Box-Muller.
+    fn nextGaussian(): float {
+        let u1 = this.nextFloat();
+        if (u1 <= 0.0) { u1 = 1e-300; }   // avoid log(0) on the rare exact-zero draw
+        let u2 = this.nextFloat();
+        return sqrt(-2.0 * log(u1)) * cos(TAU * u2);
+    }
+}
+
+export fn rng(seed: u64): Rng { return new Rng(seed); }
+
+// Fisher-Yates, in place, O(n). No `zero: T` needed — every write is a swap
+// of two elements already in the array, never a fresh slot.
+export fn shuffle<T>(arr: T[], r: Rng) {
+    let i = arr.len - 1;
+    while (i > 0) {
+        let j = r.nextBelow(i + 1);
+        let tmp = arr[i];
+        arr[i] = arr[j];
+        arr[j] = tmp;
+        i -= 1;
+    }
+}
+
+// Uniform pick. Panics on an empty array.
+export fn choice<T>(arr: T[], r: Rng): T {
+    if (arr.len == 0) { panic("choice: empty array"); }
+    return arr[r.nextBelow(arr.len)];
+}

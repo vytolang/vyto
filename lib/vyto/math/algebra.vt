@@ -1,0 +1,302 @@
+// vyto/math/algebra — general dense N×M matrices and arbitrary-length
+// vectors: the general-shape counterpart to vyto/geom's fixed-size
+// Vec2/Vec3/Vec4 + Mat4. No overlap with geom — no 3D cross product, nothing
+// geom already covers.
+//
+//   import { matrixIdentity, vdot } from "vyto/math/algebra";
+//
+//   let a = matrixFromRows([[2.0, 1.0], [1.0, 3.0]]);
+//   let x = a.solve([3.0, 5.0]);
+//
+// Matrix is a class, not a struct: it holds an array field (`data`), and per
+// vyto/geom/README.md's own stated rule a Vyto struct cannot have reference
+// fields, so an N×M backing array forces `class` regardless of style
+// preference. Being a class also means it has a real `panic` channel — unlike
+// `Mat4.inverted()`'s silent identity-on-singular (geom's value types have
+// "no error channel", by their own README's words), `Matrix.solve()` /
+// `.inverted()` panic on a singular or non-square system. This is a
+// deliberate divergence from the sibling module's convention, not an
+// oversight: geom's degenerate cases are frequent, legitimate mid-computation
+// states in graphics code, while a singular system here is far more likely a
+// data-prep bug worth surfacing immediately. `determinant()` is the one
+// exception even within this file — 0.0 for a singular matrix is the
+// mathematically correct answer, not an error, so it returns rather than
+// panics; only operations with no defined output on a singular input panic.
+//
+// Deliberately out of scope: eigenvalues/eigenvectors, SVD/QR decomposition,
+// sparse matrices. General dense N×M only.
+
+import { sqrt } from "vyto/math";
+
+export class Matrix {
+    rows: int;
+    cols: int;
+    data: float[];   // row-major, data[r*cols+c]
+
+    fn init(rows: int, cols: int) {
+        if (rows <= 0 || cols <= 0) { panic("Matrix.init: rows and cols must be positive"); }
+        this.rows = rows;
+        this.cols = cols;
+        this.data = [];
+        this.data.reserve(rows * cols);
+        for (let i in 0..rows * cols) { this.data.push(0.0); }
+    }
+
+    fn idx(r: int, c: int): int { return r * this.cols + c; }
+    fn get(r: int, c: int): float { return this.data[this.idx(r, c)]; }
+    fn set(r: int, c: int, v: float) { this.data[this.idx(r, c)] = v; }
+
+    fn row(i: int): float[] {
+        let out: float[] = [];
+        out.reserve(this.cols);
+        for (let c in 0..this.cols) { out.push(this.get(i, c)); }
+        return out;
+    }
+    fn col(i: int): float[] {
+        let out: float[] = [];
+        out.reserve(this.rows);
+        for (let r in 0..this.rows) { out.push(this.get(r, i)); }
+        return out;
+    }
+    fn isSquare(): bool { return this.rows == this.cols; }
+
+    fn add(o: Matrix): Matrix {
+        if (this.rows != o.rows || this.cols != o.cols) { panic("Matrix.add: shape mismatch"); }
+        let out = new Matrix(this.rows, this.cols);
+        for (let i in 0..this.data.len) { out.data[i] = this.data[i] + o.data[i]; }
+        return out;
+    }
+    fn sub(o: Matrix): Matrix {
+        if (this.rows != o.rows || this.cols != o.cols) { panic("Matrix.sub: shape mismatch"); }
+        let out = new Matrix(this.rows, this.cols);
+        for (let i in 0..this.data.len) { out.data[i] = this.data[i] - o.data[i]; }
+        return out;
+    }
+    fn scale(s: float): Matrix {
+        let out = new Matrix(this.rows, this.cols);
+        for (let i in 0..this.data.len) { out.data[i] = this.data[i] * s; }
+        return out;
+    }
+    fn mul(o: Matrix): Matrix {
+        if (this.cols != o.rows) { panic("Matrix.mul: inner dimensions must match"); }
+        let out = new Matrix(this.rows, o.cols);
+        for (let i in 0..this.rows) {
+            for (let j in 0..o.cols) {
+                let acc = 0.0;
+                for (let k in 0..this.cols) { acc += this.get(i, k) * o.get(k, j); }
+                out.set(i, j, acc);
+            }
+        }
+        return out;
+    }
+    fn transposed(): Matrix {
+        let out = new Matrix(this.cols, this.rows);
+        for (let r in 0..this.rows) {
+            for (let c in 0..this.cols) { out.set(c, r, this.get(r, c)); }
+        }
+        return out;
+    }
+    fn trace(): float {
+        if (!this.isSquare()) { panic("Matrix.trace: not square"); }
+        let acc = 0.0;
+        for (let i in 0..this.rows) { acc += this.get(i, i); }
+        return acc;
+    }
+
+    // Partial-pivot Gaussian elimination to upper-triangular form; determinant
+    // is the signed product of the diagonal. 0.0 on a singular matrix is the
+    // mathematically correct answer, not an error — see the file header.
+    fn determinant(): float {
+        if (!this.isSquare()) { panic("Matrix.determinant: not square"); }
+        let n = this.rows;
+        let m = this.clone();
+        let sign = 1.0;
+        for (let k in 0..n) {
+            let piv = k;
+            let best = m.absAt(k, k);
+            for (let r in k + 1..n) {
+                let v = m.absAt(r, k);
+                if (v > best) { best = v; piv = r; }
+            }
+            if (best < 1e-300) { return 0.0; }
+            if (piv != k) { m.swapRows(k, piv); sign = -sign; }
+            for (let r in k + 1..n) {
+                let factor = m.get(r, k) / m.get(k, k);
+                for (let c in k..n) { m.set(r, c, m.get(r, c) - factor * m.get(k, c)); }
+            }
+        }
+        let det = sign;
+        for (let i in 0..n) { det *= m.get(i, i); }
+        return det;
+    }
+
+    // Gauss-Jordan elimination on [A|I], in place on copies of both, so the
+    // full inverse costs one O(n^3) pass rather than n separate solves.
+    fn inverted(): Matrix {
+        if (!this.isSquare()) { panic("Matrix.inverted: not square"); }
+        let n = this.rows;
+        let a = this.clone();
+        let inv = matrixIdentity(n);
+        for (let k in 0..n) {
+            let piv = k;
+            let best = a.absAt(k, k);
+            for (let r in k + 1..n) {
+                let v = a.absAt(r, k);
+                if (v > best) { best = v; piv = r; }
+            }
+            if (best < 1e-300) { panic("Matrix.inverted: singular matrix"); }
+            if (piv != k) { a.swapRows(k, piv); inv.swapRows(k, piv); }
+            let pivval = a.get(k, k);
+            for (let c in 0..n) {
+                a.set(k, c, a.get(k, c) / pivval);
+                inv.set(k, c, inv.get(k, c) / pivval);
+            }
+            for (let r in 0..n) {
+                if (r == k) { continue; }
+                let factor = a.get(r, k);
+                if (factor == 0.0) { continue; }
+                for (let c in 0..n) {
+                    a.set(r, c, a.get(r, c) - factor * a.get(k, c));
+                    inv.set(r, c, inv.get(r, c) - factor * inv.get(k, c));
+                }
+            }
+        }
+        return inv;
+    }
+
+    // Ax = b via Gaussian elimination with partial pivoting, then back
+    // substitution.
+    fn solve(b: float[]): float[] {
+        if (!this.isSquare()) { panic("Matrix.solve: not square"); }
+        if (b.len != this.rows) { panic("Matrix.solve: b length must equal rows"); }
+        let n = this.rows;
+        let a = this.clone();
+        let rhs: float[] = [];
+        for (let x in b) { rhs.push(x); }
+        for (let k in 0..n) {
+            let piv = k;
+            let best = a.absAt(k, k);
+            for (let r in k + 1..n) {
+                let v = a.absAt(r, k);
+                if (v > best) { best = v; piv = r; }
+            }
+            if (best < 1e-300) { panic("Matrix.solve: singular matrix"); }
+            if (piv != k) {
+                a.swapRows(k, piv);
+                let tmp = rhs[k]; rhs[k] = rhs[piv]; rhs[piv] = tmp;
+            }
+            for (let r in k + 1..n) {
+                let factor = a.get(r, k) / a.get(k, k);
+                for (let c in k..n) { a.set(r, c, a.get(r, c) - factor * a.get(k, c)); }
+                rhs[r] -= factor * rhs[k];
+            }
+        }
+        let x: float[] = [];
+        x.reserve(n);
+        for (let i in 0..n) { x.push(0.0); }
+        let i = n - 1;
+        while (i >= 0) {
+            let acc = rhs[i];
+            for (let c in i + 1..n) { acc -= a.get(i, c) * x[c]; }
+            x[i] = acc / a.get(i, i);
+            i -= 1;
+        }
+        return x;
+    }
+
+    fn approxEquals(o: Matrix, eps: float): bool {
+        if (this.rows != o.rows || this.cols != o.cols) { return false; }
+        for (let i in 0..this.data.len) {
+            let d = this.data[i] - o.data[i];
+            if (d < 0.0) { d = -d; }
+            if (d > eps) { return false; }
+        }
+        return true;
+    }
+    fn toArray(): float[] {
+        let out: float[] = [];
+        out.reserve(this.data.len);
+        for (let x in this.data) { out.push(x); }
+        return out;
+    }
+    fn clone(): Matrix {
+        let out = new Matrix(this.rows, this.cols);
+        for (let i in 0..this.data.len) { out.data[i] = this.data[i]; }
+        return out;
+    }
+
+    // ---- private elimination helpers --------------------------------------
+    fn absAt(r: int, c: int): float { let v = this.get(r, c); if (v < 0.0) { return -v; } return v; }
+    fn swapRows(a: int, b: int) {
+        if (a == b) { return; }
+        for (let c in 0..this.cols) {
+            let tmp = this.get(a, c);
+            this.set(a, c, this.get(b, c));
+            this.set(b, c, tmp);
+        }
+    }
+}
+
+export fn matrixIdentity(n: int): Matrix {
+    let m = new Matrix(n, n);
+    for (let i in 0..n) { m.set(i, i, 1.0); }
+    return m;
+}
+export fn matrixZeros(rows: int, cols: int): Matrix { return new Matrix(rows, cols); }
+
+// Nested-array constructor, precedented by vyto/util/csv.vt's string[][]
+// (`CsvReader.rows()`). Panics on a ragged input.
+export fn matrixFromRows(rows: float[][]): Matrix {
+    if (rows.len == 0) { panic("matrixFromRows: no rows"); }
+    let nc = rows[0].len;
+    let m = new Matrix(rows.len, nc);
+    for (let r in 0..rows.len) {
+        if (rows[r].len != nc) { panic("matrixFromRows: ragged rows"); }
+        for (let c in 0..nc) { m.set(r, c, rows[r][c]); }
+    }
+    return m;
+}
+
+// ---- vectors ----------------------------------------------------------
+// Free functions over plain float[] — no wrapper type needed for a 1D array;
+// Matrix is the only shape here that needs a class.
+
+export fn vdot(a: float[], b: float[]): float {
+    if (a.len != b.len) { panic("vdot: length mismatch"); }
+    let acc = 0.0;
+    for (let i in 0..a.len) { acc += a[i] * b[i]; }
+    return acc;
+}
+export fn vadd(a: float[], b: float[]): float[] {
+    if (a.len != b.len) { panic("vadd: length mismatch"); }
+    let out: float[] = [];
+    out.reserve(a.len);
+    for (let i in 0..a.len) { out.push(a[i] + b[i]); }
+    return out;
+}
+export fn vsub(a: float[], b: float[]): float[] {
+    if (a.len != b.len) { panic("vsub: length mismatch"); }
+    let out: float[] = [];
+    out.reserve(a.len);
+    for (let i in 0..a.len) { out.push(a[i] - b[i]); }
+    return out;
+}
+export fn vscale(a: float[], s: float): float[] {
+    let out: float[] = [];
+    out.reserve(a.len);
+    for (let x in a) { out.push(x * s); }
+    return out;
+}
+export fn vnorm(a: float[]): float { return sqrt(vdot(a, a)); }
+
+// Panics on a zero vector — deliberate divergence from geom's Vec2/3/4
+// `.normalized()`, which silently returns a zero vector instead. geom's
+// degenerate case is a frequent, legitimate mid-computation state in graphics
+// code; here a zero-length input is far more likely a data-prep bug, and
+// every other ill-posed operation in this file already panics rather than
+// returning a sentinel.
+export fn vnormalized(a: float[]): float[] {
+    let n = vnorm(a);
+    if (n == 0.0) { panic("vnormalized: zero vector"); }
+    return vscale(a, 1.0 / n);
+}

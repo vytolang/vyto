@@ -218,6 +218,39 @@ else
     fail=1
 fi
 
+# --- vyto/math/stats: descriptive statistics over float[]/int[] (pure Vyto) ---
+got=$(./vytoc run tests/fixtures/math_stats.vt 2>&1)
+if [ "$got" = "$(cat tests/fixtures/math_stats.expected)" ]; then
+    echo "PASS math_stats"
+else
+    echo "FAIL math_stats"
+    echo "--- expected ---"; cat tests/fixtures/math_stats.expected
+    echo "--- got ---"; printf '%s\n' "$got"
+    fail=1
+fi
+
+# --- vyto/math/algebra: general N×M matrices, arbitrary-length vectors
+#     (pure Vyto) ---
+got=$(./vytoc run tests/fixtures/math_algebra.vt 2>&1)
+if [ "$got" = "$(cat tests/fixtures/math_algebra.expected)" ]; then
+    echo "PASS math_algebra"
+else
+    echo "FAIL math_algebra"
+    echo "--- expected ---"; cat tests/fixtures/math_algebra.expected
+    echo "--- got ---"; printf '%s\n' "$got"
+    fail=1
+fi
+
+# --- vyto/math/algebra: inverting a singular matrix panics. Grep-style
+#     rather than a golden, because a panic aborts the process and truncates
+#     stdout — same pattern as the mmap_guards checks below. ---
+if ./vytoc run tests/fixtures/math_algebra.vt -- singular 2>&1 | grep -q "Matrix.inverted: singular matrix"; then
+    echo "PASS math_algebra_singular"
+else
+    echo "FAIL math_algebra_singular (expected a singular-matrix panic)"
+    fail=1
+fi
+
 # --- vyto/geo: coords, datums, spherical measures, BBox (pure Vyto) ---
 got=$(./vytoc run tests/fixtures/geo_math.vt 2>&1)
 if [ "$got" = "$(cat tests/fixtures/geo_math.expected)" ]; then
