@@ -1,0 +1,320 @@
+// tables.vt — the schema both entry points must agree on, plus the small
+// helpers around it.
+//
+// db_test.vt loads and measures; db_server.vt serves. If each carried its own
+// CREATE TABLE the two would drift, and the drift would show up as a query
+// error somewhere far away from the cause. So the schema is spelled once, here,
+// and both import it.
+//
+// Everything in this file is deliberately allocation-frugal: the row generators
+// run inside the measured insert loop, so anything that allocates per row shows
+// up as db throughput that isn't.
+
+import { Db, Result, table, dropTable, insert, dbInt, dbText, dbFloat } from "vyto/db";
+import { sqlite } from "vyto/db/sqlite";
+import { appDir } from "vyto/os";
+import { file_open, file_mkdirs, file_size, file_exists } from "vyto/io/file";
+import { StringBuilder } from "vyto/util/text";
+import { fixed } from "vyto/util/fmt";
+
+export const TABLE_COUNT: int = 10;
+export const DEFAULT_ROWS: int = 1000000;
+
+// Rows per transaction during a bulk load. A single ten-million-row
+// transaction cannot checkpoint, so the WAL would grow to the size of the
+// entire dirty set before the first fsync. Batching keeps it bounded.
+export const BATCH: int = 100000;
+
+// ---- names and paths ----------------------------------------------------
+
+// t00 .. t09. Zero-padded so lexical order matches numeric order, which is
+// what makes the /-index listing and the summary table read in order.
+export fn table_name(i: int): string {
+    if (i < 10) { return "t0" + i; }
+    return "t" + i;
+}
+
+export fn table_names(n: int): string[] {
+    let out: string[] = [];
+    let i = 0;
+    while (i < n) {
+        out.push(table_name(i));
+        i += 1;
+    }
+    return out;
+}
+
+// Only a name this module minted is ever allowed to reach quoteIdent, which
+// panics on anything that is not a plain identifier. The server routes a
+// user-supplied :name through here first.
+export fn is_known_table(name: string, n: int): bool {
+    let i = 0;
+    while (i < n) {
+        if (table_name(i) == name) { return true; }
+        i += 1;
+    }
+    return false;
+}
+
+// NOT .vyto-cache: `make clean-cache` deletes every one of those in the tree,
+// and this directory holds multiple gigabytes that took an hour to write.
+export fn data_dir(): string { return appDir() + "/data"; }
+export fn db_path(): string { return data_dir() + "/store.db"; }
+export fn stats_path(): string { return data_dir() + "/stats.txt"; }
+export fn dump_path(name: string): string { return data_dir() + "/dump_" + name + ".html"; }
+
+export fn ensure_data_dir(): bool { return file_mkdirs(data_dir()); }
+
+// Size on disk including the write-ahead log, which during a load holds real
+// data that has not been checkpointed back yet. Reporting the .db alone
+// understates it by gigabytes mid-run.
+export fn db_bytes(): int {
+    let n = 0;
+    if (file_exists(db_path())) { n += file_size(db_path()); }
+    if (file_exists(db_path() + "-wal")) { n += file_size(db_path() + "-wal"); }
+    return n;
+}
+
+// ---- opening ------------------------------------------------------------
+
+// foreignKeys(false): there are no foreign keys in this schema, and the pragma
+// costs a round trip at connect for nothing. stmtCache(32) is well above the
+// handful of distinct statements either program issues, so the cache never
+// fills — it has no eviction, and a full one silently re-prepares every call.
+export fn open_db(): Db {
+    return new Db(sqlite(db_path()).wal(true).busyTimeout(10000)
+                                   .foreignKeys(false).stmtCache(32));
+}
+
+// The bulk-load configuration. synchronous=OFF means a power cut mid-load can
+// corrupt the file — which is the correct trade for a scratch dataset you can
+// regenerate, and the wrong one for anything else. Phase 6 measures the
+// durable path separately so the gap is visible rather than hidden.
+export fn apply_load_pragmas(db: Db) {
+    db.execRaw("PRAGMA synchronous=OFF");
+    db.execRaw("PRAGMA temp_store=MEMORY");
+    db.execRaw("PRAGMA cache_size=-32000");     // 32 MB; this box has ~2 GB free
+    db.execRaw("PRAGMA wal_autocheckpoint=2000");
+}
+
+// What a real application would run. NORMAL is the sane production default
+// under WAL; FULL is what phase 6 uses to price the worst case.
+export fn apply_durable_pragmas(db: Db) {
+    db.execRaw("PRAGMA synchronous=FULL");
+    db.execRaw("PRAGMA cache_size=-32000");
+}
+
+// What the server runs. NORMAL rather than the FULL default: under WAL,
+// NORMAL cannot corrupt the database — it only risks losing the last
+// transaction or two on a power cut — and it drops the per-commit fsync that
+// costs a full disk rotation on this machine. It is the correct production
+// setting for a WAL database and the one a real app should ship.
+export fn apply_read_pragmas(db: Db) {
+    db.execRaw("PRAGMA synchronous=NORMAL");
+    db.execRaw("PRAGMA cache_size=-32000");
+    db.execRaw("PRAGMA temp_store=MEMORY");
+}
+
+// ---- schema -------------------------------------------------------------
+//
+//   id       INTEGER PRIMARY KEY    rowid alias
+//   uid      INTEGER NOT NULL
+//   amount   REAL    NOT NULL
+//   label    TEXT    NOT NULL
+//   created  INTEGER NOT NULL       unix seconds
+//
+// `integer("id").primaryKey()` and not `t.id()`. The builder's id() spelling
+// renders INTEGER PRIMARY KEY AUTOINCREMENT on SQLite (dialect.vt:147), which
+// buys monotonicity across deletes at the cost of a sqlite_sequence row
+// rewritten on every single insert. Nothing here needs that guarantee.
+// db_test.vt phase 3 measures what it costs.
+
+export fn create_table(db: Db, name: string): bool {
+    let t = table(name).ifNotExists();
+    t.integer("id").primaryKey();
+    t.integer("uid").notNull();
+    t.real("amount").notNull();
+    t.text("label").notNull();
+    t.integer("created").notNull();
+    return db.execAll(t.statements(db.dialect()));
+}
+
+// Same shape but with the builder's own id(), for the phase-3 comparison.
+export fn create_table_autoinc(db: Db, name: string): bool {
+    let t = table(name).ifNotExists();
+    t.id();
+    t.integer("uid").notNull();
+    t.real("amount").notNull();
+    t.text("label").notNull();
+    t.integer("created").notNull();
+    return db.execAll(t.statements(db.dialect()));
+}
+
+export fn drop_table(db: Db, name: string): bool {
+    return db.execRaw(dropTable(name).ifExists().sql(db.dialect()));
+}
+
+// The four bound columns, in bind order, rendered through the query builder —
+// once, outside any loop. db.exec(insert(...)) would re-render this string on
+// every call (db.vt:272), quoteIdent every column name, allocate a Value per
+// column and then linear-scan the statement cache comparing strings. That is
+// the ergonomic path, and db_server.vt uses it deliberately; the loader does
+// not, because it is measuring the floor.
+//
+// id is never bound — SQLite assigns the rowid, which is the whole reason the
+// column is a plain alias rather than AUTOINCREMENT.
+export fn insert_sql(db: Db, name: string): string {
+    return insert(name).set("uid", dbInt(0))
+                       .set("amount", dbFloat(0.0))
+                       .set("label", dbText(""))
+                       .set("created", dbInt(0))
+                       .render(db.dialect());
+}
+
+// Exact, and on a large table EXPENSIVE. SQLite keeps no cached row count, so
+// COUNT(*) is a full scan of every page — 35 seconds for ten tables of ten
+// million rows on a cold spinning disk, measured. Never put this on a page
+// that renders per request; use row_estimate below.
+export fn row_count(db: Db, name: string): int {
+    let r = db.raw("SELECT COUNT(*) AS n FROM " + db.dialect().quoteIdent(name), []);
+    if (!r.ok() || r.len() == 0) { return -1; }
+    return r.at(0).at(0).asInt();
+}
+
+// MAX(id) instead: one descending seek to the right edge of the rowid btree,
+// constant time whatever the row count. It is an upper bound rather than a
+// count — deletes make it drift — but for "roughly how big is this table" on a
+// page that has to render now, an instant approximation beats an exact number
+// nobody waited for. -1 when the table is empty or missing.
+export fn row_estimate(db: Db, name: string): int {
+    let r = db.raw("SELECT MAX(id) AS n FROM " + db.dialect().quoteIdent(name), []);
+    if (!r.ok() || r.len() == 0) { return -1; }
+    let v = r.at(0).at(0);
+    if (v.isNull()) { return 0; }
+    return v.asInt();
+}
+
+// ---- row generators -----------------------------------------------------
+//
+// Deterministic, so two runs produce the same bytes and a difference in timing
+// is a difference in the database rather than in the data.
+
+// A cheap integer hash (xorshift-mix). Spreads uids across the whole range so
+// the indexed-lookup phase is not walking a contiguous prefix.
+export fn gen_uid(i: int): int {
+    let x = i + 1;
+    x = x ^ (x << 13);
+    x = x ^ (x >> 7);
+    x = x ^ (x << 17);
+    if (x < 0) { x = 0 - x; }
+    return x % 100000000;
+}
+
+export fn gen_amount(i: int): float {
+    return ((i % 100000) as float) / 100.0;
+}
+
+export fn gen_created(i: int): int {
+    return 1700000000 + (i % 31536000);
+}
+
+// 64 labels, built once, indexed by i & 63.
+//
+// Building a fresh string per row would put a string allocation inside the
+// measured loop and would be reported as database time. A low-cardinality
+// label is also the more realistic column — and SQLite stores a full copy per
+// row regardless, so the bytes on disk are unaffected either way.
+export class Labels {
+    xs: string[];
+
+    fn init() {
+        this.xs = [];
+        let i = 0;
+        while (i < 64) {
+            let sb = new StringBuilder(16);
+            sb.append("label-");
+            sb.appendInt(i);
+            this.xs.push(sb.toString());
+            i += 1;
+        }
+    }
+
+    fn at(i: int): string { return this.xs[i & 63]; }
+}
+
+// ---- memory -------------------------------------------------------------
+//
+// Linux only, via /proc. Returns -1 everywhere else, which callers print as
+// "n/a" rather than as a number that would be a lie. This app is a server
+// stress harness and servers run on Linux; the same call VytoWeb makes.
+//
+// These files stat as size 0, so they are read a line at a time. readText()
+// may size its buffer from stat and come back empty.
+
+fn proc_line(path: string, prefix: string): string {
+    let f = file_open(path, "r");
+    if (f == null) { return ""; }
+    while (!f.eof()) {
+        let ln = f.readLine();
+        if (ln.len == 0) { continue; }
+        if (prefix.len == 0) { f.close(); return ln; }
+        if (ln.starts_with(prefix)) { f.close(); return ln; }
+    }
+    f.close();
+    return "";
+}
+
+fn digits_after(s: string, start: int): int {
+    let i = start;
+    while (i < s.len && (s[i] == 32 || s[i] == 9)) { i += 1; }
+    let n = 0;
+    let any = false;
+    while (i < s.len && s[i] >= 48 && s[i] <= 57) {
+        n = n * 10 + ((s[i] as int) - 48);
+        any = true;
+        i += 1;
+    }
+    if (!any) { return -1; }
+    return n;
+}
+
+// Current resident set, KB. Field 2 of /proc/self/statm is resident pages.
+export fn rss_kb(): int {
+    let ln = proc_line("/proc/self/statm", "");
+    if (ln.len == 0) { return -1; }
+    let sp = ln.index_of(" ");
+    if (sp < 0) { return -1; }
+    let pages = digits_after(ln, sp + 1);
+    if (pages < 0) { return -1; }
+    return pages * 4;                       // 4 KB pages
+}
+
+// Peak resident set since the process started, KB. This is the number that
+// matters for "does a ten-million-row scan stay flat" — a transient spike is
+// invisible to sampling but not to VmHWM.
+export fn peak_rss_kb(): int {
+    let ln = proc_line("/proc/self/status", "VmHWM:");
+    if (ln.len == 0) { return -1; }
+    return digits_after(ln, 6);
+}
+
+// Available memory, KB — MemAvailable, not MemFree, because page cache is
+// reclaimable. Used to decide whether the dataset will be served warm or cold,
+// without which a throughput figure means nothing.
+export fn mem_available_kb(): int {
+    let ln = proc_line("/proc/meminfo", "MemAvailable:");
+    if (ln.len == 0) { return -1; }
+    return digits_after(ln, 13);
+}
+
+export fn kb_str(kb: int): string {
+    if (kb < 0) { return "n/a"; }
+    if (kb < 1024) { return kb + " KB"; }
+    if (kb < 1048576) { return fixed((kb as float) / 1024.0, 1) + " MB"; }
+    return fixed((kb as float) / 1048576.0, 2) + " GB";
+}
+
+export fn bytes_str(b: int): string {
+    if (b < 0) { return "n/a"; }
+    return kb_str(b / 1024);
+}

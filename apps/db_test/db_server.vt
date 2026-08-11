@@ -1,0 +1,328 @@
+// db_server — the same store db_test.vt loaded, served over HTTP.
+//
+//   ./vytoc run apps/db_test/db_server.vt              # :8080
+//   ./vytoc run apps/db_test/db_server.vt -- 9000
+//
+// Load the data first: ./vytoc run apps/db_test/db_test.vt
+//
+// ── THE CONSTRAINT THAT SHAPES THIS FILE ────────────────────────────────────
+//
+// vyto/net/server has no chunked or streaming response. write_response
+// (server.vt:1631) composes the status line, the headers, an auto-computed
+// Content-Length and the whole of res.body_str into the connection buffer
+// *after* the handler returns; the handler never sees the socket. Ten million
+// rows of HTML is ~1.5 GB, and a StringBuilder doubling its way there peaks at
+// twice that. On any machine that is a bad idea; on this one it is an OOM.
+//
+// So /t/:name/all does not build a response. It scans the table straight into
+// a file through a BufWriter — flush threshold 1 MB, so resident memory is
+// bounded by the buffer and not by the row count — and then hands the path to
+// res.sendFile(), which lseeks for the length and lets sendfile(2) move the
+// bytes. They never enter the process. That is the whole trick, and it is why
+// serving a ten-million-row table is possible here at all.
+//
+// The paginated route beside it is keyset, never OFFSET. LIMIT 100 OFFSET
+// 9999900 walks ten million rows to discard all but the last hundred; WHERE id
+// > ? ORDER BY id LIMIT 100 is one seek. On a spinning disk that is the
+// difference between instant and a minute, and using OFFSET here would make
+// the app a demonstration of the wrong thing.
+
+import { server, Server, ServerRequest, ServerResponse } from "vyto/net/server";
+import { Db, Result, Cursor, Row, Value,
+         select, insert, dbInt, dbText, dbFloat, OP_GT } from "vyto/db";
+import { Conn, Stmt, STEP_ROW } from "vyto/db/driver";
+import { sqlite } from "vyto/db/sqlite";
+import { query_parse, url_decode } from "vyto/util/url";
+import { html_escape } from "vyto/util/html";
+import { StringBuilder, stringBuilder } from "vyto/util/text";
+import { bufWriter, file_open, file_exists, file_size, file_mtime } from "vyto/io/file";
+import { Timer } from "vyto/util/time";
+import { fixed } from "vyto/util/fmt";
+import { parse_int, parse_float } from "vyto/cli";
+import { TABLE_COUNT, table_name, table_names, is_known_table,
+         db_path, stats_path, dump_path, db_bytes, ensure_data_dir,
+         open_db, apply_read_pragmas, row_count, row_estimate, gen_created,
+         rss_kb, peak_rss_kb, kb_str, bytes_str } from "tables";
+import { Page, PER_PAGE, css, render_index, render_page, render_form, render_miss,
+         write_dump, open_rows, row_tr, close_rows, commas } from "view";
+
+// ---- request helpers ----------------------------------------------------
+//
+// queryParam does not percent-decode and cannot tell an absent key from an
+// empty one (server.vt:865). Both are treated as "use the default", which is
+// what every existing app in the tree does.
+
+fn int_param(req: ServerRequest, name: string, dflt: int, lo: int, hi: int): int {
+    let raw = req.queryParam(name);
+    if (raw.len == 0) { return dflt; }
+    let out: int[] = [0];
+    if (!parse_int(url_decode(raw), out)) { return dflt; }
+    let v = out[0];
+    if (v < lo) { return lo; }
+    if (v > hi) { return hi; }
+    return v;
+}
+
+// A :name from the request never reaches quoteIdent unvalidated — that
+// function panics on anything that is not a plain identifier, which would turn
+// a stray URL into a process abort. Only names this app minted get through.
+fn table_of(req: ServerRequest): string {
+    let n = req.param("name");
+    if (!is_known_table(n, TABLE_COUNT)) { return ""; }
+    return n;
+}
+
+// ---- GET / --------------------------------------------------------------
+
+fn read_stats(): string[] {
+    let out: string[] = [];
+    if (!file_exists(stats_path())) { return out; }
+    let f = file_open(stats_path(), "r");
+    if (f == null) { return out; }
+    while (!f.eof()) {
+        let ln = f.readLine();
+        if (ln.len > 0) { out.push(ln); }
+    }
+    f.close();
+    return out;
+}
+
+// row_estimate, not row_count. COUNT(*) is a full scan in SQLite — there is no
+// cached row count — so counting ten tables of ten million rows took 27.7
+// seconds to render this page. MAX(id) is one seek to the edge of the rowid
+// btree and is constant time. The page says "≈" and means it.
+fn page_index(db: Db): Page {
+    let names = table_names(TABLE_COUNT);
+    let counts: int[] = [];
+    let i = 0;
+    while (i < names.len) {
+        counts.push(row_estimate(db, names[i]));
+        i += 1;
+    }
+    return render_index(names, counts, bytes_str(db_bytes()),
+                        kb_str(rss_kb()), kb_str(peak_rss_kb()), read_stats());
+}
+
+// ---- GET /t/:name -------------------------------------------------------
+
+fn page_rows(db: Db, req: ServerRequest): Page {
+    let name = table_of(req);
+    if (name.len == 0) { return render_miss(req.path(), 404); }
+
+    let after = int_param(req, "after", 0, 0, 9223372036854775000);
+    let n = int_param(req, "n", PER_PAGE, 1, 1000);
+
+    // Keyset. One index seek into the rowid btree, then n sequential rows —
+    // the same cost on page one and on page one hundred thousand.
+    let r = db.all(select(name).whereOp("id", OP_GT, dbInt(after)).orderBy("id").limit(n));
+    if (!r.ok()) { return new Page(500, "query failed: " + html_escape(r.error())); }
+
+    let last = after;
+    if (r.len() > 0) { last = r.at(r.len() - 1).getInt("id"); }
+
+    // Estimate by default, exact only when asked — ?exact=1 is a full scan and
+    // on a ten-million-row table it costs seconds.
+    let total = row_estimate(db, name);
+    let exact = req.queryParam("exact").len > 0;
+    if (exact) { total = row_count(db, name); }
+
+    return render_page(name, total, exact, after, n, r.rows, last);
+}
+
+// ---- GET /t/:name/all ---------------------------------------------------
+//
+// Writes the document to disk, then sends it with sendfile(2). Cached: the
+// dump is reused unless the store is newer than it, because regenerating ~1.5
+// GB of HTML per request on a spinning disk would make the route unusable.
+// ?force=1 regenerates; ?limit=N caps the rows so a human has a survivable
+// version.
+
+fn serve_all(db: Db, req: ServerRequest, res: ServerResponse) {
+    let name = table_of(req);
+    if (name.len == 0) {
+        let p = render_miss(req.path(), 404);
+        res.html(p.status, p.body);
+        return;
+    }
+
+    let limit = int_param(req, "limit", 0, 0, 100000000);
+    let force = req.queryParam("force").len > 0;
+
+    // A capped dump gets its own file, so asking for 500 rows never overwrites
+    // the full one that took ten minutes to write.
+    let path = dump_path(name);
+    if (limit > 0) { path = dump_path(name + "_" + limit); }
+
+    let stale = true;
+    if (!force && file_exists(path)) {
+        stale = file_mtime(path) < file_mtime(db_path());
+    }
+
+    if (stale) {
+        // Generating inline blocks the handler. On a ten-million-row table
+        // that is ~20 s, and the idle sweep (server.vt:631, a 15 s deadline)
+        // will reap this connection before a byte is sent — it cannot tell a
+        // slow client from a slow handler. db_test.vt pre-generates the
+        // uncapped dump for exactly this reason, so the common path never
+        // lands here; a capped one is fast enough not to care.
+        print("  regenerating " + path + " ...");
+        let n = write_dump(db, name, path, limit);
+        if (n < 0) {
+            res.text(500, "could not write the dump");
+            return;
+        }
+        print("  wrote " + commas(n) + " rows, " + bytes_str(file_size(path)));
+    }
+
+    // The bytes go from the page cache to the socket without passing through
+    // this process. res.body_str stays empty; Content-Length comes from the
+    // file's own length (server.vt:1657).
+    if (!res.sendFile(200, path)) {
+        res.text(500, "dump vanished between writing and sending");
+        return;
+    }
+    res.header("Content-Type", "text/html; charset=utf-8");
+    res.header("Cache-Control", "no-store");
+}
+
+// ---- /new ---------------------------------------------------------------
+
+fn page_new(req: ServerRequest): Page {
+    return render_form(table_names(TABLE_COUNT), req.queryParam("table"), "", "");
+}
+
+// The server has no form parser — bodyText() is the raw body and query_parse
+// form-decodes it (url.vt:224). The body is already bounded by
+// Limits.max_body_bytes (1 MB) before the handler runs.
+fn post_new(db: Db, req: ServerRequest): Page {
+    let names = table_names(TABLE_COUNT);
+    let f = query_parse(req.bodyText());
+
+    let name = f.get("table");
+    if (!is_known_table(name, TABLE_COUNT)) {
+        return render_form(names, "", "unknown table: " + name, "");
+    }
+
+    let uidOut: int[] = [0];
+    if (!parse_int(f.get("uid"), uidOut)) {
+        return render_form(names, name, "uid must be an integer", "");
+    }
+    let amtOut: float[] = [0.0];
+    if (!parse_float(f.get("amount"), amtOut)) {
+        return render_form(names, name, "amount must be a number", "");
+    }
+    let label = f.get("label");
+    if (label.len == 0) {
+        return render_form(names, name, "label cannot be empty", "");
+    }
+    if (label.len > 200) { label = label.slice(0, 200); }
+
+    // The ergonomic path, on purpose. db_test.vt measures the floor with a
+    // prepared statement rebound in a loop; this is what an application
+    // actually writes, and what it actually costs per request.
+    //
+    // Every value is bound. `label` arrived from a form and is never spliced
+    // into SQL — which is what makes the injection impossible rather than
+    // careful.
+    let t = new Timer();
+    let r = db.exec(insert(name).set("uid", dbInt(uidOut[0]))
+                                .set("amount", dbFloat(amtOut[0]))
+                                .set("label", dbText(label))
+                                .set("created", dbInt(gen_created(uidOut[0]))));
+    let ms = t.elapsedMs();
+
+    if (!r.ok()) {
+        return render_form(names, name, "insert failed: " + r.error(), "");
+    }
+    return render_form(names, name, "",
+        "inserted id " + commas(r.insertId) + " into " + name
+        + " in " + fixed(ms, 2) + " ms");
+}
+
+// ---- GET /stats ---------------------------------------------------------
+
+fn json_stats(db: Db): string {
+    let sb = stringBuilder(1024);
+    sb.append("{\"tables\":[");
+    let i = 0;
+    while (i < TABLE_COUNT) {
+        if (i > 0) { sb.append(","); }
+        sb.append("{\"name\":\"").append(table_name(i)).append("\",\"rows_est\":");
+        sb.appendInt(row_estimate(db, table_name(i)));
+        sb.append("}");
+        i += 1;
+    }
+    sb.append("],\"db_bytes\":").appendInt(db_bytes());
+    sb.append(",\"rss_kb\":").appendInt(rss_kb());
+    sb.append(",\"peak_rss_kb\":").appendInt(peak_rss_kb());
+    sb.append("}");
+    return sb.toString();
+}
+
+// ---- main ---------------------------------------------------------------
+
+fn main() {
+    let av = args();
+    let port = 8080;
+    if (av.len > 0) {
+        let out: int[] = [0];
+        if (parse_int(av[0], out)) { port = out[0]; }
+    }
+
+    ensure_data_dir();
+    if (!file_exists(db_path())) {
+        print("no store at " + db_path());
+        print("load it first:  ./vytoc run apps/db_test/db_test.vt");
+        return;
+    }
+
+    // Opened once, before serving, and captured by every handler below.
+    //
+    // runSingle(), not run(): run() pre-forks, and a sqlite3 handle must not
+    // cross a fork() — it would have to be opened per worker, after the fork,
+    // which core gives no hook for. One process also keeps the row counts and
+    // the RSS figure coherent, since workers share nothing.
+    let db = open_db();
+    if (!db.isOpen()) {
+        print("open failed: " + db.error());
+        return;
+    }
+    apply_read_pragmas(db);
+
+    let s = server(port).fromEnv();
+    s.bindHost("127.0.0.1");
+    s.withHeader("Server", "vyto-db_test/0.1");
+    s.withHeader("X-Content-Type-Options", "nosniff");
+    s.withHeader("Referrer-Policy", "no-referrer");
+
+    // One statement per handler — v0.1 has no nested closures, so every body
+    // is a call into a top-level fn with `db` captured.
+    s.get("/", (req, res) => { let p = page_index(db); res.html(p.status, p.body); });
+    s.get("/t/:name", (req, res) => { let p = page_rows(db, req); res.html(p.status, p.body); });
+    s.get("/t/:name/all", (req, res) => { serve_all(db, req, res); });
+    s.get("/new", (req, res) => { let p = page_new(req); res.html(p.status, p.body); });
+    s.post("/new", (req, res) => { let p = post_new(db, req); res.html(p.status, p.body); });
+    s.get("/stats", (req, res) => { res.json(200, json_stats(db)); });
+
+    // Fields set directly rather than res.html(): the helpers append a
+    // Content-Type, so calling one and then header() emits two of them.
+    s.get("/style.css", (req, res) => { send_css(res); });
+
+    s.withNotFound((req, res) => { let p = render_miss(req.path(), res.status);
+                                   res.html(p.status, p.body); });
+    s.onRequest((req, status, bytes, us) => {
+        print(req.method() + " " + req.target() + " -> " + status
+              + "  " + bytes + "B  " + (us / 1000) + "ms");
+    });
+
+    print("db_test server on http://127.0.0.1:" + port + "  (Ctrl-C to stop)");
+    print("  store " + db_path() + "  (" + bytes_str(db_bytes()) + ")");
+    s.runSingle();
+}
+
+fn send_css(res: ServerResponse) {
+    res.status = 200;
+    res.body_str = css();
+    res.header("Content-Type", "text/css; charset=utf-8");
+    res.header("Cache-Control", "max-age=3600");
+}

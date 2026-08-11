@@ -1,0 +1,347 @@
+// view.vt — every byte of HTML db_server.vt emits.
+//
+// ── ESCAPING ────────────────────────────────────────────────────────────────
+// Anything that came from a request goes through html_escape before it reaches
+// a builder. Anything this file wrote itself does not. There is no third case:
+// a value is either ours or theirs, and the call site says which.
+//
+// Rows are the exception worth naming: db_test.vt generates every label, so
+// the loaded data is ours — but the form at /new lets anyone put a string in a
+// row, so rendered cells are escaped like any other untrusted value. The
+// database is not a trust boundary.
+//
+// ── BUILDING ────────────────────────────────────────────────────────────────
+// StringBuilder throughout, never `s = s + x` in a loop, which is quadratic.
+// Helpers take the builder as their first parameter and append into it rather
+// than returning strings to be concatenated.
+
+import { StringBuilder, stringBuilder } from "vyto/util/text";
+import { html_escape, html_escape_attr } from "vyto/util/html";
+import { Db, Row } from "vyto/db";
+import { Conn, Stmt, STEP_ROW } from "vyto/db/driver";
+import { bufWriter } from "vyto/io/file";
+import { Timer } from "vyto/util/time";
+import { fixed } from "vyto/util/fmt";
+
+// A handler stays one statement wide, and a miss can still answer 404 rather
+// than being forced to 200 by the shape of the return type.
+export class Page {
+    status: int;
+    body: string;
+
+    fn init(status: int, body: string) {
+        this.status = status;
+        this.body = body;
+    }
+}
+
+export const PER_PAGE: int = 100;
+
+export fn css(): string {
+    return "*{box-sizing:border-box}"
+         + "body{margin:0;font:14px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;"
+         + "background:#0f1115;color:#d7dae0}"
+         + "header{padding:14px 20px;background:#161a21;border-bottom:1px solid #262b35;"
+         + "display:flex;gap:18px;align-items:baseline;flex-wrap:wrap}"
+         + "header h1{margin:0;font-size:15px;letter-spacing:.02em;color:#e8eaf0}"
+         + "header a{color:#8ab4f8;text-decoration:none}header a:hover{text-decoration:underline}"
+         + "main{padding:20px;max-width:1200px}"
+         + "table{border-collapse:collapse;width:100%;margin:12px 0}"
+         + "th,td{padding:5px 10px;border-bottom:1px solid #232833;text-align:left;"
+         + "white-space:nowrap}"
+         + "th{color:#9aa3b2;font-weight:600;border-bottom:1px solid #333a48}"
+         + "tbody tr:hover{background:#171b22}"
+         + "td.n{text-align:right;font-variant-numeric:tabular-nums}"
+         + "a{color:#8ab4f8}"
+         + ".grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:10px}"
+         + ".card{background:#161a21;border:1px solid #262b35;border-radius:6px;padding:12px}"
+         + ".card b{display:block;font-size:15px;color:#e8eaf0;margin-bottom:2px}"
+         + ".card span{color:#8b93a3;font-size:12px}"
+         + ".warn{background:#2a1d12;border:1px solid #5a3a1a;color:#e8b782;"
+         + "padding:10px 12px;border-radius:6px;margin:12px 0}"
+         + ".err{background:#2a1417;border:1px solid #5a2029;color:#f0a0aa;"
+         + "padding:10px 12px;border-radius:6px;margin:12px 0}"
+         + ".ok{background:#12241a;border:1px solid #23502f;color:#8fd7a4;"
+         + "padding:10px 12px;border-radius:6px;margin:12px 0}"
+         + "form{background:#161a21;border:1px solid #262b35;border-radius:6px;"
+         + "padding:16px;max-width:420px}"
+         + "label{display:block;margin:10px 0 3px;color:#9aa3b2;font-size:12px}"
+         + "input,select{width:100%;padding:7px 9px;background:#0f1115;color:#d7dae0;"
+         + "border:1px solid #333a48;border-radius:4px;font:inherit}"
+         + "button{margin-top:16px;padding:8px 18px;background:#2b5fd9;color:#fff;"
+         + "border:0;border-radius:4px;font:inherit;cursor:pointer}"
+         + "button:hover{background:#3b6ee8}"
+         + "nav.pg{display:flex;gap:10px;margin:14px 0;align-items:center}"
+         + "dl{display:grid;grid-template-columns:max-content 1fr;gap:2px 18px;margin:0}"
+         + "dt{color:#8b93a3}dd{margin:0;font-variant-numeric:tabular-nums}";
+}
+
+fn shell(title: string, body: string): string {
+    let sb = stringBuilder(body.len + 1024);
+    sb.append("<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">");
+    sb.append("<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">");
+    sb.append("<title>").append(html_escape(title)).append(" · db_test</title>");
+    sb.append("<link rel=\"stylesheet\" href=\"/style.css\"></head><body>");
+    sb.append("<header><h1>db_test</h1>");
+    sb.append("<a href=\"/\">tables</a><a href=\"/new\">insert a row</a>");
+    sb.append("<a href=\"/stats\">stats.json</a></header>");
+    sb.append("<main>").append(body).append("</main></body></html>");
+    return sb.toString();
+}
+
+// ---- index --------------------------------------------------------------
+
+export fn render_index(names: string[], counts: int[], dbSize: string,
+                       rss: string, peak: string, stats: string[]): Page {
+    let sb = stringBuilder(4096);
+
+    sb.append("<div class=\"grid\">");
+    let i = 0;
+    while (i < names.len) {
+        sb.append("<div class=\"card\"><b><a href=\"/t/").append(names[i]).append("\">");
+        sb.append(names[i]).append("</a></b><span>");
+        if (counts[i] < 0) { sb.append("not loaded"); }
+        else { sb.append(commas(counts[i])).append(" rows"); }
+        sb.append("</span></div>");
+        i += 1;
+    }
+    sb.append("</div>");
+
+    sb.append("<h2>process</h2><dl>");
+    sb.append("<dt>database on disk</dt><dd>").append(dbSize).append("</dd>");
+    sb.append("<dt>resident memory</dt><dd>").append(rss).append("</dd>");
+    sb.append("<dt>peak resident</dt><dd>").append(peak).append("</dd>");
+    sb.append("</dl>");
+
+    if (stats.len > 0) {
+        sb.append("<h2>last load</h2><table><tbody>");
+        let j = 0;
+        while (j < stats.len) {
+            let tab = stats[j].index_of("\t");
+            sb.append("<tr><td>");
+            if (tab < 0) { sb.append(html_escape(stats[j])).append("</td><td></td></tr>"); }
+            else {
+                sb.append(html_escape(stats[j].slice(0, tab)));
+                sb.append("</td><td>");
+                sb.append(html_escape(stats[j].slice(tab + 1, stats[j].len)));
+                sb.append("</td></tr>");
+            }
+            j += 1;
+        }
+        sb.append("</tbody></table>");
+    } else {
+        sb.append("<div class=\"warn\">No load recorded yet. Run "
+                + "<code>./vytoc run apps/db_test/db_test.vt</code> first.</div>");
+    }
+
+    return new Page(200, shell("tables", sb.toString()));
+}
+
+// ---- a page of rows -----------------------------------------------------
+
+export fn open_rows(sb: StringBuilder, name: string, count: int, exact: bool,
+                    after: int, n: int) {
+    sb.append("<h2>").append(name).append("</h2><p>");
+    if (count >= 0) {
+        if (exact) { sb.append(commas(count)).append(" rows exactly. "); }
+        else { sb.append("≈ ").append(commas(count)).append(" rows. "); }
+    }
+    sb.append("Showing up to ").append("" + n).append(" from id &gt; ").append("" + after);
+    sb.append(".</p>");
+    sb.append("<table><thead><tr><th class=\"n\">id</th><th class=\"n\">uid</th>");
+    sb.append("<th class=\"n\">amount</th><th>label</th><th class=\"n\">created</th>");
+    sb.append("</tr></thead><tbody>");
+}
+
+// One row. Every cell is escaped: the loader generated these, but /new lets a
+// request put anything in a label, and the database is not a trust boundary.
+export fn row_tr(sb: StringBuilder, id: int, uid: int, amount: float, label: string, created: int) {
+    sb.append("<tr><td class=\"n\">").appendInt(id);
+    sb.append("</td><td class=\"n\">").appendInt(uid);
+    sb.append("</td><td class=\"n\">").append(fixed(amount, 2));
+    sb.append("</td><td>").append(html_escape(label));
+    sb.append("</td><td class=\"n\">").appendInt(created);
+    sb.append("</td></tr>");
+}
+
+export fn close_rows(sb: StringBuilder) {
+    sb.append("</tbody></table>");
+}
+
+export fn render_page(name: string, count: int, exact: bool, after: int, n: int,
+                      rows: Row[], lastId: int): Page {
+    let sb = stringBuilder(n * 160 + 2048);
+    open_rows(sb, name, count, exact, after, n);
+    let i = 0;
+    while (i < rows.len) {
+        let r = rows[i];
+        row_tr(sb, r.getInt("id"), r.getInt("uid"), r.getFloat("amount"),
+               r.getStr("label"), r.getInt("created"));
+        i += 1;
+    }
+    close_rows(sb);
+
+    sb.append("<nav class=\"pg\">");
+    if (rows.len > 0) {
+        sb.append("<a href=\"/t/").append(name).append("?after=").append("" + lastId);
+        sb.append("&amp;n=").append("" + n).append("\">next ").append("" + n).append(" →</a>");
+    } else {
+        sb.append("<span>end of table</span>");
+    }
+    sb.append("<a href=\"/t/").append(name).append("\">first page</a>");
+    if (!exact) {
+        sb.append("<a href=\"/t/").append(name).append("?after=").append("" + after);
+        sb.append("&amp;n=").append("" + n).append("&amp;exact=1\">count exactly</a>");
+    }
+    sb.append("<a href=\"/t/").append(name).append("/all?limit=500\">dump 500 rows</a>");
+    sb.append("<a href=\"/t/").append(name).append("/all\">dump every row</a>");
+    sb.append("</nav>");
+
+    sb.append("<div class=\"warn\"><b>Why “≈”.</b> SQLite keeps no cached row "
+            + "count, so <code>COUNT(*)</code> is a full scan — 3.5&nbsp;s for one "
+            + "10M-row table here, 27.7&nbsp;s to count all ten. The figure above is "
+            + "<code>MAX(id)</code>: one seek to the edge of the rowid btree, constant "
+            + "time, and an upper bound rather than a count. “count exactly” does the "
+            + "real scan if you want to wait for it.</div>");
+
+    sb.append("<div class=\"warn\"><b>About “dump every row”.</b> It renders the whole "
+            + "table to a file and sends it with sendfile(2), so the server's memory "
+            + "stays flat no matter how many rows there are — but for 10M rows that is "
+            + "~1.5&nbsp;GB of HTML, and no browser will lay out a table that size. "
+            + "Fetch it with <code>curl -o dump.html</code>, or use the capped link.</div>");
+
+    return new Page(200, shell(name, sb.toString()));
+}
+
+// ---- the insert form ----------------------------------------------------
+
+export fn render_form(names: string[], sel: string, err: string, ok: string): Page {
+    let sb = stringBuilder(2048);
+
+    if (err.len > 0) { sb.append("<div class=\"err\">").append(html_escape(err)).append("</div>"); }
+    if (ok.len > 0) { sb.append("<div class=\"ok\">").append(html_escape(ok)).append("</div>"); }
+
+    sb.append("<h2>insert a row</h2>");
+    sb.append("<p>This goes in through <code>db.exec(insert(...))</code> — the same "
+            + "ergonomic path any app would use, re-rendering the SQL and re-binding "
+            + "through the statement cache. The loader deliberately does not use it.</p>");
+
+    sb.append("<form method=\"post\" action=\"/new\">");
+    sb.append("<label for=\"table\">table</label><select id=\"table\" name=\"table\">");
+    let i = 0;
+    while (i < names.len) {
+        sb.append("<option");
+        if (names[i] == sel) { sb.append(" selected"); }
+        sb.append(">").append(names[i]).append("</option>");
+        i += 1;
+    }
+    sb.append("</select>");
+    sb.append("<label for=\"uid\">uid — integer</label>"
+            + "<input id=\"uid\" name=\"uid\" value=\"42\" required>");
+    sb.append("<label for=\"amount\">amount — float</label>"
+            + "<input id=\"amount\" name=\"amount\" value=\"3.50\" required>");
+    sb.append("<label for=\"label\">label — text</label>"
+            + "<input id=\"label\" name=\"label\" value=\"hand-entered\" required>");
+    sb.append("<button type=\"submit\">insert</button>");
+    sb.append("</form>");
+
+    return new Page(200, shell("insert", sb.toString()));
+}
+
+export fn render_miss(path: string, status: int): Page {
+    let sb = stringBuilder(512);
+    sb.append("<h2>").append("" + status).append("</h2><p><code>");
+    sb.append(html_escape(path)).append("</code> is not a route here.</p>");
+    sb.append("<p><a href=\"/\">back to the tables</a></p>");
+    return new Page(status, shell("" + status, sb.toString()));
+}
+
+// ---- the streamed dump --------------------------------------------------
+//
+// These two write the head and tail of the file /t/:name/all sends. They are
+// separate from the page builders above because that document is never held in
+// memory — db_server.vt writes it straight through a BufWriter and the rows in
+// between never touch a StringBuilder that outlives one row.
+
+export fn dump_head(name: string): string {
+    let sb = stringBuilder(1024);
+    sb.append("<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">");
+    sb.append("<title>").append(html_escape(name)).append(" — every row</title>");
+    sb.append("<link rel=\"stylesheet\" href=\"/style.css\"></head><body><main>");
+    sb.append("<h2>").append(html_escape(name)).append(" — every row</h2>");
+    sb.append("<table><thead><tr><th>id</th><th>uid</th><th>amount</th>");
+    sb.append("<th>label</th><th>created</th></tr></thead><tbody>\n");
+    return sb.toString();
+}
+
+// Scan a whole table straight into `path`. Nothing accumulates: the BufWriter
+// flushes at 1 MB, so resident memory is bounded by that buffer whether the
+// table has a thousand rows or ten million — measured flat at 37 MB while
+// writing 935 MB.
+//
+// It lives here rather than in db_server.vt because db_test.vt calls it too.
+// A cold /t/:name/all on a ten-million-row table spends ~20 s generating
+// before a byte can be sent, and the server's idle sweep — the Slowloris
+// defence, a 15 s deadline set at server.vt:631 — cannot tell a slow client
+// from a slow handler, so it reaps the connection while the server itself is
+// the busy party. Generating the dump at load time means the request path only
+// ever sends a file that already exists.
+export fn write_dump(db: Db, name: string, path: string, limit: int): int {
+    let cn = db.conn();
+    let sql = "SELECT id, uid, amount, label, created FROM "
+            + db.dialect().quoteIdent(name) + " ORDER BY id";
+    if (limit > 0) { sql = sql + " LIMIT " + limit; }
+
+    let st = cn.prepare(sql);
+    if (st == null) { return -1; }
+
+    let w = bufWriter(path, 1048576);
+    if (w == null) { cn.release(st); return -1; }
+
+    let t = new Timer();
+    w.write(dump_head(name));
+
+    let rows = 0;
+    while (st.step() == STEP_ROW) {
+        w.write("<tr><td>").writeInt(st.columnValue(0).asInt());
+        w.write("</td><td>").writeInt(st.columnValue(1).asInt());
+        w.write("</td><td>").write(fixed(st.columnValue(2).asFloat(), 2));
+        w.write("</td><td>").write(html_escape(st.columnValue(3).asString()));
+        w.write("</td><td>").writeInt(st.columnValue(4).asInt());
+        w.write("</td></tr>\n");
+        rows += 1;
+    }
+
+    w.write(dump_tail(rows, t.elapsedMs() as int));
+    w.close();
+    cn.release(st);
+    return rows;
+}
+
+export fn dump_tail(rows: int, ms: int): string {
+    let sb = stringBuilder(256);
+    sb.append("</tbody></table><p>").append(commas(rows));
+    sb.append(" rows written in ").append("" + ms).append(" ms.</p></main></body></html>\n");
+    return sb.toString();
+}
+
+// ---- shared ------------------------------------------------------------
+
+export fn commas(v: int): string {
+    let neg = v < 0;
+    let n = v;
+    if (neg) { n = 0 - n; }
+    let digits = "" + n;
+    let sb = new StringBuilder(24);
+    if (neg) { sb.append("-"); }
+    let lead = digits.len % 3;
+    if (lead == 0) { lead = 3; }
+    sb.appendSlice(digits, 0, lead);
+    let i = lead;
+    while (i < digits.len) {
+        sb.append(",");
+        sb.appendSlice(digits, i, i + 3);
+        i += 3;
+    }
+    return sb.toString();
+}

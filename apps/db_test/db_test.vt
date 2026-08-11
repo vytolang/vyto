@@ -1,0 +1,714 @@
+// db_test — a load and stress harness for lib/vyto/db.
+//
+//   ./vytoc run apps/db_test/db_test.vt -- --rows 10000 --tables 2   # smoke, seconds
+//   ./vytoc run apps/db_test/db_test.vt                              # 1M x 10, ~450 MB
+//   ./vytoc run apps/db_test/db_test.vt -- --rows 10000000           # 10M x 10, ~4.5 GB
+//
+// Build --release before quoting any number from this. A debug build measures
+// the compiler's bounds checks, not the database.
+//
+//   ./vytoc build apps/db_test/db_test.vt --release -o /tmp/db_test
+//   /tmp/db_test --rows 10000000
+//
+// ── WHAT THIS IS FOR ─────────────────────────────────────────────────────────
+//
+// examples/103_db.vt proves vyto/db is correct. It says nothing about what it
+// costs, because it runs against :memory: with a handful of rows. Three
+// questions were open before this app existed:
+//
+//   1. What does a row cost on the ergonomic path? db.exec(insert(...)) renders
+//      the SQL string again on every call, quoteIdents every column, allocates
+//      a Value per column, and linear-scans the statement cache comparing
+//      strings. Phase 2 prices that against a prepared statement rebound in a
+//      loop — the same insert, with the library's conveniences removed.
+//
+//   2. What does Cursor/Row cost? Every next() allocates a fresh Row plus one
+//      Value per column, and getInt(name) is a linear string compare over the
+//      column names. Phase 5 measures three variants of one identical scan so
+//      the allocation and the name lookup can be told apart.
+//
+//   3. Does memory stay flat? Refcounting frees deterministically and a Row
+//      owns its cells, so a ten-million-row scan should not accumulate. Peak
+//      RSS is reported next to every phase; if it tracks row count, the
+//      package's central promise is broken.
+//
+// Phase 3 asks a fourth question the schema builder raised on the way past —
+// see below.
+
+import { Db, Result, Cursor, Tx, Row, Value,
+         select, insert, table, dbInt, dbText, dbFloat,
+         OP_GT, OP_EQ } from "vyto/db";
+import { Conn, Stmt, STEP_ROW, STEP_DONE } from "vyto/db/driver";
+import { sqlite } from "vyto/db/sqlite";
+import { Timer, monoMs } from "vyto/util/time";
+import { StringBuilder } from "vyto/util/text";
+import { fixed } from "vyto/util/fmt";
+import { parse_int } from "vyto/cli";
+import { write_dump } from "view";
+import { file_open, file_exists, file_remove, file_size } from "vyto/io/file";
+import { TABLE_COUNT, DEFAULT_ROWS, BATCH, Labels,
+         table_name, table_names, data_dir, db_path, stats_path, dump_path, db_bytes,
+         ensure_data_dir, open_db, apply_load_pragmas, apply_durable_pragmas,
+         apply_read_pragmas, create_table, create_table_autoinc, drop_table,
+         insert_sql, row_count, gen_uid, gen_amount, gen_created,
+         rss_kb, peak_rss_kb, mem_available_kb, kb_str, bytes_str } from "tables";
+
+// ---- options ------------------------------------------------------------
+
+class Opts {
+    rows: int;
+    tables: int;
+    resume: bool;
+    skipLoad: bool;
+    durableRows: int;
+    lookups: int;
+    noDump: bool;
+
+    fn init() {
+        this.rows = DEFAULT_ROWS;
+        this.tables = TABLE_COUNT;
+        this.resume = false;
+        this.skipLoad = false;
+        // 200, not 20000. A fsync per row on a 5400 RPM disk is bounded by
+        // rotational latency at roughly 7 rows/s, so 20000 rows would be a
+        // 48-minute phase. Raise it with --durable-rows on an SSD.
+        this.durableRows = 200;
+        this.lookups = 10000;
+        this.noDump = false;
+    }
+}
+
+fn flag_int(av: string[], i: int, dflt: int): int {
+    if (i + 1 >= av.len) { return dflt; }
+    let out: int[] = [0];
+    if (!parse_int(av[i + 1], out)) { return dflt; }
+    return out[0];
+}
+
+fn parse_opts(av: string[]): Opts {
+    let o = new Opts();
+    let i = 0;
+    while (i < av.len) {
+        let a = av[i];
+        if (a == "--rows") { o.rows = flag_int(av, i, o.rows); i += 2; continue; }
+        if (a == "--tables") { o.tables = flag_int(av, i, o.tables); i += 2; continue; }
+        if (a == "--durable-rows") { o.durableRows = flag_int(av, i, o.durableRows); i += 2; continue; }
+        if (a == "--lookups") { o.lookups = flag_int(av, i, o.lookups); i += 2; continue; }
+        if (a == "--resume") { o.resume = true; i += 1; continue; }
+        if (a == "--skip-load") { o.skipLoad = true; i += 1; continue; }
+        if (a == "--no-server-dump") { o.noDump = true; i += 1; continue; }
+        i += 1;
+    }
+    if (o.tables < 1) { o.tables = 1; }
+    if (o.tables > TABLE_COUNT) { o.tables = TABLE_COUNT; }
+    if (o.rows < 1) { o.rows = 1; }
+    return o;
+}
+
+// ---- reporting ----------------------------------------------------------
+//
+// Every phase records one line here so the summary can be printed as a table
+// at the end and written to data/stats.txt for db_server.vt to display without
+// re-running anything.
+
+class Stat {
+    label: string;
+    detail: string;
+
+    fn init(label: string, detail: string) {
+        this.label = label;
+        this.detail = detail;
+    }
+}
+
+class Report {
+    xs: Stat[];
+
+    fn init() { this.xs = []; }
+
+    fn add(label: string, detail: string) {
+        this.xs.push(new Stat(label, detail));
+        print("  " + pad(label, 34) + detail);
+    }
+}
+
+fn pad(s: string, w: int): string {
+    let sb = new StringBuilder(w + 4);
+    sb.append(s);
+    let i = s.len;
+    while (i < w) { sb.append(" "); i += 1; }
+    return sb.toString();
+}
+
+fn rate(n: int, ms: float): string {
+    if (ms <= 0.0) { return "instant"; }
+    let per = (n as float) * 1000.0 / ms;
+    return commas(per as int) + "/s";
+}
+
+// Thousands separators. A seven-digit throughput number is unreadable without
+// them and this output is meant to be read by a person.
+fn commas(v: int): string {
+    let neg = v < 0;
+    let n = v;
+    if (neg) { n = 0 - n; }
+    let digits = "" + n;
+    let sb = new StringBuilder(24);
+    if (neg) { sb.append("-"); }
+    let lead = digits.len % 3;
+    if (lead == 0) { lead = 3; }
+    sb.appendSlice(digits, 0, lead);
+    let i = lead;
+    while (i < digits.len) {
+        sb.append(",");
+        sb.appendSlice(digits, i, i + 3);
+        i += 3;
+    }
+    return sb.toString();
+}
+
+fn secs(ms: float): string { return fixed(ms / 1000.0, 2) + "s"; }
+
+fn banner(s: string) {
+    print("");
+    print("── " + s + " " + dashes(74 - s.len));
+}
+
+fn dashes(n: int): string {
+    let sb = new StringBuilder(n + 1);
+    let i = 0;
+    while (i < n) { sb.append("─"); i += 1; }
+    return sb.toString();
+}
+
+// ---- phase 2: bulk write, fast path ------------------------------------
+//
+// The hot loop. One prepare for the whole table, four Value objects reused by
+// mutating their public fields, and a commit every BATCH rows. Nothing inside
+// the loop allocates except SQLite's own page churn.
+
+fn load_table(db: Db, cn: Conn, name: string, rows: int, labels: Labels): float {
+    let st = cn.prepare(insert_sql(db, name));
+    if (st == null) {
+        print("  prepare failed: " + db.error());
+        return -1.0;
+    }
+
+    // Reused across every row. Value's fields are public, so rebinding is a
+    // field store rather than 4 * rows allocations.
+    let vu = dbInt(0);
+    let va = dbFloat(0.0);
+    let vl = dbText("");
+    let vc = dbInt(0);
+
+    let t = new Timer();
+    let tx = db.begin();
+    let i = 0;
+    while (i < rows) {
+        vu.i = gen_uid(i);
+        va.f = gen_amount(i);
+        vl.s = labels.at(i);
+        vc.i = gen_created(i);
+
+        st.bind(1, vu);                 // bind is 1-based; columnValue is 0-based
+        st.bind(2, va);
+        st.bind(3, vl);
+        st.bind(4, vc);
+        st.step();
+        st.reset();
+
+        i += 1;
+        if (i % BATCH == 0) {
+            tx.commit();
+            // Never nested: begin() panics if a transaction is already open,
+            // and SQLite has no nested BEGIN anyway.
+            tx = db.begin();
+        }
+    }
+    tx.commit();
+    let ms = t.elapsedMs();
+    cn.release(st);
+    return ms;
+}
+
+fn phase_load(db: Db, o: Opts, rep: Report) {
+    banner("phase 2 — bulk write, synchronous=OFF");
+
+    let labels = new Labels();
+    let cn = db.conn();
+    let names = table_names(o.tables);
+    let total = 0;
+    let totalMs = 0.0;
+    let bytes0 = db_bytes();
+
+    let ti = 0;
+    while (ti < o.tables) {
+        let name = names[ti];
+        ti += 1;
+
+        if (o.resume) {
+            let have = row_count(db, name);
+            if (have >= o.rows) {
+                print("  " + pad(name, 8) + "already at " + commas(have) + " rows, skipped");
+                total += have;
+                continue;
+            }
+        }
+
+        let ms = load_table(db, cn, name, o.rows, labels);
+        if (ms < 0.0) { return; }
+        total += o.rows;
+        totalMs += ms;
+        print("  " + pad(name, 8) + pad(commas(o.rows) + " rows", 18)
+              + pad(secs(ms), 10) + pad(rate(o.rows, ms), 16)
+              + "rss " + kb_str(rss_kb()));
+    }
+
+    let grew = db_bytes() - bytes0;
+    rep.add("bulk insert, total", commas(total) + " rows in " + secs(totalMs)
+            + "  (" + rate(total, totalMs) + ")");
+    let mbs = "n/a";
+    if (totalMs > 1.0) {
+        mbs = fixed((grew as float) / 1048576.0 / (totalMs / 1000.0), 1) + " MB/s";
+    }
+    rep.add("bulk insert, bytes written", bytes_str(grew) + "  (" + mbs + ")");
+    if (total > 0) {
+        rep.add("bulk insert, per row", fixed(totalMs * 1000.0 / (total as float), 2) + " us");
+    }
+}
+
+// ---- phase 3: what t.id() costs -----------------------------------------
+//
+// schema.vt's id() is the obvious spelling and every app will reach for it. On
+// SQLite it renders INTEGER PRIMARY KEY AUTOINCREMENT (dialect.vt:147), which
+// keeps a sqlite_sequence row updated on every insert so a rowid is never
+// reused after a delete. Most applications do not need that guarantee and
+// cannot see that they are paying for it.
+//
+// Two scratch tables, identical but for that one column, same row count, same
+// loop. If the gap is material it is a finding about vyto/db, not about this
+// app.
+
+fn phase_autoinc(db: Db, o: Opts, rep: Report) {
+    banner("phase 3 — t.id() AUTOINCREMENT vs a plain rowid alias");
+
+    // Scales with the run so a smoke test stays a smoke test, capped so the
+    // full run does not spend minutes re-proving a ratio.
+    let n = o.rows;
+    if (n > 200000) { n = 200000; }
+
+    let labels = new Labels();
+    let cn = db.conn();
+
+    drop_table(db, "z_plain");
+    drop_table(db, "z_autoinc");
+    create_table(db, "z_plain");
+    create_table_autoinc(db, "z_autoinc");
+
+    let msPlain = load_table(db, cn, "z_plain", n, labels);
+    let msAuto = load_table(db, cn, "z_autoinc", n, labels);
+
+    print("  " + pad("integer(\"id\").primaryKey()", 30) + pad(secs(msPlain), 10) + rate(n, msPlain));
+    print("  " + pad("t.id()  (AUTOINCREMENT)", 30) + pad(secs(msAuto), 10) + rate(n, msAuto));
+
+    if (msPlain > 0.0) {
+        let pct = (msAuto - msPlain) * 100.0 / msPlain;
+        rep.add("AUTOINCREMENT tax", fixed(pct, 1) + "%  ("
+                + rate(n, msPlain) + " -> " + rate(n, msAuto) + ")");
+    }
+
+    drop_table(db, "z_plain");
+    drop_table(db, "z_autoinc");
+}
+
+// ---- phase 4: index build ------------------------------------------------
+
+fn phase_index(db: Db, o: Opts, rep: Report) {
+    banner("phase 4 — index build, after the load");
+
+    db.execRaw("DROP INDEX IF EXISTS ix_uid");
+    let before = rss_kb();
+    let t = new Timer();
+    let ok = db.execRaw("CREATE INDEX ix_uid ON " + db.dialect().quoteIdent(table_name(0))
+                        + " (uid)");
+    let ms = t.elapsedMs();
+    let after = rss_kb();
+    if (!ok) {
+        rep.add("index build", "FAILED: " + db.error());
+        return;
+    }
+    rep.add("index build on t00(uid)", commas(o.rows) + " rows in " + secs(ms)
+            + "  (" + rate(o.rows, ms) + ")");
+    // CREATE INDEX is a single implicit transaction with an in-memory sorter,
+    // so unlike every other phase here its memory scales with the table. This
+    // is the one place resident memory moves, and it is SQLite's, not ours.
+    rep.add("  -> rss across the build", kb_str(before) + " -> " + kb_str(after));
+    // Only t00 is indexed. That leaves t01 as the unindexed control for the
+    // lookup comparison in phase 5 — free, because it is already loaded.
+}
+
+// ---- phase 5: reads ------------------------------------------------------
+
+// (a) The floor: one prepare, step in place, read column 0 with no Row and no
+// name lookup. Nothing here is avoidable without changing SQLite.
+fn scan_raw(db: Db, cn: Conn, name: string): int {
+    let st = cn.prepare("SELECT uid FROM " + db.dialect().quoteIdent(name));
+    if (st == null) { return -1; }
+    let sum = 0;
+    while (st.step() == STEP_ROW) {
+        sum += st.columnValue(0).asInt();
+    }
+    cn.release(st);
+    return sum;
+}
+
+// (b) The ergonomic path, as an app would actually write it. Every next()
+// builds a Row and a Value; every getInt walks the column names.
+fn scan_cursor_named(db: Db, name: string): int {
+    let c = db.cursor(select(name).column("uid"));
+    let sum = 0;
+    while (c.next()) {
+        sum += c.row().getInt("uid");
+    }
+    c.close();
+    return sum;
+}
+
+// (c) Same Row allocation as (b), but indexed rather than named. The gap
+// between (b) and (c) is the name scan alone; between (c) and (a), the Row.
+fn scan_cursor_indexed(db: Db, name: string): int {
+    let c = db.cursor(select(name).column("uid"));
+    let sum = 0;
+    while (c.next()) {
+        sum += c.row().at(0).asInt();
+    }
+    c.close();
+    return sum;
+}
+
+fn phase_scan(db: Db, o: Opts, rep: Report) {
+    banner("phase 5a — full scan, three ways over the same " + commas(o.rows) + " rows");
+
+    let cn = db.conn();
+    let name = table_name(0);
+
+    let rss0 = rss_kb();
+
+    let t1 = new Timer();
+    let s1 = scan_raw(db, cn, name);
+    let m1 = t1.elapsedMs();
+    let rss1 = rss_kb();
+
+    let t2 = new Timer();
+    let s2 = scan_cursor_indexed(db, name);
+    let m2 = t2.elapsedMs();
+    let rss2 = rss_kb();
+
+    let t3 = new Timer();
+    let s3 = scan_cursor_named(db, name);
+    let m3 = t3.elapsedMs();
+    let rss3 = rss_kb();
+
+    // All three read the same column of the same table. If the sums disagree,
+    // one of the three paths is wrong and every timing below is meaningless.
+    if (s1 != s2 || s2 != s3) {
+        print("  MISMATCH: raw=" + s1 + " indexed=" + s2 + " named=" + s3);
+        rep.add("full scan", "FAILED — paths disagree");
+        return;
+    }
+
+    print("  " + pad("", 34) + pad("elapsed", 10) + pad("rate", 18) + "rss after");
+    print("  " + pad("(before any scan)", 34) + pad("", 10) + pad("", 18) + kb_str(rss0));
+    print("  " + pad("raw Stmt.step + columnValue(0)", 34) + pad(secs(m1), 10)
+          + pad(rate(o.rows, m1), 18) + kb_str(rss1));
+    print("  " + pad("Cursor + row().at(0)", 34) + pad(secs(m2), 10)
+          + pad(rate(o.rows, m2), 18) + kb_str(rss2));
+    print("  " + pad("Cursor + row().getInt(\"uid\")", 34) + pad(secs(m3), 10)
+          + pad(rate(o.rows, m3), 18) + kb_str(rss3));
+
+    rep.add("scan: raw Stmt", secs(m1) + "  " + rate(o.rows, m1));
+    rep.add("scan: Cursor + at(0)", secs(m2) + "  " + rate(o.rows, m2)
+            + "  (+" + fixed((m2 - m1) * 100.0 / m1, 0) + "% vs raw)");
+    rep.add("scan: Cursor + getInt(name)", secs(m3) + "  " + rate(o.rows, m3)
+            + "  (+" + fixed((m3 - m1) * 100.0 / m1, 0) + "% vs raw)");
+    rep.add("  -> Row+Value allocation", fixed(m2 - m1, 0) + " ms over " + commas(o.rows) + " rows");
+    rep.add("  -> column name lookup", fixed(m3 - m2, 0) + " ms over " + commas(o.rows) + " rows");
+    rep.add("peak rss after scans", kb_str(peak_rss_kb()));
+}
+
+fn phase_count(db: Db, o: Opts, rep: Report) {
+    banner("phase 5b — COUNT(*) across " + o.tables + " tables");
+
+    let t = new Timer();
+    let total = 0;
+    let i = 0;
+    while (i < o.tables) {
+        total += row_count(db, table_name(i));
+        i += 1;
+    }
+    let ms = t.elapsedMs();
+    rep.add("COUNT(*) x " + o.tables, commas(total) + " rows total in " + secs(ms));
+}
+
+fn phase_lookups(db: Db, o: Opts, rep: Report) {
+    banner("phase 5c — point lookups");
+
+    let cn = db.conn();
+    let n0 = table_name(0);
+    let n1 = table_name(1);
+
+    // (e) rowid seek. The cheapest lookup SQLite has.
+    // Both variants must probe the SAME rows, or the comparison is worthless.
+    //
+    // The first version of this walked random rowids for (e) but the first ten
+    // thousand uids for (f), and reported the rowid seek as 1700x slower than
+    // the indexed one. That was not a fact about indexes: (e) was seeking
+    // randomly across a cold 3.7 GB file while (f) sat on a hot 400 KB prefix
+    // that the scan phase had just pulled into page cache. Locality, measured
+    // and mislabelled.
+    //
+    // So: pick one random row per iteration, then probe it by id and by uid.
+    // Row `r` was written by loop index r-1, so its uid is gen_uid(r-1).
+    let probes: int[] = [];
+    let i = 0;
+    while (i < o.lookups) {
+        probes.push(1 + (gen_uid(i) % o.rows));
+        i += 1;
+    }
+
+    let stId = cn.prepare("SELECT uid FROM " + db.dialect().quoteIdent(n0) + " WHERE id = ?");
+    let v = dbInt(0);
+    let t1 = new Timer();
+    let hit1 = 0;
+    i = 0;
+    while (i < o.lookups) {
+        v.i = probes[i];
+        stId.bind(1, v);
+        if (stId.step() == STEP_ROW) { hit1 += 1; }
+        stId.reset();
+        i += 1;
+    }
+    let m1 = t1.elapsedMs();
+    cn.release(stId);
+
+    // (f) indexed seek on t00(uid), the index phase 4 built — same rows.
+    let stIx = cn.prepare("SELECT id FROM " + db.dialect().quoteIdent(n0) + " WHERE uid = ?");
+    let t2 = new Timer();
+    let hit2 = 0;
+    i = 0;
+    while (i < o.lookups) {
+        v.i = gen_uid(probes[i] - 1);
+        stIx.bind(1, v);
+        if (stIx.step() == STEP_ROW) { hit2 += 1; }
+        stIx.reset();
+        i += 1;
+    }
+    let m2 = t2.elapsedMs();
+    cn.release(stIx);
+
+    // (g) the same query against t01, which has no index on uid. Every one of
+    // these is a full table scan, so twenty of them — not ten thousand.
+    //
+    // The probe value must be one that cannot exist. gen_uid never returns a
+    // negative, so a negative uid forces SQLite to walk the whole table before
+    // it can answer "no". Probing a value that IS present would stop at the
+    // first match — and because the loader writes rows in generator order, a
+    // small i matches near the start of the table and the "full scan" would
+    // measure a handful of pages.
+    let scans = 20;
+    let stFull = cn.prepare("SELECT id FROM " + db.dialect().quoteIdent(n1) + " WHERE uid = ?");
+    let t3 = new Timer();
+    i = 0;
+    while (i < scans) {
+        v.i = 0 - (i + 1);
+        stFull.bind(1, v);
+        stFull.step();
+        stFull.reset();
+        i += 1;
+    }
+    let m3 = t3.elapsedMs();
+    cn.release(stFull);
+
+    rep.add("lookup by id (rowid)", fixed(m1 * 1000.0 / (o.lookups as float), 1) + " us  ("
+            + commas(o.lookups) + " lookups, " + hit1 + " hits)");
+    rep.add("lookup by uid (indexed)", fixed(m2 * 1000.0 / (o.lookups as float), 1) + " us  ("
+            + commas(o.lookups) + " lookups, " + hit2 + " hits)");
+    rep.add("lookup by uid (no index)", fixed(m3 / (scans as float), 1) + " ms  ("
+            + scans + " full scans of " + commas(o.rows) + " rows)");
+}
+
+// ---- phase 6: durable write ---------------------------------------------
+//
+// One row per transaction at synchronous=FULL — what a web app pays when a
+// form POST has to be on disk before the response goes out. On a spinning disk
+// this is bounded by rotational latency and will be orders of magnitude below
+// phase 2. Both numbers are printed together because a bulk-load figure quoted
+// without its pragma is not a measurement of anything.
+
+fn phase_durable(db: Db, o: Opts, rep: Report) {
+    banner("phase 6 — durable write, synchronous=FULL, one row per transaction");
+
+    apply_durable_pragmas(db);
+    drop_table(db, "z_durable");
+    create_table(db, "z_durable");
+
+    let labels = new Labels();
+    let cn = db.conn();
+    let st = cn.prepare(insert_sql(db, "z_durable"));
+    let vu = dbInt(0);
+    let va = dbFloat(0.0);
+    let vl = dbText("");
+    let vc = dbInt(0);
+
+    let t = new Timer();
+    let i = 0;
+    while (i < o.durableRows) {
+        let tx = db.begin();
+        vu.i = gen_uid(i);
+        va.f = gen_amount(i);
+        vl.s = labels.at(i);
+        vc.i = gen_created(i);
+        st.bind(1, vu);
+        st.bind(2, va);
+        st.bind(3, vl);
+        st.bind(4, vc);
+        st.step();
+        st.reset();
+        tx.commit();
+        i += 1;
+    }
+    let ms = t.elapsedMs();
+    cn.release(st);
+
+    rep.add("durable insert (sync=FULL)", commas(o.durableRows) + " rows in " + secs(ms)
+            + "  (" + rate(o.durableRows, ms) + ")");
+    rep.add("  -> per row", fixed(ms * 1000.0 / (o.durableRows as float), 1) + " us");
+
+    drop_table(db, "z_durable");
+    apply_load_pragmas(db);
+}
+
+// ---- phase 7: pre-generate the server's dump ----------------------------
+//
+// Not decoration. A cold GET /t/t00/all has to scan the table and write ~935
+// MB before it can send a byte, and the server's idle sweep — the Slowloris
+// defence, a 15 s deadline (server.vt:631) — reaps the connection first,
+// because it cannot tell a slow client from a slow handler. Measured: the
+// first request died at 133 MB of 935 MB; the second, against the cached file,
+// delivered all 935 MB at 84.5 MB/s. Writing it here means the server only
+// ever sends a file that already exists.
+
+fn phase_dump(db: Db, o: Opts, rep: Report) {
+    banner("phase 7 — pre-generate the dump db_server.vt serves");
+
+    let name = table_name(0);
+    let path = dump_path(name);
+    let rss0 = rss_kb();
+    let t = new Timer();
+    let n = write_dump(db, name, path, 0);
+    let ms = t.elapsedMs();
+
+    if (n < 0) {
+        rep.add("dump", "FAILED");
+        return;
+    }
+    rep.add("dump " + name + " to HTML", commas(n) + " rows, "
+            + bytes_str(file_size(path)) + " in " + secs(ms));
+    // The point of the BufWriter: this number must not move with the row count.
+    rep.add("  -> rss across the write", kb_str(rss0) + " -> " + kb_str(rss_kb()));
+}
+
+// ---- stats file ---------------------------------------------------------
+
+fn write_stats(rep: Report, o: Opts) {
+    let f = file_open(stats_path(), "w");
+    if (f == null) { return; }
+    f.writeText("rows_per_table=" + o.rows + "\n");
+    f.writeText("tables=" + o.tables + "\n");
+    let i = 0;
+    while (i < rep.xs.len) {
+        f.writeText(rep.xs[i].label + "\t" + rep.xs[i].detail + "\n");
+        i += 1;
+    }
+    f.close();
+}
+
+// ---- main ---------------------------------------------------------------
+
+fn main() {
+    let o = parse_opts(args());
+
+    if (!ensure_data_dir()) {
+        print("cannot create " + data_dir());
+        return;
+    }
+
+    let total = o.rows * o.tables;
+    let estMb = (total * 45) / 1048576;          // ~45 B/row measured, incl. btree
+    let availKb = mem_available_kb();
+
+    print("db_test — vyto/db under load");
+    print("  store        " + db_path());
+    print("  dataset      " + o.tables + " tables x " + commas(o.rows) + " rows = "
+          + commas(total) + " rows");
+    print("  projected    ~" + estMb + " MB on disk");
+    print("  available    " + kb_str(availKb) + " RAM");
+    if (availKb > 0 && estMb * 1024 > availKb) {
+        print("  cache        COLD — the dataset exceeds available RAM, so reads hit the disk");
+    } else {
+        print("  cache        WARM — the dataset fits in page cache after the load");
+    }
+    print("  rss at start " + kb_str(rss_kb()));
+
+    let db = open_db();
+    if (!db.isOpen()) {
+        print("open failed: " + db.error());
+        return;
+    }
+    apply_load_pragmas(db);
+
+    let rep = new Report();
+
+    banner("phase 1 — schema");
+    let t0 = new Timer();
+    let i = 0;
+    while (i < o.tables) {
+        let name = table_name(i);
+        if (!o.resume && !o.skipLoad) { drop_table(db, name); }
+        if (!create_table(db, name)) {
+            print("  create " + name + " failed: " + db.error());
+            return;
+        }
+        i += 1;
+    }
+    rep.add("schema", o.tables + " tables in " + secs(t0.elapsedMs()));
+
+    if (!o.skipLoad) {
+        phase_load(db, o, rep);
+        phase_autoinc(db, o, rep);
+    }
+
+    phase_index(db, o, rep);
+    apply_read_pragmas(db);
+    phase_scan(db, o, rep);
+    phase_count(db, o, rep);
+    phase_lookups(db, o, rep);
+    phase_durable(db, o, rep);
+    if (!o.noDump) { phase_dump(db, o, rep); }
+
+    banner("summary");
+    let j = 0;
+    while (j < rep.xs.len) {
+        print("  " + pad(rep.xs[j].label, 34) + rep.xs[j].detail);
+        j += 1;
+    }
+    print("");
+    print("  " + pad("database on disk", 34) + bytes_str(db_bytes()));
+    print("  " + pad("peak rss", 34) + kb_str(peak_rss_kb()));
+    print("  " + pad("rss at exit", 34) + kb_str(rss_kb()));
+
+    write_stats(rep, o);
+    db.close();
+    print("");
+    print("  serve it:  ./vytoc run apps/db_test/db_server.vt -- 8080");
+}
