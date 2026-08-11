@@ -1,0 +1,260 @@
+// 103_db — vyto/db: the query builder, the schema builder, and the SQLite
+// driver, checked end to end.
+//
+//     ./vytoc run examples/103_db.vt
+//
+// Everything runs against `:memory:`, so this test touches no filesystem,
+// leaves nothing behind, and prints no path. Every SELECT carries an explicit
+// ORDER BY — row order without one is not contractual — and nothing here
+// prints a timestamp, a SQLite version, or an address, so the golden survives a
+// dependency bump.
+//
+// The dialect and schema sections render Postgres and MySQL SQL while linking
+// only SQLite. That is not a trick: dialects live in vyto/db/dialect, which has
+// no native code, precisely so this is possible.
+
+import { Db, Row, Value, Result, Cursor,
+         select, insert, update, deleteFrom, table, dropTable,
+         dbText, dbInt, dbFloat, dbNull, dbBlob, dbBool,
+         sqliteDialect, pgDialect, mysqlDialect,
+         dberr_name, OP_GT } from "vyto/db";
+import { sqlite, sqliteMemory } from "vyto/db/sqlite";
+
+fn check(name: string, got: string, want: string) {
+    if (got == want) {
+        print("ok    " + name);
+    } else {
+        print("FAIL  " + name);
+        print("  got  " + got);
+        print("  want " + want);
+    }
+}
+
+fn checkBool(name: string, got: bool) {
+    if (got) { print("ok    " + name); }
+    else { print("FAIL  " + name); }
+}
+
+// Blobs print as hex so a byte that is not valid UTF-8 cannot corrupt the
+// golden file.
+fn hex(b: byte[]): string {
+    let digits = "0123456789abcdef";
+    let out = "";
+    let i = 0;
+    while (i < b.len) {
+        let v = b[i] as int;
+        out = out + digits.slice(v / 16, v / 16 + 1) + digits.slice(v % 16, v % 16 + 1);
+        i += 1;
+    }
+    return out;
+}
+
+fn setup(db: Db) {
+    let t = table("users").ifNotExists();
+    t.id();
+    t.text("name").notNull().unique();
+    t.integer("age");
+    t.real("score");
+    t.blob("avatar");
+    t.boolean("active").defaultBool(true);
+    db.execAll(t.statements(db.dialect()));
+}
+
+// Opens a transaction, writes, and returns WITHOUT committing. Nothing rolls it
+// back explicitly — Tx's deinit does, when the last reference drops on return.
+fn bail_without_commit(db: Db) {
+    let tx = db.begin();
+    db.exec(insert("users").set("name", dbText("ghost")));
+}
+
+fn main() {
+    print("---- query builder, three dialects ----");
+    let q = select("users").column("id").column("name")
+                .where("active", dbInt(1))
+                .whereOp("age", OP_GT, dbInt(18))
+                .orderBy("name").limit(10);
+    check("select/sqlite", q.render(sqliteDialect()),
+          "SELECT \"id\", \"name\" FROM \"users\" WHERE \"active\" = ? AND \"age\" > ? ORDER BY \"name\" LIMIT 10");
+    check("select/postgres", q.render(pgDialect()),
+          "SELECT \"id\", \"name\" FROM \"users\" WHERE \"active\" = $1 AND \"age\" > $2 ORDER BY \"name\" LIMIT 10");
+    check("select/mysql", q.render(mysqlDialect()),
+          "SELECT `id`, `name` FROM `users` WHERE `active` = ? AND `age` > ? ORDER BY `name` LIMIT 10");
+
+    let ids: Value[] = [dbInt(1), dbInt(2)];
+    check("where in + is null", select("t").whereIn("id", ids).whereNull("del").render(pgDialect()),
+          "SELECT * FROM \"t\" WHERE \"id\" IN ($1, $2) AND \"del\" IS NULL");
+    check("join", select("a").join("b", "a.id", "b.a_id").render(sqliteDialect()),
+          "SELECT * FROM \"a\" JOIN \"b\" ON \"a\".\"id\" = \"b\".\"a_id\"");
+
+    // A raw fragment's ? placeholders are renumbered for the dialect; without
+    // that, a whereRaw would emit ? into SQL that numbers everything else $n.
+    let vr: Value[] = [dbInt(5), dbInt(9)];
+    check("where raw renumbered", select("t").whereRaw("(a = ? OR b = ?)", vr).render(pgDialect()),
+          "SELECT * FROM \"t\" WHERE (a = $1 OR b = $2)");
+
+    print("");
+    print("---- update binds SET before WHERE, whatever the call order ----");
+    // .where() is written FIRST here. If params() returned them in call order,
+    // every value would bind to the wrong placeholder and the statement would
+    // still run.
+    let u = update("users").where("id", dbInt(7)).set("name", dbText("grace"));
+    check("update sql", u.render(pgDialect()),
+          "UPDATE \"users\" SET \"name\" = $1 WHERE \"id\" = $2");
+    let up = u.params();
+    check("update param order", up[0].asString() + "," + str(up[1].asInt()), "grace,7");
+
+    print("");
+    print("---- schema builder, three dialects ----");
+    let t = table("users").ifNotExists();
+    t.id();
+    t.text("email").notNull().unique();
+    t.blob("avatar");
+    t.boolean("active").defaultBool(true);
+    t.index("idx_users_email", ["email"]);
+
+    check("ddl/sqlite", t.statements(sqliteDialect())[0],
+          "CREATE TABLE IF NOT EXISTS \"users\" (\"id\" INTEGER PRIMARY KEY AUTOINCREMENT, \"email\" TEXT NOT NULL UNIQUE, \"avatar\" BLOB, \"active\" INTEGER DEFAULT 1)");
+    check("ddl/postgres", t.statements(pgDialect())[0],
+          "CREATE TABLE IF NOT EXISTS \"users\" (\"id\" BIGSERIAL PRIMARY KEY, \"email\" TEXT NOT NULL UNIQUE, \"avatar\" BYTEA, \"active\" BOOLEAN DEFAULT TRUE)");
+    check("ddl/mysql", t.statements(mysqlDialect())[0],
+          "CREATE TABLE IF NOT EXISTS `users` (`id` BIGINT AUTO_INCREMENT PRIMARY KEY, `email` VARCHAR(255) NOT NULL UNIQUE, `avatar` BLOB, `active` TINYINT(1) DEFAULT TRUE)");
+    // MySQL accepts IF NOT EXISTS on CREATE TABLE but rejects it on CREATE
+    // INDEX, which is why that is a separate capability on the dialect.
+    check("index/sqlite", t.statements(sqliteDialect())[1],
+          "CREATE INDEX IF NOT EXISTS \"idx_users_email\" ON \"users\" (\"email\")");
+    check("index/mysql", t.statements(mysqlDialect())[1],
+          "CREATE INDEX `idx_users_email` ON `users` (`email`)");
+    check("drop", dropTable("users").ifExists().sql(sqliteDialect()),
+          "DROP TABLE IF EXISTS \"users\"");
+
+    print("");
+    print("---- SQLite: values are bound, never interpolated ----");
+    let db = new Db(sqliteMemory());
+    checkBool("open", db.isOpen());
+    check("dialect", db.dialect().name(), "sqlite");
+    setup(db);
+
+    // The single most important assertion here. If this string were spliced
+    // into the SQL, the table would be gone by the next line.
+    let evil = "'); DROP TABLE users; --";
+    let ins = db.exec(insert("users").set("name", dbText(evil)));
+    checkBool("insert ok", ins.ok());
+    check("injection stored verbatim",
+          db.one(select("users").where("name", dbText(evil))).getStr("name"), evil);
+    checkBool("table survived", db.all(select("users")).ok());
+
+    print("");
+    print("---- all five value kinds round-trip ----");
+    let bl = bytes(4);
+    bl[0] = 0 as byte; bl[1] = 1 as byte; bl[2] = 254 as byte; bl[3] = 255 as byte;
+    db.exec(insert("users").set("name", dbText("ada'é"))
+                           .set("age", dbInt(36))
+                           .set("score", dbFloat(9.5))
+                           .set("avatar", dbBlob(bl)));
+    let r = db.one(select("users").where("name", dbText("ada'é")));
+    checkBool("row exists", r.exists());
+    check("text with quote and non-ascii", r.getStr("name"), "ada'é");
+    check("int", str(r.getInt("age")), "36");
+    check("float", str(r.getFloat("score")), "9.5");
+    // A blob containing a NUL and a 0xff byte: proof the driver copies by
+    // length rather than scanning for a terminator.
+    check("blob bytes", hex(r.getBytes("avatar")), "0001feff");
+    check("kinds", r.get("name").kindName() + " " + r.get("age").kindName() + " "
+          + r.get("score").kindName() + " " + r.get("avatar").kindName(),
+          "text int float blob");
+    check("default applied", str(r.getInt("active")), "1");
+
+    print("");
+    print("---- NULL and the null object ----");
+    db.exec(insert("users").set("name", dbText("nully")).set("age", dbNull()));
+    let n = db.one(select("users").where("name", dbText("nully")));
+    checkBool("null column is null", n.isNull("age"));
+    check("null kind", n.get("age").kindName(), "null");
+    check("null reads as zero", str(n.getInt("age")), "0");
+    checkBool("unknown column is null", n.get("nonexistent").isNull());
+    checkBool("index out of range is null", n.at(99).isNull());
+    checkBool("no such row", !db.one(select("users").where("id", dbInt(-1))).exists());
+
+    print("");
+    print("---- transactions ----");
+    let before = db.all(select("users")).len();
+    let tx = db.begin();
+    db.exec(insert("users").set("name", dbText("committed")));
+    checkBool("commit", tx.commit());
+    let afterCommit = db.all(select("users")).len();
+
+    let tx2 = db.begin();
+    db.exec(insert("users").set("name", dbText("rolled-back")));
+    checkBool("rollback", tx2.rollback());
+    let afterRollback = db.all(select("users")).len();
+
+    // No explicit rollback anywhere — the Tx simply goes out of scope.
+    bail_without_commit(db);
+    let afterBail = db.all(select("users")).len();
+
+    check("commit added a row", str(afterCommit), str(before + 1));
+    check("rollback kept the count", str(afterRollback), str(afterCommit));
+    check("deinit rolled back the early return", str(afterBail), str(afterCommit));
+
+    print("");
+    print("---- cursor ----");
+    // Built in one statement: the Select and every intermediate are released at
+    // the `;`. The Cursor holds the statement and the connection itself, so it
+    // stays valid.
+    let c = db.cursor(select("users").orderBy("id"));
+    let seen = 0;
+    while (c.next()) { seen += 1; }
+    check("cursor row count", str(seen), str(afterCommit));
+    checkBool("cursor ok", c.ok());
+    checkBool("cursor is done", !c.next());
+
+    print("");
+    print("---- rows outlive the database ----");
+    let keep: Row[] = [];
+    let all = db.all(select("users").orderBy("id"));
+    let i = 0;
+    while (i < all.len()) {
+        keep.push(all.at(i));
+        i += 1;
+    }
+    db.close();
+    checkBool("closed", !db.isOpen());
+    // Every cell was copied out of SQLite's memory before it could be
+    // invalidated, so these are still readable with the connection gone.
+    check("row read after close", keep[0].getStr("name"), evil);
+    check("rows kept", str(keep.len), str(afterCommit));
+    db.close();
+    checkBool("close is idempotent", !db.isOpen());
+
+    print("");
+    print("---- errors report a code, not prose ----");
+    let db2 = new Db(sqliteMemory());
+    setup(db2);
+    let bad = db2.raw("SELECT * FROM no_such_table", []);
+    checkBool("bad sql not ok", !bad.ok());
+    check("bad sql code", dberr_name(bad.errorCode()), "sql");
+    check("bad sql has no rows", str(bad.len()), "0");
+
+    db2.exec(insert("users").set("name", dbText("dup")));
+    let dup = db2.exec(insert("users").set("name", dbText("dup")));
+    check("unique violation code", dberr_name(dup.errorCode()), "constraint");
+
+    let upd = db2.exec(update("users").set("age", dbInt(41)).where("name", dbText("dup")));
+    check("update affected", str(upd.affected), "1");
+    check("update applied", str(db2.one(select("users").where("name", dbText("dup"))).getInt("age")), "41");
+
+    let del = db2.exec(deleteFrom("users").where("name", dbText("dup")));
+    check("delete affected", str(del.affected), "1");
+    check("delete emptied the table", str(db2.all(select("users")).len()), "0");
+
+    // A connection that cannot be opened reports why rather than crashing.
+    let missing = new Db(sqlite("/nonexistent-dir-103/x.db").create(false));
+    checkBool("missing file is not open", !missing.isOpen());
+    check("missing file code", dberr_name(missing.errorCode()), "open");
+    let onClosed = missing.all(select("users"));
+    check("query on closed connection", dberr_name(onClosed.errorCode()), "closed");
+
+    db2.close();
+    print("");
+    print("done");
+}

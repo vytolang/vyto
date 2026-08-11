@@ -1,0 +1,599 @@
+// vyto/db — one way into a database, whichever engine is underneath.
+//
+//     import { Db, select, insert, table } from "vyto/db";
+//     import { sqlite } from "vyto/db/sqlite";
+//
+//     let db = new Db(sqlite("app.db"));
+//     db.execAll(table("users").ifNotExists().id().statements(db.dialect()));
+//     db.exec(insert("users").set("name", dbText("ada")));
+//
+//     let r = db.all(select("users").orderBy("id"));
+//     for (let row in r) { print(row.getStr("name")); }
+//
+// This module is also the barrel: importing a symbol here re-exports it, so
+// everything except the driver comes from "vyto/db".
+//
+// ── IT IMPORTS NO DRIVER, AND IT NEVER WILL ─────────────────────────────────
+// Native sources are compiled per package DIRECTORY for every module in the
+// transitive import closure. A `vyto/db` that imported the drivers would build
+// the SQLite amalgamation — and, once it exists, link libpq — into every
+// program that merely wanted to render a query string.
+//
+// So the APP names the driver and hands it in. That is the same rule vyto/ui
+// follows for Painter: no library constructs one, only app code does. It also
+// means there can be no db_open("sqlite://...") scheme dispatcher — a scheme is
+// a runtime string and the link line is a compile-time fact.
+// ─────────────────────────────────────────────────────────────────────────────
+
+import { Value, Row, dbNull, dbInt, dbFloat, dbText, dbBlob, dbBool, absentRow,
+         DB_NULL, DB_INT, DB_FLOAT, DB_TEXT, DB_BLOB } from "vyto/db/value";
+import { Dialect, SqliteDialect, PgDialect, MysqlDialect,
+         ansi, sqliteDialect, pgDialect, mysqlDialect,
+         COL_INT, COL_TEXT, COL_REAL, COL_BLOB, COL_BOOL,
+         COL_TIMESTAMP, isIdent } from "vyto/db/dialect";
+import { Driver, Conn, Stmt, dberr_name,
+         DBERR_NONE, DBERR_OPEN, DBERR_SQL, DBERR_CONSTRAINT, DBERR_BUSY,
+         DBERR_CLOSED, DBERR_UNSUPPORTED, DBERR_MISUSE,
+         STEP_ROW, STEP_DONE, STEP_ERR } from "vyto/db/driver";
+import { Query, Select, Insert, Update, Delete, Cond, Join,
+         select, insert, update, deleteFrom,
+         OP_EQ, OP_NE, OP_LT, OP_LE, OP_GT, OP_GE, OP_LIKE, OP_IN,
+         OP_NULL, OP_NOTNULL, CONJ_AND, CONJ_OR } from "vyto/db/query";
+import { Table, Column, Index, Drop, Alter,
+         table, dropTable, alterTable } from "vyto/db/schema";
+// Introspection. Note the record types are ColumnInfo / IndexInfo / TableInfo
+// and NOT Column / Index / Table — those names are already taken by the DDL
+// builder above, and the checker skips imports when looking for duplicate
+// top-level names, so a collision here would silently resolve to whichever
+// import line came first rather than erroring.
+import { ColumnInfo, IndexColumn, IndexInfo, ForeignKey, TriggerInfo,
+         TableInfo, Schema, absentColumn, absentIndex, absentTable, isInternalName,
+         readTableRow, readColumnRow, readIndexRow, readIndexColumnRow,
+         readForeignKeyRow, obj_name, idx_origin_name,
+         OBJ_TABLE, OBJ_VIEW, OBJ_VIRTUAL, OBJ_SHADOW, OBJ_INDEX, OBJ_TRIGGER,
+         OBJ_UNKNOWN, IDX_APPDEF, IDX_UNIQUE, IDX_PK,
+         HID_NONE, HID_HIDDEN, HID_VIRTUAL, HID_STORED } from "vyto/db/introspect";
+
+// A materialized result set. Rows own their cells, so a Result outlives the
+// statement it came from, the connection, and the Db itself.
+//
+// It has `len()` and `at(i)`, which is all Vyto's `for (let r in result)` needs
+// — there is no interface to declare.
+export class Result {
+    names: string[];
+    rows: Row[];
+    err: string;
+    code: int;
+    affected: int;
+    insertId: int;
+
+    fn init() {
+        this.names = [];
+        this.rows = [];
+        this.err = "";
+        this.code = DBERR_NONE;
+        this.affected = 0;
+        this.insertId = 0;
+    }
+
+    fn ok(): bool { return this.err == ""; }
+    fn error(): string { return this.err; }
+    fn errorCode(): int { return this.code; }
+
+    fn len(): int { return this.rows.len; }
+    fn at(i: int): Row {
+        if (i >= 0 && i < this.rows.len) { return this.rows[i]; }
+        return absentRow();
+    }
+
+    // The first row, or a row whose exists() is false. Never null — reading
+    // through null is an unchecked crash, and a result you did not check is
+    // exactly where that would happen.
+    fn first(): Row {
+        if (this.rows.len > 0) { return this.rows[0]; }
+        return absentRow();
+    }
+
+    fn columnNames(): string[] { return this.names; }
+}
+
+fn failedResult(code: int, msg: string): Result {
+    let r = new Result();
+    r.code = code;
+    r.err = msg;
+    return r;
+}
+
+// A streaming result. `Result` reads every row into memory; a Cursor holds the
+// statement open and yields one row at a time, which is what a million-row scan
+// wants.
+//
+//     let c = db.cursor(select("nums").orderBy("n"));
+//     while (c.next()) { total += c.row().getInt("n"); }
+//
+// It holds the Conn as well as the Stmt: the connection handle must outlive
+// every statement on it, and the Query that built this died at the `;`.
+export class Cursor {
+    cn: Conn;
+    st: Stmt;
+    names: string[];
+    cur: Row;
+    err: string;
+    code: int;
+    done: bool;
+
+    fn init(cn: Conn, st: Stmt, names: string[]) {
+        this.cn = cn;
+        this.st = st;
+        this.names = names;
+        this.cur = absentRow();
+        this.err = "";
+        this.code = DBERR_NONE;
+        this.done = false;
+    }
+
+    fn ok(): bool { return this.err == ""; }
+    fn error(): string { return this.err; }
+    fn errorCode(): int { return this.code; }
+
+    // True when a row is available from row(). False at the end and on error —
+    // check ok() afterwards to tell those apart.
+    fn next(): bool {
+        if (this.done || this.st == null) { return false; }
+        let s = this.st.step();
+        if (s == STEP_ROW) {
+            this.cur = snapshot(this.st, this.names);
+            return true;
+        }
+        if (s == STEP_ERR) {
+            this.err = this.st.errorMessage();
+            this.code = this.st.errorCode();
+        }
+        this.close();
+        return false;
+    }
+
+    fn row(): Row { return this.cur; }
+
+    // Idempotent, and the only place the statement goes back to the pool.
+    fn close() {
+        if (this.done) { return; }
+        this.done = true;
+        if (this.st != null && this.cn != null) {
+            this.cn.release(this.st);
+        }
+        this.st = null;
+    }
+
+    deinit { this.close(); }
+}
+
+// A transaction.
+//
+// `deinit` is the safety net: an early return, a bail-out, any path that drops
+// the Tx without committing rolls back the moment the last reference goes. That
+// is real RAII — refcounting frees deterministically, so there is no window
+// where a half-finished transaction sits open waiting for a collector.
+export class Tx {
+    cn: Conn;
+    finished: bool;
+    err: string;
+
+    fn init(cn: Conn) {
+        this.cn = cn;
+        this.finished = false;
+        this.err = "";
+    }
+
+    fn ok(): bool { return this.err == ""; }
+    fn error(): string { return this.err; }
+
+    fn commit(): bool {
+        if (this.finished) { return false; }
+        this.finished = true;
+        let got = this.cn.execRaw("COMMIT");
+        this.cn.setInTx(false);
+        if (!got) { this.err = this.cn.errorMessage(); }
+        return got;
+    }
+
+    fn rollback(): bool {
+        if (this.finished) { return false; }
+        this.finished = true;
+        let got = this.cn.execRaw("ROLLBACK");
+        this.cn.setInTx(false);
+        if (!got) { this.err = this.cn.errorMessage(); }
+        return got;
+    }
+
+    // Cannot report failure — there is no caller to report to — so a rollback
+    // that itself fails is swallowed here and left on the connection's error
+    // state. Guarded on isOpen() because close() may already have run.
+    deinit {
+        if (!this.finished && this.cn != null && this.cn.isOpen()) {
+            this.cn.execRaw("ROLLBACK");
+            this.cn.setInTx(false);
+        }
+    }
+}
+
+// Read the current row out of a statement into owned storage.
+//
+// This is where the "a Row owns its cells" rule is enforced: the driver's
+// columnValue must already have copied, because the pointers SQLite hands out
+// are invalidated by the very next step().
+fn snapshot(st: Stmt, names: string[]): Row {
+    let vals: Value[] = [];
+    let i = 0;
+    while (i < names.len) {
+        vals.push(st.columnValue(i));
+        i += 1;
+    }
+    return new Row(names, vals);
+}
+
+fn columnNamesOf(st: Stmt): string[] {
+    let names: string[] = [];
+    let n = st.columnCount();
+    let i = 0;
+    while (i < n) {
+        names.push(st.columnName(i));
+        i += 1;
+    }
+    return names;
+}
+
+export class Db {
+    cn: Conn;
+
+    // Takes a Driver, not a connection string. The driver is the only place an
+    // engine is named, and the app is the only place a driver is constructed.
+    fn init(d: Driver) {
+        this.cn = d.connect();
+    }
+
+    fn isOpen(): bool { return this.cn.isOpen(); }
+    fn dialect(): Dialect { return this.cn.dialect(); }
+    fn error(): string { return this.cn.errorMessage(); }
+    fn errorCode(): int { return this.cn.errorCode(); }
+    fn ok(): bool { return this.cn.isOpen() && this.cn.errorCode() == DBERR_NONE; }
+
+    // The underlying connection, for driver-specific work. Prefer the methods
+    // above; this is here so a driver feature does not require forking the Db.
+    fn conn(): Conn { return this.cn; }
+
+    fn lastInsertId(): int { return this.cn.lastInsertId(); }
+    fn changes(): int { return this.cn.changes(); }
+
+    // ---- running things ----------------------------------------------------
+
+    // Every row, read into memory.
+    fn all(q: Query): Result {
+        return this.raw(q.render(this.cn.dialect()), q.params());
+    }
+
+    // The first row, or a row whose exists() is false.
+    fn one(q: Query): Row {
+        let r = this.all(q);
+        return r.first();
+    }
+
+    // For INSERT / UPDATE / DELETE. The Result carries affected and insertId
+    // rather than rows.
+    fn exec(q: Query): Result {
+        return this.raw(q.render(this.cn.dialect()), q.params());
+    }
+
+    // Stream rather than materialize.
+    fn cursor(q: Query): Cursor {
+        return this.rawCursor(q.render(this.cn.dialect()), q.params());
+    }
+
+    // ---- the raw floor -----------------------------------------------------
+
+    fn raw(sql: string, params: Value[]): Result {
+        if (!this.cn.isOpen()) {
+            return failedResult(DBERR_CLOSED, this.cn.errorMessage());
+        }
+        let st = this.cn.prepare(sql);
+        if (st == null) {
+            return failedResult(this.cn.errorCode(), this.cn.errorMessage());
+        }
+        if (!bindAll(st, params)) {
+            let e = failedResult(st.errorCode(), st.errorMessage());
+            this.cn.release(st);
+            return e;
+        }
+
+        let r = new Result();
+        r.names = columnNamesOf(st);
+        let running = true;
+        while (running) {
+            let s = st.step();
+            if (s == STEP_ROW) {
+                r.rows.push(snapshot(st, r.names));
+            } else {
+                if (s == STEP_ERR) {
+                    r.err = st.errorMessage();
+                    r.code = st.errorCode();
+                }
+                running = false;
+            }
+        }
+        this.cn.release(st);
+
+        // Only meaningful for a statement that changed something, but reading
+        // them is free and a caller who asks on a SELECT gets 0.
+        r.affected = this.cn.changes();
+        r.insertId = this.cn.lastInsertId();
+        return r;
+    }
+
+    fn rawCursor(sql: string, params: Value[]): Cursor {
+        if (!this.cn.isOpen()) {
+            let c = new Cursor(this.cn, null, []);
+            c.err = this.cn.errorMessage();
+            c.code = DBERR_CLOSED;
+            c.done = true;
+            return c;
+        }
+        let st = this.cn.prepare(sql);
+        if (st == null) {
+            let c = new Cursor(this.cn, null, []);
+            c.err = this.cn.errorMessage();
+            c.code = this.cn.errorCode();
+            c.done = true;
+            return c;
+        }
+        if (!bindAll(st, params)) {
+            let c = new Cursor(this.cn, null, []);
+            c.err = st.errorMessage();
+            c.code = st.errorCode();
+            c.done = true;
+            this.cn.release(st);
+            return c;
+        }
+        return new Cursor(this.cn, st, columnNamesOf(st));
+    }
+
+    // DDL, PRAGMA, and anything else with no parameters and no rows.
+    fn execRaw(sql: string): bool {
+        if (!this.cn.isOpen()) { return false; }
+        return this.cn.execRaw(sql);
+    }
+
+    // Runs each statement in order, stopping at the first failure — which is
+    // what a schema wants: a CREATE INDEX after a failed CREATE TABLE would
+    // only produce a second, more confusing error.
+    fn execAll(stmts: string[]): bool {
+        let i = 0;
+        while (i < stmts.len) {
+            if (!this.execRaw(stmts[i])) { return false; }
+            i += 1;
+        }
+        return true;
+    }
+
+    // ---- introspection -----------------------------------------------------
+    //
+    // What is actually in the database. The records live in vyto/db/introspect;
+    // this is the half that runs the statements, the same split the query
+    // builder makes.
+    //
+    // Every one of these binds the object name as a parameter. None of them
+    // splices it into SQL, which is what lets them be called with a name that
+    // came from a user without going near the quoteIdent that panics.
+
+    fn supportsIntrospection(): bool { return this.cn.dialect().supportsIntrospection(); }
+
+    // Base tables only: views, indexes, triggers and SQLite's own sqlite_*
+    // bookkeeping are all filtered out. Empty, never null.
+    fn tables(): string[] { return this.namesOfKind(OBJ_TABLE); }
+
+    fn views(): string[] { return this.namesOfKind(OBJ_VIEW); }
+
+    fn namesOfKind(kind: int): string[] {
+        let out: string[] = [];
+        let r = this.raw(this.cn.dialect().introspectTablesSql(), []);
+        if (!r.ok()) { return out; }
+        let i = 0;
+        while (i < r.len()) {
+            let t = readTableRow(r.at(i));
+            i += 1;
+            if (t.kind != kind || isInternalName(t.name)) { continue; }
+            out.push(t.name);
+        }
+        return out;
+    }
+
+    // The sanctioned check before an observed name reaches the query builder.
+    // Note it answers "is there such a table", not "is that name usable" — a
+    // table really can be called `odd-name`, and that one needs isIdent() too.
+    fn hasTable(name: string): bool {
+        let r = this.raw(this.cn.dialect().introspectTablesSql(), []);
+        if (!r.ok()) { return false; }
+        let i = 0;
+        while (i < r.len()) {
+            if (r.at(i).at(1).asString() == name) { return true; }
+            i += 1;
+        }
+        return false;
+    }
+
+    // Everything about one table: columns, primary key, indexes and their
+    // columns, foreign keys, and the original CREATE text.
+    //
+    // A missing table comes back with exists() false rather than as a panic or
+    // a null — asking about a table that is not there is an ordinary answer,
+    // not a programming error. That matters because the pragmas cannot tell
+    // the difference themselves: they return zero rows for an absent table
+    // exactly as they would for an empty one, so existence is checked first.
+    fn describe(name: string): TableInfo {
+        let d = this.cn.dialect();
+        let listed = this.raw(d.introspectTablesSql(), []);
+        if (!listed.ok()) { return absentTable(name); }
+
+        let info = absentTable(name);
+        let i = 0;
+        while (i < listed.len()) {
+            let row = listed.at(i);
+            i += 1;
+            if (row.at(1).asString() != name) { continue; }
+            info = readTableRow(row);
+        }
+        if (!info.exists()) { return info; }
+        this.fillDetail(info);
+        info.sql = this.objectSql(name);
+        return info;
+    }
+
+    // Columns, indexes and foreign keys for a TableInfo already built from a
+    // listing row. Split out so schema() can list once and fill many, rather
+    // than calling describe() per table and re-scanning sqlite_master every
+    // time — that was quadratic in the number of tables.
+    fn fillDetail(info: TableInfo) {
+        let d = this.cn.dialect();
+        let key: Value[] = [dbText(info.name)];
+
+        let cr = this.raw(d.introspectColumnsSql(), key);
+        let j = 0;
+        while (j < cr.len()) {
+            info.cols.push(readColumnRow(cr.at(j)));
+            j += 1;
+        }
+
+        let ir = this.raw(d.introspectIndexesSql(), key);
+        let k = 0;
+        while (k < ir.len()) {
+            let ix = readIndexRow(ir.at(k), info.name);
+            k += 1;
+            // One statement per index — the shape SQLite forces. They come
+            // from the statement cache after the first, so a table with many
+            // indexes costs prepares only once per connection.
+            let xr = this.raw(d.introspectIndexColumnsSql(), [dbText(ix.name)]);
+            let m = 0;
+            while (m < xr.len()) {
+                ix.cols.push(readIndexColumnRow(xr.at(m)));
+                m += 1;
+            }
+            info.indexes.push(ix);
+        }
+
+        let fr = this.raw(d.introspectForeignKeysSql(), key);
+        let n = 0;
+        while (n < fr.len()) {
+            info.fks.push(readForeignKeyRow(fr.at(n)));
+            n += 1;
+        }
+    }
+
+    fn sqlFrom(objects: Result, name: string): string {
+        let i = 0;
+        while (i < objects.len()) {
+            let row = objects.at(i);
+            i += 1;
+            if (row.at(1).asString() == name) { return row.at(3).asString(); }
+        }
+        return "";
+    }
+
+    // The CREATE statement that made an object, verbatim. "" when unknown.
+    // The only place a generated column's expression survives — no pragma
+    // reports it.
+    fn objectSql(name: string): string {
+        let r = this.raw(this.cn.dialect().introspectObjectsSql(), []);
+        if (!r.ok()) { return ""; }
+        let i = 0;
+        while (i < r.len()) {
+            let row = r.at(i);
+            i += 1;
+            if (row.at(1).asString() == name) { return row.at(3).asString(); }
+        }
+        return "";
+    }
+
+    fn triggers(): TriggerInfo[] {
+        let out: TriggerInfo[] = [];
+        let r = this.raw(this.cn.dialect().introspectObjectsSql(), []);
+        if (!r.ok()) { return out; }
+        let i = 0;
+        while (i < r.len()) {
+            let row = r.at(i);
+            i += 1;
+            if (row.at(0).asString() != "trigger") { continue; }
+            let nm = row.at(1).asString();
+            if (isInternalName(nm)) { continue; }
+            out.push(new TriggerInfo(nm, row.at(2).asString(), row.at(3).asString()));
+        }
+        return out;
+    }
+
+    // Every table and view described, plus the triggers.
+    //
+    // The two listing queries run ONCE and the DDL text is matched against the
+    // result already in hand — calling describe() per table would re-scan
+    // sqlite_master twice per object, which is quadratic and shows up as soon
+    // as a schema has a few hundred tables. What remains is linear: three
+    // statements per table plus one per index, all served from the statement
+    // cache after the first table.
+    //
+    // Still a lot of round trips on a large schema. Fine for a client painting
+    // a tree at startup; not something to put in a request handler.
+    fn schema(): Schema {
+        let s = new Schema();
+        let r = this.raw(this.cn.dialect().introspectTablesSql(), []);
+        if (!r.ok()) { return s; }
+        let objects = this.raw(this.cn.dialect().introspectObjectsSql(), []);
+
+        let i = 0;
+        while (i < r.len()) {
+            let t = readTableRow(r.at(i));
+            i += 1;
+            if (isInternalName(t.name)) { continue; }
+            if (t.kind != OBJ_TABLE && t.kind != OBJ_VIEW) { continue; }
+            this.fillDetail(t);
+            t.sql = this.sqlFrom(objects, t.name);
+            if (t.kind == OBJ_VIEW) { s.views.push(t); } else { s.tables.push(t); }
+        }
+
+        let j = 0;
+        while (j < objects.len()) {
+            let row = objects.at(j);
+            j += 1;
+            if (row.at(0).asString() != "trigger") { continue; }
+            let nm = row.at(1).asString();
+            if (isInternalName(nm)) { continue; }
+            s.triggers.push(new TriggerInfo(nm, row.at(2).asString(), row.at(3).asString()));
+        }
+        return s;
+    }
+
+    // ---- transactions ------------------------------------------------------
+
+    // Panics if one is already open. Nesting BEGIN is an error on every engine
+    // here, and silently making it a no-op would let an inner rollback discard
+    // the outer transaction's work — a data-loss bug that looks like it worked.
+    // Savepoints are the real answer to nesting and are deliberately not in v1.
+    fn begin(): Tx {
+        if (this.cn.inTx()) {
+            panic("vyto/db: a transaction is already open on this connection");
+        }
+        this.cn.execRaw("BEGIN");
+        this.cn.setInTx(true);
+        return new Tx(this.cn);
+    }
+
+    // ---- teardown ----------------------------------------------------------
+
+    fn close() { this.cn.close(); }
+    deinit { this.cn.close(); }
+}
+
+fn bindAll(st: Stmt, params: Value[]): bool {
+    let i = 0;
+    while (i < params.len) {
+        if (!st.bind(i + 1, params[i])) { return false; }
+        i += 1;
+    }
+    return true;
+}

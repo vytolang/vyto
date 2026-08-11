@@ -1,0 +1,524 @@
+// vyto/db/query — build SELECT / INSERT / UPDATE / DELETE without writing SQL.
+//
+//     db.all(select("users").where("active", dbInt(1))
+//                           .orderBy("name")
+//                           .limit(10));
+//
+//     db.exec(insert("users").set("name", dbText("ada"))
+//                            .set("email", dbText("ada@example.com")));
+//
+//     db.exec(update("users").set("active", dbInt(0)).where("id", dbInt(7)));
+//
+// ── A QUERY DOES NOT EXECUTE ITSELF ─────────────────────────────────────────
+// There is no `.all()` on a Query; you write `db.all(q)`. Three reasons:
+//
+//   * This module imports no driver and no connection, so a query can be built,
+//     rendered and asserted with no database anywhere — including rendering
+//     Postgres SQL from a program that links only SQLite.
+//   * It keeps the two failure kinds apart. A malformed query shape is a bug in
+//     your source and PANICS at render; a missing table is the outside world
+//     talking and arrives as an error code on the Result. "Panic hard, sentinel
+//     soft", with the line in a place a reader can see.
+//   * A Query holding a connection is the lazy-cursor footgun: every
+//     intermediate in an expression is released at the `;`, so a cursor whose
+//     parent statement already died is exactly the shape that breaks. Keeping
+//     the connection out of the query removes the case.
+//
+// The cost is one level of nesting — db.all(select(...)) rather than
+// select(...).all() — which is the same trade vyto/validator already makes.
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Values are NEVER interpolated into the SQL. Every one becomes a placeholder
+// and travels to the engine as a bound parameter, which is what makes injection
+// structurally impossible instead of a matter of remembering to escape.
+
+import { Value, dbNull } from "vyto/db/value";
+import { Dialect, ansi } from "vyto/db/dialect";
+import { StringBuilder } from "vyto/util/text";
+
+export const OP_EQ:      int = 0;
+export const OP_NE:      int = 1;
+export const OP_LT:      int = 2;
+export const OP_LE:      int = 3;
+export const OP_GT:      int = 4;
+export const OP_GE:      int = 5;
+export const OP_LIKE:    int = 6;
+export const OP_IN:      int = 7;
+export const OP_NULL:    int = 8;
+export const OP_NOTNULL: int = 9;
+export const OP_RAW:     int = 10;
+
+export const CONJ_AND: int = 0;
+export const CONJ_OR:  int = 1;
+
+fn op_text(op: int): string {
+    if (op == OP_NE) { return " <> "; }
+    if (op == OP_LT) { return " < "; }
+    if (op == OP_LE) { return " <= "; }
+    if (op == OP_GT) { return " > "; }
+    if (op == OP_GE) { return " >= "; }
+    if (op == OP_LIKE) { return " LIKE "; }
+    return " = ";
+}
+
+// One term of a WHERE clause. `vals` carries however many values the operator
+// takes: one for a comparison, n for IN, none for IS NULL.
+export class Cond {
+    col: string;
+    op: int;
+    vals: Value[];
+    conj: int;
+    raw: string;
+
+    fn init(col: string, op: int, conj: int) {
+        this.col = col;
+        this.op = op;
+        this.conj = conj;
+        this.vals = [];
+        this.raw = "";
+    }
+}
+
+export class Join {
+    kind: string;      // "JOIN" | "LEFT JOIN"
+    tbl: string;
+    leftCol: string;
+    rightCol: string;
+
+    fn init(kind: string, tbl: string, leftCol: string, rightCol: string) {
+        this.kind = kind;
+        this.tbl = tbl;
+        this.leftCol = leftCol;
+        this.rightCol = rightCol;
+    }
+}
+
+// The shared half: a table, a WHERE clause, and the rendering contract.
+//
+// The where* methods are `builder`, so they return the receiver typed as its
+// CONCRETE class at the call site — `select("t").where(...).limit(3)` keeps
+// working even though `where` is declared here and `limit` only on Select.
+// A builder cannot be virtual, which is exactly why `render` and `params` are
+// ordinary virtuals instead.
+export class Query {
+    tbl: string;
+    conds: Cond[];
+
+    fn init(tbl: string) {
+        this.tbl = tbl;
+        this.conds = [];
+    }
+
+    builder fn where(col: string, v: Value) {
+        let c = new Cond(col, OP_EQ, CONJ_AND);
+        c.vals.push(v);
+        this.conds.push(c);
+        return this;
+    }
+
+    builder fn whereOp(col: string, op: int, v: Value) {
+        let c = new Cond(col, op, CONJ_AND);
+        c.vals.push(v);
+        this.conds.push(c);
+        return this;
+    }
+
+    builder fn orWhere(col: string, v: Value) {
+        let c = new Cond(col, OP_EQ, CONJ_OR);
+        c.vals.push(v);
+        this.conds.push(c);
+        return this;
+    }
+
+    builder fn whereNull(col: string) {
+        this.conds.push(new Cond(col, OP_NULL, CONJ_AND));
+        return this;
+    }
+
+    builder fn whereNotNull(col: string) {
+        this.conds.push(new Cond(col, OP_NOTNULL, CONJ_AND));
+        return this;
+    }
+
+    // An empty list would render `IN ()`, which is a syntax error on every
+    // engine, so it is refused here rather than at the database.
+    builder fn whereIn(col: string, vs: Value[]) {
+        if (vs.len == 0) {
+            panic("vyto/db: whereIn('" + col + "') with an empty list");
+        }
+        let c = new Cond(col, OP_IN, CONJ_AND);
+        let i = 0;
+        while (i < vs.len) {
+            c.vals.push(vs[i]);
+            i += 1;
+        }
+        this.conds.push(c);
+        return this;
+    }
+
+    // The escape hatch, for what the builder cannot express. `sql` is spliced
+    // verbatim — write the placeholders yourself as `?` and they are renumbered
+    // for the dialect. Never build this string from user input.
+    builder fn whereRaw(sql: string, vs: Value[]) {
+        let c = new Cond("", OP_RAW, CONJ_AND);
+        c.raw = sql;
+        let i = 0;
+        while (i < vs.len) {
+            c.vals.push(vs[i]);
+            i += 1;
+        }
+        this.conds.push(c);
+        return this;
+    }
+
+    // Bound values, in the order the placeholders appear in the rendered SQL.
+    // Update overrides this — see the note there, it is the one place where
+    // getting the order wrong silently binds the right values to the wrong
+    // columns.
+    virtual fn params(): Value[] { return this.whereParams(); }
+
+    fn whereParams(): Value[] {
+        let out: Value[] = [];
+        let i = 0;
+        while (i < this.conds.len) {
+            let c = this.conds[i];
+            let j = 0;
+            while (j < c.vals.len) {
+                out.push(c.vals[j]);
+                j += 1;
+            }
+            i += 1;
+        }
+        return out;
+    }
+
+    virtual fn render(d: Dialect): string { return ""; }
+
+    // Convenience for logging and tests: render under plain ANSI.
+    fn sql(): string { return this.render(ansi()); }
+
+    // `n` is a one-element array because Vyto has no out-parameters, and the
+    // placeholder counter has to survive across the clauses of one statement —
+    // Postgres numbers them $1, $2, ... across the whole query, not per clause.
+    fn renderWhere(d: Dialect, sb: StringBuilder, n: int[]) {
+        if (this.conds.len == 0) { return; }
+        sb.append(" WHERE ");
+        let i = 0;
+        while (i < this.conds.len) {
+            let c = this.conds[i];
+            if (i > 0) {
+                if (c.conj == CONJ_OR) { sb.append(" OR "); }
+                else { sb.append(" AND "); }
+            }
+            if (c.op == OP_RAW) {
+                renumber(d, sb, c.raw, n);
+            } else if (c.op == OP_NULL) {
+                sb.append(d.quotePath(c.col)).append(" IS NULL");
+            } else if (c.op == OP_NOTNULL) {
+                sb.append(d.quotePath(c.col)).append(" IS NOT NULL");
+            } else if (c.op == OP_IN) {
+                sb.append(d.quotePath(c.col)).append(" IN (");
+                let j = 0;
+                while (j < c.vals.len) {
+                    if (j > 0) { sb.append(", "); }
+                    sb.append(d.placeholder(n[0]));
+                    n[0] += 1;
+                    j += 1;
+                }
+                sb.append(")");
+            } else {
+                sb.append(d.quotePath(c.col)).append(op_text(c.op));
+                sb.append(d.placeholder(n[0]));
+                n[0] += 1;
+            }
+            i += 1;
+        }
+    }
+}
+
+// Rewrite the `?`s in a raw fragment into this dialect's placeholders, keeping
+// the running count. Without this a whereRaw would emit `?` into Postgres SQL
+// that numbers everything else $1, $2.
+fn renumber(d: Dialect, sb: StringBuilder, raw: string, n: int[]) {
+    let start = 0;
+    let i = 0;
+    while (i < raw.len) {
+        if (raw[i] == 63) {                      // '?'
+            if (i > start) { sb.appendSlice(raw, start, i); }
+            sb.append(d.placeholder(n[0]));
+            n[0] += 1;
+            start = i + 1;
+        }
+        i += 1;
+    }
+    if (start < raw.len) { sb.appendSlice(raw, start, raw.len); }
+}
+
+export class Select extends Query {
+    cols: string[];
+    joins: Join[];
+    orderCols: string[];
+    orderDesc: bool[];
+    groupCols: string[];
+    lim: int;
+    off: int;
+    distinctFlag: bool;
+
+    fn init(tbl: string) {
+        super.init(tbl);
+        this.cols = [];
+        this.joins = [];
+        this.orderCols = [];
+        this.orderDesc = [];
+        this.groupCols = [];
+        this.lim = -1;
+        this.off = 0;
+        this.distinctFlag = false;
+    }
+
+    // Column names, dotted paths, or "*". Anything else — an aggregate, an
+    // expression — goes through selectRaw.
+    builder fn columns(cs: string[]) {
+        let i = 0;
+        while (i < cs.len) {
+            this.cols.push(cs[i]);
+            i += 1;
+        }
+        return this;
+    }
+
+    builder fn column(c: string) {
+        this.cols.push(c);
+        return this;
+    }
+
+    builder fn distinct() {
+        this.distinctFlag = true;
+        return this;
+    }
+
+    builder fn join(tbl: string, leftCol: string, rightCol: string) {
+        this.joins.push(new Join("JOIN", tbl, leftCol, rightCol));
+        return this;
+    }
+
+    builder fn leftJoin(tbl: string, leftCol: string, rightCol: string) {
+        this.joins.push(new Join("LEFT JOIN", tbl, leftCol, rightCol));
+        return this;
+    }
+
+    builder fn orderBy(col: string) {
+        this.orderCols.push(col);
+        this.orderDesc.push(false);
+        return this;
+    }
+
+    builder fn orderByDesc(col: string) {
+        this.orderCols.push(col);
+        this.orderDesc.push(true);
+        return this;
+    }
+
+    builder fn groupBy(col: string) {
+        this.groupCols.push(col);
+        return this;
+    }
+
+    builder fn limit(n: int) {
+        this.lim = n;
+        return this;
+    }
+
+    builder fn offset(n: int) {
+        this.off = n;
+        return this;
+    }
+
+    override fn render(d: Dialect): string {
+        let sb = new StringBuilder(128);
+        sb.append("SELECT ");
+        if (this.distinctFlag) { sb.append("DISTINCT "); }
+        if (this.cols.len == 0) {
+            sb.append("*");
+        } else {
+            let i = 0;
+            while (i < this.cols.len) {
+                if (i > 0) { sb.append(", "); }
+                sb.append(d.quotePath(this.cols[i]));
+                i += 1;
+            }
+        }
+        sb.append(" FROM ").append(d.quoteIdent(this.tbl));
+
+        let j = 0;
+        while (j < this.joins.len) {
+            let jn = this.joins[j];
+            sb.append(" ").append(jn.kind).append(" ").append(d.quoteIdent(jn.tbl));
+            sb.append(" ON ").append(d.quotePath(jn.leftCol));
+            sb.append(" = ").append(d.quotePath(jn.rightCol));
+            j += 1;
+        }
+
+        let n: int[] = [1];
+        this.renderWhere(d, sb, n);
+
+        if (this.groupCols.len > 0) {
+            sb.append(" GROUP BY ");
+            let g = 0;
+            while (g < this.groupCols.len) {
+                if (g > 0) { sb.append(", "); }
+                sb.append(d.quotePath(this.groupCols[g]));
+                g += 1;
+            }
+        }
+
+        if (this.orderCols.len > 0) {
+            sb.append(" ORDER BY ");
+            let o = 0;
+            while (o < this.orderCols.len) {
+                if (o > 0) { sb.append(", "); }
+                sb.append(d.quotePath(this.orderCols[o]));
+                if (this.orderDesc[o]) { sb.append(" DESC"); }
+                o += 1;
+            }
+        }
+
+        // An OFFSET without a LIMIT is a syntax error on SQLite and MySQL, so
+        // ask for everything rather than emitting something that will not run.
+        let lim = this.lim;
+        if (lim < 0 && this.off > 0) { lim = -1; }
+        sb.append(d.limitClause(lim, this.off));
+        return sb.toString();
+    }
+}
+
+export class Insert extends Query {
+    cols: string[];
+    rowVals: Value[];
+    orIgnore: bool;
+
+    fn init(tbl: string) {
+        super.init(tbl);
+        this.cols = [];
+        this.rowVals = [];
+        this.orIgnore = false;
+    }
+
+    builder fn set(col: string, v: Value) {
+        this.cols.push(col);
+        this.rowVals.push(v);
+        return this;
+    }
+
+    // INSERT OR IGNORE / INSERT IGNORE — spelled differently per engine, so the
+    // flag is stored and rendered rather than written by the caller.
+    builder fn ignore() {
+        this.orIgnore = true;
+        return this;
+    }
+
+    override fn params(): Value[] { return this.rowVals; }
+
+    override fn render(d: Dialect): string {
+        if (this.cols.len == 0) {
+            panic("vyto/db: insert into '" + this.tbl + "' with no columns set");
+        }
+        let sb = new StringBuilder(128);
+        sb.append("INSERT ");
+        if (this.orIgnore) {
+            if (d.name() == "mysql") { sb.append("IGNORE "); }
+            else { sb.append("OR IGNORE "); }
+        }
+        sb.append("INTO ").append(d.quoteIdent(this.tbl)).append(" (");
+        let i = 0;
+        while (i < this.cols.len) {
+            if (i > 0) { sb.append(", "); }
+            sb.append(d.quoteIdent(this.cols[i]));
+            i += 1;
+        }
+        sb.append(") VALUES (");
+        let j = 0;
+        while (j < this.cols.len) {
+            if (j > 0) { sb.append(", "); }
+            sb.append(d.placeholder(j + 1));
+            j += 1;
+        }
+        sb.append(")");
+        return sb.toString();
+    }
+}
+
+export class Update extends Query {
+    setCols: string[];
+    setArgs: Value[];
+
+    fn init(tbl: string) {
+        super.init(tbl);
+        this.setCols = [];
+        this.setArgs = [];
+    }
+
+    builder fn set(col: string, v: Value) {
+        this.setCols.push(col);
+        this.setArgs.push(v);
+        return this;
+    }
+
+    // THE ORDERING RULE. SET placeholders are rendered before WHERE
+    // placeholders, so the bound values must be handed over in that order —
+    // regardless of whether the caller wrote .set() or .where() first. Keeping
+    // setArgs in its own array and concatenating here is the whole mechanism.
+    // Get this wrong and every value binds to the wrong column, silently, with
+    // a query that still runs.
+    override fn params(): Value[] {
+        let out: Value[] = [];
+        let i = 0;
+        while (i < this.setArgs.len) {
+            out.push(this.setArgs[i]);
+            i += 1;
+        }
+        let w = this.whereParams();
+        let j = 0;
+        while (j < w.len) {
+            out.push(w[j]);
+            j += 1;
+        }
+        return out;
+    }
+
+    override fn render(d: Dialect): string {
+        if (this.setCols.len == 0) {
+            panic("vyto/db: update of '" + this.tbl + "' with no columns set");
+        }
+        let sb = new StringBuilder(128);
+        sb.append("UPDATE ").append(d.quoteIdent(this.tbl)).append(" SET ");
+        let n: int[] = [1];
+        let i = 0;
+        while (i < this.setCols.len) {
+            if (i > 0) { sb.append(", "); }
+            sb.append(d.quoteIdent(this.setCols[i]));
+            sb.append(" = ").append(d.placeholder(n[0]));
+            n[0] += 1;
+            i += 1;
+        }
+        this.renderWhere(d, sb, n);
+        return sb.toString();
+    }
+}
+
+export class Delete extends Query {
+    fn init(tbl: string) { super.init(tbl); }
+
+    override fn render(d: Dialect): string {
+        let sb = new StringBuilder(64);
+        sb.append("DELETE FROM ").append(d.quoteIdent(this.tbl));
+        let n: int[] = [1];
+        this.renderWhere(d, sb, n);
+        return sb.toString();
+    }
+}
+
+export fn select(tbl: string): Select { return new Select(tbl); }
+export fn insert(tbl: string): Insert { return new Insert(tbl); }
+export fn update(tbl: string): Update { return new Update(tbl); }
+export fn deleteFrom(tbl: string): Delete { return new Delete(tbl); }

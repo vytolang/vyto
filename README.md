@@ -632,6 +632,15 @@ everything else is pure Vyto.
 | `vyto/util/url` | URL parse/join/format, query strings, percent-encoding |
 | `vyto/util/mime` | media types, base64, quoted-printable, multipart |
 
+**Data & persistence**
+
+| Module | What it gives you |
+|--------|-------------------|
+| `vyto/db` | SQL without writing SQL: `select`/`insert`/`update`/`deleteFrom` and a `table(...)` schema builder, both rendered per dialect. `Db`, `Result`, `Cursor` and a `Tx` that rolls back in `deinit` if you return without committing. Values are always bound, never interpolated. Reads a schema back out too — `db.describe("users")` gives you columns, keys, indexes and foreign keys |
+| `vyto/db/sqlite` ⚙ | the SQLite driver — **the amalgamation is vendored**, so it builds on a fresh clone with no `-dev` package. A `Row` copies its cells, so it outlives the statement, the connection, and the `Db`. `apps/db_test` loads a hundred million rows through it and serves them |
+| `vyto/db/pgsql` · `vyto/db/mysql` | declared and fully stubbed; every entry panics. Their dialects are real and usable today |
+| `vyto/data/frame` ⚙ | a native columnar `DataFrame` for Excel-scale data — millions of rows with sort, filter, group-by and join that stay sub-second, strings interned into a shared arena |
+
 **Internationalization** — `vyto/intl` ⚙ (ICU-backed)
 
 | Module | What it gives you |

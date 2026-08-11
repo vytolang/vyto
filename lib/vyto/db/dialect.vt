@@ -1,0 +1,320 @@
+// vyto/db/dialect — what SQL looks like on each engine.
+//
+// A Dialect knows placeholder style, identifier quoting, column types and the
+// small syntactic differences between SQLite, Postgres and MySQL. It renders
+// text; it never touches a connection.
+//
+//     select("users").where("id", dbInt(1)).render(pgDialect())
+//         // SELECT * FROM "users" WHERE "id" = $1
+//     select("users").where("id", dbInt(1)).render(sqliteDialect())
+//         // SELECT * FROM "users" WHERE "id" = ?
+//
+// ── ALL FOUR DIALECTS LIVE HERE, NOT IN THE DRIVER PACKAGES ─────────────────
+// A dialect is a few hundred bytes of string formatting with no native cost.
+// Splitting them by driver directory would buy nothing and would cost the
+// ability to render and test Postgres SQL from a program that links only
+// SQLite — which is exactly what examples/103_db.vt does.
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// ── VALUES ARE NEVER QUOTED ─────────────────────────────────────────────────
+// There is no `quoteValue`. Every value reaches the database as a bound
+// parameter, which is what makes SQL injection structurally impossible rather
+// than a matter of remembering to escape. `quoteIdent` exists for table and
+// column names, which come from your source code, and it PANICS on anything
+// that is not a plain identifier: a caller passing user input as a column name
+// has written the bug this module exists to prevent.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Column kinds, mapped per dialect by `columnType`.
+export const COL_INT:       int = 0;
+export const COL_TEXT:      int = 1;
+export const COL_REAL:      int = 2;
+export const COL_BLOB:      int = 3;
+export const COL_BOOL:      int = 4;
+export const COL_TIMESTAMP: int = 5;
+
+// The base is ordinary and instantiable — there is no `abstract` keyword — so
+// every virtual carries a working ANSI-ish default and a subclass overrides
+// only what actually differs. Same shape as vyto/ui's Painter.
+export class Dialect {
+    virtual fn name(): string { return "ansi"; }
+
+    // The quote character for identifiers. Overriding this one is enough for
+    // MySQL; quoteIdent itself never needs an override.
+    virtual fn identQuote(): string { return "\""; }
+
+    // 1-based parameter index. `?` ignores it; Postgres does not.
+    virtual fn placeholder(i: int): string { return "?"; }
+
+    virtual fn columnType(kind: int): string {
+        if (kind == COL_INT) { return "BIGINT"; }
+        if (kind == COL_REAL) { return "DOUBLE PRECISION"; }
+        if (kind == COL_BLOB) { return "BLOB"; }
+        if (kind == COL_BOOL) { return "BOOLEAN"; }
+        if (kind == COL_TIMESTAMP) { return "TIMESTAMP"; }
+        return "TEXT";
+    }
+
+    // The whole column definition for an auto-incrementing primary key — not
+    // just a type, because the three engines split the work between type,
+    // constraint and keyword differently.
+    virtual fn autoIncrementPk(): string { return "BIGINT PRIMARY KEY"; }
+
+    virtual fn boolLiteral(v: bool): string {
+        if (v) { return "TRUE"; }
+        return "FALSE";
+    }
+
+    virtual fn supportsReturning(): bool { return false; }
+    virtual fn supportsIfNotExists(): bool { return true; }
+
+    // Separate from supportsIfNotExists because MySQL accepts
+    // CREATE TABLE IF NOT EXISTS but rejects CREATE INDEX IF NOT EXISTS — one
+    // flag for both would emit DDL that fails on exactly one engine.
+    virtual fn supportsIfNotExistsIndex(): bool { return true; }
+
+    // LIMIT/OFFSET is common to all three engines; a dialect that spells it
+    // TOP or FETCH FIRST overrides this.
+    virtual fn limitClause(lim: int, off: int): string {
+        let s = "";
+        if (lim >= 0) { s = " LIMIT " + str(lim); }
+        if (off > 0) { s = s + " OFFSET " + str(off); }
+        return s;
+    }
+
+    // ---- schema introspection ------------------------------------------
+    //
+    // Each of these returns ONE statement whose result columns are a fixed
+    // contract, documented above it, because callers read them by index. That
+    // contract is the whole point: it is what lets a Postgres implementation
+    // drop in later without the reader changing.
+    //
+    // The defaults panic rather than returning "" — the same call the drivers
+    // make (lib/vyto/db/pgsql). A dialect that cannot introspect says so
+    // through supportsIntrospection(), and a caller that ignores that answer
+    // and asks anyway has a bug worth hearing about.
+
+    virtual fn supportsIntrospection(): bool { return false; }
+
+    fn noIntrospection(what: string): string {
+        panic("vyto/db: " + what + " introspection is not implemented for the "
+              + this.name() + " dialect");
+        return "";
+    }
+
+    // No parameters. Columns: schema, name, kind, ncol, withoutRowid, strict.
+    // `kind` is the engine's own word for it; the reader maps it to OBJ_*.
+    virtual fn introspectTablesSql(): string { return this.noIntrospection("table"); }
+
+    // One parameter: the table name. Columns: cid, name, declType, notNull,
+    // dflt, pkPos, hidden. `declType` is the declared type verbatim, not an
+    // affinity. `pkPos` is 1-based within the primary key, 0 when not a member.
+    virtual fn introspectColumnsSql(): string { return this.noIntrospection("column"); }
+
+    // One parameter: the table name. Columns: seq, name, unique, origin,
+    // partial. `origin` is the engine's word; the reader maps it to IDX_*.
+    virtual fn introspectIndexesSql(): string { return this.noIntrospection("index"); }
+
+    // One parameter: the INDEX name. Columns: seqno, cid, name, desc, coll, key.
+    virtual fn introspectIndexColumnsSql(): string { return this.noIntrospection("index column"); }
+
+    // One parameter: the table name. Columns: id, seq, refTable, fromCol,
+    // toCol, onUpdate, onDelete. `toCol` is empty when the reference omits the
+    // parent column list and implicitly targets its primary key.
+    virtual fn introspectForeignKeysSql(): string { return this.noIntrospection("foreign key"); }
+
+    // No parameters. Columns: type, name, tblName, sql — every schema object
+    // and the DDL text that created it.
+    virtual fn introspectObjectsSql(): string { return this.noIntrospection("schema object"); }
+
+    // Not virtual: quoting an identifier is the same operation everywhere once
+    // the quote character is known, and the validity rule must not be
+    // weakenable by a subclass.
+    fn quoteIdent(id: string): string {
+        if (!is_ident(id)) {
+            panic("vyto/db: not a valid SQL identifier: '" + id + "'");
+        }
+        let q = this.identQuote();
+        return q + id + q;
+    }
+
+    // A dotted path — "users.id" — quoted segment by segment. A bare "*" and a
+    // trailing ".*" pass through, since neither is an identifier.
+    fn quotePath(path: string): string {
+        if (path == "*") { return "*"; }
+        let parts = path.split(".");
+        let out = "";
+        let i = 0;
+        while (i < parts.len) {
+            if (i > 0) { out = out + "."; }
+            if (parts[i] == "*") { out = out + "*"; }
+            else { out = out + this.quoteIdent(parts[i]); }
+            i += 1;
+        }
+        return out;
+    }
+}
+
+// [A-Za-z_][A-Za-z0-9_$]* — deliberately narrower than what the engines
+// accept. An identifier that needs more than this is one a caller built from
+// data, which is the case worth refusing.
+//
+// Exported because introspection makes the question askable. `quoteIdent`
+// PANICS on anything this rejects, and a panic aborts the process — but a real
+// database happily contains a table called `odd-name`, and `db.tables()` will
+// hand it to you. So: test the name before you build a query from it.
+//
+//     for (let t in db.tables()) {
+//         if (!isIdent(t)) { continue; }        // cannot be used with select()
+//         let r = db.all(select(t).limit(10));
+//     }
+//
+// The introspection calls themselves never need this — every one of them binds
+// the name as a parameter rather than splicing it into SQL.
+export fn isIdent(s: string): bool { return is_ident(s); }
+
+fn is_ident(s: string): bool {
+    if (s.len == 0) { return false; }
+    let c0 = s[0];
+    let ok0 = (c0 >= 65 && c0 <= 90) || (c0 >= 97 && c0 <= 122) || c0 == 95;
+    if (!ok0) { return false; }
+    let i = 1;
+    while (i < s.len) {
+        let c = s[i];
+        let ok = (c >= 65 && c <= 90) || (c >= 97 && c <= 122)
+              || (c >= 48 && c <= 57) || c == 95 || c == 36;
+        if (!ok) { return false; }
+        i += 1;
+    }
+    return true;
+}
+
+export class SqliteDialect extends Dialect {
+    override fn name(): string { return "sqlite"; }
+
+    // SQLite stores by affinity, so the type names are advisory — but they
+    // still decide the affinity, and INTEGER PRIMARY KEY specifically is the
+    // rowid alias rather than an ordinary column.
+    override fn columnType(kind: int): string {
+        if (kind == COL_INT) { return "INTEGER"; }
+        if (kind == COL_REAL) { return "REAL"; }
+        if (kind == COL_BLOB) { return "BLOB"; }
+        if (kind == COL_BOOL) { return "INTEGER"; }
+        if (kind == COL_TIMESTAMP) { return "TEXT"; }
+        return "TEXT";
+    }
+
+    override fn autoIncrementPk(): string { return "INTEGER PRIMARY KEY AUTOINCREMENT"; }
+
+    // No boolean type: 0 and 1 in an INTEGER column.
+    override fn boolLiteral(v: bool): string {
+        if (v) { return "1"; }
+        return "0";
+    }
+
+    // 3.35+ supports RETURNING.
+    override fn supportsReturning(): bool { return true; }
+
+    // ---- introspection ---------------------------------------------------
+    //
+    // Every one of these is a SELECT over a pragma_* table-valued function
+    // rather than a bare PRAGMA, and that is a correctness decision, not a
+    // stylistic one. **PRAGMA takes no bind parameters** — its grammar admits
+    // only a name or a number, never an expression — so `PRAGMA table_info(?)`
+    // is a syntax error. Bare PRAGMA would force splicing the table name into
+    // the SQL text, through the quoteIdent that panics on the perfectly legal
+    // `odd-name`, for a string that came from outside. The TVF form binds it.
+    //
+    // These need SQLite 3.16+ (3.37+ for table_list) and virtual tables
+    // compiled in. The vendored build is 3.53.4 with SQLITE_OMIT_VIRTUALTABLE
+    // unset, so both hold; see native/src/sqlite_config.h.
+
+    override fn supportsIntrospection(): bool { return true; }
+
+    // table_list spans every attached schema and distinguishes a virtual table
+    // from an ordinary one, which sqlite_schema cannot — there a virtual table
+    // is just type='table'. It also yields wr/strict in the same pass.
+    override fn introspectTablesSql(): string {
+        return "SELECT schema, name, type, ncol, wr, strict FROM pragma_table_list "
+             + "ORDER BY schema, name";
+    }
+
+    // table_xinfo, NOT table_info. table_info renumbers cid densely over the
+    // visible columns, while index_info reports true column indices — so on a
+    // table with a generated column the two silently fail to line up. xinfo
+    // reports the true index, and carries `hidden` as well.
+    override fn introspectColumnsSql(): string {
+        return "SELECT cid, name, type, \"notnull\", dflt_value, pk, hidden "
+             + "FROM pragma_table_xinfo(?) ORDER BY cid";
+    }
+
+    override fn introspectIndexesSql(): string {
+        return "SELECT seq, name, \"unique\", origin, partial "
+             + "FROM pragma_index_list(?) ORDER BY seq";
+    }
+
+    // index_xinfo, not index_info: it reports the trailing rowid/PK columns too
+    // and flags the real key columns with key=1, which index_info cannot say.
+    override fn introspectIndexColumnsSql(): string {
+        return "SELECT seqno, cid, name, \"desc\", coll, key "
+             + "FROM pragma_index_xinfo(?) ORDER BY seqno";
+    }
+
+    // `table`, `from` and `to` are keywords, so they need quoting — which
+    // SQLITE_DQS=0 makes unambiguously an identifier rather than a string.
+    override fn introspectForeignKeysSql(): string {
+        return "SELECT id, seq, \"table\", \"from\", \"to\", on_update, on_delete "
+             + "FROM pragma_foreign_key_list(?) ORDER BY id, seq";
+    }
+
+    // sqlite_master rather than sqlite_schema: the newer spelling is preferred
+    // from 3.33 on, but the old one still resolves and reads the same on every
+    // version anyone might point this at.
+    override fn introspectObjectsSql(): string {
+        return "SELECT type, name, tbl_name, sql FROM sqlite_master "
+             + "ORDER BY type, name";
+    }
+}
+
+export class PgDialect extends Dialect {
+    override fn name(): string { return "postgres"; }
+    override fn placeholder(i: int): string { return "$" + str(i); }
+
+    override fn columnType(kind: int): string {
+        if (kind == COL_INT) { return "BIGINT"; }
+        if (kind == COL_REAL) { return "DOUBLE PRECISION"; }
+        if (kind == COL_BLOB) { return "BYTEA"; }
+        if (kind == COL_BOOL) { return "BOOLEAN"; }
+        if (kind == COL_TIMESTAMP) { return "TIMESTAMPTZ"; }
+        return "TEXT";
+    }
+
+    override fn autoIncrementPk(): string { return "BIGSERIAL PRIMARY KEY"; }
+    override fn supportsReturning(): bool { return true; }
+}
+
+export class MysqlDialect extends Dialect {
+    override fn name(): string { return "mysql"; }
+    override fn identQuote(): string { return "`"; }
+
+    // VARCHAR(255) rather than TEXT: MySQL cannot index a TEXT column without
+    // a prefix length, and a column you name in a schema is usually one you
+    // will want to index.
+    override fn columnType(kind: int): string {
+        if (kind == COL_INT) { return "BIGINT"; }
+        if (kind == COL_REAL) { return "DOUBLE"; }
+        if (kind == COL_BLOB) { return "BLOB"; }
+        if (kind == COL_BOOL) { return "TINYINT(1)"; }
+        if (kind == COL_TIMESTAMP) { return "DATETIME"; }
+        return "VARCHAR(255)";
+    }
+
+    override fn autoIncrementPk(): string { return "BIGINT AUTO_INCREMENT PRIMARY KEY"; }
+    override fn supportsReturning(): bool { return false; }
+    override fn supportsIfNotExistsIndex(): bool { return false; }
+}
+
+export fn ansi(): Dialect { return new Dialect(); }
+export fn sqliteDialect(): SqliteDialect { return new SqliteDialect(); }
+export fn pgDialect(): PgDialect { return new PgDialect(); }
+export fn mysqlDialect(): MysqlDialect { return new MysqlDialect(); }

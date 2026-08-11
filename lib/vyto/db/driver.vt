@@ -1,0 +1,134 @@
+// vyto/db/driver — the seam every database driver implements.
+//
+// This file exists to be imported by BOTH sides: `vyto/db` depends on these
+// types to do its work, and each driver package subclasses them. Both arrows
+// point here and neither points at the other, which is what keeps the import
+// graph a DAG — circular imports are rejected by the checker, since a module's
+// emitted header would have to include the header that includes it.
+//
+// It is also what keeps SQLite out of programs that do not use it. Native
+// sources are compiled per package DIRECTORY for every module in the transitive
+// import closure, so a `vyto/db` that imported a driver would compile the
+// SQLite amalgamation into a program that only wanted to build a query string.
+// `vyto/db` imports no driver; the APP names the driver. See the README.
+//
+// Nothing here has a native/ directory, so importing it compiles no C.
+//
+// ── EVERY BASE METHOD IS A WORKING DEAD-OBJECT DEFAULT ──────────────────────
+// There is no `abstract` keyword, so a base class is ordinary and instantiable.
+// Rather than leaving the defaults to panic, they behave as a closed connection
+// and a finished statement: `new Conn()` is a perfectly good null-object for a
+// connection that failed to open, and a driver that forgets to override
+// something degrades to "closed" instead of crashing.
+// ─────────────────────────────────────────────────────────────────────────────
+
+import { Value, dbNull } from "vyto/db/value";
+import { Dialect, ansi } from "vyto/db/dialect";
+
+// Error classes. Callers branch on these, never on the engine's prose — the
+// wording changes between library versions, the code does not.
+export const DBERR_NONE:        int = 0;
+export const DBERR_OPEN:        int = 1;   // could not open the database
+export const DBERR_SQL:         int = 2;   // syntax error, unknown table/column
+export const DBERR_CONSTRAINT:  int = 3;   // UNIQUE, NOT NULL, FK, CHECK
+export const DBERR_BUSY:        int = 4;   // locked by another connection
+export const DBERR_CLOSED:      int = 5;   // used after close, or never opened
+export const DBERR_UNSUPPORTED: int = 6;   // this driver cannot do that
+export const DBERR_MISUSE:      int = 7;   // bad bind index, wrong column count
+
+export fn dberr_name(c: int): string {
+    if (c == DBERR_OPEN) { return "open"; }
+    if (c == DBERR_SQL) { return "sql"; }
+    if (c == DBERR_CONSTRAINT) { return "constraint"; }
+    if (c == DBERR_BUSY) { return "busy"; }
+    if (c == DBERR_CLOSED) { return "closed"; }
+    if (c == DBERR_UNSUPPORTED) { return "unsupported"; }
+    if (c == DBERR_MISUSE) { return "misuse"; }
+    return "none";
+}
+
+// What a step() returned.
+export const STEP_ROW:  int = 0;   // a row is available to read
+export const STEP_DONE: int = 1;   // the statement finished, no more rows
+export const STEP_ERR:  int = 2;   // it failed; ask errorCode()
+
+// A prepared statement.
+//
+// Note there is deliberately NO back-reference to the Conn. A connection owns
+// its statement cache, so a Stmt pointing back at its Conn would close a strong
+// reference cycle — which Vyto leaks, silently, with nothing to detect it. The
+// object that must keep both alive is the Cursor, and it holds each of them
+// directly.
+export class Stmt {
+    sql: string;
+    busy: bool;      // a Cursor is mid-iteration; the cache must not hand it out
+
+    fn init() {
+        this.sql = "";
+        this.busy = false;
+    }
+
+    // 1-based, matching SQL placeholder numbering.
+    virtual fn bind(i: int, v: Value): bool { return false; }
+
+    virtual fn step(): int { return STEP_ERR; }
+
+    virtual fn columnCount(): int { return 0; }
+    virtual fn columnName(i: int): string { return ""; }
+    virtual fn columnValue(i: int): Value { return dbNull(); }
+
+    // Rewind for reuse. Bindings are cleared too: a statement that kept a stale
+    // binding from a previous run is a data-corruption bug waiting for the one
+    // call site that binds fewer parameters.
+    virtual fn reset() { }
+
+    // Release the underlying handle. Idempotent.
+    virtual fn finalize() { }
+
+    virtual fn errorCode(): int { return DBERR_CLOSED; }
+    virtual fn errorMessage(): string { return "statement is not prepared"; }
+}
+
+// An open connection to a database.
+export class Conn {
+    virtual fn dialect(): Dialect { return ansi(); }
+
+    // Null when the SQL could not be prepared; ask errorCode()/errorMessage().
+    // A driver may return a cached statement, so callers must hand it back with
+    // release() rather than finalizing it themselves.
+    virtual fn prepare(sql: string): Stmt { return null; }
+
+    // Give a statement back to the connection. The driver decides whether that
+    // means reset-and-cache or finalize.
+    virtual fn release(st: Stmt) { }
+
+    // Run SQL that returns no rows. Used for DDL, BEGIN/COMMIT and PRAGMA.
+    virtual fn execRaw(sql: string): bool { return false; }
+
+    virtual fn lastInsertId(): int { return 0; }
+    virtual fn changes(): int { return 0; }
+
+    virtual fn isOpen(): bool { return false; }
+    virtual fn close() { }
+
+    virtual fn errorCode(): int { return DBERR_CLOSED; }
+    virtual fn errorMessage(): string { return "no connection"; }
+
+    // Whether a transaction is currently open on this connection. Held by the
+    // connection rather than the Tx because the engine's transaction state is a
+    // property of the connection, and nesting BEGIN is an error on every engine
+    // this package targets.
+    virtual fn inTx(): bool { return false; }
+    virtual fn setInTx(v: bool) { }
+}
+
+// Names a database and knows how to connect to it. The app constructs one of
+// these; no library ever does.
+export class Driver {
+    virtual fn name(): string { return "none"; }
+
+    // Never null: a driver that cannot connect returns a Conn whose isOpen()
+    // is false and whose errorMessage() explains. That keeps every caller free
+    // of a null check on the one path that is hardest to test.
+    virtual fn connect(): Conn { return new Conn(); }
+}

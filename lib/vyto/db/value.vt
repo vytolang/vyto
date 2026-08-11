@@ -1,0 +1,229 @@
+// vyto/db/value — a database cell and a row of them.
+//
+// SQL has five value kinds and Vyto has no sum type, so `Value` is a tagged
+// class with one payload field per kind — the same shape as `JsonValue` and
+// `vyto/cli`'s `Flag`, and for the same reason: v1 generics have no bounds, and
+// a generic instantiated with a type from another module is unsupported when
+// the type parameter crosses by value (see vyto/util/sort's scope caveat). A
+// `Value<T>` would not survive an app defining its own row struct.
+//
+// A class rather than a struct because struct fields must be value types, and
+// text and blobs are references.
+//
+//     let v = dbText("ada");
+//     v.isText()        // true
+//     v.asString()      // "ada"
+//     v.asInt()         // 0 — wrong kind yields a typed zero, never a panic
+//
+// ── OWNERSHIP: A ROW OWNS ITS CELLS ─────────────────────────────────────────
+// Every Value holds Vyto-allocated storage, never a pointer into a driver's
+// buffer. SQLite invalidates the pointer from sqlite3_column_text on the next
+// step/reset/finalize, so the driver copies each cell before returning. The
+// consequence is worth relying on: a Row may outlive its statement, its
+// connection, and the whole Db.
+// ─────────────────────────────────────────────────────────────────────────────
+
+export const DB_NULL:  int = 0;
+export const DB_INT:   int = 1;
+export const DB_FLOAT: int = 2;
+export const DB_TEXT:  int = 3;
+export const DB_BLOB:  int = 4;
+
+export class Value {
+    kind: int;
+    i: int;
+    f: float;
+    s: string;
+    b: byte[];
+
+    // Payloads are left at their zero values rather than allocated per kind: a
+    // cell is created once per row per column, so the common path must not
+    // allocate anything it will not use. Only a blob gets an array, and only
+    // when it is one.
+    fn init(k: int) {
+        this.kind = k;
+        this.i = 0;
+        this.f = 0.0;
+        this.s = "";
+    }
+
+    fn isNull(): bool  { return this.kind == DB_NULL; }
+    fn isInt(): bool   { return this.kind == DB_INT; }
+    fn isFloat(): bool { return this.kind == DB_FLOAT; }
+    fn isText(): bool  { return this.kind == DB_TEXT; }
+    fn isBlob(): bool  { return this.kind == DB_BLOB; }
+
+    // ---- leaf readers ------------------------------------------------------
+    //
+    // Forgiving, JsonValue-style: the wrong kind yields a typed zero rather
+    // than a panic, so walking a result whose shape you are unsure of needs no
+    // guard at every hop. Text is deliberately NOT parsed into a number —
+    // a silent parse is how "12abc" becomes 12. Call `to_int()` yourself if
+    // that is really what you meant.
+
+    fn asInt(): int {
+        if (this.kind == DB_INT) { return this.i; }
+        if (this.kind == DB_FLOAT) { return this.f as int; }
+        return 0;
+    }
+
+    fn asFloat(): float {
+        if (this.kind == DB_FLOAT) { return this.f; }
+        if (this.kind == DB_INT) { return this.i as float; }
+        return 0.0;
+    }
+
+    // SQLite has no boolean type — it stores 0 and 1 in an INTEGER column — so
+    // a truthiness read has to accept the numeric kinds.
+    fn asBool(): bool {
+        if (this.kind == DB_INT) { return this.i != 0; }
+        if (this.kind == DB_FLOAT) { return this.f != 0.0; }
+        return false;
+    }
+
+    // Numbers stringify (a column read into a template wants text either way);
+    // NULL is "" and a blob is "" rather than mojibake — use asBytes for that.
+    fn asString(): string {
+        if (this.kind == DB_TEXT) { return this.s; }
+        if (this.kind == DB_INT) { return str(this.i); }
+        if (this.kind == DB_FLOAT) { return str(this.f); }
+        return "";
+    }
+
+    fn asBytes(): byte[] {
+        if (this.kind == DB_BLOB) { return this.b; }
+        if (this.kind == DB_TEXT) { return strbytes_of(this.s); }
+        return bytes(0);
+    }
+
+    // For diagnostics and golden tests: a stable name that no dialect or
+    // library version can change.
+    fn kindName(): string {
+        if (this.kind == DB_INT) { return "int"; }
+        if (this.kind == DB_FLOAT) { return "float"; }
+        if (this.kind == DB_TEXT) { return "text"; }
+        if (this.kind == DB_BLOB) { return "blob"; }
+        return "null";
+    }
+}
+
+// A string's bytes, without going through the FFI. `s[i]` is a byte, which is
+// exactly what a blob column wants.
+fn strbytes_of(s: string): byte[] {
+    let out = bytes(s.len);
+    let i = 0;
+    while (i < s.len) {
+        out[i] = s[i] as byte;
+        i += 1;
+    }
+    return out;
+}
+
+export fn dbNull(): Value { return new Value(DB_NULL); }
+
+export fn dbInt(v: int): Value {
+    let x = new Value(DB_INT);
+    x.i = v;
+    return x;
+}
+
+export fn dbFloat(v: float): Value {
+    let x = new Value(DB_FLOAT);
+    x.f = v;
+    return x;
+}
+
+export fn dbText(v: string): Value {
+    let x = new Value(DB_TEXT);
+    x.s = v;
+    return x;
+}
+
+export fn dbBlob(v: byte[]): Value {
+    let x = new Value(DB_BLOB);
+    x.b = v;
+    return x;
+}
+
+// SQLite stores booleans as 0/1; this is here so callers do not have to
+// remember which way round it is.
+export fn dbBool(v: bool): Value {
+    let n = 0;
+    if (v) { n = 1; }
+    return dbInt(n);
+}
+
+// One row of a result.
+//
+// `names` is shared with the result set — one array for the whole query, not
+// one per row — while `vals` are this row's own cells. Lookup is a linear scan
+// over the names, as JsonValue does for object members: a result has a handful
+// of columns, and a hash table per row would allocate a bucket array a million
+// times over a million-row cursor.
+export class Row {
+    names: string[];
+    vals: Value[];
+    present: bool;
+
+    fn init(names: string[], vals: Value[]) {
+        this.names = names;
+        this.vals = vals;
+        this.present = true;
+    }
+
+    // False for the null-object row returned by `one()` when nothing matched.
+    // Distinguishes "no such row" from "a row whose every column is NULL".
+    fn exists(): bool { return this.present; }
+
+    fn len(): int { return this.vals.len; }
+
+    fn nameAt(i: int): string {
+        if (i >= 0 && i < this.names.len) { return this.names[i]; }
+        return "";
+    }
+
+    fn indexOf(name: string): int {
+        let i = 0;
+        while (i < this.names.len) {
+            if (this.names[i] == name) { return i; }
+            i += 1;
+        }
+        return -1;
+    }
+
+    fn has(name: string): bool { return this.indexOf(name) >= 0; }
+
+    // Null-object on every miss: an unknown column and an out-of-range index
+    // both read as NULL rather than panicking, so a renderer walking an
+    // unfamiliar result never needs a guard.
+    fn at(i: int): Value {
+        if (i >= 0 && i < this.vals.len) { return this.vals[i]; }
+        return dbNull();
+    }
+
+    fn get(name: string): Value {
+        let idx = this.indexOf(name);
+        if (idx >= 0) { return this.vals[idx]; }
+        return dbNull();
+    }
+
+    // Typed shorthands. Named getInt/getStr rather than int/str because `int`
+    // is a type keyword and `str` is a builtin — the same collision vyto/cli
+    // settled the same way.
+    fn getInt(name: string): int      { return this.get(name).asInt(); }
+    fn getFloat(name: string): float  { return this.get(name).asFloat(); }
+    fn getStr(name: string): string   { return this.get(name).asString(); }
+    fn getBool(name: string): bool    { return this.get(name).asBool(); }
+    fn getBytes(name: string): byte[] { return this.get(name).asBytes(); }
+    fn isNull(name: string): bool     { return this.get(name).isNull(); }
+}
+
+// The row that says "there wasn't one". `exists()` is false and every column
+// reads as NULL.
+export fn absentRow(): Row {
+    let names: string[] = [];
+    let vals: Value[] = [];
+    let r = new Row(names, vals);
+    r.present = false;
+    return r;
+}

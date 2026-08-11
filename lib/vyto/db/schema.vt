@@ -1,0 +1,359 @@
+// vyto/db/schema — build CREATE TABLE / DROP / ALTER without writing DDL.
+//
+//     let t = table("users").ifNotExists();
+//     t.id();
+//     t.text("email").notNull().unique();
+//     t.integer("age");
+//     t.timestamp("created_at").defaultRaw("CURRENT_TIMESTAMP");
+//     t.index("idx_users_email", ["email"]);
+//     db.execAll(t.statements(db.dialect()));
+//
+// ── WHY THE COLUMN METHODS ARE NOT `builder` ────────────────────────────────
+// `t.text("email").notNull()` needs `text()` to return the COLUMN so the
+// constraints chain onto it — a builder always returns its receiver, so it
+// cannot start a new chain. Same split vyto/validator makes: `check()` returns
+// a fresh Check, and only the rules on it are builders.
+//
+// And there is no closure form. `create("t", (t) => { ... })` cannot be written
+// in Vyto at all: closures cannot capture `this`, cannot be assigned to, and
+// cannot nest. The object-returning shape is not a stylistic preference, it is
+// the only one that compiles.
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// This module builds DDL and stops there. Running migrations in order, tracking
+// which have been applied, and rolling them back is policy — whose files, whose
+// table, whose naming — and policy belongs above the stdlib.
+
+import { Dialect, ansi, COL_INT, COL_TEXT, COL_REAL, COL_BLOB, COL_BOOL,
+         COL_TIMESTAMP } from "vyto/db/dialect";
+import { StringBuilder } from "vyto/util/text";
+
+// A single column definition.
+export class Column {
+    name: string;
+    kind: int;
+    notNullFlag: bool;
+    uniqueFlag: bool;
+    pkFlag: bool;
+    autoFlag: bool;
+    defaultSql: string;
+    hasDefault: bool;
+    refTable: string;
+    refCol: string;
+    boolDefault: bool;
+    hasBoolDefault: bool;
+
+    fn init(name: string, kind: int) {
+        this.name = name;
+        this.kind = kind;
+        this.notNullFlag = false;
+        this.uniqueFlag = false;
+        this.pkFlag = false;
+        this.autoFlag = false;
+        this.defaultSql = "";
+        this.hasDefault = false;
+        this.refTable = "";
+        this.refCol = "";
+        this.boolDefault = false;
+        this.hasBoolDefault = false;
+    }
+
+    builder fn notNull() {
+        this.notNullFlag = true;
+        return this;
+    }
+
+    builder fn unique() {
+        this.uniqueFlag = true;
+        return this;
+    }
+
+    builder fn primaryKey() {
+        this.pkFlag = true;
+        return this;
+    }
+
+    builder fn defaultInt(v: int) {
+        this.defaultSql = str(v);
+        this.hasDefault = true;
+        return this;
+    }
+
+    builder fn defaultFloat(v: float) {
+        this.defaultSql = str(v);
+        this.hasDefault = true;
+        return this;
+    }
+
+    // A DEFAULT cannot be a bound parameter — it is part of the schema, not of
+    // a statement — so this is the one place in the package where a literal is
+    // written into SQL. Single quotes are doubled, which is the standard escape
+    // on all three engines. Schema defaults come from your source code; do not
+    // build one from user input.
+    builder fn defaultText(v: string) {
+        this.defaultSql = quote_literal(v);
+        this.hasDefault = true;
+        return this;
+    }
+
+    // Rendered through the dialect at definition() time, because the three
+    // engines disagree: Postgres wants TRUE, SQLite wants 1. Storing the flag
+    // rather than the text is what makes one schema portable.
+    builder fn defaultBool(v: bool) {
+        this.boolDefault = v;
+        this.hasBoolDefault = true;
+        this.hasDefault = true;
+        return this;
+    }
+
+    // For CURRENT_TIMESTAMP, nextval(...), and anything else that is an
+    // expression rather than a value. Spliced verbatim.
+    builder fn defaultRaw(sql: string) {
+        this.defaultSql = sql;
+        this.hasDefault = true;
+        return this;
+    }
+
+    builder fn references(tbl: string, col: string) {
+        this.refTable = tbl;
+        this.refCol = col;
+        return this;
+    }
+
+    // The column's own line inside CREATE TABLE.
+    fn definition(d: Dialect): string {
+        let sb = new StringBuilder(64);
+        sb.append(d.quoteIdent(this.name)).append(" ");
+        if (this.autoFlag) {
+            // The engines split auto-increment between type, constraint and
+            // keyword differently, so the dialect supplies the whole phrase.
+            sb.append(d.autoIncrementPk());
+        } else {
+            sb.append(d.columnType(this.kind));
+            if (this.pkFlag) { sb.append(" PRIMARY KEY"); }
+            if (this.notNullFlag) { sb.append(" NOT NULL"); }
+            if (this.uniqueFlag) { sb.append(" UNIQUE"); }
+        }
+        if (this.hasDefault) {
+            sb.append(" DEFAULT ");
+            if (this.hasBoolDefault) { sb.append(d.boolLiteral(this.boolDefault)); }
+            else { sb.append(this.defaultSql); }
+        }
+        if (this.refTable.len > 0) {
+            sb.append(" REFERENCES ").append(d.quoteIdent(this.refTable));
+            sb.append("(").append(d.quoteIdent(this.refCol)).append(")");
+        }
+        return sb.toString();
+    }
+}
+
+fn quote_literal(s: string): string {
+    let sb = new StringBuilder(s.len + 8);
+    sb.append("'");
+    let start = 0;
+    let i = 0;
+    while (i < s.len) {
+        if (s[i] == 39) {                       // '\''
+            if (i > start) { sb.appendSlice(s, start, i); }
+            sb.append("''");
+            start = i + 1;
+        }
+        i += 1;
+    }
+    if (start < s.len) { sb.appendSlice(s, start, s.len); }
+    sb.append("'");
+    return sb.toString();
+}
+
+export class Index {
+    name: string;
+    tbl: string;
+    cols: string[];
+    uniqueFlag: bool;
+
+    fn init(name: string, tbl: string, cols: string[]) {
+        this.name = name;
+        this.tbl = tbl;
+        this.cols = cols;
+        this.uniqueFlag = false;
+    }
+
+    builder fn unique() {
+        this.uniqueFlag = true;
+        return this;
+    }
+
+    fn sql(d: Dialect): string {
+        let sb = new StringBuilder(96);
+        sb.append("CREATE ");
+        if (this.uniqueFlag) { sb.append("UNIQUE "); }
+        sb.append("INDEX ");
+        if (d.supportsIfNotExistsIndex()) { sb.append("IF NOT EXISTS "); }
+        sb.append(d.quoteIdent(this.name));
+        sb.append(" ON ").append(d.quoteIdent(this.tbl)).append(" (");
+        let i = 0;
+        while (i < this.cols.len) {
+            if (i > 0) { sb.append(", "); }
+            sb.append(d.quoteIdent(this.cols[i]));
+            i += 1;
+        }
+        sb.append(")");
+        return sb.toString();
+    }
+}
+
+export class Table {
+    name: string;
+    cols: Column[];
+    indexes: Index[];
+    ifNotExistsFlag: bool;
+
+    fn init(name: string) {
+        this.name = name;
+        this.cols = [];
+        this.indexes = [];
+        this.ifNotExistsFlag = false;
+    }
+
+    builder fn ifNotExists() {
+        this.ifNotExistsFlag = true;
+        return this;
+    }
+
+    // The auto-incrementing primary key every table wants, spelled once.
+    builder fn id() {
+        let c = new Column("id", COL_INT);
+        c.autoFlag = true;
+        c.pkFlag = true;
+        this.cols.push(c);
+        return this;
+    }
+
+    // Named `named_id` rather than an overload of id(): Vyto has no function
+    // overloading, so the two spellings need two names.
+    builder fn idNamed(name: string) {
+        let c = new Column(name, COL_INT);
+        c.autoFlag = true;
+        c.pkFlag = true;
+        this.cols.push(c);
+        return this;
+    }
+
+    // Each returns the Column so constraints chain onto it. `integer` rather
+    // than `int` because `int` is a type keyword.
+    fn column(name: string, kind: int): Column {
+        let c = new Column(name, kind);
+        this.cols.push(c);
+        return c;
+    }
+
+    fn integer(name: string): Column   { return this.column(name, COL_INT); }
+    fn text(name: string): Column      { return this.column(name, COL_TEXT); }
+    fn real(name: string): Column      { return this.column(name, COL_REAL); }
+    fn blob(name: string): Column      { return this.column(name, COL_BLOB); }
+    fn boolean(name: string): Column   { return this.column(name, COL_BOOL); }
+    fn timestamp(name: string): Column { return this.column(name, COL_TIMESTAMP); }
+
+    // Indexes are separate statements, not part of CREATE TABLE — see
+    // statements().
+    builder fn index(name: string, cols: string[]) {
+        this.indexes.push(new Index(name, this.name, cols));
+        return this;
+    }
+
+    builder fn uniqueIndex(name: string, cols: string[]) {
+        let ix = new Index(name, this.name, cols);
+        ix.uniqueFlag = true;
+        this.indexes.push(ix);
+        return this;
+    }
+
+    fn createSql(d: Dialect): string {
+        if (this.cols.len == 0) {
+            panic("vyto/db: table '" + this.name + "' has no columns");
+        }
+        let sb = new StringBuilder(192);
+        sb.append("CREATE TABLE ");
+        if (this.ifNotExistsFlag && d.supportsIfNotExists()) {
+            sb.append("IF NOT EXISTS ");
+        }
+        sb.append(d.quoteIdent(this.name)).append(" (");
+        let i = 0;
+        while (i < this.cols.len) {
+            if (i > 0) { sb.append(", "); }
+            sb.append(this.cols[i].definition(d));
+            i += 1;
+        }
+        sb.append(")");
+        return sb.toString();
+    }
+
+    // The table and its indexes, in the order they must run. CREATE INDEX is a
+    // separate statement on every engine, and most drivers refuse more than one
+    // statement per prepare, so this is a list rather than one blob of SQL.
+    fn statements(d: Dialect): string[] {
+        let out: string[] = [this.createSql(d)];
+        let i = 0;
+        while (i < this.indexes.len) {
+            out.push(this.indexes[i].sql(d));
+            i += 1;
+        }
+        return out;
+    }
+}
+
+export class Drop {
+    name: string;
+    ifExistsFlag: bool;
+
+    fn init(name: string) {
+        this.name = name;
+        this.ifExistsFlag = false;
+    }
+
+    builder fn ifExists() {
+        this.ifExistsFlag = true;
+        return this;
+    }
+
+    fn sql(d: Dialect): string {
+        let s = "DROP TABLE ";
+        if (this.ifExistsFlag) { s = s + "IF EXISTS "; }
+        return s + d.quoteIdent(this.name);
+    }
+}
+
+// ALTER is deliberately thin: ADD COLUMN is the one form all three engines
+// spell the same way and the one SQLite supports without rebuilding the table.
+// Dropping or retyping a column on SQLite means create-copy-drop-rename, which
+// is a migration, not a DDL statement.
+export class Alter {
+    name: string;
+    added: Column[];
+
+    fn init(name: string) {
+        this.name = name;
+        this.added = [];
+    }
+
+    fn addColumn(name: string, kind: int): Column {
+        let c = new Column(name, kind);
+        this.added.push(c);
+        return c;
+    }
+
+    fn statements(d: Dialect): string[] {
+        let out: string[] = [];
+        let i = 0;
+        while (i < this.added.len) {
+            out.push("ALTER TABLE " + d.quoteIdent(this.name)
+                     + " ADD COLUMN " + this.added[i].definition(d));
+            i += 1;
+        }
+        return out;
+    }
+}
+
+export fn table(name: string): Table { return new Table(name); }
+export fn dropTable(name: string): Drop { return new Drop(name); }
+export fn alterTable(name: string): Alter { return new Alter(name); }

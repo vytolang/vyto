@@ -29,8 +29,11 @@ done
 
 - **08_sqlite** — needs SQLite. Install the system dev package
   (`sudo apt install libsqlite3-dev`); the C build links `-lsqlite3` and the Vyto
-  binding (`sqlite3.vt`) links the system library too. The large SQLite
-  amalgamation is **not** vendored here — install the package instead.
+  binding (`sqlite3.vt`) links the system library too. The amalgamation is not
+  vendored *here* — but note that **`lib/vyto/db/sqlite` does vendor it**, so a
+  benchmark rewritten against `vyto/db` would need no system package at all.
+  This one deliberately stays a raw-FFI comparison: it measures the binding
+  against C, not the ergonomic layer on top of it.
 - **09_threads** — ⚠️ **do not run `09_threads.py`.** The Python variant pins the
   machine (thread thrash); it exists only for source comparison. The `.c`/`.vt`
   variants are fine.

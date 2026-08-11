@@ -1,0 +1,634 @@
+// vyto/db/introspect — what is actually in the database.
+//
+// The rest of this package builds SQL against a schema you already know. This
+// module answers the other question: what tables exist, what columns do they
+// have, what did the DDL actually say. A database client is a schema tree
+// before it is anything else, and nothing in the tree could ask until now.
+//
+// ── IT DOES NOT EXECUTE ITSELF ──────────────────────────────────────────────
+//
+// Same split the query builder makes. The records and the reading live here;
+// running the statements is `Db.describe()` / `Db.schema()` in db.vt. That is
+// not tidiness — db.vt imports this module to re-export it, so a reference the
+// other way would be a cycle, and a cycle in this compiler surfaces as an
+// unhelpful "unknown type" rather than a diagnostic that names the problem.
+//
+// ── OBSERVED, NOT INTENDED ──────────────────────────────────────────────────
+//
+// These types are deliberately NOT `vyto/db/schema`'s Table / Column / Index.
+// Those describe DDL you are about to emit — a column there is one of six
+// COL_* kinds. A column *in a database* is whatever string the author typed:
+// `VARCHAR(255)`, `NUMERIC(10,2)`, `character varying`, or nothing at all. It
+// has a position within a composite primary key, a collation, possibly a
+// generation expression. None of that survives a six-value enum.
+//
+// So: ColumnInfo keeps `declType` verbatim and is honest that `kindGuess()` is
+// a guess. `TableInfo.toTable()` bridges to the builder and documents what it
+// throws away.
+//
+// (There is a second reason for the distinct names. db.vt re-exports both
+// modules, and the checker skips imports when looking for duplicate top-level
+// names — so a `Column` here would silently shadow or be shadowed by the one
+// in schema.vt depending on import order, with no error at all.)
+
+import { Dialect, COL_INT, COL_TEXT, COL_REAL, COL_BLOB, COL_BOOL,
+         COL_TIMESTAMP } from "vyto/db/dialect";
+import { Row, Value } from "vyto/db/value";
+import { Table, Column } from "vyto/db/schema";
+import { StringBuilder } from "vyto/util/text";
+
+// What kind of thing a schema object is.
+export const OBJ_TABLE: int = 0;
+export const OBJ_VIEW: int = 1;
+export const OBJ_VIRTUAL: int = 2;      // CREATE VIRTUAL TABLE (fts5, rtree, ...)
+export const OBJ_SHADOW: int = 3;       // a virtual table's backing store
+export const OBJ_INDEX: int = 4;
+export const OBJ_TRIGGER: int = 5;
+export const OBJ_UNKNOWN: int = 6;
+
+export fn obj_name(k: int): string {
+    if (k == OBJ_TABLE) { return "table"; }
+    if (k == OBJ_VIEW) { return "view"; }
+    if (k == OBJ_VIRTUAL) { return "virtual"; }
+    if (k == OBJ_SHADOW) { return "shadow"; }
+    if (k == OBJ_INDEX) { return "index"; }
+    if (k == OBJ_TRIGGER) { return "trigger"; }
+    return "unknown";
+}
+
+// Where an index came from. Only IDX_APPDEF was written by hand.
+export const IDX_APPDEF: int = 0;       // an explicit CREATE INDEX
+export const IDX_UNIQUE: int = 1;       // auto-created for a UNIQUE constraint
+export const IDX_PK: int = 2;           // the table's PRIMARY KEY index
+
+export fn idx_origin_name(o: int): string {
+    if (o == IDX_UNIQUE) { return "unique-constraint"; }
+    if (o == IDX_PK) { return "primary-key"; }
+    return "created";
+}
+
+// A generated column's `hidden` code. 1 is a virtual-table hidden column.
+export const HID_NONE: int = 0;
+export const HID_HIDDEN: int = 1;
+export const HID_VIRTUAL: int = 2;      // GENERATED ALWAYS AS (...) VIRTUAL
+export const HID_STORED: int = 3;       // GENERATED ALWAYS AS (...) STORED
+
+// ---- columns ------------------------------------------------------------
+
+export class ColumnInfo {
+    name: string;
+    // The declared type, exactly as written in the DDL. "" for an untyped
+    // column, which SQLite permits. This is the truth; kindGuess() is not.
+    declType: string;
+    notNull: bool;
+    dflt: string;
+    hasDefault: bool;
+    // 1-based position within the primary key, 0 when not a member. A
+    // composite key is ordered by this and NOT by column order.
+    pkPos: int;
+    // The true column index. Comes from table_xinfo, so it lines up with the
+    // cid an index reports even when the table has generated columns.
+    cid: int;
+    hidden: int;
+    present: bool;
+
+    fn init(name: string, declType: string) {
+        this.name = name;
+        this.declType = declType;
+        this.notNull = false;
+        this.dflt = "";
+        this.hasDefault = false;
+        this.pkPos = 0;
+        this.cid = -1;
+        this.hidden = HID_NONE;
+        this.present = true;
+    }
+
+    fn exists(): bool { return this.present; }
+    fn isPk(): bool { return this.pkPos > 0; }
+    fn isGenerated(): bool { return this.hidden >= HID_VIRTUAL; }
+    fn isHidden(): bool { return this.hidden != HID_NONE; }
+
+    // SQLite's five affinity rules applied to the declared type, mapped onto
+    // the builder's COL_* kinds. Best-effort by construction: `declType` is
+    // free text and two engines disagree about what "TIMESTAMP" means. Keep
+    // declType for anything that matters.
+    fn kindGuess(): int {
+        let t = upper(this.declType);
+        if (t.len == 0) { return COL_TEXT; }
+        if (contains(t, "INT")) { return COL_INT; }
+        if (contains(t, "CHAR") || contains(t, "CLOB") || contains(t, "TEXT")) { return COL_TEXT; }
+        if (contains(t, "BLOB")) { return COL_BLOB; }
+        if (contains(t, "REAL") || contains(t, "FLOA") || contains(t, "DOUB")) { return COL_REAL; }
+        if (contains(t, "BOOL")) { return COL_BOOL; }
+        if (contains(t, "DATE") || contains(t, "TIME")) { return COL_TIMESTAMP; }
+        return COL_REAL;                     // NUMERIC affinity
+    }
+
+    // A stable name for the guessed kind. For diagnostics and golden tests:
+    // no engine or library version can change what this string says.
+    fn kindName(): string {
+        let k = this.kindGuess();
+        if (k == COL_INT) { return "int"; }
+        if (k == COL_REAL) { return "real"; }
+        if (k == COL_BLOB) { return "blob"; }
+        if (k == COL_BOOL) { return "bool"; }
+        if (k == COL_TIMESTAMP) { return "timestamp"; }
+        return "text";
+    }
+}
+
+export fn absentColumn(): ColumnInfo {
+    let c = new ColumnInfo("", "");
+    c.present = false;
+    return c;
+}
+
+// ---- indexes ------------------------------------------------------------
+
+export class IndexColumn {
+    // "" when the index is over an expression rather than a column, in which
+    // case cid is negative and the expression is only in the CREATE text.
+    name: string;
+    cid: int;
+    desc: bool;
+    coll: string;
+    // False for the rowid/PK columns SQLite appends to every index. Those are
+    // real and worth seeing, but they are not what was indexed.
+    isKey: bool;
+
+    fn init(name: string, cid: int) {
+        this.name = name;
+        this.cid = cid;
+        this.desc = false;
+        this.coll = "";
+        this.isKey = true;
+    }
+
+    fn isExpression(): bool { return this.name.len == 0; }
+}
+
+export class IndexInfo {
+    name: string;
+    tbl: string;
+    unique: bool;
+    origin: int;
+    partial: bool;
+    cols: IndexColumn[];
+    present: bool;
+
+    fn init(name: string, tbl: string) {
+        this.name = name;
+        this.tbl = tbl;
+        this.unique = false;
+        this.origin = IDX_APPDEF;
+        this.partial = false;
+        this.cols = [];
+        this.present = true;
+    }
+
+    fn exists(): bool { return this.present; }
+
+    // The columns actually indexed, without the appended rowid/PK trailer.
+    fn keyColumns(): IndexColumn[] {
+        let out: IndexColumn[] = [];
+        let i = 0;
+        while (i < this.cols.len) {
+            if (this.cols[i].isKey) { out.push(this.cols[i]); }
+            i += 1;
+        }
+        return out;
+    }
+
+    fn columnNames(): string[] {
+        let out: string[] = [];
+        let ks = this.keyColumns();
+        let i = 0;
+        while (i < ks.len) {
+            out.push(ks[i].name);
+            i += 1;
+        }
+        return out;
+    }
+
+    // True when nothing in the schema asked for this index — SQLite made it to
+    // enforce a UNIQUE constraint or a primary key.
+    fn isImplicit(): bool { return this.origin != IDX_APPDEF; }
+}
+
+// ---- foreign keys -------------------------------------------------------
+
+export class ForeignKey {
+    // Foreign keys sharing an `id` are one multi-column constraint; `seq` is
+    // the position within it.
+    id: int;
+    seq: int;
+    refTable: string;
+    fromCol: string;
+    // "" when the reference named no parent column and so implicitly targets
+    // the parent's primary key.
+    toCol: string;
+    onUpdate: string;
+    onDelete: string;
+
+    fn init(id: int, seq: int) {
+        this.id = id;
+        this.seq = seq;
+        this.refTable = "";
+        this.fromCol = "";
+        this.toCol = "";
+        this.onUpdate = "";
+        this.onDelete = "";
+    }
+
+    fn isImplicitTarget(): bool { return this.toCol.len == 0; }
+}
+
+// ---- triggers -----------------------------------------------------------
+
+export class TriggerInfo {
+    name: string;
+    tbl: string;
+    sql: string;
+
+    fn init(name: string, tbl: string, sql: string) {
+        this.name = name;
+        this.tbl = tbl;
+        this.sql = sql;
+    }
+}
+
+// ---- tables -------------------------------------------------------------
+
+export class TableInfo {
+    schema: string;
+    name: string;
+    kind: int;
+    withoutRowid: bool;
+    strict: bool;
+    // The original CREATE statement, verbatim. The only place a generated
+    // column's expression survives — no pragma will give it to you.
+    sql: string;
+    cols: ColumnInfo[];
+    indexes: IndexInfo[];
+    fks: ForeignKey[];
+    present: bool;
+
+    fn init(name: string) {
+        this.schema = "main";
+        this.name = name;
+        this.kind = OBJ_TABLE;
+        this.withoutRowid = false;
+        this.strict = false;
+        this.sql = "";
+        this.cols = [];
+        this.indexes = [];
+        this.fks = [];
+        this.present = true;
+    }
+
+    fn exists(): bool { return this.present; }
+
+    // len/at make `for (let c in info)` walk the columns, the same duck-typed
+    // iteration Result uses. Neither may be a builder — a builder cannot serve
+    // as an iteration accessor.
+    fn len(): int { return this.cols.len; }
+    fn at(i: int): ColumnInfo {
+        if (i < 0 || i >= this.cols.len) { return absentColumn(); }
+        return this.cols[i];
+    }
+
+    fn indexOf(name: string): int {
+        let i = 0;
+        while (i < this.cols.len) {
+            if (this.cols[i].name == name) { return i; }
+            i += 1;
+        }
+        return -1;
+    }
+
+    fn hasColumn(name: string): bool { return this.indexOf(name) >= 0; }
+
+    // Null object on a miss, never null and never a panic — the same contract
+    // Row.get and JsonValue.get keep.
+    fn column(name: string): ColumnInfo {
+        let i = this.indexOf(name);
+        if (i < 0) { return absentColumn(); }
+        return this.cols[i];
+    }
+
+    // The column with this true index, as an index reports it. Not cols[i] —
+    // those agree today but would diverge if a column were ever skipped.
+    fn columnByCid(cid: int): ColumnInfo {
+        let i = 0;
+        while (i < this.cols.len) {
+            if (this.cols[i].cid == cid) { return this.cols[i]; }
+            i += 1;
+        }
+        return absentColumn();
+    }
+
+    fn columnNames(): string[] {
+        let out: string[] = [];
+        let i = 0;
+        while (i < this.cols.len) {
+            out.push(this.cols[i].name);
+            i += 1;
+        }
+        return out;
+    }
+
+    // Ordered by position within the key, which is not column order. Empty for
+    // a table with no declared primary key.
+    fn primaryKey(): ColumnInfo[] {
+        let out: ColumnInfo[] = [];
+        let want = 1;
+        let guard = 0;
+        while (guard < this.cols.len) {
+            let found = false;
+            let i = 0;
+            while (i < this.cols.len) {
+                if (this.cols[i].pkPos == want) {
+                    out.push(this.cols[i]);
+                    found = true;
+                }
+                i += 1;
+            }
+            if (!found) { return out; }
+            want += 1;
+            guard += 1;
+        }
+        return out;
+    }
+
+    // Null object on a miss, like column() — never null, so `t.index("nope")
+    // .unique` reads false instead of crashing through a null pointer.
+    fn index(name: string): IndexInfo {
+        let i = 0;
+        while (i < this.indexes.len) {
+            if (this.indexes[i].name == name) { return this.indexes[i]; }
+            i += 1;
+        }
+        return absentIndex(name);
+    }
+
+    fn hasIndex(name: string): bool { return this.index(name).exists(); }
+
+    fn isTable(): bool { return this.kind == OBJ_TABLE; }
+    fn isView(): bool { return this.kind == OBJ_VIEW; }
+
+    // A BEST-EFFORT bridge to the DDL builder, for "recreate something like
+    // this elsewhere". It is lossy and the losses are not subtle:
+    //
+    //   - the declared type collapses to one of six COL_* kinds, so
+    //     NUMERIC(10,2) comes back as DOUBLE PRECISION and VARCHAR(255) as TEXT
+    //   - a COMPOSITE primary key cannot be represented at all. Column.pkFlag
+    //     is a bool with no ordinal, so two key columns would emit two
+    //     PRIMARY KEY clauses — invalid DDL on all three engines. Only a
+    //     single-column key is carried over; a composite one is dropped and
+    //     you must add it yourself.
+    //   - collations, generated-column expressions, CHECK constraints, partial
+    //     index predicates, index sort order and every table-level constraint
+    //     are dropped, because the builder has nowhere to put them.
+    //
+    // `sql` holds the original text. Use that when fidelity matters.
+    fn toTable(): Table {
+        let t = table_of(this.name);
+        let pk = this.primaryKey();
+        let single = pk.len == 1;
+        let i = 0;
+        while (i < this.cols.len) {
+            let c = this.cols[i];
+            i += 1;
+            if (c.isHidden()) { continue; }        // no builder spelling exists
+            let nc = t.column(c.name, c.kindGuess());
+            if (c.notNull) { nc.notNull(); }
+            if (single && c.isPk()) { nc.primaryKey(); }
+            if (c.hasDefault && c.dflt.len > 0) { nc.defaultRaw(c.dflt); }
+        }
+        let j = 0;
+        while (j < this.indexes.len) {
+            let ix = this.indexes[j];
+            j += 1;
+            if (ix.isImplicit()) { continue; }     // the engine remakes these
+            let names = ix.columnNames();
+            if (names.len == 0) { continue; }      // expression index, unbuildable
+            if (ix.unique) { t.uniqueIndex(ix.name, names); }
+            else { t.index(ix.name, names); }
+        }
+        return t;
+    }
+
+    // A short human-readable dump, for diagnostics and golden tests.
+    fn describe(): string {
+        let sb = new StringBuilder(256);
+        sb.append(obj_name(this.kind)).append(" ").append(this.name);
+        if (this.withoutRowid) { sb.append(" WITHOUT ROWID"); }
+        if (this.strict) { sb.append(" STRICT"); }
+        sb.append("\n");
+        let i = 0;
+        while (i < this.cols.len) {
+            let c = this.cols[i];
+            i += 1;
+            sb.append("  ").append(c.name).append(" ");
+            if (c.declType.len > 0) { sb.append(c.declType); } else { sb.append("(untyped)"); }
+            if (c.notNull) { sb.append(" NOT NULL"); }
+            if (c.isPk()) { sb.append(" PK").appendInt(c.pkPos); }
+            if (c.isGenerated()) { sb.append(" GENERATED"); }
+            if (c.hasDefault) { sb.append(" DEFAULT ").append(c.dflt); }
+            sb.append("\n");
+        }
+        let j = 0;
+        while (j < this.indexes.len) {
+            let ix = this.indexes[j];
+            j += 1;
+            sb.append("  index ").append(ix.name);
+            if (ix.unique) { sb.append(" UNIQUE"); }
+            if (ix.partial) { sb.append(" PARTIAL"); }
+            sb.append(" (").append(join_names(ix.columnNames())).append(") ");
+            sb.append(idx_origin_name(ix.origin)).append("\n");
+        }
+        let k = 0;
+        while (k < this.fks.len) {
+            let f = this.fks[k];
+            k += 1;
+            sb.append("  fk ").append(f.fromCol).append(" -> ").append(f.refTable);
+            if (f.toCol.len > 0) { sb.append(".").append(f.toCol); }
+            else { sb.append(" (pk)"); }
+            sb.append("\n");
+        }
+        return sb.toString();
+    }
+}
+
+export fn absentIndex(name: string): IndexInfo {
+    let ix = new IndexInfo(name, "");
+    ix.present = false;
+    return ix;
+}
+
+export fn absentTable(name: string): TableInfo {
+    let t = new TableInfo(name);
+    t.present = false;
+    return t;
+}
+
+// ---- the whole schema ---------------------------------------------------
+
+export class Schema {
+    tables: TableInfo[];
+    views: TableInfo[];
+    triggers: TriggerInfo[];
+
+    fn init() {
+        this.tables = [];
+        this.views = [];
+        this.triggers = [];
+    }
+
+    fn len(): int { return this.tables.len; }
+    fn at(i: int): TableInfo {
+        if (i < 0 || i >= this.tables.len) { return absentTable(""); }
+        return this.tables[i];
+    }
+
+    fn table(name: string): TableInfo {
+        let i = 0;
+        while (i < this.tables.len) {
+            if (this.tables[i].name == name) { return this.tables[i]; }
+            i += 1;
+        }
+        return absentTable(name);
+    }
+
+    fn tableNames(): string[] {
+        let out: string[] = [];
+        let i = 0;
+        while (i < this.tables.len) {
+            out.push(this.tables[i].name);
+            i += 1;
+        }
+        return out;
+    }
+
+    fn viewNames(): string[] {
+        let out: string[] = [];
+        let i = 0;
+        while (i < this.views.len) {
+            out.push(this.views[i].name);
+            i += 1;
+        }
+        return out;
+    }
+}
+
+// ---- row readers --------------------------------------------------------
+//
+// One per dialect virtual, each reading the contract that virtual documents.
+// They take a Row rather than a connection so that this module never needs to
+// execute anything — db.vt runs the statement and hands the rows over.
+
+// schema, name, kind, ncol, withoutRowid, strict
+export fn readTableRow(r: Row): TableInfo {
+    let t = new TableInfo(r.at(1).asString());
+    t.schema = r.at(0).asString();
+    t.kind = kind_of(r.at(2).asString());
+    t.withoutRowid = r.at(4).asInt() != 0;
+    t.strict = r.at(5).asInt() != 0;
+    return t;
+}
+
+// cid, name, declType, notNull, dflt, pkPos, hidden
+export fn readColumnRow(r: Row): ColumnInfo {
+    let c = new ColumnInfo(r.at(1).asString(), r.at(2).asString());
+    c.cid = r.at(0).asInt();
+    c.notNull = r.at(3).asInt() != 0;
+    c.hasDefault = !r.at(4).isNull();
+    c.dflt = r.at(4).asString();
+    c.pkPos = r.at(5).asInt();
+    c.hidden = r.at(6).asInt();
+    return c;
+}
+
+// seq, name, unique, origin, partial
+export fn readIndexRow(r: Row, tbl: string): IndexInfo {
+    let ix = new IndexInfo(r.at(1).asString(), tbl);
+    ix.unique = r.at(2).asInt() != 0;
+    ix.origin = origin_of(r.at(3).asString());
+    ix.partial = r.at(4).asInt() != 0;
+    return ix;
+}
+
+// seqno, cid, name, desc, coll, key
+export fn readIndexColumnRow(r: Row): IndexColumn {
+    let c = new IndexColumn(r.at(2).asString(), r.at(1).asInt());
+    c.desc = r.at(3).asInt() != 0;
+    c.coll = r.at(4).asString();
+    c.isKey = r.at(5).asInt() != 0;
+    return c;
+}
+
+// id, seq, refTable, fromCol, toCol, onUpdate, onDelete
+export fn readForeignKeyRow(r: Row): ForeignKey {
+    let f = new ForeignKey(r.at(0).asInt(), r.at(1).asInt());
+    f.refTable = r.at(2).asString();
+    f.fromCol = r.at(3).asString();
+    f.toCol = r.at(4).asString();
+    f.onUpdate = r.at(5).asString();
+    f.onDelete = r.at(6).asString();
+    return f;
+}
+
+// SQLite names an internal object sqlite_*: sqlite_sequence, sqlite_stat1, the
+// sqlite_autoindex_* that back UNIQUE constraints. They are real, and they are
+// never what a caller listing tables meant.
+export fn isInternalName(name: string): bool {
+    return name.starts_with("sqlite_");
+}
+
+fn kind_of(s: string): int {
+    if (s == "table") { return OBJ_TABLE; }
+    if (s == "view") { return OBJ_VIEW; }
+    if (s == "virtual") { return OBJ_VIRTUAL; }
+    if (s == "shadow") { return OBJ_SHADOW; }
+    if (s == "index") { return OBJ_INDEX; }
+    if (s == "trigger") { return OBJ_TRIGGER; }
+    return OBJ_UNKNOWN;
+}
+
+fn origin_of(s: string): int {
+    if (s == "u") { return IDX_UNIQUE; }
+    if (s == "pk") { return IDX_PK; }
+    return IDX_APPDEF;
+}
+
+fn join_names(xs: string[]): string {
+    let sb = new StringBuilder(64);
+    let i = 0;
+    while (i < xs.len) {
+        if (i > 0) { sb.append(", "); }
+        sb.append(xs[i]);
+        i += 1;
+    }
+    return sb.toString();
+}
+
+fn upper(s: string): string {
+    let sb = new StringBuilder(s.len + 1);
+    let i = 0;
+    while (i < s.len) {
+        let c = s[i] as int;
+        if (c >= 97 && c <= 122) { c = c - 32; }
+        sb.appendByte(c);
+        i += 1;
+    }
+    return sb.toString();
+}
+
+fn contains(hay: string, needle: string): bool {
+    return hay.index_of(needle) >= 0;
+}
+
+// schema.vt's `table()` factory, reached without importing the name into this
+// module's scope — `table` is also a natural local variable name here.
+fn table_of(name: string): Table { return new Table(name); }

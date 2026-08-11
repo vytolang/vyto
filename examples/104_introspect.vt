@@ -1,0 +1,307 @@
+// Schema introspection — reading a database's own shape back out.
+//
+// Runs entirely against :memory:, so it touches no filesystem and leaves
+// nothing behind. The fixture schema below is not arbitrary: every table in it
+// exists to pin one thing that is easy to get wrong, and most of them are wrong
+// in ways no ordinary test would notice.
+
+import { Db, Value, Row, dbText, isIdent,
+         ColumnInfo, IndexInfo, TableInfo, ForeignKey, TriggerInfo, Schema,
+         obj_name, idx_origin_name,
+         OBJ_TABLE, OBJ_VIEW, IDX_APPDEF, IDX_UNIQUE, IDX_PK,
+         HID_NONE, HID_STORED,
+         sqliteDialect, pgDialect, mysqlDialect } from "vyto/db";
+import { sqliteMemory } from "vyto/db/sqlite";
+
+fn check(name: string, got: string, want: string) {
+    if (got == want) {
+        print("ok    " + name);
+    } else {
+        print("FAIL  " + name);
+        print("  got  " + got);
+        print("  want " + want);
+    }
+}
+
+fn checkBool(name: string, got: bool) {
+    if (got) { print("ok    " + name); }
+    else { print("FAIL  " + name); }
+}
+
+fn join(xs: string[]): string {
+    let out = "";
+    let i = 0;
+    while (i < xs.len) {
+        if (i > 0) { out = out + ","; }
+        out = out + xs[i];
+        i += 1;
+    }
+    return out;
+}
+
+fn pkNames(t: TableInfo): string {
+    let pk = t.primaryKey();
+    let out = "";
+    let i = 0;
+    while (i < pk.len) {
+        if (i > 0) { out = out + ","; }
+        out = out + pk[i].name;
+        i += 1;
+    }
+    return out;
+}
+
+// ---- the fixture --------------------------------------------------------
+
+fn setup(db: Db) {
+    // A rowid alias primary key. SQLite makes NO index for this — the PK is
+    // only visible through a column's pk position.
+    db.execRaw("CREATE TABLE users ("
+             + "id INTEGER PRIMARY KEY, "
+             + "email TEXT NOT NULL UNIQUE, "
+             + "name VARCHAR(255), "
+             + "score NUMERIC(10,2), "
+             + "note, "                              // no declared type at all
+             + "created TEXT DEFAULT 'epoch')");
+
+    // A composite primary key, declared in the opposite order to the columns,
+    // so reading it back in column order would be wrong.
+    db.execRaw("CREATE TABLE memberships ("
+             + "user_id INTEGER NOT NULL, "
+             + "tenant_id INTEGER NOT NULL, "
+             + "role TEXT, "
+             + "PRIMARY KEY (tenant_id, user_id))");
+
+    // A stored generated column in the MIDDLE of the table. This is the one
+    // that breaks a naive reader: PRAGMA table_info renumbers cid over the
+    // visible columns only, while an index reports the true index, so they
+    // stop lining up from here on.
+    db.execRaw("CREATE TABLE items ("
+             + "sku TEXT, "
+             + "qty INTEGER, "
+             + "price REAL, "
+             + "total REAL GENERATED ALWAYS AS (qty * price) STORED, "
+             + "label TEXT)");
+    db.execRaw("CREATE INDEX idx_items_label ON items (label)");
+
+    // Two foreign keys: one naming the parent column, one leaving it implicit.
+    db.execRaw("CREATE TABLE posts ("
+             + "id INTEGER PRIMARY KEY, "
+             + "author INTEGER REFERENCES users(id) ON DELETE CASCADE, "
+             + "editor INTEGER REFERENCES users)");
+
+    // Sort order and collation on index columns, and a partial index.
+    db.execRaw("CREATE INDEX idx_posts_author ON posts (author DESC)");
+    db.execRaw("CREATE INDEX idx_posts_live ON posts (id) WHERE author IS NOT NULL");
+
+    db.execRaw("CREATE TABLE logs (k TEXT PRIMARY KEY, v TEXT) WITHOUT ROWID");
+    db.execRaw("CREATE TABLE tight (id INTEGER PRIMARY KEY, n INT NOT NULL) STRICT");
+
+    // A perfectly legal table name that quoteIdent would abort the process on.
+    db.execRaw("CREATE TABLE \"odd-name\" (a INTEGER)");
+
+    db.execRaw("CREATE VIEW active_users AS SELECT id, email FROM users WHERE note IS NULL");
+    db.execRaw("CREATE TRIGGER trg_users_ins AFTER INSERT ON users "
+             + "BEGIN UPDATE users SET note = 'seen' WHERE id = NEW.id; END");
+}
+
+fn main() {
+    let db = new Db(sqliteMemory());
+    setup(db);
+
+    print("---- capability ----");
+    checkBool("sqlite supports introspection", db.supportsIntrospection());
+    checkBool("sqlite dialect says so", sqliteDialect().supportsIntrospection());
+    // Written but never run: the Postgres and MySQL introspection SQL would be
+    // untestable without a server, so those virtuals panic instead of shipping
+    // a query nobody has executed. Callers ask first.
+    checkBool("postgres does not", !pgDialect().supportsIntrospection());
+    checkBool("mysql does not", !mysqlDialect().supportsIntrospection());
+
+    print("");
+    print("---- listing ----");
+    check("tables", join(db.tables()),
+          "items,logs,memberships,odd-name,posts,tight,users");
+    check("views", join(db.views()), "active_users");
+    checkBool("hasTable users", db.hasTable("users"));
+    checkBool("hasTable nope", !db.hasTable("nope"));
+    // sqlite_autoindex_* and friends are real objects and never what a caller
+    // listing tables meant.
+    checkBool("internals filtered", !db.hasTable("sqlite_master"));
+
+    print("");
+    print("---- a rowid-alias primary key has no index ----");
+    let u = db.describe("users");
+    checkBool("users exists", u.exists());
+    check("kind", obj_name(u.kind), "table");
+    check("columns", join(u.columnNames()), "id,email,name,score,note,created");
+    check("primary key", pkNames(u), "id");
+    checkBool("id is pk", u.column("id").isPk());
+    check("id pk position", "" + u.column("id").pkPos, "1");
+    // The whole point: the PK is real, and there is no index for it.
+    check("index count", "" + u.indexes.len, "1");
+    check("the one index is the UNIQUE", idx_origin_name(u.indexes[0].origin),
+          "unique-constraint");
+    checkBool("and it is implicit", u.indexes[0].isImplicit());
+    check("its column", join(u.indexes[0].columnNames()), "email");
+
+    print("");
+    print("---- declared types are kept verbatim ----");
+    check("varchar", u.column("name").declType, "VARCHAR(255)");
+    check("numeric", u.column("score").declType, "NUMERIC(10,2)");
+    check("untyped column", "[" + u.column("note").declType + "]", "[]");
+    // kindGuess is affinity, and affinity is a guess. declType is the truth.
+    check("varchar guesses text", u.column("name").kindName(), "text");
+    check("numeric guesses real", u.column("score").kindName(), "real");
+    check("int guesses int", u.column("id").kindName(), "int");
+    checkBool("email is NOT NULL", u.column("email").notNull);
+    checkBool("name is nullable", !u.column("name").notNull);
+    check("default", u.column("created").dflt, "'epoch'");
+    checkBool("has a default", u.column("created").hasDefault);
+    checkBool("no default", !u.column("name").hasDefault);
+
+    print("");
+    print("---- a composite key is ordered by position, not by column ----");
+    let m = db.describe("memberships");
+    check("columns in table order", join(m.columnNames()), "user_id,tenant_id,role");
+    // Declared PRIMARY KEY (tenant_id, user_id) — the reverse.
+    check("primary key in key order", pkNames(m), "tenant_id,user_id");
+    check("tenant_id position", "" + m.column("tenant_id").pkPos, "1");
+    check("user_id position", "" + m.column("user_id").pkPos, "2");
+    check("role is not a key", "" + m.column("role").pkPos, "0");
+
+    print("");
+    print("---- a generated column, and the cid it would have broken ----");
+    let it = db.describe("items");
+    check("columns incl. generated", join(it.columnNames()),
+          "sku,qty,price,total,label");
+    checkBool("total is generated", it.column("total").isGenerated());
+    check("stored, not virtual", "" + it.column("total").hidden, "" + HID_STORED);
+    checkBool("label is not", !it.column("label").isGenerated());
+    // `label` is the 5th column, true index 4. PRAGMA table_info would have
+    // called it 3, having renumbered around the generated column — and the
+    // index below reports 4. Reading cid from table_info would resolve this
+    // index to `total`.
+    check("label true cid", "" + it.column("label").cid, "4");
+    let ixl = it.index("idx_items_label");
+    check("index column by cid", it.columnByCid(ixl.keyColumns()[0].cid).name, "label");
+
+    print("");
+    print("---- index shape ----");
+    let p = db.describe("posts");
+    let byAuthor = p.index("idx_posts_author");
+    checkBool("explicit index is not implicit", !byAuthor.isImplicit());
+    check("origin", idx_origin_name(byAuthor.origin), "created");
+    checkBool("descending", byAuthor.keyColumns()[0].desc);
+    checkBool("not unique", !byAuthor.unique);
+    checkBool("not partial", !byAuthor.partial);
+    checkBool("partial index is partial", p.index("idx_posts_live").partial);
+    // A miss is a null object here too, so reading through it is safe.
+    checkBool("absent index", !p.index("no_such_index").exists());
+    checkBool("and reads false rather than crashing", !p.index("no_such_index").unique);
+    checkBool("hasIndex", p.hasIndex("idx_posts_author"));
+    // index_xinfo reports the trailing rowid column too; keyColumns() is what
+    // was actually indexed.
+    checkBool("more raw columns than key columns",
+              byAuthor.cols.len > byAuthor.keyColumns().len);
+
+    print("");
+    print("---- foreign keys ----");
+    check("fk count", "" + p.fks.len, "2");
+    let fkImplicit = p.fks[0];
+    let fkExplicit = p.fks[1];
+    check("explicit from", fkExplicit.fromCol, "author");
+    check("explicit to", fkExplicit.refTable + "." + fkExplicit.toCol, "users.id");
+    check("on delete", fkExplicit.onDelete, "CASCADE");
+    check("implicit from", fkImplicit.fromCol, "editor");
+    // No parent column named, so it targets the parent's primary key and
+    // SQLite reports the target as NULL rather than guessing for you.
+    checkBool("implicit target", fkImplicit.isImplicitTarget());
+    check("implicit to is empty", "[" + fkImplicit.toCol + "]", "[]");
+
+    print("");
+    print("---- table flags ----");
+    checkBool("logs is WITHOUT ROWID", db.describe("logs").withoutRowid);
+    checkBool("users is not", !db.describe("users").withoutRowid);
+    checkBool("tight is STRICT", db.describe("tight").strict);
+    checkBool("users is not strict", !db.describe("users").strict);
+
+    print("");
+    print("---- a view ----");
+    let v = db.describe("active_users");
+    checkBool("view exists", v.exists());
+    check("view kind", obj_name(v.kind), "view");
+    checkBool("isView", v.isView());
+    check("view columns", join(v.columnNames()), "id,email");
+
+    print("");
+    print("---- triggers ----");
+    let trs = db.triggers();
+    check("trigger count", "" + trs.len, "1");
+    check("trigger name", trs[0].name, "trg_users_ins");
+    check("trigger table", trs[0].tbl, "users");
+
+    print("");
+    print("---- the original DDL survives ----");
+    // The only place a generated column's expression exists: no pragma reports
+    // it, because dflt_value is forced NULL for a generated column.
+    checkBool("items DDL mentions the expression",
+              db.objectSql("items").index_of("qty * price") > 0);
+    check("generated column has no default", "[" + it.column("total").dflt + "]", "[]");
+
+    print("");
+    print("---- a name a query builder cannot take ----");
+    // `odd-name` is a legal table. Handing it to quoteIdent would panic, and a
+    // panic aborts the process — so introspection is how you find out first.
+    checkBool("the table is there", db.hasTable("odd-name"));
+    let odd = db.describe("odd-name");
+    checkBool("and describable", odd.exists());
+    check("its column", join(odd.columnNames()), "a");
+    checkBool("but not a usable identifier", !isIdent("odd-name"));
+    checkBool("unlike users", isIdent("users"));
+
+    print("");
+    print("---- absence is an answer, not an error ----");
+    let missing = db.describe("no_such_table");
+    checkBool("describe reports absent", !missing.exists());
+    check("with no columns", "" + missing.len(), "0");
+    // A pragma cannot tell an absent table from an empty one — both are zero
+    // rows — so existence is established before the columns are read.
+    checkBool("column of an absent table", !missing.column("x").exists());
+    checkBool("column of a real table that has none", !u.column("nope").exists());
+    check("out of range", "" + u.at(99).exists(), "false");
+
+    print("");
+    print("---- the whole schema in one call ----");
+    let s = db.schema();
+    check("schema tables", join(s.tableNames()),
+          "items,logs,memberships,odd-name,posts,tight,users");
+    check("schema views", join(s.viewNames()), "active_users");
+    check("schema triggers", "" + s.triggers.len, "1");
+    check("reachable by name", s.table("users").column("email").declType, "TEXT");
+    checkBool("miss is absent", !s.table("nope").exists());
+
+    print("");
+    print("---- toTable() is a bridge, and it is lossy ----");
+    // Round-tripping users through the DDL builder: the rowid PK and NOT NULL
+    // survive; VARCHAR(255) does not, because the builder has six kinds and
+    // that is not one of them.
+    let rebuilt = db.describe("users").toTable();
+    check("re-rendered", rebuilt.createSql(sqliteDialect()),
+          "CREATE TABLE \"users\" (\"id\" INTEGER PRIMARY KEY, "
+        + "\"email\" TEXT NOT NULL, \"name\" TEXT, \"score\" REAL, "
+        + "\"note\" TEXT, \"created\" TEXT DEFAULT 'epoch')");
+    // A composite key cannot be expressed at all — Column.pkFlag is a bool
+    // with no ordinal, so emitting both would produce two PRIMARY KEY clauses.
+    // It is dropped rather than rendered wrong.
+    check("composite pk dropped", db.describe("memberships").toTable()
+                                    .createSql(sqliteDialect()),
+          "CREATE TABLE \"memberships\" (\"user_id\" INTEGER NOT NULL, "
+        + "\"tenant_id\" INTEGER NOT NULL, \"role\" TEXT)");
+
+    print("");
+    print("---- describe() renders ----");
+    print(db.describe("memberships").describe());
+
+    db.close();
+}

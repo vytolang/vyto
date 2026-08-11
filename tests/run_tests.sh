@@ -94,6 +94,51 @@ else
     echo "FAIL freestanding_shim_stub (vyto/mmap's VT_NO_LIBC arm does not build)"
     fail=1
 fi
+# vyto/db is pure Vyto and must stay freestanding-safe; its SQLite subpackage is
+# the one part that is not, so db_shim.c carries a VT_NO_LIBC arm that drops the
+# whole library and returns failure sentinels. Both halves are checked because
+# only the second one can rot silently.
+if ./vytoc build tests/fixtures/db_nodriver.vt --freestanding --cc gcc \
+        -o examples/.vyto-cache/libdb_fs.a >/dev/null 2>&1; then
+    echo "PASS freestanding_db"
+else
+    echo "FAIL freestanding_db (vyto/db no longer builds freestanding)"
+    fail=1
+fi
+
+# --- vyto/db does not drag a driver in ---
+# THE architectural invariant of the package: native sources compile per package
+# DIRECTORY for every module in the import closure, so a vyto/db that imported
+# its drivers would build 9.5 MB of SQLite into a program that only wanted to
+# render a query string. Asserting on the compiled object list rather than on
+# "did it build" is the whole point — the contagious version builds fine.
+rm -rf tests/tmp/dbcontagion
+mkdir -p tests/tmp/dbcontagion
+cp tests/fixtures/db_nodriver.vt tests/tmp/dbcontagion/
+if ./vytoc build tests/tmp/dbcontagion/db_nodriver.vt \
+        -o tests/tmp/dbcontagion/nodriver >/dev/null 2>&1; then
+    if find tests/tmp/dbcontagion/.vyto-cache -iname '*sqlite*' 2>/dev/null | grep -q .; then
+        echo "FAIL db_no_driver_contagion (importing vyto/db compiled SQLite)"
+        find tests/tmp/dbcontagion/.vyto-cache -iname '*sqlite*' | head
+        fail=1
+    else
+        echo "PASS db_no_driver_contagion"
+    fi
+else
+    echo "FAIL db_no_driver_contagion (fixture does not build)"
+    fail=1
+fi
+
+# --- the vendored SQLite tree is byte-identical to what upstream shipped ---
+# A local edit inside native/src/sqlite3/ would be silently reverted by the next
+# refresh, so it is an error rather than a warning. Local changes belong in
+# db_shim.c or sqlite_config.h.
+if sh lib/vyto/db/sqlite/native/refresh-sqlite.sh --verify >/dev/null 2>&1; then
+    echo "PASS db_vendored_sqlite_unmodified"
+else
+    echo "FAIL db_vendored_sqlite_unmodified (native/src/sqlite3/ has been edited)"
+    fail=1
+fi
 
 # --- stdlib search path: VYTO_HOME lib, stem-collision naming, local shadowing ---
 got=$(VYTO_HOME=tests/fixtures/volthome ./vytoc run tests/fixtures/libpath/main.vt 2>&1)

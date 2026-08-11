@@ -1,0 +1,63 @@
+// vyto/db/pgsql — PostgreSQL driver. DECLARED, NOT IMPLEMENTED.
+//
+// Every entry point panics. The shape is here so the interface a real driver
+// must satisfy is reviewable, and so that reaching for Postgres fails at the
+// first call with the module name in the message rather than silently returning
+// empty result sets.
+//
+//     let db = new Db(pgsql("postgres://localhost/app"));   // panics
+//
+// ── WHY IT IS ITS OWN PACKAGE DIRECTORY ─────────────────────────────────────
+// Not style. Native sources compile per package DIRECTORY for every module in
+// it, and `#link` attaches to the module. A real implementation adds
+// `#link "pq" if "linux"` here — and because `vyto/db` imports no driver, that
+// link reaches only programs that actually import this file. Putting it beside
+// db.vt would force libpq onto every consumer of the package.
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// ── WHAT IMPLEMENTING IT COSTS, BEYOND THE BINDING ──────────────────────────
+// The libpq binding is the easy half. The half that matters:
+//
+//   * EVERY QUERY PARKS THE WORKER. libpq's synchronous API blocks, Vyto has no
+//     threads, and vyto/net/server is a pre-fork reactor — so a query holds up
+//     that worker and every connection on it. SQLite does not have this problem
+//     because it is a local file read. Sizing becomes
+//     workers ~= cores / (1 - blocked_fraction), which is cover for parked
+//     workers rather than a tuning knob. The real fix is non-blocking outbound
+//     I/O (PQsendQuery + the connection fd in the reactor's poll set), which is
+//     a larger piece of work than the driver itself.
+//   * NO CONNECTION POOL IS POSSIBLE. Pre-fork workers share nothing, so it is
+//     one connection per worker held for the worker's life. Sixteen workers
+//     across four app servers is 64 connections before any traffic, against a
+//     default max_connections of 100.
+//   * TYPE MAPPING IS NOT FIVE KINDS. libpq returns everything as text by
+//     default, and binary mode needs per-OID decoding. Value's five kinds cover
+//     what SQL portably has; arrays, JSONB, numeric, and timestamptz all need a
+//     decision about which one they become.
+//
+// PgDialect already ships in vyto/db/dialect and is fully usable — you can
+// render and test Postgres SQL today from a program that links only SQLite.
+// Only the transport is missing.
+// ─────────────────────────────────────────────────────────────────────────────
+
+import { Driver, Conn } from "vyto/db/driver";
+import { Dialect, pgDialect } from "vyto/db/dialect";
+
+export class PgDriver extends Driver {
+    dsn: string;
+
+    fn init(dsn: string) { this.dsn = dsn; }
+
+    override fn name(): string { return "postgres"; }
+
+    override fn connect(): Conn {
+        panic("vyto/db/pgsql: not implemented — no PostgreSQL driver in this build");
+    }
+}
+
+// The dialect is real even though the driver is not, so query and schema
+// rendering for Postgres works without this package at all — import
+// pgDialect() from vyto/db instead.
+export fn pgsqlDialect(): Dialect { return pgDialect(); }
+
+export fn pgsql(dsn: string): PgDriver { return new PgDriver(dsn); }

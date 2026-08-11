@@ -1,0 +1,428 @@
+// vyto/db/sqlite — the SQLite driver.
+//
+//     import { Db, select, dbText } from "vyto/db";
+//     import { sqlite, sqliteMemory } from "vyto/db/sqlite";
+//
+//     let db = new Db(sqlite("app.db").wal(true).busyTimeout(5000));
+//     let db = new Db(sqliteMemory());          // a private in-process database
+//
+// SQLite is vendored — the amalgamation is committed under native/src/sqlite3/
+// — so this builds on a fresh clone with nothing to install and no -dev package
+// anywhere. That is deliberate and it is the same argument vyto/crypto makes
+// for micro-ecc: a fetched dependency makes the test suite SKIP silently, and a
+// green run that proved nothing is worse than a red one.
+//
+// ── TWO MEMORY RULES, BOTH ENFORCED IN THE SHIM ─────────────────────────────
+//
+// A ROW OWNS ITS CELLS. The pointer sqlite3_column_text returns is invalidated
+// by the very next step(), reset() or finalize(), so every cell is copied into
+// Vyto storage before control returns here. A Row may therefore outlive its
+// statement, its connection, and the whole Db — which is what makes
+// `db.all(...)` safe to hand around, and what makes a Cursor the only object
+// with a lifetime worth thinking about.
+//
+// BINDING IS ALWAYS SQLITE_TRANSIENT. A `.cstr()` borrow dies at the end of the
+// enclosing statement, so SQLite copies rather than aliasing it.
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// A note for anyone using this behind vyto/net/server: an sqlite3 handle must
+// not be carried across fork(). Open the connection in the worker, after the
+// pre-fork, not in the parent.
+
+import { Value, Row, dbNull, dbInt, dbFloat, dbText, dbBlob,
+         DB_NULL, DB_INT, DB_FLOAT, DB_TEXT, DB_BLOB } from "vyto/db/value";
+import { Dialect, SqliteDialect, sqliteDialect } from "vyto/db/dialect";
+import { Driver, Conn, Stmt, STEP_ROW, STEP_DONE, STEP_ERR,
+         DBERR_NONE, DBERR_OPEN, DBERR_SQL, DBERR_CLOSED,
+         DBERR_MISUSE } from "vyto/db/driver";
+
+extern "C" {
+    fn vdb_open(path: cstring, readonly: i32, create: i32): rawptr;
+    fn vdb_close(db: rawptr): i32;
+    fn vdb_prepare(db: rawptr, sql: cstring, n: i64): rawptr;
+    fn vdb_step(st: rawptr): i32;
+    fn vdb_reset(st: rawptr): i32;
+    fn vdb_finalize(st: rawptr): i32;
+    fn vdb_bind_null(st: rawptr, i: i32): i32;
+    fn vdb_bind_int(st: rawptr, i: i32, v: i64): i32;
+    fn vdb_bind_double(st: rawptr, i: i32, v: f64): i32;
+    fn vdb_bind_text(st: rawptr, i: i32, p: cstring, n: i64): i32;
+    fn vdb_bind_blob(st: rawptr, i: i32, p: cstring, n: i64): i32;
+    fn vdb_column_count(st: rawptr): i32;
+    fn vdb_column_type(st: rawptr, i: i32): i32;
+    fn vdb_column_int(st: rawptr, i: i32): i64;
+    fn vdb_column_double(st: rawptr, i: i32): f64;
+    fn vdb_column_bytes(st: rawptr, i: i32): i64;
+    fn vdb_column_copy(st: rawptr, i: i32, out: cstring, cap: i64): i64;
+    fn vdb_column_name(st: rawptr, i: i32, out: cstring, cap: i64): i64;
+    fn vdb_errcode(db: rawptr): i32;
+    fn vdb_errmsg(db: rawptr, out: cstring, cap: i64): i64;
+    fn vdb_stmt_errcode(st: rawptr): i32;
+    fn vdb_stmt_errmsg(st: rawptr, out: cstring, cap: i64): i64;
+    fn vdb_last_insert_rowid(db: rawptr): i64;
+    fn vdb_changes(db: rawptr): i32;
+    fn vdb_exec(db: rawptr, sql: cstring): i32;
+    fn vdb_busy_timeout(db: rawptr, ms: i32): i32;
+}
+
+// Two-pass read of a buffer-filling shim call: ask, and if the answer did not
+// fit, ask again with a buffer that does. The shim returns the length the
+// result NEEDS, so one retry is always enough.
+fn read_msg(dbh: rawptr, sth: rawptr): string {
+    let cap = 256;
+    let buf = bytes(cap);
+    let n = 0;
+    if (sth != null) { n = vdb_stmt_errmsg(sth, buf as cstring, cap as i64) as int; }
+    else { n = vdb_errmsg(dbh, buf as cstring, cap as i64) as int; }
+    if (n < 0) { return ""; }
+    if (n >= cap) {
+        cap = n + 1;
+        buf = bytes(cap);
+        if (sth != null) { n = vdb_stmt_errmsg(sth, buf as cstring, cap as i64) as int; }
+        else { n = vdb_errmsg(dbh, buf as cstring, cap as i64) as int; }
+    }
+    return strbytes(buf, n);
+}
+
+export class SqliteStmt extends Stmt {
+    h: rawptr;
+
+    fn init(h: rawptr, sql: string) {
+        this.h = h;
+        this.sql = sql;
+        this.busy = false;
+    }
+
+    override fn bind(i: int, v: Value): bool {
+        if (this.h == null) { return false; }
+        let rc = -1;
+        if (v.kind == DB_NULL) {
+            rc = vdb_bind_null(this.h, i as i32) as int;
+        } else if (v.kind == DB_INT) {
+            rc = vdb_bind_int(this.h, i as i32, v.i as i64) as int;
+        } else if (v.kind == DB_FLOAT) {
+            rc = vdb_bind_double(this.h, i as i32, v.f) as int;
+        } else if (v.kind == DB_TEXT) {
+            // Explicit length rather than trusting NUL: a Vyto string may
+            // contain zero bytes, and strlen would silently truncate the value
+            // at the first one.
+            rc = vdb_bind_text(this.h, i as i32, v.s.cstr(), v.s.len as i64) as int;
+        } else {
+            rc = vdb_bind_blob(this.h, i as i32, v.b as cstring, v.b.len as i64) as int;
+        }
+        return rc == 0;
+    }
+
+    override fn step(): int {
+        if (this.h == null) { return STEP_ERR; }
+        let s = vdb_step(this.h) as int;
+        if (s == 0) { return STEP_ROW; }
+        if (s == 1) { return STEP_DONE; }
+        return STEP_ERR;
+    }
+
+    override fn columnCount(): int {
+        if (this.h == null) { return 0; }
+        return vdb_column_count(this.h) as int;
+    }
+
+    override fn columnName(i: int): string {
+        if (this.h == null) { return ""; }
+        let cap = 64;
+        let buf = bytes(cap);
+        let n = vdb_column_name(this.h, i as i32, buf as cstring, cap as i64) as int;
+        if (n < 0) { return ""; }
+        if (n >= cap) {
+            cap = n + 1;
+            buf = bytes(cap);
+            n = vdb_column_name(this.h, i as i32, buf as cstring, cap as i64) as int;
+        }
+        return strbytes(buf, n);
+    }
+
+    // Copies. See the header: the bytes SQLite lends us die at the next step().
+    override fn columnValue(i: int): Value {
+        if (this.h == null) { return dbNull(); }
+        let t = vdb_column_type(this.h, i as i32) as int;
+        if (t == DB_INT) { return dbInt(vdb_column_int(this.h, i as i32) as int); }
+        if (t == DB_FLOAT) { return dbFloat(vdb_column_double(this.h, i as i32)); }
+        if (t == DB_NULL) { return dbNull(); }
+
+        let n = vdb_column_bytes(this.h, i as i32) as int;
+        if (n <= 0) {
+            if (t == DB_BLOB) { return dbBlob(bytes(0)); }
+            return dbText("");
+        }
+        // +1 so the NUL the shim writes has somewhere to go; the value itself
+        // is the first n bytes either way.
+        let buf = bytes(n + 1);
+        let got = vdb_column_copy(this.h, i as i32, buf as cstring, (n + 1) as i64) as int;
+        if (got < 0) { return dbNull(); }
+        if (got > n) { got = n; }
+        if (t == DB_BLOB) {
+            let b = bytes(got);
+            let k = 0;
+            while (k < got) { b[k] = buf[k]; k += 1; }
+            return dbBlob(b);
+        }
+        // strbytes, not str(): a TEXT column may contain an embedded NUL, and
+        // a strlen scan would truncate the value there.
+        return dbText(strbytes(buf, got));
+    }
+
+    override fn reset() {
+        if (this.h != null) { vdb_reset(this.h); }
+    }
+
+    override fn finalize() {
+        if (this.h != null) {
+            vdb_finalize(this.h);
+            this.h = null;
+        }
+    }
+
+    override fn errorCode(): int {
+        if (this.h == null) { return DBERR_CLOSED; }
+        return vdb_stmt_errcode(this.h) as int;
+    }
+
+    override fn errorMessage(): string {
+        if (this.h == null) { return "statement is finalized"; }
+        return read_msg(null, this.h);
+    }
+
+    deinit {
+        if (this.h != null) {
+            vdb_finalize(this.h);
+            this.h = null;
+        }
+    }
+}
+
+export class SqliteConn extends Conn {
+    h: rawptr;
+    dial: SqliteDialect;
+    openErr: string;
+    openCode: int;
+    txOpen: bool;
+    cacheSql: string[];
+    cacheStmt: SqliteStmt[];
+    cacheCap: int;
+
+    fn init(h: rawptr, openErr: string, openCode: int) {
+        this.h = h;
+        this.dial = sqliteDialect();
+        this.openErr = openErr;
+        this.openCode = openCode;
+        this.txOpen = false;
+        this.cacheSql = [];
+        this.cacheStmt = [];
+        this.cacheCap = 64;
+    }
+
+    override fn dialect(): Dialect { return this.dial; }
+
+    override fn isOpen(): bool { return this.h != null; }
+
+    override fn errorCode(): int {
+        if (this.h == null) {
+            if (this.openCode != DBERR_NONE) { return this.openCode; }
+            return DBERR_CLOSED;
+        }
+        return vdb_errcode(this.h) as int;
+    }
+
+    override fn errorMessage(): string {
+        if (this.h == null) {
+            if (this.openErr.len > 0) { return this.openErr; }
+            return "connection is closed";
+        }
+        return read_msg(this.h, null);
+    }
+
+    override fn inTx(): bool { return this.txOpen; }
+    override fn setInTx(v: bool) { this.txOpen = v; }
+
+    // The statement cache. Keyed on the SQL text, holding the statements
+    // strongly — and the statements hold NO reference back, which is what keeps
+    // this from being a reference cycle that would leak the connection forever.
+    //
+    // A cached statement is handed out only when it is not already in use: two
+    // live cursors over the same SQL get two statements rather than trampling
+    // one, which is the re-entrancy trap that a naive cache walks straight into.
+    override fn prepare(sql: string): Stmt {
+        if (this.h == null) { return null; }
+        let i = 0;
+        while (i < this.cacheSql.len) {
+            if (this.cacheSql[i] == sql && !this.cacheStmt[i].busy) {
+                let st = this.cacheStmt[i];
+                st.reset();
+                st.busy = true;
+                return st;
+            }
+            i += 1;
+        }
+        let h = vdb_prepare(this.h, sql.cstr(), sql.len as i64);
+        if (h == null) { return null; }
+        let st = new SqliteStmt(h, sql);
+        st.busy = true;
+        return st;
+    }
+
+    override fn release(st: Stmt) {
+        if (st == null) { return; }
+        let s = st as SqliteStmt;
+        s.busy = false;
+        if (this.h == null) { s.finalize(); return; }
+        s.reset();
+
+        // Already cached? Nothing to do — it is back in the pool by virtue of
+        // busy going false.
+        let i = 0;
+        while (i < this.cacheStmt.len) {
+            if (this.cacheStmt[i] == s) { return; }
+            i += 1;
+        }
+        if (this.cacheCap <= 0 || this.cacheSql.len >= this.cacheCap) {
+            // Cache off, or full. Finalizing rather than evicting keeps this
+            // simple and bounded; a full cache on a workload with unbounded
+            // distinct SQL means the SQL should have been parameterized.
+            s.finalize();
+            return;
+        }
+        this.cacheSql.push(s.sql);
+        this.cacheStmt.push(s);
+    }
+
+    override fn execRaw(sql: string): bool {
+        if (this.h == null) { return false; }
+        return (vdb_exec(this.h, sql.cstr()) as int) == 0;
+    }
+
+    override fn lastInsertId(): int {
+        if (this.h == null) { return 0; }
+        return vdb_last_insert_rowid(this.h) as int;
+    }
+
+    override fn changes(): int {
+        if (this.h == null) { return 0; }
+        return vdb_changes(this.h) as int;
+    }
+
+    // Idempotent, and it finalizes every cached statement first: close_v2 would
+    // otherwise keep the connection alive as a zombie until they went, which
+    // looks exactly like a leak.
+    override fn close() {
+        if (this.h == null) { return; }
+        let i = 0;
+        while (i < this.cacheStmt.len) {
+            this.cacheStmt[i].finalize();
+            i += 1;
+        }
+        this.cacheSql = [];
+        this.cacheStmt = [];
+        vdb_close(this.h);
+        this.h = null;
+        this.txOpen = false;
+    }
+
+    deinit { this.close(); }
+}
+
+export class SqliteDriver extends Driver {
+    path: string;
+    readonlyFlag: bool;
+    createFlag: bool;
+    walFlag: bool;
+    fkFlag: bool;
+    busyMs: int;
+    cacheCap: int;
+
+    fn init(path: string) {
+        this.path = path;
+        this.readonlyFlag = false;
+        this.createFlag = true;
+        this.walFlag = false;
+        this.fkFlag = true;
+        this.busyMs = 0;
+        this.cacheCap = 64;
+    }
+
+    override fn name(): string { return "sqlite"; }
+
+    // These are `builder` and live on the SUBCLASS, which is legal and is the
+    // whole reason the fluent surface works: a builder returns the receiver's
+    // concrete type, so the chain stays a SqliteDriver and upcasts into
+    // `new Db(d: Driver)` at the end. The polymorphic types — Conn, Stmt —
+    // carry no builders, because a builder cannot be virtual.
+    builder fn readOnly(v: bool) {
+        this.readonlyFlag = v;
+        return this;
+    }
+
+    builder fn create(v: bool) {
+        this.createFlag = v;
+        return this;
+    }
+
+    // Write-ahead logging: readers stop blocking the writer. Worth turning on
+    // for anything serving concurrent requests, and a no-op for :memory:.
+    builder fn wal(v: bool) {
+        this.walFlag = v;
+        return this;
+    }
+
+    // SQLite defaults foreign keys OFF for backwards compatibility, so a
+    // REFERENCES clause is decoration until this runs. On by default here,
+    // because a schema that declares a constraint means it.
+    builder fn foreignKeys(v: bool) {
+        this.fkFlag = v;
+        return this;
+    }
+
+    // How long a writer waits for a lock before giving up with DBERR_BUSY.
+    builder fn busyTimeout(ms: int) {
+        this.busyMs = ms;
+        return this;
+    }
+
+    builder fn stmtCache(n: int) {
+        this.cacheCap = n;
+        return this;
+    }
+
+    override fn connect(): Conn {
+        let h = vdb_open(this.path.cstr(),
+                         bool_i(this.readonlyFlag) as i32,
+                         bool_i(this.createFlag) as i32);
+        if (h == null) {
+            return new SqliteConn(null, "out of memory opening " + this.path, DBERR_OPEN);
+        }
+        // A handle can come back carrying an error — a missing file with
+        // create off, a directory, a non-database. Read it before using it.
+        let code = vdb_errcode(h) as int;
+        if (code != DBERR_NONE) {
+            let msg = read_msg(h, null);
+            vdb_close(h);
+            return new SqliteConn(null, msg, code);
+        }
+
+        let c = new SqliteConn(h, "", DBERR_NONE);
+        c.cacheCap = this.cacheCap;
+        if (this.busyMs > 0) { vdb_busy_timeout(h, this.busyMs as i32); }
+        if (this.walFlag) { c.execRaw("PRAGMA journal_mode=WAL"); }
+        if (this.fkFlag) { c.execRaw("PRAGMA foreign_keys=ON"); }
+        return c;
+    }
+}
+
+fn bool_i(b: bool): int {
+    if (b) { return 1; }
+    return 0;
+}
+
+export fn sqlite(path: string): SqliteDriver { return new SqliteDriver(path); }
+
+// A private in-memory database, discarded when the connection closes. What
+// tests want: no file, no path in the output, nothing to clean up.
+export fn sqliteMemory(): SqliteDriver { return new SqliteDriver(":memory:"); }
