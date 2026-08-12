@@ -392,6 +392,230 @@ export fn pbkdf2_sha256(password: byte[], salt: byte[], iters: int, dklen: int):
     return out;
 }
 
+// ---- SHA-1 (FIPS 180-1) -----------------------------------------------------
+//
+// ⚠ SHA-1 IS BROKEN for collision resistance — SHAttered (2017) produced two
+// PDFs with the same digest, and chosen-prefix collisions followed in 2020. It
+// must never be used for a signature, a certificate, or a content address where
+// an attacker chooses the input.
+//
+// It is here for the same reason md5() is: protocols that specify it and cannot
+// be argued with. The RFC 6455 WebSocket handshake computes an accept key with
+// it (vyto/net/websocket, which re-exports this), and MySQL's
+// mysql_native_password derives its auth response from it. Both use it as a
+// mixing function against a server nonce rather than for collision resistance.
+//
+// If you are choosing rather than complying, use sha256.
+
+export const SHA1_SIZE: int = 20;
+export const SHA1_BLOCK: int = 64;
+
+export fn sha1(data: byte[]): byte[] {
+    let ml = data.len;
+    let total = ml + 1;
+    while (total % 64 != 56) { total += 1; }
+    total += 8;
+    let msg = bytes(total); // zeroed: padding comes for free
+    let i = 0;
+    while (i < ml) { msg[i] = data[i]; i += 1; }
+    msg[ml] = 0x80 as byte;
+    let bits = ml * 8;
+    let k = 0;
+    while (k < 8) { msg[total - 1 - k] = ((bits >> (k * 8)) & 0xFF) as byte; k += 1; }
+
+    let h0 = 0x67452301;
+    let h1 = 0xEFCDAB89;
+    let h2 = 0x98BADCFE;
+    let h3 = 0x10325476;
+    let h4 = 0xC3D2E1F0;
+
+    let off = 0;
+    while (off < total) {
+        let w: int[] = [];
+        let t = 0;
+        while (t < 16) {
+            let p = off + t * 4;
+            w.push(((msg[p] as int) << 24) | ((msg[p + 1] as int) << 16) |
+                   ((msg[p + 2] as int) << 8) | (msg[p + 3] as int));
+            t += 1;
+        }
+        while (t < 80) {
+            w.push(rotl32(w[t - 3] ^ w[t - 8] ^ w[t - 14] ^ w[t - 16], 1));
+            t += 1;
+        }
+        let a = h0; let b = h1; let c = h2; let d = h3; let e = h4;
+        let r = 0;
+        while (r < 80) {
+            let f = 0;
+            let kc = 0;
+            if (r < 20) { f = (b & c) | ((~b) & d); kc = 0x5A827999; }
+            else if (r < 40) { f = b ^ c ^ d; kc = 0x6ED9EBA1; }
+            else if (r < 60) { f = (b & c) | (b & d) | (c & d); kc = 0x8F1BBCDC; }
+            else { f = b ^ c ^ d; kc = 0xCA62C1D6; }
+            let tmp = (rotl32(a, 5) + (f & 0xFFFFFFFF) + e + kc + w[r]) & 0xFFFFFFFF;
+            e = d;
+            d = c;
+            c = rotl32(b, 30);
+            b = a;
+            a = tmp;
+            r += 1;
+        }
+        h0 = (h0 + a) & 0xFFFFFFFF;
+        h1 = (h1 + b) & 0xFFFFFFFF;
+        h2 = (h2 + c) & 0xFFFFFFFF;
+        h3 = (h3 + d) & 0xFFFFFFFF;
+        h4 = (h4 + e) & 0xFFFFFFFF;
+        off += 64;
+    }
+
+    let hs = [h0, h1, h2, h3, h4];
+    let dg = bytes(20);
+    let j = 0;
+    while (j < 5) {
+        dg[j * 4] = ((hs[j] >> 24) & 0xFF) as byte;
+        dg[j * 4 + 1] = ((hs[j] >> 16) & 0xFF) as byte;
+        dg[j * 4 + 2] = ((hs[j] >> 8) & 0xFF) as byte;
+        dg[j * 4 + 3] = (hs[j] & 0xFF) as byte;
+        j += 1;
+    }
+    return dg;
+}
+
+// ---- MD5 (RFC 1321) ---------------------------------------------------------
+//
+// ⚠ MD5 IS BROKEN. Collisions are trivial to produce — minutes on a laptop,
+// and chosen-prefix collisions are practical — so it must never be used for a
+// signature, a certificate, a content address, a deduplication key, or anything
+// else where an attacker choosing the input is a threat. It is not a password
+// hash either; that is what pbkdf2_sha256 and vyto/crypto/argon2 are for.
+//
+// It is here for ONE reason: protocol interoperability with things that specify
+// it and cannot be talked out of it. Concretely, PostgreSQL's `md5`
+// authentication method, which is still the default in older RDS parameter
+// groups, on Azure Flexible Server, and in every pg_hba.conf nobody has
+// revisited — so a driver without it is one that works against a local Docker
+// container and fails in production. Legacy checksums, HTTP ETags and S3's
+// Content-MD5 header are the same shape of need.
+//
+// Second preimages are what matter for that use, and MD5 is not practically
+// broken there — but do not read that as a reason to reach for it. If you are
+// choosing rather than complying, use sha256.
+
+export const MD5_SIZE: int = 16;
+export const MD5_BLOCK: int = 64;
+
+// Per-round left-rotation amounts, four groups of four, repeated per group.
+fn md5_shifts(): int[] {
+    return [
+        7, 12, 17, 22,  7, 12, 17, 22,  7, 12, 17, 22,  7, 12, 17, 22,
+        5,  9, 14, 20,  5,  9, 14, 20,  5,  9, 14, 20,  5,  9, 14, 20,
+        4, 11, 16, 23,  4, 11, 16, 23,  4, 11, 16, 23,  4, 11, 16, 23,
+        6, 10, 15, 21,  6, 10, 15, 21,  6, 10, 15, 21,  6, 10, 15, 21
+    ];
+}
+
+// K[i] = floor(2^32 * abs(sin(i + 1))). A table rather than a computation: the
+// same reason k256() is one, and it keeps this free of a libm dependency.
+fn md5_k(): int[] {
+    return [
+        0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee,
+        0xf57c0faf, 0x4787c62a, 0xa8304613, 0xfd469501,
+        0x698098d8, 0x8b44f7af, 0xffff5bb1, 0x895cd7be,
+        0x6b901122, 0xfd987193, 0xa679438e, 0x49b40821,
+        0xf61e2562, 0xc040b340, 0x265e5a51, 0xe9b6c7aa,
+        0xd62f105d, 0x02441453, 0xd8a1e681, 0xe7d3fbc8,
+        0x21e1cde6, 0xc33707d6, 0xf4d50d87, 0x455a14ed,
+        0xa9e3e905, 0xfcefa3f8, 0x676f02d9, 0x8d2a4c8a,
+        0xfffa3942, 0x8771f681, 0x6d9d6122, 0xfde5380c,
+        0xa4beea44, 0x4bdecfa9, 0xf6bb4b60, 0xbebfbc70,
+        0x289b7ec6, 0xeaa127fa, 0xd4ef3085, 0x04881d05,
+        0xd9d4d039, 0xe6db99e5, 0x1fa27cf8, 0xc4ac5665,
+        0xf4292244, 0x432aff97, 0xab9423a7, 0xfc93a039,
+        0x655b59c3, 0x8f0ccc92, 0xffeff47d, 0x85845dd1,
+        0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1,
+        0xf7537e82, 0xbd3af235, 0x2ad7d2bb, 0xeb86d391
+    ];
+}
+
+export fn md5(data: byte[]): byte[] {
+    let K = md5_k();
+    let S = md5_shifts();
+
+    // Same padding rule as SHA-256 — 0x80, zeroes, then the bit length — except
+    // the length is LITTLE-endian here. bytes() is zeroed, so the middle is free.
+    let ml = data.len;
+    let total = ml + 1;
+    while (total % 64 != 56) { total += 1; }
+    total += 8;
+    let msg = bytes(total);
+    let i = 0;
+    while (i < ml) { msg[i] = data[i]; i += 1; }
+    msg[ml] = 0x80 as byte;
+    let bits = ml * 8;
+    let k = 0;
+    while (k < 8) { msg[total - 8 + k] = ((bits >> (k * 8)) & 0xFF) as byte; k += 1; }
+
+    let a0 = 0x67452301; let b0 = 0xefcdab89;
+    let c0 = 0x98badcfe; let d0 = 0x10325476;
+
+    let off = 0;
+    while (off < total) {
+        let m: int[] = [];
+        let t = 0;
+        while (t < 16) {
+            let p = off + t * 4;
+            m.push((msg[p] as int) | ((msg[p + 1] as int) << 8) |
+                   ((msg[p + 2] as int) << 16) | ((msg[p + 3] as int) << 24));
+            t += 1;
+        }
+
+        let a = a0; let b = b0; let c = c0; let d = d0;
+        let r = 0;
+        while (r < 64) {
+            let f = 0;
+            let g = 0;
+            if (r < 16) {
+                f = (b & c) | ((~b) & d);
+                g = r;
+            } else if (r < 32) {
+                f = (d & b) | ((~d) & c);
+                g = (5 * r + 1) % 16;
+            } else if (r < 48) {
+                f = b ^ c ^ d;
+                g = (3 * r + 5) % 16;
+            } else {
+                f = c ^ (b | ((~d) & 0xFFFFFFFF));
+                g = (7 * r) % 16;
+            }
+            // ~ on a 64-bit int sets the high half too; mask before it can leak
+            // into the sum.
+            f = (f + a + K[r] + m[g]) & 0xFFFFFFFF;
+            a = d;
+            d = c;
+            c = b;
+            b = (b + rotl32(f, S[r])) & 0xFFFFFFFF;
+            r += 1;
+        }
+        a0 = (a0 + a) & 0xFFFFFFFF;
+        b0 = (b0 + b) & 0xFFFFFFFF;
+        c0 = (c0 + c) & 0xFFFFFFFF;
+        d0 = (d0 + d) & 0xFFFFFFFF;
+        off += 64;
+    }
+
+    let hs = [a0, b0, c0, d0];
+    let dg = bytes(16);
+    let j = 0;
+    while (j < 4) {
+        dg[j * 4]     = (hs[j] & 0xFF) as byte;
+        dg[j * 4 + 1] = ((hs[j] >> 8) & 0xFF) as byte;
+        dg[j * 4 + 2] = ((hs[j] >> 16) & 0xFF) as byte;
+        dg[j * 4 + 3] = ((hs[j] >> 24) & 0xFF) as byte;
+        j += 1;
+    }
+    return dg;
+}
+
 // ---- ChaCha20 (RFC 8439 §2.3) -----------------------------------------------
 
 export const CHACHA_KEY_SIZE: int = 32;
