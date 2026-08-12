@@ -1,0 +1,615 @@
+// vyto/db/pgsql/session — one connection's conversation with the server.
+//
+// This is the only file in the driver that holds both a transport and protocol
+// state. proto.vt, pgtype.vt and auth.vt are pure; pgsql.vt is the driver seam.
+//
+// ── WHY PgSession EXISTS AT ALL ─────────────────────────────────────────────
+// driver.vt:56-61 forbids a Stmt from holding a reference back to its Conn: a
+// connection owns its statement cache, so the back-reference would close a
+// strong reference cycle, and Vyto leaks those silently with nothing to detect
+// it. The SQLite driver dodges the problem by asking SQLite in C for a
+// statement's database handle. A wire driver has no C to ask.
+//
+// The answer is not `weak`. It is this object: a third thing that PgConn and
+// PgStmt each hold STRONGLY, and that holds a reference to NEITHER of them.
+//
+//     PgConn ──> PgSession <── PgStmt
+//                    │
+//                    └──> WireIo ──> Socket
+//
+// Every edge points down. There is no cycle, so nothing leaks, and both objects
+// see exactly the same connection state — which is why errorCode() on a Conn
+// and on a Stmt can never disagree here, and why changes() still reports the
+// right number after release() has handed the statement back (db.vt:327 reads
+// it at that point).
+//
+// PgRowBuffer is the second half of the trick. Only one statement can own the
+// wire at a time, so when a second one needs it the first has to be drained
+// somewhere — and PgSession cannot hold a PgStmt to drain into without
+// recreating the cycle. A PgRowBuffer is inert: it points at nothing, so the
+// session and the statement can both hold it.
+// ─────────────────────────────────────────────────────────────────────────────
+
+import { WireIo, IO_OK, io_state_name } from "vyto/db/wire/io";
+import { parseIntOr, sqlstateToDberr } from "vyto/db/wire";
+import { DBERR_NONE, DBERR_OPEN, DBERR_SQL, DBERR_CLOSED, DBERR_BUSY,
+         DBERR_UNSUPPORTED, DBERR_MISUSE } from "vyto/db/driver";
+import { readU32BE } from "vyto/mmap/decode";
+import { PgError, PgTag, PgColumn, PgAuth,
+         decodeError, decodeCommandComplete, decodeRowDescription,
+         decodeParameterDescription, decodeAuth, decodeParameterStatus,
+         decodeBackendKey, decodeReadyForQuery,
+         encodeStartup, encodeQuery, encodeParse, encodeDescribe, encodeBind,
+         encodeExecute, encodeSync, encodeClose, encodeTerminate,
+         encodePassword, encodeSaslInitial, encodeSaslResponse,
+         PgParam, DESC_STATEMENT,
+         B_AUTH, B_BACKEND_KEY, B_PARAM_STATUS, B_READY, B_PARSE_DONE,
+         B_BIND_DONE, B_CLOSE_DONE, B_CMD_COMPLETE, B_DATA_ROW, B_ROW_DESC,
+         B_PARAM_DESC, B_NO_DATA, B_EMPTY_QUERY, B_PORTAL_SUSP, B_ERROR,
+         B_NOTICE, B_NOTIFY, B_NEGOTIATE, B_COPY_IN, B_COPY_OUT, B_COPY_BOTH,
+         AUTH_OK, AUTH_CLEARTEXT, AUTH_MD5, AUTH_SASL, AUTH_SASL_CONTINUE,
+         AUTH_SASL_FINAL, AUTH_KERBEROS_V5, AUTH_GSS, AUTH_SSPI, AUTH_SCM,
+         TX_IDLE, TX_INTX, TX_FAILED } from "vyto/db/pgsql/proto";
+import { ScramClient, scramClient, scramClientWith, md5Password,
+         SCRAM_SHA_256 } from "vyto/db/pgsql/auth";
+
+// A message off the wire, already framed.
+export class PgMsg {
+    kind: int;
+    body: byte[];
+    fn init(kind: int, body: byte[]) { this.kind = kind; this.body = body; }
+}
+
+// Somewhere to park rows, holding no reference to anything.
+//
+// A statement that is streaming keeps this empty and reads from the wire. One
+// that has been evicted — because another statement on the same connection
+// needed the wire — finds its remaining rows here instead, already in order.
+export class PgRowBuffer {
+    rows: byte[][];      // raw DataRow bodies, in order
+    head: int;           // how many have been handed out
+    complete: bool;      // the result finished; there is no more to come
+
+    fn init() { this.rows = []; this.head = 0; this.complete = false; }
+
+    fn reset() { this.rows = []; this.head = 0; this.complete = false; }
+    fn pending(): int { return this.rows.len - this.head; }
+    fn take(): byte[] {
+        if (this.head >= this.rows.len) { return null; }
+        let b = this.rows[this.head];
+        this.head += 1;
+        return b;
+    }
+}
+
+// What Describe told us about a prepared statement.
+export class PgPrepared {
+    ok: bool;
+    paramOids: int[];
+    cols: PgColumn[];
+    fn init() { this.ok = false; this.paramOids = []; this.cols = []; }
+}
+
+export class PgSession {
+    io: WireIo;
+    open: bool;
+
+    txStatus: int;          // from the last ReadyForQuery
+    errCode: int;
+    errMsg: string;
+    errState: string;       // the raw SQLSTATE, for callers who want 23505 vs 23503
+    noticeMsg: string;      // the last NoticeResponse, which is NOT an error
+
+    lastTag: string;
+    lastRows: int;
+    lastOid: int;
+
+    paramKeys: string[];    // ParameterStatus, as reported and updated
+    paramVals: string[];
+    backendPid: int;
+    backendKey: int;
+
+    nextStmtId: int;
+
+    // Wire ownership. Not the same thing as Stmt.busy, which is a statement
+    // cache concern — a drained cursor is still busy but no longer owns the wire.
+    activeId: int;
+    activeSink: PgRowBuffer;
+    drainCap: int;
+
+    // Held only for the duration of the handshake.
+    scram: ScramClient;
+
+    // Forces the SCRAM client nonce, so a recorded handshake can be replayed
+    // byte for byte. Empty in every real connection, where the nonce is drawn
+    // from the OS CSPRNG — a fixed nonce destroys the replay protection the
+    // nonce exists for. Only PgOverDriver sets it.
+    fixedNonce: string;
+
+    fn init(io: WireIo) {
+        this.io = io;
+        this.open = false;
+        this.txStatus = TX_IDLE;
+        this.errCode = DBERR_NONE;
+        this.errMsg = "";
+        this.errState = "";
+        this.noticeMsg = "";
+        this.lastTag = "";
+        this.lastRows = 0;
+        this.lastOid = 0;
+        this.paramKeys = [];
+        this.paramVals = [];
+        this.backendPid = 0;
+        this.backendKey = 0;
+        this.nextStmtId = 0;
+        this.activeId = 0;
+        this.activeSink = null;
+        this.drainCap = 100000;
+        this.scram = null;
+        this.fixedNonce = "";
+    }
+
+    // ---- error state ------------------------------------------------------
+
+    fn fail(code: int, msg: string) {
+        this.errCode = code;
+        this.errMsg = msg;
+    }
+
+    fn clearError() {
+        this.errCode = DBERR_NONE;
+        this.errMsg = "";
+        this.errState = "";
+    }
+
+    fn recordError(e: PgError) {
+        this.errState = e.sqlstate;
+        this.errCode = e.code();
+        this.errMsg = e.text();
+    }
+
+    // Whatever went wrong at the transport level, phrased for a caller.
+    fn transportFail() {
+        let s = this.io.error();
+        if (s == "") { s = "the connection failed"; }
+        this.fail(DBERR_CLOSED, s);
+        this.open = false;
+    }
+
+    fn param(name: string): string {
+        let i = 0;
+        while (i < this.paramKeys.len) {
+            if (this.paramKeys[i] == name) { return this.paramVals[i]; }
+            i += 1;
+        }
+        return "";
+    }
+
+    fn setParam(name: string, value: string) {
+        let i = 0;
+        while (i < this.paramKeys.len) {
+            if (this.paramKeys[i] == name) { this.paramVals[i] = value; return; }
+            i += 1;
+        }
+        this.paramKeys.push(name);
+        this.paramVals.push(value);
+    }
+
+    // ---- the message pump -------------------------------------------------
+
+    fn send(b: byte[]): bool {
+        if (!this.io.writeAll(b)) { this.transportFail(); return false; }
+        return true;
+    }
+
+    // The ONE place a message header is read.
+    //
+    // NoticeResponse, ParameterStatus and NotificationResponse are swallowed
+    // here and never surface to a caller. They can arrive at any point — a
+    // RAISE NOTICE mid-statement, a SET changing client_encoding, a LISTEN
+    // firing — and a caller that has to remember to skip them will forget in
+    // one place and desynchronize the stream. Making it structural is the only
+    // version of this that stays correct.
+    //
+    // Null means the connection is gone; the session's error says why.
+    fn nextMessage(): PgMsg {
+        while (true) {
+            if (!this.io.isOpen()) { this.fail(DBERR_CLOSED, "the connection is closed"); return null; }
+            let t = this.io.readByte();
+            if (t < 0) { this.transportFail(); return null; }
+            let lenb = this.io.readExact(4);
+            if (lenb == null) { this.transportFail(); return null; }
+            let len = readU32BE(lenb, 0);
+            if (len < 4) {
+                this.fail(DBERR_CLOSED, "malformed message length from the server");
+                this.open = false;
+                return null;
+            }
+            let body = this.io.readExact(len - 4);
+            if (body == null) { this.transportFail(); return null; }
+
+            if (t == B_NOTICE) {
+                // A notice is not an error and must never touch the error state.
+                this.noticeMsg = decodeError(body).text();
+                continue;
+            }
+            if (t == B_PARAM_STATUS) {
+                let p = decodeParameterStatus(body);
+                this.setParam(p.name, p.value);
+                continue;
+            }
+            if (t == B_NOTIFY) { continue; }
+
+            return new PgMsg(t, body);
+        }
+        return null;
+    }
+
+    // Consume through to the next ReadyForQuery, which is the protocol's
+    // resynchronization point. After an error the server discards everything
+    // until it sees our Sync and answers with this, so stopping at the
+    // ErrorResponse would leave the stream one message out of step.
+    fn readToReady(): bool {
+        while (true) {
+            let m = this.nextMessage();
+            if (m == null) { return false; }
+            if (m.kind == B_READY) { this.txStatus = decodeReadyForQuery(m.body); return true; }
+            if (m.kind == B_ERROR) { this.recordError(decodeError(m.body)); continue; }
+            if (m.kind == B_CMD_COMPLETE) { this.noteTag(decodeCommandComplete(m.body)); continue; }
+            // Everything else on the way out is discarded on purpose.
+        }
+        return false;
+    }
+
+    fn noteTag(t: PgTag) {
+        this.lastTag = t.tag;
+        this.lastRows = t.rows;
+        this.lastOid = t.oid;
+    }
+
+    // Reset the per-statement counters. Called at the START of each execution,
+    // so a failed statement cannot leave the previous one's numbers readable —
+    // db.vt:327-328 reads changes()/lastInsertId() on the error path too.
+    fn resetTag() {
+        this.lastTag = "";
+        this.lastRows = 0;
+        this.lastOid = 0;
+    }
+
+    // ---- connecting -------------------------------------------------------
+
+    // Startup packet, authentication, and the parameters the server volunteers,
+    // through to the first ReadyForQuery.
+    fn connect(user: string, password: string, database: string,
+               appName: string, timeZone: string, extraKeys: string[],
+               extraVals: string[]): bool {
+        if (this.io == null || !this.io.isOpen()) {
+            this.fail(DBERR_OPEN, "could not reach the server");
+            return false;
+        }
+
+        let kv: string[] = [];
+        kv.push("user"); kv.push(user);
+        if (database != "") { kv.push("database"); kv.push(database); }
+        // Vyto strings are byte strings, so anything but UTF8 would arrive
+        // mis-encoded with nothing to notice it.
+        kv.push("client_encoding"); kv.push("UTF8");
+        // Pin every setting that changes how a value is RENDERED. Without these
+        // the text of a date or an interval depends on server configuration,
+        // which makes the same query return differently on two servers.
+        kv.push("DateStyle"); kv.push("ISO, MDY");
+        kv.push("IntervalStyle"); kv.push("iso_8601");
+        kv.push("TimeZone"); kv.push(timeZone);
+        // Not cosmetic: without it, a float8 that does arrive as text is
+        // rendered with too few digits to round-trip on older servers.
+        kv.push("extra_float_digits"); kv.push("3");
+        kv.push("application_name"); kv.push(appName);
+        let i = 0;
+        while (i < extraKeys.len && i < extraVals.len) {
+            kv.push(extraKeys[i]);
+            kv.push(extraVals[i]);
+            i += 1;
+        }
+
+        if (!this.send(encodeStartup(kv))) { return false; }
+
+        while (true) {
+            let m = this.nextMessage();
+            if (m == null) {
+                if (this.errCode == DBERR_NONE) { this.fail(DBERR_OPEN, "the server closed the connection during startup"); }
+                else if (this.errCode == DBERR_CLOSED) { this.errCode = DBERR_OPEN; }
+                return false;
+            }
+            if (m.kind == B_ERROR) {
+                // The server's own words are always better than ours here:
+                // "password authentication failed for user", "database does not
+                // exist", "no pg_hba.conf entry for host".
+                let e = decodeError(m.body);
+                this.recordError(e);
+                if (this.errCode != DBERR_OPEN) { this.errCode = DBERR_OPEN; }
+                this.open = false;
+                return false;
+            }
+            if (m.kind == B_AUTH) {
+                if (!this.handleAuth(decodeAuth(m.body), user, password)) { return false; }
+                continue;
+            }
+            if (m.kind == B_BACKEND_KEY) {
+                let k = decodeBackendKey(m.body);
+                this.backendPid = k.pid;
+                this.backendKey = k.key;
+                continue;
+            }
+            if (m.kind == B_READY) {
+                this.txStatus = decodeReadyForQuery(m.body);
+                this.open = true;
+                this.scram = null;               // the password goes out of scope with it
+                return true;
+            }
+            if (m.kind == B_NEGOTIATE) {
+                this.fail(DBERR_OPEN, "the server does not support protocol 3.0");
+                return false;
+            }
+            // Anything else before ReadyForQuery is not interesting.
+        }
+        return false;
+    }
+
+    fn handleAuth(a: PgAuth, user: string, password: string): bool {
+        if (a.kind == AUTH_OK) { return true; }
+
+        if (a.kind == AUTH_CLEARTEXT) {
+            return this.send(encodePassword(password));
+        }
+
+        if (a.kind == AUTH_MD5) {
+            if (a.salt.len < 4) {
+                this.fail(DBERR_OPEN, "the server sent a malformed md5 salt");
+                return false;
+            }
+            return this.send(encodePassword(md5Password(user, password, a.salt)));
+        }
+
+        if (a.kind == AUTH_SASL) {
+            // Take plain SCRAM-SHA-256. SCRAM-SHA-256-PLUS binds the exchange
+            // to the TLS channel, and there is no TLS here to bind to.
+            let found = false;
+            let i = 0;
+            while (i < a.mechanisms.len) {
+                if (a.mechanisms[i] == SCRAM_SHA_256) { found = true; }
+                i += 1;
+            }
+            if (!found) {
+                this.fail(DBERR_OPEN,
+                          "the server offered no SASL mechanism this driver supports "
+                          + "(wanted " + SCRAM_SHA_256 + ")");
+                return false;
+            }
+            if (this.fixedNonce != "") { this.scram = scramClientWith("", password, this.fixedNonce); }
+            else { this.scram = scramClient(password); }
+            return this.send(encodeSaslInitial(SCRAM_SHA_256, this.scram.first()));
+        }
+
+        if (a.kind == AUTH_SASL_CONTINUE) {
+            if (this.scram == null) {
+                this.fail(DBERR_OPEN, "the server sent a SASL continuation before a SASL challenge");
+                return false;
+            }
+            let fin = this.scram.final(a.data);
+            if (fin == null) { this.fail(DBERR_OPEN, this.scram.err); return false; }
+            return this.send(encodeSaslResponse(fin));
+        }
+
+        if (a.kind == AUTH_SASL_FINAL) {
+            if (this.scram == null) {
+                this.fail(DBERR_OPEN, "the server sent a SASL result before a SASL challenge");
+                return false;
+            }
+            // Fail closed. Verifying the server's signature is what proves it
+            // also knows the password, which is the entire point of SCRAM over
+            // sending a hash.
+            if (!this.scram.verify(a.data)) {
+                this.fail(DBERR_OPEN, this.scram.err);
+                return false;
+            }
+            return true;
+        }
+
+        if (a.kind == AUTH_GSS || a.kind == AUTH_SSPI || a.kind == AUTH_KERBEROS_V5) {
+            this.fail(DBERR_OPEN,
+                      "this driver does not implement GSSAPI/SSPI authentication; "
+                      + "configure the server for scram-sha-256, md5 or trust");
+            return false;
+        }
+        if (a.kind == AUTH_SCM) {
+            this.fail(DBERR_OPEN, "this driver does not implement SCM credential authentication");
+            return false;
+        }
+
+        this.fail(DBERR_OPEN, "unsupported authentication method " + str(a.kind));
+        return false;
+    }
+
+    // ---- wire ownership ---------------------------------------------------
+
+    // Take the wire for `stmtId`, draining whoever has it.
+    //
+    // PostgreSQL cannot interleave two portals on one connection the way SQLite
+    // interleaves two statements on one handle. Refusing the second statement
+    // would be simpler, but it would break Db.fillDetail (db.vt:454, four raw()
+    // calls in a row) and any query run inside a `while (c.next())` loop — both
+    // of which work against SQLite. Draining preserves those semantics at a
+    // bounded cost.
+    fn acquire(stmtId: int, sink: PgRowBuffer): bool {
+        if (!this.open) { this.fail(DBERR_CLOSED, "the connection is closed"); return false; }
+        if (this.activeId == stmtId) { this.activeSink = sink; return true; }
+        if (this.activeId != 0) {
+            if (!this.drainActive()) { return false; }
+        }
+        this.activeId = stmtId;
+        this.activeSink = sink;
+        return true;
+    }
+
+    // Read the incumbent statement's remaining rows into ITS buffer, then let go
+    // of the wire. The evicted statement finds them there and keeps working —
+    // it has merely stopped being lazy.
+    fn drainActive(): bool {
+        let sink = this.activeSink;
+        while (true) {
+            let m = this.nextMessage();
+            if (m == null) { this.activeId = 0; this.activeSink = null; return false; }
+
+            if (m.kind == B_DATA_ROW) {
+                if (sink != null) {
+                    if (sink.rows.len >= this.drainCap) {
+                        this.fail(DBERR_BUSY,
+                                  "a second statement needed this connection while a cursor was still "
+                                  + "open, and draining it exceeded " + str(this.drainCap)
+                                  + " buffered rows; finish or close the cursor first");
+                        sink.complete = true;
+                        this.activeId = 0;
+                        this.activeSink = null;
+                        return false;
+                    }
+                    sink.rows.push(m.body);
+                }
+                continue;
+            }
+            if (m.kind == B_CMD_COMPLETE) { this.noteTag(decodeCommandComplete(m.body)); continue; }
+            if (m.kind == B_ERROR) { this.recordError(decodeError(m.body)); continue; }
+            if (m.kind == B_READY) {
+                this.txStatus = decodeReadyForQuery(m.body);
+                if (sink != null) { sink.complete = true; }
+                this.activeId = 0;
+                this.activeSink = null;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Give the wire back. Safe to call for a statement that does not hold it.
+    fn releaseWire(stmtId: int) {
+        if (this.activeId == stmtId) {
+            this.activeId = 0;
+            this.activeSink = null;
+        }
+    }
+
+    // ---- simple query -----------------------------------------------------
+
+    // 'Q'. Used for DDL and for BEGIN/COMMIT/ROLLBACK: no parameters, and the
+    // server may answer with several result sets, all of which are discarded.
+    fn simpleQuery(sql: string): bool {
+        if (!this.open) { this.fail(DBERR_CLOSED, "the connection is closed"); return false; }
+        if (this.activeId != 0) {
+            if (!this.drainActive()) { return false; }
+        }
+        this.clearError();
+        this.resetTag();
+        if (!this.send(encodeQuery(sql))) { return false; }
+
+        let failed = false;
+        while (true) {
+            let m = this.nextMessage();
+            if (m == null) { return false; }
+            if (m.kind == B_READY) {
+                this.txStatus = decodeReadyForQuery(m.body);
+                return !failed;
+            }
+            if (m.kind == B_ERROR) { this.recordError(decodeError(m.body)); failed = true; continue; }
+            if (m.kind == B_CMD_COMPLETE) { this.noteTag(decodeCommandComplete(m.body)); continue; }
+            if (m.kind == B_COPY_IN || m.kind == B_COPY_OUT || m.kind == B_COPY_BOTH) {
+                this.fail(DBERR_UNSUPPORTED, "COPY is not supported by this driver");
+                failed = true;
+                continue;
+            }
+            // DataRow / RowDescription from a SELECT run through execRaw: the
+            // caller asked for no rows, so they are dropped.
+        }
+        return false;
+    }
+
+    // ---- extended query ---------------------------------------------------
+
+    fn newStatementName(): string {
+        this.nextStmtId += 1;
+        return "vts" + str(this.nextStmtId);
+    }
+
+    // Parse + Describe + Sync, in one round trip.
+    //
+    // Describing the STATEMENT rather than the portal is what makes the column
+    // names available before anything has been bound — which vyto/db requires,
+    // because Db.raw calls columnNamesOf() before the first step() (db.vt:309).
+    // It hands back the inferred parameter types in the same trip, which is what
+    // lets a float8 parameter be sent as exact binary later.
+    fn prepare(name: string, sql: string): PgPrepared {
+        let p = new PgPrepared();
+        if (!this.open) { this.fail(DBERR_CLOSED, "the connection is closed"); return p; }
+        if (this.activeId != 0) {
+            if (!this.drainActive()) { return p; }
+        }
+        this.clearError();
+
+        let w = encodeParse(name, sql, null);
+        if (!this.send(w)) { return p; }
+        if (!this.send(encodeDescribe(DESC_STATEMENT, name))) { return p; }
+        if (!this.send(encodeSync())) { return p; }
+
+        let failed = false;
+        while (true) {
+            let m = this.nextMessage();
+            if (m == null) { return p; }
+            if (m.kind == B_READY) {
+                this.txStatus = decodeReadyForQuery(m.body);
+                p.ok = !failed;
+                return p;
+            }
+            if (m.kind == B_ERROR) { this.recordError(decodeError(m.body)); failed = true; continue; }
+            if (m.kind == B_PARSE_DONE) { continue; }
+            if (m.kind == B_PARAM_DESC) { p.paramOids = decodeParameterDescription(m.body); continue; }
+            if (m.kind == B_ROW_DESC) { p.cols = decodeRowDescription(m.body); continue; }
+            // NoData: a statement that returns no rows at all — DDL, or an
+            // INSERT with no RETURNING. columnCount() is then 0, correctly.
+            if (m.kind == B_NO_DATA) { continue; }
+        }
+        return p;
+    }
+
+    // Bind + Execute + Sync. maxRows 0 lets the server stream the whole result.
+    fn execute(stmt: string, params: PgParam[], resultFormats: int[]): bool {
+        this.clearError();
+        this.resetTag();
+        if (!this.send(encodeBind("", stmt, params, resultFormats))) { return false; }
+        if (!this.send(encodeExecute("", 0))) { return false; }
+        return this.send(encodeSync());
+    }
+
+    // Close a named prepared statement server-side.
+    fn closeStatement(name: string): bool {
+        if (!this.open || name == "") { return false; }
+        if (this.activeId != 0) {
+            if (!this.drainActive()) { return false; }
+        }
+        if (!this.send(encodeClose(DESC_STATEMENT, name))) { return false; }
+        if (!this.send(encodeSync())) { return false; }
+        return this.readToReady();
+    }
+
+    // ---- shutting down ----------------------------------------------------
+
+    fn close() {
+        if (this.io != null && this.io.isOpen()) {
+            // Best effort: if the socket is already broken there is nothing to
+            // say and nothing to report it to.
+            this.io.writeAll(encodeTerminate());
+            this.io.close();
+        }
+        this.open = false;
+        this.activeId = 0;
+        this.activeSink = null;
+        this.scram = null;
+    }
+}

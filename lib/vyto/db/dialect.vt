@@ -291,6 +291,205 @@ export class PgDialect extends Dialect {
 
     override fn autoIncrementPk(): string { return "BIGSERIAL PRIMARY KEY"; }
     override fn supportsReturning(): bool { return true; }
+
+    // ---- introspection --------------------------------------------------
+    //
+    // These live here, next to SqliteDialect's, rather than in vyto/db/pgsql:
+    // a dialect is string formatting with no native cost, so keeping them here
+    // means the SQL is renderable — and testable — from a program that links no
+    // driver at all. tests/fixtures/db_nodriver.vt prints all six.
+    //
+    // ── TWO THINGS THESE QUERIES MUST DO THAT ARE NOT OBVIOUS ─────────────
+    //
+    // 1. They emit SQLite's VOCABULARY, because introspect.vt matches it
+    //    literally: kind_of() (introspect.vt:589) tests for "table"/"view",
+    //    origin_of() (:599) tests for "pk"/"u", and db.vt:523,563 compare
+    //    against "trigger". Hence the CASE expressions translating relkind and
+    //    contype rather than passing the catalog's own letters through.
+    //
+    // 2. They filter PostgreSQL's internals in the WHERE clause.
+    //    isInternalName() (introspect.vt:585) is hardcoded to "sqlite_" and is
+    //    called from four sites in db.vt; changing its signature would be a
+    //    public API break for no benefit. Excluding pg_catalog and
+    //    information_schema here means it harmlessly returns false for every
+    //    name it sees.
+    //
+    // pg_table_is_visible() also resolves search_path, so when two schemas both
+    // contain `users` these return the one a bare SELECT would hit — which is
+    // what Db.hasTable(name) and Db.describe(name) mean by an unqualified name.
+
+    override fn supportsIntrospection(): bool { return true; }
+
+    // schema, name, kind, ncol, withoutRowid, strict.
+    //
+    // 'r' ordinary, 'p' partitioned and 'f' foreign tables all collapse to
+    // "table"; 'v' and 'm' (materialized) to "view". PostgreSQL has no analogue
+    // of SQLite's virtual or shadow tables, so those words are never emitted.
+    // withoutRowid and strict are constant 0 — readTableRow reads them with
+    // asInt() != 0 (introspect.vt:536-537) and neither concept exists here.
+    override fn introspectTablesSql(): string {
+        return "SELECT n.nspname AS schema, c.relname AS name,"
+             + " CASE c.relkind WHEN 'r' THEN 'table' WHEN 'p' THEN 'table'"
+             + " WHEN 'f' THEN 'table' WHEN 'v' THEN 'view' WHEN 'm' THEN 'view'"
+             + " ELSE 'unknown' END AS kind,"
+             + " (SELECT count(*)::int FROM pg_attribute a"
+             + " WHERE a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped) AS ncol,"
+             + " 0 AS withoutrowid, 0 AS strict"
+             + " FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace"
+             + " WHERE c.relkind IN ('r','p','v','m','f')"
+             + " AND n.nspname NOT IN ('pg_catalog','information_schema')"
+             + " AND pg_table_is_visible(c.oid)"
+             + " ORDER BY n.nspname, c.relname";
+    }
+
+    // cid, name, declType, notNull, dflt, pkPos, hidden.
+    //
+    // Three details that a naive version gets wrong:
+    //   * cid is attnum - 1. SQLite's cid is 0-based and attnum is 1-based, and
+    //     TableInfo.columnByCid (introspect.vt:322) indexes on it.
+    //   * dflt must be NULL, not '', when there is no default: readColumnRow
+    //     tests !r.at(4).isNull() (introspect.vt:546). The LEFT JOIN gives that.
+    //   * pkPos is the ordinal WITHIN the key, not a boolean.
+    //     TableInfo.primaryKey() orders by it (introspect.vt:343), so a
+    //     composite key ordered by column position instead of key position is
+    //     silently wrong. unnest(indkey) WITH ORDINALITY is what gives the real
+    //     position.
+    override fn introspectColumnsSql(): string {
+        return "SELECT (a.attnum - 1) AS cid, a.attname AS name,"
+             + " format_type(a.atttypid, a.atttypmod) AS decltype,"
+             + " CASE WHEN a.attnotnull THEN 1 ELSE 0 END AS notnull,"
+             + " pg_get_expr(d.adbin, d.adrelid) AS dflt,"
+             + " COALESCE(k.ord::int, 0) AS pkpos,"
+             + " CASE a.attgenerated WHEN 's' THEN 3 WHEN 'v' THEN 2 ELSE 0 END AS hidden"
+             + " FROM pg_attribute a"
+             + " JOIN pg_class c ON c.oid = a.attrelid"
+             + " LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum"
+             + " LEFT JOIN LATERAL (SELECT u.ord FROM pg_index x"
+             + " CROSS JOIN LATERAL unnest(x.indkey) WITH ORDINALITY AS u(attnum, ord)"
+             + " WHERE x.indrelid = a.attrelid AND x.indisprimary"
+             + " AND u.attnum = a.attnum) k ON true"
+             + " WHERE c.relname = $1 AND pg_table_is_visible(c.oid)"
+             + " AND a.attnum > 0 AND NOT a.attisdropped"
+             + " ORDER BY a.attnum";
+    }
+
+    // seq, name, unique, origin, partial. origin emits SQLite's exact three-value
+    // vocabulary so origin_of() (introspect.vt:599) maps it, which is what makes
+    // IndexInfo.isImplicit() and TableInfo.toTable()'s skip rule work unchanged.
+    override fn introspectIndexesSql(): string {
+        return "SELECT (row_number() OVER (ORDER BY ic.relname))::int - 1 AS seq,"
+             + " ic.relname AS name,"
+             + " CASE WHEN x.indisunique THEN 1 ELSE 0 END AS \"unique\","
+             + " CASE WHEN x.indisprimary THEN 'pk'"
+             + " WHEN con.contype = 'u' THEN 'u' ELSE 'c' END AS origin,"
+             + " CASE WHEN x.indpred IS NULL THEN 0 ELSE 1 END AS partial"
+             + " FROM pg_index x"
+             + " JOIN pg_class ic ON ic.oid = x.indexrelid"
+             + " JOIN pg_class tc ON tc.oid = x.indrelid"
+             + " LEFT JOIN pg_constraint con ON con.conindid = x.indexrelid"
+             + " AND con.contype IN ('u','p')"
+             + " WHERE tc.relname = $1 AND pg_table_is_visible(tc.oid)"
+             + " ORDER BY ic.relname";
+    }
+
+    // seqno, cid, name, desc, coll, key. The parameter is the INDEX name.
+    //
+    // An expression index column has attnum = 0, so name is '' and cid is -1 —
+    // exactly what IndexColumn.isExpression() tests (introspect.vt:168).
+    // `key` uses indnkeyatts (PG 11+) to separate real key columns from INCLUDE
+    // columns, the closest analogue of the rowid trailer IndexInfo.keyColumns()
+    // filters on.
+    //
+    // indoption and indcollation are int2vector/oidvector, which are
+    // 0-SUBSCRIPTED unlike every ordinary PostgreSQL array — hence [u.ord - 1].
+    // That is the single most likely off-by-one in this file.
+    override fn introspectIndexColumnsSql(): string {
+        return "SELECT (u.ord::int - 1) AS seqno, (u.attnum::int - 1) AS cid,"
+             + " COALESCE(a.attname, '') AS name,"
+             + " CASE WHEN (x.indoption[u.ord - 1] & 1) = 1 THEN 1 ELSE 0 END AS \"desc\","
+             + " COALESCE(NULLIF(cl.collname, 'default'), '') AS coll,"
+             + " CASE WHEN u.ord <= x.indnkeyatts THEN 1 ELSE 0 END AS key"
+             + " FROM pg_index x"
+             + " JOIN pg_class ic ON ic.oid = x.indexrelid"
+             + " CROSS JOIN LATERAL unnest(x.indkey) WITH ORDINALITY AS u(attnum, ord)"
+             + " LEFT JOIN pg_attribute a ON a.attrelid = x.indrelid"
+             + " AND a.attnum = u.attnum AND u.attnum > 0"
+             + " LEFT JOIN pg_collation cl ON cl.oid = x.indcollation[u.ord - 1]"
+             + " WHERE ic.relname = $1 AND pg_table_is_visible(ic.oid)"
+             + " ORDER BY u.ord";
+    }
+
+    // id, seq, refTable, fromCol, toCol, onUpdate, onDelete.
+    //
+    // The action words match what SQLite's pragma_foreign_key_list emits
+    // verbatim. `id` groups the columns of one multi-column constraint, which is
+    // ForeignKey.id's documented meaning (introspect.vt:222). PostgreSQL always
+    // names the referenced columns, so toCol is never empty here and
+    // isImplicitTarget() is always false — a benign difference from SQLite.
+    override fn introspectForeignKeysSql(): string {
+        return "SELECT (dense_rank() OVER (ORDER BY con.oid))::int - 1 AS id,"
+             + " (u.ord::int - 1) AS seq, rc.relname AS reftable,"
+             + " fa.attname AS fromcol, COALESCE(ta.attname, '') AS tocol,"
+             + " CASE con.confupdtype WHEN 'a' THEN 'NO ACTION' WHEN 'r' THEN 'RESTRICT'"
+             + " WHEN 'c' THEN 'CASCADE' WHEN 'n' THEN 'SET NULL'"
+             + " WHEN 'd' THEN 'SET DEFAULT' ELSE '' END AS onupdate,"
+             + " CASE con.confdeltype WHEN 'a' THEN 'NO ACTION' WHEN 'r' THEN 'RESTRICT'"
+             + " WHEN 'c' THEN 'CASCADE' WHEN 'n' THEN 'SET NULL'"
+             + " WHEN 'd' THEN 'SET DEFAULT' ELSE '' END AS ondelete"
+             + " FROM pg_constraint con"
+             + " JOIN pg_class c ON c.oid = con.conrelid"
+             + " JOIN pg_class rc ON rc.oid = con.confrelid"
+             + " CROSS JOIN LATERAL unnest(con.conkey) WITH ORDINALITY AS u(attnum, ord)"
+             + " JOIN pg_attribute fa ON fa.attrelid = con.conrelid AND fa.attnum = u.attnum"
+             + " LEFT JOIN pg_attribute ta ON ta.attrelid = con.confrelid"
+             + " AND ta.attnum = con.confkey[u.ord]"
+             + " WHERE con.contype = 'f' AND c.relname = $1 AND pg_table_is_visible(c.oid)"
+             + " ORDER BY con.oid, u.ord";
+    }
+
+    // type, name, tblName, sql.
+    //
+    // `sql` is '' for a table, and that is not a gap to fill: PostgreSQL does
+    // not store DDL text. pg_dump reconstructs it from the catalogs, and
+    // reimplementing that is a project. Views, indexes and triggers do have a
+    // canonical definition, so those get a real one.
+    //
+    // introspect.vt:269-271 calls `sql` "the only place a generated column's
+    // expression survives" — untrue here, which is why introspectColumnsSql
+    // returns pg_get_expr and does that job instead.
+    //
+    // NOT tgisinternal drops the RI_ConstraintTrigger_* machinery behind every
+    // foreign key, which isInternalName would not filter.
+    override fn introspectObjectsSql(): string {
+        return "SELECT 'table'::text AS type, c.relname AS name, c.relname AS tblname,"
+             + " ''::text AS sql"
+             + " FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace"
+             + " WHERE c.relkind IN ('r','p','f')"
+             + " AND n.nspname NOT IN ('pg_catalog','information_schema')"
+             + " AND pg_table_is_visible(c.oid)"
+             + " UNION ALL"
+             + " SELECT 'view', c.relname, c.relname,"
+             + " 'CREATE VIEW ' || quote_ident(c.relname) || ' AS ' || pg_get_viewdef(c.oid, true)"
+             + " FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace"
+             + " WHERE c.relkind IN ('v','m')"
+             + " AND n.nspname NOT IN ('pg_catalog','information_schema')"
+             + " AND pg_table_is_visible(c.oid)"
+             + " UNION ALL"
+             + " SELECT 'index', ic.relname, tc.relname, pg_get_indexdef(x.indexrelid)"
+             + " FROM pg_index x JOIN pg_class ic ON ic.oid = x.indexrelid"
+             + " JOIN pg_class tc ON tc.oid = x.indrelid"
+             + " JOIN pg_namespace n ON n.oid = ic.relnamespace"
+             + " WHERE n.nspname NOT IN ('pg_catalog','information_schema')"
+             + " AND pg_table_is_visible(ic.oid)"
+             + " UNION ALL"
+             + " SELECT 'trigger', t.tgname, tc.relname, pg_get_triggerdef(t.oid)"
+             + " FROM pg_trigger t JOIN pg_class tc ON tc.oid = t.tgrelid"
+             + " JOIN pg_namespace n ON n.oid = tc.relnamespace"
+             + " WHERE NOT t.tgisinternal"
+             + " AND n.nspname NOT IN ('pg_catalog','information_schema')"
+             + " AND pg_table_is_visible(tc.oid)"
+             + " ORDER BY 1, 2";
+    }
 }
 
 export class MysqlDialect extends Dialect {

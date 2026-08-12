@@ -44,7 +44,9 @@ while (c.next()) { total += c.row().getInt("n"); }
 | `vyto/db/schema` | `table` / `dropTable` / `alterTable` — DDL, no migration runner |
 | `vyto/db/introspect` | reading a schema back out: `TableInfo`, `ColumnInfo`, `IndexInfo`, `ForeignKey` |
 | `vyto/db/sqlite` ⚙ | the SQLite driver. **Vendored**, nothing to install |
-| `vyto/db/pgsql` | declared, every entry panics |
+| `vyto/db/wire` | byte-level floor shared by the network drivers: frame building, endian conversion, tolerant parsing, DSN parsing |
+| `vyto/db/wire/io` | the framed transport — `WireIo`, `SockIo`, and `MemIo` for testing without a server |
+| `vyto/db/pgsql` | the PostgreSQL driver. **Pure Vyto**, speaks the v3 wire protocol; no libpq, nothing to install |
 | `vyto/db/mysql` | declared, every entry panics |
 
 `import { … } from "vyto/db"` re-exports all of it except a driver. Importing an
@@ -55,8 +57,8 @@ individual module pulls in less.
 **The app names the driver; no library ever does.** Native sources compile per
 package *directory* for every module in the transitive import closure, so a
 `vyto/db` that imported the drivers would build the 9.5 MB SQLite amalgamation —
-and, once it exists, link libpq — into every program that merely wanted to
-render a query string. Hence two imports at the top of an app, and hence:
+and the socket shim behind the Postgres driver — into every program that merely
+wanted to render a query string. Hence two imports at the top of an app, and hence:
 
 1. `db.vt` never imports a driver, not even as a default.
 2. There is never a `drivers.vt` barrel importing all three.
@@ -66,8 +68,10 @@ render a query string. Hence two imports at the top of an app, and hence:
    import site is the price, and it is the same price `vyto/crypto/ecc` and
    `vyto/util/uuid` already charge.
 
-This is verifiable, not aspirational: a program importing `vyto/db` without a
-driver compiles eight pure-Vyto objects and zero SQLite.
+This is verifiable, not aspirational, and `tests/run_tests.sh` checks it both
+ways: `db_no_driver_contagion` builds a driverless program and fails if any
+SQLite *or* socket object was produced for it, and `pgsql_no_sqlite` builds a
+Postgres-only program and fails if any SQLite object was.
 
 **A row owns its cells.** `sqlite3_column_text` returns a pointer invalidated by
 the next `step()`, so every cell is copied into Vyto storage before control
@@ -144,8 +148,8 @@ let s = db.schema();                      // every table, view and trigger
 
 | | |
 |---|---|
-| `db.supportsIntrospection()` | SQLite yes; Postgres and MySQL panic if asked |
-| `db.tables()` / `db.views()` | names, `sqlite_*` internals filtered, never null |
+| `db.supportsIntrospection()` | SQLite and Postgres yes; MySQL panics if asked |
+| `db.tables()` / `db.views()` | names, engine internals filtered, never null |
 | `db.hasTable(name)` | existence, without quoting the name |
 | `db.describe(name)` | `TableInfo` — columns, PK, indexes, foreign keys, DDL text |
 | `db.triggers()` / `db.objectSql(name)` | |
@@ -385,6 +389,97 @@ Build options worth knowing, all in `sqlite_config.h`: `SQLITE_THREADSAFE=0`
 double-quoted strings are identifiers, never string literals, so a typo'd column
 name is an error instead of quietly comparing against itself.
 
+## PostgreSQL, and what it costs
+
+```vyto
+import { Db, select, dbText } from "vyto/db";
+import { pgsql } from "vyto/db/pgsql";
+
+let db = new Db(pgsql("postgres://ada@localhost/app"));
+if (!db.ok()) { print(db.error()); return; }
+```
+
+The driver speaks the v3 wire protocol directly. There is **no `native/`
+directory and no `#link`** in the package: it reaches the server through
+`vyto/net/socket`, so nothing has to be provisioned, the tests cannot silently
+skip on a fresh clone the way the blend2d and ICU ones do, and there is no
+GPL/LGPL question about a shipped client library. It also means the socket is
+ours, which is the only route to the reactor integration described below.
+
+Authentication: trust, cleartext, **md5**, and **SCRAM-SHA-256** (the default
+since PostgreSQL 14). Not GSSAPI/SSPI, and not SCRAM-SHA-256-PLUS, which binds
+the exchange to the TLS channel.
+
+### Six things to know before you rely on it
+
+**There is no TLS.** `lib/vyto/crypto/openssl` is a stub in which every entry
+point panics, so this connects in the clear. `sslmode=require` is *refused*
+rather than quietly downgraded — connecting unencrypted when encryption was
+asked for is the one failure a caller must never get without being told. That
+rules out most managed providers (RDS, Neon, Supabase) for now. The place TLS
+plugs in is `WireIo.requestSsl()`, which is written and returns false.
+
+**`lastInsertId()` is always 0.** Not a gap in this driver: PostgreSQL 12
+removed OIDs from ordinary tables, and the `INSERT` tag's oid field is the only
+thing the protocol offers. Ask for the key instead —
+
+```vyto
+let r = db.exec(insert("users").set("name", dbText("ada")).returning("id"));
+let id = r.first().getInt("id");
+```
+
+— which is exact, works for non-integer and composite keys, and does not depend
+on the insert being the last statement on the connection.
+
+**An error aborts the whole transaction block.** After any failure inside a
+transaction the server rejects every further statement with `25P02` until
+`ROLLBACK`. SQLite lets you carry on after a constraint violation, so code that
+catches a duplicate key and continues inside the same `Tx` works on SQLite and
+fails here. `25P02` maps to `DBERR_MISUSE` to make it read as the programming
+error it is; `Tx`'s rollback recovers. **Portable code has to assume the
+stricter rule.**
+
+**`numeric` and arrays come back as text.** `Value` has five kinds and neither
+an exact decimal nor a list is among them. `NUMERIC(19,4)` is used precisely
+because a double cannot represent it, and quietly routing money through one
+produces the bug that surfaces in a reconciliation months later — so it stays
+text. Note `asFloat()` returns `0.0` on a text `Value` by design, so cast in SQL
+(`col::float8`) if you want a number. Arrays arrive as the server's literal,
+`{1,2,3}`; use `unnest()` in the query, or `array_to_json(col)` with
+`vyto/json`.
+
+**One cursor at a time, really.** The protocol cannot interleave two portals on
+one connection. Opening a second statement while a `Cursor` is live drains that
+cursor's remaining rows into memory so it keeps working — correct, and bounded
+by `.drainLimit(n)`, but it has stopped streaming.
+
+**Every query parks the worker, and there is no pool.** No threads, and
+`vyto/net/server` is a pre-fork reactor, so a query holds up that worker and
+every connection on it; shared-nothing workers mean one connection per worker
+for its life. Sixteen workers across four app servers is 64 connections before
+any traffic, against a default `max_connections` of 100. The transport
+underneath is already non-blocking — `WireIo` drives a non-blocking socket
+through a `PollSet` and `PgConn.io()` hands out the fd — but the `Stmt` seam is
+inherently blocking: `step()` returns row/done/error with no would-block, and
+both `Cursor.next()` and `Db.raw()`'s loop treat anything that is not a row as
+terminal. A non-blocking client is an *additive* API on `PgConn`, not a
+reinterpretation of this one.
+
+### Why float8 is the one type read as binary
+
+Everything else is requested as text, because the default branch hands back
+whatever the server printed and so an unknown OID always degrades gracefully —
+which matters, since between the built-ins and every extension type (PostGIS,
+`hstore`, `citext`, enums, composites, domains) that set is never closed.
+
+Floats are the exception: reading one as decimal text needs a correctly-rounded
+decimal-to-binary conversion, which needs arbitrary-precision arithmetic to do
+properly, and getting it merely nearly right loses the last bit. Asking for the
+IEEE bits sidesteps the question entirely. Bound float parameters go the same
+way when the server has inferred `float8`, and otherwise as the *exact* decimal
+expansion — never `str(v)`, which is `%g` and would send `1.23457e+06` for
+`1234567.89`.
+
 ## Deliberately out of scope
 
 **A migration runner.** Ordered files, a `schema_migrations` table, up and down
@@ -419,6 +514,50 @@ is closed.
 The dialect and schema sections render Postgres and MySQL SQL while linking only
 SQLite — which is why all four dialects live in `vyto/db/dialect` rather than in
 the driver packages.
+
+`examples/105_pgwire.vt` — 326 assertions, in the golden suite, and **it needs no
+PostgreSQL**. Because the driver is pure Vyto, its codec is a set of pure
+functions over `byte[]`, so every message it builds is asserted against a
+hand-computed byte string from the protocol specification, and every message it
+parses against a hand-built body. The authentication section is two known-answer
+tests — RFC 7677 §3 for SCRAM-SHA-256 and RFC 1321 §A.5 for MD5 — which between
+them pin PBKDF2, HMAC, SHA-256, MD5, base64 and the exact `AuthMessage`
+assembly.
+
+The last third is the part worth copying elsewhere: `MemIo` is a `WireIo` whose
+"server" is a recorded transcript in a `byte[]`, so an entire session — the
+handshake, the statement cache, prepare, bind, streaming, error recovery, and
+`vyto/db`'s own `Db`/`Result`/`Cursor` machinery above it — replays with no
+server, no fd and no network. It captures what the *client* said too, which is
+the half a live test cannot pin down. Every transcript is also replayed
+byte-at-a-time, because a driver that only works when messages arrive whole is
+one that will desynchronize against a real socket. Same call `vyto/ui` makes
+with `VS_HEADLESS`, and the reason it has 55 tests.
+
+Both goldens were fault-injected — a wrong length prefix, a dropped
+`AuthMessage` separator, `numeric` quietly becoming a float, a float formatted
+with `%g`, a stale binding resent, an error path that skips resynchronization,
+`indoption` read as a 1-based array — to confirm each one fails when it should.
+A test of this shape passes trivially once it stops finding anything, so it is
+worth redoing if it is ever refactored.
+
+**Against a real server**, `tests/run_tests_pgsql.sh` runs
+`tests/fixtures/pgsql_live.vt` and `tests/fixtures/pgsql_introspect_live.vt`. It
+is not in `make test` and skips cleanly when `VYTO_PG_DSN` is unset, so CI never
+stands up a database:
+
+```sh
+docker run -d -p 5432:5432 -e POSTGRES_PASSWORD=pw postgres:16
+VYTO_PG_DSN='postgres://postgres:pw@localhost/postgres' sh tests/run_tests_pgsql.sh
+```
+
+It covers what a recorded transcript structurally cannot: a real handshake
+against a real `pg_hba.conf` (set `VYTO_PG_DSN_TRUST` / `_MD5` / `_SCRAM` to
+exercise all three), values round-tripping through actual storage, the aborted
+transaction block, the cached-plan retry after a mid-session `ALTER TABLE`, a
+200k-row cursor's memory profile, and — the one thing nothing offline can settle
+— whether `indoption` and `indcollation` really are 0-subscripted, which decides
+whether `DESC` index columns are reported against the right column.
 
 `apps/db_test` is the load half, and not in the suite: it loads a hundred
 million rows, times every phase and samples resident memory beside each one,

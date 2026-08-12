@@ -1,0 +1,312 @@
+// pgsql_live — the PostgreSQL driver against a real server.
+//
+// Driven by tests/run_tests_pgsql.sh; reads the DSN from $VYTO_PG_DSN. Not part
+// of `make test`, which stays serverless.
+//
+// Everything happens inside a scratch schema that is created at the start and
+// dropped at the end, so this leaves nothing behind in the target database and
+// two runs cannot collide with each other.
+//
+// This is the counterpart to examples/105_pgwire.vt, which asserts the same
+// driver against a recorded transcript. What only a real server can settle:
+// whether it accepts what we computed during authentication, whether a value
+// round-trips through actual storage rather than through our own encoder, and
+// how the driver behaves against a server with opinions — an aborted
+// transaction block, a plan invalidated by DDL, a result set larger than memory
+// would like.
+
+import { Db, Row, Result, Cursor, Tx,
+         select, insert, update, deleteFrom, table, dropTable,
+         dbText, dbInt, dbFloat, dbNull, dbBlob, dbBool,
+         dberr_name, DBERR_CONSTRAINT, DBERR_MISUSE } from "vyto/db";
+import { pgsql, PgConn } from "vyto/db/pgsql";
+import { Value } from "vyto/db/value";
+import { getenv } from "vyto/os";
+
+fn check(name: string, got: string, want: string) {
+    if (got == want) { print("ok    " + name); }
+    else {
+        print("FAIL  " + name);
+        print("  got  " + got);
+        print("  want " + want);
+    }
+}
+
+fn checkBool(name: string, got: bool) {
+    if (got) { print("ok    " + name); }
+    else { print("FAIL  " + name); }
+}
+
+fn hex(b: byte[]): string {
+    let digits = "0123456789abcdef";
+    let out = "";
+    let i = 0;
+    while (i < b.len) {
+        let v = b[i] as int;
+        out = out + digits.slice(v / 16, v / 16 + 1) + digits.slice(v % 16, v % 16 + 1);
+        i += 1;
+    }
+    return out;
+}
+
+const SCHEMA: string = "vyto_live_test";
+
+fn main() {
+    let dsn = getenv("VYTO_PG_DSN");
+    if (dsn == "") {
+        print("FAIL  VYTO_PG_DSN is not set");
+        return;
+    }
+
+    let db = new Db(pgsql(dsn).applicationName("vyto-live-test"));
+    if (!db.ok()) {
+        print("FAIL  could not connect: " + db.error());
+        return;
+    }
+    checkBool("connected", db.isOpen());
+
+    let cn = db.conn() as PgConn;
+    checkBool("the server reported its version", cn.serverParam("server_version") != "");
+    checkBool("the server reported a backend pid", cn.backendPid() > 0);
+    // Pinned at startup; if the server disagreed, every timestamp below would
+    // render differently.
+    check("TimeZone was accepted", cn.serverParam("TimeZone"), "UTC");
+
+    db.execRaw("DROP SCHEMA IF EXISTS " + SCHEMA + " CASCADE");
+    checkBool("scratch schema created", db.execRaw("CREATE SCHEMA " + SCHEMA));
+    checkBool("search_path set", db.execRaw("SET search_path TO " + SCHEMA));
+
+    values(db);
+    transactions(db);
+    constraints(db);
+    abortedTransaction(db);
+    cachedPlanRetry(db);
+    cursorAtScale(db);
+    twoCursors(db);
+    returningClause(db);
+
+    checkBool("scratch schema dropped", db.execRaw("DROP SCHEMA " + SCHEMA + " CASCADE"));
+    db.close();
+    checkBool("closed", !db.isOpen());
+}
+
+// Every Value kind through real storage and back.
+fn values(db: Db) {
+    print("---- values round-trip through the server ----");
+
+    checkBool("table created", db.execRaw(
+        "CREATE TABLE t ("
+        + " id bigserial PRIMARY KEY,"
+        + " s text, n bigint, f double precision, b bytea,"
+        + " flag boolean, num numeric(19,4), j jsonb, u uuid,"
+        + " ts timestamptz, arr int[])"));
+
+    let sql = "INSERT INTO t (s, n, f, b, flag, num, j, u, ts, arr)"
+            + " VALUES ($1, $2, $3, $4, $5, $6::numeric, $7::jsonb, $8::uuid,"
+            + " $9::timestamptz, $10::int[])";
+
+    let blob = bytes(4);
+    blob[0] = 0 as byte; blob[1] = 0xFF as byte; blob[2] = 0x41 as byte; blob[3] = 0 as byte;
+
+    let ps: Value[] = [
+        dbText("O'Brien -- '); DROP TABLE t; --"),
+        dbInt(-9223372036854775807 - 1),
+        dbFloat(0.1),
+        dbBlob(blob),
+        dbBool(true),
+        dbText("1234.5678"),
+        dbText("{\"a\": [1, 2, 3]}"),
+        dbText("0b6e1f0a-1111-2222-3333-444455556666"),
+        dbText("2026-08-12 10:30:00+00"),
+        dbText("{1,2,3}")
+    ];
+    let ins = db.raw(sql, ps);
+    checkBool("insert succeeded", ins.ok());
+    if (!ins.ok()) { print("  " + ins.err); return; }
+
+    let r = db.raw("SELECT s, n, f, b, flag, num, j, u, ts, arr FROM t ORDER BY id", []);
+    checkBool("select succeeded", r.ok());
+    if (!r.ok()) { print("  " + r.err); return; }
+    let row = r.first();
+
+    // A value that would end the statement if it were spliced rather than bound.
+    check("text survives verbatim", row.getStr("s"), "O'Brien -- '); DROP TABLE t; --");
+    check("bigint at i64 min", str(row.getInt("n")), "-9223372036854775808");
+    // The reason float8 is requested in binary rather than parsed from decimal.
+    checkBool("float8 is exact after a round trip", row.getFloat("f") == 0.1);
+    check("bytea with a NUL and a high byte", hex(row.getBytes("b")), "00ff4100");
+    checkBool("boolean", row.getBool("flag"));
+    // numeric stays text on purpose: a double cannot hold it.
+    check("numeric keeps every digit", row.getStr("num"), "1234.5678");
+    checkBool("numeric is NOT a float", row.get("num").isText());
+    checkBool("jsonb came back as text", row.get("j").isText());
+    check("uuid", row.getStr("u"), "0b6e1f0a-1111-2222-3333-444455556666");
+    // DateStyle and TimeZone are pinned at startup, so this is deterministic.
+    check("timestamptz renders in UTC ISO", row.getStr("ts"), "2026-08-12 10:30:00+00");
+    check("an array comes back as its literal", row.getStr("arr"), "{1,2,3}");
+
+    // NULL is not the empty string, all the way up through Row.
+    let ins2 = db.raw("INSERT INTO t (s, n) VALUES ($1, $2)", [dbNull(), dbInt(1)]);
+    checkBool("insert with a NULL", ins2.ok());
+    let r2 = db.raw("SELECT s FROM t WHERE n = 1", []);
+    checkBool("NULL reads back as NULL", r2.first().isNull("s"));
+
+    let ins3 = db.raw("INSERT INTO t (s, n) VALUES ($1, $2)", [dbText(""), dbInt(2)]);
+    checkBool("insert with an empty string", ins3.ok());
+    let r3 = db.raw("SELECT s FROM t WHERE n = 2", []);
+    checkBool("the empty string is NOT null", !r3.first().isNull("s"));
+    check("and is empty", "[" + r3.first().getStr("s") + "]", "[]");
+
+    check("changes() after an update",
+          str(db.raw("UPDATE t SET flag = false WHERE n IN (1,2)", []).affected), "2");
+}
+
+fn transactions(db: Db) {
+    print("---- transactions ----");
+
+    let cn = db.conn() as PgConn;
+    checkBool("not in a transaction", !cn.inTx());
+
+    db.execRaw("CREATE TABLE tx (id int PRIMARY KEY)");
+    let t = db.begin();
+    checkBool("inside the transaction", cn.inTx());
+    db.raw("INSERT INTO tx (id) VALUES ($1)", [dbInt(1)]);
+    checkBool("committed", t.commit());
+    checkBool("out again", !cn.inTx());
+    check("the row is there", str(db.raw("SELECT count(*)::int AS c FROM tx", []).first().getInt("c")), "1");
+
+    // Dropped without committing: Tx.deinit rolls back. This is real RAII —
+    // refcounting frees deterministically, so there is no window in which a
+    // half-finished transaction sits open.
+    if (true) {
+        let t2 = db.begin();
+        db.raw("INSERT INTO tx (id) VALUES ($1)", [dbInt(2)]);
+    }
+    check("the abandoned transaction rolled back",
+          str(db.raw("SELECT count(*)::int AS c FROM tx", []).first().getInt("c")), "1");
+}
+
+fn constraints(db: Db) {
+    print("---- constraint violations ----");
+
+    db.execRaw("CREATE TABLE u (id int PRIMARY KEY, email text UNIQUE)");
+    db.raw("INSERT INTO u VALUES ($1, $2)", [dbInt(1), dbText("a@example.com")]);
+
+    let dup = db.raw("INSERT INTO u VALUES ($1, $2)", [dbInt(2), dbText("a@example.com")]);
+    checkBool("a duplicate key fails", !dup.ok());
+    check("classified as a constraint violation", dberr_name(dup.code), "constraint");
+
+    let cn = db.conn() as PgConn;
+    check("the raw SQLSTATE is reachable", cn.sqlstate(), "23505");
+    checkBool("and the message names the constraint",
+              dup.err.index_of("u_email_key") >= 0);
+
+    // A different constraint class, to prove the mapping is not a coincidence.
+    db.execRaw("CREATE TABLE child (id int PRIMARY KEY, parent int REFERENCES u(id))");
+    let fk = db.raw("INSERT INTO child VALUES ($1, $2)", [dbInt(1), dbInt(999)]);
+    checkBool("a foreign key violation fails", !fk.ok());
+    check("also a constraint violation", dberr_name(fk.code), "constraint");
+    check("but a different SQLSTATE", cn.sqlstate(), "23503");
+}
+
+fn abortedTransaction(db: Db) {
+    print("---- an error aborts the whole transaction block ----");
+
+    // The behaviour most likely to surprise someone porting from SQLite, which
+    // lets you carry on after a constraint violation. Here every subsequent
+    // statement fails with 25P02 until ROLLBACK.
+    let t = db.begin();
+    let bad = db.raw("SELECT * FROM does_not_exist", []);
+    checkBool("the bad statement failed", !bad.ok());
+
+    let after = db.raw("SELECT 1 AS one", []);
+    checkBool("and so does the next one, even though it is valid", !after.ok());
+    let cn = db.conn() as PgConn;
+    check("with 25P02", cn.sqlstate(), "25P02");
+    check("mapped to misuse, because it is a programming error",
+          dberr_name(after.code), "misuse");
+
+    checkBool("rollback recovers", t.rollback());
+    let recovered = db.raw("SELECT 1 AS one", []);
+    checkBool("the connection is usable again", recovered.ok());
+    check("and answers", str(recovered.first().getInt("one")), "1");
+}
+
+fn cachedPlanRetry(db: Db) {
+    print("---- a cached plan invalidated by DDL ----");
+
+    // The driver caches prepared statements, and Describe pins the result shape
+    // at prepare time. An ALTER TABLE between two executions makes the server
+    // raise 0A000 "cached plan must not change result type". The driver
+    // re-parses once and retries, so this is invisible to the caller — without
+    // that, this is the classic "worked until we ran a migration" failure.
+    db.execRaw("CREATE TABLE mig (id int PRIMARY KEY, a text)");
+    db.raw("INSERT INTO mig VALUES ($1, $2)", [dbInt(1), dbText("x")]);
+
+    let sql = "SELECT * FROM mig ORDER BY id";
+    let before = db.raw(sql, []);
+    checkBool("the query works", before.ok());
+    check("two columns", str(before.columnNames().len), "2");
+
+    checkBool("a column is added", db.execRaw("ALTER TABLE mig ADD COLUMN b text"));
+
+    let after = db.raw(sql, []);
+    checkBool("the same cached statement still works", after.ok());
+    if (!after.ok()) { print("  " + after.err); }
+    check("and now sees three columns", str(after.columnNames().len), "3");
+}
+
+fn cursorAtScale(db: Db) {
+    print("---- a cursor over a large result ----");
+
+    // Rows are streamed one at a time rather than materialized, so this is
+    // O(widest row) rather than O(result). generate_series makes the rows
+    // without needing to insert them.
+    let n = 200000;
+    let c = db.rawCursor("SELECT i, repeat('x', 40) AS pad FROM generate_series(1, "
+                         + str(n) + ") AS g(i) ORDER BY i", []);
+    let count = 0;
+    let sum = 0;
+    while (c.next()) {
+        count += 1;
+        sum += c.row().getInt("i");
+    }
+    checkBool("the cursor finished cleanly", c.ok());
+    check("every row arrived", str(count), str(n));
+    check("and the values are right", str(sum), str(n * (n + 1) / 2));
+}
+
+fn twoCursors(db: Db) {
+    print("---- a second statement while a cursor is open ----");
+
+    // PostgreSQL cannot interleave two portals on one connection. The driver
+    // drains the open cursor's remaining rows into memory so it keeps working;
+    // it stops streaming but stays correct.
+    let c = db.rawCursor("SELECT i FROM generate_series(1, 5) AS g(i) ORDER BY i", []);
+    checkBool("first row", c.next());
+    check("  it is 1", str(c.row().getInt("i")), "1");
+
+    let other = db.raw("SELECT 99 AS answer", []);
+    checkBool("the second query ran", other.ok());
+    check("  and answered", str(other.first().getInt("answer")), "99");
+
+    let rest = "";
+    while (c.next()) { rest = rest + str(c.row().getInt("i")); }
+    check("the evicted cursor yields the rest, in order", rest, "2345");
+    checkBool("and ends cleanly", c.ok());
+}
+
+fn returningClause(db: Db) {
+    print("---- RETURNING, which is how you get a generated key ----");
+
+    // lastInsertId() is 0 on PostgreSQL 12+ and always will be: OIDs on
+    // ordinary tables were removed, and the INSERT tag's oid field is the only
+    // thing the protocol offers. RETURNING is the real answer, and it works for
+    // non-integer and composite keys too.
+    db.execRaw("CREATE TABLE k (id bigserial PRIMARY KEY, name text)");
+    let r = db.raw("INSERT INTO k (name) VALUES ($1) RETURNING id", [dbText("ada")]);
+    checkBool("the insert returned a row", r.ok());
+    check("one row", str(r.len()), "1");
+    checkBool("carrying a generated key", r.first().getInt("id") > 0);
+    check("lastInsertId is 0, as documented", str(db.lastInsertId()), "0");
+}

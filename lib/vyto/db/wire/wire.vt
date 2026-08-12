@@ -1,0 +1,772 @@
+// vyto/db/wire — the byte-level floor under the network database drivers.
+//
+// vyto/db/sqlite talks to a C library, so its "wire" is a function call. A
+// PostgreSQL or MySQL driver talks to a socket, and everything it says is a
+// length-prefixed frame of big- or little-endian fields. This module is that
+// half: building those frames, taking them apart, and the numeric conversions
+// the protocols need that the rest of the tree does not have.
+//
+// It is deliberately SOCKET-FREE. Every function here is a pure function over
+// byte[] and the classes hold no handle, which is what lets a driver's codec be
+// golden-tested with no server, no fd and no network. The transport lives next
+// door in vyto/db/wire/io and is the only thing that touches vyto/net/socket.
+//
+// ── WHY IT IS A PACKAGE OF ITS OWN ──────────────────────────────────────────
+// Not the per-directory-native rule that put SQLite in its own directory —
+// nothing here compiles any C. It is that `vyto/db` stakes its identity on
+// importing it compiling eight pure-Vyto objects and nothing else (db.vt:16).
+// A sibling directory makes that structural instead of a promise. And it is
+// shared rather than copied per driver because a framed reader that gets short
+// reads, short writes, EOF-versus-timeout and hostile lengths right is exactly
+// the code you do not want two of.
+// ─────────────────────────────────────────────────────────────────────────────
+
+import { DBERR_NONE, DBERR_SQL, DBERR_CONSTRAINT, DBERR_BUSY, DBERR_CLOSED,
+         DBERR_UNSUPPORTED, DBERR_MISUSE, DBERR_OPEN } from "vyto/db/driver";
+import { url_parse, url_decode, query_parse, QueryParams } from "vyto/util/url";
+
+// ---------------------------------------------------------------------------
+// Building a frame
+// ---------------------------------------------------------------------------
+
+// A growable byte buffer with the field widths both protocols speak.
+//
+// Every append returns the receiver so a message reads as one statement, the
+// same shape as StringBuilder. StringBuilder itself is the wrong tool here:
+// its toString() is strlen-based and truncates at the first NUL, and a wire
+// frame is full of them.
+export class ByteWriter {
+    b: byte[];
+
+    // `cap` is a capacity hint. Pre-sizing matters: a Bind carrying a large
+    // bytea otherwise doubles its way there one realloc at a time.
+    fn init(cap: int) {
+        this.b = bytes(0);
+        if (cap > 0) { this.b.reserve(cap); }
+    }
+
+    fn len(): int { return this.b.len; }
+
+    fn u8(v: int): ByteWriter { this.b.push((v & 0xFF) as byte); return this; }
+
+    fn u16be(v: int): ByteWriter {
+        this.b.push(((v >> 8) & 0xFF) as byte);
+        this.b.push((v & 0xFF) as byte);
+        return this;
+    }
+
+    fn u16le(v: int): ByteWriter {
+        this.b.push((v & 0xFF) as byte);
+        this.b.push(((v >> 8) & 0xFF) as byte);
+        return this;
+    }
+
+    // MySQL's packet header length field. Nothing else in the tree writes 24
+    // bits, and nothing else reads them either — see readU24LE below.
+    fn u24le(v: int): ByteWriter {
+        this.b.push((v & 0xFF) as byte);
+        this.b.push(((v >> 8) & 0xFF) as byte);
+        this.b.push(((v >> 16) & 0xFF) as byte);
+        return this;
+    }
+
+    fn u32be(v: int): ByteWriter {
+        this.b.push(((v >> 24) & 0xFF) as byte);
+        this.b.push(((v >> 16) & 0xFF) as byte);
+        this.b.push(((v >> 8) & 0xFF) as byte);
+        this.b.push((v & 0xFF) as byte);
+        return this;
+    }
+
+    fn u32le(v: int): ByteWriter {
+        this.b.push((v & 0xFF) as byte);
+        this.b.push(((v >> 8) & 0xFF) as byte);
+        this.b.push(((v >> 16) & 0xFF) as byte);
+        this.b.push(((v >> 24) & 0xFF) as byte);
+        return this;
+    }
+
+    fn i64be(v: int): ByteWriter {
+        let i = 56;
+        while (i >= 0) { this.b.push(((v >> i) & 0xFF) as byte); i -= 8; }
+        return this;
+    }
+
+    fn i64le(v: int): ByteWriter {
+        let i = 0;
+        while (i < 64) { this.b.push(((v >> i) & 0xFF) as byte); i += 8; }
+        return this;
+    }
+
+    // IEEE-754 big-endian, which is what PostgreSQL's binary float8 is.
+    fn f64be(v: float): ByteWriter { return this.i64be(f64ToBits(v)); }
+    fn f64le(v: float): ByteWriter { return this.i64le(f64ToBits(v)); }
+
+    fn raw(src: byte[]): ByteWriter {
+        let i = 0;
+        while (i < src.len) { this.b.push(src[i]); i += 1; }
+        return this;
+    }
+
+    fn rawSlice(src: byte[], off: int, n: int): ByteWriter {
+        let i = off;
+        let end = off + n;
+        if (i < 0) { i = 0; }
+        if (end > src.len) { end = src.len; }
+        while (i < end) { this.b.push(src[i]); i += 1; }
+        return this;
+    }
+
+    // The string's bytes, with no terminator and no length prefix. Binary-safe:
+    // s.len is the byte count, so an interior NUL is written like any other
+    // byte rather than ending the value.
+    fn text(s: string): ByteWriter {
+        let i = 0;
+        while (i < s.len) { this.b.push(s[i] as byte); i += 1; }
+        return this;
+    }
+
+    // A C string: the bytes plus a terminating NUL. This is how every string in
+    // the PostgreSQL protocol is framed.
+    fn cstr(s: string): ByteWriter { return this.text(s).u8(0); }
+
+    // Reserve four bytes for a length that is not known until the body has been
+    // written, and return where they went. Every PostgreSQL message and every
+    // MySQL packet needs this.
+    //
+    //     let at = w.placeholderU32();
+    //     ... write the body ...
+    //     w.patchU32BE(at, w.len() - at);
+    fn placeholderU32(): int {
+        let at = this.b.len;
+        this.u32be(0);
+        return at;
+    }
+
+    fn patchU32BE(at: int, v: int): ByteWriter {
+        if (at < 0 || at + 4 > this.b.len) {
+            panic("vyto/db/wire: patchU32BE past the end of the buffer");
+        }
+        this.b[at] = ((v >> 24) & 0xFF) as byte;
+        this.b[at + 1] = ((v >> 16) & 0xFF) as byte;
+        this.b[at + 2] = ((v >> 8) & 0xFF) as byte;
+        this.b[at + 3] = (v & 0xFF) as byte;
+        return this;
+    }
+
+    fn patchU24LE(at: int, v: int): ByteWriter {
+        if (at < 0 || at + 3 > this.b.len) {
+            panic("vyto/db/wire: patchU24LE past the end of the buffer");
+        }
+        this.b[at] = (v & 0xFF) as byte;
+        this.b[at + 1] = ((v >> 8) & 0xFF) as byte;
+        this.b[at + 2] = ((v >> 16) & 0xFF) as byte;
+        return this;
+    }
+
+    // The accumulated bytes. The buffer is handed over, not copied, so the
+    // writer must not be appended to afterwards — build one frame per writer,
+    // or clear() between frames.
+    fn take(): byte[] { return this.b; }
+
+    // Reset to empty. Unlike take() this keeps the writer usable; unlike
+    // StringBuilder.clear() it does not keep the capacity, because byte[] has
+    // no truncate-in-place.
+    fn clear(): ByteWriter { this.b = bytes(0); return this; }
+}
+
+export fn byteWriter(cap: int): ByteWriter { return new ByteWriter(cap); }
+
+// ---------------------------------------------------------------------------
+// Reading fields vyto/mmap/decode does not cover
+// ---------------------------------------------------------------------------
+//
+// Everything else — readU8/readU16BE/readU32BE/readI64BE/readF64BE/readText/
+// findByte — comes from vyto/mmap/decode, which was written to be reusable over
+// "a byte[] from File.read or a socket" (decode.vt:14). These are the two field
+// widths it does not have, both needed by MySQL.
+
+// MySQL's 3-byte little-endian packet length.
+export fn readU24LE(b: byte[], off: int): int {
+    if (off < 0 || off + 3 > b.len) { panic("vyto/db/wire: read past the end of the buffer"); }
+    return (b[off] as int) | ((b[off + 1] as int) << 8) | ((b[off + 2] as int) << 16);
+}
+
+// 4-byte IEEE-754. MySQL's binary protocol sends a FLOAT column as one of
+// these, and nothing in the tree reads a single-precision value.
+export fn readF32BE(b: byte[], off: int): float {
+    if (off < 0 || off + 4 > b.len) { panic("vyto/db/wire: read past the end of the buffer"); }
+    let bits = ((b[off] as int) << 24) | ((b[off + 1] as int) << 16)
+             | ((b[off + 2] as int) << 8) | (b[off + 3] as int);
+    return f32BitsToFloat(bits);
+}
+
+export fn readF32LE(b: byte[], off: int): float {
+    if (off < 0 || off + 4 > b.len) { panic("vyto/db/wire: read past the end of the buffer"); }
+    let bits = (b[off] as int) | ((b[off + 1] as int) << 8)
+             | ((b[off + 2] as int) << 16) | ((b[off + 3] as int) << 24);
+    return f32BitsToFloat(bits);
+}
+
+fn f32BitsToFloat(bits: int): float {
+    let sign = 1.0;
+    if ((bits >> 31) & 1 == 1) { sign = -1.0; }
+    let exp = (bits >> 23) & 0xFF;
+    let frac = bits & 0x7FFFFF;
+
+    if (exp == 0) {
+        if (frac == 0) { return sign * 0.0; }
+        return sign * (frac as float) * pow2(-149);
+    }
+    if (exp == 255) {
+        if (frac == 0) { return sign * inf(); }
+        return nan();
+    }
+    let mant = 1.0 + (frac as float) * pow2(-23);
+    return sign * mant * pow2(exp - 127);
+}
+
+// ---------------------------------------------------------------------------
+// Floats
+// ---------------------------------------------------------------------------
+
+// Vyto has no literal for either, and no bit-cast to build one with. These are
+// the same construction vyto/mmap/decode uses (decode.vt:115-116) — and they
+// are functions rather than consts because the checker constant-folds a const
+// initializer and rejects the division that produces a NaN.
+export fn inf(): float { return 1.0e308 * 10.0; }
+export fn nan(): float { return 0.0 / 0.0; }
+
+export fn isNan(v: float): bool { return v != v; }
+export fn isInf(v: float): bool { return v != 0.0 && v * 2.0 == v && v == v; }
+export fn isFinite(v: float): bool { return v == v && !isInf(v); }
+
+// 2^n for n >= 0, by squaring: a wide exponent costs log n multiplications.
+fn pow2pos(n: int): float {
+    let e = n;
+    let r = 1.0;
+    let base = 2.0;
+    while (e > 0) {
+        if (e & 1 == 1) { r = r * base; }
+        base = base * base;
+        e = e >> 1;
+    }
+    return r;
+}
+
+// 2^n for any n. Exported because it is the scaling ladder every float
+// conversion here runs on, and it is the one piece worth reusing.
+//
+// The negative side is NOT 1.0 / pow2pos(-n): above n = 1023 that divisor is
+// already infinity and the quotient is zero, which silently flushes every
+// subnormal to nothing. Stepping down in chunks keeps each divisor finite and
+// each intermediate representable, all the way to 2^-1074. The same bug was
+// live in vyto/mmap/decode, where it made readF64BE return 0.0 for every
+// subnormal; it is fixed there too.
+export fn pow2(n: int): float {
+    if (n >= 0) { return pow2pos(n); }
+    let e = -n;
+    let r = 1.0;
+    while (e > 0) {
+        let c = e;
+        if (c > 500) { c = 500; }
+        r = r / pow2pos(c);
+        e -= c;
+    }
+    return r;
+}
+
+// Reinterpret a double as its 64 IEEE-754 bits — the inverse of decode.vt's
+// private bitsToFloat, which the tree has never needed until now.
+//
+// Vyto has no bit-cast, so this decomposes by arithmetic. Every scaling factor
+// is a power of two, so every step is exact: no rounding is introduced and the
+// result is the true bit pattern, not an approximation of it.
+export fn f64ToBits(v: float): int {
+    if (v != v) { return 0x7FF8000000000000; }      // canonical quiet NaN
+
+    let sign = 0;
+    let x = v;
+    if (x < 0.0) { sign = 1; x = -x; }
+
+    if (x == 0.0) {
+        // -0.0 compares equal to 0.0, so the sign has to come from the one
+        // operation that still distinguishes them.
+        if (1.0 / v < 0.0) { return 1 << 63; }
+        return 0;
+    }
+    if (x * 2.0 == x) { return (sign << 63) | (2047 << 52); }   // infinity
+
+    // Normalize into [1, 2) with an exact power-of-two ladder.
+    let e = 0;
+    while (x >= 2.0) {
+        let s = 1;
+        while (s < 1024 && x >= pow2(s + s)) { s = s + s; }
+        x = x / pow2(s);
+        e += s;
+    }
+    while (x < 1.0) {
+        let s = 1;
+        while (s < 1024 && x * pow2(s + s) < 1.0) { s = s + s; }
+        x = x * pow2(s);
+        e -= s;
+    }
+
+    if (e < -1022) {
+        // Subnormal: the value is frac * 2^-1074, with no implicit leading 1.
+        let frac = (x * pow2(52 + e + 1022)) as int;
+        return (sign << 63) | frac;
+    }
+    let exp = e + 1023;
+    if (exp >= 2047) { return (sign << 63) | (2047 << 52); }
+    // x is in [1,2) and carries at most 52 fraction bits, so this is exact.
+    let frac = ((x - 1.0) * pow2(52)) as int;
+    return (sign << 63) | (exp << 52) | frac;
+}
+
+// The EXACT decimal value of a double, as text. Not 17 significant digits — the
+// real thing, however long that is: 0.1 comes back as
+// 0.1000000000000000055511151231257827021181583404541015625.
+//
+// That is deliberate, and it is why this is not `str(v)`. `str(float)` and
+// StringBuilder.appendFloat both format with "%g" (runtime/vyto_rt.c:749,
+// util/native/src/sb_shim.c:73) — six significant digits, not round-trip. A
+// parameter bound as dbFloat(1234567.89) would reach the server as
+// 1.23457e+06, which is a silent data-corruption bug rather than a formatting
+// one.
+//
+// Printing the exact value sidesteps the whole question of correctly-rounded
+// shortest output: an exact decimal parses back to exactly the same double by
+// definition, on any server, with no rounding mode to agree about. Every double
+// has a finite decimal expansion because its value is m * 2^k, and 2^-k is
+// 5^k / 10^k.
+//
+// This is the fallback path. When the server tells us a parameter's type is
+// float8 or float4, the driver sends the IEEE bits instead and none of this
+// runs.
+export fn exactFloatText(v: float): string {
+    if (v != v) { return "NaN"; }
+    if (isInf(v)) { if (v < 0.0) { return "-Infinity"; } return "Infinity"; }
+
+    let bits = f64ToBits(v);
+    let neg = ((bits >> 63) & 1) == 1;
+    let exp = (bits >> 52) & 0x7FF;
+    let frac = bits & 0xFFFFFFFFFFFFF;
+
+    let m = frac;
+    let k = 0;
+    if (exp == 0) {
+        if (frac == 0) { if (neg) { return "-0"; } return "0"; }
+        k = -1074;                          // subnormal: no implicit leading 1
+    } else {
+        m = frac | (1 << 52);
+        k = (exp as int) - 1075;
+    }
+
+    // Strip trailing powers of two out of the mantissa first. It costs nothing
+    // and it is what keeps 0.5 printing as "0.5" instead of as a 52-digit
+    // expansion of the same value.
+    while (k < 0 && (m & 1) == 0) { m = m >> 1; k += 1; }
+
+    let sign = "";
+    if (neg) { sign = "-"; }
+
+    if (k >= 0) {
+        // An integer: m * 2^k.
+        let d = decOf(m);
+        decShiftLeft(d, k);
+        return sign + decText(d, 0);
+    }
+    // A fraction: m / 2^|k|, which is exactly (m * 5^|k|) / 10^|k|.
+    let s = -k;
+    let d = decOf(m);
+    decMulPow5(d, s);
+    return sign + decText(d, s);
+}
+
+// ---- a decimal digit string, little-endian, one digit per element ----------
+//
+// Only ever used by exactFloatText, on a path that runs once per bound float
+// with an uninferrable type. A double's exact expansion reaches ~770 digits,
+// which no fixed-width integer holds, and this is the smallest thing that does.
+// The chunked multipliers keep it to a few thousand digit operations rather
+// than the hundreds of thousands a multiply-by-5-1074-times loop would cost.
+
+fn decOf(m: int): int[] {
+    let d: int[] = [];
+    let x = m;
+    if (x == 0) { d.push(0); return d; }
+    while (x > 0) { d.push(x % 10); x = x / 10; }
+    return d;
+}
+
+// Multiply in place by a value small enough that digit*mul plus the carry
+// stays inside i64.
+fn decMulSmall(d: int[], mul: int) {
+    let carry = 0;
+    let i = 0;
+    while (i < d.len) {
+        let p = d[i] * mul + carry;
+        d[i] = p % 10;
+        carry = p / 10;
+        i += 1;
+    }
+    while (carry > 0) { d.push(carry % 10); carry = carry / 10; }
+}
+
+// 2^30 and 5^13 both fit comfortably: the worst carry is under the multiplier,
+// so the product stays below 10 * mul, well inside i64.
+fn decShiftLeft(d: int[], k: int) {
+    let n = k;
+    while (n >= 30) { decMulSmall(d, 1073741824); n -= 30; }
+    if (n > 0) { decMulSmall(d, 1 << n); }
+}
+
+fn decMulPow5(d: int[], k: int) {
+    let n = k;
+    while (n >= 13) { decMulSmall(d, 1220703125); n -= 13; }
+    let i = 0;
+    while (i < n) { decMulSmall(d, 5); i += 1; }
+}
+
+// Render the digits with a decimal point `scale` places from the right,
+// trimming the trailing zeros the expansion always ends in.
+fn decText(d: int[], scale: int): string {
+    let hi = d.len - 1;
+    while (hi > 0 && d[hi] == 0) { hi -= 1; }        // leading zeros
+
+    if (scale <= 0) {
+        let s = "";
+        let i = hi;
+        while (i >= 0) { s = s + str(d[i]); i -= 1; }
+        return s;
+    }
+
+    let lo = 0;
+    while (lo < scale && lo < d.len && d[lo] == 0) { lo += 1; }   // trailing zeros
+
+    let ip = "";
+    let i = hi;
+    while (i >= scale) { ip = ip + str(d[i]); i -= 1; }
+    if (ip == "") { ip = "0"; }
+
+    if (lo >= scale) { return ip; }                  // the fraction was all zeros
+
+    let fp = "";
+    let j = scale - 1;
+    while (j >= lo) {
+        if (j < d.len) { fp = fp + str(d[j]); } else { fp = fp + "0"; }
+        j -= 1;
+    }
+    return ip + "." + fp;
+}
+
+// ---------------------------------------------------------------------------
+// Tolerant parsing
+// ---------------------------------------------------------------------------
+//
+// to_int() and to_float() PANIC on anything unexpected — "to_int: not an
+// integer", "to_int: trailing characters", "to_int: integer overflow"
+// (runtime/vyto_rt_str.c:197-243). A driver parses text the SERVER chose: a
+// column value, a CommandComplete tag, a ParameterStatus. Using the builtins
+// would turn "this server said something we did not expect" into a process
+// abort, which is the wrong failure for every one of those.
+
+// Parse a decimal integer, returning `fallback` for anything that is not one.
+// Never panics, never aborts.
+export fn parseIntOr(s: string, fallback: int): int {
+    if (s.len == 0) { return fallback; }
+    let i = 0;
+    let neg = false;
+    if (s[0] == 45) { neg = true; i = 1; }            // '-'
+    else if (s[0] == 43) { i = 1; }                   // '+'
+    if (i >= s.len) { return fallback; }
+
+    // Accumulate NEGATIVELY. The negative side of i64 is one wider than the
+    // positive side, so building the magnitude and negating at the end cannot
+    // represent -9223372036854775808 — which is a perfectly ordinary value in a
+    // bigint column, and would come back as the fallback.
+    let v = 0;
+    let LIM = -922337203685477580;              // i64 min / 10, truncated
+    while (i < s.len) {
+        let c = s[i];
+        if (c < 48 || c > 57) { return fallback; }
+        let d = c - 48;
+        // Check before multiplying: an overflowing multiply is not detectable
+        // afterwards, and the builtin's answer to this case is to abort.
+        if (v < LIM) { return fallback; }
+        if (v == LIM && d > 8) { return fallback; }
+        v = v * 10 - d;
+        i += 1;
+    }
+    if (neg) { return v; }
+    // The magnitude is representable as a negative but not as a positive.
+    if (v == -9223372036854775807 - 1) { return fallback; }
+    return -v;
+}
+
+// Parse a decimal float, returning `fallback` for anything that is not one.
+// Accepts the three non-finite spellings PostgreSQL uses.
+//
+// ── ACCURACY, MEASURED ──────────────────────────────────────────────────────
+// Exact when the value has at most 15 significant digits and a decimal exponent
+// within ±22: the mantissa is then under 2^53 and the scaling operand is an
+// exact double, so one IEEE operation is correctly rounded. That covers
+// ordinary column values.
+//
+// Beyond it this is approximate. Fed the full exact expansion of a random
+// double it lands within 2 ulp over 2^-60..2^60 and within 5 ulp over the whole
+// range, differing from the true value about 16% of the time. The floor is that
+// a mantissa of more than 15 digits exceeds 2^53 and rounds when it becomes a
+// double, before any scaling happens; getting past that needs 128-bit or
+// arbitrary-precision arithmetic, which is a poor trade for a function on no
+// exactness-critical path.
+//
+// It is on no such path because the exact directions do not come through here:
+// float4/float8 RESULT columns are requested in binary and decoded by
+// readF32BE/readF64BE, which are exact, and float PARAMETERS are sent either as
+// binary or as exactFloatText, which is exact. `numeric` stays text and is
+// never made into a float at all. This is the tolerant fallback for a float
+// that shows up as text anyway — its job is to not abort the process.
+// ─────────────────────────────────────────────────────────────────────────────
+export fn parseFloatOr(s: string, fallback: float): float {
+    if (s.len == 0) { return fallback; }
+    if (s == "NaN" || s == "nan") { return nan(); }
+    if (s == "Infinity" || s == "inf" || s == "Inf") { return inf(); }
+    if (s == "-Infinity" || s == "-inf" || s == "-Inf") { return -inf(); }
+
+    let i = 0;
+    let neg = false;
+    if (s[0] == 45) { neg = true; i = 1; }
+    else if (s[0] == 43) { i = 1; }
+
+    let mant = 0;
+    let digits = 0;
+    let scale = 0;
+    let seenDigit = false;
+    let seenDot = false;
+    let rounded = false;
+
+    while (i < s.len) {
+        let c = s[i];
+        if (c >= 48 && c <= 57) {
+            seenDigit = true;
+            if (c == 48 && mant == 0) {
+                // A leading zero is not a significant digit. Counting it would
+                // spend the 18-digit budget on the zeros of 0.0000000001 and
+                // leave nothing for the value.
+                if (seenDot) { scale -= 1; }
+                i += 1;
+                continue;
+            }
+            // Past 18 digits the mantissa cannot take more without overflowing;
+            // keep counting the exponent instead of losing the magnitude.
+            if (digits < 18) {
+                mant = mant * 10 + (c - 48);
+                digits += 1;
+                if (seenDot) { scale -= 1; }
+            } else {
+                // ROUND at the cut, do not truncate. Dropping the tail outright
+                // costs up to a full unit in the last kept digit, which is
+                // several ulp of the result; rounding here is what keeps an
+                // exact expansion parsing back to the double it came from.
+                if (!rounded) {
+                    rounded = true;
+                    if (c >= 53) { mant += 1; }        // next digit >= '5'
+                }
+                if (!seenDot) { scale += 1; }
+            }
+            i += 1;
+            continue;
+        }
+        if (c == 46 && !seenDot) { seenDot = true; i += 1; continue; }   // '.'
+        break;
+    }
+    if (!seenDigit) { return fallback; }
+
+    if (i < s.len && (s[i] == 101 || s[i] == 69)) {                      // 'e' 'E'
+        i += 1;
+        let esign = 1;
+        if (i < s.len && s[i] == 45) { esign = -1; i += 1; }
+        else if (i < s.len && s[i] == 43) { i += 1; }
+        if (i >= s.len) { return fallback; }
+        let ev = 0;
+        while (i < s.len) {
+            let c = s[i];
+            if (c < 48 || c > 57) { return fallback; }
+            if (ev < 100000) { ev = ev * 10 + (c - 48); }
+            i += 1;
+        }
+        scale += esign * ev;
+    }
+    if (i != s.len) { return fallback; }              // trailing junk
+
+    let v = mant as float;
+    if (neg) { v = -v; }
+    return scaleByPow10(v, scale);
+}
+
+// Scale by 10^e as accurately as a few IEEE operations allow.
+//
+// 10^e is split into 2^e * 5^e rather than applied as powers of ten. The
+// binary half is then exact at every magnitude — pow2 introduces no error at
+// all — so only the 5^e half can round, which roughly halves the operations
+// that can lose a bit. Splitting also keeps the intermediates in range: 10^300
+// overflows, while 5^300 and 2^300 applied in either order do not.
+fn scaleByPow10(v: float, e: int): float {
+    if (e == 0 || v == 0.0) { return v; }
+
+    // 10^0..10^22 are exactly representable, so one multiply or divide by an
+    // exact operand is correctly rounded. This covers ordinary column values.
+    if (e > 0 && e <= 22) { return v * pow5Exact(e) * pow2(e); }
+    if (e < 0 && e >= -22) { return v / pow5Exact(-e) * pow2(e); }
+
+    let r = v;
+    let n = e;
+    if (n > 0) {
+        // Apply 5^n in exact chunks, interleaving the binary scaling so a large
+        // positive exponent cannot overflow before the division brings it back.
+        while (n > 22) {
+            r = r * pow5Exact(22) * pow2(22);
+            n -= 22;
+            if (isInf(r)) { return r; }
+        }
+        return r * pow5Exact(n) * pow2(n);
+    }
+    let m = -n;
+    while (m > 22) {
+        r = r / pow5Exact(22) * pow2(-22);
+        m -= 22;
+        if (r == 0.0) { return r; }
+    }
+    return r / pow5Exact(m) * pow2(-m);
+}
+
+// 5^n is exact in a double up to n = 22 (5^22 < 2^53); callers never ask for
+// more than that in one go.
+fn pow5Exact(n: int): float {
+    let r = 1.0;
+    let i = 0;
+    while (i < n) { r = r * 5.0; i += 1; }
+    return r;
+}
+
+// ---------------------------------------------------------------------------
+// SQLSTATE
+// ---------------------------------------------------------------------------
+
+// Map a five-character SQLSTATE onto the driver seam's error classes. Both
+// engines carry one, which is why this is shared rather than per-driver.
+//
+// driver.vt:28-29 is explicit that callers branch on DBERR_* and never on the
+// engine's prose. The set is coarse on purpose; a driver that wants to route on
+// 23505 versus 23503 exposes the raw state alongside, as a code rather than as
+// a message.
+export fn sqlstateToDberr(state: string): int {
+    if (state.len < 2) { return DBERR_SQL; }
+
+    // Exact codes whose class would otherwise send them to the wrong place.
+    if (state == "40001") { return DBERR_BUSY; }        // serialization_failure
+    if (state == "40P01") { return DBERR_BUSY; }        // deadlock_detected
+    if (state == "55P03") { return DBERR_BUSY; }        // lock_not_available
+    if (state == "55006") { return DBERR_BUSY; }        // object_in_use
+    if (state == "57014") { return DBERR_BUSY; }        // query_canceled
+    if (state == "25P02") { return DBERR_MISUSE; }      // in_failed_sql_transaction
+    if (state == "0A000") { return DBERR_UNSUPPORTED; } // feature_not_supported
+
+    let c = state.slice(0, 2);
+    if (c == "00") { return DBERR_NONE; }
+    if (c == "08") { return DBERR_CLOSED; }             // connection_exception
+    if (c == "0A") { return DBERR_UNSUPPORTED; }
+    if (c == "22") { return DBERR_SQL; }                // data_exception
+    if (c == "23") { return DBERR_CONSTRAINT; }         // integrity_constraint_violation
+    if (c == "25") { return DBERR_MISUSE; }             // invalid_transaction_state
+    if (c == "26") { return DBERR_MISUSE; }             // invalid_sql_statement_name
+    if (c == "28") { return DBERR_OPEN; }               // invalid_authorization
+    if (c == "3D") { return DBERR_OPEN; }               // invalid_catalog_name
+    if (c == "3F") { return DBERR_SQL; }                // invalid_schema_name
+    // A serialization failure is a retry-me condition, and DBERR_BUSY is this
+    // seam's word for retry-me.
+    if (c == "40") { return DBERR_BUSY; }               // transaction_rollback
+    if (c == "42") { return DBERR_SQL; }                // syntax_error_or_access_rule
+    if (c == "53") { return DBERR_BUSY; }               // insufficient_resources
+    if (c == "54") { return DBERR_SQL; }                // program_limit_exceeded
+    if (c == "57") { return DBERR_BUSY; }               // operator_intervention
+    if (c == "58") { return DBERR_CLOSED; }             // system_error
+    if (c == "XX") { return DBERR_CLOSED; }             // internal_error
+    return DBERR_SQL;
+}
+
+// ---------------------------------------------------------------------------
+// Connection strings
+// ---------------------------------------------------------------------------
+
+// A parsed data source name.
+//
+// This is a thin layer over vyto/util/url rather than a parser of its own: a
+// DSN *is* a URL, and url_parse already handles IPv6 literals, an '@' inside a
+// password, and percent-encoding — all three of which a hand-rolled splitter
+// gets wrong. Everything left is defaults and the option bag.
+export class Dsn {
+    scheme: string;
+    user: string;
+    pass: string;
+    host: string;
+    port: int;
+    database: string;
+    opts: QueryParams;
+    err: string;
+
+    fn init() {
+        this.scheme = "";
+        this.user = "";
+        this.pass = "";
+        this.host = "";
+        this.port = 0;
+        this.database = "";
+        this.opts = query_parse("");
+        this.err = "";
+    }
+
+    fn isValid(): bool { return this.err == ""; }
+    fn error(): string { return this.err; }
+
+    fn opt(k: string, dflt: string): string { return this.opts.getOr(k, dflt); }
+    fn hasOpt(k: string): bool { return this.opts.has(k); }
+}
+
+// Parse a DSN, filling in `defaultHost` and `defaultPort` where it is silent.
+// Never panics; check isValid().
+//
+//     postgres://ada:s3cr3t@db.internal:5432/app?sslmode=disable
+//     mysql://root@127.0.0.1/shop
+//
+// The database is the path with its leading slash removed, and defaults to the
+// user name — which is PostgreSQL's own rule and harmless for MySQL, where a
+// connection with no database selected is legal anyway.
+export fn parseDsn(s: string, defaultHost: string, defaultPort: int): Dsn {
+    let d = new Dsn();
+    if (s.len == 0) { d.err = "empty connection string"; return d; }
+
+    let u = url_parse(s);
+    if (!u.isValid()) { d.err = u.error(); return d; }
+
+    d.scheme = u.scheme;
+    // url_parse leaves userinfo percent-encoded, which is the only way a
+    // password containing ':' or '@' can survive the grammar at all.
+    d.user = url_decode(u.user);
+    d.pass = url_decode(u.pass);
+
+    d.host = u.host;
+    if (d.host == "") { d.host = defaultHost; }
+    d.port = u.port;
+    if (d.port == 0) { d.port = defaultPort; }
+
+    let p = u.path;
+    if (p.starts_with("/")) { p = p.slice(1, p.len); }
+    d.database = url_decode(p);
+    if (d.database == "") { d.database = d.user; }
+
+    d.opts = query_parse(u.query);
+    return d;
+}

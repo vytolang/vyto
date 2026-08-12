@@ -1,0 +1,212 @@
+// vyto/db/pgsql/auth — the password exchanges, as pure functions.
+//
+// Socket-free: every step takes what the server said and returns what to say
+// back, so the whole of SCRAM can be checked against the RFC 7677 worked
+// example offline, with no server. That matters more here than anywhere else in
+// the driver — an authentication bug that "works against my local Postgres"
+// usually works because the local server is set to trust.
+//
+// Supported: trust, cleartext, md5, and SCRAM-SHA-256 (the default since
+// PostgreSQL 14). Not supported: SCRAM-SHA-256-PLUS, which binds the exchange
+// to the TLS channel and so needs TLS; and GSSAPI/SSPI.
+//
+// ── ON SASLprep ─────────────────────────────────────────────────────────────
+// RFC 5802 says the password should be run through SASLprep (RFC 4013) before
+// hashing. This does not: the bytes are used as given. Implementing it means
+// Unicode normalization, which means depending on vyto/intl and therefore on
+// ICU — an unacceptable dependency for a database driver, and one that would
+// make this package fail to build wherever ICU is not provisioned.
+//
+// The practical effect is nil for ASCII passwords and for the overwhelming
+// majority of others, since the server stores a verifier computed from the
+// password it was given. A password that only differs from the stored one by
+// Unicode normalization will fail to authenticate. Most client libraries make
+// the same trade.
+// ─────────────────────────────────────────────────────────────────────────────
+
+import { sha256, hmac_sha256, pbkdf2_sha256, ct_equal, md5,
+         hex_encode, strBytes, concat_bytes, sub_bytes } from "vyto/crypto";
+import { base64_encode, base64_decode } from "vyto/util/mime";
+import { rand_bytes } from "vyto/util/uuid";
+import { parseIntOr } from "vyto/db/wire";
+
+export const SCRAM_SHA_256: string = "SCRAM-SHA-256";
+
+// ---- md5 -------------------------------------------------------------------
+
+// PostgreSQL's md5 method: "md5" + hex(md5(hex(md5(password + user)) + salt)).
+//
+// The inner digest binds the user name so the same password on two accounts
+// stores differently; the outer one binds the server's four random salt bytes
+// so a captured exchange cannot be replayed. Neither makes MD5 sound — see the
+// warning on md5() in vyto/crypto — but this is what the server asked for.
+export fn md5Password(user: string, password: string, salt: byte[]): string {
+    let inner = hex_encode(md5(strBytes(password + user)));
+    let outer = hex_encode(md5(concat_bytes(strBytes(inner), salt)));
+    return "md5" + outer;
+}
+
+// ---- SCRAM-SHA-256 ---------------------------------------------------------
+
+// The client half of the exchange, carried across three messages.
+//
+// It holds the password for the duration. That is unavoidable — the final proof
+// needs it — but nothing else may hold a reference: the session drops this
+// object as soon as the exchange finishes.
+export class ScramClient {
+    user: string;          // the n= field; see first()
+    password: string;
+    nonce: string;         // ours
+    clientFirstBare: string;
+    serverFirst: string;
+    serverSignature: byte[];
+    err: string;
+
+    fn init(user: string, password: string, nonce: string) {
+        this.user = user;
+        this.password = password;
+        this.nonce = nonce;
+        this.clientFirstBare = "";
+        this.serverFirst = "";
+        this.serverSignature = bytes(0);
+        this.err = "";
+    }
+
+    fn failed(): bool { return this.err != ""; }
+
+    // client-first-message. The "n,," prefix is the GS2 header: no channel
+    // binding, no authorization identity. It is repeated (base64-encoded) in
+    // the final message so the server can detect a downgrade.
+    //
+    // `user` is normally empty against PostgreSQL: RFC 5802 carries the name in
+    // n=, but the server authenticates the one from the startup packet and
+    // ignores this. It is settable because the field is part of AuthMessage and
+    // therefore of the proof, which is what makes the RFC's worked example
+    // reproducible here.
+    fn first(): byte[] {
+        this.clientFirstBare = "n=" + this.user + ",r=" + this.nonce;
+        return strBytes("n,," + this.clientFirstBare);
+    }
+
+    // Given server-first-message, produce client-final-message.
+    //
+    //   SaltedPassword  = PBKDF2-HMAC-SHA256(password, salt, i, 32)
+    //   ClientKey       = HMAC(SaltedPassword, "Client Key")
+    //   StoredKey       = SHA256(ClientKey)
+    //   AuthMessage     = client-first-bare + "," + server-first + "," + client-final-without-proof
+    //   ClientSignature = HMAC(StoredKey, AuthMessage)
+    //   ClientProof     = ClientKey XOR ClientSignature
+    //   ServerKey       = HMAC(SaltedPassword, "Server Key")
+    //   ServerSignature = HMAC(ServerKey, AuthMessage)
+    fn final(serverFirst: byte[]): byte[] {
+        let sf = strFromBytes(serverFirst);
+        this.serverFirst = sf;
+
+        let combined = scramField(sf, "r");
+        let saltB64 = scramField(sf, "s");
+        let iterTxt = scramField(sf, "i");
+        if (combined == "" || saltB64 == "" || iterTxt == "") {
+            this.err = "malformed SCRAM server-first-message";
+            return null;
+        }
+        // The server's nonce must extend ours verbatim. If it does not, we are
+        // not talking to the party that saw our first message.
+        if (!combined.starts_with(this.nonce)) {
+            this.err = "SCRAM server nonce does not extend the client nonce";
+            return null;
+        }
+        let iters = parseIntOr(iterTxt, 0);
+        if (iters <= 0) {
+            this.err = "SCRAM iteration count is not a positive integer: " + iterTxt;
+            return null;
+        }
+
+        let salt = base64_decode(saltB64);
+        let salted = pbkdf2_sha256(strBytes(this.password), salt, iters, 32);
+        let clientKey = hmac_sha256(salted, strBytes("Client Key"));
+        let storedKey = sha256(clientKey);
+
+        // c=biws is base64("n,,") — the GS2 header echoed back.
+        let withoutProof = "c=biws,r=" + combined;
+        let authMessage = this.clientFirstBare + "," + sf + "," + withoutProof;
+
+        let clientSig = hmac_sha256(storedKey, strBytes(authMessage));
+        let proof = xorBytes(clientKey, clientSig);
+
+        let serverKey = hmac_sha256(salted, strBytes("Server Key"));
+        this.serverSignature = hmac_sha256(serverKey, strBytes(authMessage));
+
+        return strBytes(withoutProof + ",p=" + base64_encode(proof));
+    }
+
+    // Check server-final-message. This is not optional bookkeeping: verifying
+    // it is what proves the server also knows the password, which is the whole
+    // reason SCRAM exists rather than sending a hash. Fails closed.
+    fn verify(serverFinal: byte[]): bool {
+        let sf = strFromBytes(serverFinal);
+        let e = scramField(sf, "e");
+        if (e != "") { this.err = "SCRAM authentication failed: " + e; return false; }
+        let v = scramField(sf, "v");
+        if (v == "") { this.err = "SCRAM server-final-message carried no verifier"; return false; }
+        if (!ct_equal(base64_decode(v), this.serverSignature)) {
+            this.err = "SCRAM server signature did not verify";
+            return false;
+        }
+        return true;
+    }
+}
+
+// A fresh client with a 24-character random nonce.
+//
+// The nonce must be unpredictable, so it comes from the OS CSPRNG rather than
+// from vyto/math/random. It also must not contain a comma, which is the field
+// separator — base64 has none.
+export fn scramClient(password: string): ScramClient {
+    return new ScramClient("", password, scramNonce(18));
+}
+
+// Fully determined, for reproducing a known-answer vector. Nothing in the
+// driver calls this: a fixed nonce destroys the replay protection the nonce
+// exists for.
+export fn scramClientWith(user: string, password: string, nonce: string): ScramClient {
+    return new ScramClient(user, password, nonce);
+}
+
+// `n` random bytes, base64'd. 18 bytes is 24 base64 characters and 144 bits.
+export fn scramNonce(n: int): string {
+    return base64_encode(rand_bytes(n));
+}
+
+// The value of `key=` in a comma-separated SCRAM message, or "".
+//
+// Only the FIRST field is considered for a given key and matching is anchored
+// at a field boundary, so a value that happens to contain ",r=" cannot be
+// mistaken for the nonce field.
+export fn scramField(msg: string, key: string): string {
+    let parts = msg.split(",");
+    let i = 0;
+    while (i < parts.len) {
+        let p = parts[i];
+        if (p.len >= 2 && p.slice(0, 1) == key && p.slice(1, 2) == "=") {
+            return p.slice(2, p.len);
+        }
+        i += 1;
+    }
+    return "";
+}
+
+fn xorBytes(a: byte[], b: byte[]): byte[] {
+    let n = a.len;
+    if (b.len < n) { n = b.len; }
+    let out = bytes(n);
+    let i = 0;
+    while (i < n) { out[i] = ((a[i] as int) ^ (b[i] as int)) as byte; i += 1; }
+    return out;
+}
+
+// strbytes, not str(): a SASL message is not NUL-terminated and may be handed
+// to us as an exactly-sized buffer.
+fn strFromBytes(b: byte[]): string {
+    if (b == null) { return ""; }
+    return strbytes(b, b.len);
+}

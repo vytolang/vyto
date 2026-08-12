@@ -1,0 +1,1351 @@
+// 105_pgwire — the PostgreSQL wire protocol, checked without a PostgreSQL.
+//
+//     ./vytoc run examples/105_pgwire.vt
+//
+// vyto/db/pgsql is a pure-Vyto driver: it speaks the v3 frontend/backend
+// protocol over a socket rather than binding libpq. That makes the codec a set
+// of pure functions over byte[], and this file is the consequence — every
+// message the driver builds, every message it parses, its type mapping and its
+// authentication all asserted here with no server running, no fd open, and
+// nothing installed. It runs in CI on a machine that has never heard of
+// PostgreSQL.
+//
+// Every encoder is checked against a hand-computed byte string taken from the
+// protocol specification, so a wrong length prefix or a missing NUL fails at
+// the byte rather than at some later desynchronization. The SCRAM section is a
+// known-answer test copied from RFC 7677 §3 and the MD5 section from
+// RFC 1321 §A.5 — between them they pin PBKDF2, HMAC, SHA-256, MD5, base64 and
+// the AuthMessage assembly.
+//
+// Nothing here prints a version, a timestamp, an address, or a random value, so
+// the golden survives a dependency bump.
+
+import { encodeStartup, encodeSslRequest, encodeQuery, encodeParse, encodeDescribe,
+         encodeBind, encodeExecute, encodeSync, encodeFlush, encodeClose,
+         encodeTerminate, encodePassword, encodeSaslInitial, encodeSaslResponse,
+         decodeRowDescription, decodeParameterDescription, decodeDataRow,
+         decodeError, decodeCommandComplete, decodeAuth, decodeParameterStatus,
+         decodeBackendKey, decodeReadyForQuery, txStatusName,
+         PgParam, pgParamNull, pgParamText, pgParamBinary,
+         DESC_STATEMENT, DESC_PORTAL, FMT_TEXT, FMT_BINARY,
+         AUTH_OK, AUTH_CLEARTEXT, AUTH_MD5, AUTH_SASL, AUTH_SASL_CONTINUE,
+         TX_IDLE, TX_INTX, TX_FAILED } from "vyto/db/pgsql/proto";
+import { decodeText, decodeBinary, encodeParam, resultFormatFor,
+         OID_BOOL, OID_INT2, OID_INT4, OID_INT8, OID_FLOAT4, OID_FLOAT8,
+         OID_NUMERIC, OID_BYTEA, OID_TEXT, OID_JSONB, OID_TIMESTAMPTZ,
+         OID_UUID } from "vyto/db/pgsql/pgtype";
+import { scramClientWith, md5Password, scramField } from "vyto/db/pgsql/auth";
+import { ByteWriter, byteWriter, f64ToBits, exactFloatText, parseIntOr, parseFloatOr,
+         sqlstateToDberr, parseDsn, pow2, readF32BE, readU24LE,
+         inf, nan, isInf } from "vyto/db/wire";
+import { memIo, MAX_FRAME, io_state_name } from "vyto/db/wire/io";
+import { Db, Result, Cursor, select } from "vyto/db";
+import { pgsql, pgsqlOver, PgConn } from "vyto/db/pgsql";
+import { pgDialect, mysqlDialect } from "vyto/db/dialect";
+import { ColumnInfo } from "vyto/db/introspect";
+import { readF64BE } from "vyto/mmap/decode";
+import { Value, dbNull, dbInt, dbFloat, dbText, dbBlob } from "vyto/db/value";
+import { AUTH_SASL_FINAL } from "vyto/db/pgsql/proto";
+import { dberr_name } from "vyto/db/driver";
+import { md5, sha256, hex_encode, strBytes } from "vyto/crypto";
+
+fn check(name: string, got: string, want: string) {
+    if (got == want) {
+        print("ok    " + name);
+    } else {
+        print("FAIL  " + name);
+        print("  got  " + got);
+        print("  want " + want);
+    }
+}
+
+fn checkBool(name: string, got: bool) {
+    if (got) { print("ok    " + name); }
+    else { print("FAIL  " + name); }
+}
+
+// Every byte string prints as hex: a wire frame is full of NULs and
+// non-UTF-8 bytes, and neither may reach the golden file directly.
+fn hex(b: byte[]): string {
+    let digits = "0123456789abcdef";
+    let out = "";
+    let i = 0;
+    while (i < b.len) {
+        let v = b[i] as int;
+        out = out + digits.slice(v / 16, v / 16 + 1) + digits.slice(v % 16, v % 16 + 1);
+        i += 1;
+    }
+    return out;
+}
+
+// A message body, with the type byte and the four length bytes stripped.
+fn bodyOf(m: byte[]): byte[] {
+    let out = bytes(m.len - 5);
+    let i = 0;
+    while (i < out.len) { out[i] = m[i + 5]; i += 1; }
+    return out;
+}
+
+fn showValue(v: Value): string {
+    if (v.isNull()) { return "null"; }
+    if (v.isInt()) { return "int " + str(v.i); }
+    if (v.isFloat()) { return "float " + str(v.f); }
+    if (v.isBlob()) { return "blob " + hex(v.b); }
+    return "text " + v.s;
+}
+
+// ---------------------------------------------------------------------------
+
+fn encoders() {
+    print("---- encoders, byte for byte ----");
+
+    // Untyped: 4-byte length, protocol 3.0 (196608 = 0x00030000), then
+    // NUL-terminated key/value pairs, then a final NUL.
+    check("StartupMessage",
+          hex(encodeStartup(["user", "ada", "database", "app"])),
+          "0000001f000300007573657200616461006461746162617365006170700000");
+
+    // 8-byte length and the magic 80877103 (0x04d2162f). Answered with a bare
+    // 'S' or 'N' byte, not a message.
+    check("SSLRequest", hex(encodeSslRequest()), "0000000804d2162f");
+
+    // 'Q' (0x51), length 13 = 4 + len("SELECT 1\0").
+    check("Query", hex(encodeQuery("SELECT 1")), "510000000d53454c454354203100");
+
+    // 'P' (0x50): name, sql, then an int16 count of specified parameter types.
+    // Zero means "infer them all", which is what we want.
+    check("Parse", hex(encodeParse("s1", "SELECT $1", null)),
+          "500000001373310053454c454354202431000000");
+
+    // 'D' (0x44) with 'S' (0x53) — describe the STATEMENT, which yields the
+    // parameter types as well as the columns.
+    check("Describe statement", hex(encodeDescribe(DESC_STATEMENT, "s1")),
+          "440000000853733100");
+    check("Describe portal", hex(encodeDescribe(DESC_PORTAL, "")),
+          "440000000650" + "00");
+
+    // 'E' (0x45): portal name, then maxRows. 0 means every row, streamed.
+    check("Execute", hex(encodeExecute("", 0)), "45000000090000000000");
+
+    check("Sync", hex(encodeSync()), "5300000004");
+    check("Flush", hex(encodeFlush()), "4800000004");
+    check("Terminate", hex(encodeTerminate()), "5800000004");
+    check("Close statement", hex(encodeClose(DESC_STATEMENT, "s1")), "430000000853733100");
+
+    check("PasswordMessage", hex(encodePassword("md5abc")), "700000000b6d643561626300");
+
+    // SASLInitialResponse: mechanism as a C string, then an int32 length and
+    // the initial response. Same 'p' type byte as PasswordMessage.
+    check("SASLInitialResponse",
+          hex(encodeSaslInitial("SCRAM-SHA-256", strBytes("n,,n=,r=AAAA"))),
+          "7000000022534352414d2d5348412d323536000000000c6e2c2c6e3d2c723d41414141");
+    check("SASLResponse", hex(encodeSaslResponse(strBytes("c=biws"))),
+          "700000000a633d62697773");
+
+    // Bind. The two int16-counted arrays are what a hand-written driver most
+    // often gets wrong: parameter FORMAT codes come first, then parameter
+    // VALUES, then result format codes. A NULL value is a length of -1
+    // (ffffffff); an empty value is a length of 0. They are not the same.
+    let ps: PgParam[] = [pgParamText(bytes(0)), pgParamNull()];
+    check("Bind (empty vs NULL param)", hex(encodeBind("", "s1", ps, [FMT_TEXT])),
+          "420000001c00733100000200000000000200000000ffffffff00010000");
+
+    // Per-column result formats: text for the int, binary for the float8.
+    let ps2: PgParam[] = [pgParamBinary(byteWriter(8).f64be(0.5).take())];
+    check("Bind (binary param, mixed result formats)",
+          hex(encodeBind("", "s2", ps2, [FMT_TEXT, FMT_BINARY])),
+          "42000000200073320000010001000100000008" + "3fe0000000000000" + "000200000001");
+}
+
+fn encodeDecodeRoundTrip() {
+    print("---- encode, then decode back ----");
+
+    // Independent of the hand-computed literals above: if one of those was
+    // itself wrong, this still catches an encoder that disagrees with its own
+    // decoder.
+    let rd = byteWriter(64);
+    rd.u16be(2);
+    rd.cstr("id").u32be(1234).u16be(1).u32be(OID_INT4).u16be(4).u32be(0xFFFFFFFF).u16be(FMT_TEXT);
+    rd.cstr("score").u32be(1234).u16be(2).u32be(OID_FLOAT8).u16be(8).u32be(0xFFFFFFFF).u16be(FMT_BINARY);
+    let cols = decodeRowDescription(rd.take());
+    check("RowDescription count", str(cols.len), "2");
+    check("RowDescription col0", cols[0].name + "/" + str(cols[0].typeOid) + "/fmt" + str(cols[0].format),
+          "id/23/fmt0");
+    check("RowDescription col1", cols[1].name + "/" + str(cols[1].typeOid) + "/fmt" + str(cols[1].format),
+          "score/701/fmt1");
+    check("RowDescription typeLen col1", str(cols[1].typeLen), "8");
+
+    let pd = decodeParameterDescription(byteWriter(16).u16be(3).u32be(OID_INT4).u32be(OID_TEXT).u32be(0).take());
+    check("ParameterDescription", str(pd.len) + ":" + str(pd[0]) + "," + str(pd[1]) + "," + str(pd[2]),
+          "3:23,25,0");
+
+    let ps = decodeParameterStatus(byteWriter(32).cstr("client_encoding").cstr("UTF8").take());
+    check("ParameterStatus", ps.name + "=" + ps.value, "client_encoding=UTF8");
+
+    let bk = decodeBackendKey(byteWriter(8).u32be(4242).u32be(99).take());
+    check("BackendKeyData", str(bk.pid) + "/" + str(bk.key), "4242/99");
+
+    check("ReadyForQuery idle", txStatusName(decodeReadyForQuery(byteWriter(1).u8(TX_IDLE).take())), "idle");
+    check("ReadyForQuery in tx", txStatusName(decodeReadyForQuery(byteWriter(1).u8(TX_INTX).take())), "in transaction");
+    check("ReadyForQuery failed", txStatusName(decodeReadyForQuery(byteWriter(1).u8(TX_FAILED).take())), "failed transaction");
+}
+
+fn dataRows() {
+    print("---- DataRow: NULL is not the empty string ----");
+
+    // The single most-conflated pair in a hand-written driver. A field length
+    // of -1 is SQL NULL; a length of 0 is a zero-length value. Both appear here
+    // side by side, in that order.
+    let w = byteWriter(32);
+    w.u16be(4);
+    w.u32be(0xFFFFFFFF);                       // NULL
+    w.u32be(0);                                // ''
+    w.u32be(3).text("abc");
+    w.u32be(4).u8(0).u8(0xFF).u8(0x41).u8(0);  // bytes that are not text
+    let row = decodeDataRow(w.take());
+
+    checkBool("DataRow parsed", row.ok);
+    check("DataRow field count", str(row.count()), "4");
+    checkBool("field 0 is NULL", row.isNull(0));
+    checkBool("field 0 has no bytes", row.field(0) == null);
+    checkBool("field 1 is NOT null", !row.isNull(1));
+    check("field 1 length", str(row.field(1).len), "0");
+    check("field 2 text", row.fieldText(2), "abc");
+    check("field 3 bytes", hex(row.field(3)), "00ff4100");
+
+    // Out of range reads answer rather than panicking: the row came off a
+    // network and a caller must not be able to abort the process with an index.
+    checkBool("out-of-range field is null", row.isNull(99));
+    checkBool("out-of-range field bytes", row.field(99) == null);
+    check("out-of-range field text", row.fieldText(-1), "");
+
+    // A truncated body must yield nothing, not a half-built row.
+    let bad = decodeDataRow(byteWriter(8).u16be(4).u32be(100).take());
+    checkBool("truncated DataRow is not ok", !bad.ok);
+    let badDesc = decodeRowDescription(byteWriter(4).u16be(5).take());
+    check("truncated RowDescription yields no columns", str(badDesc.len), "0");
+}
+
+fn errors() {
+    print("---- ErrorResponse and SQLSTATE ----");
+
+    let w = byteWriter(128);
+    w.u8(83).cstr("ERROR");                     // 'S' severity, localized
+    w.u8(86).cstr("ERROR");                     // 'V' severity, never localized
+    w.u8(67).cstr("23505");                     // 'C' SQLSTATE
+    w.u8(77).cstr("duplicate key value violates unique constraint \"users_email_key\"");
+    w.u8(68).cstr("Key (email)=(ada@example.com) already exists.");
+    w.u8(110).cstr("users_email_key");          // 'n' constraint
+    w.u8(116).cstr("users");                    // 't' table
+    w.u8(70).cstr("nbtinsert.c");               // 'F' file — must be dropped
+    w.u8(76).cstr("664");                       // 'L' line — must be dropped
+    w.u8(0);
+    let e = decodeError(w.take());
+
+    check("SQLSTATE", e.sqlstate, "23505");
+    check("constraint name", e.constraint, "users_email_key");
+    check("mapped error class", dberr_name(e.code()), "constraint");
+    check("composed message", e.text(),
+          "ERROR: duplicate key value violates unique constraint \"users_email_key\" — Key (email)=(ada@example.com) already exists. (constraint users_email_key) [23505]");
+
+    print("---- SQLSTATE to DBERR_* ----");
+    check("23505 unique violation",      dberr_name(sqlstateToDberr("23505")), "constraint");
+    check("23503 foreign key",           dberr_name(sqlstateToDberr("23503")), "constraint");
+    check("42P01 undefined table",       dberr_name(sqlstateToDberr("42P01")), "sql");
+    check("42601 syntax error",          dberr_name(sqlstateToDberr("42601")), "sql");
+    check("22P02 bad input syntax",      dberr_name(sqlstateToDberr("22P02")), "sql");
+    check("40001 serialization failure", dberr_name(sqlstateToDberr("40001")), "busy");
+    check("40P01 deadlock",              dberr_name(sqlstateToDberr("40P01")), "busy");
+    check("55P03 lock not available",    dberr_name(sqlstateToDberr("55P03")), "busy");
+    check("57014 query canceled",        dberr_name(sqlstateToDberr("57014")), "busy");
+    check("28P01 bad password",          dberr_name(sqlstateToDberr("28P01")), "open");
+    check("3D000 no such database",      dberr_name(sqlstateToDberr("3D000")), "open");
+    check("08006 connection failure",    dberr_name(sqlstateToDberr("08006")), "closed");
+    check("0A000 not supported",         dberr_name(sqlstateToDberr("0A000")), "unsupported");
+    check("25P02 aborted transaction",   dberr_name(sqlstateToDberr("25P02")), "misuse");
+    check("00000 success",               dberr_name(sqlstateToDberr("00000")), "none");
+    check("unknown class",               dberr_name(sqlstateToDberr("ZZ999")), "sql");
+    check("empty state",                 dberr_name(sqlstateToDberr("")), "sql");
+}
+
+fn commandTags() {
+    print("---- CommandComplete tags ----");
+
+    // changes() reads `rows`; lastInsertId() reads `oid`, which is 0 on every
+    // server since PostgreSQL 12 removed OIDs from ordinary tables.
+    let cases = ["SELECT 10", "UPDATE 3", "DELETE 2", "INSERT 0 5",
+                 "CREATE TABLE", "BEGIN", "COMMIT", "MOVE 4", "FETCH 8",
+                 "COPY 100", "SELECT 0", "INSERT 42 1"];
+    let want = ["10/0", "3/0", "2/0", "5/0", "0/0", "0/0", "0/0",
+                "4/0", "8/0", "100/0", "0/0", "1/42"];
+    let i = 0;
+    while (i < cases.len) {
+        let t = decodeCommandComplete(byteWriter(24).cstr(cases[i]).take());
+        check("tag " + cases[i], str(t.rows) + "/" + str(t.oid), want[i]);
+        i += 1;
+    }
+}
+
+fn authentication() {
+    print("---- Authentication messages ----");
+
+    let a0 = decodeAuth(byteWriter(4).u32be(AUTH_OK).take());
+    check("AuthenticationOk", str(a0.kind), str(AUTH_OK));
+
+    let a3 = decodeAuth(byteWriter(4).u32be(AUTH_CLEARTEXT).take());
+    check("AuthenticationCleartextPassword", str(a3.kind), str(AUTH_CLEARTEXT));
+
+    let a5 = decodeAuth(byteWriter(8).u32be(AUTH_MD5).u8(0xDE).u8(0xAD).u8(0xBE).u8(0xEF).take());
+    check("AuthenticationMD5Password salt", hex(a5.salt), "deadbeef");
+
+    let a10 = decodeAuth(byteWriter(32).u32be(AUTH_SASL).cstr("SCRAM-SHA-256").u8(0).take());
+    check("AuthenticationSASL mechanisms", str(a10.mechanisms.len) + ":" + a10.mechanisms[0],
+          "1:SCRAM-SHA-256");
+
+    let a11 = decodeAuth(byteWriter(32).u32be(AUTH_SASL_CONTINUE).text("r=abc,s=xyz,i=4096").take());
+    check("AuthenticationSASLContinue payload", strbytes(a11.data, a11.data.len),
+          "r=abc,s=xyz,i=4096");
+
+    print("---- MD5 authentication ----");
+
+    // RFC 1321 §A.5, verbatim.
+    check("md5(\"\")",    hex_encode(md5(strBytes(""))),    "d41d8cd98f00b204e9800998ecf8427e");
+    check("md5(\"a\")",   hex_encode(md5(strBytes("a"))),   "0cc175b9c0f1b6a831c399e269772661");
+    check("md5(\"abc\")", hex_encode(md5(strBytes("abc"))), "900150983cd24fb0d6963f7d28e17f72");
+    check("md5(\"message digest\")", hex_encode(md5(strBytes("message digest"))),
+          "f96b697d7cb7938d525a2f31aaf161d0");
+    check("md5(a..z)", hex_encode(md5(strBytes("abcdefghijklmnopqrstuvwxyz"))),
+          "c3fcd3d76192e4007dfb496cca67e13b");
+    check("md5(A..Za..z0..9)",
+          hex_encode(md5(strBytes("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"))),
+          "d174ab98d277d9f5a5611c2c9f419d9f");
+    check("md5(80 digits)",
+          hex_encode(md5(strBytes("12345678901234567890123456789012345678901234567890123456789012345678901234567890"))),
+          "57edf4a22be3c955ac49da2e2107b67a");
+
+    // The shape PostgreSQL asks for: md5(md5(password + user) hexed, + salt).
+    let salt = bytes(4);
+    salt[0] = 0x01 as byte; salt[1] = 0x02 as byte;
+    salt[2] = 0x03 as byte; salt[3] = 0x04 as byte;
+    check("md5Password", md5Password("ada", "secret", salt),
+          "md5164dbcd37c01a78e869e72965960a754");
+
+    print("---- SCRAM-SHA-256 (RFC 7677 section 3) ----");
+
+    // The RFC's complete worked example. This one test pins PBKDF2-HMAC-SHA256,
+    // HMAC, SHA-256, base64, the XOR, and the exact AuthMessage concatenation —
+    // get any of them wrong and neither the proof nor the verifier matches.
+    let cnonce = "rOprNGfwEbeRWgbNEkqO";
+    let snonce = "rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0";
+    let c = scramClientWith("user", "pencil", cnonce);
+
+    let first = c.first();
+    check("client-first-message", strbytes(first, first.len), "n,,n=user,r=" + cnonce);
+
+    let sf = "r=" + snonce + ",s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096";
+    let fin = c.final(strBytes(sf));
+    checkBool("client-final produced", fin != null);
+    check("client-final-message", strbytes(fin, fin.len),
+          "c=biws,r=" + snonce + ",p=dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ=");
+
+    checkBool("server signature verifies",
+              c.verify(strBytes("v=6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=")));
+
+    // Fail closed. Skipping this check is what turns SCRAM back into "send a
+    // hash and hope", so it is asserted rather than assumed.
+    let c2 = scramClientWith("user", "pencil", cnonce);
+    c2.first();
+    c2.final(strBytes(sf));
+    checkBool("wrong server signature is rejected",
+              !c2.verify(strBytes("v=AAAATRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=")));
+    check("  and says why", c2.err, "SCRAM server signature did not verify");
+
+    let c3 = scramClientWith("user", "pencil", cnonce);
+    c3.first();
+    checkBool("server nonce must extend ours",
+              c3.final(strBytes("r=SOMETHINGELSE,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096")) == null);
+
+    let c4 = scramClientWith("user", "pencil", cnonce);
+    c4.first();
+    checkBool("malformed server-first is refused", c4.final(strBytes("garbage")) == null);
+
+    let c5 = scramClientWith("user", "pencil", cnonce);
+    c5.first();
+    c5.final(strBytes(sf));
+    checkBool("server error field is surfaced", !c5.verify(strBytes("e=invalid-proof")));
+    check("  as an error", c5.err, "SCRAM authentication failed: invalid-proof");
+
+    // Field matching is anchored at a field boundary.
+    check("scramField r", scramField("s=abc,r=XYZ,i=4096", "r"), "XYZ");
+    check("scramField i", scramField("s=abc,r=XYZ,i=4096", "i"), "4096");
+    check("scramField absent", scramField("s=abc,r=XYZ", "z"), "");
+}
+
+fn typeMapping() {
+    print("---- OID to Value ----");
+
+    check("bool 't'",      showValue(decodeText(OID_BOOL, strBytes("t"))), "int 1");
+    check("bool 'f'",      showValue(decodeText(OID_BOOL, strBytes("f"))), "int 0");
+    check("int2",          showValue(decodeText(OID_INT2, strBytes("-7"))), "int -7");
+    check("int4",          showValue(decodeText(OID_INT4, strBytes("42"))), "int 42");
+    check("int8 max",      showValue(decodeText(OID_INT8, strBytes("9223372036854775807"))),
+          "int 9223372036854775807");
+    check("int8 min",      showValue(decodeText(OID_INT8, strBytes("-9223372036854775808"))),
+          "int -9223372036854775808");
+    check("text",          showValue(decodeText(OID_TEXT, strBytes("O'Brien"))), "text O'Brien");
+    check("empty text",    showValue(decodeText(OID_TEXT, bytes(0))), "text ");
+    check("NULL",          showValue(decodeText(OID_TEXT, null)), "null");
+
+    // numeric stays TEXT. It is used precisely because a double cannot hold it,
+    // and quietly routing money through one is a bug that surfaces months later
+    // in a reconciliation. This assertion is the guard on that decision.
+    check("numeric is text, not float", showValue(decodeText(OID_NUMERIC, strBytes("1234.50"))),
+          "text 1234.50");
+    check("numeric keeps its scale", showValue(decodeText(OID_NUMERIC, strBytes("1.500"))),
+          "text 1.500");
+
+    // Arrays likewise: Value has five kinds and none is a list.
+    check("int4 array is text", showValue(decodeText(1007, strBytes("{1,2,3}"))), "text {1,2,3}");
+
+    check("jsonb",         showValue(decodeText(OID_JSONB, strBytes("{\"a\": 1}"))), "text {\"a\": 1}");
+    check("uuid",          showValue(decodeText(OID_UUID, strBytes("0b6e1f0a-1111-2222-3333-444455556666"))),
+          "text 0b6e1f0a-1111-2222-3333-444455556666");
+    check("timestamptz",   showValue(decodeText(OID_TIMESTAMPTZ, strBytes("2026-08-12 10:30:00+00"))),
+          "text 2026-08-12 10:30:00+00");
+    check("unknown OID degrades to text",
+          showValue(decodeText(987654, strBytes("whatever the extension said"))),
+          "text whatever the extension said");
+
+    // bytea in both of the server's output formats.
+    check("bytea hex format", showValue(decodeText(OID_BYTEA, strBytes("\\x48656c6c6f"))),
+          "blob 48656c6c6f");
+    check("bytea with NUL and high bytes",
+          showValue(decodeText(OID_BYTEA, strBytes("\\x00ff41"))), "blob 00ff41");
+    check("bytea escape format", showValue(decodeText(OID_BYTEA, strBytes("a\\000b\\\\c"))),
+          "blob 6100625c63");
+
+    print("---- binary results, for the two types that need them ----");
+
+    check("float8 and float4 are requested binary",
+          str(resultFormatFor(OID_FLOAT8)) + str(resultFormatFor(OID_FLOAT4)), "11");
+    check("everything else is text",
+          str(resultFormatFor(OID_INT4)) + str(resultFormatFor(OID_NUMERIC))
+          + str(resultFormatFor(OID_TEXT)), "000");
+
+    // Exactness is the whole reason for the binary request.
+    checkBool("float8 0.1 survives exactly",
+              decodeBinary(OID_FLOAT8, byteWriter(8).f64be(0.1).take()).f == 0.1);
+    checkBool("float8 1/3 survives exactly",
+              decodeBinary(OID_FLOAT8, byteWriter(8).f64be(1.0 / 3.0).take()).f == 1.0 / 3.0);
+    checkBool("float8 1e308 survives exactly",
+              decodeBinary(OID_FLOAT8, byteWriter(8).f64be(1.0e308).take()).f == 1.0e308);
+    checkBool("float8 subnormal survives exactly",
+              decodeBinary(OID_FLOAT8, byteWriter(8).f64be(1.0e-308).take()).f == 1.0e-308);
+    check("float4 0.5 binary", showValue(decodeBinary(OID_FLOAT4, byteWriter(4).u32be(0x3F000000).take())),
+          "float 0.5");
+    check("int4 binary, negative", showValue(decodeBinary(OID_INT4, byteWriter(4).u32be(0xFFFFFFFB).take())),
+          "int -5");
+    check("int2 binary, negative", showValue(decodeBinary(OID_INT2, byteWriter(2).u16be(0xFFFB).take())),
+          "int -5");
+
+    print("---- Value to a bound parameter ----");
+
+    let p1 = encodeParam(OID_FLOAT8, dbFloat(0.1));
+    check("float8 param is binary and exact", str(p1.format) + " " + hex(p1.data),
+          "1 3fb999999999999a");
+
+    // With no inferred type there is nowhere to put bits, so it goes as EXACT
+    // decimal text. Never str(v.f) — that is "%g", six significant digits, and
+    // would silently send 1.23457e+06 for this value.
+    let p2 = encodeParam(0, dbFloat(1234567.89));
+    check("float param with no inferred type", str(p2.format) + " " + strbytes(p2.data, p2.data.len),
+          "0 1234567.88999999989755451679229736328125");
+
+    let p3 = encodeParam(0, dbInt(-42));
+    check("int param", strbytes(p3.data, p3.data.len), "-42");
+    let p4 = encodeParam(OID_BOOL, dbInt(1));
+    check("bool param true", strbytes(p4.data, p4.data.len), "t");
+    let p5 = encodeParam(OID_BOOL, dbInt(0));
+    check("bool param false", strbytes(p5.data, p5.data.len), "f");
+
+    let blob = bytes(3);
+    blob[0] = 0 as byte; blob[1] = 0xFF as byte; blob[2] = 0x41 as byte;
+    let p6 = encodeParam(OID_BYTEA, dbBlob(blob));
+    check("bytea param is binary", str(p6.format) + " " + hex(p6.data), "1 00ff41");
+    let p7 = encodeParam(0, dbBlob(blob));
+    check("blob with no inferred type is hex text", strbytes(p7.data, p7.data.len), "\\x00ff41");
+
+    checkBool("NULL param has no bytes", encodeParam(OID_TEXT, dbNull()).isNull());
+    let p8 = encodeParam(OID_TEXT, dbText("'); DROP TABLE users; --"));
+    check("text param goes verbatim, unescaped", strbytes(p8.data, p8.data.len),
+          "'); DROP TABLE users; --");
+}
+
+fn numerics() {
+    print("---- float conversion ----");
+
+    // f64ToBits is the inverse vyto/mmap/decode never had. Every one of these
+    // is a round trip through the actual encoder and the actual decoder.
+    checkBool("0.0",        readF64BE(byteWriter(8).f64be(0.0).take(), 0) == 0.0);
+    checkBool("1.0",        readF64BE(byteWriter(8).f64be(1.0).take(), 0) == 1.0);
+    checkBool("-1.0",       readF64BE(byteWriter(8).f64be(-1.0).take(), 0) == -1.0);
+    checkBool("0.1",        readF64BE(byteWriter(8).f64be(0.1).take(), 0) == 0.1);
+    checkBool("1/3",        readF64BE(byteWriter(8).f64be(1.0 / 3.0).take(), 0) == 1.0 / 3.0);
+    checkBool("1e308",      readF64BE(byteWriter(8).f64be(1.0e308).take(), 0) == 1.0e308);
+    checkBool("1e-308 (subnormal)",
+              readF64BE(byteWriter(8).f64be(1.0e-308).take(), 0) == 1.0e-308);
+    checkBool("smallest subnormal",
+              readF64BE(byteWriter(8).f64be(pow2(-1074)).take(), 0) == pow2(-1074));
+    check("-0.0 keeps its sign bit", hex(byteWriter(8).f64be(-0.0).take()), "8000000000000000");
+    check("+inf bits", hex(byteWriter(8).f64be(inf()).take()), "7ff0000000000000");
+    check("-inf bits", hex(byteWriter(8).f64be(-inf()).take()), "fff0000000000000");
+
+    // Exact decimal text, not 17 digits and not "%g". An exact expansion parses
+    // back to the same double on any server, with no rounding mode to agree on.
+    check("exact text 0.5",  exactFloatText(0.5), "0.5");
+    check("exact text 1.0",  exactFloatText(1.0), "1");
+    check("exact text -0.0", exactFloatText(-0.0), "-0");
+    check("exact text 100",  exactFloatText(100.0), "100");
+    check("exact text 0.1",  exactFloatText(0.1),
+          "0.1000000000000000055511151231257827021181583404541015625");
+    check("exact text NaN",  exactFloatText(nan()), "NaN");
+    check("exact text +inf", exactFloatText(inf()), "Infinity");
+    check("exact text -inf", exactFloatText(-inf()), "-Infinity");
+
+    print("---- tolerant parsing ----");
+
+    // to_int()/to_float() PANIC on unexpected input. These values come from a
+    // server, so reaching the next line IS the assertion: the builtins would
+    // abort the process here and truncate this golden file.
+    check("parseIntOr sound",     str(parseIntOr("42", -1)), "42");
+    check("parseIntOr negative",  str(parseIntOr("-42", -1)), "-42");
+    check("parseIntOr empty",     str(parseIntOr("", -1)), "-1");
+    check("parseIntOr letters",   str(parseIntOr("abc", -1)), "-1");
+    check("parseIntOr trailing",  str(parseIntOr("12x", -1)), "-1");
+    check("parseIntOr overflow",  str(parseIntOr("99999999999999999999", -1)), "-1");
+    check("parseIntOr i64 min",   str(parseIntOr("-9223372036854775808", -1)),
+          "-9223372036854775808");
+    check("parseIntOr past max",  str(parseIntOr("9223372036854775808", -1)), "-1");
+
+    checkBool("parseFloatOr sound",   parseFloatOr("1.5", 0.0) == 1.5);
+    checkBool("parseFloatOr exp",     parseFloatOr("1.5e3", 0.0) == 1500.0);
+    checkBool("parseFloatOr leading zeros", parseFloatOr("0.00125", 0.0) == 0.00125);
+    checkBool("parseFloatOr bad exponent falls back", parseFloatOr("1.0e", -1.0) == -1.0);
+    checkBool("parseFloatOr junk falls back", parseFloatOr("nope", -1.0) == -1.0);
+    checkBool("parseFloatOr NaN",     parseFloatOr("NaN", 0.0) != parseFloatOr("NaN", 0.0));
+    checkBool("parseFloatOr Infinity", isInf(parseFloatOr("Infinity", 0.0)));
+
+    check("readU24LE", str(readU24LE(byteWriter(3).u24le(0xABCDEF).take(), 0)), "11259375");
+    check("readF32BE", str(readF32BE(byteWriter(4).u32be(0x40490FDB).take(), 0)), "3.14159");
+
+    // The scaling ladder has to survive the whole negative exponent range.
+    // Computing 2^-n as 1.0/2^n looks right and is not: above n = 1023 the
+    // divisor is already infinity, so every subnormal quietly becomes zero.
+    // That bug was live in vyto/mmap/decode, where it made readF64BE return 0.0
+    // for every subnormal double. These are the assertions that catch it.
+    checkBool("pow2(-1074) is not flushed to zero", pow2(-1074) != 0.0);
+    checkBool("pow2(-1074) round trips through the encoder",
+              readF64BE(byteWriter(8).f64be(pow2(-1074)).take(), 0) == pow2(-1074));
+    checkBool("float4's smallest subnormal decodes non-zero",
+              readF32BE(byteWriter(4).u32be(0x00000001).take(), 0) != 0.0);
+    checkBool("float4 subnormal has the right magnitude",
+              readF32BE(byteWriter(4).u32be(0x00000001).take(), 0) == pow2(-149));
+}
+
+fn transport() {
+    print("---- the framed transport ----");
+
+    let w = byteWriter(32);
+    w.u8(82).u32be(8).u32be(0);        // AuthenticationOk
+    w.u8(90).u32be(5).u8(TX_IDLE);     // ReadyForQuery
+    let script = w.take();
+
+    // Whole-buffer delivery.
+    let m = memIo(script);
+    let t1 = m.readByte();
+    let l1 = m.readExact(4);
+    let b1 = m.readExact(4);
+    check("message 1 tag/len/body", str(t1) + "/" + hex(l1) + "/" + hex(b1),
+          "82/00000008/00000000");
+
+    // The same transcript delivered one byte at a time. A driver that only
+    // works when every message arrives whole is a driver that desynchronizes
+    // against a real socket, so the fragmented case is asserted to be identical.
+    let m2 = memIo(script).dribble(1);
+    let t2 = m2.readByte();
+    let l2 = m2.readExact(4);
+    let b2 = m2.readExact(4);
+    check("same, delivered one byte at a time", str(t2) + "/" + hex(l2) + "/" + hex(b2),
+          "82/00000008/00000000");
+
+    // The client half of the conversation is capturable, which is what lets a
+    // replay test assert on what the driver actually said.
+    let m3 = memIo(bytes(0));
+    m3.writeAll(encodeQuery("SELECT 1"));
+    check("writes are captured", hex(m3.sent), "510000000d53454c454354203100");
+
+    // EOF, timeout and a broken socket are distinguishable — the reason this
+    // drives a non-blocking socket rather than calling the blocking recv.
+    let m4 = memIo(bytes(0));
+    let eofRead = m4.readByte();
+    check("past the end reads -1", str(eofRead), "-1");
+    check("  and the state says why", io_state_name(m4.state), "eof");
+    check("  with a message", m4.error(), "the server closed the connection");
+
+    // A hostile length is refused before anything is allocated.
+    let m5 = memIo(script);
+    let huge = m5.readExact(MAX_FRAME + 1);
+    checkBool("an absurd frame length is refused", huge == null);
+    check("  before allocating", io_state_name(m5.state), "error");
+}
+
+fn dsn() {
+    print("---- connection strings ----");
+
+    let d = parseDsn("postgres://ada:s%3Acr3t@db.internal:6432/app?sslmode=disable", "localhost", 5432);
+    check("user", d.user, "ada");
+    check("password is percent-decoded", d.pass, "s:cr3t");
+    check("host", d.host, "db.internal");
+    check("port", str(d.port), "6432");
+    check("database", d.database, "app");
+    check("option", d.opt("sslmode", "?"), "disable");
+
+    // Defaults: the database falls back to the user name, which is
+    // PostgreSQL's own rule.
+    let d2 = parseDsn("postgres://ada@/", "localhost", 5432);
+    check("default host", d2.host, "localhost");
+    check("default port", str(d2.port), "5432");
+    check("database defaults to the user", d2.database, "ada");
+
+    // An IPv6 literal, which is exactly what a hand-rolled splitter gets wrong.
+    let d3 = parseDsn("postgres://u@[::1]:5433/db", "localhost", 5432);
+    check("IPv6 host", d3.host, "::1");
+    check("IPv6 port", str(d3.port), "5433");
+
+    let d4 = parseDsn("", "localhost", 5432);
+    checkBool("an empty DSN is invalid rather than fatal", !d4.isValid());
+}
+
+// ---------------------------------------------------------------------------
+// The whole driver, replayed against a recorded session
+// ---------------------------------------------------------------------------
+//
+// Everything above tests a piece. This runs the entire stack — the handshake,
+// the statement cache, prepare, bind, streaming, error handling, and vyto/db's
+// own Db/Result/Cursor machinery on top of it — against a canned transcript,
+// with no server, no fd and no network.
+//
+// It also asserts what the CLIENT said, which is the half a live test cannot
+// pin down: mem.sent is exactly the bytes the driver put on the wire.
+
+// One framed backend message appended to `w`.
+fn msg(w: ByteWriter, kind: int, body: byte[]) {
+    w.u8(kind).u32be(body.len + 4).raw(body);
+}
+
+fn buf(): ByteWriter { return byteWriter(64); }
+
+// AuthenticationOk, two ParameterStatus, BackendKeyData, ReadyForQuery(idle).
+fn handshake(w: ByteWriter) {
+    msg(w, 82, buf().u32be(AUTH_OK).take());
+    msg(w, 83, buf().cstr("server_version").cstr("16.2").take());
+    msg(w, 83, buf().cstr("client_encoding").cstr("UTF8").take());
+    msg(w, 75, buf().u32be(4242).u32be(99).take());
+    msg(w, 90, buf().u8(TX_IDLE).take());
+}
+
+// The answer to Parse + Describe + Sync: three columns, no parameters.
+fn prepareReply(w: ByteWriter) {
+    msg(w, 49, bytes(0));                            // ParseComplete
+    msg(w, 116, buf().u16be(0).take());              // ParameterDescription: none
+    let rd = buf();
+    rd.u16be(3);
+    rd.cstr("id").u32be(16384).u16be(1).u32be(OID_INT4).u16be(4).u32be(0xFFFFFFFF).u16be(FMT_TEXT);
+    rd.cstr("name").u32be(16384).u16be(2).u32be(OID_TEXT).u16be(0xFFFF).u32be(0xFFFFFFFF).u16be(FMT_TEXT);
+    rd.cstr("score").u32be(16384).u16be(3).u32be(OID_FLOAT8).u16be(8).u32be(0xFFFFFFFF).u16be(FMT_TEXT);
+    msg(w, 84, rd.take());                           // RowDescription
+    msg(w, 90, buf().u8(TX_IDLE).take());            // ReadyForQuery
+}
+
+// Three rows, then SELECT 3. Row 2's name is the empty string and row 3's is
+// NULL, so the pair stays under test all the way up through Row.getStr().
+fn threeRows(w: ByteWriter) {
+    msg(w, 50, bytes(0));                            // BindComplete
+    let r1 = buf(); r1.u16be(3).u32be(1).text("1").u32be(3).text("ada").u32be(8).f64be(0.1);
+    msg(w, 68, r1.take());
+    let r2 = buf(); r2.u16be(3).u32be(1).text("2").u32be(0).u32be(8).f64be(1.0 / 3.0);
+    msg(w, 68, r2.take());
+    let r3 = buf(); r3.u16be(3).u32be(1).text("3").u32be(0xFFFFFFFF).u32be(0xFFFFFFFF);
+    msg(w, 68, r3.take());
+    msg(w, 67, buf().cstr("SELECT 3").take());       // CommandComplete
+    msg(w, 90, buf().u8(TX_IDLE).take());            // ReadyForQuery
+}
+
+fn replaySelect() {
+    print("---- a whole session, replayed ----");
+
+    let w = byteWriter(1024);
+    handshake(w);
+    prepareReply(w);
+    threeRows(w);
+
+    let mem = memIo(w.take());
+    let db = new Db(pgsqlOver(mem, "postgres://ada@h/app"));
+
+    checkBool("connected", db.isOpen());
+    checkBool("no error after connecting", db.ok());
+    check("connection error is empty", db.error(), "");
+
+    let cn = db.conn() as PgConn;
+    check("ParameterStatus was absorbed", cn.serverParam("server_version"), "16.2");
+    check("BackendKeyData was absorbed", str(cn.backendPid()), "4242");
+
+    let r = db.all(select("users").orderBy("id"));
+    checkBool("query succeeded", r.ok());
+    check("row count", str(r.len()), "3");
+    // affected comes from the CommandComplete tag, read AFTER release() — the
+    // tag lives on the session, not on the statement, which is what makes that
+    // ordering safe.
+    check("affected from the tag", str(r.affected), "3");
+
+    // Column names were known before the first step(), because prepare()
+    // describes the statement rather than the portal.
+    let names = r.columnNames();
+    check("column names", names[0] + "," + names[1] + "," + names[2], "id,name,score");
+
+    check("row 0", str(r.at(0).getInt("id")) + "/" + r.at(0).getStr("name"), "1/ada");
+    checkBool("row 1 name is empty but NOT null", !r.at(1).isNull("name"));
+    check("row 1 name", "[" + r.at(1).getStr("name") + "]", "[]");
+    checkBool("row 2 name IS null", r.at(2).isNull("name"));
+    checkBool("row 2 score IS null", r.at(2).isNull("score"));
+
+    // The reason float8 is requested in binary.
+    checkBool("float8 0.1 arrived exactly", r.at(0).getFloat("score") == 0.1);
+    checkBool("float8 1/3 arrived exactly", r.at(1).getFloat("score") == 1.0 / 3.0);
+
+    // And what the driver actually said — the half a live test cannot pin down.
+    let sent = hex(mem.sent);
+
+    // The startup packet names every setting that changes how a value renders,
+    // so the same query cannot return differently on two servers.
+    checkBool("startup pinned client_encoding",
+              sent.index_of("636c69656e745f656e636f64696e670055544638") >= 0);
+    checkBool("startup pinned extra_float_digits",
+              sent.index_of("65787472615f666c6f61745f64696769747300") >= 0);
+    checkBool("startup pinned DateStyle", sent.index_of("446174655374796c6500") >= 0);
+
+    // Parse names the statement vts1 rather than using the unnamed one, which
+    // the next Parse would destroy. ("vts1" + NUL follows the length field.)
+    checkBool("Parse used a named statement", sent.index_of("7674733100") >= 0);
+    // Describe 'S' (0x53) — the STATEMENT, not the portal. This is what makes
+    // the column names available before the first step().
+    checkBool("Describe targeted the statement", sent.index_of("53767473310053") >= 0);
+
+    // The tail: Bind, Execute, Sync. Its trailing result-format array is
+    // 0003 0000 0000 0001 — text, text, BINARY — the per-column decision made
+    // from the RowDescription's type OIDs.
+    let tail = "4200000016007674733100000000000003000000000001450000000900000000005300000004";
+    check("Bind/Execute/Sync, with binary asked for only on the float8 column",
+          sent.slice(sent.len - tail.len, sent.len), tail);
+}
+
+fn replayError() {
+    print("---- an error, replayed ----");
+
+    let w = byteWriter(1024);
+    handshake(w);
+    prepareReply(w);
+    // Bind succeeds, then the insert violates a unique constraint.
+    msg(w, 50, bytes(0));
+    let e = buf();
+    e.u8(86).cstr("ERROR");
+    e.u8(67).cstr("23505");
+    e.u8(77).cstr("duplicate key value violates unique constraint \"users_name_key\"");
+    e.u8(110).cstr("users_name_key");
+    e.u8(0);
+    msg(w, 69, e.take());
+    msg(w, 90, buf().u8(TX_IDLE).take());
+
+    let mem = memIo(w.take());
+    let db = new Db(pgsqlOver(mem, "postgres://ada@h/app"));
+    let r = db.all(select("users").orderBy("id"));
+
+    checkBool("the query reports failure", !r.ok());
+    check("mapped to a constraint error", dberr_name(r.code), "constraint");
+    check("the server's own wording survives", r.err,
+          "ERROR: duplicate key value violates unique constraint \"users_name_key\" (constraint users_name_key) [23505]");
+
+    // The raw SQLSTATE is reachable for callers who route on 23505 vs 23503.
+    let cn = db.conn() as PgConn;
+    check("raw SQLSTATE", cn.sqlstate(), "23505");
+    // Conn and Stmt read the same session, so these cannot disagree.
+    check("Conn agrees with the Result", dberr_name(db.errorCode()), "constraint");
+}
+
+fn replayAuthFailure() {
+    print("---- a rejected password, replayed ----");
+
+    let w = byteWriter(256);
+    let e = buf();
+    e.u8(86).cstr("FATAL");
+    e.u8(67).cstr("28P01");
+    e.u8(77).cstr("password authentication failed for user \"ada\"");
+    e.u8(0);
+    msg(w, 69, e.take());
+
+    let db = new Db(pgsqlOver(memIo(w.take()), "postgres://ada@h/app"));
+    checkBool("not open", !db.isOpen());
+    check("classified as an open failure", dberr_name(db.errorCode()), "open");
+    check("the server's message is passed through", db.error(),
+          "FATAL: password authentication failed for user \"ada\" [28P01]");
+
+    // A failed connect still yields a usable Conn, never null — every caller is
+    // spared a null check on the path hardest to test (driver.vt:130-133).
+    let r = db.all(select("users"));
+    checkBool("querying a dead connection fails cleanly", !r.ok());
+    check("  as closed", dberr_name(r.code), "closed");
+}
+
+fn replayCursorAndCache() {
+    print("---- a Cursor, and the statement cache ----");
+
+    let w = byteWriter(2048);
+    handshake(w);
+    prepareReply(w);      // one Parse only: the second query reuses the cache
+    threeRows(w);
+    threeRows(w);         // the second execution needs no second prepare
+
+    let mem = memIo(w.take());
+    let db = new Db(pgsqlOver(mem, "postgres://ada@h/app"));
+
+    let c = db.cursor(select("users").orderBy("id"));
+    let n = 0;
+    let ids = "";
+    while (c.next()) {
+        ids = ids + str(c.row().getInt("id"));
+        n += 1;
+    }
+    check("cursor streamed every row", str(n), "3");
+    check("in order", ids, "123");
+    checkBool("cursor ended cleanly", c.ok());
+
+    // Running the same SQL again must NOT send a second Parse — the transcript
+    // has no second prepare reply, so a cache miss would desynchronize and this
+    // would fail rather than merely being slower.
+    let r2 = db.all(select("users").orderBy("id"));
+    checkBool("the same SQL reused the cached statement", r2.ok());
+    check("and returned the same rows", str(r2.len()), "3");
+
+    let sent = hex(mem.sent);
+    // "vts1" is 76747331; the driver names statements vts1, vts2, ... so a
+    // second prepare would show up as vts2.
+    checkBool("only one statement was ever prepared", sent.index_of("76747332") < 0);
+}
+
+fn replayDrain() {
+    print("---- two statements, one connection ----");
+
+    // PostgreSQL cannot interleave two portals on one connection. A second
+    // statement while a Cursor is live drains the cursor's remaining rows into
+    // its own buffer, so the cursor keeps working — it just stops being lazy.
+    let w = byteWriter(2048);
+    handshake(w);
+    prepareReply(w);
+    threeRows(w);         // statement A's rows, all of them, in the stream
+
+    // Statement B: a fresh prepare, then one row.
+    msg(w, 49, bytes(0));
+    msg(w, 116, buf().u16be(0).take());
+    let rd = buf();
+    rd.u16be(1);
+    rd.cstr("n").u32be(0).u16be(0).u32be(OID_INT4).u16be(4).u32be(0xFFFFFFFF).u16be(FMT_TEXT);
+    msg(w, 84, rd.take());
+    msg(w, 90, buf().u8(TX_IDLE).take());
+    msg(w, 50, bytes(0));
+    let br = buf(); br.u16be(1).u32be(2).text("99");
+    msg(w, 68, br.take());
+    msg(w, 67, buf().cstr("SELECT 1").take());
+    msg(w, 90, buf().u8(TX_IDLE).take());
+
+    let db = new Db(pgsqlOver(memIo(w.take()), "postgres://ada@h/app"));
+
+    let c = db.cursor(select("users").orderBy("id"));
+    checkBool("first row of the cursor", c.next());
+    check("  it is row 1", str(c.row().getInt("id")), "1");
+
+    // This takes the wire out from under the cursor.
+    let other = db.all(select("counts").orderBy("n"));
+    checkBool("the second query ran", other.ok());
+    check("  and got its row", str(other.at(0).getInt("n")), "99");
+
+    // The cursor picks up exactly where it left off, from its own buffer.
+    let rest = "";
+    while (c.next()) { rest = rest + str(c.row().getInt("id")); }
+    check("the evicted cursor still yields its remaining rows", rest, "23");
+    checkBool("and ends cleanly", c.ok());
+}
+
+fn replayExecRawAndTx() {
+    print("---- execRaw and transaction state ----");
+
+    let w = byteWriter(1024);
+    handshake(w);
+    // BEGIN
+    msg(w, 67, buf().cstr("BEGIN").take());
+    msg(w, 90, buf().u8(TX_INTX).take());
+    // a DDL statement
+    msg(w, 67, buf().cstr("CREATE TABLE").take());
+    msg(w, 90, buf().u8(TX_INTX).take());
+    // COMMIT
+    msg(w, 67, buf().cstr("COMMIT").take());
+    msg(w, 90, buf().u8(TX_IDLE).take());
+
+    let db = new Db(pgsqlOver(memIo(w.take()), "postgres://ada@h/app"));
+    let cn = db.conn() as PgConn;
+
+    checkBool("not in a transaction to begin with", !cn.inTx());
+    checkBool("BEGIN succeeded", db.execRaw("BEGIN"));
+    // Read from the server's reported status rather than from a flag we keep,
+    // so it stays right even when a statement failed and aborted the block.
+    checkBool("now in a transaction", cn.inTx());
+    checkBool("DDL succeeded", db.execRaw("CREATE TABLE t (a int)"));
+    check("a tag with no row count reads as 0", str(db.changes()), "0");
+    checkBool("COMMIT succeeded", db.execRaw("COMMIT"));
+    checkBool("no longer in a transaction", !cn.inTx());
+
+    // Always 0 on PostgreSQL 12+; there is nothing else the protocol offers.
+    check("lastInsertId", str(db.lastInsertId()), "0");
+}
+
+fn replayFragmented() {
+    print("---- the same session, one byte at a time ----");
+
+    // A driver that only works when every message arrives whole desynchronizes
+    // against a real socket. Same transcript, delivered a byte at a time; the
+    // result must be identical.
+    let w = byteWriter(1024);
+    handshake(w);
+    prepareReply(w);
+    threeRows(w);
+
+    let db = new Db(pgsqlOver(memIo(w.take()).dribble(1), "postgres://ada@h/app"));
+    checkBool("connected over a dribbling transport", db.isOpen());
+    let r = db.all(select("users").orderBy("id"));
+    checkBool("query succeeded", r.ok());
+    check("same row count", str(r.len()), "3");
+    check("same first row", str(r.at(0).getInt("id")) + "/" + r.at(0).getStr("name"), "1/ada");
+    checkBool("same exact float", r.at(0).getFloat("score") == 0.1);
+}
+
+fn replayTruncated() {
+    print("---- the server hangs up mid-session ----");
+
+    // The transcript stops after the handshake. Nothing may panic; the failure
+    // has to arrive as an error a caller can read.
+    let w = byteWriter(256);
+    handshake(w);
+
+    let db = new Db(pgsqlOver(memIo(w.take()), "postgres://ada@h/app"));
+    checkBool("the handshake completed", db.isOpen());
+    let r = db.all(select("users").orderBy("id"));
+    checkBool("the query fails rather than hanging or panicking", !r.ok());
+    check("classified as closed", dberr_name(r.code), "closed");
+    check("with the transport's reason", r.err, "the server closed the connection");
+}
+
+fn replayScramHandshake() {
+    print("---- a full SCRAM-SHA-256 handshake, replayed ----");
+
+    // The nonce is pinned so a recorded exchange can be replayed; a real
+    // connection draws it from the OS CSPRNG. Everything else here is the
+    // RFC 7677 example recomputed for PostgreSQL's empty `n=` field, which is
+    // what the server actually sees.
+    let cnonce = "rOprNGfwEbeRWgbNEkqO";
+    let snonce = cnonce + "%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0";
+
+    let w = byteWriter(1024);
+    msg(w, 82, buf().u32be(AUTH_SASL).cstr("SCRAM-SHA-256").u8(0).take());
+    msg(w, 82, buf().u32be(AUTH_SASL_CONTINUE)
+                    .text("r=" + snonce + ",s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096").take());
+    msg(w, 82, buf().u32be(AUTH_SASL_FINAL)
+                    .text("v=3HO6Qt1M4MKJrmlKaoOqLAI0/0TV0HZe7J9H3MBtSOg=").take());
+    msg(w, 82, buf().u32be(AUTH_OK).take());
+    msg(w, 90, buf().u8(TX_IDLE).take());
+
+    let mem = memIo(w.take());
+    let db = new Db(pgsqlOver(mem, "postgres://user:pencil@h/app").scramNonce(cnonce));
+    checkBool("authenticated over SCRAM", db.isOpen());
+    check("no error", db.error(), "");
+
+    // The proof the driver computed must be the one the RFC's arithmetic gives.
+    let sent = hex(mem.sent);
+    let proof = "p=qvT2SWdEH5Q06albL+hjSYuUhCG7VndFyzIb7CK4n9k=";
+    let proofHex = hex(strBytes(proof));
+    checkBool("the client proof matches the known answer", sent.index_of(proofHex) >= 0);
+    checkBool("the mechanism name went on the wire",
+              sent.index_of(hex(strBytes("SCRAM-SHA-256"))) >= 0);
+
+    // And the wiring fails closed when the server's signature is wrong. Getting
+    // this backwards turns SCRAM into "send a hash and hope".
+    let w2 = byteWriter(1024);
+    msg(w2, 82, buf().u32be(AUTH_SASL).cstr("SCRAM-SHA-256").u8(0).take());
+    msg(w2, 82, buf().u32be(AUTH_SASL_CONTINUE)
+                     .text("r=" + snonce + ",s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096").take());
+    msg(w2, 82, buf().u32be(AUTH_SASL_FINAL)
+                     .text("v=AAAAQt1M4MKJrmlKaoOqLAI0/0TV0HZe7J9H3MBtSOg=").take());
+    msg(w2, 82, buf().u32be(AUTH_OK).take());
+    msg(w2, 90, buf().u8(TX_IDLE).take());
+
+    let bad = new Db(pgsqlOver(memIo(w2.take()), "postgres://user:pencil@h/app").scramNonce(cnonce));
+    checkBool("a forged server signature is refused", !bad.isOpen());
+    check("  as an open failure", dberr_name(bad.errorCode()), "open");
+    check("  saying what happened", bad.error(), "SCRAM server signature did not verify");
+
+    // A server offering only mechanisms we cannot do must fail with a clear
+    // message rather than hanging or connecting anyway.
+    let w3 = byteWriter(256);
+    msg(w3, 82, buf().u32be(AUTH_SASL).cstr("SCRAM-SHA-256-PLUS").u8(0).take());
+    let noMech = new Db(pgsqlOver(memIo(w3.take()), "postgres://user:pencil@h/app"));
+    checkBool("an unsupported mechanism fails", !noMech.isOpen());
+    checkBool("  and names what it wanted",
+              noMech.error().index_of("SCRAM-SHA-256") >= 0);
+}
+
+fn replayNoticeAndResync() {
+    print("---- notices, and resynchronizing after an error ----");
+
+    // A NoticeResponse can arrive at any point — RAISE NOTICE, an index build
+    // report, "table will be created". It is not an error and must be consumed
+    // without disturbing the message stream. Here one lands mid-result, between
+    // two DataRows: if it were not swallowed, the row count would be wrong.
+    let w = byteWriter(2048);
+    handshake(w);
+    prepareReply(w);
+    msg(w, 50, bytes(0));
+    let r1 = buf(); r1.u16be(3).u32be(1).text("1").u32be(3).text("ada").u32be(8).f64be(0.1);
+    msg(w, 68, r1.take());
+    let n = buf();
+    n.u8(86).cstr("NOTICE").u8(67).cstr("00000").u8(77).cstr("index \"users_pkey\" will be created").u8(0);
+    msg(w, 78, n.take());                            // NoticeResponse, mid-result
+    let r2 = buf(); r2.u16be(3).u32be(1).text("2").u32be(3).text("bob").u32be(8).f64be(0.2);
+    msg(w, 68, r2.take());
+    msg(w, 67, buf().cstr("SELECT 2").take());
+    msg(w, 90, buf().u8(TX_IDLE).take());
+
+    let mem = memIo(w.take());
+    let db = new Db(pgsqlOver(mem, "postgres://ada@h/app"));
+    let r = db.all(select("users").orderBy("id"));
+
+    checkBool("a mid-result notice did not break the stream", r.ok());
+    check("both rows arrived", str(r.len()), "2");
+    check("the second row is intact", r.at(1).getStr("name"), "bob");
+    // A notice must never be mistaken for an error.
+    checkBool("the result is still ok", r.ok());
+    let cn = db.conn() as PgConn;
+    checkBool("but the notice was kept where it can be read",
+              cn.lastNotice().index_of("users_pkey") >= 0);
+    check("and did not become the error state", db.error(), "");
+}
+
+fn replayErrorThenRecover() {
+    print("---- a statement fails, then the connection carries on ----");
+
+    // After an ErrorResponse the server discards everything until it sees our
+    // Sync and answers ReadyForQuery. A driver that stops reading at the error
+    // leaves that ReadyForQuery in the stream and the NEXT statement reads it
+    // as its own reply — so the failure only shows up one query later. The
+    // second query here is what proves the resynchronization happened.
+    let w = byteWriter(2048);
+    handshake(w);
+    prepareReply(w);
+    msg(w, 50, bytes(0));
+    let e = buf();
+    e.u8(86).cstr("ERROR").u8(67).cstr("42703");
+    e.u8(77).cstr("column \"nope\" does not exist").u8(0);
+    msg(w, 69, e.take());
+    msg(w, 90, buf().u8(TX_IDLE).take());
+    // A second, different statement: fresh prepare, then rows.
+    prepareReply(w);
+    threeRows(w);
+
+    let db = new Db(pgsqlOver(memIo(w.take()), "postgres://ada@h/app"));
+
+    let bad = db.all(select("users").orderBy("id"));
+    checkBool("the first query failed", !bad.ok());
+    check("  with the right class", dberr_name(bad.code), "sql");
+
+    // Different SQL, so it does not hit the statement cache.
+    let good = db.all(select("users").orderBy("name"));
+    checkBool("the connection recovered and the next query worked", good.ok());
+    check("  and returned its rows", str(good.len()), "3");
+    check("  and the error state was cleared", db.error(), "");
+}
+
+fn replayParameters() {
+    print("---- bound parameters, and rebinding a cached statement ----");
+
+    // Nothing above binds a parameter. This does, twice, through one cached
+    // statement — which is the path where a reset() that forgets to clear
+    // bindings silently sends the previous call's values.
+    let w = byteWriter(2048);
+    handshake(w);
+    msg(w, 49, bytes(0));
+    msg(w, 116, buf().u16be(2).u32be(OID_INT4).u32be(OID_TEXT).take());   // two params
+    let rd = buf();
+    rd.u16be(1);
+    rd.cstr("id").u32be(0).u16be(0).u32be(OID_INT4).u16be(4).u32be(0xFFFFFFFF).u16be(FMT_TEXT);
+    msg(w, 84, rd.take());
+    msg(w, 90, buf().u8(TX_IDLE).take());
+    // first execution
+    msg(w, 50, bytes(0));
+    let a = buf(); a.u16be(1).u32be(1).text("7");
+    msg(w, 68, a.take());
+    msg(w, 67, buf().cstr("SELECT 1").take());
+    msg(w, 90, buf().u8(TX_IDLE).take());
+    // second execution, same cached statement
+    msg(w, 50, bytes(0));
+    let b2 = buf(); b2.u16be(1).u32be(1).text("8");
+    msg(w, 68, b2.take());
+    msg(w, 67, buf().cstr("SELECT 1").take());
+    msg(w, 90, buf().u8(TX_IDLE).take());
+
+    let mem = memIo(w.take());
+    let db = new Db(pgsqlOver(mem, "postgres://ada@h/app"));
+
+    let sql = "SELECT id FROM users WHERE age > $1 AND name = $2";
+    // "zeta" appears nowhere else on the wire — not in the DSN, not in the
+    // startup packet, not in the SQL — so finding it twice can only mean the
+    // stale binding was resent.
+    let p1: Value[] = [dbInt(30), dbText("zeta")];
+    let r1 = db.raw(sql, p1);
+    checkBool("parameterized query ran", r1.ok());
+    check("  and returned its row", str(r1.at(0).getInt("id")), "7");
+
+    // Rerun the SAME cached statement binding FEWER parameters. driver.vt:80-83
+    // requires reset() to clear bindings, and this is the call site it warns
+    // about: if the old values survived, $2 would silently still be 'ada' and
+    // the query would return the wrong rows with no error anywhere.
+    let p2: Value[] = [dbInt(40)];
+    let r2 = db.raw(sql, p2);
+    checkBool("the cached statement was rebound and rerun", r2.ok());
+    check("  returning the second row", str(r2.at(0).getInt("id")), "8");
+
+    let sent = hex(mem.sent);
+    let adaHex = hex(strBytes("zeta"));
+    // It must appear exactly once, in the first Bind.
+    let firstAda = sent.index_of(adaHex);
+    checkBool("the first Bind carried zeta", firstAda >= 0);
+    let after = sent.slice(firstAda + adaHex.len, sent.len);
+    checkBool("the second Bind did NOT resend a stale zeta", after.index_of(adaHex) < 0);
+    checkBool("the second Bind carried 40", sent.index_of(hex(strBytes("40"))) >= 0);
+    // Only one Parse: the second call reused the cached statement.
+    checkBool("only one statement was prepared", sent.index_of("76747332") < 0);
+}
+
+fn replayTagReset() {
+    print("---- changes() reflects the current statement, not the last one ----");
+
+    // db.vt:327-328 reads changes()/lastInsertId() after EVERY raw(), including
+    // the failing ones. If the counters were not reset at the start of each
+    // execution, a statement that reports no row count would still be showing
+    // the previous statement's number.
+    let w = byteWriter(2048);
+    handshake(w);
+    // UPDATE ... : 3 rows
+    msg(w, 49, bytes(0));
+    msg(w, 116, buf().u16be(0).take());
+    msg(w, 110, bytes(0));                           // NoData — no result columns
+    msg(w, 90, buf().u8(TX_IDLE).take());
+    msg(w, 50, bytes(0));
+    msg(w, 67, buf().cstr("UPDATE 3").take());
+    msg(w, 90, buf().u8(TX_IDLE).take());
+    // A second statement on the SAME extended-query path whose tag carries no
+    // number at all. Running this through execRaw instead would test the simple
+    // -query path and miss the counter reset in execute() entirely.
+    msg(w, 49, bytes(0));
+    msg(w, 116, buf().u16be(0).take());
+    msg(w, 110, bytes(0));
+    msg(w, 90, buf().u8(TX_IDLE).take());
+    msg(w, 50, bytes(0));
+    msg(w, 67, buf().cstr("CREATE TABLE").take());
+    msg(w, 90, buf().u8(TX_IDLE).take());
+    // And a third through the simple-query path, for the same reason.
+    msg(w, 67, buf().cstr("BEGIN").take());
+    msg(w, 90, buf().u8(TX_INTX).take());
+    // A second successful UPDATE, to put a non-zero count back on the session.
+    msg(w, 49, bytes(0));
+    msg(w, 116, buf().u16be(0).take());
+    msg(w, 110, bytes(0));
+    msg(w, 90, buf().u8(TX_INTX).take());
+    msg(w, 50, bytes(0));
+    msg(w, 67, buf().cstr("UPDATE 2").take());
+    msg(w, 90, buf().u8(TX_INTX).take());
+    // Finally one that FAILS, so no CommandComplete arrives at all. This is the
+    // case the reset actually exists for: with nothing to overwrite the
+    // counters, a failed statement would keep reporting the last successful
+    // statement's row count — and db.vt:327 reads affected on the error path.
+    msg(w, 49, bytes(0));
+    msg(w, 116, buf().u16be(0).take());
+    msg(w, 110, bytes(0));
+    msg(w, 90, buf().u8(TX_INTX).take());
+    let ef = buf();
+    ef.u8(86).cstr("ERROR").u8(67).cstr("42P01");
+    ef.u8(77).cstr("relation \"missing\" does not exist").u8(0);
+    msg(w, 69, ef.take());
+    msg(w, 90, buf().u8(TX_FAILED).take());
+
+    let db = new Db(pgsqlOver(memIo(w.take()), "postgres://ada@h/app"));
+
+    let r = db.raw("UPDATE users SET active = true", []);
+    checkBool("the update ran", r.ok());
+    check("three rows affected", str(r.affected), "3");
+    check("no result columns", str(r.columnNames().len), "0");
+    check("changes() agrees", str(db.changes()), "3");
+
+    let ddl = db.raw("CREATE TABLE t (a int)", []);
+    checkBool("then a statement whose tag has no row count", ddl.ok());
+    check("affected is 0, not the previous 3", str(ddl.affected), "0");
+    check("changes() is 0 too", str(db.changes()), "0");
+
+    checkBool("and on the simple-query path", db.execRaw("BEGIN"));
+    check("changes() is still 0", str(db.changes()), "0");
+
+    // Set the counter to something non-zero, then fail.
+    let again = db.raw("UPDATE users SET active = false", []);
+    let failed = db.raw("DELETE FROM missing", []);
+    checkBool("the failing statement reports failure", !failed.ok());
+    check("  with the right class", dberr_name(failed.code), "sql");
+    check("affected is 0 on a statement that never completed", str(failed.affected), "0");
+
+    // PostgreSQL aborts the whole transaction block on any error — every
+    // further statement fails with 25P02 until ROLLBACK. SQLite carries on
+    // after a constraint violation, so this is the behaviour difference most
+    // likely to surprise someone porting.
+    let cn2 = db.conn() as PgConn;
+    checkBool("the transaction is now in the aborted state", cn2.inTx());
+}
+
+fn introspectionSql() {
+    print("---- introspection SQL ----");
+
+    // These live in vyto/db/dialect, not in the driver package, so they render
+    // from a program that links no driver at all. Printing them verbatim makes
+    // any drift a visible diff.
+    //
+    // What this CANNOT check is whether PostgreSQL accepts them — that needs a
+    // server, and tests/run_tests_pgsql.sh is where it is settled. In
+    // particular the [u.ord - 1] subscripts on indoption and indcollation rely
+    // on those being 0-subscripted int2vector/oidvector rather than ordinary
+    // 1-subscripted arrays, and nothing offline can confirm it.
+    let d = pgDialect();
+    checkBool("postgres reports it can introspect", d.supportsIntrospection());
+
+    // The vocabulary these must emit is SQLite's, because introspect.vt matches
+    // it literally. Assert that rather than only eyeballing the SQL.
+    let tables = d.introspectTablesSql();
+    checkBool("tables SQL maps relkind onto SQLite's words",
+              tables.index_of("THEN 'table'") >= 0 && tables.index_of("THEN 'view'") >= 0);
+    checkBool("tables SQL hides pg_catalog and information_schema",
+              tables.index_of("'pg_catalog','information_schema'") >= 0);
+    checkBool("tables SQL respects search_path",
+              tables.index_of("pg_table_is_visible") >= 0);
+
+    let cols = d.introspectColumnsSql();
+    checkBool("columns SQL makes cid 0-based", cols.index_of("(a.attnum - 1) AS cid") >= 0);
+    checkBool("columns SQL takes the pk ordinal from the key, not the column",
+              cols.index_of("unnest(x.indkey) WITH ORDINALITY") >= 0);
+    checkBool("columns SQL leaves dflt NULL when there is none",
+              cols.index_of("LEFT JOIN pg_attrdef") >= 0);
+    checkBool("columns SQL binds the table name", cols.index_of("c.relname = $1") >= 0);
+
+    let idx = d.introspectIndexesSql();
+    checkBool("indexes SQL emits SQLite's origin words",
+              idx.index_of("THEN 'pk'") >= 0 && idx.index_of("THEN 'u'") >= 0);
+
+    let idxc = d.introspectIndexColumnsSql();
+    checkBool("index-column SQL 0-subscripts indoption",
+              idxc.index_of("x.indoption[u.ord - 1]") >= 0);
+    checkBool("index-column SQL separates INCLUDE columns",
+              idxc.index_of("indnkeyatts") >= 0);
+
+    let fks = d.introspectForeignKeysSql();
+    checkBool("foreign-key SQL spells the actions as SQLite does",
+              fks.index_of("'NO ACTION'") >= 0 && fks.index_of("'SET DEFAULT'") >= 0);
+    checkBool("foreign-key SQL groups multi-column constraints",
+              fks.index_of("dense_rank()") >= 0);
+
+    let objs = d.introspectObjectsSql();
+    // db.vt:523 and :563 compare this literal.
+    checkBool("objects SQL emits the literal 'trigger'", objs.index_of("'trigger'") >= 0);
+    checkBool("objects SQL drops foreign-key machinery triggers",
+              objs.index_of("NOT t.tgisinternal") >= 0);
+
+    // MySQL's are still unwritten and say so rather than shipping a query
+    // nobody has run.
+    checkBool("mysql still reports it cannot", !mysqlDialect().supportsIntrospection());
+
+    // kindGuess applies SQLite's affinity rules to the declared type, and
+    // introspectColumnsSql hands it format_type() output. Most cases land
+    // correctly by luck of the substrings; these three do not unless the rules
+    // know the Postgres spellings, and would otherwise fall through to the
+    // NUMERIC default and come back as "real".
+    check("bigint",                   new ColumnInfo("c", "bigint").kindName(), "int");
+    check("character varying(255)",   new ColumnInfo("c", "character varying(255)").kindName(), "text");
+    check("double precision",         new ColumnInfo("c", "double precision").kindName(), "real");
+    check("boolean",                  new ColumnInfo("c", "boolean").kindName(), "bool");
+    check("timestamp with time zone", new ColumnInfo("c", "timestamp with time zone").kindName(), "timestamp");
+    check("numeric(10,2)",            new ColumnInfo("c", "numeric(10,2)").kindName(), "real");
+    check("bytea is a blob, not a real",  new ColumnInfo("c", "bytea").kindName(), "blob");
+    check("uuid is text, not a real",     new ColumnInfo("c", "uuid").kindName(), "text");
+    check("jsonb is text, not a real",    new ColumnInfo("c", "jsonb").kindName(), "text");
+    check("json is text, not a real",     new ColumnInfo("c", "json").kindName(), "text");
+
+    print("-- tables --");        print(tables);
+    print("-- columns --");       print(cols);
+    print("-- indexes --");       print(idx);
+    print("-- index columns --"); print(idxc);
+    print("-- foreign keys --");  print(fks);
+    print("-- objects --");       print(objs);
+}
+
+fn tlsIsRefused() {
+    print("---- TLS is refused, not silently downgraded ----");
+
+    // Connecting in the clear when TLS was asked for is the one failure a
+    // caller must never get without being told.
+    let d = pgsql("postgres://ada@h/app?sslmode=require");
+    let cn = d.connect();
+    checkBool("sslmode=require does not connect", !cn.isOpen());
+    check("and says so", dberr_name(cn.errorCode()), "unsupported");
+    checkBool("naming the stub that has to be implemented",
+              cn.errorMessage().index_of("lib/vyto/crypto/openssl") >= 0);
+}
+
+fn main() {
+    encoders();
+    encodeDecodeRoundTrip();
+    dataRows();
+    errors();
+    commandTags();
+    authentication();
+    typeMapping();
+    numerics();
+    transport();
+    dsn();
+    replaySelect();
+    replayError();
+    replayAuthFailure();
+    replayCursorAndCache();
+    replayDrain();
+    replayExecRawAndTx();
+    replayFragmented();
+    replayTruncated();
+    replayScramHandshake();
+    replayNoticeAndResync();
+    replayErrorThenRecover();
+    replayParameters();
+    replayTagReset();
+    introspectionSql();
+    tlsIsRefused();
+    print("---- done ----");
+}

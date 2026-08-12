@@ -1,0 +1,722 @@
+// vyto/db/pgsql/proto — the PostgreSQL v3 frontend/backend protocol, as pure
+// functions over byte[].
+//
+// Nothing here touches a socket, and nothing here holds a connection. Every
+// encoder returns the bytes of one message and every decoder takes the bytes of
+// one message body, which is what lets the whole protocol be golden-tested
+// offline: examples/105_pgwire.vt asserts on these bytes with no server running
+// and no fd open.
+//
+// ── MESSAGE FRAMING ─────────────────────────────────────────────────────────
+// Every message except the startup packet is:
+//
+//     [1 byte type][int32 length][body]
+//
+// The length INCLUDES its own four bytes but not the type byte, so a body of n
+// bytes has length n+4. Getting that off by one desynchronizes the stream at
+// the next message rather than at this one, which is why every encoder here
+// patches the length from the buffer position rather than computing it.
+//
+// The startup and SSL request packets have no type byte — they are the first
+// thing on the wire, before the server knows what protocol version it is
+// speaking, so there is nothing yet to disambiguate.
+//
+// Strings are NUL-terminated, not length-prefixed. A field value inside DataRow
+// is length-prefixed instead, and its length may be -1 meaning NULL — which is
+// distinct from a length of 0 meaning the empty string, and conflating the two
+// is the classic bug in a hand-written driver.
+// ─────────────────────────────────────────────────────────────────────────────
+
+import { ByteWriter, byteWriter, parseIntOr, sqlstateToDberr } from "vyto/db/wire";
+import { DBERR_NONE, DBERR_SQL } from "vyto/db/driver";
+
+// ---- message type bytes ----------------------------------------------------
+
+// Backend (server -> us).
+export const B_AUTH:          int = 82;   // 'R'
+export const B_BACKEND_KEY:   int = 75;   // 'K'
+export const B_PARAM_STATUS:  int = 83;   // 'S'
+export const B_READY:         int = 90;   // 'Z'
+export const B_PARSE_DONE:    int = 49;   // '1'
+export const B_BIND_DONE:     int = 50;   // '2'
+export const B_CLOSE_DONE:    int = 51;   // '3'
+export const B_CMD_COMPLETE:  int = 67;   // 'C'
+export const B_DATA_ROW:      int = 68;   // 'D'
+export const B_ROW_DESC:      int = 84;   // 'T'
+export const B_PARAM_DESC:    int = 116;  // 't'
+export const B_NO_DATA:       int = 110;  // 'n'
+export const B_EMPTY_QUERY:   int = 73;   // 'I'
+export const B_PORTAL_SUSP:   int = 115;  // 's'
+export const B_ERROR:         int = 69;   // 'E'
+export const B_NOTICE:        int = 78;   // 'N'
+export const B_NOTIFY:        int = 65;   // 'A'
+export const B_NEGOTIATE:     int = 118;  // 'v'
+export const B_COPY_IN:       int = 71;   // 'G'
+export const B_COPY_OUT:      int = 72;   // 'H'
+export const B_COPY_BOTH:     int = 87;   // 'W'
+export const B_COPY_DATA:     int = 100;  // 'd'
+export const B_COPY_DONE:     int = 99;   // 'c'
+
+// Frontend (us -> server).
+export const F_PASSWORD:  int = 112;  // 'p' — and SASLInitialResponse, and SASLResponse
+export const F_QUERY:     int = 81;   // 'Q'
+export const F_PARSE:     int = 80;   // 'P'
+export const F_BIND:      int = 66;   // 'B'
+export const F_DESCRIBE:  int = 68;   // 'D'
+export const F_EXECUTE:   int = 69;   // 'E'
+export const F_SYNC:      int = 83;   // 'S'
+export const F_CLOSE:     int = 67;   // 'C'
+export const F_FLUSH:     int = 72;   // 'H'
+export const F_TERMINATE: int = 88;   // 'X'
+
+// Authentication request subtypes (the int32 that opens an 'R' body).
+export const AUTH_OK:            int = 0;
+export const AUTH_KERBEROS_V5:   int = 2;
+export const AUTH_CLEARTEXT:     int = 3;
+export const AUTH_MD5:           int = 5;
+export const AUTH_SCM:           int = 6;
+export const AUTH_GSS:           int = 7;
+export const AUTH_GSS_CONTINUE:  int = 8;
+export const AUTH_SSPI:          int = 9;
+export const AUTH_SASL:          int = 10;
+export const AUTH_SASL_CONTINUE: int = 11;
+export const AUTH_SASL_FINAL:    int = 12;
+
+// Transaction status, as reported by every ReadyForQuery.
+export const TX_IDLE:   int = 73;   // 'I'
+export const TX_INTX:   int = 84;   // 'T'
+export const TX_FAILED: int = 69;   // 'E' — every statement fails until ROLLBACK
+
+// Result/parameter format codes.
+export const FMT_TEXT:   int = 0;
+export const FMT_BINARY: int = 1;
+
+// 3.0. The startup packet's version field, and the only version this speaks.
+export const PROTOCOL_3_0: int = 196608;      // (3 << 16) | 0
+const SSL_REQUEST_CODE:    int = 80877103;    // (1234 << 16) | 5679
+
+// ---------------------------------------------------------------------------
+// Reading a body
+// ---------------------------------------------------------------------------
+
+// A bounds-safe cursor over a message body.
+//
+// Every read clamps and sets `bad` instead of panicking. That is deliberate:
+// the bytes came from the network, so a short or malformed body is a condition
+// to report as a protocol error, not a reason to abort the process. A driver
+// that panics on a truncated message hands a remote peer a denial of service.
+export class PgReader {
+    b: byte[];
+    off: int;
+    bad: bool;
+
+    fn init(b: byte[]) { this.b = b; this.off = 0; this.bad = false; }
+
+    fn remaining(): int { return this.b.len - this.off; }
+    fn atEnd(): bool { return this.off >= this.b.len; }
+
+    fn u8(): int {
+        if (this.off + 1 > this.b.len) { this.bad = true; return 0; }
+        let v = this.b[this.off] as int;
+        this.off += 1;
+        return v;
+    }
+
+    fn i16(): int {
+        if (this.off + 2 > this.b.len) { this.bad = true; return 0; }
+        let v = ((this.b[this.off] as int) << 8) | (this.b[this.off + 1] as int);
+        this.off += 2;
+        if (v >= 32768) { v -= 65536; }
+        return v;
+    }
+
+    fn i32(): int {
+        if (this.off + 4 > this.b.len) { this.bad = true; return 0; }
+        let v = ((this.b[this.off] as int) << 24) | ((this.b[this.off + 1] as int) << 16)
+              | ((this.b[this.off + 2] as int) << 8) | (this.b[this.off + 3] as int);
+        this.off += 4;
+        if (v >= 2147483648) { v -= 4294967296; }
+        return v;
+    }
+
+    // A NUL-terminated string. An unterminated one consumes the rest and marks
+    // the reader bad rather than running off the end.
+    fn cstr(): string {
+        let start = this.off;
+        let i = this.off;
+        while (i < this.b.len && this.b[i] != 0 as byte) { i += 1; }
+        if (i >= this.b.len) {
+            this.bad = true;
+            this.off = this.b.len;
+            return sliceText(this.b, start, this.b.len - start);
+        }
+        let s = sliceText(this.b, start, i - start);
+        this.off = i + 1;
+        return s;
+    }
+
+    fn take(n: int): byte[] {
+        if (n < 0 || this.off + n > this.b.len) { this.bad = true; return bytes(0); }
+        let out = bytes(n);
+        let i = 0;
+        while (i < n) { out[i] = this.b[this.off + i]; i += 1; }
+        this.off += n;
+        return out;
+    }
+}
+
+// strbytes, not str(): a value may contain an embedded NUL and a strlen scan
+// would truncate it there. Copies, so the result outlives the buffer.
+export fn sliceText(b: byte[], off: int, n: int): string {
+    if (off < 0 || n <= 0 || off >= b.len) { return ""; }
+    let k = n;
+    if (off + k > b.len) { k = b.len - off; }
+    let out = bytes(k);
+    let i = 0;
+    while (i < k) { out[i] = b[off + i]; i += 1; }
+    return strbytes(out, k);
+}
+
+// ---------------------------------------------------------------------------
+// Encoders
+// ---------------------------------------------------------------------------
+
+// Open a typed message and reserve its length. Returns the writer; close with
+// endMsg.
+fn beginMsg(w: ByteWriter, kind: int): int {
+    w.u8(kind);
+    return w.placeholderU32();
+}
+
+// The length covers itself and the body, but not the type byte.
+fn endMsg(w: ByteWriter, at: int) {
+    w.patchU32BE(at, w.len() - at);
+}
+
+// StartupMessage — no type byte, because nothing has agreed on a protocol yet.
+// `kv` is [k0, v0, k1, v1, ...]; an odd tail is ignored.
+export fn encodeStartup(kv: string[]): byte[] {
+    let w = byteWriter(128);
+    let at = w.placeholderU32();
+    w.u32be(PROTOCOL_3_0);
+    let i = 0;
+    while (i + 1 < kv.len) {
+        w.cstr(kv[i]);
+        w.cstr(kv[i + 1]);
+        i += 2;
+    }
+    w.u8(0);                       // end of the parameter list
+    w.patchU32BE(at, w.len() - at);
+    return w.take();
+}
+
+// SSLRequest — also untyped, and answered with a bare 'S' or 'N' byte rather
+// than a message. Encoded here so the TLS seam is a call site rather than a
+// comment, even though nothing sends it until vyto/crypto/openssl exists.
+export fn encodeSslRequest(): byte[] {
+    let w = byteWriter(8);
+    w.u32be(8);
+    w.u32be(SSL_REQUEST_CODE);
+    return w.take();
+}
+
+// PasswordMessage. Carries a cleartext password, or the "md5"+hex digest — the
+// server knows which it asked for.
+export fn encodePassword(secret: string): byte[] {
+    let w = byteWriter(64);
+    let at = beginMsg(w, F_PASSWORD);
+    w.cstr(secret);
+    endMsg(w, at);
+    return w.take();
+}
+
+// SASLInitialResponse: the mechanism name as a C string, then the initial
+// response with an int32 length of its own (-1 for absent).
+export fn encodeSaslInitial(mechanism: string, initial: byte[]): byte[] {
+    let w = byteWriter(128);
+    let at = beginMsg(w, F_PASSWORD);
+    w.cstr(mechanism);
+    if (initial == null) { w.u32be(0xFFFFFFFF); }
+    else { w.u32be(initial.len).raw(initial); }
+    endMsg(w, at);
+    return w.take();
+}
+
+// SASLResponse: the continuation, raw, with no length of its own — the message
+// length already bounds it. Same 'p' type byte as PasswordMessage; the two are
+// told apart by where in the exchange they appear, not by the byte.
+export fn encodeSaslResponse(data: byte[]): byte[] {
+    let w = byteWriter(128);
+    let at = beginMsg(w, F_PASSWORD);
+    w.raw(data);
+    endMsg(w, at);
+    return w.take();
+}
+
+// Simple query. One round trip, no parameters, and the server may return
+// several result sets. Used for DDL and BEGIN/COMMIT/ROLLBACK.
+export fn encodeQuery(sql: string): byte[] {
+    let w = byteWriter(sql.len + 8);
+    let at = beginMsg(w, F_QUERY);
+    w.cstr(sql);
+    endMsg(w, at);
+    return w.take();
+}
+
+// Parse: name the statement, give the SQL, and declare how many parameter types
+// we are specifying. Zero means "infer them all", which is what we want — the
+// server's inference is better than ours and Describe hands the answer back.
+export fn encodeParse(name: string, sql: string, paramOids: int[]): byte[] {
+    let w = byteWriter(sql.len + 32);
+    let at = beginMsg(w, F_PARSE);
+    w.cstr(name);
+    w.cstr(sql);
+    let n = 0;
+    if (paramOids != null) { n = paramOids.len; }
+    w.u16be(n);
+    let i = 0;
+    while (i < n) { w.u32be(paramOids[i]); i += 1; }
+    endMsg(w, at);
+    return w.take();
+}
+
+// Describe. 'S' for a statement (yields ParameterDescription then
+// RowDescription), 'P' for a portal (yields RowDescription only).
+//
+// Describing the STATEMENT is what lets prepare() learn the column names before
+// anything is bound — which vyto/db needs, because Db.raw calls columnNamesOf()
+// before the first step() (db.vt:309).
+export const DESC_STATEMENT: int = 83;   // 'S'
+export const DESC_PORTAL:    int = 80;   // 'P'
+
+export fn encodeDescribe(what: int, name: string): byte[] {
+    let w = byteWriter(32);
+    let at = beginMsg(w, F_DESCRIBE);
+    w.u8(what);
+    w.cstr(name);
+    endMsg(w, at);
+    return w.take();
+}
+
+export fn encodeClose(what: int, name: string): byte[] {
+    let w = byteWriter(32);
+    let at = beginMsg(w, F_CLOSE);
+    w.u8(what);
+    w.cstr(name);
+    endMsg(w, at);
+    return w.take();
+}
+
+// One bound parameter: its bytes and the format they are in. A null `data`
+// means SQL NULL, which goes on the wire as a length of -1 — not as a length of
+// zero, which is the empty string.
+export class PgParam {
+    data: byte[];
+    format: int;
+
+    fn init(data: byte[], format: int) { this.data = data; this.format = format; }
+    fn isNull(): bool { return this.data == null; }
+}
+
+export fn pgParamNull(): PgParam { return new PgParam(null, FMT_TEXT); }
+export fn pgParamText(b: byte[]): PgParam { return new PgParam(b, FMT_TEXT); }
+export fn pgParamBinary(b: byte[]): PgParam { return new PgParam(b, FMT_BINARY); }
+
+// Bind: attach parameter values to a prepared statement, producing a portal.
+//
+// `resultFormats` is per column, with two shortcuts the protocol defines: an
+// empty list means all-text, and a one-element list applies that format to
+// every column. The driver uses the per-column form so float8 can come back as
+// exact binary while everything else stays text.
+export fn encodeBind(portal: string, stmt: string, params: PgParam[],
+                     resultFormats: int[]): byte[] {
+    let w = byteWriter(128);
+    let at = beginMsg(w, F_BIND);
+    w.cstr(portal);
+    w.cstr(stmt);
+
+    let n = 0;
+    if (params != null) { n = params.len; }
+
+    // Parameter format codes, one per parameter.
+    w.u16be(n);
+    let i = 0;
+    while (i < n) { w.u16be(params[i].format); i += 1; }
+
+    // Parameter values.
+    w.u16be(n);
+    i = 0;
+    while (i < n) {
+        let p = params[i];
+        if (p.isNull()) { w.u32be(0xFFFFFFFF); }
+        else { w.u32be(p.data.len).raw(p.data); }
+        i += 1;
+    }
+
+    let rf = 0;
+    if (resultFormats != null) { rf = resultFormats.len; }
+    w.u16be(rf);
+    i = 0;
+    while (i < rf) { w.u16be(resultFormats[i]); i += 1; }
+
+    endMsg(w, at);
+    return w.take();
+}
+
+// Execute a portal. maxRows 0 means "all of them" and lets the server stream;
+// a positive value suspends the portal instead, which this driver does not use.
+export fn encodeExecute(portal: string, maxRows: int): byte[] {
+    let w = byteWriter(32);
+    let at = beginMsg(w, F_EXECUTE);
+    w.cstr(portal);
+    w.u32be(maxRows);
+    endMsg(w, at);
+    return w.take();
+}
+
+// Sync ends an extended-query sequence: the server finishes what it is doing,
+// closes an implicit transaction, and answers with ReadyForQuery. It is also
+// the resynchronization point after an error — the server discards messages
+// until it sees one, which is why every error path must read through to the
+// ReadyForQuery rather than stopping at the ErrorResponse.
+export fn encodeSync(): byte[] {
+    let w = byteWriter(5);
+    let at = beginMsg(w, F_SYNC);
+    endMsg(w, at);
+    return w.take();
+}
+
+export fn encodeFlush(): byte[] {
+    let w = byteWriter(5);
+    let at = beginMsg(w, F_FLUSH);
+    endMsg(w, at);
+    return w.take();
+}
+
+export fn encodeTerminate(): byte[] {
+    let w = byteWriter(5);
+    let at = beginMsg(w, F_TERMINATE);
+    endMsg(w, at);
+    return w.take();
+}
+
+// ---------------------------------------------------------------------------
+// Decoders
+// ---------------------------------------------------------------------------
+
+// One column of a result, from RowDescription.
+export class PgColumn {
+    name: string;
+    tableOid: int;
+    column: int;      // attribute number within that table, or 0
+    typeOid: int;
+    typeLen: int;     // negative for a variable-length type
+    typeMod: int;
+    format: int;
+
+    fn init() {
+        this.name = "";
+        this.tableOid = 0;
+        this.column = 0;
+        this.typeOid = 0;
+        this.typeLen = 0;
+        this.typeMod = 0;
+        this.format = FMT_TEXT;
+    }
+}
+
+// RowDescription body -> the columns. Empty, never null.
+export fn decodeRowDescription(body: byte[]): PgColumn[] {
+    let out: PgColumn[] = [];
+    let r = new PgReader(body);
+    let n = r.i16();
+    let i = 0;
+    while (i < n && !r.bad) {
+        let c = new PgColumn();
+        c.name = r.cstr();
+        c.tableOid = r.i32();
+        c.column = r.i16();
+        c.typeOid = r.i32();
+        c.typeLen = r.i16();
+        c.typeMod = r.i32();
+        c.format = r.i16();
+        // Only after the whole descriptor read cleanly. Pushing first would let
+        // a truncated body contribute one column of zeroes, and a bogus column
+        // is worse than a missing one: columnCount() would report it and
+        // columnValue() would decode against a type OID of 0.
+        if (r.bad) { break; }
+        out.push(c);
+        i += 1;
+    }
+    return out;
+}
+
+// ParameterDescription body -> the inferred parameter type OIDs. An OID of 0
+// means the server could not infer that one.
+export fn decodeParameterDescription(body: byte[]): int[] {
+    let out: int[] = [];
+    let r = new PgReader(body);
+    let n = r.i16();
+    let i = 0;
+    while (i < n) {
+        let oid = r.i32();
+        if (r.bad) { break; }
+        out.push(oid);
+        i += 1;
+    }
+    return out;
+}
+
+// A DataRow, split into its fields.
+//
+// Offsets into the original body rather than copies: a wide row whose caller
+// reads two columns should not pay to materialize forty. A length of -1 is
+// SQL NULL and is kept distinct from a length of 0, the empty string — this is
+// the distinction a driver must not lose.
+export class PgRow {
+    body: byte[];
+    offs: int[];      // start of each field's bytes
+    lens: int[];      // its length, or -1 for NULL
+    ok: bool;
+
+    fn init() { this.body = bytes(0); this.offs = []; this.lens = []; this.ok = false; }
+
+    fn count(): int { return this.lens.len; }
+    fn isNull(i: int): bool {
+        if (i < 0 || i >= this.lens.len) { return true; }
+        return this.lens[i] < 0;
+    }
+    // The raw bytes of field i, or null when it is NULL. Copies, because the
+    // body is replaced by the next row and vyto/db requires a Row to own its
+    // cells (value.vt:18-24).
+    fn field(i: int): byte[] {
+        if (i < 0 || i >= this.lens.len) { return null; }
+        let n = this.lens[i];
+        if (n < 0) { return null; }
+        let out = bytes(n);
+        let o = this.offs[i];
+        let k = 0;
+        while (k < n) { out[k] = this.body[o + k]; k += 1; }
+        return out;
+    }
+    fn fieldText(i: int): string {
+        if (i < 0 || i >= this.lens.len) { return ""; }
+        let n = this.lens[i];
+        if (n <= 0) { return ""; }
+        return sliceText(this.body, this.offs[i], n);
+    }
+}
+
+export fn decodeDataRow(body: byte[]): PgRow {
+    let row = new PgRow();
+    row.body = body;
+    let r = new PgReader(body);
+    let n = r.i16();
+    let i = 0;
+    while (i < n) {
+        let len = r.i32();
+        if (r.bad) { return row; }
+        if (len < 0) {
+            row.offs.push(0);
+            row.lens.push(-1);
+        } else {
+            if (r.off + len > body.len) { return row; }
+            row.offs.push(r.off);
+            row.lens.push(len);
+            r.off += len;
+        }
+        i += 1;
+    }
+    row.ok = !r.bad;
+    return row;
+}
+
+// An ErrorResponse or NoticeResponse. Same wire shape; only the type byte
+// differs, and only one of them is an error.
+export class PgError {
+    severity: string;    // from 'V' where present, else 'S'
+    sqlstate: string;
+    message: string;
+    detail: string;
+    hint: string;
+    position: string;
+    constraint: string;
+    table: string;
+    schema: string;
+    column: string;
+    dataType: string;
+
+    fn init() {
+        this.severity = "";
+        this.sqlstate = "";
+        this.message = "";
+        this.detail = "";
+        this.hint = "";
+        this.position = "";
+        this.constraint = "";
+        this.table = "";
+        this.schema = "";
+        this.column = "";
+        this.dataType = "";
+    }
+
+    // The DBERR_* class this maps to.
+    fn code(): int {
+        if (this.sqlstate == "") { return DBERR_SQL; }
+        return sqlstateToDberr(this.sqlstate);
+    }
+
+    // What errorMessage() hands back. The server's own wording, plus the fields
+    // a caller acts on — the constraint name after a unique violation is the
+    // one people actually need and the one most drivers drop.
+    fn text(): string {
+        let s = this.severity;
+        if (s == "") { s = "ERROR"; }
+        let out = s + ": " + this.message;
+        if (this.detail != "") { out = out + " — " + this.detail; }
+        if (this.constraint != "") { out = out + " (constraint " + this.constraint + ")"; }
+        else if (this.table != "") { out = out + " (table " + this.table + ")"; }
+        if (this.hint != "") { out = out + " — hint: " + this.hint; }
+        if (this.position != "") { out = out + " at character " + this.position; }
+        if (this.sqlstate != "") { out = out + " [" + this.sqlstate + "]"; }
+        return out;
+    }
+}
+
+// Field codes are single bytes; the body is pairs of (code, C string) ending at
+// a zero byte. Unknown codes are skipped rather than rejected — the set grows
+// between server versions and a new one is not an error.
+export fn decodeError(body: byte[]): PgError {
+    let e = new PgError();
+    let r = new PgReader(body);
+    while (!r.atEnd() && !r.bad) {
+        let code = r.u8();
+        if (code == 0) { break; }
+        let v = r.cstr();
+        if (code == 86) { e.severity = v; }            // 'V' — never localized
+        else if (code == 83) {                          // 'S' — localized
+            if (e.severity == "") { e.severity = v; }
+        }
+        else if (code == 67) { e.sqlstate = v; }        // 'C'
+        else if (code == 77) { e.message = v; }         // 'M'
+        else if (code == 68) { e.detail = v; }          // 'D'
+        else if (code == 72) { e.hint = v; }            // 'H'
+        else if (code == 80) { e.position = v; }        // 'P'
+        else if (code == 110) { e.constraint = v; }     // 'n'
+        else if (code == 116) { e.table = v; }          // 't'
+        else if (code == 115) { e.schema = v; }         // 's'
+        else if (code == 99) { e.column = v; }          // 'c'
+        else if (code == 100) { e.dataType = v; }       // 'd'
+        // 'F' file, 'L' line, 'R' routine: backend internals, deliberately dropped.
+    }
+    return e;
+}
+
+// A CommandComplete tag, split.
+//
+//     "SELECT 10"   rows=10
+//     "UPDATE 3"    rows=3
+//     "INSERT 0 5"  oid=0  rows=5
+//     "CREATE TABLE"        rows=0
+export class PgTag {
+    tag: string;
+    rows: int;
+    oid: int;
+
+    fn init() { this.tag = ""; this.rows = 0; this.oid = 0; }
+}
+
+export fn decodeCommandComplete(body: byte[]): PgTag {
+    let t = new PgTag();
+    let r = new PgReader(body);
+    t.tag = r.cstr();
+    if (t.tag == "") { return t; }
+
+    let parts = t.tag.split(" ");
+    if (parts.len < 2) { return t; }
+
+    // The row count is always the LAST token, which is what makes one rule work
+    // for INSERT's three-token form and everything else's two.
+    //
+    // parseIntOr, not to_int: to_int panics on "TABLE" and this text came from
+    // the server (runtime/vyto_rt_str.c:197-206).
+    t.rows = parseIntOr(parts[parts.len - 1], 0);
+    if (parts.len >= 3 && parts[0] == "INSERT") { t.oid = parseIntOr(parts[1], 0); }
+    return t;
+}
+
+// An Authentication message, decoded.
+export class PgAuth {
+    kind: int;
+    salt: byte[];         // AUTH_MD5: the four salt bytes
+    mechanisms: string[]; // AUTH_SASL: what the server will accept
+    data: byte[];         // AUTH_SASL_CONTINUE / AUTH_SASL_FINAL: the SASL payload
+
+    fn init() { this.kind = -1; this.salt = bytes(0); this.mechanisms = []; this.data = bytes(0); }
+}
+
+export fn decodeAuth(body: byte[]): PgAuth {
+    let a = new PgAuth();
+    let r = new PgReader(body);
+    a.kind = r.i32();
+    if (r.bad) { a.kind = -1; return a; }
+
+    if (a.kind == AUTH_MD5) { a.salt = r.take(4); return a; }
+    if (a.kind == AUTH_SASL) {
+        while (!r.atEnd() && !r.bad) {
+            let m = r.cstr();
+            if (m == "") { break; }
+            a.mechanisms.push(m);
+        }
+        return a;
+    }
+    if (a.kind == AUTH_SASL_CONTINUE || a.kind == AUTH_SASL_FINAL) {
+        a.data = r.take(r.remaining());
+        return a;
+    }
+    return a;
+}
+
+// ParameterStatus: a runtime setting the server is reporting. Sent at startup
+// for the interesting ones, and again whenever one changes mid-session.
+export class PgParamStatus {
+    name: string;
+    value: string;
+    fn init() { this.name = ""; this.value = ""; }
+}
+
+export fn decodeParameterStatus(body: byte[]): PgParamStatus {
+    let p = new PgParamStatus();
+    let r = new PgReader(body);
+    p.name = r.cstr();
+    p.value = r.cstr();
+    return p;
+}
+
+// BackendKeyData: the pid and secret needed to cancel a query on this session
+// over a second connection.
+export class PgBackendKey {
+    pid: int;
+    key: int;
+    fn init() { this.pid = 0; this.key = 0; }
+}
+
+export fn decodeBackendKey(body: byte[]): PgBackendKey {
+    let k = new PgBackendKey();
+    let r = new PgReader(body);
+    k.pid = r.i32();
+    k.key = r.i32();
+    return k;
+}
+
+// ReadyForQuery's single byte: TX_IDLE / TX_INTX / TX_FAILED.
+export fn decodeReadyForQuery(body: byte[]): int {
+    if (body.len < 1) { return TX_IDLE; }
+    return body[0] as int;
+}
+
+export fn txStatusName(s: int): string {
+    if (s == TX_INTX) { return "in transaction"; }
+    if (s == TX_FAILED) { return "failed transaction"; }
+    return "idle";
+}

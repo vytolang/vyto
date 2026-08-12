@@ -1,0 +1,380 @@
+// vyto/db/wire/io — the framed transport under the network database drivers.
+//
+// One class, WireIo, with exactly two virtuals: rawRead and rawWrite. Buffering,
+// deadlines, short reads, short writes and error classification all live above
+// them and are written once. Everything else in a driver goes through readExact
+// and writeAll and never touches a socket.
+//
+// That is not tidiness, it is the whole design:
+//
+//   * MemIo — a canned server transcript in a byte[] — is a subclass. That is
+//     what lets a driver be tested end to end, through vyto/db itself, with no
+//     server, no fd and no network, so the tests run in CI on a machine with no
+//     database installed.
+//   * TLS, when lib/vyto/crypto/openssl stops being a stub, is a subclass too.
+//     Nothing above these two methods has to change.
+//   * A non-blocking reactor port is a rewrite of this file and nothing else.
+//     The read buffer already carries head/tail across calls, which is the part
+//     that makes such a port possible at all.
+//
+// ── WHY THE SOCKET IS NON-BLOCKING BUT THE API IS NOT ───────────────────────
+// Socket.recv returns bytes(0) for a clean EOF, for a timeout and for a broken
+// socket alike — `take` erases the negative return entirely (socket.vt:75-82).
+// Those three want three different DBERR_* codes and three different messages,
+// so a driver built on the blocking call cannot tell a slow server from a dead
+// one. tryRecv's RecvResult.status does distinguish them, and PollSet supplies
+// a real deadline on both directions, so this drives a non-blocking socket and
+// presents a blocking API on top.
+//
+// The API stays blocking because the seam it feeds is: Stmt.step() returns
+// STEP_ROW/STEP_DONE/STEP_ERR with no STEP_WOULDBLOCK (driver.vt:51-53), and
+// both Cursor.next() and Db.raw()'s loop treat anything that is not a row as
+// terminal. A non-blocking PostgreSQL client is an ADDITIVE api on the driver's
+// Conn — pollFd(), a step that can yield — not a reinterpretation of this one.
+// ─────────────────────────────────────────────────────────────────────────────
+
+import { Socket, PollSet, RecvResult, socket_connect,
+         POLL_READ, POLL_WRITE } from "vyto/net/socket";
+
+// What state the transport is in. `err` carries the prose; this is what the
+// driver branches on.
+export const IO_OK:      int = 0;
+export const IO_EOF:     int = 1;   // the peer closed the connection
+export const IO_TIMEOUT: int = 2;   // the deadline passed with nothing to read
+export const IO_ERROR:   int = 3;   // the socket broke, or was never opened
+
+export fn io_state_name(s: int): string {
+    if (s == IO_EOF) { return "eof"; }
+    if (s == IO_TIMEOUT) { return "timeout"; }
+    if (s == IO_ERROR) { return "error"; }
+    return "ok";
+}
+
+// A frame length larger than this is refused before anything is allocated.
+//
+// The length is the first thing a server sends and the last thing we can check,
+// so a corrupt or hostile one otherwise drives an unbounded bytes(n). Same cap
+// and same reasoning as the WebSocket client (websocket.vt:99).
+export const MAX_FRAME: int = 67108864;   // 64 MiB
+
+// Return codes for the two virtuals. Deliberately the same shape as
+// Socket.trySend so a socket-backed implementation is a pass-through.
+export const RAW_EOF:   int = 0;
+export const RAW_BLOCK: int = -1;
+export const RAW_ERR:   int = -2;
+
+export class WireIo {
+    buf: byte[];        // read buffer; [head, tail) is filled and unconsumed
+    head: int;
+    tail: int;
+    timeoutMs: int;     // 0 waits forever
+    state: int;
+    err: string;
+
+    fn init(timeoutMs: int) {
+        this.buf = bytes(0);
+        this.head = 0;
+        this.tail = 0;
+        this.timeoutMs = timeoutMs;
+        this.state = IO_OK;
+        this.err = "";
+    }
+
+    // ---- the seam ---------------------------------------------------------
+    //
+    // Fill dst[0..n) with whatever is available. Returns the count, or RAW_EOF /
+    // RAW_BLOCK / RAW_ERR. A base WireIo is a dead transport, matching the
+    // dead-object defaults the driver seam uses (driver.vt:17-23).
+    virtual fn rawRead(dst: byte[], n: int): int { return RAW_ERR; }
+
+    // Write src[off..off+n). Returns the count written (which may be short), or
+    // RAW_BLOCK / RAW_ERR.
+    virtual fn rawWrite(src: byte[], off: int, n: int): int { return RAW_ERR; }
+
+    // Wait until the underlying transport is readable/writable, or the deadline
+    // passes. False means "stop waiting" — for MemIo, which is always ready,
+    // there is nothing to wait for and a block is a genuine end of input.
+    virtual fn awaitReady(forWrite: bool): bool { return false; }
+
+    virtual fn isOpen(): bool { return false; }
+    virtual fn close() { }
+
+    // The underlying descriptor, or -1. Present from the first version so a
+    // reactor port has somewhere to start; nothing in the drivers calls it.
+    virtual fn fd(): int { return -1; }
+
+    // PostgreSQL's SSLRequest handshake. False means the transport is staying
+    // in the clear — which is the only answer available until
+    // lib/vyto/crypto/openssl stops panicking. It is a method rather than a
+    // comment so the place TLS slots in is a real call site.
+    virtual fn requestSsl(): bool { return false; }
+
+    // ---- state ------------------------------------------------------------
+
+    fn ok(): bool { return this.state == IO_OK; }
+    fn error(): string { return this.err; }
+
+    fn fail(state: int, msg: string) {
+        // The first failure is the interesting one; a later EOF caused by it is
+        // not, so it does not overwrite.
+        if (this.state == IO_OK) {
+            this.state = state;
+            this.err = msg;
+        }
+    }
+
+    // ---- reading ----------------------------------------------------------
+
+    fn buffered(): int { return this.tail - this.head; }
+
+    // Pull at least one more chunk into the buffer. False on eof/timeout/error,
+    // with `state` saying which.
+    fn fill(): bool {
+        if (!this.isOpen()) { this.fail(IO_ERROR, "connection is closed"); return false; }
+
+        // Reclaim the consumed prefix rather than growing forever. Compacting
+        // instead of reallocating is what keeps a long result set from turning
+        // into a realloc per message.
+        if (this.head > 0) {
+            let n = this.tail - this.head;
+            let i = 0;
+            while (i < n) { this.buf[i] = this.buf[this.head + i]; i += 1; }
+            this.head = 0;
+            this.tail = n;
+        }
+        if (this.tail + 4096 > this.buf.len) {
+            let want = this.buf.len * 2;
+            if (want < this.tail + 4096) { want = this.tail + 4096; }
+            let nb = bytes(want);
+            let i = 0;
+            while (i < this.tail) { nb[i] = this.buf[i]; i += 1; }
+            this.buf = nb;
+        }
+
+        let chunk = bytes(this.buf.len - this.tail);
+        while (true) {
+            let got = this.rawRead(chunk, chunk.len);
+            if (got > 0) {
+                let i = 0;
+                while (i < got) { this.buf[this.tail + i] = chunk[i]; i += 1; }
+                this.tail += got;
+                return true;
+            }
+            if (got == RAW_EOF) { this.fail(IO_EOF, "the server closed the connection"); return false; }
+            if (got == RAW_ERR) { this.fail(IO_ERROR, "socket read failed"); return false; }
+            // would-block: wait for readability, then retry.
+            if (!this.awaitReady(false)) {
+                this.fail(IO_TIMEOUT, "timed out waiting for the server");
+                return false;
+            }
+        }
+        return false;
+    }
+
+    // Exactly `n` bytes, or null with `state` explaining. Never returns a short
+    // buffer — a partial read that reported success is how a protocol goes out
+    // of sync, and websocket.vt:234-244's readExact returns bytes(0) after
+    // consuming what it read, which is worse.
+    fn readExact(n: int): byte[] {
+        if (n < 0 || n > MAX_FRAME) {
+            this.fail(IO_ERROR, "refusing a frame of " + str(n) + " bytes");
+            return null;
+        }
+        if (n == 0) { return bytes(0); }
+        while (this.buffered() < n) {
+            if (!this.fill()) { return null; }
+        }
+        let out = bytes(n);
+        let i = 0;
+        while (i < n) { out[i] = this.buf[this.head + i]; i += 1; }
+        this.head += n;
+        return out;
+    }
+
+    // One byte, or -1. Cheaper than readExact(1) for a message tag.
+    fn readByte(): int {
+        while (this.buffered() < 1) {
+            if (!this.fill()) { return -1; }
+        }
+        let v = this.buf[this.head] as int;
+        this.head += 1;
+        return v;
+    }
+
+    // ---- writing ----------------------------------------------------------
+
+    // Write all of `b`, looping over short writes and backpressure.
+    //
+    // Socket.send can write fewer bytes than asked and there is no sendAll in
+    // the socket layer, so the naive version silently truncates a large Bind
+    // carrying a big bytea — and only ever under load, which is the worst way
+    // to find out.
+    fn writeAll(b: byte[]): bool {
+        if (!this.isOpen()) { this.fail(IO_ERROR, "connection is closed"); return false; }
+        let off = 0;
+        while (off < b.len) {
+            let n = this.rawWrite(b, off, b.len - off);
+            if (n > 0) { off += n; continue; }
+            if (n == RAW_ERR) { this.fail(IO_ERROR, "socket write failed"); return false; }
+            if (n == RAW_EOF) { this.fail(IO_EOF, "the server closed the connection"); return false; }
+            if (!this.awaitReady(true)) {
+                this.fail(IO_TIMEOUT, "timed out writing to the server");
+                return false;
+            }
+        }
+        return true;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A real socket
+// ---------------------------------------------------------------------------
+
+export class SockIo extends WireIo {
+    sock: Socket;
+    poll: PollSet;
+
+    fn init(sock: Socket, timeoutMs: int) {
+        this.buf = bytes(0);
+        this.head = 0;
+        this.tail = 0;
+        this.timeoutMs = timeoutMs;
+        this.state = IO_OK;
+        this.err = "";
+        this.sock = sock;
+        this.poll = null;
+        if (sock != null) {
+            // Nagle plus delayed ACK is a 40ms stall on the small Sync that
+            // follows a large Bind, and a database conversation is round-trip
+            // bound rather than throughput bound.
+            sock.setNoDelay(true);
+            sock.setNonBlocking(true);
+            this.poll = new PollSet();
+            this.poll.add(sock, POLL_READ);
+        }
+    }
+
+    override fn isOpen(): bool { return this.sock != null && this.sock.isValid(); }
+    override fn fd(): int {
+        if (this.sock == null) { return -1; }
+        return this.sock.fd as int;
+    }
+
+    override fn rawRead(dst: byte[], n: int): int {
+        if (!this.isOpen()) { return RAW_ERR; }
+        let r = this.sock.tryRecv(n);
+        if (r.status > 0) {
+            let k = r.data.len;
+            if (k > n) { k = n; }
+            let i = 0;
+            while (i < k) { dst[i] = r.data[i]; i += 1; }
+            return k;
+        }
+        return r.status;      // 0 eof, -1 would-block, -2 error — same encoding
+    }
+
+    override fn rawWrite(src: byte[], off: int, n: int): int {
+        if (!this.isOpen()) { return RAW_ERR; }
+        // trySendRaw takes an offset, so resuming a partial write costs no copy.
+        return this.sock.trySendRaw(src as cstring, off, n);
+    }
+
+    override fn awaitReady(forWrite: bool): bool {
+        if (this.poll == null || !this.isOpen()) { return false; }
+        let ev = POLL_READ;
+        if (forWrite) { ev = POLL_WRITE; }
+        this.poll.modify(this.sock, ev);
+        let t = this.timeoutMs;
+        if (t <= 0) { t = -1; }               // wait forever
+        return this.poll.wait(t) > 0;
+    }
+
+    override fn close() {
+        if (this.sock != null) { this.sock.close(); this.sock = null; }
+        this.poll = null;
+    }
+
+    deinit { this.close(); }
+}
+
+// Connect, or return null. The caller turns that into a Conn whose isOpen() is
+// false — a driver never returns a null Conn (driver.vt:130-133).
+export fn dialTcp(host: string, port: int, timeoutMs: int): SockIo {
+    let s = socket_connect(host, port);
+    if (s == null) { return null; }
+    return new SockIo(s, timeoutMs);
+}
+
+// ---------------------------------------------------------------------------
+// A canned transcript
+// ---------------------------------------------------------------------------
+
+// A WireIo whose "server" is a byte[] written in advance, and whose client
+// output is captured for inspection.
+//
+// This is the test seam, and it ships in the library on purpose — the same call
+// the UI toolkit makes with VS_HEADLESS, which is why that has 55 tests. It
+// costs one class and no native code, and it buys running a driver's entire
+// stack (auth, prepare, bind, step, error handling, and vyto/db's own raw()
+// loop above it) against a recorded session inside `make test`, on a machine
+// with no database installed.
+//
+// It also makes the CLIENT's half of the conversation testable: `sent` is
+// exactly what the driver put on the wire, so a golden can assert on the bytes
+// rather than only on the parsed result.
+export class MemIo extends WireIo {
+    script: byte[];     // what the "server" says
+    pos: int;           // how much of it has been handed over
+    sent: byte[];       // what the driver said back
+    open: bool;
+    chunk: int;         // hand out at most this many bytes per read
+
+    fn init(script: byte[]) {
+        this.buf = bytes(0);
+        this.head = 0;
+        this.tail = 0;
+        this.timeoutMs = 0;
+        this.state = IO_OK;
+        this.err = "";
+        this.script = script;
+        this.pos = 0;
+        this.sent = bytes(0);
+        this.open = true;
+        this.chunk = 0;
+    }
+
+    // Serve the transcript a few bytes at a time. A driver that happens to work
+    // only because every message arrived in one piece is a driver that will
+    // desync against a real socket, so a test can force the fragmented case.
+    fn dribble(n: int): MemIo { this.chunk = n; return this; }
+
+    override fn isOpen(): bool { return this.open; }
+
+    override fn rawRead(dst: byte[], n: int): int {
+        if (!this.open) { return RAW_ERR; }
+        let avail = this.script.len - this.pos;
+        if (avail <= 0) { return RAW_EOF; }
+        let k = n;
+        if (k > avail) { k = avail; }
+        if (this.chunk > 0 && k > this.chunk) { k = this.chunk; }
+        let i = 0;
+        while (i < k) { dst[i] = this.script[this.pos + i]; i += 1; }
+        this.pos += k;
+        return k;
+    }
+
+    override fn rawWrite(src: byte[], off: int, n: int): int {
+        if (!this.open) { return RAW_ERR; }
+        let i = 0;
+        while (i < n) { this.sent.push(src[off + i]); i += 1; }
+        return n;
+    }
+
+    // Always ready: there is no waiting to do, so a would-block from rawRead
+    // means the transcript is genuinely exhausted rather than merely not ready.
+    override fn awaitReady(forWrite: bool): bool { return false; }
+
+    override fn close() { this.open = false; }
+}
+
+export fn memIo(script: byte[]): MemIo { return new MemIo(script); }

@@ -1,0 +1,271 @@
+// vyto/db/pgsql/pgtype — PostgreSQL type OIDs, and the mapping in both
+// directions between a wire value and vyto/db's Value.
+//
+// Socket-free like proto.vt, so the whole table is golden-testable offline.
+//
+// ── WHY RESULTS COME BACK AS TEXT, WITH TWO EXCEPTIONS ──────────────────────
+// Every OID decodes, because the default branch hands back the text the server
+// printed — which is always a correct rendering of the value. A driver that
+// decoded everything in binary has no such fallback: the bytes of a type it has
+// never heard of are meaningless without a decoder for it, and between the
+// built-ins and every extension type (PostGIS, hstore, citext, user enums,
+// composites, domains) that set is never closed. Binary layouts are also
+// version-sensitive in ways text is not — timestamptz is microseconds since
+// 2000-01-01 as an int64, and was a float8 on --disable-integer-datetimes
+// builds — so each one is a decoder plus a test plus a way to be subtly wrong.
+//
+// The exceptions are float4 and float8, which are requested in BINARY. Their
+// layout is plain IEEE-754 and has never changed, and it is the only way to get
+// the exact value: reading a float as decimal text costs a correctly-rounded
+// decimal-to-binary conversion that needs arbitrary-precision arithmetic to do
+// right (see parseFloatOr's accuracy note in vyto/db/wire). Asking for the bits
+// sidesteps the entire question.
+//
+// ── TWO MAPPINGS THAT WILL SURPRISE PEOPLE, BOTH DELIBERATE ─────────────────
+// `numeric` becomes TEXT, not float. NUMERIC(19,4) is chosen precisely because
+// a double cannot represent it, and quietly routing money through one produces
+// the kind of bug that surfaces in a reconciliation report months later. Read it
+// as a string, or cast it in SQL with ::float8 if a double is genuinely wanted.
+//
+// Arrays become TEXT — the literal `{1,2,3}`. Value has five kinds and none of
+// them is a list, so the honest answer is the server's own rendering. Use
+// unnest() in the query, or array_to_json(col) and vyto/json.
+// ─────────────────────────────────────────────────────────────────────────────
+
+import { Value, dbNull, dbInt, dbFloat, dbText, dbBlob,
+         DB_NULL, DB_INT, DB_FLOAT, DB_TEXT, DB_BLOB } from "vyto/db/value";
+import { PgParam, pgParamNull, pgParamText, pgParamBinary,
+         FMT_TEXT, FMT_BINARY, sliceText } from "vyto/db/pgsql/proto";
+import { byteWriter, parseIntOr, parseFloatOr, exactFloatText,
+         readF32BE, inf, nan } from "vyto/db/wire";
+import { readF64BE } from "vyto/mmap/decode";
+import { hex_encode, strBytes } from "vyto/crypto";
+
+// ---- the OIDs that get special treatment -----------------------------------
+//
+// Anything not named here decodes as text, which is why this list is short and
+// why an unknown or extension type needs no entry.
+
+export const OID_BOOL:        int = 16;
+export const OID_BYTEA:       int = 17;
+export const OID_CHAR:        int = 18;
+export const OID_NAME:        int = 19;
+export const OID_INT8:        int = 20;
+export const OID_INT2:        int = 21;
+export const OID_INT4:        int = 23;
+export const OID_TEXT:        int = 25;
+export const OID_OID:         int = 26;
+export const OID_XID:         int = 28;
+export const OID_CID:         int = 29;
+export const OID_JSON:        int = 114;
+export const OID_FLOAT4:      int = 700;
+export const OID_FLOAT8:      int = 701;
+export const OID_UNKNOWN:     int = 705;
+export const OID_MONEY:       int = 790;
+export const OID_BPCHAR:      int = 1042;
+export const OID_VARCHAR:     int = 1043;
+export const OID_DATE:        int = 1082;
+export const OID_TIME:        int = 1083;
+export const OID_TIMESTAMP:   int = 1114;
+export const OID_TIMESTAMPTZ: int = 1184;
+export const OID_INTERVAL:    int = 1186;
+export const OID_TIMETZ:      int = 1266;
+export const OID_NUMERIC:     int = 1700;
+export const OID_UUID:        int = 2950;
+export const OID_JSONB:       int = 3802;
+
+// Which wire format to ask for, per column. See the header: text for
+// everything except the two float types, whose exact value is only available
+// as bits.
+export fn resultFormatFor(oid: int): int {
+    if (oid == OID_FLOAT4 || oid == OID_FLOAT8) { return FMT_BINARY; }
+    return FMT_TEXT;
+}
+
+// The kind a column of this type will produce. Lets a caller size up a result
+// without a row in hand; the driver itself does not need it.
+export fn kindFor(oid: int): int {
+    if (oid == OID_BOOL || oid == OID_INT2 || oid == OID_INT4 || oid == OID_INT8
+        || oid == OID_OID || oid == OID_XID || oid == OID_CID) { return DB_INT; }
+    if (oid == OID_FLOAT4 || oid == OID_FLOAT8) { return DB_FLOAT; }
+    if (oid == OID_BYTEA) { return DB_BLOB; }
+    return DB_TEXT;
+}
+
+// ---- decoding --------------------------------------------------------------
+
+// One field of a DataRow. `raw` null means SQL NULL — which is distinct from a
+// zero-length value, the empty string.
+export fn decodeValue(oid: int, format: int, raw: byte[]): Value {
+    if (raw == null) { return dbNull(); }
+    if (format == FMT_BINARY) { return decodeBinary(oid, raw); }
+    return decodeText(oid, raw);
+}
+
+export fn decodeText(oid: int, raw: byte[]): Value {
+    if (raw == null) { return dbNull(); }
+
+    if (oid == OID_BOOL) {
+        // 't' / 'f'. Value.asBool reads DB_INT (value.vt:78), so a bool has to
+        // arrive as an int to be readable as one.
+        if (raw.len > 0 && raw[0] == 116 as byte) { return dbInt(1); }
+        return dbInt(0);
+    }
+
+    if (oid == OID_INT2 || oid == OID_INT4 || oid == OID_INT8
+        || oid == OID_OID || oid == OID_XID || oid == OID_CID) {
+        return dbInt(parseIntOr(sliceText(raw, 0, raw.len), 0));
+    }
+
+    if (oid == OID_FLOAT4 || oid == OID_FLOAT8) {
+        // Only reachable when something asked for text anyway; the driver
+        // requests binary for these.
+        return dbFloat(parseFloatOr(sliceText(raw, 0, raw.len), 0.0));
+    }
+
+    if (oid == OID_BYTEA) { return dbBlob(decodeByteaText(raw)); }
+
+    // numeric, json, jsonb, uuid, every date/time type, inet, arrays, money,
+    // and everything unknown: the server's own rendering, verbatim.
+    return dbText(sliceText(raw, 0, raw.len));
+}
+
+export fn decodeBinary(oid: int, raw: byte[]): Value {
+    if (raw == null) { return dbNull(); }
+
+    if (oid == OID_FLOAT8) {
+        if (raw.len < 8) { return dbFloat(0.0); }
+        return dbFloat(readF64BE(raw, 0));
+    }
+    if (oid == OID_FLOAT4) {
+        if (raw.len < 4) { return dbFloat(0.0); }
+        return dbFloat(readF32BE(raw, 0));
+    }
+    if (oid == OID_BOOL) {
+        if (raw.len < 1 || raw[0] == 0 as byte) { return dbInt(0); }
+        return dbInt(1);
+    }
+    if (oid == OID_INT2) { return dbInt(beInt(raw, 2)); }
+    if (oid == OID_INT4 || oid == OID_OID) { return dbInt(beInt(raw, 4)); }
+    if (oid == OID_INT8) { return dbInt(beInt(raw, 8)); }
+    if (oid == OID_BYTEA) { return dbBlob(raw); }
+
+    // Nothing else is ever requested in binary, so this is a safety net rather
+    // than a path: hand the bytes back rather than inventing a reading of them.
+    return dbBlob(raw);
+}
+
+// Signed big-endian integer of `n` bytes.
+fn beInt(b: byte[], n: int): int {
+    if (b.len < n) { return 0; }
+    let v = 0;
+    let i = 0;
+    while (i < n) { v = (v << 8) | (b[i] as int); i += 1; }
+    // Sign-extend from the top bit of the value's own width.
+    if (n < 8) {
+        let signBit = 1 << (n * 8 - 1);
+        if ((v & signBit) != 0) { v -= (1 << (n * 8)); }
+    }
+    return v;
+}
+
+// bytea's text output, which since PostgreSQL 9.0 is hex: a literal "\x"
+// followed by two hex digits per byte. The older "escape" format is still
+// possible if bytea_output is set to it, so both are handled.
+export fn decodeByteaText(raw: byte[]): byte[] {
+    if (raw.len >= 2 && raw[0] == 92 as byte && raw[1] == 120 as byte) {   // '\' 'x'
+        let n = (raw.len - 2) / 2;
+        let out = bytes(n);
+        let i = 0;
+        while (i < n) {
+            let hi = hexVal(raw[2 + i * 2] as int);
+            let lo = hexVal(raw[3 + i * 2] as int);
+            if (hi < 0 || lo < 0) { return bytes(0); }
+            out[i] = ((hi << 4) | lo) as byte;
+            i += 1;
+        }
+        return out;
+    }
+    return decodeByteaEscape(raw);
+}
+
+// The legacy escape format: printable bytes literally, a backslash doubled, and
+// anything else as a backslash plus three octal digits.
+fn decodeByteaEscape(raw: byte[]): byte[] {
+    let out = bytes(0);
+    let i = 0;
+    while (i < raw.len) {
+        let c = raw[i] as int;
+        if (c != 92) { out.push(c as byte); i += 1; continue; }   // not a backslash
+        if (i + 1 < raw.len && raw[i + 1] == 92 as byte) {
+            out.push(92 as byte);
+            i += 2;
+            continue;
+        }
+        if (i + 3 < raw.len) {
+            let a = (raw[i + 1] as int) - 48;
+            let b = (raw[i + 2] as int) - 48;
+            let d = (raw[i + 3] as int) - 48;
+            if (a >= 0 && a <= 7 && b >= 0 && b <= 7 && d >= 0 && d <= 7) {
+                out.push(((a << 6) | (b << 3) | d) as byte);
+                i += 4;
+                continue;
+            }
+        }
+        out.push(92 as byte);
+        i += 1;
+    }
+    return out;
+}
+
+fn hexVal(c: int): int {
+    if (c >= 48 && c <= 57) { return c - 48; }        // 0-9
+    if (c >= 97 && c <= 102) { return c - 87; }       // a-f
+    if (c >= 65 && c <= 70) { return c - 55; }        // A-F
+    return -1;
+}
+
+// ---- encoding --------------------------------------------------------------
+
+// Turn a bound Value into a Bind parameter, using the type the server inferred.
+//
+// `oid` comes from the ParameterDescription that Describe returned at prepare
+// time, so binary is only ever used where the server has already told us the
+// exact type. An oid of 0 means it could not infer one, and everything falls
+// back to text.
+export fn encodeParam(oid: int, v: Value): PgParam {
+    if (v == null || v.kind == DB_NULL) { return pgParamNull(); }
+
+    if (v.kind == DB_FLOAT) {
+        // float8: send the bits. Exact, and no decimal conversion on either
+        // side. float4 is deliberately NOT sent as binary — that would need a
+        // 32-bit encoder, and exact decimal text rounds to the same float4.
+        if (oid == OID_FLOAT8) { return pgParamBinary(byteWriter(8).f64be(v.f).take()); }
+        // NEVER str(v.f) here: that is "%g", six significant digits
+        // (runtime/vyto_rt.c:749), which would silently truncate the value.
+        return pgParamText(strBytes(exactFloatText(v.f)));
+    }
+
+    if (v.kind == DB_INT) {
+        // Decimal text is exact for an integer, and works whatever the server
+        // inferred — int2, int8, numeric, or a bool column.
+        if (oid == OID_BOOL) {
+            if (v.i != 0) { return pgParamText(strBytes("t")); }
+            return pgParamText(strBytes("f"));
+        }
+        return pgParamText(strBytes(str(v.i)));
+    }
+
+    if (v.kind == DB_BLOB) {
+        let b = v.b;
+        if (b == null) { return pgParamNull(); }
+        // Binary avoids the 2x expansion of hex, but only when we know the
+        // server is expecting bytea.
+        if (oid == OID_BYTEA) { return pgParamBinary(b); }
+        return pgParamText(strBytes("\\x" + hex_encode(b)));
+    }
+
+    // DB_TEXT: the bytes as they are. Binary-safe — a string carries its own
+    // length, so an interior NUL is sent rather than ending the value.
+    return pgParamText(strBytes(v.s));
+}

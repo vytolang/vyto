@@ -638,7 +638,8 @@ everything else is pure Vyto.
 |--------|-------------------|
 | `vyto/db` | SQL without writing SQL: `select`/`insert`/`update`/`deleteFrom` and a `table(...)` schema builder, both rendered per dialect. `Db`, `Result`, `Cursor` and a `Tx` that rolls back in `deinit` if you return without committing. Values are always bound, never interpolated. Reads a schema back out too — `db.describe("users")` gives you columns, keys, indexes and foreign keys |
 | `vyto/db/sqlite` ⚙ | the SQLite driver — **the amalgamation is vendored**, so it builds on a fresh clone with no `-dev` package. A `Row` copies its cells, so it outlives the statement, the connection, and the `Db`. `apps/db_test` loads a hundred million rows through it and serves them |
-| `vyto/db/pgsql` · `vyto/db/mysql` | declared and fully stubbed; every entry panics. Their dialects are real and usable today |
+| `vyto/db/pgsql` | the PostgreSQL driver — **pure Vyto**, speaking the v3 wire protocol over a socket. No libpq, no `native/`, nothing to install, and no GPL question. SCRAM-SHA-256 and md5 authentication, per-column binary results so a `float8` is exact, and schema introspection over `pg_catalog`. Plaintext only until `vyto/crypto/openssl` exists. `examples/105_pgwire.vt` asserts all of it — 326 assertions — against a recorded transcript, with no PostgreSQL installed |
+| `vyto/db/mysql` | declared and fully stubbed; every entry panics. Its dialect is real and usable today |
 | `vyto/data/frame` ⚙ | a native columnar `DataFrame` for Excel-scale data — millions of rows with sort, filter, group-by and join that stay sub-second, strings interned into a shared arena |
 
 **Internationalization** — `vyto/intl` ⚙ (ICU-backed)

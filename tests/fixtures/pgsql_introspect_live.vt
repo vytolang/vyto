@@ -1,0 +1,298 @@
+// pgsql_introspect_live — the six PgDialect introspection queries against a
+// real server.
+//
+// Driven by tests/run_tests_pgsql.sh; reads the DSN from $VYTO_PG_DSN.
+//
+// This is the counterpart to examples/104_introspect.vt, which does the same
+// against SQLite. The point is that the SAME reader code in vyto/db/introspect
+// has to produce the same records from either engine — the queries differ, the
+// by-index result contracts do not.
+//
+// It is also the ONLY thing that can settle two questions no offline test can:
+// whether PostgreSQL accepts these queries at all, and whether indoption and
+// indcollation really are 0-subscripted (they are int2vector and oidvector,
+// unlike every ordinary PostgreSQL array). Get that wrong and DESC index
+// columns and collations are silently reported against the neighbouring column.
+//
+// The fixture schema is deliberately awkward: a composite primary key declared
+// in reverse column order, a partial index, an expression index, a DESC index
+// column, an INCLUDE column, a two-column foreign key with ON DELETE CASCADE, a
+// stored generated column, a view, and a trigger.
+
+import { Db, TableInfo, ColumnInfo, IndexInfo, IndexColumn, ForeignKey, TriggerInfo,
+         OBJ_TABLE, OBJ_VIEW, IDX_PK, IDX_UNIQUE, IDX_APPDEF,
+         HID_NONE, HID_STORED } from "vyto/db";
+import { pgsql, PgConn } from "vyto/db/pgsql";
+import { getenv } from "vyto/os";
+
+fn check(name: string, got: string, want: string) {
+    if (got == want) { print("ok    " + name); }
+    else {
+        print("FAIL  " + name);
+        print("  got  " + got);
+        print("  want " + want);
+    }
+}
+
+fn checkBool(name: string, got: bool) {
+    if (got) { print("ok    " + name); }
+    else { print("FAIL  " + name); }
+}
+
+const SCHEMA: string = "vyto_introspect_test";
+
+fn main() {
+    let dsn = getenv("VYTO_PG_DSN");
+    if (dsn == "") { print("FAIL  VYTO_PG_DSN is not set"); return; }
+
+    let db = new Db(pgsql(dsn).applicationName("vyto-introspect-test"));
+    if (!db.ok()) { print("FAIL  could not connect: " + db.error()); return; }
+
+    checkBool("the dialect claims introspection", db.supportsIntrospection());
+
+    db.execRaw("DROP SCHEMA IF EXISTS " + SCHEMA + " CASCADE");
+    db.execRaw("CREATE SCHEMA " + SCHEMA);
+    db.execRaw("SET search_path TO " + SCHEMA);
+
+    setup(db);
+    tables(db);
+    columns(db);
+    indexes(db);
+    foreignKeys(db);
+    objects(db);
+
+    db.execRaw("DROP SCHEMA " + SCHEMA + " CASCADE");
+}
+
+fn setup(db: Db) {
+    // A composite primary key whose members are declared in the OPPOSITE order
+    // to the column order. If pkPos came from column position rather than from
+    // the key's own ordinal, this is where it shows.
+    db.execRaw("CREATE TABLE parent ("
+               + " a int NOT NULL,"
+               + " b int NOT NULL,"
+               + " label text DEFAULT 'none',"
+               + " amount numeric(19,4),"
+               + " payload bytea,"
+               + " tag uuid,"
+               + " doc jsonb,"
+               + " total numeric(19,4) GENERATED ALWAYS AS (amount * 2) STORED,"
+               + " PRIMARY KEY (b, a))");
+
+    db.execRaw("CREATE TABLE child ("
+               + " id bigserial PRIMARY KEY,"
+               + " pa int, pb int, name text, active boolean DEFAULT true,"
+               + " FOREIGN KEY (pa, pb) REFERENCES parent (a, b)"
+               + " ON DELETE CASCADE ON UPDATE RESTRICT)");
+
+    db.execRaw("CREATE UNIQUE INDEX child_name_uq ON child (name)");
+    db.execRaw("CREATE INDEX child_partial ON child (pa) WHERE active");
+    db.execRaw("CREATE INDEX child_desc ON child (pa DESC, pb ASC)");
+    db.execRaw("CREATE INDEX child_expr ON child (lower(name))");
+    db.execRaw("CREATE INDEX child_include ON child (pa) INCLUDE (name)");
+
+    db.execRaw("CREATE VIEW active_children AS SELECT id, name FROM child WHERE active");
+
+    db.execRaw("CREATE FUNCTION touch() RETURNS trigger AS"
+               + " $$ BEGIN RETURN NEW; END $$ LANGUAGE plpgsql");
+    db.execRaw("CREATE TRIGGER child_touch BEFORE UPDATE ON child"
+               + " FOR EACH ROW EXECUTE FUNCTION touch()");
+}
+
+fn tables(db: Db) {
+    print("---- tables and views ----");
+
+    let ts = db.tables();
+    checkBool("parent is listed", has(ts, "parent"));
+    checkBool("child is listed", has(ts, "child"));
+    // The kind CASE must emit SQLite's words, or these land in the wrong list.
+    checkBool("the view is NOT in tables()", !has(ts, "active_children"));
+    checkBool("the view IS in views()", has(db.views(), "active_children"));
+    // pg_catalog and information_schema are filtered in the query's WHERE,
+    // because isInternalName only knows about "sqlite_".
+    checkBool("no catalog tables leaked in", !has(ts, "pg_class"));
+    checkBool("no information_schema tables leaked in", !has(ts, "tables"));
+
+    checkBool("hasTable finds one", db.hasTable("child"));
+    checkBool("hasTable rejects a missing one", !db.hasTable("nope"));
+}
+
+fn columns(db: Db) {
+    print("---- columns ----");
+
+    let t = db.describe("parent");
+    checkBool("parent was described", t.exists());
+    check("column count", str(t.cols.len), "8");
+
+    // cid must be 0-based to line up with what the index queries report.
+    check("first column is cid 0", str(t.cols[0].cid), "0");
+    check("first column name", t.cols[0].name, "a");
+
+    // The whole point of taking the ordinal from unnest(indkey) WITH ORDINALITY
+    // rather than from column position: the key is (b, a), not (a, b).
+    let pk = t.primaryKey();
+    check("primary key column count", str(pk.len), "2");
+    check("primary key is in KEY order, not column order",
+          pk[0].name + "," + pk[1].name, "b,a");
+
+    let a = t.column("a");
+    check("a's pkPos", str(a.pkPos), "2");
+    let b = t.column("b");
+    check("b's pkPos", str(b.pkPos), "1");
+    checkBool("a is a pk member", a.isPk());
+
+    let label = t.column("label");
+    checkBool("label has a default", label.hasDefault);
+    checkBool("amount has no default", !t.column("amount").hasDefault);
+    checkBool("a is NOT NULL", a.notNull);
+    checkBool("label is nullable", !label.notNull);
+
+    // attgenerated 's' maps to HID_STORED.
+    let total = t.column("total");
+    checkBool("the generated column is marked generated", total.isGenerated());
+    check("as STORED", str(total.hidden), str(HID_STORED));
+    checkBool("an ordinary column is not hidden", label.hidden == HID_NONE);
+
+    // declType is format_type() output, and kindGuess has to cope with the
+    // Postgres spellings.
+    check("bytea guesses blob", t.column("payload").kindName(), "blob");
+    check("uuid guesses text", t.column("tag").kindName(), "text");
+    check("jsonb guesses text", t.column("doc").kindName(), "text");
+    check("numeric guesses real", t.column("amount").kindName(), "real");
+    check("int guesses int", a.kindName(), "int");
+}
+
+fn indexes(db: Db) {
+    print("---- indexes ----");
+
+    let t = db.describe("child");
+    checkBool("child was described", t.exists());
+
+    let uq = findIndex(t, "child_name_uq");
+    checkBool("the unique index was found", uq.exists());
+    checkBool("and is unique", uq.unique);
+    check("its origin is app-defined", str(uq.origin), str(IDX_APPDEF));
+
+    let partial = findIndex(t, "child_partial");
+    checkBool("the partial index is marked partial", partial.partial);
+    checkBool("the plain one is not", !findIndex(t, "child_desc").partial);
+
+    // THE assertion this fixture exists for. indoption is an int2vector and is
+    // 0-subscripted; if it were read as an ordinary 1-based array, the DESC flag
+    // would be reported against the wrong column — and pa DESC, pb ASC is
+    // chosen so the two columns disagree.
+    let desc = findIndex(t, "child_desc");
+    check("the DESC index has two columns", str(desc.cols.len), "2");
+    check("first column", desc.cols[0].name, "pa");
+    checkBool("first column is DESC", desc.cols[0].desc);
+    check("second column", desc.cols[1].name, "pb");
+    checkBool("second column is ASC", !desc.cols[1].desc);
+
+    // An expression column has attnum 0, so no name and cid -1.
+    let expr = findIndex(t, "child_expr");
+    checkBool("the expression index was found", expr.exists());
+    checkBool("its column is an expression", expr.cols[0].isExpression());
+    check("with no column name", "[" + expr.cols[0].name + "]", "[]");
+
+    // indnkeyatts separates real key columns from INCLUDE columns.
+    let inc = findIndex(t, "child_include");
+    check("the INCLUDE index reports both columns", str(inc.cols.len), "2");
+    check("but only one is a key column", str(inc.keyColumns().len), "1");
+    check("and it is the right one", inc.keyColumns()[0].name, "pa");
+
+    // The primary key's backing index is reported with origin 'pk'.
+    let pkIdx = pkIndex(t);
+    checkBool("the primary key index was found", pkIdx.exists());
+    check("its origin is pk", str(pkIdx.origin), str(IDX_PK));
+    checkBool("and it counts as implicit", pkIdx.isImplicit());
+}
+
+fn foreignKeys(db: Db) {
+    print("---- foreign keys ----");
+
+    let t = db.describe("child");
+    check("one foreign key", str(distinctFkIds(t)), "1");
+    check("spanning two columns", str(t.fks.len), "2");
+
+    let f0 = t.fks[0];
+    let f1 = t.fks[1];
+    check("both belong to the same constraint", str(f0.id) + "," + str(f1.id), "0,0");
+    check("in declaration order", str(f0.seq) + "," + str(f1.seq), "0,1");
+    check("referencing parent", f0.refTable, "parent");
+    check("from columns", f0.fromCol + "," + f1.fromCol, "pa,pb");
+    check("to columns", f0.toCol + "," + f1.toCol, "a,b");
+    // The action words must match what SQLite's pragma emits, verbatim.
+    check("on delete", f0.onDelete, "CASCADE");
+    check("on update", f0.onUpdate, "RESTRICT");
+}
+
+fn objects(db: Db) {
+    print("---- schema objects ----");
+
+    // db.vt compares this against the literal "trigger".
+    let trs = db.triggers();
+    checkBool("the trigger is listed", hasTrigger(trs, "child_touch"));
+    // NOT tgisinternal drops the RI_ConstraintTrigger_* pair that backs the
+    // foreign key; without it these would show up as user triggers.
+    checkBool("the foreign key's internal triggers are not listed",
+              !anyTriggerStartsWith(trs, "RI_ConstraintTrigger"));
+
+    // PostgreSQL stores no DDL text for a table — pg_dump reconstructs it — so
+    // this is empty by design, while a view has a real definition.
+    let t = db.describe("child");
+    check("a table has no stored DDL", "[" + t.sql + "]", "[]");
+    let v = db.objectSql("active_children");
+    checkBool("a view does have a definition", v.index_of("CREATE VIEW") >= 0);
+}
+
+// ---- little helpers --------------------------------------------------------
+
+fn has(xs: string[], name: string): bool {
+    let i = 0;
+    while (i < xs.len) { if (xs[i] == name) { return true; } i += 1; }
+    return false;
+}
+
+fn hasTrigger(xs: TriggerInfo[], name: string): bool {
+    let i = 0;
+    while (i < xs.len) { if (xs[i].name == name) { return true; } i += 1; }
+    return false;
+}
+
+fn anyTriggerStartsWith(xs: TriggerInfo[], p: string): bool {
+    let i = 0;
+    while (i < xs.len) { if (xs[i].name.starts_with(p)) { return true; } i += 1; }
+    return false;
+}
+
+fn findIndex(t: TableInfo, name: string): IndexInfo {
+    let i = 0;
+    while (i < t.indexes.len) {
+        if (t.indexes[i].name == name) { return t.indexes[i]; }
+        i += 1;
+    }
+    return new IndexInfo("", "");
+}
+
+fn pkIndex(t: TableInfo): IndexInfo {
+    let i = 0;
+    while (i < t.indexes.len) {
+        if (t.indexes[i].origin == IDX_PK) { return t.indexes[i]; }
+        i += 1;
+    }
+    return new IndexInfo("", "");
+}
+
+fn distinctFkIds(t: TableInfo): int {
+    let seen: int[] = [];
+    let i = 0;
+    while (i < t.fks.len) {
+        let id = t.fks[i].id;
+        let found = false;
+        let j = 0;
+        while (j < seen.len) { if (seen[j] == id) { found = true; } j += 1; }
+        if (!found) { seen.push(id); }
+        i += 1;
+    }
+    return seen.len;
+}

@@ -1,63 +1,707 @@
-// vyto/db/pgsql — PostgreSQL driver. DECLARED, NOT IMPLEMENTED.
+// vyto/db/pgsql — a PostgreSQL driver, speaking the v3 wire protocol directly.
 //
-// Every entry point panics. The shape is here so the interface a real driver
-// must satisfy is reviewable, and so that reaching for Postgres fails at the
-// first call with the module name in the message rather than silently returning
-// empty result sets.
+//     import { Db, select, dbText } from "vyto/db";
+//     import { pgsql } from "vyto/db/pgsql";
 //
-//     let db = new Db(pgsql("postgres://localhost/app"));   // panics
+//     let db = new Db(pgsql("postgres://ada@localhost/app"));
+//     if (!db.ok()) { print(db.error()); return; }
+//     let r = db.all(select("users").where("active", dbText("t")).orderBy("id"));
 //
-// ── WHY IT IS ITS OWN PACKAGE DIRECTORY ─────────────────────────────────────
-// Not style. Native sources compile per package DIRECTORY for every module in
-// it, and `#link` attaches to the module. A real implementation adds
-// `#link "pq" if "linux"` here — and because `vyto/db` imports no driver, that
-// link reaches only programs that actually import this file. Putting it beside
-// db.vt would force libpq onto every consumer of the package.
-// ─────────────────────────────────────────────────────────────────────────────
+// ── NO libpq ────────────────────────────────────────────────────────────────
+// This package contains no native/ directory and links no library. It talks to
+// the server over vyto/net/socket, which buys three things a binding could not:
+// nothing has to be provisioned, so the tests cannot silently skip on a fresh
+// clone the way the blend2d and ICU ones do; there is no GPL/LGPL question
+// about a shipped client library; and the socket is ours, which is the only
+// route to the non-blocking reactor integration described below.
 //
-// ── WHAT IMPLEMENTING IT COSTS, BEYOND THE BINDING ──────────────────────────
-// The libpq binding is the easy half. The half that matters:
+// ── WHAT THIS COSTS, HONESTLY ───────────────────────────────────────────────
 //
-//   * EVERY QUERY PARKS THE WORKER. libpq's synchronous API blocks, Vyto has no
-//     threads, and vyto/net/server is a pre-fork reactor — so a query holds up
-//     that worker and every connection on it. SQLite does not have this problem
-//     because it is a local file read. Sizing becomes
-//     workers ~= cores / (1 - blocked_fraction), which is cover for parked
-//     workers rather than a tuning knob. The real fix is non-blocking outbound
-//     I/O (PQsendQuery + the connection fd in the reactor's poll set), which is
-//     a larger piece of work than the driver itself.
+//   * EVERY QUERY PARKS THE WORKER. There are no threads, and vyto/net/server
+//     is a pre-fork reactor, so a query holds up that worker and every
+//     connection on it. Sizing becomes workers ~= cores / (1 - blocked_fraction),
+//     which is cover for parked workers rather than a tuning knob.
+//
+//     The transport underneath is already non-blocking — WireIo drives a
+//     non-blocking socket through a PollSet, and PgConn.io() hands out the fd.
+//     What is blocking is this API, and it has to be: Stmt.step() returns
+//     STEP_ROW/STEP_DONE/STEP_ERR with no STEP_WOULDBLOCK (driver.vt:51-53),
+//     and both Cursor.next() and Db.raw()'s loop treat anything that is not a
+//     row as terminal. A non-blocking client is an ADDITIVE api on PgConn, not
+//     a reinterpretation of this one, and the seam for it is already here.
+//
 //   * NO CONNECTION POOL IS POSSIBLE. Pre-fork workers share nothing, so it is
 //     one connection per worker held for the worker's life. Sixteen workers
 //     across four app servers is 64 connections before any traffic, against a
 //     default max_connections of 100.
-//   * TYPE MAPPING IS NOT FIVE KINDS. libpq returns everything as text by
-//     default, and binary mode needs per-OID decoding. Value's five kinds cover
-//     what SQL portably has; arrays, JSONB, numeric, and timestamptz all need a
-//     decision about which one they become.
 //
-// PgDialect already ships in vyto/db/dialect and is fully usable — you can
-// render and test Postgres SQL today from a program that links only SQLite.
-// Only the transport is missing.
+//   * NO TLS. lib/vyto/crypto/openssl is a stub in which every entry point
+//     panics, so this connects in the clear. sslMode("require") is refused
+//     rather than silently downgraded. That rules out most managed providers
+//     (RDS, Neon, Supabase) until the shim exists; the place it plugs in is
+//     WireIo.requestSsl(), which is written and returns false.
+//
+//   * ONE CURSOR AT A TIME, really. The protocol cannot interleave two portals
+//     on one connection. Opening a second statement while a Cursor is live
+//     drains the cursor's remaining rows into memory so it keeps working —
+//     correct, and bounded by drainCap(), but it stops being streaming.
+//
+// ── TWO BEHAVIOURS THAT DIFFER FROM SQLITE ──────────────────────────────────
+//
+//   1. A FAILED STATEMENT POISONS THE TRANSACTION. After any error inside a
+//      transaction PostgreSQL rejects every further statement with 25P02 until
+//      ROLLBACK. SQLite lets you carry on after a constraint violation, so code
+//      that catches a duplicate-key error and continues inside the same Tx
+//      works on SQLite and fails here. 25P02 maps to DBERR_MISUSE to make it
+//      read as the programming error it is. Tx.deinit's rollback recovers.
+//
+//   2. lastInsertId() IS ALWAYS 0 on PostgreSQL 12 and later. OIDs on ordinary
+//      tables were removed in 12, and the INSERT tag's oid field — the only
+//      thing the protocol offers — has been 0 ever since. This is not a gap in
+//      this driver; there is nothing to report. Ask for the key instead:
+//
+//          let r = db.exec(insert("users").set("name", dbText("ada"))
+//                                         .returning("id"));
+//          let id = r.first().getInt("id");
+//
+//      which is exact, works for non-integer and composite keys, and does not
+//      depend on the insert being the last statement on the connection.
+//      PgDialect.supportsReturning() is true.
+//
+// ── numeric AND ARRAYS COME BACK AS TEXT ────────────────────────────────────
+// Value has five kinds and neither an exact decimal nor a list is among them.
+// A numeric column reads as text — parse it, or cast it in SQL with ::float8 if
+// a double is genuinely what you want. Note asFloat() returns 0.0 on a text
+// Value by design (value.vt:70-74), so the cast is not optional if you want a
+// number. Arrays read as the server's literal, `{1,2,3}`; use unnest() in the
+// query or array_to_json(col) with vyto/json. See vyto/db/pgsql/pgtype.
 // ─────────────────────────────────────────────────────────────────────────────
 
-import { Driver, Conn } from "vyto/db/driver";
-import { Dialect, pgDialect } from "vyto/db/dialect";
+import { Driver, Conn, Stmt, STEP_ROW, STEP_DONE, STEP_ERR,
+         DBERR_NONE, DBERR_OPEN, DBERR_SQL, DBERR_CLOSED, DBERR_MISUSE,
+         DBERR_UNSUPPORTED } from "vyto/db/driver";
+import { Dialect, PgDialect, pgDialect } from "vyto/db/dialect";
+import { Value, dbNull, DB_NULL } from "vyto/db/value";
+import { WireIo } from "vyto/db/wire/io";
+import { SockIo, dialTcp } from "vyto/db/wire/io";
+import { Dsn, parseDsn } from "vyto/db/wire";
+import { PgSession, PgRowBuffer, PgPrepared, PgMsg } from "vyto/db/pgsql/session";
+import { PgColumn, PgRow, PgParam, decodeDataRow, decodeError,
+         decodeCommandComplete, decodeRowDescription, decodeReadyForQuery,
+         B_DATA_ROW, B_CMD_COMPLETE, B_BIND_DONE, B_ERROR, B_READY,
+         B_EMPTY_QUERY, B_PORTAL_SUSP, B_ROW_DESC, B_NO_DATA,
+         FMT_TEXT } from "vyto/db/pgsql/proto";
+import { decodeValue, encodeParam, resultFormatFor } from "vyto/db/pgsql/pgtype";
+
+const DEFAULT_PORT: int = 5432;
+
+// ---------------------------------------------------------------------------
+// Statement
+// ---------------------------------------------------------------------------
+
+export class PgStmt extends Stmt {
+    sess: PgSession;      // strong — the SAME object PgConn holds. NOT a PgConn.
+    id: int;              // this statement's serial; 0 is "nobody"
+    name: string;         // server-side statement name; "" once closed
+    cols: PgColumn[];
+    paramOids: int[];
+    params: Value[];
+    sink: PgRowBuffer;    // strong; inert, so the session may hold it too
+    cur: PgRow;
+    started: bool;
+    finished: bool;
+    localCode: int;       // a misuse we detected before the wire was involved
+    localMsg: string;
+    retried: bool;        // the cached-plan retry has been spent
+
+    fn init(sess: PgSession, id: int, name: string, sql: string,
+            cols: PgColumn[], paramOids: int[]) {
+        // The base class's fields are assigned directly rather than through
+        // super — same as SqliteStmt.init (sqlite.vt:90-94).
+        this.sql = sql;
+        this.busy = false;
+        this.sess = sess;
+        this.id = id;
+        this.name = name;
+        this.cols = cols;
+        this.paramOids = paramOids;
+        this.params = [];
+        this.sink = new PgRowBuffer();
+        this.cur = null;
+        this.started = false;
+        this.finished = false;
+        this.localCode = DBERR_NONE;
+        this.localMsg = "";
+        this.retried = false;
+    }
+
+    fn alive(): bool { return this.sess != null && this.sess.open && this.name != ""; }
+
+    fn misuse(msg: string): bool {
+        this.localCode = DBERR_MISUSE;
+        this.localMsg = msg;
+        return false;
+    }
+
+    // Purely local — no wire traffic at all, which is a real improvement over
+    // the FFI call per bind that a libpq or SQLite binding pays.
+    override fn bind(i: int, v: Value): bool {
+        if (!this.alive()) { return this.misuse("the statement is not prepared"); }
+        if (i < 1) { return this.misuse("bind index " + str(i) + " is below 1"); }
+        if (i > this.paramOids.len) {
+            return this.misuse("bind index " + str(i) + " but the statement takes "
+                               + str(this.paramOids.len) + " parameters");
+        }
+        while (this.params.len < i) { this.params.push(dbNull()); }
+        this.params[i - 1] = v;
+        this.localCode = DBERR_NONE;
+        this.localMsg = "";
+        return true;
+    }
+
+    override fn columnCount(): int { return this.cols.len; }
+
+    override fn columnName(i: int): string {
+        if (i < 0 || i >= this.cols.len) { return ""; }
+        return this.cols[i].name;
+    }
+
+    override fn columnValue(i: int): Value {
+        if (this.cur == null || i < 0 || i >= this.cols.len) { return dbNull(); }
+        // Decoded lazily and copied: a Cursor over a forty-column table whose
+        // caller reads two columns should pay for two, and the row body is
+        // replaced by the next step() so the bytes cannot be borrowed.
+        return decodeValue(this.cols[i].typeOid, this.cols[i].format, this.cur.field(i));
+    }
+
+    override fn step(): int {
+        if (this.finished) { return STEP_DONE; }
+        if (!this.alive()) { return STEP_ERR; }
+
+        if (!this.started) {
+            if (!this.beginExecute()) { return STEP_ERR; }
+            this.started = true;
+        }
+
+        // Rows parked by a drain come first: we were evicted from the wire
+        // while a second statement used it, and these are ours, in order.
+        if (this.sink.pending() > 0) {
+            this.cur = decodeDataRow(this.sink.take());
+            return STEP_ROW;
+        }
+        if (this.sink.complete) {
+            this.finished = true;
+            this.cur = null;
+            if (this.sess.errCode != DBERR_NONE) { return STEP_ERR; }
+            return STEP_DONE;
+        }
+
+        return this.pump();
+    }
+
+    // Read from the wire until something decisive happens.
+    fn pump(): int {
+        while (true) {
+            let m = this.sess.nextMessage();
+            if (m == null) { this.finished = true; return STEP_ERR; }
+
+            if (m.kind == B_DATA_ROW) {
+                this.cur = decodeDataRow(m.body);
+                return STEP_ROW;
+            }
+            if (m.kind == B_BIND_DONE) { continue; }
+            if (m.kind == B_ROW_DESC) {
+                // A re-describe after the cached-plan retry; take the new shape.
+                this.cols = decodeRowDescription(m.body);
+                continue;
+            }
+            if (m.kind == B_NO_DATA) { continue; }
+            if (m.kind == B_CMD_COMPLETE) {
+                this.sess.noteTag(decodeCommandComplete(m.body));
+                continue;
+            }
+            if (m.kind == B_EMPTY_QUERY) { continue; }
+            if (m.kind == B_PORTAL_SUSP) { continue; }   // never asked for
+            if (m.kind == B_ERROR) {
+                let e = decodeError(m.body);
+                this.sess.recordError(e);
+                // A cached plan whose result type changed under an ALTER TABLE.
+                // Re-parsing once turns "worked until we ran a migration" into
+                // a transparent retry.
+                if (e.sqlstate == "0A000" && !this.retried) {
+                    this.retried = true;
+                    if (this.sess.readToReady() && this.reprepare()) {
+                        this.sess.clearError();
+                        if (this.beginExecute()) { continue; }
+                    }
+                }
+                this.sess.readToReady();
+                this.sess.releaseWire(this.id);
+                this.finished = true;
+                this.cur = null;
+                return STEP_ERR;
+            }
+            if (m.kind == B_READY) {
+                this.sess.txStatus = decodeReadyForQuery(m.body);
+                this.sess.releaseWire(this.id);
+                this.finished = true;
+                this.cur = null;
+                if (this.sess.errCode != DBERR_NONE) { return STEP_ERR; }
+                return STEP_DONE;
+            }
+        }
+        return STEP_ERR;
+    }
+
+    fn beginExecute(): bool {
+        if (!this.sess.acquire(this.id, this.sink)) { return false; }
+        let ps: PgParam[] = [];
+        let i = 0;
+        while (i < this.paramOids.len) {
+            let v = dbNull();
+            if (i < this.params.len) { v = this.params[i]; }
+            ps.push(encodeParam(this.paramOids[i], v));
+            i += 1;
+        }
+        // Per-column result formats: binary for float4/float8, where it is the
+        // only way to get the exact value, and text for everything else, where
+        // it is the only way an unknown type can degrade gracefully.
+        let rf: int[] = [];
+        let k = 0;
+        while (k < this.cols.len) { rf.push(resultFormatFor(this.cols[k].typeOid)); k += 1; }
+        if (rf.len == 0) { rf.push(FMT_TEXT); }
+
+        // Record the format we asked for, so columnValue decodes what actually
+        // arrives rather than what the RowDescription said before Bind.
+        k = 0;
+        while (k < this.cols.len) { this.cols[k].format = rf[k]; k += 1; }
+
+        return this.sess.execute(this.name, ps, rf);
+    }
+
+    // Re-Parse and re-Describe after 0A000.
+    fn reprepare(): bool {
+        this.sess.closeStatement(this.name);
+        let p = this.sess.prepare(this.name, this.sql);
+        if (!p.ok) { return false; }
+        this.cols = p.cols;
+        this.paramOids = p.paramOids;
+        return true;
+    }
+
+    // Rewind for reuse. Bindings are cleared too, per driver.vt:80-83: a
+    // statement that kept a stale binding is a data-corruption bug waiting for
+    // the one call site that binds fewer parameters.
+    //
+    // No server round trip. The named statement is untouched; only the portal
+    // is, and the next Bind replaces it. That is the payoff for naming
+    // statements rather than reusing the unnamed one.
+    override fn reset() {
+        if (this.sess != null && this.sess.activeId == this.id) {
+            this.sess.drainActive();
+        }
+        this.params = [];
+        this.sink.reset();
+        this.cur = null;
+        this.started = false;
+        this.finished = false;
+        this.retried = false;
+        this.localCode = DBERR_NONE;
+        this.localMsg = "";
+    }
+
+    override fn finalize() {
+        if (this.name == "") { return; }
+        let n = this.name;
+        this.name = "";
+        if (this.sess != null && this.sess.open) {
+            this.sess.releaseWire(this.id);
+            this.sess.closeStatement(n);
+        }
+        this.cur = null;
+        this.sink.reset();
+    }
+
+    override fn errorCode(): int {
+        if (this.localCode != DBERR_NONE) { return this.localCode; }
+        if (this.sess == null) { return DBERR_CLOSED; }
+        return this.sess.errCode;
+    }
+
+    override fn errorMessage(): string {
+        if (this.localCode != DBERR_NONE) { return this.localMsg; }
+        if (this.sess == null) { return "statement is finalized"; }
+        if (this.sess.errMsg != "") { return this.sess.errMsg; }
+        if (!this.sess.open) { return "the connection is closed"; }
+        return "";
+    }
+
+    deinit { this.finalize(); }
+}
+
+// ---------------------------------------------------------------------------
+// Connection
+// ---------------------------------------------------------------------------
+
+export class PgConn extends Conn {
+    sess: PgSession;      // strong — the SAME object every PgStmt holds
+    dial: PgDialect;
+    openErr: string;
+    openCode: int;
+
+    cacheSql: string[];
+    cacheStmt: PgStmt[];
+    cacheCap: int;
+
+    fn init(sess: PgSession, openErr: string, openCode: int) {
+        this.sess = sess;
+        this.dial = pgDialect();
+        this.openErr = openErr;
+        this.openCode = openCode;
+        this.cacheSql = [];
+        this.cacheStmt = [];
+        this.cacheCap = 64;
+    }
+
+    override fn dialect(): Dialect { return this.dial; }
+
+    override fn isOpen(): bool { return this.sess != null && this.sess.open; }
+
+    override fn errorCode(): int {
+        if (this.sess == null) { return this.openCode; }
+        if (!this.sess.open && this.sess.errCode == DBERR_NONE) { return this.openCode; }
+        return this.sess.errCode;
+    }
+
+    override fn errorMessage(): string {
+        if (this.sess == null) { return this.openErr; }
+        if (this.sess.errMsg != "") { return this.sess.errMsg; }
+        if (!this.sess.open) { return this.openErr; }
+        return "";
+    }
+
+    // The raw five-character SQLSTATE of the last error.
+    //
+    // DBERR_* is coarse on purpose (driver.vt:28-29), but 23505 versus 23503 is
+    // a routing decision applications genuinely make, and a SQLSTATE is a code
+    // rather than prose — it does not change between server versions the way a
+    // message does.
+    fn sqlstate(): string {
+        if (this.sess == null) { return ""; }
+        return this.sess.errState;
+    }
+
+    // The last NoticeResponse. Not an error: a RAISE NOTICE, an index build
+    // report, "table will be created". Never sets the error state.
+    fn lastNotice(): string {
+        if (this.sess == null) { return ""; }
+        return this.sess.noticeMsg;
+    }
+
+    // A server runtime parameter as reported by ParameterStatus — server_version,
+    // client_encoding, TimeZone, and anything a SET has changed since.
+    fn serverParam(name: string): string {
+        if (this.sess == null) { return ""; }
+        return this.sess.param(name);
+    }
+
+    fn backendPid(): int {
+        if (this.sess == null) { return 0; }
+        return this.sess.backendPid;
+    }
+
+    // The transport, for a caller building something this API does not cover.
+    // Db.conn() exists so a driver feature does not require forking the Db
+    // (db.vt:261-263); this is that, and it is where a reactor port starts.
+    fn io(): WireIo {
+        if (this.sess == null) { return null; }
+        return this.sess.io;
+    }
+
+    override fn prepare(sql: string): Stmt {
+        if (!this.isOpen()) { return null; }
+
+        let hit = this.fromCache(sql);
+        if (hit != null) { return hit; }
+
+        let name = this.sess.newStatementName();
+        let p = this.sess.prepare(name, sql);
+        if (!p.ok) { return null; }
+
+        let st = new PgStmt(this.sess, this.sess.nextStmtId, name, sql, p.cols, p.paramOids);
+        st.busy = true;
+        return st;
+    }
+
+    fn fromCache(sql: string): PgStmt {
+        let i = 0;
+        while (i < this.cacheSql.len) {
+            if (this.cacheSql[i] == sql) {
+                let st = this.cacheStmt[i];
+                if (!st.busy && st.alive()) {
+                    st.busy = true;
+                    st.reset();
+                    return st;
+                }
+                return null;
+            }
+            i += 1;
+        }
+        return null;
+    }
+
+    // Same shape as SqliteConn.release (sqlite.vt:272-295). The cache is worth
+    // MORE here than there: a miss costs a network round trip rather than a
+    // sqlite3_prepare.
+    override fn release(st: Stmt) {
+        if (st == null) { return; }
+        let ps = st as PgStmt;
+        if (ps == null) { return; }
+        ps.busy = false;
+        ps.reset();
+
+        if (!ps.alive()) { return; }
+
+        let i = 0;
+        while (i < this.cacheStmt.len) {
+            if (this.cacheStmt[i] == ps) { return; }     // already cached
+            i += 1;
+        }
+        if (this.cacheCap <= 0 || this.cacheStmt.len >= this.cacheCap) {
+            ps.finalize();
+            return;
+        }
+        this.cacheSql.push(ps.sql);
+        this.cacheStmt.push(ps);
+    }
+
+    override fn execRaw(sql: string): bool {
+        if (!this.isOpen()) { return false; }
+        return this.sess.simpleQuery(sql);
+    }
+
+    override fn changes(): int {
+        if (this.sess == null) { return 0; }
+        return this.sess.lastRows;
+    }
+
+    // Always 0 on PostgreSQL 12 and later — see the module header. Returned
+    // anyway because it is the protocol's own answer to the question.
+    override fn lastInsertId(): int {
+        if (this.sess == null) { return 0; }
+        return this.sess.lastOid;
+    }
+
+    // Read from the server's own transaction status rather than from a flag we
+    // keep, so it stays right even when a statement failed and left the
+    // transaction in the aborted state.
+    override fn inTx(): bool {
+        if (this.sess == null) { return false; }
+        return this.sess.txStatus != 73;      // 'I' — idle
+    }
+    override fn setInTx(v: bool) { }          // the server is the authority
+
+    override fn close() {
+        if (this.sess == null) { return; }
+        let i = 0;
+        while (i < this.cacheStmt.len) {
+            this.cacheStmt[i].finalize();
+            i += 1;
+        }
+        this.cacheSql = [];
+        this.cacheStmt = [];
+        // The fd is released here, not when the last PgStmt drops. An
+        // outstanding statement keeps the PgSession object alive, so nothing
+        // dangles: it sees open == false and answers DBERR_CLOSED.
+        this.sess.close();
+    }
+
+    deinit { this.close(); }
+}
+
+// ---------------------------------------------------------------------------
+// Driver
+// ---------------------------------------------------------------------------
 
 export class PgDriver extends Driver {
     dsn: string;
+    appName: string;
+    timeZone: string;
+    timeoutMs: int;
+    cacheCap: int;
+    drainCap: int;
+    ssl: string;
+    optKeys: string[];
+    optVals: string[];
 
-    fn init(dsn: string) { this.dsn = dsn; }
+    fn init(dsn: string) {
+        this.dsn = dsn;
+        this.appName = "vyto";
+        this.timeZone = "UTC";
+        // A local file read cannot hang forever; a TCP read can. SqliteDriver
+        // defaults its busy timeout to 0 for that reason and this cannot.
+        this.timeoutMs = 30000;
+        this.cacheCap = 64;
+        this.drainCap = 100000;
+        this.ssl = "disable";
+        this.optKeys = [];
+        this.optVals = [];
+    }
 
     override fn name(): string { return "postgres"; }
 
+    // Shows up in pg_stat_activity, which is where someone looks when a query
+    // is stuck.
+    builder fn applicationName(s: string) { this.appName = s; return this; }
+
+    // Pinned so a timestamptz renders the same on every server. Setting it to
+    // something else is fine; leaving it to server configuration is not.
+    builder fn timezone(s: string) { this.timeZone = s; return this; }
+
+    // 0 waits forever.
+    builder fn timeout(ms: int) { this.timeoutMs = ms; return this; }
+
+    // Prepared statements kept per connection. 0 disables the cache.
+    builder fn stmtCache(n: int) { this.cacheCap = n; return this; }
+
+    // How many rows a cursor may be forced to buffer when another statement
+    // takes the connection out from under it.
+    builder fn drainLimit(n: int) { this.drainCap = n; return this; }
+
+    // Only "disable" is accepted. Anything else is refused rather than
+    // downgraded in silence — connecting in the clear when TLS was asked for is
+    // exactly the failure mode a caller must never get without being told.
+    builder fn sslMode(m: string) { this.ssl = m; return this; }
+
+    builder fn option(k: string, v: string) {
+        this.optKeys.push(k);
+        this.optVals.push(v);
+        return this;
+    }
+
     override fn connect(): Conn {
-        panic("vyto/db/pgsql: not implemented — no PostgreSQL driver in this build");
+        let d = parseDsn(this.dsn, "localhost", DEFAULT_PORT);
+        if (!d.isValid()) {
+            return deadConn("vyto/db/pgsql: " + d.error(), DBERR_OPEN);
+        }
+
+        let mode = d.opt("sslmode", this.ssl);
+        if (mode != "disable" && mode != "allow" && mode != "prefer") {
+            return deadConn(
+                "vyto/db/pgsql: sslmode=" + mode + " was requested but this driver has no TLS. "
+                + "lib/vyto/crypto/openssl is a stub in which every entry point panics; until it "
+                + "is implemented, use sslmode=disable and a trusted network, or a local socket.",
+                DBERR_UNSUPPORTED);
+        }
+
+        let io = dialTcp(d.host, d.port, this.timeoutMs);
+        if (io == null) {
+            return deadConn("vyto/db/pgsql: could not connect to " + d.host + ":" + str(d.port),
+                            DBERR_OPEN);
+        }
+
+        let sess = new PgSession(io);
+        sess.drainCap = this.drainCap;
+
+        let user = d.user;
+        if (user == "") { user = d.opt("user", ""); }
+        if (user == "") {
+            return deadConn("vyto/db/pgsql: the connection string names no user", DBERR_OPEN);
+        }
+        let pass = d.pass;
+        if (pass == "") { pass = d.opt("password", ""); }
+        let dbname = d.database;
+        if (dbname == "") { dbname = user; }
+        let app = d.opt("application_name", this.appName);
+
+        if (!sess.connect(user, pass, dbname, app, this.timeZone, this.optKeys, this.optVals)) {
+            let msg = sess.errMsg;
+            if (msg == "") { msg = "vyto/db/pgsql: the connection failed"; }
+            let code = sess.errCode;
+            if (code == DBERR_NONE) { code = DBERR_OPEN; }
+            sess.close();
+            return deadConn(msg, code);
+        }
+
+        let cn = new PgConn(sess, "", DBERR_NONE);
+        cn.cacheCap = this.cacheCap;
+        return cn;
     }
 }
 
-// The dialect is real even though the driver is not, so query and schema
-// rendering for Postgres works without this package at all — import
-// pgDialect() from vyto/db instead.
-export fn pgsqlDialect(): Dialect { return pgDialect(); }
+// A connection that failed to open.
+//
+// Never null: a driver that cannot connect returns a Conn whose isOpen() is
+// false and whose errorMessage() explains, which keeps every caller free of a
+// null check on the one path that is hardest to test (driver.vt:130-133).
+fn deadConn(msg: string, code: int): Conn {
+    return new PgConn(null, msg, code);
+}
+
+// ---------------------------------------------------------------------------
 
 export fn pgsql(dsn: string): PgDriver { return new PgDriver(dsn); }
+
+// Speak the protocol over a transport that is already built.
+//
+// The point of this is testing: with a MemIo carrying a recorded server
+// transcript, an entire session — authentication, prepare, bind, streaming,
+// error handling, and vyto/db's own machinery above it — runs with no server,
+// no fd and no network. examples/105_pgwire.vt does exactly that. Same call the
+// UI toolkit makes with VS_HEADLESS, and the reason 55 UI tests exist.
+//
+// It is also how a TLS transport would be handed in once one exists.
+export fn pgsqlOver(io: WireIo, dsn: string): PgOverDriver { return new PgOverDriver(io, dsn); }
+
+export class PgOverDriver extends PgDriver {
+    io: WireIo;
+    nonce: string;
+
+    fn init(io: WireIo, dsn: string) {
+        this.dsn = dsn;
+        this.appName = "vyto";
+        this.timeZone = "UTC";
+        this.timeoutMs = 30000;
+        this.cacheCap = 64;
+        this.drainCap = 100000;
+        this.ssl = "disable";
+        this.optKeys = [];
+        this.optVals = [];
+        this.io = io;
+        this.nonce = "";
+    }
+
+    // Pin the SCRAM client nonce so a recorded handshake replays byte for byte.
+    // Meaningless outside a replay, and refused on the real driver — a fixed
+    // nonce is exactly what SCRAM's nonce exists to prevent.
+    builder fn scramNonce(s: string) { this.nonce = s; return this; }
+
+    override fn connect(): Conn {
+        if (this.io == null) { return deadConn("vyto/db/pgsql: no transport", DBERR_OPEN); }
+        let d = parseDsn(this.dsn, "localhost", DEFAULT_PORT);
+        let user = d.user;
+        if (user == "") { user = "vyto"; }
+        let dbname = d.database;
+        if (dbname == "") { dbname = user; }
+
+        let sess = new PgSession(this.io);
+        sess.drainCap = this.drainCap;
+        sess.fixedNonce = this.nonce;
+        if (!sess.connect(user, d.pass, dbname, this.appName, this.timeZone,
+                          this.optKeys, this.optVals)) {
+            let msg = sess.errMsg;
+            if (msg == "") { msg = "vyto/db/pgsql: the connection failed"; }
+            let code = sess.errCode;
+            if (code == DBERR_NONE) { code = DBERR_OPEN; }
+            return deadConn(msg, code);
+        }
+        let cn = new PgConn(sess, "", DBERR_NONE);
+        cn.cacheCap = this.cacheCap;
+        return cn;
+    }
+}
+
+// The dialect is real without the driver: query and schema rendering for
+// PostgreSQL works from a program that links no driver at all. Import it from
+// vyto/db as pgDialect() when that is all you need.
+export fn pgsqlDialect(): Dialect { return pgDialect(); }

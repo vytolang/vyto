@@ -98,6 +98,13 @@ fi
 # the one part that is not, so db_shim.c carries a VT_NO_LIBC arm that drops the
 # whole library and returns failure sentinels. Both halves are checked because
 # only the second one can rot silently.
+#
+# NOTE: do NOT extend this to vyto/db/pgsql. That driver reaches the network
+# through vyto/net/socket, whose socket_shim.c has no VT_NO_LIBC arm at all, so
+# a freestanding build of anything importing it cannot link. That is expected,
+# not a regression: the fixture below imports vyto/db and no driver, which is
+# exactly the surface that has to stay freestanding. Adding such a check would
+# cost an afternoon and prove nothing.
 if ./vytoc build tests/fixtures/db_nodriver.vt --freestanding --cc gcc \
         -o examples/.vyto-cache/libdb_fs.a >/dev/null 2>&1; then
     echo "PASS freestanding_db"
@@ -117,15 +124,66 @@ mkdir -p tests/tmp/dbcontagion
 cp tests/fixtures/db_nodriver.vt tests/tmp/dbcontagion/
 if ./vytoc build tests/tmp/dbcontagion/db_nodriver.vt \
         -o tests/tmp/dbcontagion/nodriver >/dev/null 2>&1; then
-    if find tests/tmp/dbcontagion/.vyto-cache -iname '*sqlite*' 2>/dev/null | grep -q .; then
-        echo "FAIL db_no_driver_contagion (importing vyto/db compiled SQLite)"
-        find tests/tmp/dbcontagion/.vyto-cache -iname '*sqlite*' | head
+    # Also reject a socket object. vyto/db/pgsql is pure Vyto but reaches the
+    # network through vyto/net/socket, which does carry a native shim — so the
+    # driver is still contagious, just with a different payload than SQLite.
+    if find tests/tmp/dbcontagion/.vyto-cache \
+            \( -iname '*sqlite*' -o -iname '*socket*' \) 2>/dev/null | grep -q .; then
+        echo "FAIL db_no_driver_contagion (importing vyto/db compiled a driver's native code)"
+        find tests/tmp/dbcontagion/.vyto-cache \
+             \( -iname '*sqlite*' -o -iname '*socket*' \) | head
         fail=1
     else
         echo "PASS db_no_driver_contagion"
     fi
 else
     echo "FAIL db_no_driver_contagion (fixture does not build)"
+    fail=1
+fi
+
+# --- and the mirror: naming ONE driver must not compile the other ---
+# The drivers are separate package directories so that a program using Postgres
+# does not build the SQLite amalgamation, and vice versa. That only holds while
+# neither driver imports the other and vyto/db imports none.
+#
+# VYTO_OBJ_CACHE is set explicitly, as in validator_no_regex below: native
+# objects are content-addressed and shared machine-wide (src/main.c:167-175), so
+# a check that reads only the local .vyto-cache can be satisfied by a hit in the
+# shared one and pass without proving anything.
+rm -rf tests/tmp/pgonly
+mkdir -p tests/tmp/pgonly
+cat > tests/tmp/pgonly/pgonly.vt <<'VTEOF'
+import { Db, select } from "vyto/db";
+import { pgsql } from "vyto/db/pgsql";
+fn main() {
+    let db = new Db(pgsql("postgres://nobody@127.0.0.1:1/none"));
+    print(db.isOpen());
+}
+VTEOF
+#
+# Two places have to be checked, because the compiler splits its output:
+# per-module C and objects land in the local .vyto-cache under readable names,
+# while native shim objects land in the object cache under content-addressed
+# hashes. A name search finds the first and a content search finds the second;
+# either alone passes while the other leaks.
+if VYTO_OBJ_CACHE=tests/tmp/pgonly/obj ./vytoc build tests/tmp/pgonly/pgonly.vt \
+        -o tests/tmp/pgonly/pgonly >/dev/null 2>&1; then
+    leaked=""
+    if find tests/tmp/pgonly/.vyto-cache -iname '*sqlite*' 2>/dev/null | grep -q .; then
+        leaked="module objects"
+    fi
+    if grep -rl sqlite3_ tests/tmp/pgonly/obj >/dev/null 2>&1; then
+        leaked="$leaked native objects"
+    fi
+    if [ -n "$leaked" ]; then
+        echo "FAIL pgsql_no_sqlite (the Postgres driver compiled SQLite: $leaked)"
+        find tests/tmp/pgonly/.vyto-cache -iname '*sqlite*' 2>/dev/null | head
+        fail=1
+    else
+        echo "PASS pgsql_no_sqlite"
+    fi
+else
+    echo "FAIL pgsql_no_sqlite (fixture does not build)"
     fail=1
 fi
 
