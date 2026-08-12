@@ -119,12 +119,9 @@ fn bitsToFloat(bits: int): float {
     return sign * mant * pow2(exp - 1023);
 }
 
-// 2^n by squaring, so a wide exponent does not cost |n| multiplications and a
-// subnormal's -1074 does not underflow on the way down.
-fn pow2(n: int): float {
+// 2^n for n >= 0, by squaring, so a wide exponent costs log n multiplications.
+fn pow2pos(n: int): float {
     let e = n;
-    let neg = false;
-    if (e < 0) { neg = true; e = -e; }
     let r = 1.0;
     let base = 2.0;
     while (e > 0) {
@@ -132,7 +129,26 @@ fn pow2(n: int): float {
         base = base * base;
         e = e >> 1;
     }
-    if (neg) { return 1.0 / r; }
+    return r;
+}
+
+// 2^n for any n.
+//
+// The negative side is NOT 1.0 / pow2pos(-n). Above n = 1023 that divisor is
+// already infinity, so the quotient is zero — which made every subnormal read
+// back as 0.0, since bitsToFloat scales those by pow2(-1074). Stepping down in
+// chunks keeps each divisor finite and each intermediate representable, all the
+// way to the smallest subnormal.
+fn pow2(n: int): float {
+    if (n >= 0) { return pow2pos(n); }
+    let e = -n;
+    let r = 1.0;
+    while (e > 0) {
+        let c = e;
+        if (c > 500) { c = 500; }
+        r = r / pow2pos(c);
+        e -= c;
+    }
     return r;
 }
 

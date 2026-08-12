@@ -187,7 +187,17 @@ fn main() {
     checkInt("readI64LE", readI64LE(rec, 8), 1);
     checkInt("readI64BE", readI64BE(rec, 8), 72057594037927936);
     checkBool("readF64LE 1.0", readF64LE(rec, 16) == 1.0);
-    checkBool("readF64LE of zero bits is 0.0", readF64LE(rec, 8) == 0.0);
+    // rec[8..16] is the integer 1, so as a double it is the bit pattern
+    // 0x0000000000000001 — the SMALLEST SUBNORMAL, not zero. This used to be
+    // asserted as 0.0 and passed for the wrong reason: bitsToFloat scales a
+    // subnormal by pow2(-1074), and pow2 computed the negative side as
+    // 1.0/pow2(1074), whose divisor is already infinity — so every subnormal
+    // silently read back as zero.
+    checkBool("readF64LE of the smallest subnormal is not zero", readF64LE(rec, 8) != 0.0);
+    checkBool("readF64LE of the smallest subnormal is 2^-1074",
+              readF64LE(rec, 8) == 4.9406564584124654e-324);
+    let z = bytes(8);
+    checkBool("readF64LE of genuinely zero bits is 0.0", readF64LE(z, 0) == 0.0);
     // Negative and fractional, to exercise the sign and exponent paths.
     let f = bytes(8);
     f[6] = 0xF8 as byte; f[7] = 0xBF as byte;          // -1.5 LE
