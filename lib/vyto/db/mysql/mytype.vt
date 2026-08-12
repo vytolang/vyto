@@ -1,0 +1,228 @@
+// vyto/db/mysql/mytype — MySQL column types, and the mapping in both directions
+// between a wire value and vyto/db's Value.
+//
+// Socket-free like proto.vt.
+//
+// ── TWO WIRE FORMATS, NOT ONE ───────────────────────────────────────────────
+// MySQL has a text protocol (COM_QUERY) and a binary one (COM_STMT_EXECUTE),
+// and they are different enough that every type needs both decoders. This
+// driver uses the binary path for everything that carries a parameter, because
+// the alternative is client-side escaping — see the module header of
+// vyto/db/mysql for why that is not on the table.
+//
+// ── THE MAPPING MATCHES THE POSTGRES DRIVER DELIBERATELY ────────────────────
+// DECIMAL/NEWDECIMAL become TEXT, not float, for the same reason numeric does
+// there: they are used precisely because a double cannot represent them.
+// Dates and times are rendered to ISO strings so schema-portable code reads the
+// same value from either engine. JSON stays text. The only asymmetry that
+// remains is unavoidable: MySQL has no array type, so nothing has to be decided
+// about arrays here.
+
+import { Value, dbNull, dbInt, dbFloat, dbText, dbBlob,
+         DB_NULL, DB_INT, DB_FLOAT, DB_TEXT, DB_BLOB } from "vyto/db/value";
+import { MyColumn, MyParam, sliceText,
+         MT_DECIMAL, MT_TINY, MT_SHORT, MT_LONG, MT_FLOAT, MT_DOUBLE, MT_NULL,
+         MT_TIMESTAMP, MT_LONGLONG, MT_INT24, MT_DATE, MT_TIME, MT_DATETIME,
+         MT_YEAR, MT_VARCHAR, MT_BIT, MT_JSON, MT_NEWDECIMAL, MT_ENUM, MT_SET,
+         MT_TINY_BLOB, MT_MEDIUM_BLOB, MT_LONG_BLOB, MT_BLOB, MT_VAR_STRING,
+         MT_STRING, MT_GEOMETRY } from "vyto/db/mysql/proto";
+import { byteWriter, parseIntOr, parseFloatOr, exactFloatText,
+         readF32LE } from "vyto/db/wire";
+import { readF64LE } from "vyto/mmap/decode";
+import { strBytes } from "vyto/crypto";
+
+// True when this column holds bytes rather than characters. A BLOB and a TEXT
+// share a column type and are told apart only by the charset being `binary`.
+export fn isBinaryColumn(c: MyColumn): bool {
+    if (c.kind == MT_TINY_BLOB || c.kind == MT_MEDIUM_BLOB
+        || c.kind == MT_LONG_BLOB || c.kind == MT_BLOB
+        || c.kind == MT_VAR_STRING || c.kind == MT_STRING
+        || c.kind == MT_GEOMETRY || c.kind == MT_BIT) {
+        return c.isBinary();
+    }
+    return false;
+}
+
+// ---- text protocol ---------------------------------------------------------
+
+export fn decodeText(c: MyColumn, raw: byte[]): Value {
+    if (raw == null) { return dbNull(); }
+
+    if (c.kind == MT_TINY || c.kind == MT_SHORT || c.kind == MT_LONG
+        || c.kind == MT_INT24 || c.kind == MT_LONGLONG || c.kind == MT_YEAR) {
+        return dbInt(parseIntOr(sliceText(raw, 0, raw.len), 0));
+    }
+    if (c.kind == MT_FLOAT || c.kind == MT_DOUBLE) {
+        return dbFloat(parseFloatOr(sliceText(raw, 0, raw.len), 0.0));
+    }
+    if (isBinaryColumn(c)) { return dbBlob(raw); }
+    // DECIMAL/NEWDECIMAL, JSON, ENUM, SET, every date and time, and anything
+    // unknown: the server's own rendering.
+    return dbText(sliceText(raw, 0, raw.len));
+}
+
+// ---- binary protocol -------------------------------------------------------
+
+export fn decodeBinary(c: MyColumn, raw: byte[]): Value {
+    if (raw == null) { return dbNull(); }
+
+    if (c.kind == MT_TINY)    { return dbInt(leInt(raw, 1, c.isUnsigned())); }
+    if (c.kind == MT_SHORT || c.kind == MT_YEAR) { return dbInt(leInt(raw, 2, c.isUnsigned())); }
+    if (c.kind == MT_LONG || c.kind == MT_INT24)  { return dbInt(leInt(raw, 4, c.isUnsigned())); }
+    if (c.kind == MT_LONGLONG) { return dbInt(leInt(raw, 8, true)); }
+    if (c.kind == MT_DOUBLE) {
+        if (raw.len < 8) { return dbFloat(0.0); }
+        return dbFloat(readF64LE(raw, 0));
+    }
+    if (c.kind == MT_FLOAT) {
+        if (raw.len < 4) { return dbFloat(0.0); }
+        return dbFloat(readF32LE(raw, 0));
+    }
+    if (c.kind == MT_DATE || c.kind == MT_DATETIME || c.kind == MT_TIMESTAMP) {
+        return dbText(renderDateTime(raw));
+    }
+    if (c.kind == MT_TIME) { return dbText(renderTime(raw)); }
+    if (isBinaryColumn(c)) { return dbBlob(raw); }
+    return dbText(sliceText(raw, 0, raw.len));
+}
+
+// Little-endian integer of `n` bytes, sign-extended unless the column says
+// unsigned.
+fn leInt(b: byte[], n: int, unsigned: bool): int {
+    if (b.len < n) { return 0; }
+    let v = 0;
+    let i = n - 1;
+    while (i >= 0) { v = (v << 8) | (b[i] as int); i -= 1; }
+    if (!unsigned && n < 8) {
+        let signBit = 1 << (n * 8 - 1);
+        if ((v & signBit) != 0) { v -= (1 << (n * 8)); }
+    }
+    return v;
+}
+
+// The binary DATE/DATETIME/TIMESTAMP struct, rendered to ISO text so it reads
+// the same as the Postgres driver's timestamptz. Length says how much is there:
+// 0 is the zero date, 4 is date only, 7 adds time, 11 adds microseconds.
+fn renderDateTime(b: byte[]): string {
+    if (b.len == 0) { return "0000-00-00"; }
+    if (b.len < 4) { return ""; }
+    let year = (b[0] as int) | ((b[1] as int) << 8);
+    let month = b[2] as int;
+    let day = b[3] as int;
+    let s = pad4(year) + "-" + pad2(month) + "-" + pad2(day);
+    if (b.len < 7) { return s; }
+    let h = b[4] as int;
+    let mi = b[5] as int;
+    let sec = b[6] as int;
+    s = s + " " + pad2(h) + ":" + pad2(mi) + ":" + pad2(sec);
+    if (b.len < 11) { return s; }
+    let us = (b[7] as int) | ((b[8] as int) << 8) | ((b[9] as int) << 16) | ((b[10] as int) << 24);
+    return s + "." + pad6(us);
+}
+
+// The binary TIME struct. Unlike a timestamp this is a signed interval and can
+// exceed 24 hours, so the day field is folded into the hours rather than
+// dropped.
+fn renderTime(b: byte[]): string {
+    if (b.len == 0) { return "00:00:00"; }
+    if (b.len < 8) { return ""; }
+    let neg = (b[0] as int) != 0;
+    let days = (b[1] as int) | ((b[2] as int) << 8) | ((b[3] as int) << 16) | ((b[4] as int) << 24);
+    let h = b[5] as int;
+    let mi = b[6] as int;
+    let sec = b[7] as int;
+    let hours = days * 24 + h;
+    let s = pad2(hours) + ":" + pad2(mi) + ":" + pad2(sec);
+    if (b.len >= 12) {
+        let us = (b[8] as int) | ((b[9] as int) << 8) | ((b[10] as int) << 16) | ((b[11] as int) << 24);
+        s = s + "." + pad6(us);
+    }
+    if (neg) { return "-" + s; }
+    return s;
+}
+
+fn pad2(v: int): string {
+    if (v < 10) { return "0" + str(v); }
+    return str(v);
+}
+fn pad4(v: int): string {
+    if (v < 10) { return "000" + str(v); }
+    if (v < 100) { return "00" + str(v); }
+    if (v < 1000) { return "0" + str(v); }
+    return str(v);
+}
+fn pad6(v: int): string {
+    let s = str(v);
+    while (s.len < 6) { s = "0" + s; }
+    return s;
+}
+
+// ---- encoding parameters ---------------------------------------------------
+
+// Turn a bound Value into a binary-protocol parameter.
+//
+// Everything goes as its natural binary width where one exists, and as a
+// length-encoded string otherwise. A DOUBLE is sent as IEEE bits — exactly the
+// reason the Postgres driver asks for binary float8, and the reason f64ToBits
+// lives in the shared vyto/db/wire rather than in either driver.
+export fn encodeParam(v: Value): MyParam {
+    if (v == null || v.kind == DB_NULL) { return new MyParam(MT_NULL, false, null); }
+
+    if (v.kind == DB_INT) {
+        return new MyParam(MT_LONGLONG, false, byteWriter(8).i64le(v.i).take());
+    }
+    if (v.kind == DB_FLOAT) {
+        return new MyParam(MT_DOUBLE, false, byteWriter(8).f64le(v.f).take());
+    }
+    if (v.kind == DB_BLOB) {
+        let b = v.b;
+        if (b == null) { return new MyParam(MT_NULL, false, null); }
+        return new MyParam(MT_BLOB, false, lenEnc(b));
+    }
+    // DB_TEXT. Binary-safe: a string carries its own length, so an interior NUL
+    // is sent rather than ending the value.
+    return new MyParam(MT_VAR_STRING, false, lenEnc(strBytes(v.s)));
+}
+
+// A length-encoded string, as a parameter value carries it.
+fn lenEnc(b: byte[]): byte[] {
+    let w = byteWriter(b.len + 9);
+    let n = b.len;
+    if (n < 251) { w.u8(n); }
+    else if (n < 65536) { w.u8(0xFC).u16le(n); }
+    else if (n < 16777216) { w.u8(0xFD).u24le(n); }
+    else { w.u8(0xFE).i64le(n); }
+    w.raw(b);
+    return w.take();
+}
+
+// A stable name for a column type, for diagnostics and goldens.
+export fn typeName(kind: int): string {
+    if (kind == MT_DECIMAL || kind == MT_NEWDECIMAL) { return "decimal"; }
+    if (kind == MT_TINY) { return "tiny"; }
+    if (kind == MT_SHORT) { return "short"; }
+    if (kind == MT_LONG) { return "long"; }
+    if (kind == MT_FLOAT) { return "float"; }
+    if (kind == MT_DOUBLE) { return "double"; }
+    if (kind == MT_NULL) { return "null"; }
+    if (kind == MT_TIMESTAMP) { return "timestamp"; }
+    if (kind == MT_LONGLONG) { return "longlong"; }
+    if (kind == MT_INT24) { return "int24"; }
+    if (kind == MT_DATE) { return "date"; }
+    if (kind == MT_TIME) { return "time"; }
+    if (kind == MT_DATETIME) { return "datetime"; }
+    if (kind == MT_YEAR) { return "year"; }
+    if (kind == MT_VARCHAR) { return "varchar"; }
+    if (kind == MT_BIT) { return "bit"; }
+    if (kind == MT_JSON) { return "json"; }
+    if (kind == MT_ENUM) { return "enum"; }
+    if (kind == MT_SET) { return "set"; }
+    if (kind == MT_TINY_BLOB) { return "tinyblob"; }
+    if (kind == MT_MEDIUM_BLOB) { return "mediumblob"; }
+    if (kind == MT_LONG_BLOB) { return "longblob"; }
+    if (kind == MT_BLOB) { return "blob"; }
+    if (kind == MT_VAR_STRING) { return "varstring"; }
+    if (kind == MT_STRING) { return "string"; }
+    if (kind == MT_GEOMETRY) { return "geometry"; }
+    return "unknown";
+}

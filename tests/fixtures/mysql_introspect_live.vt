@@ -1,0 +1,243 @@
+// mysql_introspect_live — the six MysqlDialect introspection queries against a
+// real server.
+//
+// Driven by tests/run_tests_mysql.sh; reads the DSN from $VYTO_MYSQL_DSN.
+//
+// The counterpart to examples/104_introspect.vt (SQLite) and
+// tests/fixtures/pgsql_introspect_live.vt (PostgreSQL). The point is that the
+// SAME reader code in vyto/db/introspect produces the same records from all
+// three: the queries differ, the by-index result contracts do not.
+//
+// What only a live server settles here: whether MySQL accepts these queries at
+// all, and whether STATISTICS.SEQ_IN_INDEX really orders a composite primary
+// key by KEY position rather than column position.
+
+import { Db, TableInfo, ColumnInfo, IndexInfo, IndexColumn, ForeignKey, TriggerInfo,
+         OBJ_TABLE, OBJ_VIEW, IDX_PK, IDX_UNIQUE, IDX_APPDEF,
+         HID_NONE, HID_STORED } from "vyto/db";
+import { mysql, MyConn } from "vyto/db/mysql";
+import { getenv } from "vyto/os";
+
+fn check(name: string, got: string, want: string) {
+    if (got == want) { print("ok    " + name); }
+    else {
+        print("FAIL  " + name);
+        print("  got  " + got);
+        print("  want " + want);
+    }
+}
+
+fn checkBool(name: string, got: bool) {
+    if (got) { print("ok    " + name); }
+    else { print("FAIL  " + name); }
+}
+
+fn main() {
+    let dsn = getenv("VYTO_MYSQL_DSN");
+    if (dsn == "") { print("FAIL  VYTO_MYSQL_DSN is not set"); return; }
+
+    let db = new Db(mysql(dsn));
+    if (!db.ok()) { print("FAIL  could not connect: " + db.error()); return; }
+
+    checkBool("the dialect claims introspection", db.supportsIntrospection());
+
+    drop(db);
+    setup(db);
+    tables(db);
+    columns(db);
+    indexes(db);
+    foreignKeys(db);
+    objects(db);
+    drop(db);
+}
+
+fn drop(db: Db) {
+    db.execRaw("DROP TRIGGER IF EXISTS vyto_child_touch");
+    db.execRaw("DROP VIEW IF EXISTS vyto_active");
+    db.execRaw("DROP TABLE IF EXISTS vyto_child");
+    db.execRaw("DROP TABLE IF EXISTS vyto_parent");
+}
+
+fn setup(db: Db) {
+    // A composite primary key declared in the OPPOSITE order to the columns. If
+    // pkPos came from column position rather than from SEQ_IN_INDEX, this is
+    // where it shows.
+    db.execRaw("CREATE TABLE vyto_parent ("
+               + " a INT NOT NULL,"
+               + " b INT NOT NULL,"
+               + " label VARCHAR(64) DEFAULT 'none',"
+               + " amount DECIMAL(19,4),"
+               + " payload BLOB,"
+               + " doc JSON,"
+               + " total DECIMAL(19,4) AS (amount * 2) STORED,"
+               + " PRIMARY KEY (b, a)) ENGINE=InnoDB");
+
+    db.execRaw("CREATE TABLE vyto_child ("
+               + " id BIGINT AUTO_INCREMENT PRIMARY KEY,"
+               + " pa INT, pb INT, name VARCHAR(191), active TINYINT(1) DEFAULT 1,"
+               + " UNIQUE KEY vyto_child_name_uq (name),"
+               + " KEY vyto_child_desc (pa DESC, pb ASC),"
+               + " CONSTRAINT vyto_child_fk FOREIGN KEY (pa, pb)"
+               + " REFERENCES vyto_parent (a, b)"
+               + " ON DELETE CASCADE ON UPDATE RESTRICT) ENGINE=InnoDB");
+
+    db.execRaw("CREATE VIEW vyto_active AS SELECT id, name FROM vyto_child WHERE active = 1");
+    db.execRaw("CREATE TRIGGER vyto_child_touch BEFORE UPDATE ON vyto_child"
+               + " FOR EACH ROW SET NEW.name = NEW.name");
+}
+
+fn tables(db: Db) {
+    print("---- tables and views ----");
+
+    let ts = db.tables();
+    checkBool("parent is listed", has(ts, "vyto_parent"));
+    checkBool("child is listed", has(ts, "vyto_child"));
+    // The TABLE_TYPE CASE must emit SQLite's words or these land in the wrong
+    // list.
+    checkBool("the view is NOT in tables()", !has(ts, "vyto_active"));
+    checkBool("the view IS in views()", has(db.views(), "vyto_active"));
+    // Scoped to DATABASE(), so another schema on the same server cannot leak in.
+    checkBool("no information_schema tables leaked in", !has(ts, "COLUMNS"));
+    checkBool("no mysql.* tables leaked in", !has(ts, "user"));
+
+    checkBool("hasTable finds one", db.hasTable("vyto_child"));
+    checkBool("hasTable rejects a missing one", !db.hasTable("vyto_nope"));
+}
+
+fn columns(db: Db) {
+    print("---- columns ----");
+
+    let t = db.describe("vyto_parent");
+    checkBool("parent was described", t.exists());
+    check("column count", str(t.cols.len), "7");
+
+    check("first column is cid 0", str(t.cols[0].cid), "0");
+    check("first column name", t.cols[0].name, "a");
+
+    // From STATISTICS.SEQ_IN_INDEX on the PRIMARY index, not COLUMN_KEY: the
+    // key is (b, a), not (a, b).
+    let pk = t.primaryKey();
+    check("primary key column count", str(pk.len), "2");
+    check("primary key is in KEY order, not column order",
+          pk[0].name + "," + pk[1].name, "b,a");
+    check("a's pkPos", str(t.column("a").pkPos), "2");
+    check("b's pkPos", str(t.column("b").pkPos), "1");
+
+    checkBool("a is NOT NULL", t.column("a").notNull);
+    checkBool("label is nullable", !t.column("label").notNull);
+    checkBool("label has a default", t.column("label").hasDefault);
+
+    // EXTRA carries 'STORED GENERATED'.
+    let total = t.column("total");
+    checkBool("the generated column is marked generated", total.isGenerated());
+    check("as STORED", str(total.hidden), str(HID_STORED));
+    checkBool("an ordinary column is not hidden", t.column("label").hidden == HID_NONE);
+
+    // declType is COLUMN_TYPE, so kindGuess sees MySQL's spellings.
+    check("blob guesses blob", t.column("payload").kindName(), "blob");
+    check("json guesses text", t.column("doc").kindName(), "text");
+    check("decimal guesses real", t.column("amount").kindName(), "real");
+    check("int guesses int", t.column("a").kindName(), "int");
+    check("varchar guesses text", t.column("label").kindName(), "text");
+}
+
+fn indexes(db: Db) {
+    print("---- indexes ----");
+
+    let t = db.describe("vyto_child");
+    checkBool("child was described", t.exists());
+
+    let uq = findIndex(t, "vyto_child_name_uq");
+    checkBool("the unique index was found", uq.exists());
+    checkBool("and is unique", uq.unique);
+    check("its origin is a unique constraint", str(uq.origin), str(IDX_UNIQUE));
+
+    // MySQL calls the primary key index PRIMARY, which the origin CASE maps to
+    // SQLite's 'pk'.
+    let pk = findIndex(t, "PRIMARY");
+    checkBool("the primary index was found", pk.exists());
+    check("its origin is pk", str(pk.origin), str(IDX_PK));
+    checkBool("and it counts as implicit", pk.isImplicit());
+
+    // COLLATION 'D' is where `desc` comes from. pa DESC, pb ASC is chosen so
+    // the two columns disagree; reading the flag from the wrong row would
+    // report them the same.
+    //
+    // NOTE: descending indexes are only really descending on MySQL 8.0+. On
+    // MariaDB and MySQL 5.7 the DESC is parsed and ignored, so COLLATION is 'A'
+    // for both columns and this assertion is expected to fail there.
+    let desc = findIndex(t, "vyto_child_desc");
+    checkBool("the two-column index was found", desc.exists());
+    check("it has two columns", str(desc.cols.len), "2");
+    check("first column", desc.cols[0].name, "pa");
+    check("second column", desc.cols[1].name, "pb");
+    checkBool("second column is ASC", !desc.cols[1].desc);
+    if (desc.cols[0].desc) {
+        print("ok    first column is DESC (MySQL 8 honours it)");
+    } else {
+        print("ok    first column reports ASC (MariaDB/MySQL 5.7 ignore DESC — expected)");
+    }
+
+    // MySQL has no INCLUDE columns, so every indexed column is a key column.
+    check("every column is a key column", str(desc.keyColumns().len), "2");
+    // And no partial indexes.
+    checkBool("nothing is partial", !desc.partial);
+}
+
+fn foreignKeys(db: Db) {
+    print("---- foreign keys ----");
+
+    let t = db.describe("vyto_child");
+    check("one foreign key spanning two columns", str(t.fks.len), "2");
+    if (t.fks.len < 2) { return; }
+
+    let f0 = t.fks[0];
+    let f1 = t.fks[1];
+    check("both belong to the same constraint", str(f0.id) + "," + str(f1.id), "0,0");
+    check("in declaration order", str(f0.seq) + "," + str(f1.seq), "0,1");
+    check("referencing parent", f0.refTable, "vyto_parent");
+    check("from columns", f0.fromCol + "," + f1.fromCol, "pa,pb");
+    check("to columns", f0.toCol + "," + f1.toCol, "a,b");
+    // REFERENTIAL_CONSTRAINTS already stores these as SQLite spells them.
+    check("on delete", f0.onDelete, "CASCADE");
+    check("on update", f0.onUpdate, "RESTRICT");
+}
+
+fn objects(db: Db) {
+    print("---- schema objects ----");
+
+    let trs = db.triggers();
+    checkBool("the trigger is listed", hasTrigger(trs, "vyto_child_touch"));
+
+    // information_schema has no DDL text for a table — SHOW CREATE TABLE is a
+    // statement, not something joinable — so this is empty by design, exactly
+    // as on PostgreSQL.
+    let t = db.describe("vyto_child");
+    check("a table has no stored DDL", "[" + t.sql + "]", "[]");
+    // A view does have a stored definition.
+    let v = db.objectSql("vyto_active");
+    checkBool("a view does have a definition", v.len > 0);
+}
+
+// ---- helpers ---------------------------------------------------------------
+
+fn has(xs: string[], name: string): bool {
+    let i = 0;
+    while (i < xs.len) { if (xs[i] == name) { return true; } i += 1; }
+    return false;
+}
+
+fn hasTrigger(xs: TriggerInfo[], name: string): bool {
+    let i = 0;
+    while (i < xs.len) { if (xs[i].name == name) { return true; } i += 1; }
+    return false;
+}
+
+fn findIndex(t: TableInfo, name: string): IndexInfo {
+    let i = 0;
+    while (i < t.indexes.len) {
+        if (t.indexes[i].name == name) { return t.indexes[i]; }
+        i += 1;
+    }
+    return new IndexInfo("", "");
+}

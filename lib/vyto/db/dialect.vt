@@ -115,7 +115,14 @@ export class Dialect {
     // partial. `origin` is the engine's word; the reader maps it to IDX_*.
     virtual fn introspectIndexesSql(): string { return this.noIntrospection("index"); }
 
-    // One parameter: the INDEX name. Columns: seqno, cid, name, desc, coll, key.
+    // TWO parameters, in this order: the TABLE name, then the INDEX name.
+    // Columns: seqno, cid, name, desc, coll, key.
+    //
+    // The table is not redundant. MySQL index names are unique per TABLE rather
+    // than per schema — every primary key in a schema is called PRIMARY — so an
+    // index name alone selects every table's index of that name at once. It
+    // also lets SQLite and Postgres scope the lookup rather than trusting the
+    // name to be unique.
     virtual fn introspectIndexColumnsSql(): string { return this.noIntrospection("index column"); }
 
     // One parameter: the table name. Columns: id, seq, refTable, fromCol,
@@ -256,8 +263,9 @@ export class SqliteDialect extends Dialect {
     // index_xinfo, not index_info: it reports the trailing rowid/PK columns too
     // and flags the real key columns with key=1, which index_info cannot say.
     override fn introspectIndexColumnsSql(): string {
-        return "SELECT seqno, cid, name, \"desc\", coll, key "
-             + "FROM pragma_index_xinfo(?) ORDER BY seqno";
+        return "SELECT x.seqno, x.cid, x.name, x.\"desc\", x.coll, x.key "
+             + "FROM pragma_index_list(?) l JOIN pragma_index_xinfo(l.name) x "
+             + "WHERE l.name = ? ORDER BY x.seqno";
     }
 
     // `table`, `from` and `to` are keywords, so they need quoting — which
@@ -411,11 +419,13 @@ export class PgDialect extends Dialect {
              + " CASE WHEN u.ord <= x.indnkeyatts THEN 1 ELSE 0 END AS key"
              + " FROM pg_index x"
              + " JOIN pg_class ic ON ic.oid = x.indexrelid"
+             + " JOIN pg_class tc ON tc.oid = x.indrelid"
              + " CROSS JOIN LATERAL unnest(x.indkey) WITH ORDINALITY AS u(attnum, ord)"
              + " LEFT JOIN pg_attribute a ON a.attrelid = x.indrelid"
              + " AND a.attnum = u.attnum AND u.attnum > 0"
              + " LEFT JOIN pg_collation cl ON cl.oid = x.indcollation[u.ord - 1]"
-             + " WHERE ic.relname = $1 AND pg_table_is_visible(ic.oid)"
+             + " WHERE tc.relname = $1 AND ic.relname = $2"
+             + " AND pg_table_is_visible(ic.oid)"
              + " ORDER BY u.ord";
     }
 
@@ -511,6 +521,138 @@ export class MysqlDialect extends Dialect {
     override fn autoIncrementPk(): string { return "BIGINT AUTO_INCREMENT PRIMARY KEY"; }
     override fn supportsReturning(): bool { return false; }
     override fn supportsIfNotExistsIndex(): bool { return false; }
+
+    // ---- introspection --------------------------------------------------
+    //
+    // information_schema rather than a catalog of MySQL's own, which makes
+    // these much closer to ordinary SQL than the Postgres versions — but the
+    // same two rules apply: they emit SQLite's vocabulary, because
+    // introspect.vt matches it literally, and they scope themselves to
+    // DATABASE() so that another schema on the same server cannot leak in.
+    //
+    // introspectIndexColumnsSql takes the TABLE as well as the index, which
+    // matters more here than anywhere else: MySQL index names are unique per
+    // table rather than per schema, and every primary key in a schema is called
+    // PRIMARY, so an index name alone would select every table's at once.
+
+    override fn supportsIntrospection(): bool { return true; }
+
+    // schema, name, kind, ncol, withoutRowid, strict.
+    override fn introspectTablesSql(): string {
+        return "SELECT t.TABLE_SCHEMA AS `schema`, t.TABLE_NAME AS `name`,"
+             + " CASE t.TABLE_TYPE WHEN 'BASE TABLE' THEN 'table'"
+             + " WHEN 'VIEW' THEN 'view' WHEN 'SYSTEM VIEW' THEN 'view'"
+             + " ELSE 'unknown' END AS `kind`,"
+             + " (SELECT COUNT(*) FROM information_schema.COLUMNS c"
+             + " WHERE c.TABLE_SCHEMA = t.TABLE_SCHEMA"
+             + " AND c.TABLE_NAME = t.TABLE_NAME) AS ncol,"
+             + " 0 AS withoutrowid, 0 AS strict"
+             + " FROM information_schema.TABLES t"
+             + " WHERE t.TABLE_SCHEMA = DATABASE()"
+             + " ORDER BY t.TABLE_NAME";
+    }
+
+    // cid, name, declType, notNull, dflt, pkPos, hidden.
+    //
+    // pkPos comes from STATISTICS.SEQ_IN_INDEX on the PRIMARY index, not from
+    // COLUMNS.COLUMN_KEY: the latter is only a flag, and a composite key
+    // ordered by column position rather than key position is silently wrong.
+    override fn introspectColumnsSql(): string {
+        return "SELECT (c.ORDINAL_POSITION - 1) AS cid, c.COLUMN_NAME AS `name`,"
+             + " c.COLUMN_TYPE AS decltype,"
+             + " CASE WHEN c.IS_NULLABLE = 'NO' THEN 1 ELSE 0 END AS notnull,"
+             + " c.COLUMN_DEFAULT AS dflt,"
+             + " COALESCE(s.SEQ_IN_INDEX, 0) AS pkpos,"
+             + " CASE WHEN c.EXTRA LIKE '%STORED GENERATED%' THEN 3"
+             + " WHEN c.EXTRA LIKE '%VIRTUAL GENERATED%' THEN 2 ELSE 0 END AS hidden"
+             + " FROM information_schema.COLUMNS c"
+             + " LEFT JOIN information_schema.STATISTICS s"
+             + " ON s.TABLE_SCHEMA = c.TABLE_SCHEMA AND s.TABLE_NAME = c.TABLE_NAME"
+             + " AND s.COLUMN_NAME = c.COLUMN_NAME AND s.INDEX_NAME = 'PRIMARY'"
+             + " WHERE c.TABLE_SCHEMA = DATABASE() AND c.TABLE_NAME = ?"
+             + " ORDER BY c.ORDINAL_POSITION";
+    }
+
+    // seq, name, unique, origin, partial. `partial` is constant 0: MySQL has no
+    // partial indexes at all.
+    override fn introspectIndexesSql(): string {
+        return "SELECT (ROW_NUMBER() OVER (ORDER BY s.INDEX_NAME) - 1) AS seq,"
+             + " s.INDEX_NAME AS `name`,"
+             + " CASE WHEN MIN(s.NON_UNIQUE) = 0 THEN 1 ELSE 0 END AS `unique`,"
+             + " CASE WHEN s.INDEX_NAME = 'PRIMARY' THEN 'pk'"
+             + " WHEN MIN(s.NON_UNIQUE) = 0 THEN 'u' ELSE 'c' END AS origin,"
+             + " 0 AS `partial`"
+             + " FROM information_schema.STATISTICS s"
+             + " WHERE s.TABLE_SCHEMA = DATABASE() AND s.TABLE_NAME = ?"
+             + " GROUP BY s.INDEX_NAME"
+             + " ORDER BY s.INDEX_NAME";
+    }
+
+    // seqno, cid, name, desc, coll, key. The parameter is the INDEX name — see
+    // the warning above about MySQL index names not being schema-unique.
+    //
+    // COLLATION is 'A' for ascending and 'D' for descending, which is where
+    // `desc` comes from. `key` is constant 1: MySQL has no INCLUDE columns, so
+    // every indexed column is a key column.
+    override fn introspectIndexColumnsSql(): string {
+        return "SELECT (s.SEQ_IN_INDEX - 1) AS seqno,"
+             + " COALESCE(c.ORDINAL_POSITION - 1, -1) AS cid,"
+             + " COALESCE(s.COLUMN_NAME, '') AS `name`,"
+             + " CASE WHEN s.COLLATION = 'D' THEN 1 ELSE 0 END AS `desc`,"
+             + " '' AS coll, 1 AS `key`"
+             + " FROM information_schema.STATISTICS s"
+             + " LEFT JOIN information_schema.COLUMNS c"
+             + " ON c.TABLE_SCHEMA = s.TABLE_SCHEMA AND c.TABLE_NAME = s.TABLE_NAME"
+             + " AND c.COLUMN_NAME = s.COLUMN_NAME"
+             + " WHERE s.TABLE_SCHEMA = DATABASE()"
+             + " AND s.TABLE_NAME = ? AND s.INDEX_NAME = ?"
+             + " ORDER BY s.SEQ_IN_INDEX";
+    }
+
+    // id, seq, refTable, fromCol, toCol, onUpdate, onDelete.
+    //
+    // The action words match what SQLite's pragma_foreign_key_list emits, which
+    // is what REFERENTIAL_CONSTRAINTS already stores them as.
+    override fn introspectForeignKeysSql(): string {
+        return "SELECT (DENSE_RANK() OVER (ORDER BY k.CONSTRAINT_NAME) - 1) AS id,"
+             + " (k.ORDINAL_POSITION - 1) AS seq,"
+             + " k.REFERENCED_TABLE_NAME AS reftable,"
+             + " k.COLUMN_NAME AS fromcol,"
+             + " COALESCE(k.REFERENCED_COLUMN_NAME, '') AS tocol,"
+             + " r.UPDATE_RULE AS onupdate, r.DELETE_RULE AS ondelete"
+             + " FROM information_schema.KEY_COLUMN_USAGE k"
+             + " JOIN information_schema.REFERENTIAL_CONSTRAINTS r"
+             + " ON r.CONSTRAINT_SCHEMA = k.CONSTRAINT_SCHEMA"
+             + " AND r.CONSTRAINT_NAME = k.CONSTRAINT_NAME"
+             + " WHERE k.TABLE_SCHEMA = DATABASE() AND k.TABLE_NAME = ?"
+             + " AND k.REFERENCED_TABLE_NAME IS NOT NULL"
+             + " ORDER BY k.CONSTRAINT_NAME, k.ORDINAL_POSITION";
+    }
+
+    // type, name, tblName, sql.
+    //
+    // `sql` is '' for a table for the same reason as on PostgreSQL:
+    // information_schema does not carry the DDL text, and SHOW CREATE TABLE is
+    // a statement rather than something joinable. Views and triggers do have a
+    // stored definition.
+    override fn introspectObjectsSql(): string {
+        return "SELECT 'table' AS `type`, t.TABLE_NAME AS `name`,"
+             + " t.TABLE_NAME AS tblname, '' AS sql"
+             + " FROM information_schema.TABLES t"
+             + " WHERE t.TABLE_SCHEMA = DATABASE() AND t.TABLE_TYPE = 'BASE TABLE'"
+             + " UNION ALL"
+             + " SELECT 'view', v.TABLE_NAME, v.TABLE_NAME, v.VIEW_DEFINITION"
+             + " FROM information_schema.VIEWS v WHERE v.TABLE_SCHEMA = DATABASE()"
+             + " UNION ALL"
+             + " SELECT 'index', s.INDEX_NAME, s.TABLE_NAME, ''"
+             + " FROM information_schema.STATISTICS s"
+             + " WHERE s.TABLE_SCHEMA = DATABASE() AND s.SEQ_IN_INDEX = 1"
+             + " UNION ALL"
+             + " SELECT 'trigger', g.TRIGGER_NAME, g.EVENT_OBJECT_TABLE, g.ACTION_STATEMENT"
+             + " FROM information_schema.TRIGGERS g"
+             + " WHERE g.TRIGGER_SCHEMA = DATABASE()"
+             + " ORDER BY 1, 2";
+    }
 }
 
 export fn ansi(): Dialect { return new Dialect(); }

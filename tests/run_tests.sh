@@ -187,6 +187,38 @@ else
     fail=1
 fi
 
+# --- and the same for the MySQL driver ---
+rm -rf tests/tmp/myonly
+mkdir -p tests/tmp/myonly
+cat > tests/tmp/myonly/myonly.vt <<'VTEOF'
+import { Db, select } from "vyto/db";
+import { mysql } from "vyto/db/mysql";
+fn main() {
+    let db = new Db(mysql("mysql://nobody@127.0.0.1:1/none"));
+    print(db.isOpen());
+}
+VTEOF
+if VYTO_OBJ_CACHE=tests/tmp/myonly/obj ./vytoc build tests/tmp/myonly/myonly.vt \
+        -o tests/tmp/myonly/myonly >/dev/null 2>&1; then
+    leaked=""
+    if find tests/tmp/myonly/.vyto-cache \( -iname '*sqlite*' -o -iname '*pgsql*' \) \
+            2>/dev/null | grep -q .; then
+        leaked="module objects"
+    fi
+    if grep -rl sqlite3_ tests/tmp/myonly/obj >/dev/null 2>&1; then
+        leaked="$leaked native objects"
+    fi
+    if [ -n "$leaked" ]; then
+        echo "FAIL mysql_no_other_driver (the MySQL driver compiled another one: $leaked)"
+        fail=1
+    else
+        echo "PASS mysql_no_other_driver"
+    fi
+else
+    echo "FAIL mysql_no_other_driver (fixture does not build)"
+    fail=1
+fi
+
 # --- the vendored SQLite tree is byte-identical to what upstream shipped ---
 # A local edit inside native/src/sqlite3/ would be silently reverted by the next
 # refresh, so it is an error rather than a warning. Local changes belong in

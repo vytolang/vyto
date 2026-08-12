@@ -47,7 +47,7 @@ while (c.next()) { total += c.row().getInt("n"); }
 | `vyto/db/wire` | byte-level floor shared by the network drivers: frame building, endian conversion, tolerant parsing, DSN parsing |
 | `vyto/db/wire/io` | the framed transport — `WireIo`, `SockIo`, and `MemIo` for testing without a server |
 | `vyto/db/pgsql` | the PostgreSQL driver. **Pure Vyto**, speaks the v3 wire protocol; no libpq, nothing to install |
-| `vyto/db/mysql` | declared, every entry panics |
+| `vyto/db/mysql` | the MySQL / MariaDB driver. **Pure Vyto**, speaks the client-server protocol; no libmysqlclient, nothing to install, no GPL question |
 
 `import { … } from "vyto/db"` re-exports all of it except a driver. Importing an
 individual module pulls in less.
@@ -70,8 +70,9 @@ wanted to render a query string. Hence two imports at the top of an app, and hen
 
 This is verifiable, not aspirational, and `tests/run_tests.sh` checks it both
 ways: `db_no_driver_contagion` builds a driverless program and fails if any
-SQLite *or* socket object was produced for it, and `pgsql_no_sqlite` builds a
-Postgres-only program and fails if any SQLite object was.
+SQLite *or* socket object was produced for it, while `pgsql_no_sqlite` and
+`mysql_no_other_driver` each build a single-driver program and fail if another
+driver's objects appear.
 
 **A row owns its cells.** `sqlite3_column_text` returns a pointer invalidated by
 the next `step()`, so every cell is copied into Vyto storage before control
@@ -91,8 +92,9 @@ passing user input as a column name has written the bug this package prevents.
 
 > **A synchronous query parks the whole worker.** Vyto has no threads, so a
 > query blocks the process — and behind `vyto/net/server`'s pre-fork reactor,
-> that worker's other connections wait too. It is the main reason the Postgres
-> and MySQL drivers are stubs rather than half-built.
+> that worker's other connections wait too. It is the dominant cost of the two
+> network drivers, and the reason both keep their socket non-blocking
+> underneath even though the `Stmt` seam above it cannot be.
 >
 > SQLite escapes this **only while the working set stays in page cache.** Once
 > the database is larger than RAM the assumption fails and the numbers are not
@@ -148,7 +150,7 @@ let s = db.schema();                      // every table, view and trigger
 
 | | |
 |---|---|
-| `db.supportsIntrospection()` | SQLite and Postgres yes; MySQL panics if asked |
+| `db.supportsIntrospection()` | all three engines; the `ansi()` base says no rather than panicking |
 | `db.tables()` / `db.views()` | names, engine internals filtered, never null |
 | `db.hasTable(name)` | existence, without quoting the name |
 | `db.describe(name)` | `TableInfo` — columns, PK, indexes, foreign keys, DDL text |
@@ -206,12 +208,22 @@ ordinal, so two key columns would emit two `PRIMARY KEY` clauses and produce
 invalid DDL. It drops them rather than rendering them wrong. `TableInfo.sql`
 holds the original text when fidelity matters.
 
-Two limits worth stating plainly. **A generated column's expression is not
-recoverable** from any pragma — SQLite forces its `dflt_value` to NULL — so it
-lives only in `objectSql()`. And **Postgres and MySQL panic**: their
-introspection SQL would be untestable without a server, and the package would
-rather have a clear abort than ship a large query nobody has run. Ask
-`supportsIntrospection()` first.
+Limits worth stating plainly. **A generated column's expression is not
+recoverable** from any pragma on SQLite — it forces `dflt_value` to NULL — so
+there it lives only in `objectSql()`; the Postgres and MySQL queries return it
+directly. **Neither of those engines stores a table's DDL text**, so
+`TableInfo.sql` is empty for a table on both (`pg_dump` reconstructs it from the
+catalogs, and `SHOW CREATE TABLE` is a statement rather than something
+joinable); views, indexes and triggers do have real definitions. And **the
+`ansi()` base dialect still panics if asked** — a dialect that cannot
+introspect says so through `supportsIntrospection()`, and a caller that ignores
+that answer has a bug worth hearing about. Ask first.
+
+One rough edge is MySQL-specific: `introspectIndexColumnsSql` is handed only an
+index name, and MySQL index names are unique per *table* rather than per schema.
+On a schema with the same index name on two tables it returns both tables'
+columns. SQLite and PostgreSQL both have schema-unique index names, which is
+why the seam is shaped that way; widening it is a change to all three.
 
 ## What things cost
 

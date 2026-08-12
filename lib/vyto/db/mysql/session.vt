@@ -1,0 +1,565 @@
+// vyto/db/mysql/session — one connection's conversation with the server.
+//
+// Same shape as the PostgreSQL session, and for the same reason: driver.vt:56
+// forbids a Stmt from referencing its Conn, because that closes a refcount
+// cycle that Vyto leaks silently. MySession is the third object MyConn and
+// MyStmt each hold strongly and which points at neither, and MyRowBuffer is the
+// inert place an evicted cursor's rows are parked.
+//
+// ── WHAT DIFFERS FROM THE POSTGRES SESSION ──────────────────────────────────
+//
+//   * Framing. Every packet carries a sequence id that increments within a
+//     command and resets at each new one. A mismatch is a hard error: the only
+//     alternative is reading the next command's reply as this one's.
+//
+//   * The server speaks first. HandshakeV10 arrives before we have said
+//     anything, which is the reverse of PostgreSQL's client-first startup.
+//
+//   * Result sets are self-delimiting rather than punctuated by a
+//     ReadyForQuery. A query answers with either an OK packet, an ERR packet,
+//     or a column count followed by that many column definitions and then rows
+//     until an EOF-shaped packet. With CLIENT_DEPRECATE_EOF that terminator is
+//     an OK packet with a 0xFE lead byte, which is why length has to be checked
+//     as well as the first byte.
+// ─────────────────────────────────────────────────────────────────────────────
+
+import { WireIo } from "vyto/db/wire/io";
+import { readU24LE, parseIntOr } from "vyto/db/wire";
+import { DBERR_NONE, DBERR_OPEN, DBERR_SQL, DBERR_CLOSED, DBERR_BUSY,
+         DBERR_UNSUPPORTED, DBERR_MISUSE } from "vyto/db/driver";
+import { MyHandshake, MyOk, MyError, MyColumn, MyPrepareOk, MyParam, MyAuthSwitch,
+         decodeHandshake, encodeHandshakeResponse, decodeOk, decodeError,
+         decodeColumnDef, decodeTextRow, decodeBinaryRow, decodePrepareOk,
+         decodeAuthSwitch, encodeStmtPrepare, encodeStmtExecute, encodeStmtClose,
+         encodeStmtReset, encodeQuery, encodeQuit, framePayload, MyReader,
+         clientCapabilities, sliceText,
+         PKT_OK, PKT_EOF, PKT_ERR, PKT_LOCAL_INFILE,
+         CLIENT_CONNECT_WITH_DB, CLIENT_PLUGIN_AUTH_LENENC, CLIENT_SSL,
+         SERVER_STATUS_IN_TRANS, MAX_PAYLOAD } from "vyto/db/mysql/proto";
+import { authResponse, nativePassword, sha2FastPassword,
+         PLUGIN_NATIVE, PLUGIN_SHA2, PLUGIN_CLEAR,
+         SHA2_FAST_AUTH_OK, SHA2_FULL_AUTH_NEEDED } from "vyto/db/mysql/auth";
+
+// Somewhere to park rows, holding no reference to anything.
+export class MyRowBuffer {
+    rows: byte[][];
+    head: int;
+    complete: bool;
+
+    fn init() { this.rows = []; this.head = 0; this.complete = false; }
+    fn reset() { this.rows = []; this.head = 0; this.complete = false; }
+    fn pending(): int { return this.rows.len - this.head; }
+    fn take(): byte[] {
+        if (this.head >= this.rows.len) { return null; }
+        let b = this.rows[this.head];
+        this.head += 1;
+        return b;
+    }
+}
+
+// What COM_STMT_PREPARE told us.
+export class MyPrepared {
+    ok: bool;
+    stmtId: int;
+    params: MyColumn[];
+    cols: MyColumn[];
+    fn init() { this.ok = false; this.stmtId = 0; this.params = []; this.cols = []; }
+}
+
+export class MySession {
+    io: WireIo;
+    open: bool;
+    seq: int;               // the next sequence id to send
+
+    capabilities: int;      // what both sides agreed on
+    serverVersion: string;
+    connectionId: int;
+    statusFlags: int;
+
+    errCode: int;
+    errMsg: string;
+    errState: string;
+    errNo: int;             // MySQL's own error number
+
+    lastRows: int;
+    lastInsertId: int;
+
+    activeId: int;
+    activeSink: MyRowBuffer;
+    activeCols: MyColumn[];
+    drainCap: int;
+
+    fn init(io: WireIo) {
+        this.io = io;
+        this.open = false;
+        this.seq = 0;
+        this.capabilities = 0;
+        this.serverVersion = "";
+        this.connectionId = 0;
+        this.statusFlags = 0;
+        this.errCode = DBERR_NONE;
+        this.errMsg = "";
+        this.errState = "";
+        this.errNo = 0;
+        this.lastRows = 0;
+        this.lastInsertId = 0;
+        this.activeId = 0;
+        this.activeSink = null;
+        this.activeCols = [];
+        this.drainCap = 100000;
+    }
+
+    // ---- error state ------------------------------------------------------
+
+    fn fail(code: int, msg: string) { this.errCode = code; this.errMsg = msg; }
+
+    fn clearError() {
+        this.errCode = DBERR_NONE;
+        this.errMsg = "";
+        this.errState = "";
+        this.errNo = 0;
+    }
+
+    fn recordError(e: MyError) {
+        this.errNo = e.code;
+        this.errState = e.sqlstate;
+        this.errCode = e.dberr();
+        this.errMsg = e.text();
+    }
+
+    fn transportFail() {
+        let s = this.io.error();
+        if (s == "") { s = "the connection failed"; }
+        this.fail(DBERR_CLOSED, s);
+        this.open = false;
+    }
+
+    fn inTransaction(): bool { return (this.statusFlags & SERVER_STATUS_IN_TRANS) != 0; }
+
+    fn resetCounters() {
+        this.lastRows = 0;
+        this.lastInsertId = 0;
+    }
+
+    fn noteOk(o: MyOk) {
+        this.lastRows = o.affectedRows;
+        this.lastInsertId = o.lastInsertId;
+        this.statusFlags = o.statusFlags;
+    }
+
+    // ---- framing ----------------------------------------------------------
+
+    // Send one payload as a new command: the sequence id restarts at 0.
+    fn sendCommand(payload: byte[]): bool {
+        this.seq = 0;
+        return this.sendPacket(payload);
+    }
+
+    // Send one payload continuing the current exchange.
+    fn sendPacket(payload: byte[]): bool {
+        let framed = framePayload(payload, this.seq);
+        // framePayload may have emitted several packets; advance past all of them.
+        let n = payload.len / MAX_PAYLOAD + 1;
+        this.seq = (this.seq + n) & 0xFF;
+        if (!this.io.writeAll(framed)) { this.transportFail(); return false; }
+        return true;
+    }
+
+    // Read one logical payload, reassembling continuation packets.
+    //
+    // A payload of exactly 0xFFFFFF is continued by the next packet, so a large
+    // result row is several packets that have to be joined before anything can
+    // parse it. Null means the connection is gone.
+    fn readPayload(): byte[] {
+        let acc = bytes(0);
+        while (true) {
+            if (!this.io.isOpen()) { this.fail(DBERR_CLOSED, "the connection is closed"); return null; }
+            let head = this.io.readExact(4);
+            if (head == null) { this.transportFail(); return null; }
+            let n = readU24LE(head, 0);
+            let s = head[3] as int;
+
+            // The sequence must be the one we expect. Letting a mismatch slide
+            // means every later reply is attributed to the wrong command.
+            if (s != (this.seq & 0xFF)) {
+                this.fail(DBERR_CLOSED,
+                          "MySQL packet sequence out of step (expected " + str(this.seq & 0xFF)
+                          + ", got " + str(s) + "); the connection is no longer trustworthy");
+                this.open = false;
+                return null;
+            }
+            this.seq = (this.seq + 1) & 0xFF;
+
+            let body = this.io.readExact(n);
+            if (body == null) { this.transportFail(); return null; }
+
+            if (acc.len == 0 && n < MAX_PAYLOAD) { return body; }
+            let joined = bytes(acc.len + body.len);
+            let i = 0;
+            while (i < acc.len) { joined[i] = acc[i]; i += 1; }
+            let j = 0;
+            while (j < body.len) { joined[acc.len + j] = body[j]; j += 1; }
+            acc = joined;
+            if (n < MAX_PAYLOAD) { return acc; }
+        }
+        return null;
+    }
+
+    // ---- packet classification --------------------------------------------
+
+    fn isErr(p: byte[]): bool { return p.len > 0 && (p[0] as int) == PKT_ERR; }
+
+    fn isOk(p: byte[]): bool {
+        if (p.len < 1) { return false; }
+        let lead = p[0] as int;
+        if (lead == PKT_OK && p.len >= 7) { return true; }
+        // With CLIENT_DEPRECATE_EOF the terminating packet is an OK packet that
+        // leads with 0xFE. A short 0xFE packet is the old EOF; a long one would
+        // be a length-encoded integer. Both the byte and the length are needed.
+        if (lead == PKT_EOF && p.len < 9) { return true; }
+        return false;
+    }
+
+    fn isEof(p: byte[]): bool {
+        return p.len > 0 && (p[0] as int) == PKT_EOF && p.len < 9;
+    }
+
+    // Whether a packet ENDS a result set, as opposed to being a row in one.
+    //
+    // This is NOT isOk(), and the difference is a real bug waiting to happen: a
+    // binary-protocol row begins with 0x00 and is usually longer than seven
+    // bytes, so isOk() classifies it as an OK packet and the result set appears
+    // to end before the first row. The protocol resolves 0x00 by CONTEXT — it
+    // means "OK" only where a row cannot appear — so inside a result set the
+    // only terminators are 0xFE (an EOF, or the OK that replaces it under
+    // CLIENT_DEPRECATE_EOF) and 0xFF (an error, handled separately).
+    fn isResultEnd(p: byte[]): bool {
+        return p.len > 0 && (p[0] as int) == PKT_EOF && p.len < 0xFFFFFF;
+    }
+
+    // ---- connecting -------------------------------------------------------
+
+    fn connect(user: string, password: string, database: string): bool {
+        if (this.io == null || !this.io.isOpen()) {
+            this.fail(DBERR_OPEN, "could not reach the server");
+            return false;
+        }
+
+        // The server speaks first.
+        this.seq = 0;
+        let hs = this.readPayload();
+        if (hs == null) {
+            // Keep whatever readPayload already diagnosed — "sequence out of
+            // step" is far more useful than "the connection closed", and it is
+            // the specific message that would otherwise be lost here. Only the
+            // CLASS is promoted, because this is a connect-time failure.
+            if (this.errMsg == "") {
+                this.fail(DBERR_OPEN, "the server closed the connection during the handshake");
+            } else {
+                this.errCode = DBERR_OPEN;
+            }
+            return false;
+        }
+        if (this.isErr(hs)) {
+            let e = decodeError(hs);
+            this.recordError(e);
+            this.errCode = DBERR_OPEN;
+            return false;
+        }
+
+        let h = decodeHandshake(hs);
+        if (!h.ok) {
+            this.fail(DBERR_OPEN, "the server sent a handshake this driver does not understand"
+                                  + " (protocol version " + str(h.protocolVersion) + ")");
+            return false;
+        }
+        this.serverVersion = h.serverVersion;
+        this.connectionId = h.connectionId;
+        this.statusFlags = h.statusFlags;
+
+        let plugin = h.authPlugin;
+        if (plugin == "") { plugin = PLUGIN_NATIVE; }
+
+        let resp = authResponse(plugin, password, h.authData);
+        if (resp == null) {
+            this.fail(DBERR_OPEN, this.pluginRefusal(plugin));
+            return false;
+        }
+
+        let caps = clientCapabilities(database != "") & h.capabilities;
+        // These are ours to require regardless of what the server volunteered.
+        caps = caps | (clientCapabilities(database != "") & (CLIENT_PLUGIN_AUTH_LENENC));
+        this.capabilities = caps;
+
+        let payload = encodeHandshakeResponse(caps, 16777215, 45, user, resp, database, plugin);
+        if (!this.sendPacket(payload)) { return false; }
+
+        return this.finishAuth(password);
+    }
+
+    fn pluginRefusal(plugin: string): string {
+        if (plugin == PLUGIN_CLEAR) {
+            return "the server asked for mysql_clear_password, which sends the password in the "
+                 + "clear and is only safe over TLS; this driver has no TLS "
+                 + "(lib/vyto/crypto/openssl is a stub)";
+        }
+        return "the server asked for an authentication plugin this driver does not implement: "
+             + plugin + " (supported: " + PLUGIN_NATIVE + ", " + PLUGIN_SHA2 + " fast path)";
+    }
+
+    // Read through to the OK that ends authentication, handling a plugin switch
+    // and caching_sha2_password's second stage.
+    fn finishAuth(password: string): bool {
+        while (true) {
+            let p = this.readPayload();
+            if (p == null) {
+                if (this.errMsg == "") {
+                    this.fail(DBERR_OPEN, "the server closed the connection during authentication");
+                } else {
+                    this.errCode = DBERR_OPEN;
+                }
+                return false;
+            }
+
+            if (this.isErr(p)) {
+                let e = decodeError(p);
+                this.recordError(e);
+                this.errCode = DBERR_OPEN;
+                return false;
+            }
+
+            if (this.isOk(p)) {
+                let o = decodeOk(p);
+                this.statusFlags = o.statusFlags;
+                this.open = true;
+                return true;
+            }
+
+            let lead = p[0] as int;
+
+            // AuthSwitchRequest: the server wants a different plugin.
+            if (lead == 0xFE) {
+                let sw = decodeAuthSwitch(p);
+                let r = authResponse(sw.plugin, password, sw.data);
+                if (r == null) {
+                    this.fail(DBERR_OPEN, this.pluginRefusal(sw.plugin));
+                    return false;
+                }
+                if (!this.sendPacket(r)) { return false; }
+                continue;
+            }
+
+            // caching_sha2_password's second stage. 0x03 is "the cache had you";
+            // 0x04 is "it did not, send the password itself" — which needs TLS
+            // or RSA, and we have neither.
+            if (lead == 0x01 && p.len >= 2) {
+                let marker = p[1] as int;
+                if (marker == SHA2_FAST_AUTH_OK) { continue; }
+                if (marker == SHA2_FULL_AUTH_NEEDED) {
+                    this.fail(DBERR_OPEN,
+                        "the server demanded caching_sha2_password full authentication, which "
+                        + "sends the password itself and so needs TLS or an RSA key exchange; "
+                        + "this driver has neither. This happens on the FIRST login for a user "
+                        + "and after any server restart or cache flush. Fix it with "
+                        + "ALTER USER ... IDENTIFIED WITH mysql_native_password, or use MariaDB, "
+                        + "or wait for lib/vyto/crypto/openssl.");
+                    return false;
+                }
+                continue;
+            }
+
+            this.fail(DBERR_OPEN, "unexpected packet during authentication (lead byte "
+                                  + str(lead) + ")");
+            return false;
+        }
+        return false;
+    }
+
+    // ---- wire ownership ---------------------------------------------------
+
+    fn acquire(stmtId: int, sink: MyRowBuffer, cols: MyColumn[]): bool {
+        if (!this.open) { this.fail(DBERR_CLOSED, "the connection is closed"); return false; }
+        if (this.activeId == stmtId) {
+            this.activeSink = sink;
+            this.activeCols = cols;
+            return true;
+        }
+        if (this.activeId != 0) {
+            if (!this.drainActive()) { return false; }
+        }
+        this.activeId = stmtId;
+        this.activeSink = sink;
+        this.activeCols = cols;
+        return true;
+    }
+
+    // Read the incumbent statement's remaining rows into its own buffer, then
+    // let go of the wire.
+    fn drainActive(): bool {
+        let sink = this.activeSink;
+        while (true) {
+            let p = this.readPayload();
+            if (p == null) { this.activeId = 0; this.activeSink = null; return false; }
+
+            if (this.isErr(p)) {
+                this.recordError(decodeError(p));
+                if (sink != null) { sink.complete = true; }
+                this.activeId = 0;
+                this.activeSink = null;
+                return false;
+            }
+            if (this.isResultEnd(p)) {
+                this.noteOk(decodeOk(p));
+                if (sink != null) { sink.complete = true; }
+                this.activeId = 0;
+                this.activeSink = null;
+                return true;
+            }
+            if (sink != null) {
+                if (sink.rows.len >= this.drainCap) {
+                    this.fail(DBERR_BUSY,
+                              "a second statement needed this connection while a cursor was still "
+                              + "open, and draining it exceeded " + str(this.drainCap)
+                              + " buffered rows; finish or close the cursor first");
+                    sink.complete = true;
+                    this.activeId = 0;
+                    this.activeSink = null;
+                    return false;
+                }
+                sink.rows.push(p);
+            }
+        }
+        return false;
+    }
+
+    fn releaseWire(stmtId: int) {
+        if (this.activeId == stmtId) {
+            this.activeId = 0;
+            this.activeSink = null;
+            this.activeCols = [];
+        }
+    }
+
+    // ---- simple query -----------------------------------------------------
+
+    // COM_QUERY, for DDL and BEGIN/COMMIT/ROLLBACK. Any rows are discarded.
+    fn simpleQuery(sql: string): bool {
+        if (!this.open) { this.fail(DBERR_CLOSED, "the connection is closed"); return false; }
+        if (this.activeId != 0) {
+            if (!this.drainActive()) { return false; }
+        }
+        this.clearError();
+        this.resetCounters();
+        if (!this.sendCommand(encodeQuery(sql))) { return false; }
+
+        let first = this.readPayload();
+        if (first == null) { return false; }
+
+        if (this.isErr(first)) { this.recordError(decodeError(first)); return false; }
+        if (this.isOk(first)) { this.noteOk(decodeOk(first)); return true; }
+        if (first.len > 0 && (first[0] as int) == PKT_LOCAL_INFILE) {
+            this.fail(DBERR_UNSUPPORTED, "LOCAL INFILE is not supported by this driver");
+            return false;
+        }
+
+        // A result set: a column count, that many definitions, then rows.
+        let r = new MyReader(first);
+        let ncols = r.lenEncInt();
+        if (ncols <= 0) { this.fail(DBERR_SQL, "malformed result header"); return false; }
+
+        let i = 0;
+        while (i < ncols) {
+            let d = this.readPayload();
+            if (d == null) { return false; }
+            i += 1;
+        }
+        while (true) {
+            let p = this.readPayload();
+            if (p == null) { return false; }
+            if (this.isErr(p)) { this.recordError(decodeError(p)); return false; }
+            if (this.isResultEnd(p)) { this.noteOk(decodeOk(p)); return true; }
+            // a row, discarded
+        }
+        return false;
+    }
+
+    // ---- prepared statements ----------------------------------------------
+
+    // COM_STMT_PREPARE. The reply carries the column definitions, so column
+    // names are known before the first step() — the same property Describe gives
+    // the Postgres driver, and what vyto/db needs at db.vt:309.
+    fn prepare(sql: string): MyPrepared {
+        let p = new MyPrepared();
+        if (!this.open) { this.fail(DBERR_CLOSED, "the connection is closed"); return p; }
+        if (this.activeId != 0) {
+            if (!this.drainActive()) { return p; }
+        }
+        this.clearError();
+
+        if (!this.sendCommand(encodeStmtPrepare(sql))) { return p; }
+        let first = this.readPayload();
+        if (first == null) { return p; }
+        if (this.isErr(first)) { this.recordError(decodeError(first)); return p; }
+
+        let ok = decodePrepareOk(first);
+        if (!ok.ok) { this.fail(DBERR_SQL, "malformed COM_STMT_PREPARE response"); return p; }
+        p.stmtId = ok.stmtId;
+
+        let i = 0;
+        while (i < ok.numParams) {
+            let d = this.readPayload();
+            if (d == null) { return p; }
+            if (!this.isEof(d)) { p.params.push(decodeColumnDef(d)); }
+            i += 1;
+        }
+        // Without DEPRECATE_EOF an EOF packet closes each block.
+        if (ok.numParams > 0 && !this.deprecateEof()) {
+            let d = this.readPayload();
+            if (d == null) { return p; }
+        }
+
+        i = 0;
+        while (i < ok.numColumns) {
+            let d = this.readPayload();
+            if (d == null) { return p; }
+            if (!this.isEof(d)) { p.cols.push(decodeColumnDef(d)); }
+            i += 1;
+        }
+        if (ok.numColumns > 0 && !this.deprecateEof()) {
+            let d = this.readPayload();
+            if (d == null) { return p; }
+        }
+
+        p.ok = true;
+        return p;
+    }
+
+    fn deprecateEof(): bool { return (this.capabilities & 16777216) != 0; }
+
+    fn execute(stmtId: int, params: MyParam[]): bool {
+        this.clearError();
+        this.resetCounters();
+        return this.sendCommand(encodeStmtExecute(stmtId, params));
+    }
+
+    fn closeStatement(stmtId: int): bool {
+        if (!this.open || stmtId == 0) { return false; }
+        if (this.activeId != 0) {
+            if (!this.drainActive()) { return false; }
+        }
+        // COM_STMT_CLOSE has no reply at all, which is unusual and worth not
+        // waiting for.
+        return this.sendCommand(encodeStmtClose(stmtId));
+    }
+
+    fn close() {
+        if (this.io != null && this.io.isOpen()) {
+            this.seq = 0;
+            this.io.writeAll(framePayload(encodeQuit(), 0));
+            this.io.close();
+        }
+        this.open = false;
+        this.activeId = 0;
+        this.activeSink = null;
+    }
+}

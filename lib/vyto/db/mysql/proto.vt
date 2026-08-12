@@ -1,0 +1,774 @@
+// vyto/db/mysql/proto — the MySQL/MariaDB client-server protocol, as pure
+// functions over byte[].
+//
+// Socket-free, like its Postgres counterpart: every encoder returns the payload
+// of one packet and every decoder takes one, so examples/106_mywire.vt asserts
+// the whole thing with no server running.
+//
+// ── PACKET FRAMING ──────────────────────────────────────────────────────────
+//
+//     [3-byte LE payload length][1-byte sequence id][payload]
+//
+// Two rules that are not optional:
+//
+//   * The sequence id increments per packet within a command and RESETS to 0 at
+//     each new command. A mismatch means the stream is out of step, and the only
+//     safe response is to fail the connection — continuing reads the next
+//     command's reply as this one's.
+//
+//   * A payload of exactly 0xFFFFFF is CONTINUED by the following packet, and a
+//     payload that is an exact multiple of 0xFFFFFF is terminated by a
+//     zero-length one. Reassembly is part of the protocol, not an optimization
+//     for large results.
+//
+// ── LENGTH-ENCODED INTEGERS ─────────────────────────────────────────────────
+// MySQL's variable-width integer, used for nearly every count and every string
+// length. 0xFB is NULL in a row context; 0xFC/0xFD/0xFE introduce 2, 3 and 8
+// further bytes. They live here rather than in vyto/db/wire because the
+// encoding is MySQL's, not the wire's.
+// ─────────────────────────────────────────────────────────────────────────────
+
+import { ByteWriter, byteWriter, parseIntOr, sqlstateToDberr, readU24LE } from "vyto/db/wire";
+import { DBERR_NONE, DBERR_SQL, DBERR_CONSTRAINT, DBERR_BUSY, DBERR_OPEN,
+         DBERR_CLOSED, DBERR_MISUSE, DBERR_UNSUPPORTED } from "vyto/db/driver";
+
+// The largest payload one packet can carry; anything this size is continued.
+export const MAX_PAYLOAD: int = 16777215;    // 0xFFFFFF
+
+// ---- commands --------------------------------------------------------------
+
+export const COM_QUIT:          int = 0x01;
+export const COM_QUERY:         int = 0x03;
+export const COM_PING:          int = 0x0E;
+export const COM_STMT_PREPARE:  int = 0x16;
+export const COM_STMT_EXECUTE:  int = 0x17;
+export const COM_STMT_CLOSE:    int = 0x19;
+export const COM_STMT_RESET:    int = 0x1A;
+
+// ---- packet leading bytes --------------------------------------------------
+
+export const PKT_OK:   int = 0x00;
+export const PKT_EOF:  int = 0xFE;
+export const PKT_ERR:  int = 0xFF;
+export const PKT_LOCAL_INFILE: int = 0xFB;
+
+// ---- capability flags ------------------------------------------------------
+
+export const CLIENT_LONG_PASSWORD:     int = 1;
+export const CLIENT_FOUND_ROWS:        int = 2;
+export const CLIENT_LONG_FLAG:         int = 4;
+export const CLIENT_CONNECT_WITH_DB:   int = 8;
+export const CLIENT_COMPRESS:          int = 32;
+export const CLIENT_LOCAL_FILES:       int = 128;
+export const CLIENT_PROTOCOL_41:       int = 512;
+export const CLIENT_SSL:               int = 2048;
+export const CLIENT_TRANSACTIONS:      int = 8192;
+export const CLIENT_SECURE_CONNECTION: int = 32768;
+export const CLIENT_MULTI_STATEMENTS:  int = 65536;         // 1 << 16
+export const CLIENT_MULTI_RESULTS:     int = 131072;        // 1 << 17
+export const CLIENT_PS_MULTI_RESULTS:  int = 262144;        // 1 << 18
+export const CLIENT_PLUGIN_AUTH:       int = 524288;        // 1 << 19
+export const CLIENT_CONNECT_ATTRS:     int = 1048576;       // 1 << 20
+export const CLIENT_PLUGIN_AUTH_LENENC: int = 2097152;      // 1 << 21
+export const CLIENT_SESSION_TRACK:     int = 8388608;       // 1 << 23
+export const CLIENT_DEPRECATE_EOF:     int = 16777216;      // 1 << 24
+
+// What this driver asks for.
+//
+// DEPRECATE_EOF is worth the most: it removes the EOF packets that would
+// otherwise punctuate every result set, which roughly halves the parsing state
+// machine and removes the ambiguity between an EOF packet and an OK packet that
+// happens to start with 0xFE.
+//
+// MULTI_STATEMENTS is deliberately NOT requested. It would turn a stray `;` in
+// a statement into a second statement, which is an injection vector for no
+// benefit — every value here is a bound parameter and nothing needs it.
+export fn clientCapabilities(withDb: bool): int {
+    let c = CLIENT_LONG_PASSWORD | CLIENT_LONG_FLAG | CLIENT_PROTOCOL_41
+          | CLIENT_TRANSACTIONS | CLIENT_SECURE_CONNECTION | CLIENT_PLUGIN_AUTH
+          | CLIENT_PLUGIN_AUTH_LENENC | CLIENT_DEPRECATE_EOF
+          | CLIENT_MULTI_RESULTS | CLIENT_PS_MULTI_RESULTS;
+    if (withDb) { c = c | CLIENT_CONNECT_WITH_DB; }
+    return c;
+}
+
+// ---- server status flags ---------------------------------------------------
+
+export const SERVER_STATUS_IN_TRANS:  int = 1;
+export const SERVER_MORE_RESULTS:     int = 8;
+
+// ---- column types ----------------------------------------------------------
+
+export const MT_DECIMAL:     int = 0x00;
+export const MT_TINY:        int = 0x01;
+export const MT_SHORT:       int = 0x02;
+export const MT_LONG:        int = 0x03;
+export const MT_FLOAT:       int = 0x04;
+export const MT_DOUBLE:      int = 0x05;
+export const MT_NULL:        int = 0x06;
+export const MT_TIMESTAMP:   int = 0x07;
+export const MT_LONGLONG:    int = 0x08;
+export const MT_INT24:       int = 0x09;
+export const MT_DATE:        int = 0x0A;
+export const MT_TIME:        int = 0x0B;
+export const MT_DATETIME:    int = 0x0C;
+export const MT_YEAR:        int = 0x0D;
+export const MT_VARCHAR:     int = 0x0F;
+export const MT_BIT:         int = 0x10;
+export const MT_JSON:        int = 0xF5;
+export const MT_NEWDECIMAL:  int = 0xF6;
+export const MT_ENUM:        int = 0xF7;
+export const MT_SET:         int = 0xF8;
+export const MT_TINY_BLOB:   int = 0xF9;
+export const MT_MEDIUM_BLOB: int = 0xFA;
+export const MT_LONG_BLOB:   int = 0xFB;
+export const MT_BLOB:        int = 0xFC;
+export const MT_VAR_STRING:  int = 0xFD;
+export const MT_STRING:      int = 0xFE;
+export const MT_GEOMETRY:    int = 0xFF;
+
+// ---- column flags ----------------------------------------------------------
+
+export const FLAG_NOT_NULL:  int = 1;
+export const FLAG_PRI_KEY:   int = 2;
+export const FLAG_UNSIGNED:  int = 32;
+export const FLAG_BINARY:    int = 128;
+export const FLAG_AUTO_INCR: int = 512;
+
+// ---------------------------------------------------------------------------
+// Reading
+// ---------------------------------------------------------------------------
+
+// A bounds-safe cursor over a packet payload. Every read clamps and sets `bad`
+// instead of panicking: the bytes came off a network, so a truncated packet is
+// a protocol error to report, never a reason to abort the process.
+export class MyReader {
+    b: byte[];
+    off: int;
+    bad: bool;
+
+    fn init(b: byte[]) { this.b = b; this.off = 0; this.bad = false; }
+
+    fn remaining(): int { return this.b.len - this.off; }
+    fn atEnd(): bool { return this.off >= this.b.len; }
+
+    fn u8(): int {
+        if (this.off + 1 > this.b.len) { this.bad = true; return 0; }
+        let v = this.b[this.off] as int;
+        this.off += 1;
+        return v;
+    }
+
+    fn u16(): int {
+        if (this.off + 2 > this.b.len) { this.bad = true; return 0; }
+        let v = (this.b[this.off] as int) | ((this.b[this.off + 1] as int) << 8);
+        this.off += 2;
+        return v;
+    }
+
+    fn u24(): int {
+        if (this.off + 3 > this.b.len) { this.bad = true; return 0; }
+        let v = readU24LE(this.b, this.off);
+        this.off += 3;
+        return v;
+    }
+
+    fn u32(): int {
+        if (this.off + 4 > this.b.len) { this.bad = true; return 0; }
+        let v = (this.b[this.off] as int) | ((this.b[this.off + 1] as int) << 8)
+              | ((this.b[this.off + 2] as int) << 16) | ((this.b[this.off + 3] as int) << 24);
+        this.off += 4;
+        return v;
+    }
+
+    fn u64(): int {
+        if (this.off + 8 > this.b.len) { this.bad = true; return 0; }
+        let v = 0;
+        let i = 7;
+        while (i >= 0) { v = (v << 8) | (this.b[this.off + i] as int); i -= 1; }
+        this.off += 8;
+        return v;
+    }
+
+    fn skip(n: int) {
+        if (this.off + n > this.b.len) { this.bad = true; this.off = this.b.len; return; }
+        this.off += n;
+    }
+
+    // A length-encoded integer. -1 means the NULL marker (0xFB), which only
+    // appears where a value is expected.
+    fn lenEncInt(): int {
+        let first = this.u8();
+        if (this.bad) { return 0; }
+        if (first < 0xFB) { return first; }
+        if (first == 0xFB) { return -1; }
+        if (first == 0xFC) { return this.u16(); }
+        if (first == 0xFD) { return this.u24(); }
+        if (first == 0xFE) { return this.u64(); }
+        this.bad = true;
+        return 0;
+    }
+
+    // A length-encoded string. Null for the NULL marker, which is distinct from
+    // a zero-length string — the same distinction Postgres draws with -1.
+    fn lenEncBytes(): byte[] {
+        let n = this.lenEncInt();
+        if (this.bad) { return null; }
+        if (n < 0) { return null; }
+        return this.take(n);
+    }
+
+    fn lenEncString(): string {
+        let b = this.lenEncBytes();
+        if (b == null) { return ""; }
+        return strbytes(b, b.len);
+    }
+
+    // A NUL-terminated string, used in the handshake.
+    fn cstr(): string {
+        let start = this.off;
+        let i = this.off;
+        while (i < this.b.len && this.b[i] != 0 as byte) { i += 1; }
+        let s = sliceText(this.b, start, i - start);
+        if (i >= this.b.len) { this.bad = true; this.off = this.b.len; }
+        else { this.off = i + 1; }
+        return s;
+    }
+
+    // Everything left, as a string.
+    fn restString(): string { return sliceText(this.b, this.off, this.b.len - this.off); }
+
+    fn take(n: int): byte[] {
+        if (n < 0 || this.off + n > this.b.len) { this.bad = true; return bytes(0); }
+        let out = bytes(n);
+        let i = 0;
+        while (i < n) { out[i] = this.b[this.off + i]; i += 1; }
+        this.off += n;
+        return out;
+    }
+}
+
+// strbytes, not str(): a value may contain an embedded NUL and a strlen scan
+// would truncate it there.
+export fn sliceText(b: byte[], off: int, n: int): string {
+    if (off < 0 || n <= 0 || off >= b.len) { return ""; }
+    let k = n;
+    if (off + k > b.len) { k = b.len - off; }
+    let out = bytes(k);
+    let i = 0;
+    while (i < k) { out[i] = b[off + i]; i += 1; }
+    return strbytes(out, k);
+}
+
+// ---- writing length-encoded values -----------------------------------------
+
+export fn writeLenEncInt(w: ByteWriter, v: int): ByteWriter {
+    if (v < 0) { return w.u8(0xFB); }
+    if (v < 251) { return w.u8(v); }
+    if (v < 65536) { return w.u8(0xFC).u16le(v); }
+    if (v < 16777216) { return w.u8(0xFD).u24le(v); }
+    return w.u8(0xFE).i64le(v);
+}
+
+export fn writeLenEncBytes(w: ByteWriter, b: byte[]): ByteWriter {
+    if (b == null) { return w.u8(0xFB); }
+    writeLenEncInt(w, b.len);
+    return w.raw(b);
+}
+
+// ---------------------------------------------------------------------------
+// Packet framing
+// ---------------------------------------------------------------------------
+
+// Frame one payload, splitting it across packets when it is too large.
+//
+// The trailing empty packet is not a nicety: a payload that is an exact
+// multiple of 0xFFFFFF is only terminated by a zero-length one, and without it
+// the server waits forever for a continuation.
+export fn framePayload(payload: byte[], seq: int): byte[] {
+    let w = byteWriter(payload.len + 8);
+    let off = 0;
+    let s = seq;
+    while (true) {
+        let n = payload.len - off;
+        if (n > MAX_PAYLOAD) { n = MAX_PAYLOAD; }
+        w.u24le(n).u8(s & 0xFF).rawSlice(payload, off, n);
+        off += n;
+        s += 1;
+        if (n < MAX_PAYLOAD) { break; }
+        if (off >= payload.len) { w.u24le(0).u8(s & 0xFF); break; }
+    }
+    return w.take();
+}
+
+// ---------------------------------------------------------------------------
+// Handshake
+// ---------------------------------------------------------------------------
+
+export class MyHandshake {
+    protocolVersion: int;
+    serverVersion: string;
+    connectionId: int;
+    authData: byte[];        // the 20-byte nonce, both halves joined
+    capabilities: int;
+    charset: int;
+    statusFlags: int;
+    authPlugin: string;
+    ok: bool;
+
+    fn init() {
+        this.protocolVersion = 0;
+        this.serverVersion = "";
+        this.connectionId = 0;
+        this.authData = bytes(0);
+        this.capabilities = 0;
+        this.charset = 0;
+        this.statusFlags = 0;
+        this.authPlugin = "";
+        this.ok = false;
+    }
+}
+
+// HandshakeV10. Note the server speaks FIRST here, the opposite of PostgreSQL,
+// and the auth nonce arrives in two pieces that have to be rejoined.
+export fn decodeHandshake(body: byte[]): MyHandshake {
+    let h = new MyHandshake();
+    let r = new MyReader(body);
+
+    h.protocolVersion = r.u8();
+    if (h.protocolVersion != 10) { return h; }
+    h.serverVersion = r.cstr();
+    h.connectionId = r.u32();
+
+    let part1 = r.take(8);
+    r.skip(1);                                    // filler
+    let capLow = r.u16();
+
+    if (r.atEnd()) {
+        h.capabilities = capLow;
+        h.authData = part1;
+        h.ok = !r.bad;
+        return h;
+    }
+
+    h.charset = r.u8();
+    h.statusFlags = r.u16();
+    let capHigh = r.u16();
+    h.capabilities = capLow | (capHigh << 16);
+    let authLen = r.u8();
+    r.skip(10);                                   // reserved
+
+    // The second half is at least 13 bytes on the wire but only
+    // (authLen - 8) of them are data; the rest is a NUL the length lies about.
+    let want = authLen - 8;
+    if (want < 13) { want = 13; }
+    let part2 = r.take(want);
+    let keep = authLen - 8;
+    if (keep < 0) { keep = 0; }
+    if (keep > part2.len) { keep = part2.len; }
+
+    let joined = bytes(part1.len + keep);
+    let i = 0;
+    while (i < part1.len) { joined[i] = part1[i]; i += 1; }
+    let j = 0;
+    while (j < keep) { joined[part1.len + j] = part2[j]; j += 1; }
+    // Some servers include the trailing NUL in the count.
+    if (joined.len == 21 && joined[20] == 0 as byte) {
+        let trimmed = bytes(20);
+        let k = 0;
+        while (k < 20) { trimmed[k] = joined[k]; k += 1; }
+        joined = trimmed;
+    }
+    h.authData = joined;
+
+    if (!r.atEnd()) { h.authPlugin = r.cstr(); }
+    h.ok = true;
+    return h;
+}
+
+// HandshakeResponse41.
+export fn encodeHandshakeResponse(caps: int, maxPacket: int, charset: int,
+                                  user: string, authResponse: byte[],
+                                  database: string, plugin: string): byte[] {
+    let w = byteWriter(128);
+    w.u32le(caps);
+    w.u32le(maxPacket);
+    w.u8(charset);
+    let i = 0;
+    while (i < 23) { w.u8(0); i += 1; }           // reserved
+    w.cstr(user);
+
+    if ((caps & CLIENT_PLUGIN_AUTH_LENENC) != 0) {
+        writeLenEncBytes(w, authResponse);
+    } else {
+        let n = 0;
+        if (authResponse != null) { n = authResponse.len; }
+        w.u8(n);
+        if (authResponse != null) { w.raw(authResponse); }
+    }
+
+    if ((caps & CLIENT_CONNECT_WITH_DB) != 0) { w.cstr(database); }
+    if ((caps & CLIENT_PLUGIN_AUTH) != 0) { w.cstr(plugin); }
+    return w.take();
+}
+
+// The client's reply to an AuthSwitchRequest, or the extra data a plugin asks
+// for: the raw bytes, with the packet length bounding them.
+export fn encodeAuthData(data: byte[]): byte[] {
+    if (data == null) { return bytes(0); }
+    return data;
+}
+
+export class MyAuthSwitch {
+    plugin: string;
+    data: byte[];
+    fn init() { this.plugin = ""; this.data = bytes(0); }
+}
+
+export fn decodeAuthSwitch(body: byte[]): MyAuthSwitch {
+    let a = new MyAuthSwitch();
+    let r = new MyReader(body);
+    r.u8();                                       // 0xFE
+    a.plugin = r.cstr();
+    let d = r.take(r.remaining());
+    // The nonce is 20 bytes plus a trailing NUL the length includes.
+    if (d.len == 21 && d[20] == 0 as byte) {
+        let t = bytes(20);
+        let i = 0;
+        while (i < 20) { t[i] = d[i]; i += 1; }
+        d = t;
+    }
+    a.data = d;
+    return a;
+}
+
+// ---------------------------------------------------------------------------
+// OK / ERR
+// ---------------------------------------------------------------------------
+
+export class MyOk {
+    affectedRows: int;
+    lastInsertId: int;
+    statusFlags: int;
+    warnings: int;
+    info: string;
+
+    fn init() {
+        this.affectedRows = 0;
+        this.lastInsertId = 0;
+        this.statusFlags = 0;
+        this.warnings = 0;
+        this.info = "";
+    }
+    fn inTransaction(): bool { return (this.statusFlags & SERVER_STATUS_IN_TRANS) != 0; }
+}
+
+// Unlike PostgreSQL, which reports a row count as text in a CommandComplete tag,
+// MySQL puts both numbers in the OK packet as length-encoded integers. This is
+// the one place MySQL is strictly easier: lastInsertId is real here.
+export fn decodeOk(body: byte[]): MyOk {
+    let o = new MyOk();
+    let r = new MyReader(body);
+    r.u8();                                       // 0x00 or 0xFE
+    o.affectedRows = r.lenEncInt();
+    o.lastInsertId = r.lenEncInt();
+    o.statusFlags = r.u16();
+    o.warnings = r.u16();
+    if (!r.atEnd()) { o.info = r.restString(); }
+    if (o.affectedRows < 0) { o.affectedRows = 0; }
+    if (o.lastInsertId < 0) { o.lastInsertId = 0; }
+    return o;
+}
+
+export class MyError {
+    code: int;              // the MySQL error number
+    sqlstate: string;
+    message: string;
+
+    fn init() { this.code = 0; this.sqlstate = ""; this.message = ""; }
+
+    // The DBERR_* class.
+    //
+    // The errno is checked FIRST and the SQLSTATE only as a fallback: MySQL's
+    // errno is both more specific and more stable than its SQLSTATE mapping,
+    // several of which are the catch-all HY000.
+    fn dberr(): int {
+        if (this.code == 1062) { return DBERR_CONSTRAINT; }   // duplicate entry
+        if (this.code == 1451) { return DBERR_CONSTRAINT; }   // FK: parent row
+        if (this.code == 1452) { return DBERR_CONSTRAINT; }   // FK: child row
+        if (this.code == 1048) { return DBERR_CONSTRAINT; }   // column cannot be null
+        if (this.code == 1216) { return DBERR_CONSTRAINT; }
+        if (this.code == 1217) { return DBERR_CONSTRAINT; }
+        if (this.code == 3819) { return DBERR_CONSTRAINT; }   // CHECK violated
+        if (this.code == 1213) { return DBERR_BUSY; }         // deadlock
+        if (this.code == 1205) { return DBERR_BUSY; }         // lock wait timeout
+        if (this.code == 1040) { return DBERR_BUSY; }         // too many connections
+        if (this.code == 1064) { return DBERR_SQL; }          // syntax error
+        if (this.code == 1146) { return DBERR_SQL; }          // no such table
+        if (this.code == 1054) { return DBERR_SQL; }          // no such column
+        if (this.code == 1045) { return DBERR_OPEN; }         // access denied
+        if (this.code == 1044) { return DBERR_OPEN; }         // access denied to db
+        if (this.code == 1049) { return DBERR_OPEN; }         // no such database
+        if (this.code == 2013 || this.code == 2006) { return DBERR_CLOSED; }
+        if (this.sqlstate != "") { return sqlstateToDberr(this.sqlstate); }
+        return DBERR_SQL;
+    }
+
+    fn text(): string {
+        let out = "ERROR " + str(this.code);
+        if (this.sqlstate != "") { out = out + " (" + this.sqlstate + ")"; }
+        return out + ": " + this.message;
+    }
+}
+
+export fn decodeError(body: byte[]): MyError {
+    let e = new MyError();
+    let r = new MyReader(body);
+    r.u8();                                       // 0xFF
+    e.code = r.u16();
+    // The SQLSTATE marker is only present with CLIENT_PROTOCOL_41, which this
+    // driver always negotiates — but a handshake error can arrive before the
+    // capabilities are agreed, so it is checked rather than assumed.
+    if (!r.atEnd() && r.b[r.off] == 35 as byte) {  // '#'
+        r.skip(1);
+        e.sqlstate = sliceText(r.b, r.off, 5);
+        r.skip(5);
+    }
+    e.message = r.restString();
+    return e;
+}
+
+// ---------------------------------------------------------------------------
+// Column definitions and rows
+// ---------------------------------------------------------------------------
+
+export class MyColumn {
+    schema: string;
+    table: string;
+    orgTable: string;
+    name: string;
+    orgName: string;
+    charset: int;
+    length: int;
+    kind: int;              // one of MT_*
+    flags: int;
+    decimals: int;
+
+    fn init() {
+        this.schema = "";
+        this.table = "";
+        this.orgTable = "";
+        this.name = "";
+        this.orgName = "";
+        this.charset = 0;
+        this.length = 0;
+        this.kind = MT_NULL;
+        this.flags = 0;
+        this.decimals = 0;
+    }
+
+    fn isUnsigned(): bool { return (this.flags & FLAG_UNSIGNED) != 0; }
+    // charset 63 is `binary`, which is how a BLOB is told from a TEXT: they
+    // share a column type and differ only here.
+    fn isBinary(): bool { return this.charset == 63; }
+}
+
+export fn decodeColumnDef(body: byte[]): MyColumn {
+    let c = new MyColumn();
+    let r = new MyReader(body);
+    r.lenEncString();                             // catalog, always "def"
+    c.schema = r.lenEncString();
+    c.table = r.lenEncString();
+    c.orgTable = r.lenEncString();
+    c.name = r.lenEncString();
+    c.orgName = r.lenEncString();
+    r.lenEncInt();                                // length of the fixed fields, 0x0c
+    c.charset = r.u16();
+    c.length = r.u32();
+    c.kind = r.u8();
+    c.flags = r.u16();
+    c.decimals = r.u8();
+    return c;
+}
+
+// A row of the TEXT protocol: every column is a length-encoded string, and
+// 0xFB is SQL NULL.
+export fn decodeTextRow(body: byte[], ncols: int): byte[][] {
+    let out: byte[][] = [];
+    let r = new MyReader(body);
+    let i = 0;
+    while (i < ncols) {
+        let v = r.lenEncBytes();
+        if (r.bad) { return out; }
+        out.push(v);
+        i += 1;
+    }
+    return out;
+}
+
+// A row of the BINARY protocol, which is what a prepared statement returns.
+//
+// Leads with 0x00, then a NULL bitmap of (ncols + 7 + 2) / 8 bytes — offset by
+// TWO bits, a quirk with no counterpart in the text protocol and an easy place
+// to be off by one column. Then the non-null values, each encoded according to
+// its column's type rather than as text.
+export fn decodeBinaryRow(body: byte[], cols: MyColumn[]): byte[][] {
+    let n = cols.len;
+    let out: byte[][] = [];
+    let r = new MyReader(body);
+    r.u8();                                       // 0x00 header
+
+    let bitmapLen = (n + 7 + 2) / 8;
+    let bitmap = r.take(bitmapLen);
+    if (r.bad) { return out; }
+
+    let i = 0;
+    while (i < n) {
+        let bit = i + 2;
+        let isNull = false;
+        if ((bit / 8) < bitmap.len) {
+            isNull = ((bitmap[bit / 8] as int) & (1 << (bit % 8))) != 0;
+        }
+        if (isNull) { out.push(null); i += 1; continue; }
+
+        let v = readBinaryValue(r, cols[i].kind);
+        if (r.bad) { return out; }
+        out.push(v);
+        i += 1;
+    }
+    return out;
+}
+
+// The bytes of one binary-protocol value, left in wire form for mytype to
+// interpret. Fixed-width types are taken by width; everything else is a
+// length-encoded string.
+fn readBinaryValue(r: MyReader, kind: int): byte[] {
+    if (kind == MT_LONGLONG) { return r.take(8); }
+    if (kind == MT_LONG || kind == MT_INT24) { return r.take(4); }
+    if (kind == MT_SHORT || kind == MT_YEAR) { return r.take(2); }
+    if (kind == MT_TINY) { return r.take(1); }
+    if (kind == MT_DOUBLE) { return r.take(8); }
+    if (kind == MT_FLOAT) { return r.take(4); }
+    if (kind == MT_DATE || kind == MT_DATETIME || kind == MT_TIMESTAMP) {
+        let n = r.u8();
+        return r.take(n);
+    }
+    if (kind == MT_TIME) {
+        let n = r.u8();
+        return r.take(n);
+    }
+    if (kind == MT_NULL) { return null; }
+    return r.lenEncBytes();
+}
+
+// ---------------------------------------------------------------------------
+// Prepared statements
+// ---------------------------------------------------------------------------
+
+export class MyPrepareOk {
+    stmtId: int;
+    numColumns: int;
+    numParams: int;
+    warnings: int;
+    ok: bool;
+
+    fn init() {
+        this.stmtId = 0;
+        this.numColumns = 0;
+        this.numParams = 0;
+        this.warnings = 0;
+        this.ok = false;
+    }
+}
+
+export fn decodePrepareOk(body: byte[]): MyPrepareOk {
+    let p = new MyPrepareOk();
+    let r = new MyReader(body);
+    if (r.u8() != 0x00) { return p; }
+    p.stmtId = r.u32();
+    p.numColumns = r.u16();
+    p.numParams = r.u16();
+    r.skip(1);                                    // filler
+    p.warnings = r.u16();
+    p.ok = !r.bad;
+    return p;
+}
+
+export fn encodeStmtPrepare(sql: string): byte[] {
+    let w = byteWriter(sql.len + 4);
+    w.u8(COM_STMT_PREPARE).text(sql);
+    return w.take();
+}
+
+export fn encodeStmtClose(stmtId: int): byte[] {
+    return byteWriter(8).u8(COM_STMT_CLOSE).u32le(stmtId).take();
+}
+
+export fn encodeStmtReset(stmtId: int): byte[] {
+    return byteWriter(8).u8(COM_STMT_RESET).u32le(stmtId).take();
+}
+
+export fn encodeQuery(sql: string): byte[] {
+    let w = byteWriter(sql.len + 4);
+    w.u8(COM_QUERY).text(sql);
+    return w.take();
+}
+
+export fn encodeQuit(): byte[] { return byteWriter(2).u8(COM_QUIT).take(); }
+export fn encodePing(): byte[] { return byteWriter(2).u8(COM_PING).take(); }
+
+// One bound parameter, already encoded.
+export class MyParam {
+    kind: int;              // MT_*
+    unsigned: bool;
+    data: byte[];           // null for SQL NULL
+    fn init(kind: int, unsigned: bool, data: byte[]) {
+        this.kind = kind;
+        this.unsigned = unsigned;
+        this.data = data;
+    }
+    fn isNull(): bool { return this.data == null; }
+}
+
+// COM_STMT_EXECUTE.
+//
+// The NULL bitmap here is NOT offset by two bits — that quirk belongs to the
+// binary result row only. Sending the type block every time (rather than
+// tracking whether the types changed since the last execute) costs two bytes
+// per parameter and removes a whole class of state bug.
+export fn encodeStmtExecute(stmtId: int, params: MyParam[]): byte[] {
+    let w = byteWriter(64);
+    w.u8(COM_STMT_EXECUTE);
+    w.u32le(stmtId);
+    w.u8(0);                                      // flags: no cursor
+    w.u32le(1);                                   // iteration count, always 1
+
+    let n = 0;
+    if (params != null) { n = params.len; }
+    if (n == 0) { return w.take(); }
+
+    let bitmapLen = (n + 7) / 8;
+    let bitmap = bytes(bitmapLen);
+    let i = 0;
+    while (i < n) {
+        if (params[i].isNull()) {
+            bitmap[i / 8] = ((bitmap[i / 8] as int) | (1 << (i % 8))) as byte;
+        }
+        i += 1;
+    }
+    w.raw(bitmap);
+    w.u8(1);                                      // new params bound
+
+    i = 0;
+    while (i < n) {
+        w.u8(params[i].kind);
+        if (params[i].unsigned) { w.u8(0x80); } else { w.u8(0); }
+        i += 1;
+    }
+    i = 0;
+    while (i < n) {
+        if (!params[i].isNull()) { w.raw(params[i].data); }
+        i += 1;
+    }
+    return w.take();
+}

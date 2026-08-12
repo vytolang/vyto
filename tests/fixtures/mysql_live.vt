@@ -1,0 +1,276 @@
+// mysql_live — the MySQL/MariaDB driver against a real server.
+//
+// Driven by tests/run_tests_mysql.sh; reads the DSN from $VYTO_MYSQL_DSN. Not
+// part of `make test`, which stays serverless.
+//
+// The counterpart to examples/106_mywire.vt, which asserts the same driver
+// against a recorded transcript. What only a real server settles: whether it
+// accepts the auth response we computed, whether a value survives actual
+// storage, and how the binary protocol behaves against types we only ever
+// hand-built.
+//
+// Everything happens in a scratch table set that is dropped at the end.
+//
+// ON MySQL 8: caching_sha2_password works here only on its fast path, so a
+// FIRST connection for a user fails and later ones succeed. See the driver's
+// module header — that is the documented limitation, not a fault in this test.
+
+import { Db, Row, Result, Cursor, Tx,
+         select, insert, update, deleteFrom, table, dropTable,
+         dbText, dbInt, dbFloat, dbNull, dbBlob, dbBool,
+         dberr_name } from "vyto/db";
+import { mysql, MyConn } from "vyto/db/mysql";
+import { Value } from "vyto/db/value";
+import { getenv } from "vyto/os";
+
+fn check(name: string, got: string, want: string) {
+    if (got == want) { print("ok    " + name); }
+    else {
+        print("FAIL  " + name);
+        print("  got  " + got);
+        print("  want " + want);
+    }
+}
+
+fn checkBool(name: string, got: bool) {
+    if (got) { print("ok    " + name); }
+    else { print("FAIL  " + name); }
+}
+
+fn hex(b: byte[]): string {
+    let digits = "0123456789abcdef";
+    let out = "";
+    let i = 0;
+    while (i < b.len) {
+        let v = b[i] as int;
+        out = out + digits.slice(v / 16, v / 16 + 1) + digits.slice(v % 16, v % 16 + 1);
+        i += 1;
+    }
+    return out;
+}
+
+fn main() {
+    let dsn = getenv("VYTO_MYSQL_DSN");
+    if (dsn == "") { print("FAIL  VYTO_MYSQL_DSN is not set"); return; }
+
+    let db = new Db(mysql(dsn));
+    if (!db.ok()) {
+        print("FAIL  could not connect: " + db.error());
+        return;
+    }
+    checkBool("connected", db.isOpen());
+
+    let cn = db.conn() as MyConn;
+    checkBool("the server reported its version", cn.serverVersion() != "");
+    checkBool("and a connection id", cn.connectionId() > 0);
+
+    cleanup(db);
+    values(db);
+    insertsAndIds(db);
+    transactions(db);
+    constraints(db);
+    errorDoesNotAbortTransaction(db);
+    cursorAtScale(db);
+    twoCursors(db);
+    cleanup(db);
+
+    db.close();
+    checkBool("closed", !db.isOpen());
+}
+
+fn cleanup(db: Db) {
+    db.execRaw("DROP TABLE IF EXISTS vyto_child");
+    db.execRaw("DROP TABLE IF EXISTS vyto_t");
+    db.execRaw("DROP TABLE IF EXISTS vyto_u");
+    db.execRaw("DROP TABLE IF EXISTS vyto_k");
+    db.execRaw("DROP TABLE IF EXISTS vyto_tx");
+}
+
+fn values(db: Db) {
+    print("---- values round-trip through the server ----");
+
+    checkBool("table created", db.execRaw(
+        "CREATE TABLE vyto_t ("
+        + " id BIGINT AUTO_INCREMENT PRIMARY KEY,"
+        + " s VARCHAR(255), n BIGINT, f DOUBLE, b BLOB,"
+        + " flag TINYINT(1), num DECIMAL(19,4), j JSON,"
+        + " d DATE, dt DATETIME(6), tm TIME, u INT UNSIGNED)"));
+
+    let blob = bytes(4);
+    blob[0] = 0 as byte; blob[1] = 0xFF as byte; blob[2] = 0x41 as byte; blob[3] = 0 as byte;
+
+    let ps: Value[] = [
+        dbText("O'Brien -- '); DROP TABLE vyto_t; --"),
+        dbInt(-9223372036854775807 - 1),
+        dbFloat(0.1),
+        dbBlob(blob),
+        dbBool(true),
+        dbText("1234.5678"),
+        dbText("{\"a\": [1, 2, 3]}"),
+        dbText("2026-08-12"),
+        dbText("2026-08-12 10:30:05.123456"),
+        dbText("01:02:03"),
+        dbInt(4294967291)
+    ];
+    let ins = db.raw("INSERT INTO vyto_t (s, n, f, b, flag, num, j, d, dt, tm, u)"
+                     + " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", ps);
+    checkBool("insert succeeded", ins.ok());
+    if (!ins.ok()) { print("  " + ins.err); return; }
+
+    let r = db.raw("SELECT s, n, f, b, flag, num, j, d, dt, tm, u FROM vyto_t ORDER BY id", []);
+    checkBool("select succeeded", r.ok());
+    if (!r.ok()) { print("  " + r.err); return; }
+    let row = r.first();
+
+    // A value that would end the statement if it were spliced rather than bound.
+    check("text survives verbatim", row.getStr("s"), "O'Brien -- '); DROP TABLE vyto_t; --");
+    check("bigint at i64 min", str(row.getInt("n")), "-9223372036854775808");
+    // The reason a DOUBLE parameter and result both go as IEEE bits.
+    checkBool("double is exact after a round trip", row.getFloat("f") == 0.1);
+    check("blob with a NUL and a high byte", hex(row.getBytes("b")), "00ff4100");
+    checkBool("boolean", row.getBool("flag"));
+    // DECIMAL stays text: a double cannot hold it.
+    check("decimal keeps every digit", row.getStr("num"), "1234.5678");
+    checkBool("decimal is NOT a float", row.get("num").isText());
+    checkBool("json came back as text", row.get("j").isText());
+    // Rendered from the binary struct, so this is the driver's formatting, not
+    // the server's.
+    check("date", row.getStr("d"), "2026-08-12");
+    check("datetime with microseconds", row.getStr("dt"), "2026-08-12 10:30:05.123456");
+    check("time", row.getStr("tm"), "01:02:03");
+    // Read as signed this would come back negative.
+    check("an UNSIGNED INT above 2^31", str(row.getInt("u")), "4294967291");
+
+    // NULL is not the empty string, all the way up through Row.
+    db.raw("INSERT INTO vyto_t (s, n) VALUES (?, ?)", [dbNull(), dbInt(1)]);
+    let r2 = db.raw("SELECT s FROM vyto_t WHERE n = ?", [dbInt(1)]);
+    checkBool("NULL reads back as NULL", r2.first().isNull("s"));
+
+    db.raw("INSERT INTO vyto_t (s, n) VALUES (?, ?)", [dbText(""), dbInt(2)]);
+    let r3 = db.raw("SELECT s FROM vyto_t WHERE n = ?", [dbInt(2)]);
+    checkBool("the empty string is NOT null", !r3.first().isNull("s"));
+    check("and is empty", "[" + r3.first().getStr("s") + "]", "[]");
+}
+
+fn insertsAndIds(db: Db) {
+    print("---- lastInsertId, which is real here ----");
+
+    // Unlike PostgreSQL, where it is always 0 and RETURNING is the answer, the
+    // OK packet carries the value directly.
+    db.execRaw("CREATE TABLE vyto_k (id BIGINT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(64))");
+    let a = db.raw("INSERT INTO vyto_k (name) VALUES (?)", [dbText("ada")]);
+    checkBool("insert succeeded", a.ok());
+    check("one row affected", str(a.affected), "1");
+    checkBool("a generated id came back", a.insertId > 0);
+    check("and the connection agrees", str(db.lastInsertId()), str(a.insertId));
+
+    let b = db.raw("INSERT INTO vyto_k (name) VALUES (?)", [dbText("bob")]);
+    checkBool("the next id is larger", b.insertId > a.insertId);
+
+    let upd = db.raw("UPDATE vyto_k SET name = ? WHERE id > ?", [dbText("x"), dbInt(0)]);
+    check("an update reports its row count", str(upd.affected), "2");
+}
+
+fn transactions(db: Db) {
+    print("---- transactions ----");
+
+    let cn = db.conn() as MyConn;
+    db.execRaw("CREATE TABLE vyto_tx (id INT PRIMARY KEY) ENGINE=InnoDB");
+
+    checkBool("not in a transaction", !cn.inTx());
+    let t = db.begin();
+    checkBool("inside the transaction", cn.inTx());
+    db.raw("INSERT INTO vyto_tx (id) VALUES (?)", [dbInt(1)]);
+    checkBool("committed", t.commit());
+    checkBool("out again", !cn.inTx());
+    check("the row is there",
+          str(db.raw("SELECT COUNT(*) AS c FROM vyto_tx", []).first().getInt("c")), "1");
+
+    // Dropped without committing: Tx.deinit rolls back.
+    if (true) {
+        let t2 = db.begin();
+        db.raw("INSERT INTO vyto_tx (id) VALUES (?)", [dbInt(2)]);
+    }
+    check("the abandoned transaction rolled back",
+          str(db.raw("SELECT COUNT(*) AS c FROM vyto_tx", []).first().getInt("c")), "1");
+}
+
+fn constraints(db: Db) {
+    print("---- constraint violations ----");
+
+    db.execRaw("CREATE TABLE vyto_u (id INT PRIMARY KEY, email VARCHAR(191) UNIQUE) ENGINE=InnoDB");
+    db.raw("INSERT INTO vyto_u VALUES (?, ?)", [dbInt(1), dbText("a@example.com")]);
+
+    let dup = db.raw("INSERT INTO vyto_u VALUES (?, ?)", [dbInt(2), dbText("a@example.com")]);
+    checkBool("a duplicate key fails", !dup.ok());
+    check("classified as a constraint violation", dberr_name(dup.code), "constraint");
+
+    let cn = db.conn() as MyConn;
+    // The errno is what the mapping keys on: more specific and more stable than
+    // the SQLSTATE, several of which are the catch-all HY000.
+    check("errno 1062", str(cn.errno()), "1062");
+
+    db.execRaw("CREATE TABLE vyto_child (id INT PRIMARY KEY,"
+               + " parent INT, FOREIGN KEY (parent) REFERENCES vyto_u(id)) ENGINE=InnoDB");
+    let fk = db.raw("INSERT INTO vyto_child VALUES (?, ?)", [dbInt(1), dbInt(999)]);
+    checkBool("a foreign key violation fails", !fk.ok());
+    check("also a constraint violation", dberr_name(fk.code), "constraint");
+    check("but a different errno", str(cn.errno()), "1452");
+}
+
+fn errorDoesNotAbortTransaction(db: Db) {
+    print("---- an error does NOT abort the transaction ----");
+
+    // The behaviour difference from PostgreSQL that portable code has to
+    // account for: there, everything after a failure inside a transaction is
+    // rejected with 25P02 until ROLLBACK. MySQL carries on, like SQLite.
+    let t = db.begin();
+    let bad = db.raw("SELECT * FROM vyto_does_not_exist", []);
+    checkBool("the bad statement failed", !bad.ok());
+    check("  with the right class", dberr_name(bad.code), "sql");
+
+    let after = db.raw("SELECT 1 AS one", []);
+    checkBool("the NEXT statement still works, unlike PostgreSQL", after.ok());
+    check("  and answers", str(after.first().getInt("one")), "1");
+    checkBool("rollback still succeeds", t.rollback());
+}
+
+fn cursorAtScale(db: Db) {
+    print("---- a cursor over a larger result ----");
+
+    // Rows are streamed rather than materialized. No generate_series in MySQL,
+    // so the rows come from a self-join over information_schema, which is
+    // always populated.
+    let c = db.rawCursor(
+        "SELECT (@r := @r + 1) AS i FROM information_schema.COLUMNS a,"
+        + " information_schema.COLUMNS b, (SELECT @r := 0) init LIMIT 20000", []);
+    let count = 0;
+    let last = 0;
+    while (c.next()) {
+        count += 1;
+        last = c.row().getInt("i");
+    }
+    checkBool("the cursor finished cleanly", c.ok());
+    if (!c.ok()) { print("  " + c.error()); }
+    check("every row arrived", str(count), "20000");
+    check("and the last value is right", str(last), "20000");
+}
+
+fn twoCursors(db: Db) {
+    print("---- a second statement while a cursor is open ----");
+
+    // MySQL cannot interleave two result sets on one connection either, so the
+    // driver drains the open cursor's remaining rows into memory.
+    let c = db.rawCursor("SELECT id FROM vyto_k ORDER BY id", []);
+    checkBool("first row", c.next());
+    let first = c.row().getInt("id");
+
+    let other = db.raw("SELECT 99 AS answer", []);
+    checkBool("the second query ran", other.ok());
+    check("  and answered", str(other.first().getInt("answer")), "99");
+
+    let rest = 0;
+    while (c.next()) { rest += 1; }
+    check("the evicted cursor yielded its remaining row", str(rest), "1");
+    checkBool("and ended cleanly", c.ok());
+}

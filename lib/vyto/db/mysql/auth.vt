@@ -1,0 +1,94 @@
+// vyto/db/mysql/auth — the MySQL authentication plugins, as pure functions.
+//
+// Socket-free, so both are known-answer testable offline.
+//
+// ── WHAT WORKS AND WHAT DOES NOT ────────────────────────────────────────────
+//
+// mysql_native_password — works everywhere. MariaDB's default, and MySQL's
+// through 5.7. This is the whole plugin:
+//
+//     XOR(SHA1(password), SHA1(nonce || SHA1(SHA1(password))))
+//
+// The password never crosses the wire; the server stores SHA1(SHA1(password))
+// and can verify without knowing the password. It is not a strong construction
+// — SHA-1 with no iteration — but it is what the protocol specifies.
+//
+// caching_sha2_password — MySQL 8.0's DEFAULT, and only the FAST PATH works
+// here:
+//
+//     XOR(SHA256(password), SHA256(SHA256(SHA256(password)) || nonce))
+//
+// The fast path is only accepted when the server already has that credential in
+// its in-memory cache. On a cache miss the server demands the full exchange,
+// which sends the password itself and therefore requires either TLS or an
+// RSA-encrypted transfer — and this driver has neither. So a first connection
+// to a MySQL 8 server over plaintext WILL FAIL, and it will fail
+// INTERMITTENTLY: after a server restart, after a cache flush, after the entry
+// ages out. That is worse than failing consistently, because it looks like a
+// network fault.
+//
+// If you hit it, the options are: ALTER USER ... IDENTIFIED WITH
+// mysql_native_password, use MariaDB, or wait for lib/vyto/crypto/openssl to
+// stop being a stub. The driver detects the demand and says so rather than
+// hanging.
+// ─────────────────────────────────────────────────────────────────────────────
+
+import { sha1, sha256, concat_bytes, strBytes } from "vyto/crypto";
+
+export const PLUGIN_NATIVE: string = "mysql_native_password";
+export const PLUGIN_SHA2:   string = "caching_sha2_password";
+export const PLUGIN_CLEAR:  string = "mysql_clear_password";
+
+// caching_sha2_password's second-stage markers.
+export const SHA2_FAST_AUTH_OK:    int = 3;
+export const SHA2_FULL_AUTH_NEEDED: int = 4;
+
+// mysql_native_password.
+//
+// An empty password authenticates as an empty response — NOT as the hash of the
+// empty string, which would be a different (and wrong) 20 bytes.
+export fn nativePassword(password: string, nonce: byte[]): byte[] {
+    if (password == "") { return bytes(0); }
+    let pw = strBytes(password);
+    let stage1 = sha1(pw);                       // SHA1(password)
+    let stage2 = sha1(stage1);                   // SHA1(SHA1(password))
+    let scrambled = sha1(concat_bytes(nonce, stage2));
+    return xorBytes(stage1, scrambled);
+}
+
+// caching_sha2_password, fast path only. See the header.
+export fn sha2FastPassword(password: string, nonce: byte[]): byte[] {
+    if (password == "") { return bytes(0); }
+    let pw = strBytes(password);
+    let d1 = sha256(pw);                         // SHA256(password)
+    let d2 = sha256(d1);                         // SHA256(SHA256(password))
+    let scrambled = sha256(concat_bytes(d2, nonce));
+    return xorBytes(d1, scrambled);
+}
+
+// mysql_clear_password sends the password itself, NUL-terminated. Only ever
+// correct over TLS, so the driver refuses it — this exists so the refusal can
+// name the plugin rather than say "unsupported".
+export fn clearPassword(password: string): byte[] {
+    let w = strBytes(password);
+    let out = bytes(w.len + 1);
+    let i = 0;
+    while (i < w.len) { out[i] = w[i]; i += 1; }
+    return out;
+}
+
+// The response for a named plugin, or null when this driver cannot do it.
+export fn authResponse(plugin: string, password: string, nonce: byte[]): byte[] {
+    if (plugin == "" || plugin == PLUGIN_NATIVE) { return nativePassword(password, nonce); }
+    if (plugin == PLUGIN_SHA2) { return sha2FastPassword(password, nonce); }
+    return null;
+}
+
+fn xorBytes(a: byte[], b: byte[]): byte[] {
+    let n = a.len;
+    if (b.len < n) { n = b.len; }
+    let out = bytes(n);
+    let i = 0;
+    while (i < n) { out[i] = ((a[i] as int) ^ (b[i] as int)) as byte; i += 1; }
+    return out;
+}

@@ -1,41 +1,671 @@
-// vyto/db/mysql — MySQL / MariaDB driver. DECLARED, NOT IMPLEMENTED.
+// vyto/db/mysql — a MySQL / MariaDB driver, speaking the client-server
+// protocol directly.
 //
-// Every entry point panics. See vyto/db/pgsql for the full rationale — it is
-// the same one, and the same two costs dominate: a synchronous query parks the
-// whole pre-fork worker, and shared-nothing workers make a connection pool
-// impossible (one connection per worker, for the worker's life).
+//     import { Db, select, dbText } from "vyto/db";
+//     import { mysql } from "vyto/db/mysql";
 //
-//     let db = new Db(mysql("mysql://localhost/app"));      // panics
+//     let db = new Db(mysql("mysql://ada@localhost/app"));
+//     if (!db.ok()) { print(db.error()); return; }
 //
-// It is its own package directory so that a future `#link "mysqlclient"`
-// reaches only programs that import this file. `vyto/db` imports no driver.
+// ── READ THIS FIRST IF YOU ARE ON MySQL 8 ───────────────────────────────────
+// MySQL 8.0's default authentication plugin is caching_sha2_password, and only
+// its FAST PATH works here — the one the server accepts when it already holds
+// that credential in memory. On a cache miss it demands the full exchange,
+// which sends the password itself and so requires TLS or an RSA key transfer,
+// and this driver has neither.
 //
-// Two things specific to this engine, worth recording before someone starts:
+// The practical consequence is nasty: the FIRST login for a user fails, and so
+// does the first after any server restart or cache flush. It fails
+// INTERMITTENTLY, which looks like a network fault rather than a configuration
+// one. The driver detects the demand and says all of this in the error rather
+// than hanging, but it cannot satisfy it.
 //
-//   * libmysqlclient is GPL, and MariaDB Connector/C is LGPL. That is a
-//     licensing decision about the shipped binary, not a technical one, and it
-//     should be made before the binding is written rather than after.
-//   * MysqlDialect already handles the syntax that differs — backtick
-//     identifiers, VARCHAR(255) over TEXT so a column can be indexed,
-//     TINYINT(1) for booleans, no RETURNING, and no IF NOT EXISTS on
-//     CREATE INDEX. Rendering and testing MySQL SQL works today without this
-//     package; only the transport is missing.
+// Three ways out: `ALTER USER ... IDENTIFIED WITH mysql_native_password`, use
+// MariaDB (whose default is mysql_native_password), or wait for
+// lib/vyto/crypto/openssl to stop being a stub.
+//
+// ── NO libmysqlclient, AND WHY THAT MATTERS HERE ────────────────────────────
+// This package contains no native/ directory and links no library: it speaks
+// the protocol over vyto/net/socket.
+//
+// That is not only a build convenience. libmysqlclient is GPL and MariaDB
+// Connector/C is LGPL, so binding either would have made the licence of every
+// program that used this package a decision someone had to make. Implementing
+// the protocol makes the question disappear rather than answering it — there is
+// nothing to link. The same is true of provisioning: nothing has to be fetched,
+// so the tests cannot silently skip on a fresh clone.
+//
+// ── EVERY VALUE IS A BOUND PARAMETER ────────────────────────────────────────
+// Statements go through COM_STMT_PREPARE and the binary protocol, never through
+// COM_QUERY with client-side escaping. dialect.vt:19-26 states the package's
+// central invariant — there is no quoteValue, and every value reaches the
+// database as a bound parameter, "which is what makes SQL injection
+// structurally impossible rather than a matter of remembering to escape".
+// Escaping on the client would trade that for a function nobody can forget to
+// call correctly. This is the one place MySQL costs materially more work than
+// PostgreSQL, and the reason is not negotiable.
+//
+// ── WHAT IT SHARES WITH THE POSTGRES DRIVER ─────────────────────────────────
+// Every query parks the worker and no connection pool is possible (no threads,
+// pre-fork reactor); one streaming cursor per connection, with a second
+// statement draining the first; no TLS. See vyto/db/pgsql's header — the
+// reasoning is identical.
+//
+// ── AND WHERE IT DIFFERS ────────────────────────────────────────────────────
+//
+//   * lastInsertId() and changes() are exactly right here. The OK packet
+//     carries both as length-encoded integers, so unlike PostgreSQL — where
+//     lastInsertId is always 0 and RETURNING is the answer — this is the
+//     engine's own number. MysqlDialect.supportsReturning() is false, which
+//     matches: MySQL has no RETURNING (MariaDB 10.5+ does, for INSERT only).
+//
+//   * An error does NOT abort the transaction. MySQL carries on after a
+//     statement error inside a transaction, like SQLite and unlike PostgreSQL.
+//     Portable code still has to assume the stricter PostgreSQL rule.
+//
+//   * DECIMAL comes back as text, for the same reason numeric does there: it
+//     is used precisely because a double cannot represent it.
 
-import { Driver, Conn } from "vyto/db/driver";
-import { Dialect, mysqlDialect } from "vyto/db/dialect";
+import { Driver, Conn, Stmt, STEP_ROW, STEP_DONE, STEP_ERR,
+         DBERR_NONE, DBERR_OPEN, DBERR_SQL, DBERR_CLOSED, DBERR_MISUSE,
+         DBERR_UNSUPPORTED } from "vyto/db/driver";
+import { Dialect, MysqlDialect, mysqlDialect } from "vyto/db/dialect";
+import { Value, dbNull, DB_NULL } from "vyto/db/value";
+import { WireIo, SockIo, dialTcp } from "vyto/db/wire/io";
+import { Dsn, parseDsn } from "vyto/db/wire";
+import { MySession, MyRowBuffer, MyPrepared } from "vyto/db/mysql/session";
+import { MyColumn, MyParam, MyReader, decodeBinaryRow, decodeError, decodeOk,
+         decodeColumnDef } from "vyto/db/mysql/proto";
+import { decodeBinary, encodeParam } from "vyto/db/mysql/mytype";
+
+const DEFAULT_PORT: int = 3306;
+
+// ---------------------------------------------------------------------------
+// Statement
+// ---------------------------------------------------------------------------
+
+export class MyStmt extends Stmt {
+    sess: MySession;      // strong — the SAME object MyConn holds. NOT a MyConn.
+    id: int;              // our serial, for wire ownership
+    stmtId: int;          // the server's statement handle
+    cols: MyColumn[];
+    nparams: int;
+    params: Value[];
+    sink: MyRowBuffer;
+    cur: byte[][];        // the current row, already split into fields
+    started: bool;
+    finished: bool;
+    localCode: int;
+    localMsg: string;
+
+    fn init(sess: MySession, id: int, stmtId: int, sql: string,
+            cols: MyColumn[], nparams: int) {
+        this.sql = sql;
+        this.busy = false;
+        this.sess = sess;
+        this.id = id;
+        this.stmtId = stmtId;
+        this.cols = cols;
+        this.nparams = nparams;
+        this.params = [];
+        this.sink = new MyRowBuffer();
+        this.cur = null;
+        this.started = false;
+        this.finished = false;
+        this.localCode = DBERR_NONE;
+        this.localMsg = "";
+    }
+
+    fn alive(): bool { return this.sess != null && this.sess.open && this.stmtId != 0; }
+
+    fn misuse(msg: string): bool {
+        this.localCode = DBERR_MISUSE;
+        this.localMsg = msg;
+        return false;
+    }
+
+    override fn bind(i: int, v: Value): bool {
+        if (!this.alive()) { return this.misuse("the statement is not prepared"); }
+        if (i < 1) { return this.misuse("bind index " + str(i) + " is below 1"); }
+        if (i > this.nparams) {
+            return this.misuse("bind index " + str(i) + " but the statement takes "
+                               + str(this.nparams) + " parameters");
+        }
+        while (this.params.len < i) { this.params.push(dbNull()); }
+        this.params[i - 1] = v;
+        this.localCode = DBERR_NONE;
+        this.localMsg = "";
+        return true;
+    }
+
+    override fn columnCount(): int { return this.cols.len; }
+
+    override fn columnName(i: int): string {
+        if (i < 0 || i >= this.cols.len) { return ""; }
+        return this.cols[i].name;
+    }
+
+    override fn columnValue(i: int): Value {
+        if (this.cur == null || i < 0 || i >= this.cols.len || i >= this.cur.len) {
+            return dbNull();
+        }
+        // decodeBinary copies out of the row body, which is replaced by the next
+        // step() — vyto/db requires a Row to own its cells (value.vt:18-24).
+        return decodeBinary(this.cols[i], this.cur[i]);
+    }
+
+    override fn step(): int {
+        if (this.finished) { return STEP_DONE; }
+        if (!this.alive()) { return STEP_ERR; }
+
+        if (!this.started) {
+            if (!this.beginExecute()) { return STEP_ERR; }
+            this.started = true;
+            // The execute reply opens with either an error, an OK (no result
+            // set), or a column count. Consume that before any row can arrive.
+            let opened = this.openResult();
+            if (opened != 0) { return opened; }
+        }
+
+        if (this.sink.pending() > 0) {
+            this.cur = decodeBinaryRow(this.sink.take(), this.cols);
+            return STEP_ROW;
+        }
+        if (this.sink.complete) {
+            this.finished = true;
+            this.cur = null;
+            if (this.sess.errCode != DBERR_NONE) { return STEP_ERR; }
+            return STEP_DONE;
+        }
+        return this.pump();
+    }
+
+    fn beginExecute(): bool {
+        if (!this.sess.acquire(this.id, this.sink, this.cols)) { return false; }
+        let ps: MyParam[] = [];
+        let i = 0;
+        while (i < this.nparams) {
+            let v = dbNull();
+            if (i < this.params.len) { v = this.params[i]; }
+            ps.push(encodeParam(v));
+            i += 1;
+        }
+        return this.sess.execute(this.stmtId, ps);
+    }
+
+    // Read the result-set header. Returns 0 to carry on, or a STEP_* to return.
+    fn openResult(): int {
+        let first = this.sess.readPayload();
+        if (first == null) { this.finished = true; return STEP_ERR; }
+
+        if (this.sess.isErr(first)) {
+            this.sess.recordError(decodeError(first));
+            this.sess.releaseWire(this.id);
+            this.finished = true;
+            return STEP_ERR;
+        }
+        if (this.sess.isOk(first)) {
+            // No result set at all — an INSERT, UPDATE or DDL. columnCount() is
+            // 0 and there is nothing to step over.
+            this.sess.noteOk(decodeOk(first));
+            this.sess.releaseWire(this.id);
+            this.finished = true;
+            return STEP_DONE;
+        }
+
+        // A column count followed by that many definitions. They repeat the
+        // shape prepare() already gave us, so they are consumed and dropped —
+        // except that a column whose type the server re-reports differently
+        // would matter, so the fresh set wins.
+        let r = new MyReader(first);
+        let ncols = r.lenEncInt();
+        if (ncols <= 0) {
+            this.sess.fail(DBERR_SQL, "malformed result header");
+            this.finished = true;
+            return STEP_ERR;
+        }
+        let fresh: MyColumn[] = [];
+        let i = 0;
+        while (i < ncols) {
+            let d = this.sess.readPayload();
+            if (d == null) { this.finished = true; return STEP_ERR; }
+            if (!this.sess.isEof(d)) { fresh.push(decodeColumnDef(d)); }
+            i += 1;
+        }
+        if (!this.sess.deprecateEof()) {
+            let d = this.sess.readPayload();
+            if (d == null) { this.finished = true; return STEP_ERR; }
+        }
+        if (fresh.len > 0) {
+            this.cols = fresh;
+            this.sess.activeCols = fresh;
+        }
+        return 0;
+    }
+
+    fn pump(): int {
+        while (true) {
+            let p = this.sess.readPayload();
+            if (p == null) { this.finished = true; return STEP_ERR; }
+
+            if (this.sess.isErr(p)) {
+                this.sess.recordError(decodeError(p));
+                this.sess.releaseWire(this.id);
+                this.finished = true;
+                this.cur = null;
+                return STEP_ERR;
+            }
+            if (this.sess.isResultEnd(p)) {
+                this.sess.noteOk(decodeOk(p));
+                this.sess.releaseWire(this.id);
+                this.finished = true;
+                this.cur = null;
+                if (this.sess.errCode != DBERR_NONE) { return STEP_ERR; }
+                return STEP_DONE;
+            }
+            this.cur = decodeBinaryRow(p, this.cols);
+            return STEP_ROW;
+        }
+        return STEP_ERR;
+    }
+
+    // Bindings are cleared, per driver.vt:80-83.
+    override fn reset() {
+        if (this.sess != null && this.sess.activeId == this.id) {
+            this.sess.drainActive();
+        }
+        this.params = [];
+        this.sink.reset();
+        this.cur = null;
+        this.started = false;
+        this.finished = false;
+        this.localCode = DBERR_NONE;
+        this.localMsg = "";
+    }
+
+    override fn finalize() {
+        if (this.stmtId == 0) { return; }
+        let id = this.stmtId;
+        this.stmtId = 0;
+        if (this.sess != null && this.sess.open) {
+            this.sess.releaseWire(this.id);
+            this.sess.closeStatement(id);
+        }
+        this.cur = null;
+        this.sink.reset();
+    }
+
+    override fn errorCode(): int {
+        if (this.localCode != DBERR_NONE) { return this.localCode; }
+        if (this.sess == null) { return DBERR_CLOSED; }
+        return this.sess.errCode;
+    }
+
+    override fn errorMessage(): string {
+        if (this.localCode != DBERR_NONE) { return this.localMsg; }
+        if (this.sess == null) { return "statement is finalized"; }
+        if (this.sess.errMsg != "") { return this.sess.errMsg; }
+        if (!this.sess.open) { return "the connection is closed"; }
+        return "";
+    }
+
+    deinit { this.finalize(); }
+}
+
+// ---------------------------------------------------------------------------
+// Connection
+// ---------------------------------------------------------------------------
+
+export class MyConn extends Conn {
+    sess: MySession;
+    dial: MysqlDialect;
+    openErr: string;
+    openCode: int;
+
+    cacheSql: string[];
+    cacheStmt: MyStmt[];
+    cacheCap: int;
+    nextId: int;
+
+    fn init(sess: MySession, openErr: string, openCode: int) {
+        this.sess = sess;
+        this.dial = mysqlDialect();
+        this.openErr = openErr;
+        this.openCode = openCode;
+        this.cacheSql = [];
+        this.cacheStmt = [];
+        this.cacheCap = 64;
+        this.nextId = 0;
+    }
+
+    override fn dialect(): Dialect { return this.dial; }
+    override fn isOpen(): bool { return this.sess != null && this.sess.open; }
+
+    override fn errorCode(): int {
+        if (this.sess == null) { return this.openCode; }
+        if (!this.sess.open && this.sess.errCode == DBERR_NONE) { return this.openCode; }
+        return this.sess.errCode;
+    }
+
+    override fn errorMessage(): string {
+        if (this.sess == null) { return this.openErr; }
+        if (this.sess.errMsg != "") { return this.sess.errMsg; }
+        if (!this.sess.open) { return this.openErr; }
+        return "";
+    }
+
+    // MySQL's own error number. More specific and more stable than its
+    // SQLSTATE, several of which are the catch-all HY000 — 1062 versus 1452 is
+    // a routing decision an application genuinely makes.
+    fn errno(): int {
+        if (this.sess == null) { return 0; }
+        return this.sess.errNo;
+    }
+
+    fn sqlstate(): string {
+        if (this.sess == null) { return ""; }
+        return this.sess.errState;
+    }
+
+    fn serverVersion(): string {
+        if (this.sess == null) { return ""; }
+        return this.sess.serverVersion;
+    }
+
+    fn connectionId(): int {
+        if (this.sess == null) { return 0; }
+        return this.sess.connectionId;
+    }
+
+    fn io(): WireIo {
+        if (this.sess == null) { return null; }
+        return this.sess.io;
+    }
+
+    override fn prepare(sql: string): Stmt {
+        if (!this.isOpen()) { return null; }
+
+        let hit = this.fromCache(sql);
+        if (hit != null) { return hit; }
+
+        let p = this.sess.prepare(sql);
+        if (!p.ok) { return null; }
+
+        this.nextId += 1;
+        let st = new MyStmt(this.sess, this.nextId, p.stmtId, sql, p.cols, p.params.len);
+        st.busy = true;
+        return st;
+    }
+
+    fn fromCache(sql: string): MyStmt {
+        let i = 0;
+        while (i < this.cacheSql.len) {
+            if (this.cacheSql[i] == sql) {
+                let st = this.cacheStmt[i];
+                if (!st.busy && st.alive()) {
+                    st.busy = true;
+                    st.reset();
+                    return st;
+                }
+                return null;
+            }
+            i += 1;
+        }
+        return null;
+    }
+
+    override fn release(st: Stmt) {
+        if (st == null) { return; }
+        let ms = st as MyStmt;
+        if (ms == null) { return; }
+        ms.busy = false;
+        ms.reset();
+        if (!ms.alive()) { return; }
+
+        let i = 0;
+        while (i < this.cacheStmt.len) {
+            if (this.cacheStmt[i] == ms) { return; }
+            i += 1;
+        }
+        if (this.cacheCap <= 0 || this.cacheStmt.len >= this.cacheCap) {
+            ms.finalize();
+            return;
+        }
+        this.cacheSql.push(ms.sql);
+        this.cacheStmt.push(ms);
+    }
+
+    override fn execRaw(sql: string): bool {
+        if (!this.isOpen()) { return false; }
+        let ok = this.sess.simpleQuery(sql);
+        // A statement that changed the default schema invalidates every cached
+        // prepared statement. See changesSchema below — this is not a tidiness
+        // measure, it is a correctness one.
+        if (ok && changesSchema(sql)) { this.flushCache(); }
+        return ok;
+    }
+
+    // Finalize and forget every cached statement.
+    fn flushCache() {
+        let i = 0;
+        while (i < this.cacheStmt.len) {
+            this.cacheStmt[i].finalize();
+            i += 1;
+        }
+        this.cacheSql = [];
+        this.cacheStmt = [];
+    }
+
+    override fn changes(): int {
+        if (this.sess == null) { return 0; }
+        return this.sess.lastRows;
+    }
+
+    // Real, unlike PostgreSQL's: the OK packet carries it directly.
+    override fn lastInsertId(): int {
+        if (this.sess == null) { return 0; }
+        return this.sess.lastInsertId;
+    }
+
+    override fn inTx(): bool {
+        if (this.sess == null) { return false; }
+        return this.sess.inTransaction();
+    }
+    override fn setInTx(v: bool) { }      // the server's status flag is the authority
+
+    override fn close() {
+        if (this.sess == null) { return; }
+        let i = 0;
+        while (i < this.cacheStmt.len) {
+            this.cacheStmt[i].finalize();
+            i += 1;
+        }
+        this.cacheSql = [];
+        this.cacheStmt = [];
+        this.sess.close();
+    }
+
+    deinit { this.close(); }
+}
+
+// ---------------------------------------------------------------------------
+// Driver
+// ---------------------------------------------------------------------------
 
 export class MysqlDriver extends Driver {
     dsn: string;
+    timeoutMs: int;
+    cacheCap: int;
+    drainCap: int;
+    ssl: string;
 
-    fn init(dsn: string) { this.dsn = dsn; }
+    fn init(dsn: string) {
+        this.dsn = dsn;
+        this.timeoutMs = 30000;
+        this.cacheCap = 64;
+        this.drainCap = 100000;
+        this.ssl = "disable";
+    }
 
     override fn name(): string { return "mysql"; }
 
+    builder fn timeout(ms: int) { this.timeoutMs = ms; return this; }
+    builder fn stmtCache(n: int) { this.cacheCap = n; return this; }
+    builder fn drainLimit(n: int) { this.drainCap = n; return this; }
+    builder fn sslMode(m: string) { this.ssl = m; return this; }
+
     override fn connect(): Conn {
-        panic("vyto/db/mysql: not implemented — no MySQL driver in this build");
+        let d = parseDsn(this.dsn, "127.0.0.1", DEFAULT_PORT);
+        if (!d.isValid()) {
+            return deadConn("vyto/db/mysql: " + d.error(), DBERR_OPEN);
+        }
+
+        let mode = d.opt("ssl-mode", d.opt("sslmode", this.ssl));
+        if (mode != "disable" && mode != "DISABLED" && mode != "prefer") {
+            return deadConn(
+                "vyto/db/mysql: ssl-mode=" + mode + " was requested but this driver has no TLS. "
+                + "lib/vyto/crypto/openssl is a stub in which every entry point panics; until it "
+                + "is implemented, use ssl-mode=disable and a trusted network.",
+                DBERR_UNSUPPORTED);
+        }
+
+        let io = dialTcp(d.host, d.port, this.timeoutMs);
+        if (io == null) {
+            return deadConn("vyto/db/mysql: could not connect to " + d.host + ":" + str(d.port),
+                            DBERR_OPEN);
+        }
+
+        let sess = new MySession(io);
+        sess.drainCap = this.drainCap;
+
+        let user = d.user;
+        if (user == "") { user = d.opt("user", ""); }
+        if (user == "") {
+            return deadConn("vyto/db/mysql: the connection string names no user", DBERR_OPEN);
+        }
+        let pass = d.pass;
+        if (pass == "") { pass = d.opt("password", ""); }
+
+        if (!sess.connect(user, pass, d.database)) {
+            let msg = sess.errMsg;
+            if (msg == "") { msg = "vyto/db/mysql: the connection failed"; }
+            let code = sess.errCode;
+            if (code == DBERR_NONE) { code = DBERR_OPEN; }
+            sess.close();
+            return deadConn(msg, code);
+        }
+
+        let cn = new MyConn(sess, "", DBERR_NONE);
+        cn.cacheCap = this.cacheCap;
+        return cn;
     }
 }
 
-export fn mysqlDialectOf(): Dialect { return mysqlDialect(); }
+fn deadConn(msg: string, code: int): Conn {
+    return new MyConn(null, msg, code);
+}
+
+// Whether a statement changes the connection's default schema.
+//
+// ── WHY THIS EXISTS, AND WHY IT IS NOT PARANOIA ─────────────────────────────
+// MySQL binds DATABASE() at PREPARE time, not at execute time. A cached
+// prepared statement containing DATABASE() therefore keeps answering for
+// whichever schema was current when it was prepared — measured against 8.0.46:
+//
+//     USE mivida;  SELECT DATABASE(), COUNT(*) ... WHERE TABLE_SCHEMA=DATABASE()
+//         -> mivida, 61
+//     USE sys;     (the SAME sql, served from the statement cache)
+//         -> mivida, 61      <- wrong schema, no error, no warning
+//         (the same sql text with a comment appended, so freshly prepared)
+//         -> sys, 101        <- correct
+//
+// Every one of MysqlDialect's six introspection queries is scoped with
+// DATABASE(), so without this the statement cache silently reports the previous
+// schema's tables after a USE. It is invisible: the rows are real, well-formed
+// and entirely wrong.
+//
+// The check is deliberately loose — a false positive only costs re-preparing —
+// but it does skip leading whitespace and both comment forms, because `USE` is
+// usually the first token but need not be the first byte.
+fn changesSchema(sql: string): bool {
+    let i = skipLeading(sql);
+    if (i + 3 > sql.len) { return false; }
+    let c0 = upperByte(sql[i]);
+    let c1 = upperByte(sql[i + 1]);
+    let c2 = upperByte(sql[i + 2]);
+    if (c0 != 85 || c1 != 83 || c2 != 69) { return false; }        // U S E
+    // Must be the whole keyword: "USER" and "USE_X" are not this.
+    if (i + 3 >= sql.len) { return true; }
+    let n = sql[i + 3];
+    return n == 32 || n == 9 || n == 10 || n == 13 || n == 96;     // space/tab/nl/cr/backtick
+}
+
+// Past leading whitespace, `-- ...` line comments and `/* ... */ block comments.
+fn skipLeading(s: string): int {
+    let i = 0;
+    while (i < s.len) {
+        let c = s[i];
+        if (c == 32 || c == 9 || c == 10 || c == 13) { i += 1; continue; }
+        if (c == 45 && i + 1 < s.len && s[i + 1] == 45) {          // "--"
+            while (i < s.len && s[i] != 10) { i += 1; }
+            continue;
+        }
+        if (c == 47 && i + 1 < s.len && s[i + 1] == 42) {          // "/*"
+            i += 2;
+            while (i + 1 < s.len && !(s[i] == 42 && s[i + 1] == 47)) { i += 1; }
+            i += 2;
+            continue;
+        }
+        break;
+    }
+    return i;
+}
+
+fn upperByte(c: int): int {
+    if (c >= 97 && c <= 122) { return c - 32; }
+    return c;
+}
 
 export fn mysql(dsn: string): MysqlDriver { return new MysqlDriver(dsn); }
+
+// Speak the protocol over a transport that is already built — a MemIo carrying
+// a recorded transcript, for testing without a server, or a TLS transport once
+// one exists. See vyto/db/pgsql's pgsqlOver for the reasoning.
+export fn mysqlOver(io: WireIo, dsn: string): MyOverDriver { return new MyOverDriver(io, dsn); }
+
+export class MyOverDriver extends MysqlDriver {
+    io: WireIo;
+
+    fn init(io: WireIo, dsn: string) {
+        this.dsn = dsn;
+        this.timeoutMs = 30000;
+        this.cacheCap = 64;
+        this.drainCap = 100000;
+        this.ssl = "disable";
+        this.io = io;
+    }
+
+    override fn connect(): Conn {
+        if (this.io == null) { return deadConn("vyto/db/mysql: no transport", DBERR_OPEN); }
+        let d = parseDsn(this.dsn, "127.0.0.1", DEFAULT_PORT);
+        let user = d.user;
+        if (user == "") { user = "vyto"; }
+
+        let sess = new MySession(this.io);
+        sess.drainCap = this.drainCap;
+        if (!sess.connect(user, d.pass, d.database)) {
+            let msg = sess.errMsg;
+            if (msg == "") { msg = "vyto/db/mysql: the connection failed"; }
+            let code = sess.errCode;
+            if (code == DBERR_NONE) { code = DBERR_OPEN; }
+            return deadConn(msg, code);
+        }
+        let cn = new MyConn(sess, "", DBERR_NONE);
+        cn.cacheCap = this.cacheCap;
+        return cn;
+    }
+}
+
+// The dialect is real without the driver: query and schema rendering for MySQL
+// works from a program that links no driver at all.
+export fn mysqlDialectOf(): Dialect { return mysqlDialect(); }

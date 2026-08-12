@@ -610,12 +610,14 @@ fn dsn() {
     check("database", d.database, "app");
     check("option", d.opt("sslmode", "?"), "disable");
 
-    // Defaults: the database falls back to the user name, which is
-    // PostgreSQL's own rule.
     let d2 = parseDsn("postgres://ada@/", "localhost", 5432);
     check("default host", d2.host, "localhost");
     check("default port", str(d2.port), "5432");
-    check("database defaults to the user", d2.database, "ada");
+    // The PARSER leaves an absent database empty. Substituting the user name is
+    // PostgreSQL's rule and is applied by that driver, not here — MySQL treats
+    // a connection with no database selected as ordinary, and defaulting it
+    // there turns mysql://root:root@host/ into "Unknown database 'root'".
+    check("an absent database stays empty", "[" + d2.database + "]", "[]");
 
     // An IPv6 literal, which is exactly what a hand-rolled splitter gets wrong.
     let d3 = parseDsn("postgres://u@[::1]:5433/db", "localhost", 5432);
@@ -1280,9 +1282,9 @@ fn introspectionSql() {
     checkBool("objects SQL drops foreign-key machinery triggers",
               objs.index_of("NOT t.tgisinternal") >= 0);
 
-    // MySQL's are still unwritten and say so rather than shipping a query
-    // nobody has run.
-    checkBool("mysql still reports it cannot", !mysqlDialect().supportsIntrospection());
+    // MySQL implements the same six over information_schema; the ansi base is
+    // the one that still cannot, and says so rather than panicking when asked.
+    checkBool("mysql implements them too", mysqlDialect().supportsIntrospection());
 
     // kindGuess applies SQLite's affinity rules to the declared type, and
     // introspectColumnsSql hands it format_type() output. Most cases land

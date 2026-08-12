@@ -1,0 +1,882 @@
+// 106_mywire — the MySQL/MariaDB protocol, checked without a MySQL.
+//
+//     ./vytoc run examples/106_mywire.vt
+//
+// The companion to 105_pgwire, and the same idea: vyto/db/mysql is a pure-Vyto
+// driver, so its codec is a set of pure functions over byte[] and every packet
+// it builds or parses is asserted here with no server running and nothing
+// installed.
+//
+// The authentication section is a known-answer test. mysql_native_password and
+// caching_sha2_password's fast path are both short compositions of SHA-1 and
+// SHA-256, so a single wrong concatenation order still produces plausible-
+// looking bytes — which is exactly the bug a fixed vector catches and a live
+// test against a trust-configured server does not.
+//
+// Nothing here prints a version, a timestamp, an address or a random value, so
+// the golden survives a dependency bump.
+
+import { framePayload, decodeHandshake, encodeHandshakeResponse,
+         decodeOk, decodeError, decodeColumnDef, decodeTextRow, decodeBinaryRow,
+         decodePrepareOk, decodeAuthSwitch,
+         encodeStmtPrepare, encodeStmtExecute, encodeStmtClose, encodeQuery,
+         encodeQuit, writeLenEncInt, writeLenEncBytes, clientCapabilities,
+         MyReader, MyParam, MyColumn, MAX_PAYLOAD,
+         MT_TINY, MT_SHORT, MT_LONG, MT_LONGLONG, MT_FLOAT, MT_DOUBLE,
+         MT_VAR_STRING, MT_BLOB, MT_NEWDECIMAL, MT_JSON, MT_DATE, MT_DATETIME,
+         MT_TIME, MT_NULL, FLAG_UNSIGNED, FLAG_NOT_NULL,
+         CLIENT_DEPRECATE_EOF, CLIENT_MULTI_STATEMENTS, CLIENT_PROTOCOL_41,
+         CLIENT_CONNECT_WITH_DB, CLIENT_PLUGIN_AUTH } from "vyto/db/mysql/proto";
+import { nativePassword, sha2FastPassword, clearPassword, authResponse,
+         PLUGIN_NATIVE, PLUGIN_SHA2, PLUGIN_CLEAR } from "vyto/db/mysql/auth";
+import { decodeText, decodeBinary, encodeParam, typeName,
+         isBinaryColumn } from "vyto/db/mysql/mytype";
+import { ByteWriter, byteWriter } from "vyto/db/wire";
+import { memIo } from "vyto/db/wire/io";
+import { Db, Result, Cursor, select } from "vyto/db";
+import { mysql, mysqlOver, MyConn } from "vyto/db/mysql";
+import { mysqlDialect } from "vyto/db/dialect";
+import { Value, dbNull, dbInt, dbFloat, dbText, dbBlob } from "vyto/db/value";
+import { dberr_name } from "vyto/db/driver";
+import { hex_encode, strBytes } from "vyto/crypto";
+
+fn check(name: string, got: string, want: string) {
+    if (got == want) {
+        print("ok    " + name);
+    } else {
+        print("FAIL  " + name);
+        print("  got  " + got);
+        print("  want " + want);
+    }
+}
+
+fn checkBool(name: string, got: bool) {
+    if (got) { print("ok    " + name); }
+    else { print("FAIL  " + name); }
+}
+
+fn hex(b: byte[]): string {
+    if (b == null) { return "<null>"; }
+    return hex_encode(b);
+}
+
+fn showValue(v: Value): string {
+    if (v.isNull()) { return "null"; }
+    if (v.isInt()) { return "int " + str(v.i); }
+    if (v.isFloat()) { return "float " + str(v.f); }
+    if (v.isBlob()) { return "blob " + hex(v.b); }
+    return "text " + v.s;
+}
+
+// A column definition, built the way the server sends one.
+fn colDef(name: string, kind: int, charset: int, flags: int): byte[] {
+    let w = byteWriter(64);
+    writeLenEncBytes(w, strBytes("def"));
+    writeLenEncBytes(w, strBytes("app"));
+    writeLenEncBytes(w, strBytes("t"));
+    writeLenEncBytes(w, strBytes("t"));
+    writeLenEncBytes(w, strBytes(name));
+    writeLenEncBytes(w, strBytes(name));
+    writeLenEncInt(w, 12);
+    w.u16le(charset);
+    w.u32le(255);
+    w.u8(kind);
+    w.u16le(flags);
+    w.u8(0);
+    w.u16le(0);
+    return w.take();
+}
+
+fn column(name: string, kind: int, charset: int, flags: int): MyColumn {
+    return decodeColumnDef(colDef(name, kind, charset, flags));
+}
+
+// ---------------------------------------------------------------------------
+
+fn framing() {
+    print("---- packet framing ----");
+
+    // [3-byte LE length][1-byte sequence][payload]
+    check("a small payload", hex(framePayload(strBytes("hi"), 0)), "020000006869");
+    check("sequence id is carried", hex(framePayload(strBytes("hi"), 7)), "020000076869");
+    check("an empty payload", hex(framePayload(bytes(0), 3)), "00000003");
+
+    // A payload of exactly 0xFFFFFF is CONTINUED by the next packet, and one
+    // that is an exact multiple is terminated by a zero-length packet. Without
+    // that trailing packet the server waits forever for the continuation.
+    let big = bytes(MAX_PAYLOAD);
+    let framed = framePayload(big, 0);
+    check("a maximum-size payload becomes two packets",
+          str(framed.len), str(4 + MAX_PAYLOAD + 4));
+    check("  the first is full and marked so", hex(framed.slice(0, 4)), "ffffff00");
+    check("  and the second is empty, terminating it",
+          hex(framed.slice(framed.len - 4, framed.len)), "00000001");
+
+    let ordinary = framePayload(bytes(10), 0);
+    check("an ordinary payload is one packet", str(ordinary.len), "14");
+}
+
+fn lengthEncoded() {
+    print("---- length-encoded integers ----");
+
+    // < 0xFB direct; 0xFC + u16; 0xFD + u24; 0xFE + u64. 0xFB alone is NULL.
+    let w = byteWriter(32);
+    writeLenEncInt(w, 0);
+    writeLenEncInt(w, 250);
+    writeLenEncInt(w, 251);
+    writeLenEncInt(w, 65535);
+    writeLenEncInt(w, 65536);
+    writeLenEncInt(w, 16777215);
+    check("encoded", hex(w.take()),
+          "00" + "fa" + "fcfb00" + "fcffff" + "fd000001" + "fdffffff");
+
+    // Read them back one at a time — binary operands evaluate right to left, so
+    // several reads in one expression would run backwards.
+    let r = new MyReader(byteWriter(32).u8(0).u8(250).u8(0xFC).u16le(251)
+                          .u8(0xFD).u24le(70000).u8(0xFB).take());
+    let a = r.lenEncInt();
+    let b = r.lenEncInt();
+    let c = r.lenEncInt();
+    let d = r.lenEncInt();
+    let e = r.lenEncInt();
+    check("decoded", str(a) + "," + str(b) + "," + str(c) + "," + str(d), "0,250,251,70000");
+    check("0xFB decodes as the NULL marker", str(e), "-1");
+
+    // A length-encoded string, and the NULL that is not an empty string.
+    let r2 = new MyReader(byteWriter(16).u8(3).text("ada").u8(0).u8(0xFB).take());
+    let s1 = r2.lenEncBytes();
+    let s2 = r2.lenEncBytes();
+    let s3 = r2.lenEncBytes();
+    check("a length-encoded string", hex(s1), "616461");
+    check("an EMPTY string is not null", hex(s2), "");
+    checkBool("  and really is not null", s2 != null);
+    checkBool("the NULL marker is null", s3 == null);
+}
+
+fn handshake() {
+    print("---- handshake ----");
+
+    // HandshakeV10. The nonce arrives in two pieces which have to be rejoined;
+    // taking only the first 8 bytes is a classic way to produce an auth
+    // response that is wrong but the right length.
+    let w = byteWriter(128);
+    w.u8(10);
+    w.cstr("8.0.36");
+    w.u32le(42);
+    let i = 0;
+    while (i < 8) { w.u8(i + 1); i += 1; }        // nonce part 1
+    w.u8(0);                                       // filler
+    w.u16le(0xFFFF);                               // capabilities, low
+    w.u8(45);                                      // charset
+    w.u16le(2);                                    // status
+    w.u16le(0x81FF);                               // capabilities, high
+    w.u8(21);                                      // auth data length
+    let j = 0;
+    while (j < 10) { w.u8(0); j += 1; }            // reserved
+    let k = 8;
+    while (k < 20) { w.u8(k + 1); k += 1; }        // nonce part 2
+    w.u8(0);                                       // its trailing NUL
+    w.cstr("caching_sha2_password");
+
+    let h = decodeHandshake(w.take());
+    checkBool("parsed", h.ok);
+    check("server version", h.serverVersion, "8.0.36");
+    check("connection id", str(h.connectionId), "42");
+    check("auth plugin", h.authPlugin, "caching_sha2_password");
+    // Both halves, rejoined, and the trailing NUL dropped.
+    check("nonce length", str(h.authData.len), "20");
+    check("nonce is both halves in order", hex(h.authData),
+          "0102030405060708090a0b0c0d0e0f1011121314");
+
+    // A truncated handshake must not panic.
+    let bad = decodeHandshake(byteWriter(4).u8(10).take());
+    checkBool("a truncated handshake is refused, not fatal", !bad.ok);
+    let wrongVersion = decodeHandshake(byteWriter(4).u8(9).take());
+    checkBool("protocol 9 is refused", !wrongVersion.ok);
+
+    // What the client asks for.
+    let caps = clientCapabilities(true);
+    checkBool("PROTOCOL_41 is requested", (caps & CLIENT_PROTOCOL_41) != 0);
+    checkBool("CONNECT_WITH_DB is requested when there is one",
+              (caps & CLIENT_CONNECT_WITH_DB) != 0);
+    checkBool("PLUGIN_AUTH is requested", (caps & CLIENT_PLUGIN_AUTH) != 0);
+    // Removes the EOF packets that would otherwise punctuate every result set.
+    checkBool("DEPRECATE_EOF is requested", (caps & CLIENT_DEPRECATE_EOF) != 0);
+    // Deliberately NOT requested: it turns a stray ';' into a second statement,
+    // which is an injection vector for no benefit here.
+    checkBool("MULTI_STATEMENTS is NOT requested",
+              (caps & CLIENT_MULTI_STATEMENTS) == 0);
+    checkBool("no CONNECT_WITH_DB without a database",
+              (clientCapabilities(false) & CLIENT_CONNECT_WITH_DB) == 0);
+
+    let nonce = bytes(20);
+    let n = 0;
+    while (n < 20) { nonce[n] = (n + 1) as byte; n += 1; }
+    let resp = encodeHandshakeResponse(caps, 16777215, 45, "ada",
+                                       nativePassword("secret", nonce), "app",
+                                       PLUGIN_NATIVE);
+    checkBool("the response names the user", hex(resp).index_of(hex(strBytes("ada"))) >= 0);
+    checkBool("and the database", hex(resp).index_of(hex(strBytes("app"))) >= 0);
+    checkBool("and the plugin", hex(resp).index_of(hex(strBytes(PLUGIN_NATIVE))) >= 0);
+
+    // AuthSwitchRequest.
+    let sw = decodeAuthSwitch(byteWriter(64).u8(0xFE).cstr(PLUGIN_NATIVE)
+                               .raw(nonce).u8(0).take());
+    check("auth switch plugin", sw.plugin, PLUGIN_NATIVE);
+    check("auth switch nonce keeps 20 bytes", str(sw.data.len), "20");
+}
+
+fn authentication() {
+    print("---- authentication ----");
+
+    // A fixed nonce, so these are known answers rather than round trips.
+    let nonce = bytes(20);
+    let i = 0;
+    while (i < 20) { nonce[i] = (i + 1) as byte; i += 1; }
+
+    // mysql_native_password:
+    //   XOR(SHA1(pw), SHA1(nonce || SHA1(SHA1(pw))))
+    check("mysql_native_password", hex(nativePassword("secret", nonce)),
+          "b32bb3a583e1340c0a1108d58b1be49781ad8c2f");
+
+    // caching_sha2_password fast path:
+    //   XOR(SHA256(pw), SHA256(SHA256(SHA256(pw)) || nonce))
+    // Note the nonce goes LAST here and FIRST above — swapping them yields a
+    // digest of the right length that no server will accept.
+    check("caching_sha2_password fast path", hex(sha2FastPassword("secret", nonce)),
+          "746ebe205d56a0707acb3e796e834e0dd7b1d61743b26bd5202c7a623230c7c9");
+
+    check("native response is 20 bytes", str(nativePassword("secret", nonce).len), "20");
+    check("sha2 response is 32 bytes", str(sha2FastPassword("secret", nonce).len), "32");
+
+    // An empty password is an EMPTY response, not the hash of the empty string.
+    check("an empty password sends nothing", str(nativePassword("", nonce).len), "0");
+    check("  for sha2 too", str(sha2FastPassword("", nonce).len), "0");
+
+    // Dispatch.
+    checkBool("native is supported", authResponse(PLUGIN_NATIVE, "pw", nonce) != null);
+    checkBool("sha2 is supported", authResponse(PLUGIN_SHA2, "pw", nonce) != null);
+    checkBool("an unnamed plugin defaults to native", authResponse("", "pw", nonce) != null);
+    // Sends the password itself; only ever correct over TLS, which there is none of.
+    checkBool("mysql_clear_password is refused", authResponse(PLUGIN_CLEAR, "pw", nonce) == null);
+    checkBool("an unknown plugin is refused", authResponse("sha256_password", "pw", nonce) == null);
+
+    check("clearPassword is NUL-terminated", hex(clearPassword("ab")), "616200");
+}
+
+fn okAndError() {
+    print("---- OK and ERR packets ----");
+
+    // Unlike PostgreSQL, which reports counts as text in a CommandComplete tag,
+    // MySQL puts both in the OK packet as length-encoded integers.
+    let ok = decodeOk(byteWriter(16).u8(0).u8(3).u8(42).u16le(1).u16le(0).take());
+    check("affected rows", str(ok.affectedRows), "3");
+    check("last insert id", str(ok.lastInsertId), "42");
+    checkBool("in a transaction", ok.inTransaction());
+
+    // Large counts use the wide forms.
+    let big = decodeOk(byteWriter(24).u8(0).u8(0xFC).u16le(1000)
+                        .u8(0xFE).i64le(9007199254740993).u16le(0).u16le(0).take());
+    check("a 16-bit affected count", str(big.affectedRows), "1000");
+    check("a 64-bit insert id", str(big.lastInsertId), "9007199254740993");
+
+    let e = decodeError(byteWriter(64).u8(0xFF).u16le(1062).u8(35).text("23000")
+                         .text("Duplicate entry 'a@b.com' for key 'users.email'").take());
+    check("error number", str(e.code), "1062");
+    check("sqlstate", e.sqlstate, "23000");
+    check("mapped class", dberr_name(e.dberr()), "constraint");
+    check("composed message", e.text(),
+          "ERROR 1062 (23000): Duplicate entry 'a@b.com' for key 'users.email'");
+
+    // The errno is checked before the SQLSTATE: it is more specific and more
+    // stable, and several MySQL SQLSTATEs are the catch-all HY000.
+    print("---- errno to DBERR_* ----");
+    let codes = [1062, 1451, 1452, 1048, 1213, 1205, 1040, 1064, 1146, 1054, 1045, 1049, 2013];
+    let want = ["constraint", "constraint", "constraint", "constraint", "busy", "busy",
+                "busy", "sql", "sql", "sql", "open", "open", "closed"];
+    let i = 0;
+    while (i < codes.len) {
+        let er = decodeError(byteWriter(32).u8(0xFF).u16le(codes[i]).u8(35)
+                              .text("HY000").text("x").take());
+        check("errno " + str(codes[i]), dberr_name(er.dberr()), want[i]);
+        i += 1;
+    }
+
+    // An error before capabilities are agreed carries no SQLSTATE marker.
+    let bare = decodeError(byteWriter(32).u8(0xFF).u16le(1045).text("Access denied").take());
+    check("an error with no sqlstate still maps", dberr_name(bare.dberr()), "open");
+    check("  and keeps its message", bare.message, "Access denied");
+}
+
+fn columnsAndRows() {
+    print("---- column definitions and rows ----");
+
+    let c = column("name", MT_VAR_STRING, 45, FLAG_NOT_NULL);
+    check("column name", c.name, "name");
+    check("column type", typeName(c.kind), "varstring");
+    checkBool("a utf8 varstring is not binary", !isBinaryColumn(c));
+    // charset 63 is `binary` — the ONLY thing distinguishing a BLOB from a TEXT,
+    // which share a column type.
+    let b = column("data", MT_BLOB, 63, 0);
+    checkBool("a binary-charset blob is binary", isBinaryColumn(b));
+    let t = column("body", MT_BLOB, 45, 0);
+    checkBool("a utf8 blob is TEXT, not bytes", !isBinaryColumn(t));
+
+    let u = column("n", MT_LONG, 63, FLAG_UNSIGNED);
+    checkBool("the unsigned flag is read", u.isUnsigned());
+
+    // A text-protocol row: every field length-encoded, 0xFB for NULL.
+    let tr = byteWriter(32);
+    tr.u8(1).text("7");
+    tr.u8(0xFB);
+    tr.u8(0);
+    let fields = decodeTextRow(tr.take(), 3);
+    check("text row field count", str(fields.len), "3");
+    check("  a value", hex(fields[0]), "37");
+    checkBool("  a NULL", fields[1] == null);
+    checkBool("  an empty string, which is NOT null", fields[2] != null);
+    check("  and is empty", str(fields[2].len), "0");
+
+    // A binary-protocol row. The NULL bitmap is offset by TWO bits here — a
+    // quirk with no counterpart in the text protocol, and an easy way to report
+    // the wrong column as null.
+    let cols: MyColumn[] = [column("a", MT_LONG, 63, 0),
+                            column("b", MT_VAR_STRING, 45, 0),
+                            column("c", MT_LONGLONG, 63, 0)];
+    let br = byteWriter(32);
+    br.u8(0);
+    br.u8(0x08);                                  // bit 3 set => column 1 is NULL
+    br.u32le(5);
+    br.i64le(99);
+    let vals = decodeBinaryRow(br.take(), cols);
+    check("binary row field count", str(vals.len), "3");
+    check("  column 0", hex(vals[0]), "05000000");
+    checkBool("  column 1 is NULL, from bit 3", vals[1] == null);
+    check("  column 2 follows the gap", hex(vals[2]), "6300000000000000");
+
+    // With no NULLs at all the bitmap is zero and every value is present.
+    let br2 = byteWriter(32);
+    br2.u8(0).u8(0).u32le(1).u8(2).text("hi").i64le(3);
+    let vals2 = decodeBinaryRow(br2.take(), cols);
+    check("a row with no nulls", str(vals2.len), "3");
+    check("  the string came through", hex(vals2[1]), "6869");
+}
+
+fn prepared() {
+    print("---- prepared statements ----");
+
+    let p = decodePrepareOk(byteWriter(16).u8(0).u32le(7).u16le(3).u16le(2).u8(0).u16le(0).take());
+    checkBool("parsed", p.ok);
+    check("statement id", str(p.stmtId), "7");
+    check("column count", str(p.numColumns), "3");
+    check("parameter count", str(p.numParams), "2");
+
+    check("COM_STMT_PREPARE", hex(encodeStmtPrepare("SELECT 1")), "1653454c4543542031");
+    check("COM_QUERY", hex(encodeQuery("SELECT 1")), "0353454c4543542031");
+    check("COM_STMT_CLOSE", hex(encodeStmtClose(7)), "1907000000");
+    check("COM_QUIT", hex(encodeQuit()), "01");
+
+    // COM_STMT_EXECUTE: id, flags, iteration count, NULL bitmap, the
+    // new-params-bound flag, a (type, unsigned) pair per parameter, then the
+    // values. The bitmap here is NOT offset — that belongs to result rows only.
+    let ps: MyParam[] = [encodeParam(dbInt(-42)), encodeParam(dbNull())];
+    check("COM_STMT_EXECUTE", hex(encodeStmtExecute(7, ps)),
+          "17" + "07000000" + "00" + "01000000"
+          + "02" + "01" + "0800" + "0600" + "d6ffffffffffffff");
+
+    // No parameters means no bitmap and no type block at all.
+    let none: MyParam[] = [];
+    check("COM_STMT_EXECUTE with no parameters", hex(encodeStmtExecute(7, none)),
+          "17" + "07000000" + "00" + "01000000");
+}
+
+fn typeMapping() {
+    print("---- values ----");
+
+    let intCol  = column("i", MT_LONG, 63, 0);
+    let bigCol  = column("b", MT_LONGLONG, 63, 0);
+    let uCol    = column("u", MT_LONG, 63, FLAG_UNSIGNED);
+    let dblCol  = column("d", MT_DOUBLE, 63, 0);
+    let fltCol  = column("f", MT_FLOAT, 63, 0);
+    let txtCol  = column("t", MT_VAR_STRING, 45, 0);
+    let blobCol = column("z", MT_BLOB, 63, 0);
+    let decCol  = column("m", MT_NEWDECIMAL, 63, 0);
+    let jsonCol = column("j", MT_JSON, 45, 0);
+
+    print("-- text protocol --");
+    check("int", showValue(decodeText(intCol, strBytes("42"))), "int 42");
+    check("bigint at i64 min", showValue(decodeText(bigCol, strBytes("-9223372036854775808"))),
+          "int -9223372036854775808");
+    check("double", showValue(decodeText(dblCol, strBytes("0.5"))), "float 0.5");
+    check("text", showValue(decodeText(txtCol, strBytes("O'Brien"))), "text O'Brien");
+    check("NULL", showValue(decodeText(txtCol, null)), "null");
+    check("empty string", showValue(decodeText(txtCol, bytes(0))), "text ");
+    // DECIMAL stays text, for the same reason numeric does in the Postgres
+    // driver: it is used precisely because a double cannot represent it.
+    check("decimal is text, not a float", showValue(decodeText(decCol, strBytes("1234.5678"))),
+          "text 1234.5678");
+    check("json is text", showValue(decodeText(jsonCol, strBytes("{\"a\": 1}"))),
+          "text {\"a\": 1}");
+
+    print("-- binary protocol --");
+    check("int4", showValue(decodeBinary(intCol, byteWriter(4).u32le(5).take())), "int 5");
+    check("int4 negative", showValue(decodeBinary(intCol, byteWriter(4).u32le(0xFFFFFFFB).take())),
+          "int -5");
+    // The same bytes read as unsigned. Getting this from the column flag rather
+    // than assuming signed is what keeps a large UNSIGNED INT from reading
+    // negative.
+    check("the same bytes, unsigned",
+          showValue(decodeBinary(uCol, byteWriter(4).u32le(0xFFFFFFFB).take())), "int 4294967291");
+    check("int8", showValue(decodeBinary(bigCol, byteWriter(8).i64le(-9).take())), "int -9");
+    checkBool("double is exact",
+              decodeBinary(dblCol, byteWriter(8).f64le(0.1).take()).f == 0.1);
+    checkBool("double 1/3 is exact",
+              decodeBinary(dblCol, byteWriter(8).f64le(1.0 / 3.0).take()).f == 1.0 / 3.0);
+    check("float4", showValue(decodeBinary(fltCol, byteWriter(4).u32le(0x3F000000).take())),
+          "float 0.5");
+    check("blob keeps its bytes",
+          showValue(decodeBinary(blobCol, byteWriter(4).u8(0).u8(0xFF).u8(0x41).take())),
+          "blob 00ff41");
+
+    // Dates render to ISO text, so schema-portable code reads the same string
+    // from either engine.
+    let dateCol = column("d", MT_DATE, 63, 0);
+    check("date", showValue(decodeBinary(dateCol, byteWriter(8).u16le(2026).u8(8).u8(12).take())),
+          "text 2026-08-12");
+    let dtCol = column("dt", MT_DATETIME, 63, 0);
+    check("datetime",
+          showValue(decodeBinary(dtCol, byteWriter(8).u16le(2026).u8(8).u8(12)
+                                        .u8(10).u8(30).u8(5).take())),
+          "text 2026-08-12 10:30:05");
+    check("datetime with microseconds",
+          showValue(decodeBinary(dtCol, byteWriter(12).u16le(2026).u8(8).u8(12)
+                                        .u8(10).u8(30).u8(5).u32le(123456).take())),
+          "text 2026-08-12 10:30:05.123456");
+    check("the zero date", showValue(decodeBinary(dateCol, bytes(0))), "text 0000-00-00");
+
+    // A TIME is a signed interval and may exceed 24 hours, so days fold into
+    // the hours rather than being dropped.
+    let timeCol = column("tm", MT_TIME, 63, 0);
+    check("time",
+          showValue(decodeBinary(timeCol, byteWriter(8).u8(0).u32le(0).u8(1).u8(2).u8(3).take())),
+          "text 01:02:03");
+    check("time beyond a day",
+          showValue(decodeBinary(timeCol, byteWriter(8).u8(0).u32le(2).u8(3).u8(0).u8(0).take())),
+          "text 51:00:00");
+    check("a negative interval",
+          showValue(decodeBinary(timeCol, byteWriter(8).u8(1).u32le(0).u8(1).u8(0).u8(0).take())),
+          "text -01:00:00");
+
+    print("-- parameters --");
+    let p1 = encodeParam(dbInt(-42));
+    check("int becomes LONGLONG", typeName(p1.kind) + " " + hex(p1.data),
+          "longlong d6ffffffffffffff");
+    let p2 = encodeParam(dbFloat(0.5));
+    check("float becomes DOUBLE, as bits", typeName(p2.kind) + " " + hex(p2.data),
+          "double 000000000000e03f");
+    let p3 = encodeParam(dbText("ada"));
+    check("text is length-encoded", typeName(p3.kind) + " " + hex(p3.data),
+          "varstring 03616461");
+    let blob = bytes(3);
+    blob[0] = 0 as byte; blob[1] = 0xFF as byte; blob[2] = 0x41 as byte;
+    let p4 = encodeParam(dbBlob(blob));
+    check("a blob keeps every byte", typeName(p4.kind) + " " + hex(p4.data), "blob 0300ff41");
+    checkBool("NULL has no data", encodeParam(dbNull()).isNull());
+    check("NULL is typed as MT_NULL", typeName(encodeParam(dbNull()).kind), "null");
+    // Bound, never spliced.
+    let p5 = encodeParam(dbText("'); DROP TABLE users; --"));
+    check("a hostile value goes verbatim, unescaped",
+          strbytes(p5.data.slice(1, p5.data.len), p5.data.len - 1),
+          "'); DROP TABLE users; --");
+}
+
+// ---------------------------------------------------------------------------
+// A whole session, replayed
+// ---------------------------------------------------------------------------
+
+fn pkt(w: ByteWriter, seq: int, payload: byte[]) {
+    w.raw(framePayload(payload, seq));
+}
+
+fn buf(): ByteWriter { return byteWriter(64); }
+
+// HandshakeV10 (seq 0), then OK (seq 2) after our response at seq 1.
+fn handshakeScript(w: ByteWriter) {
+    let h = buf();
+    h.u8(10);
+    h.cstr("8.0.36");
+    h.u32le(42);
+    let i = 0;
+    while (i < 8) { h.u8(i + 1); i += 1; }
+    h.u8(0);
+    h.u16le(0xFFFF);
+    h.u8(45);
+    h.u16le(2);
+    h.u16le(0x81FF);
+    h.u8(21);
+    let j = 0;
+    while (j < 10) { h.u8(0); j += 1; }
+    let k = 8;
+    while (k < 20) { h.u8(k + 1); k += 1; }
+    h.u8(0);
+    h.cstr("mysql_native_password");
+    pkt(w, 0, h.take());
+    pkt(w, 2, buf().u8(0).u8(0).u8(0).u16le(2).u16le(0).take());     // OK
+}
+
+// COM_STMT_PREPARE reply: prepare-ok, then two column definitions.
+fn prepareScript(w: ByteWriter) {
+    pkt(w, 1, buf().u8(0).u32le(1).u16le(2).u16le(0).u8(0).u16le(0).take());
+    pkt(w, 2, colDef("id", MT_LONG, 63, FLAG_NOT_NULL));
+    pkt(w, 3, colDef("name", MT_VAR_STRING, 45, 0));
+}
+
+// COM_STMT_EXECUTE reply: column count, definitions, rows, terminating OK.
+fn rowsScript(w: ByteWriter) {
+    pkt(w, 1, buf().u8(2).take());                                    // 2 columns
+    pkt(w, 2, colDef("id", MT_LONG, 63, FLAG_NOT_NULL));
+    pkt(w, 3, colDef("name", MT_VAR_STRING, 45, 0));
+    // row 1: 1, "ada"
+    pkt(w, 4, buf().u8(0).u8(0).u32le(1).u8(3).text("ada").take());
+    // row 2: 2, "" — an empty string, not NULL
+    pkt(w, 5, buf().u8(0).u8(0).u32le(2).u8(0).take());
+    // row 3: 3, NULL — bit 3 of the offset-by-two bitmap
+    pkt(w, 6, buf().u8(0).u8(0x08).u32le(3).take());
+    // terminating OK, 0xFE lead with DEPRECATE_EOF
+    pkt(w, 7, buf().u8(0xFE).u8(0).u8(0).u16le(2).u16le(0).take());
+}
+
+fn replaySelect() {
+    print("---- a whole session, replayed ----");
+
+    let w = byteWriter(1024);
+    handshakeScript(w);
+    prepareScript(w);
+    rowsScript(w);
+
+    let mem = memIo(w.take());
+    let db = new Db(mysqlOver(mem, "mysql://ada:secret@h/app"));
+
+    checkBool("connected", db.isOpen());
+    check("no error", db.error(), "");
+
+    let cn = db.conn() as MyConn;
+    check("server version was absorbed", cn.serverVersion(), "8.0.36");
+    check("connection id", str(cn.connectionId()), "42");
+
+    let r = db.all(select("t").orderBy("id"));
+    checkBool("the query succeeded", r.ok());
+    check("row count", str(r.len()), "3");
+
+    // Known before the first step, because COM_STMT_PREPARE returns the column
+    // definitions — the same property Describe gives the Postgres driver.
+    let names = r.columnNames();
+    check("column names", names[0] + "," + names[1], "id,name");
+
+    check("row 0", str(r.at(0).getInt("id")) + "/" + r.at(0).getStr("name"), "1/ada");
+    checkBool("row 1 name is empty but NOT null", !r.at(1).isNull("name"));
+    check("row 1 name", "[" + r.at(1).getStr("name") + "]", "[]");
+    checkBool("row 2 name IS null", r.at(2).isNull("name"));
+
+    // The client's half.
+    let sent = hex(mem.sent);
+    checkBool("the handshake response named the user",
+              sent.index_of(hex(strBytes("ada"))) >= 0);
+    checkBool("COM_STMT_PREPARE was sent", sent.index_of("1653454c454354") >= 0);
+    checkBool("COM_STMT_EXECUTE was sent", sent.index_of("1701000000") >= 0);
+}
+
+fn replayInsert() {
+    print("---- an INSERT, where MySQL beats Postgres ----");
+
+    // No result set: the execute reply is an OK packet carrying both counts
+    // directly, so lastInsertId is the engine's own number rather than always 0.
+    let w = byteWriter(512);
+    handshakeScript(w);
+    pkt(w, 1, buf().u8(0).u32le(1).u16le(0).u16le(1).u8(0).u16le(0).take());  // 0 cols, 1 param
+    pkt(w, 2, colDef("p", MT_VAR_STRING, 45, 0));                            // param def
+    pkt(w, 1, buf().u8(0).u8(1).u8(77).u16le(2).u16le(0).take());            // OK: 1 row, id 77
+
+    let db = new Db(mysqlOver(memIo(w.take()), "mysql://ada:secret@h/app"));
+    let r = db.raw("INSERT INTO t (name) VALUES (?)", [dbText("ada")]);
+    checkBool("the insert succeeded", r.ok());
+    check("no result columns", str(r.columnNames().len), "0");
+    check("affected rows", str(r.affected), "1");
+    check("lastInsertId is real here", str(r.insertId), "77");
+    check("  and on the connection too", str(db.lastInsertId()), "77");
+    check("changes()", str(db.changes()), "1");
+}
+
+fn replayError() {
+    print("---- an error, replayed ----");
+
+    let w = byteWriter(512);
+    handshakeScript(w);
+    prepareScript(w);
+    pkt(w, 1, buf().u8(0xFF).u16le(1062).u8(35).text("23000")
+                   .text("Duplicate entry 'ada' for key 't.name'").take());
+
+    let db = new Db(mysqlOver(memIo(w.take()), "mysql://ada:secret@h/app"));
+    let r = db.all(select("t").orderBy("id"));
+
+    checkBool("the query reports failure", !r.ok());
+    check("classified as a constraint violation", dberr_name(r.code), "constraint");
+    check("the server's wording survives", r.err,
+          "ERROR 1062 (23000): Duplicate entry 'ada' for key 't.name'");
+
+    let cn = db.conn() as MyConn;
+    check("the raw errno is reachable", str(cn.errno()), "1062");
+    check("and the sqlstate", cn.sqlstate(), "23000");
+}
+
+fn replayAuthFailures() {
+    print("---- authentication failures, replayed ----");
+
+    // Access denied.
+    let w = byteWriter(512);
+    let h = buf();
+    h.u8(10); h.cstr("8.0.36"); h.u32le(1);
+    let i = 0;
+    while (i < 8) { h.u8(1); i += 1; }
+    h.u8(0); h.u16le(0xFFFF); h.u8(45); h.u16le(2); h.u16le(0x81FF); h.u8(21);
+    let j = 0;
+    while (j < 10) { h.u8(0); j += 1; }
+    let k = 0;
+    while (k < 12) { h.u8(2); k += 1; }
+    h.u8(0);
+    h.cstr("mysql_native_password");
+    pkt(w, 0, h.take());
+    pkt(w, 2, buf().u8(0xFF).u16le(1045).u8(35).text("28000")
+                   .text("Access denied for user 'ada'@'localhost'").take());
+
+    let db = new Db(mysqlOver(memIo(w.take()), "mysql://ada:wrong@h/app"));
+    checkBool("not open", !db.isOpen());
+    check("classified as an open failure", dberr_name(db.errorCode()), "open");
+    check("the server's message is passed through", db.error(),
+          "ERROR 1045 (28000): Access denied for user 'ada'@'localhost'");
+
+    // caching_sha2_password demanding the full exchange — the failure MySQL 8
+    // users will actually hit, and the one that must explain itself.
+    let w2 = byteWriter(512);
+    let h2 = buf();
+    h2.u8(10); h2.cstr("8.0.36"); h2.u32le(1);
+    let a = 0;
+    while (a < 8) { h2.u8(1); a += 1; }
+    h2.u8(0); h2.u16le(0xFFFF); h2.u8(45); h2.u16le(2); h2.u16le(0x81FF); h2.u8(21);
+    let b = 0;
+    while (b < 10) { h2.u8(0); b += 1; }
+    let c = 0;
+    while (c < 12) { h2.u8(2); c += 1; }
+    h2.u8(0);
+    h2.cstr("caching_sha2_password");
+    pkt(w2, 0, h2.take());
+    pkt(w2, 2, buf().u8(0x01).u8(4).take());       // full auth required
+
+    let db2 = new Db(mysqlOver(memIo(w2.take()), "mysql://ada:secret@h/app"));
+    checkBool("the connection fails rather than hanging", !db2.isOpen());
+    checkBool("and explains that it needs TLS or RSA",
+              db2.error().index_of("TLS or an RSA key exchange") >= 0);
+    checkBool("and names the fix",
+              db2.error().index_of("mysql_native_password") >= 0);
+    checkBool("and warns that it is intermittent",
+              db2.error().index_of("FIRST login") >= 0);
+
+    // A plugin we cannot do at all.
+    let w3 = byteWriter(512);
+    let h3 = buf();
+    h3.u8(10); h3.cstr("8.0.36"); h3.u32le(1);
+    let d = 0;
+    while (d < 8) { h3.u8(1); d += 1; }
+    h3.u8(0); h3.u16le(0xFFFF); h3.u8(45); h3.u16le(2); h3.u16le(0x81FF); h3.u8(21);
+    let e2 = 0;
+    while (e2 < 10) { h3.u8(0); e2 += 1; }
+    let f = 0;
+    while (f < 12) { h3.u8(2); f += 1; }
+    h3.u8(0);
+    h3.cstr("mysql_clear_password");
+    pkt(w3, 0, h3.take());
+
+    let db3 = new Db(mysqlOver(memIo(w3.take()), "mysql://ada:secret@h/app"));
+    checkBool("mysql_clear_password is refused", !db3.isOpen());
+    checkBool("  because it would send the password in the clear",
+              db3.error().index_of("in the clear") >= 0);
+}
+
+fn replaySequenceDesync() {
+    print("---- a packet sequence that does not line up ----");
+
+    // The server's second packet claims sequence 5 when 2 is due. Continuing
+    // would attribute every later reply to the wrong command, so the connection
+    // is failed instead.
+    let w = byteWriter(512);
+    let h = buf();
+    h.u8(10); h.cstr("8.0.36"); h.u32le(1);
+    let i = 0;
+    while (i < 8) { h.u8(1); i += 1; }
+    h.u8(0); h.u16le(0xFFFF); h.u8(45); h.u16le(2); h.u16le(0x81FF); h.u8(21);
+    let j = 0;
+    while (j < 10) { h.u8(0); j += 1; }
+    let k = 0;
+    while (k < 12) { h.u8(2); k += 1; }
+    h.u8(0);
+    h.cstr("mysql_native_password");
+    pkt(w, 0, h.take());
+    pkt(w, 5, buf().u8(0).u8(0).u8(0).u16le(2).u16le(0).take());     // wrong sequence
+
+    let db = new Db(mysqlOver(memIo(w.take()), "mysql://ada:secret@h/app"));
+    checkBool("the connection is refused", !db.isOpen());
+    checkBool("and says the stream is out of step",
+              db.error().index_of("sequence out of step") >= 0);
+}
+
+fn replayUseFlushesCache() {
+    print("---- USE invalidates every cached statement ----");
+
+    // MySQL binds DATABASE() at PREPARE time, not at execute time, so a cached
+    // prepared statement keeps answering for whichever schema was current when
+    // it was prepared. Measured against 8.0.46: after `USE sys`, a cached
+    // `SELECT DATABASE()` still returned the previous schema — real rows,
+    // well-formed, entirely wrong. Every introspection query is scoped with
+    // DATABASE(), so this is a correctness bug and not a tidiness one.
+    //
+    // The transcript below is the assertion: it contains TWO prepare replies
+    // for the same SQL. If the cache were not flushed by the USE, the second
+    // query would reuse the first statement, never send COM_STMT_PREPARE, and
+    // read the prepare reply as its execute reply — desynchronizing.
+    let w = byteWriter(2048);
+    handshakeScript(w);
+    prepareScript(w);
+    rowsScript(w);
+    // USE: a simple query answered with a plain OK.
+    pkt(w, 1, buf().u8(0).u8(0).u8(0).u16le(2).u16le(0).take());
+    // the SAME sql, prepared again because the cache was dropped
+    prepareScript(w);
+    rowsScript(w);
+
+    let db = new Db(mysqlOver(memIo(w.take()), "mysql://ada:secret@h/app"));
+    let a = db.all(select("t").orderBy("id"));
+    checkBool("the first query worked", a.ok());
+    check("  three rows", str(a.len()), "3");
+
+    checkBool("USE succeeded", db.execRaw("USE other_schema"));
+
+    let b = db.all(select("t").orderBy("id"));
+    checkBool("the same SQL was re-prepared after the USE", b.ok());
+    check("  and still returns its rows", str(b.len()), "3");
+    if (!b.ok()) { print("    " + b.err); }
+}
+
+fn replayFragmented() {
+    print("---- the same session, one byte at a time ----");
+
+    let w = byteWriter(1024);
+    handshakeScript(w);
+    prepareScript(w);
+    rowsScript(w);
+
+    let db = new Db(mysqlOver(memIo(w.take()).dribble(1), "mysql://ada:secret@h/app"));
+    checkBool("connected over a dribbling transport", db.isOpen());
+    let r = db.all(select("t").orderBy("id"));
+    checkBool("the query succeeded", r.ok());
+    check("same row count", str(r.len()), "3");
+    check("same first row", str(r.at(0).getInt("id")) + "/" + r.at(0).getStr("name"), "1/ada");
+    checkBool("row 2 is still null", r.at(2).isNull("name"));
+}
+
+fn replayTruncated() {
+    print("---- the server hangs up mid-session ----");
+
+    let w = byteWriter(256);
+    handshakeScript(w);
+
+    let db = new Db(mysqlOver(memIo(w.take()), "mysql://ada:secret@h/app"));
+    checkBool("the handshake completed", db.isOpen());
+    let r = db.all(select("t").orderBy("id"));
+    checkBool("the query fails rather than hanging or panicking", !r.ok());
+    check("classified as closed", dberr_name(r.code), "closed");
+}
+
+fn tlsIsRefused() {
+    print("---- TLS is refused, not silently downgraded ----");
+
+    let cn = mysql("mysql://ada@h/app?ssl-mode=REQUIRED").connect();
+    checkBool("ssl-mode=REQUIRED does not connect", !cn.isOpen());
+    check("and says so", dberr_name(cn.errorCode()), "unsupported");
+    checkBool("naming the stub that has to be implemented",
+              cn.errorMessage().index_of("lib/vyto/crypto/openssl") >= 0);
+}
+
+fn dialectStillHonest() {
+    print("---- the dialect ----");
+
+    let d = mysqlDialect();
+    check("name", d.name(), "mysql");
+    check("identifiers are backquoted", d.quoteIdent("users"), "`users`");
+    // MySQL has no RETURNING, which is why lastInsertId matters here and does
+    // not on PostgreSQL.
+    checkBool("no RETURNING", !d.supportsReturning());
+    checkBool("no IF NOT EXISTS on CREATE INDEX", !d.supportsIfNotExistsIndex());
+    checkBool("introspection is now supported", d.supportsIntrospection());
+
+    // Same two rules as the Postgres queries: emit SQLite's vocabulary, because
+    // introspect.vt matches it literally, and scope to one schema.
+    let tables = d.introspectTablesSql();
+    checkBool("tables SQL maps TABLE_TYPE onto SQLite's words",
+              tables.index_of("THEN 'table'") >= 0 && tables.index_of("THEN 'view'") >= 0);
+    checkBool("tables SQL is scoped to one database", tables.index_of("DATABASE()") >= 0);
+
+    let cols = d.introspectColumnsSql();
+    checkBool("columns SQL makes cid 0-based",
+              cols.index_of("(c.ORDINAL_POSITION - 1) AS cid") >= 0);
+    // From the PRIMARY index's own ordinal, not from COLUMN_KEY, which is only
+    // a flag and would order a composite key by column position.
+    checkBool("columns SQL takes the pk ordinal from SEQ_IN_INDEX",
+              cols.index_of("s.SEQ_IN_INDEX") >= 0
+              && cols.index_of("s.INDEX_NAME = 'PRIMARY'") >= 0);
+    checkBool("columns SQL uses MySQL's placeholder", cols.index_of("= ?") >= 0);
+
+    let idx = d.introspectIndexesSql();
+    checkBool("indexes SQL emits SQLite's origin words",
+              idx.index_of("THEN 'pk'") >= 0 && idx.index_of("THEN 'u'") >= 0);
+
+    let idxc = d.introspectIndexColumnsSql();
+    checkBool("index-column SQL reads direction from COLLATION",
+              idxc.index_of("s.COLLATION = 'D'") >= 0);
+
+    let fks = d.introspectForeignKeysSql();
+    checkBool("foreign-key SQL groups multi-column constraints",
+              fks.index_of("DENSE_RANK()") >= 0);
+
+    let objs = d.introspectObjectsSql();
+    // db.vt:523 and :563 compare this literal.
+    checkBool("objects SQL emits the literal 'trigger'", objs.index_of("'trigger'") >= 0);
+
+    print("-- tables --");        print(tables);
+    print("-- columns --");       print(cols);
+    print("-- indexes --");       print(idx);
+    print("-- index columns --"); print(idxc);
+    print("-- foreign keys --");  print(fks);
+    print("-- objects --");       print(objs);
+}
+
+fn main() {
+    framing();
+    lengthEncoded();
+    handshake();
+    authentication();
+    okAndError();
+    columnsAndRows();
+    prepared();
+    typeMapping();
+    replaySelect();
+    replayInsert();
+    replayError();
+    replayAuthFailures();
+    replaySequenceDesync();
+    replayUseFlushesCache();
+    replayFragmented();
+    replayTruncated();
+    tlsIsRefused();
+    dialectStillHonest();
+    print("---- done ----");
+}
