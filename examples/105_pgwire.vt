@@ -47,7 +47,7 @@ import { readF64BE } from "vyto/mmap/decode";
 import { Value, dbNull, dbInt, dbFloat, dbText, dbBlob } from "vyto/db/value";
 import { AUTH_SASL_FINAL } from "vyto/db/pgsql/proto";
 import { dberr_name } from "vyto/db/driver";
-import { md5, sha256, hex_encode, strBytes } from "vyto/crypto";
+import { md5, sha256, hex_encode, strBytes, sub_bytes } from "vyto/crypto";
 
 fn check(name: string, got: string, want: string) {
     if (got == want) {
@@ -1310,17 +1310,76 @@ fn introspectionSql() {
     print("-- objects --");       print(objs);
 }
 
-fn tlsIsRefused() {
-    print("---- TLS is refused, not silently downgraded ----");
+fn tlsNegotiation() {
+    print("---- TLS negotiation ----");
 
-    // Connecting in the clear when TLS was asked for is the one failure a
-    // caller must never get without being told.
-    let d = pgsql("postgres://ada@h/app?sslmode=require");
-    let cn = d.connect();
-    checkBool("sslmode=require does not connect", !cn.isOpen());
-    check("and says so", dberr_name(cn.errorCode()), "unsupported");
-    checkBool("naming the stub that has to be implemented",
-              cn.errorMessage().index_of("lib/vyto/crypto/openssl") >= 0);
+    // An unknown mode is refused outright rather than guessed at. Silently
+    // treating a typo as "disable" is how a connection ends up in the clear
+    // while its DSN says otherwise.
+    let bad = pgsql("postgres://ada@h/app?sslmode=maybe").connect();
+    checkBool("an unknown sslmode does not connect", !bad.isOpen());
+    check("and is classified as unsupported", dberr_name(bad.errorCode()), "unsupported");
+
+    // THE DEFAULT IS PLAINTEXT, and libpq's is prefer. Asserted rather than
+    // assumed: a default of prefer would put an SSLRequest round trip in front
+    // of every connection to a local server that has TLS off, and the only way
+    // that change stays visible is a test that reads the first bytes on the
+    // wire. A startup message begins with its length and then protocol 3.0.
+    let w0 = buf();
+    handshake(w0);                               // no 'S'/'N' byte at all
+    let mem0 = memIo(w0.take());
+    let db0 = new Db(pgsqlOver(mem0, "postgres://ada@h/app"));
+    checkBool("a DSN with no sslmode connects", db0.isOpen());
+    check("and went straight to the startup message",
+          hex(sub_bytes(mem0.sent, 4, 4)), "00030000");
+
+    // The client half of the exchange, over a recorded transport. The server's
+    // answer to SSLRequest is a bare byte, not a message — 'N' for "no TLS
+    // here" and 'S' for "go ahead".
+    //
+    // 'N' + prefer keeps going in the clear, which is the whole point of
+    // prefer, so this drives it all the way through a real startup.
+    let w = buf();
+    w.u8(0x4E);                                  // N: no TLS on this server
+    handshake(w);                                // ... and then a normal session
+    let mem = memIo(w.take());
+    let db = new Db(pgsqlOver(mem, "postgres://ada@h/app?sslmode=prefer"));
+    checkBool("prefer falls back to plaintext when the server says N", db.isOpen());
+
+    // ...and the first thing it put on the wire was the SSLRequest, byte for
+    // byte. Asserting on `sent` is what makes this a protocol test rather than
+    // a "did it not crash" test.
+    check("SSLRequest went first", hex(sub_bytes(mem.sent, 0, 8)), "0000000804d2162f");
+
+    // 'N' + require is a refusal, because the alternative is connecting in the
+    // clear when TLS was asked for — the one failure a caller must never get
+    // without being told.
+    let w2 = buf();
+    w2.u8(0x4E);
+    let cn = pgsqlOver(memIo(w2.take()), "postgres://ada@h/app?sslmode=require").connect();
+    checkBool("require does not fall back", !cn.isOpen());
+    checkBool("and says the server refused TLS",
+              cn.errorMessage().index_of("does not accept TLS") >= 0);
+
+    // 'S' means the server has switched to expecting TLS records. A recorded
+    // transport has no socket to hand to OpenSSL, so the upgrade fails — and it
+    // must fail rather than carry on in the clear on a socket the server is no
+    // longer reading as plaintext.
+    let w3 = buf();
+    w3.u8(0x53);                                 // S: TLS from here
+    let cn3 = pgsqlOver(memIo(w3.take()), "postgres://ada@h/app?sslmode=require").connect();
+    checkBool("a transport with no socket cannot be upgraded", !cn3.isOpen());
+    checkBool("and says exactly that",
+              cn3.errorMessage().index_of("no socket to upgrade") >= 0);
+
+    // An old server answers the SSL request with an ErrorResponse tag instead
+    // of a bare byte. Diagnosed rather than reported as a corrupt stream.
+    let w4 = buf();
+    w4.u8(0x45);                                 // E
+    let cn4 = pgsqlOver(memIo(w4.take()), "postgres://ada@h/app?sslmode=require").connect();
+    checkBool("an ErrorResponse to SSLRequest is diagnosed", !cn4.isOpen());
+    checkBool("as a server too old to understand it",
+              cn4.errorMessage().index_of("too old") >= 0);
 }
 
 fn main() {
@@ -1348,6 +1407,6 @@ fn main() {
     replayParameters();
     replayTagReset();
     introspectionSql();
-    tlsIsRefused();
+    tlsNegotiation();
     print("---- done ----");
 }

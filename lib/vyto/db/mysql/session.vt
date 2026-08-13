@@ -24,6 +24,8 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 import { WireIo } from "vyto/db/wire/io";
+import { tlsUpgrade, tlsClientContext,
+         TLS_NO_VERIFY, TLS_VERIFY_CA, TLS_VERIFY_FULL } from "vyto/db/wire/tls";
 import { readU24LE, parseIntOr } from "vyto/db/wire";
 import { DBERR_NONE, DBERR_OPEN, DBERR_SQL, DBERR_CLOSED, DBERR_BUSY,
          DBERR_UNSUPPORTED, DBERR_MISUSE } from "vyto/db/driver";
@@ -32,11 +34,12 @@ import { MyHandshake, MyOk, MyError, MyColumn, MyPrepareOk, MyParam, MyAuthSwitc
          decodeColumnDef, decodeTextRow, decodeBinaryRow, decodePrepareOk,
          decodeAuthSwitch, encodeStmtPrepare, encodeStmtExecute, encodeStmtClose,
          encodeStmtReset, encodeQuery, encodeQuit, framePayload, MyReader,
+         encodeSslRequestPacket,
          clientCapabilities, sliceText,
          PKT_OK, PKT_EOF, PKT_ERR, PKT_LOCAL_INFILE,
          CLIENT_CONNECT_WITH_DB, CLIENT_PLUGIN_AUTH_LENENC, CLIENT_SSL,
          SERVER_STATUS_IN_TRANS, MAX_PAYLOAD } from "vyto/db/mysql/proto";
-import { authResponse, nativePassword, sha2FastPassword,
+import { authResponse, nativePassword, sha2FastPassword, clearPassword,
          PLUGIN_NATIVE, PLUGIN_SHA2, PLUGIN_CLEAR,
          SHA2_FAST_AUTH_OK, SHA2_FULL_AUTH_NEEDED } from "vyto/db/mysql/auth";
 
@@ -89,6 +92,19 @@ export class MySession {
     activeCols: MyColumn[];
     drainCap: int;
 
+    // ---- TLS, set before connect() and read by negotiateSsl() -------------
+    //
+    // sslMode is a MySQL spelling: DISABLED, PREFERRED, REQUIRED, VERIFY_CA,
+    // VERIFY_IDENTITY. The driver normalises and validates; this only acts.
+    sslMode: string;
+    sslCaFile: string;
+    sslHost: string;
+    tlsVersion: string;     // what was negotiated, or "" when in the clear
+
+    // Whether the transport is encrypted. Not cosmetic: it decides which
+    // authentication plugins are answerable at all.
+    secure: bool;
+
     fn init(io: WireIo) {
         this.io = io;
         this.open = false;
@@ -107,6 +123,11 @@ export class MySession {
         this.activeSink = null;
         this.activeCols = [];
         this.drainCap = 100000;
+        this.sslMode = "DISABLED";
+        this.sslCaFile = "";
+        this.sslHost = "";
+        this.tlsVersion = "";
+        this.secure = false;
     }
 
     // ---- error state ------------------------------------------------------
@@ -280,16 +301,26 @@ export class MySession {
         let plugin = h.authPlugin;
         if (plugin == "") { plugin = PLUGIN_NATIVE; }
 
-        let resp = authResponse(plugin, password, h.authData);
+        let caps = clientCapabilities(database != "") & h.capabilities;
+        // These are ours to require regardless of what the server volunteered.
+        caps = caps | (clientCapabilities(database != "") & (CLIENT_PLUGIN_AUTH_LENENC));
+
+        // TLS goes here — after the server's handshake packet, before anything
+        // that carries a credential. negotiateSsl returns the capability set to
+        // actually send (CLIENT_SSL added when the upgrade happened), or -1 on
+        // failure with errMsg set.
+        caps = this.negotiateSsl(h.capabilities, caps);
+        if (caps < 0) { return false; }
+        this.capabilities = caps;
+
+        // Which plugins are answerable depends on the transport, so this is
+        // asked AFTER the upgrade, not before: mysql_clear_password is a
+        // credential disclosure in the clear and correct over TLS.
+        let resp = authResponse(plugin, password, h.authData, this.secure);
         if (resp == null) {
             this.fail(DBERR_OPEN, this.pluginRefusal(plugin));
             return false;
         }
-
-        let caps = clientCapabilities(database != "") & h.capabilities;
-        // These are ours to require regardless of what the server volunteered.
-        caps = caps | (clientCapabilities(database != "") & (CLIENT_PLUGIN_AUTH_LENENC));
-        this.capabilities = caps;
 
         let payload = encodeHandshakeResponse(caps, 16777215, 45, user, resp, database, plugin);
         if (!this.sendPacket(payload)) { return false; }
@@ -297,11 +328,63 @@ export class MySession {
         return this.finishAuth(password);
     }
 
+    // ---- TLS --------------------------------------------------------------
+
+    // Upgrade the transport, if the mode asks for it and the server offers it.
+    //
+    // Returns the capability set to send in the handshake response, or -1 with
+    // errMsg set. The two are one function because CLIENT_SSL has to be in the
+    // SSLRequest packet AND in the handshake response that follows it, and the
+    // decision to set it is the decision to upgrade.
+    fn negotiateSsl(serverCaps: int, caps: int): int {
+        let m = this.sslMode;
+        if (m == "" || m == "DISABLED") { return caps; }
+
+        if ((serverCaps & CLIENT_SSL) == 0) {
+            if (m == "PREFERRED") { return caps; }
+            this.fail(DBERR_OPEN, "ssl-mode=" + m + " was requested but the server "
+                                + "does not offer TLS");
+            return -1;
+        }
+
+        let want = caps | CLIENT_SSL;
+
+        // The truncated handshake response: 32 bytes, no username, no
+        // credential. The sequence id keeps counting from here — resetting it
+        // is the classic way to break MySQL TLS, and readPayload treats a
+        // mismatch as fatal, so it would surface as a dead connection.
+        if (!this.sendPacket(encodeSslRequestPacket(want, 16777215, 45))) { return -1; }
+
+        // REQUIRED encrypts without checking who is on the other end, which is
+        // MySQL's meaning of the word. VERIFY_CA and VERIFY_IDENTITY are the
+        // spellings that check something.
+        let level = TLS_VERIFY_FULL;
+        if (m == "REQUIRED" || m == "PREFERRED") { level = TLS_NO_VERIFY; }
+        else if (m == "VERIFY_CA") { level = TLS_VERIFY_CA; }
+
+        let ctx = tlsClientContext(level, this.sslCaFile);
+        let t = tlsUpgrade(this.io, ctx, this.sslHost);
+
+        // No falling back, not even for PREFERRED: the SSLRequest packet is
+        // already sent and the server is waiting for a ClientHello.
+        if (t == null || !t.ok()) {
+            let why = "the TLS handshake failed";
+            if (t != null && t.error() != "") { why = t.error(); }
+            this.fail(DBERR_OPEN, why);
+            return -1;
+        }
+
+        this.io = t;
+        this.tlsVersion = t.protocolVersion();
+        this.secure = true;
+        return want;
+    }
+
     fn pluginRefusal(plugin: string): string {
         if (plugin == PLUGIN_CLEAR) {
-            return "the server asked for mysql_clear_password, which sends the password in the "
-                 + "clear and is only safe over TLS; this driver has no TLS "
-                 + "(lib/vyto/crypto/openssl is a stub)";
+            return "the server asked for mysql_clear_password, which sends the password in "
+                 + "the clear and is only safe over TLS; this connection is not encrypted. "
+                 + "Connect with ssl-mode=REQUIRED or better.";
         }
         return "the server asked for an authentication plugin this driver does not implement: "
              + plugin + " (supported: " + PLUGIN_NATIVE + ", " + PLUGIN_SHA2 + " fast path)";
@@ -340,7 +423,7 @@ export class MySession {
             // AuthSwitchRequest: the server wants a different plugin.
             if (lead == 0xFE) {
                 let sw = decodeAuthSwitch(p);
-                let r = authResponse(sw.plugin, password, sw.data);
+                let r = authResponse(sw.plugin, password, sw.data, this.secure);
                 if (r == null) {
                     this.fail(DBERR_OPEN, this.pluginRefusal(sw.plugin));
                     return false;
@@ -349,20 +432,29 @@ export class MySession {
                 continue;
             }
 
-            // caching_sha2_password's second stage. 0x03 is "the cache had you";
-            // 0x04 is "it did not, send the password itself" — which needs TLS
-            // or RSA, and we have neither.
+            // caching_sha2_password's second stage. 0x03 is "the cache had
+            // you"; 0x04 is "it did not, send the password itself".
             if (lead == 0x01 && p.len >= 2) {
                 let marker = p[1] as int;
                 if (marker == SHA2_FAST_AUTH_OK) { continue; }
                 if (marker == SHA2_FULL_AUTH_NEEDED) {
+                    // Over TLS this is exactly what the server expects: the
+                    // password, NUL-terminated, inside the encrypted stream.
+                    // The alternative it offers — an RSA key exchange — exists
+                    // only to make this safe WITHOUT TLS, so with TLS there is
+                    // nothing to negotiate.
+                    if (this.secure) {
+                        if (!this.sendPacket(clearPassword(password))) { return false; }
+                        continue;
+                    }
                     this.fail(DBERR_OPEN,
                         "the server demanded caching_sha2_password full authentication, which "
                         + "sends the password itself and so needs TLS or an RSA key exchange; "
-                        + "this driver has neither. This happens on the FIRST login for a user "
-                        + "and after any server restart or cache flush. Fix it with "
-                        + "ALTER USER ... IDENTIFIED WITH mysql_native_password, or use MariaDB, "
-                        + "or wait for lib/vyto/crypto/openssl.");
+                        + "this connection is in the clear and this driver does not implement "
+                        + "the RSA exchange. This happens on the FIRST login for a user and "
+                        + "after any server restart or cache flush. Fix it with a TLS DSN "
+                        + "(ssl-mode=REQUIRED), or ALTER USER ... IDENTIFIED WITH "
+                        + "mysql_native_password, or use MariaDB.");
                     return false;
                 }
                 continue;

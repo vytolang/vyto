@@ -26,7 +26,8 @@ import { framePayload, decodeHandshake, encodeHandshakeResponse,
          MT_VAR_STRING, MT_BLOB, MT_NEWDECIMAL, MT_JSON, MT_DATE, MT_DATETIME,
          MT_TIME, MT_NULL, FLAG_UNSIGNED, FLAG_NOT_NULL,
          CLIENT_DEPRECATE_EOF, CLIENT_MULTI_STATEMENTS, CLIENT_PROTOCOL_41,
-         CLIENT_CONNECT_WITH_DB, CLIENT_PLUGIN_AUTH } from "vyto/db/mysql/proto";
+         CLIENT_CONNECT_WITH_DB, CLIENT_PLUGIN_AUTH, CLIENT_SSL,
+         encodeSslRequestPacket } from "vyto/db/mysql/proto";
 import { nativePassword, sha2FastPassword, clearPassword, authResponse,
          PLUGIN_NATIVE, PLUGIN_SHA2, PLUGIN_CLEAR } from "vyto/db/mysql/auth";
 import { decodeText, decodeBinary, encodeParam, typeName,
@@ -38,7 +39,7 @@ import { mysql, mysqlOver, MyConn } from "vyto/db/mysql";
 import { mysqlDialect } from "vyto/db/dialect";
 import { Value, dbNull, dbInt, dbFloat, dbText, dbBlob } from "vyto/db/value";
 import { dberr_name } from "vyto/db/driver";
-import { hex_encode, strBytes } from "vyto/crypto";
+import { hex_encode, strBytes, sub_bytes } from "vyto/crypto";
 
 fn check(name: string, got: string, want: string) {
     if (got == want) {
@@ -253,13 +254,24 @@ fn authentication() {
     check("an empty password sends nothing", str(nativePassword("", nonce).len), "0");
     check("  for sha2 too", str(sha2FastPassword("", nonce).len), "0");
 
-    // Dispatch.
-    checkBool("native is supported", authResponse(PLUGIN_NATIVE, "pw", nonce) != null);
-    checkBool("sha2 is supported", authResponse(PLUGIN_SHA2, "pw", nonce) != null);
-    checkBool("an unnamed plugin defaults to native", authResponse("", "pw", nonce) != null);
-    // Sends the password itself; only ever correct over TLS, which there is none of.
-    checkBool("mysql_clear_password is refused", authResponse(PLUGIN_CLEAR, "pw", nonce) == null);
-    checkBool("an unknown plugin is refused", authResponse("sha256_password", "pw", nonce) == null);
+    // Dispatch. The last argument is whether the transport is encrypted, and
+    // it changes the answer for exactly one plugin — which is the point of it
+    // being a parameter rather than an assumption.
+    checkBool("native is supported", authResponse(PLUGIN_NATIVE, "pw", nonce, false) != null);
+    checkBool("sha2 is supported", authResponse(PLUGIN_SHA2, "pw", nonce, false) != null);
+    checkBool("an unnamed plugin defaults to native", authResponse("", "pw", nonce, false) != null);
+    checkBool("an unknown plugin is refused",
+              authResponse("sha256_password", "pw", nonce, false) == null);
+
+    // mysql_clear_password sends the password itself: a disclosure in the
+    // clear, and the documented plugin over TLS.
+    checkBool("mysql_clear_password is refused in the clear",
+              authResponse(PLUGIN_CLEAR, "pw", nonce, false) == null);
+    checkBool("and answered over TLS",
+              authResponse(PLUGIN_CLEAR, "pw", nonce, true) != null);
+    // TLS does not make an unimplemented plugin implemented.
+    checkBool("an unknown plugin is still refused over TLS",
+              authResponse("sha256_password", "pw", nonce, true) == null);
 
     check("clearPassword is NUL-terminated", hex(clearPassword("ab")), "616200");
 }
@@ -796,14 +808,127 @@ fn replayTruncated() {
     check("classified as closed", dberr_name(r.code), "closed");
 }
 
-fn tlsIsRefused() {
-    print("---- TLS is refused, not silently downgraded ----");
+// The server's handshake packet, with a caps word that can be adjusted. The
+// low 16 bits carry CLIENT_SSL (bit 11), which is what the client checks before
+// offering to upgrade.
+fn handshakeScriptCaps(w: ByteWriter, lowCaps: int, okSeq: int) {
+    let h = buf();
+    h.u8(10);
+    h.cstr("8.0.36");
+    h.u32le(42);
+    let i = 0;
+    while (i < 8) { h.u8(i + 1); i += 1; }
+    h.u8(0);
+    h.u16le(lowCaps);
+    h.u8(45);
+    h.u16le(2);
+    h.u16le(0x81FF);
+    h.u8(21);
+    let j = 0;
+    while (j < 10) { h.u8(0); j += 1; }
+    let k = 8;
+    while (k < 20) { h.u8(k + 1); k += 1; }
+    h.u8(0);
+    h.cstr("mysql_native_password");
+    pkt(w, 0, h.take());
+    // okSeq < 0 leaves the script at exactly one packet, so nothing is left in
+    // the read buffer afterwards — which is what the TLS upgrade requires.
+    if (okSeq >= 0) {
+        pkt(w, okSeq, buf().u8(0).u8(0).u8(0).u16le(2).u16le(0).take());  // OK
+    }
+}
 
-    let cn = mysql("mysql://ada@h/app?ssl-mode=REQUIRED").connect();
-    checkBool("ssl-mode=REQUIRED does not connect", !cn.isOpen());
-    check("and says so", dberr_name(cn.errorCode()), "unsupported");
-    checkBool("naming the stub that has to be implemented",
-              cn.errorMessage().index_of("lib/vyto/crypto/openssl") >= 0);
+fn u32leAt(b: byte[], off: int): int {
+    return (b[off] as int) | ((b[off + 1] as int) << 8)
+         | ((b[off + 2] as int) << 16) | ((b[off + 3] as int) << 24);
+}
+
+fn tlsNegotiation() {
+    print("---- TLS negotiation ----");
+
+    // An unknown mode is refused rather than guessed at. Guessing means a
+    // connection in the clear under a DSN that asked for encryption.
+    let bad = mysql("mysql://ada@h/app?ssl-mode=MAYBE").connect();
+    checkBool("an unknown ssl-mode does not connect", !bad.isOpen());
+    check("and is classified as unsupported", dberr_name(bad.errorCode()), "unsupported");
+
+    // MySQL's own spellings and libpq's both work, because a DSN gets copied
+    // from whatever was last working.
+    let alias = mysql("mysql://ada@h/app?ssl-mode=verify-full").connect();
+    checkBool("verify-full is accepted as an alias for VERIFY_IDENTITY",
+              dberr_name(alias.errorCode()) != "unsupported");
+
+    // THE DEFAULT IS PLAINTEXT, and mysql(1)'s is PREFERRED. Asserted against a
+    // server that DOES advertise CLIENT_SSL, so a default that negotiated would
+    // take the bait: the first packet out must be the full handshake response
+    // (username, credential, database) and not the 32-byte SSLRequest.
+    let w0 = buf();
+    handshakeScriptCaps(w0, 0xFFFF, 2);          // CLIENT_SSL offered
+    let mem0 = memIo(w0.take());
+    let db0 = new Db(mysqlOver(mem0, "mysql://ada@h/app"));
+    checkBool("a DSN with no ssl-mode connects", db0.isOpen());
+    checkBool("and sent the full handshake response, not a 32-byte SSLRequest",
+              mem0.sent.len > 36);
+
+    // PREFERRED against a server that does not advertise CLIENT_SSL stays in
+    // the clear and connects — that is the whole meaning of the word, and the
+    // reason it is the default.
+    let w = buf();
+    handshakeScriptCaps(w, 0xF7FF, 2);              // 0x0800 (CLIENT_SSL) cleared
+    let db = new Db(mysqlOver(memIo(w.take()), "mysql://ada@h/app?ssl-mode=PREFERRED"));
+    checkBool("PREFERRED connects in the clear when TLS is not offered", db.isOpen());
+
+    // REQUIRED against the same server fails instead.
+    let w2 = buf();
+    handshakeScriptCaps(w2, 0xF7FF, 2);
+    let cn2 = mysqlOver(memIo(w2.take()), "mysql://ada@h/app?ssl-mode=REQUIRED").connect();
+    checkBool("REQUIRED does not fall back", !cn2.isOpen());
+    checkBool("and says the server does not offer TLS",
+              cn2.errorMessage().index_of("does not offer TLS") >= 0);
+
+    // A server that DOES advertise CLIENT_SSL gets the 32-byte SSLRequest
+    // packet. The upgrade then fails because a recorded transport has no
+    // socket — which is what makes the bytes on the wire assertable.
+    let w3 = buf();
+    handshakeScriptCaps(w3, 0xFFFF, -1);
+    let mem = memIo(w3.take());
+    let cn3 = mysqlOver(mem, "mysql://ada:secret@h/app?ssl-mode=REQUIRED").connect();
+    checkBool("a transport with no socket cannot be upgraded", !cn3.isOpen());
+    checkBool("and says exactly that",
+              cn3.errorMessage().index_of("no socket to upgrade") >= 0);
+
+    // THE PROPERTY THAT MATTERS: the client sent the truncated packet and
+    // NOTHING ELSE. 4 header bytes + 32 payload bytes. No username, no
+    // credential — those belong inside the encrypted stream, and a driver that
+    // sent the full handshake response first would have leaked them before TLS
+    // existed.
+    check("only the SSLRequest went out", str(mem.sent.len), "36");
+    check("header is 32 bytes at sequence 1", hex(sub_bytes(mem.sent, 0, 4)), "20000001");
+
+    // CLIENT_SSL is set in the capability word the packet carries.
+    let caps = u32leAt(mem.sent, 4);
+    checkBool("CLIENT_SSL is set", (caps & CLIENT_SSL) != 0);
+    // The rest of the negotiated set is carried across unchanged: the same word
+    // has to go in the handshake response after the upgrade, and a client that
+    // recomputed it there would disagree with what it already committed to.
+    checkBool("the negotiated capabilities came with it",
+              (caps & CLIENT_CONNECT_WITH_DB) != 0);
+
+    // max_allowed_packet, charset, and the 23 reserved zeros.
+    check("max packet", hex(sub_bytes(mem.sent, 8, 4)), "ffffff00");
+    check("charset", hex(sub_bytes(mem.sent, 12, 1)), "2d");
+    check("23 reserved zeros", hex(sub_bytes(mem.sent, 13, 23)),
+          "0000000000000000000000000000000000000000000000");
+
+    // A server that volunteers bytes before the upgrade is refused rather than
+    // quietly losing them: anything sitting in the plaintext read buffer when
+    // TLS starts is a byte the encrypted stream will never see again.
+    let w4 = buf();
+    handshakeScriptCaps(w4, 0xFFFF, 3);          // ... and an OK nobody asked for yet
+    let cn4 = mysqlOver(memIo(w4.take()), "mysql://ada@h/app?ssl-mode=REQUIRED").connect();
+    checkBool("buffered plaintext blocks the upgrade", !cn4.isOpen());
+    checkBool("and says what was left over",
+              cn4.errorMessage().index_of("unexpected bytes before TLS started") >= 0);
 }
 
 fn dialectStillHonest() {
@@ -876,7 +1001,7 @@ fn main() {
     replayUseFlushesCache();
     replayFragmented();
     replayTruncated();
-    tlsIsRefused();
+    tlsNegotiation();
     dialectStillHonest();
     print("---- done ----");
 }

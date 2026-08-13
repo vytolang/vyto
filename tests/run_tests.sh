@@ -94,6 +94,17 @@ else
     echo "FAIL freestanding_shim_stub (vyto/mmap's VT_NO_LIBC arm does not build)"
     fail=1
 fi
+# Same shape for vyto/crypto/openssl, and it needs its own fixture for the same
+# reason: nothing else in the suite compiles that shim without a libc, so its
+# stub arm is the kind of thing that rots without anyone noticing until a
+# freestanding build of an unrelated program stops linking.
+if ./vytoc build tests/fixtures/openssl_freestanding.vt --freestanding --cc gcc \
+        -o examples/.vyto-cache/libossl_fs.a >/dev/null 2>&1; then
+    echo "PASS freestanding_openssl_stub"
+else
+    echo "FAIL freestanding_openssl_stub (vyto/crypto/openssl's VT_NO_LIBC arm does not build)"
+    fail=1
+fi
 # vyto/db is pure Vyto and must stay freestanding-safe; its SQLite subpackage is
 # the one part that is not, so db_shim.c carries a VT_NO_LIBC arm that drops the
 # whole library and returns failure sentinels. Both halves are checked because
@@ -124,14 +135,18 @@ mkdir -p tests/tmp/dbcontagion
 cp tests/fixtures/db_nodriver.vt tests/tmp/dbcontagion/
 if ./vytoc build tests/tmp/dbcontagion/db_nodriver.vt \
         -o tests/tmp/dbcontagion/nodriver >/dev/null 2>&1; then
-    # Also reject a socket object. vyto/db/pgsql is pure Vyto but reaches the
-    # network through vyto/net/socket, which does carry a native shim — so the
-    # driver is still contagious, just with a different payload than SQLite.
+    # Also reject a socket object and an OpenSSL one. vyto/db/pgsql is pure
+    # Vyto but reaches the network through vyto/net/socket and TLS through
+    # vyto/crypto/openssl, both of which carry native shims — so the driver is
+    # still contagious, just with a different payload than SQLite. The ossl
+    # entry is what stops vyto/db itself from ever importing vyto/db/wire/tls,
+    # which would put libssl on the link line of a program that renders a query
+    # string and nothing else.
     if find tests/tmp/dbcontagion/.vyto-cache \
-            \( -iname '*sqlite*' -o -iname '*socket*' \) 2>/dev/null | grep -q .; then
+            \( -iname '*sqlite*' -o -iname '*socket*' -o -iname '*ossl*' \) 2>/dev/null | grep -q .; then
         echo "FAIL db_no_driver_contagion (importing vyto/db compiled a driver's native code)"
         find tests/tmp/dbcontagion/.vyto-cache \
-             \( -iname '*sqlite*' -o -iname '*socket*' \) | head
+             \( -iname '*sqlite*' -o -iname '*socket*' -o -iname '*ossl*' \) | head
         fail=1
     else
         echo "PASS db_no_driver_contagion"

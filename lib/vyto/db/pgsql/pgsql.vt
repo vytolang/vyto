@@ -35,11 +35,15 @@
 //     across four app servers is 64 connections before any traffic, against a
 //     default max_connections of 100.
 //
-//   * NO TLS. lib/vyto/crypto/openssl is a stub in which every entry point
-//     panics, so this connects in the clear. sslMode("require") is refused
-//     rather than silently downgraded. That rules out most managed providers
-//     (RDS, Neon, Supabase) until the shim exists; the place it plugs in is
-//     WireIo.requestSsl(), which is written and returns false.
+//   * TLS COSTS A LINKED libssl. The driver imports vyto/db/wire/tls, which
+//     imports vyto/crypto/openssl, so every program using this driver links
+//     libssl and libcrypto and needs libssl-dev present to build — the same
+//     bargain vyto/net already makes for libcurl. In exchange sslmode works
+//     the way it does in libpq, and managed providers (RDS, Neon, Supabase)
+//     are reachable. The default is `disable`, which is NOT libpq's default:
+//     a local development server has TLS off, and paying an SSLRequest round
+//     trip to discover that on every connection is a cost with no buyer. Ask
+//     for TLS where the server has it — `verify-full` in production.
 //
 //   * ONE CURSOR AT A TIME, really. The protocol cannot interleave two portals
 //     on one connection. Opening a second statement while a Cursor is live
@@ -94,6 +98,20 @@ import { PgColumn, PgRow, PgParam, decodeDataRow, decodeError,
 import { decodeValue, encodeParam, resultFormatFor } from "vyto/db/pgsql/pgtype";
 
 const DEFAULT_PORT: int = 5432;
+
+// The sslmode a DSN that says nothing gets. NOT libpq's `prefer`, deliberately:
+// prefer puts an SSLRequest round trip in front of every connection to a server
+// that has TLS off, which is every local development database and the whole of
+// this test suite. Whether a given server speaks TLS is something the app knows
+// and this driver does not, so the app asks for it per connection with
+// ?sslmode= or .sslMode(...).
+//
+// Both PgDriver and PgOverDriver read this ONE name. They assign their fields
+// directly rather than through super (see PgStmt.init), so without it the two
+// defaults would drift, and the replay tests in examples/105_pgwire.vt — which
+// are what prove this default is plaintext — would go on passing while the real
+// driver did something else.
+const DEFAULT_SSLMODE: string = "disable";
 
 // ---------------------------------------------------------------------------
 // Statement
@@ -531,6 +549,7 @@ export class PgDriver extends Driver {
     cacheCap: int;
     drainCap: int;
     ssl: string;
+    sslRootCert: string;
     optKeys: string[];
     optVals: string[];
 
@@ -543,7 +562,8 @@ export class PgDriver extends Driver {
         this.timeoutMs = 30000;
         this.cacheCap = 64;
         this.drainCap = 100000;
-        this.ssl = "disable";
+        this.ssl = DEFAULT_SSLMODE;
+        this.sslRootCert = "";
         this.optKeys = [];
         this.optVals = [];
     }
@@ -568,10 +588,25 @@ export class PgDriver extends Driver {
     // takes the connection out from under it.
     builder fn drainLimit(n: int) { this.drainCap = n; return this; }
 
-    // Only "disable" is accepted. Anything else is refused rather than
-    // downgraded in silence — connecting in the clear when TLS was asked for is
-    // exactly the failure mode a caller must never get without being told.
+    // The libpq spellings, with the libpq meanings:
+    //
+    //   disable       plaintext, and never ask
+    //   allow         plaintext (TLS only if a plaintext connection is refused)
+    //   prefer        TLS if the server offers it, plaintext if not. NOT verified
+    //   require       TLS or fail. NOT verified — this is libpq's meaning of the
+    //                 word, and it stops an eavesdropper but not an impostor
+    //   verify-ca     TLS or fail, and the chain must verify
+    //   verify-full   TLS or fail, the chain must verify, and the certificate
+    //                 must name the host that was dialled. Use this one.
+    //
+    // The DSN's ?sslmode= overrides whatever is set here, so a connection string
+    // copied from psql behaves the way it does in psql.
     builder fn sslMode(m: string) { this.ssl = m; return this; }
+
+    // A PEM bundle of roots to trust IN ADDITION to the system store — what a
+    // managed provider's downloadable CA file is for. Also settable per DSN as
+    // ?sslrootcert=, matching libpq.
+    builder fn sslRootCertFile(path: string) { this.sslRootCert = path; return this; }
 
     builder fn option(k: string, v: string) {
         this.optKeys.push(k);
@@ -586,11 +621,11 @@ export class PgDriver extends Driver {
         }
 
         let mode = d.opt("sslmode", this.ssl);
-        if (mode != "disable" && mode != "allow" && mode != "prefer") {
+        if (mode != "disable" && mode != "allow" && mode != "prefer"
+            && mode != "require" && mode != "verify-ca" && mode != "verify-full") {
             return deadConn(
-                "vyto/db/pgsql: sslmode=" + mode + " was requested but this driver has no TLS. "
-                + "lib/vyto/crypto/openssl is a stub in which every entry point panics; until it "
-                + "is implemented, use sslmode=disable and a trusted network, or a local socket.",
+                "vyto/db/pgsql: sslmode=" + mode + " is not a mode this driver knows. "
+                + "Use disable, allow, prefer, require, verify-ca or verify-full.",
                 DBERR_UNSUPPORTED);
         }
 
@@ -602,6 +637,12 @@ export class PgDriver extends Driver {
 
         let sess = new PgSession(io);
         sess.drainCap = this.drainCap;
+        sess.sslMode = mode;
+        sess.sslCaFile = d.opt("sslrootcert", this.sslRootCert);
+        // The name the certificate has to carry is the one the DSN dialled.
+        // Passing an IP here when the certificate names the DNS name is the
+        // usual cause of a verify-full failure that looks like a chain problem.
+        sess.sslHost = d.host;
 
         let user = d.user;
         if (user == "") { user = d.opt("user", ""); }
@@ -664,7 +705,13 @@ export class PgOverDriver extends PgDriver {
         this.timeoutMs = 30000;
         this.cacheCap = 64;
         this.drainCap = 100000;
-        this.ssl = "disable";
+        // The SAME constant PgDriver uses, not a copy — so a replay with no
+        // sslmode in its DSN is a test OF the default. It works only because
+        // that default is plaintext: a recorded transport has no socket to
+        // upgrade, so a default that negotiated would break the replays here,
+        // loudly, which is the point.
+        this.ssl = DEFAULT_SSLMODE;
+        this.sslRootCert = "";
         this.optKeys = [];
         this.optVals = [];
         this.io = io;
@@ -687,6 +734,14 @@ export class PgOverDriver extends PgDriver {
         let sess = new PgSession(this.io);
         sess.drainCap = this.drainCap;
         sess.fixedNonce = this.nonce;
+        // Honoured so the CLIENT half of the SSL negotiation is testable: a
+        // recorded transport can answer 'S' or 'N' and the SSLRequest bytes the
+        // driver put on the wire can be asserted. The upgrade itself always
+        // fails here — a MemIo has no fd — which is the other half worth
+        // pinning, because it is the path a caller hits when they hand a
+        // non-socket transport to a TLS DSN.
+        sess.sslMode = d.opt("sslmode", this.ssl);
+        sess.sslHost = d.host;
         if (!sess.connect(user, d.pass, dbname, this.appName, this.timeZone,
                           this.optKeys, this.optVals)) {
             let msg = sess.errMsg;

@@ -1,12 +1,25 @@
 # vyto/crypto — hashing, key derivation, authenticated encryption, P-256
 
-Two packages, split on a build boundary:
+Four packages, split on build boundaries. A `native/src` compiles once per
+package *directory*, so the split is what keeps a program that hashes a password
+from linking anything:
 
 | Import | What it gives you | Native code |
 |--------|-------------------|-------------|
-| `vyto/crypto` | SHA-256, HMAC, HKDF, PBKDF2, ChaCha20-Poly1305, constant-time compare, hex | none — pure Vyto |
+| `vyto/crypto` | SHA-256, SHA-1, MD5, HMAC, HKDF, PBKDF2, ChaCha20-Poly1305, constant-time compare, hex | none — pure Vyto |
 | `vyto/crypto/argon2` | Argon2id/i/d password hashing, BLAKE2b | none — pure Vyto |
 | `vyto/crypto/ecc` | P-256 key generation, ECDSA, ECDH, point compression | micro-ecc v1.1, vendored |
+| `vyto/crypto/openssl` | TLS client and server over any socket, X.509 parsing, chain verification, RFC 6125 hostname matching, channel binding | **system** libssl/libcrypto 3.0+ |
+
+`vyto/crypto/openssl` is the odd one out and deliberately so: it is the only
+package here with an external dependency, it is provisioned rather than
+vendored (an OpenSSL build is a decision, not a fetch — `native/provision-openssl.sh`),
+and its primitives are **not** implemented, only its TLS and X.509 halves.
+Use the pure-Vyto modules for hashing and AEAD; reach for this one when you
+need a TLS connection or a certificate parsed. It has its own README —
+[`openssl/README.md`](openssl/README.md) — with the implemented / not-implemented
+list, the provisioning story, and the non-blocking rule that is easy to get
+wrong.
 
 ```vyto
 import { sha256, hmac_sha256, hkdf_sha256, pbkdf2_sha256,

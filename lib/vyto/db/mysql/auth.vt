@@ -27,10 +27,12 @@
 // ages out. That is worse than failing consistently, because it looks like a
 // network fault.
 //
-// If you hit it, the options are: ALTER USER ... IDENTIFIED WITH
-// mysql_native_password, use MariaDB, or wait for lib/vyto/crypto/openssl to
-// stop being a stub. The driver detects the demand and says so rather than
-// hanging.
+// OVER TLS BOTH OF THESE GO AWAY. The full exchange is legal on an encrypted
+// transport — it is what the server expects there — so ssl-mode=REQUIRED or
+// better makes caching_sha2_password work on a cache miss, and makes
+// mysql_clear_password answerable at all. In the clear the driver detects the
+// demand and says so rather than hanging; the fix is a TLS DSN, or ALTER USER
+// ... IDENTIFIED WITH mysql_native_password, or MariaDB.
 // ─────────────────────────────────────────────────────────────────────────────
 
 import { sha1, sha256, concat_bytes, strBytes } from "vyto/crypto";
@@ -77,10 +79,17 @@ export fn clearPassword(password: string): byte[] {
     return out;
 }
 
-// The response for a named plugin, or null when this driver cannot do it.
-export fn authResponse(plugin: string, password: string, nonce: byte[]): byte[] {
+// The response for a named plugin, or null when this driver cannot do it on
+// this connection.
+//
+// `secure` is whether the transport is encrypted, and it is a parameter rather
+// than an assumption because it changes which plugins are ANSWERABLE, not just
+// which are advisable: mysql_clear_password sends the password itself, so it is
+// correct over TLS and a credential disclosure without it.
+export fn authResponse(plugin: string, password: string, nonce: byte[], secure: bool): byte[] {
     if (plugin == "" || plugin == PLUGIN_NATIVE) { return nativePassword(password, nonce); }
     if (plugin == PLUGIN_SHA2) { return sha2FastPassword(password, nonce); }
+    if (plugin == PLUGIN_CLEAR && secure) { return clearPassword(password); }
     return null;
 }
 

@@ -1,0 +1,220 @@
+// vyto/db/wire/tls — the TLS transport under the network database drivers.
+//
+// One class, TlsIo, which is a WireIo like any other: it overrides rawRead and
+// rawWrite and inherits every line of buffering, framing, deadline handling and
+// error classification from the base (io.vt:1-6). No driver above it changes
+// shape because the transport became encrypted.
+//
+// ── WHY THIS IS ITS OWN MODULE ──────────────────────────────────────────────
+// It sits in the vyto/db/wire package DIRECTORY, which has no native/src, but
+// in its own module file. Native code compiles per package directory for every
+// module in the IMPORT CLOSURE, and #link travels the same way, so a program
+// that imports vyto/db/wire/io — or vyto/db itself — links no libssl. Only a
+// module that imports THIS one does. That is the invariant
+// tests/run_tests.sh's db_no_driver_contagion check exists to protect.
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// ── THE PART THAT IS NOT OBVIOUS ────────────────────────────────────────────
+// WireIo.awaitReady(forWrite) takes its direction from the CALLER: fill()
+// always asks for readability, writeAll() always for writability. That is right
+// for a socket and wrong for TLS. SSL_read can need the socket to become
+// WRITABLE — a TLS 1.3 key update, a renegotiation — and SSL_write can need it
+// READABLE. A transport that waits for the caller's direction after a blocked
+// SSL operation deadlocks: both ends are waiting for the other to speak.
+//
+// So rawRead and rawWrite record the direction the SSL layer actually asked
+// for (that is what the want-read / want-write split in the shim's return codes
+// is for) and awaitReady IGNORES its argument in favour of that. WireIo, SockIo
+// and MemIo are untouched.
+// ─────────────────────────────────────────────────────────────────────────────
+
+import { WireIo, IO_OK, IO_EOF, IO_TIMEOUT, IO_ERROR,
+         RAW_EOF, RAW_BLOCK, RAW_ERR } from "vyto/db/wire/io";
+import { TlsContext, TlsConn, tls_connect,
+         tls_client, tls_client_verify_chain_only,
+         tls_client_insecure_no_verification,
+         OSSL_WANT_READ, OSSL_WANT_WRITE } from "vyto/crypto/openssl";
+
+// How much of the peer's identity to check. Engine-independent on purpose:
+// PostgreSQL spells these sslmode=require / verify-ca / verify-full and MySQL
+// spells them REQUIRED / VERIFY_CA / VERIFY_IDENTITY, and neither spelling
+// belongs in the transport.
+export const TLS_NO_VERIFY:   int = 0;
+export const TLS_VERIFY_CA:   int = 1;
+export const TLS_VERIFY_FULL: int = 2;
+
+// Build the client context a connection should use.
+//
+// `caFile` is a PEM bundle to trust IN ADDITION to the system store, or "" for
+// the system store alone. Every managed database hands out one of these.
+export fn tlsClientContext(level: int, caFile: string): TlsContext {
+    let ctx: TlsContext = null;
+    if (level == TLS_VERIFY_FULL) {
+        ctx = tls_client();
+    } else if (level == TLS_VERIFY_CA) {
+        ctx = tls_client_verify_chain_only();
+    } else {
+        ctx = tls_client_insecure_no_verification();
+    }
+    if (ctx == null || !ctx.ok()) { return ctx; }
+    if (caFile != "") {
+        if (!ctx.trustFile(caFile)) {
+            return new TlsContext(null, false, "the CA file could not be read: " + caFile);
+        }
+    }
+    return ctx;
+}
+
+// ---------------------------------------------------------------------------
+// The transport
+// ---------------------------------------------------------------------------
+
+export class TlsIo extends WireIo {
+    // The transport underneath. Typed WireIo rather than SockIo so no downcast
+    // is needed at the call sites, where the driver only knows it holds a
+    // WireIo. A MemIo reaching here has fd() == -1 and fails the upgrade with a
+    // message instead of type-checking differently.
+    inner: WireIo;
+    conn: TlsConn;
+
+    // Which direction the last SSL operation asked for. Read by awaitReady.
+    wantWrite: bool;
+
+    fn init(inner: WireIo, conn: TlsConn) {
+        this.buf = bytes(0);
+        this.head = 0;
+        this.tail = 0;
+        this.timeoutMs = 0;
+        this.state = IO_OK;
+        this.err = "";
+        this.inner = inner;
+        this.conn = conn;
+        this.wantWrite = false;
+        if (inner != null) { this.timeoutMs = inner.timeoutMs; }
+    }
+
+    override fn isOpen(): bool {
+        return this.conn != null && this.conn.ok()
+            && this.inner != null && this.inner.isOpen();
+    }
+
+    override fn fd(): int {
+        if (this.inner == null) { return -1; }
+        return this.inner.fd();
+    }
+
+    override fn rawRead(dst: byte[], n: int): int {
+        if (!this.isOpen()) { return RAW_ERR; }
+        let r = this.conn.readInto(dst, n);
+        if (r > 0) { return r; }
+        if (r == 0) { return RAW_EOF; }
+        if (r == OSSL_WANT_READ)  { this.wantWrite = false; return RAW_BLOCK; }
+        if (r == OSSL_WANT_WRITE) { this.wantWrite = true;  return RAW_BLOCK; }
+        // A more specific reason than fill()'s "socket read failed". fail()
+        // keeps the first failure, so this one is the one that survives.
+        this.fail(IO_ERROR, "the TLS read failed: " + this.conn.lastError());
+        return RAW_ERR;
+    }
+
+    override fn rawWrite(src: byte[], off: int, n: int): int {
+        if (!this.isOpen()) { return RAW_ERR; }
+        let r = this.conn.writeFrom(src, off, n);
+        if (r > 0) { return r; }
+        if (r == 0) { return RAW_EOF; }
+        if (r == OSSL_WANT_READ)  { this.wantWrite = false; return RAW_BLOCK; }
+        if (r == OSSL_WANT_WRITE) { this.wantWrite = true;  return RAW_BLOCK; }
+        this.fail(IO_ERROR, "the TLS write failed: " + this.conn.lastError());
+        return RAW_ERR;
+    }
+
+    // Deliberately ignores `forWrite`. See the header: the direction that
+    // matters is the one the SSL layer asked for, not the one the caller
+    // assumed. This is the whole reason the class exists as more than a pair of
+    // pass-throughs.
+    override fn awaitReady(forWrite: bool): bool {
+        if (this.inner == null) { return false; }
+        return this.inner.awaitReady(this.wantWrite);
+    }
+
+    override fn close() {
+        // close_notify first, so the server records a finished conversation
+        // rather than a truncated one, and only then the socket underneath.
+        if (this.conn != null) { this.conn.close(); this.conn = null; }
+        if (this.inner != null) { this.inner.close(); }
+    }
+
+    // Drive the handshake to completion over the non-blocking socket, waiting
+    // for whichever direction each step asks for.
+    fn handshake(): bool {
+        if (this.conn == null) { return false; }
+        while (true) {
+            let r = this.conn.handshakeStep();
+            if (r == 1) { return true; }
+            if (r != OSSL_WANT_READ && r != OSSL_WANT_WRITE) {
+                this.fail(IO_ERROR, "the TLS handshake failed: " + this.conn.lastError());
+                return false;
+            }
+            this.wantWrite = (r == OSSL_WANT_WRITE);
+            if (!this.inner.awaitReady(this.wantWrite)) {
+                this.fail(IO_TIMEOUT, "timed out during the TLS handshake");
+                return false;
+            }
+        }
+        return false;
+    }
+
+    // What was negotiated, for a driver that wants to report it.
+    fn protocolVersion(): string {
+        if (this.conn == null) { return ""; }
+        return this.conn.protocolVersion();
+    }
+
+    deinit { this.close(); }
+}
+
+// ---------------------------------------------------------------------------
+// The upgrade
+// ---------------------------------------------------------------------------
+
+// Wrap a live plaintext transport in TLS and complete the handshake.
+//
+// Never returns null for a non-null `io`: a failure comes back as a TlsIo whose
+// ok() is false and whose error() explains, which is the same shape every other
+// failure in this layer has.
+//
+// The caller must have consumed everything it read before calling. A byte
+// sitting in the plaintext buffer at this point is a byte TLS will never see
+// again, so an upgrade with anything buffered is refused rather than silently
+// losing it — and it means a server that sent data it was not asked for cannot
+// desync the connection quietly.
+export fn tlsUpgrade(io: WireIo, ctx: TlsContext, host: string): TlsIo {
+    if (io == null) { return null; }
+
+    let t = new TlsIo(io, null);
+
+    if (ctx == null || !ctx.ok()) {
+        let why = "no TLS context";
+        if (ctx != null && ctx.err != "") { why = ctx.err; }
+        t.fail(IO_ERROR, "TLS was requested but the context could not be built: " + why);
+        return t;
+    }
+    if (io.buffered() > 0) {
+        t.fail(IO_ERROR, "the server sent " + str(io.buffered())
+                       + " unexpected bytes before TLS started");
+        return t;
+    }
+    let fd = io.fd();
+    if (fd < 0) {
+        t.fail(IO_ERROR, "this transport has no socket to upgrade");
+        return t;
+    }
+
+    let c = tls_connect(ctx, fd, host);
+    if (c == null) {
+        t.fail(IO_ERROR, "the TLS connection could not be created");
+        return t;
+    }
+    t.conn = c;
+    t.handshake();
+    return t;
+}

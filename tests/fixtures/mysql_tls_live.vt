@@ -1,0 +1,120 @@
+// The ssl-mode ladder against a real MySQL or MariaDB with TLS turned on.
+//
+// NOT part of `make test` — run by tests/run_tests_mysql.sh with
+// VYTO_MYSQL_TLS_DSN pointing at a TLS-enabled server. examples/106_mywire.vt
+// already asserts the 32-byte SSLRequest packet byte for byte; what only a real
+// server can prove is that MySQL accepts it, switches, and keeps counting
+// packet sequence numbers across the upgrade — the one thing that cannot be
+// checked against a recorded transcript, because the transcript is what a
+// correct client's traffic would look like.
+//
+// It also covers the payoff: caching_sha2_password's FULL exchange, which MySQL
+// 8 demands on a cache miss and which is only answerable over TLS.
+
+import { Db, select } from "vyto/db";
+import { mysql } from "vyto/db/mysql";
+import { getenv } from "vyto/os";
+
+fn checkBool(name: string, got: bool, want: bool) {
+    if (got == want) {
+        print("ok    " + name);
+    } else {
+        print("FAIL  " + name + " (got " + str(got) + ", want " + str(want) + ")");
+    }
+}
+
+fn withMode(dsn: string, extra: string): string {
+    let base = dsn;
+    let q = dsn.index_of("?");
+    if (q >= 0) { base = dsn.slice(0, q); }
+    return base + "?" + extra;
+}
+
+fn works(dsn: string): bool {
+    let db = new Db(mysql(dsn));
+    if (!db.ok()) { return false; }
+    let r = db.raw("select 1 as one", []);
+    return r.ok() && r.rows.len == 1;
+}
+
+fn why(dsn: string): string {
+    let db = new Db(mysql(dsn));
+    if (db.ok()) { return "(connected)"; }
+    return db.error();
+}
+
+fn main() {
+    // run_tests_mysql.sh passes whichever server it was pointed at through
+    // VYTO_MYSQL_DSN, the same as every other fixture here.
+    let dsn = getenv("VYTO_MYSQL_DSN");
+    if (dsn == "") { print("FAIL  VYTO_MYSQL_DSN is not set"); return; }
+
+    checkBool("ssl-mode=DISABLED", works(withMode(dsn, "ssl-mode=DISABLED")), true);
+    checkBool("ssl-mode=PREFERRED", works(withMode(dsn, "ssl-mode=PREFERRED")), true);
+    checkBool("ssl-mode=REQUIRED", works(withMode(dsn, "ssl-mode=REQUIRED")), true);
+
+    // The libpq spellings are accepted too, and mean the same thing.
+    checkBool("ssl-mode=require is the same as REQUIRED",
+              works(withMode(dsn, "ssl-mode=require")), true);
+
+    // A server's auto-generated certificate is self-signed, so identity
+    // checking must FAIL without a CA — asserted in both directions, because a
+    // VERIFY_IDENTITY that passes against a self-signed certificate would make
+    // the whole mode worthless.
+    let ca = getenv("VYTO_MYSQL_SSLCA");
+    if (ca == "") {
+        checkBool("VERIFY_IDENTITY rejects an untrusted certificate",
+                  works(withMode(dsn, "ssl-mode=VERIFY_IDENTITY")), false);
+        print("      " + why(withMode(dsn, "ssl-mode=VERIFY_IDENTITY")));
+        print("note  set VYTO_MYSQL_SSLCA to the server's ca.pem to test the passing side");
+    } else {
+        checkBool("ssl-mode=VERIFY_CA with the CA",
+                  works(withMode(dsn, "ssl-mode=VERIFY_CA&ssl-ca=" + ca)), true);
+        checkBool("ssl-mode=VERIFY_IDENTITY with the CA",
+                  works(withMode(dsn, "ssl-mode=VERIFY_IDENTITY&ssl-ca=" + ca)), true);
+    }
+
+    checkBool("an unknown mode is refused", works(withMode(dsn, "ssl-mode=YES")), false);
+
+    // ---- what TLS actually buys on MySQL -----------------------------------
+    //
+    // A caching_sha2_password user whose credential is NOT in the server's
+    // in-memory cache forces the full exchange. In the clear that is a hard
+    // failure this driver diagnoses; over TLS it is the documented path and
+    // must simply work.
+    //
+    // Getting a guaranteed cache miss needs FLUSH PRIVILEGES, which needs
+    // RELOAD — so this only runs when a DSN with the privilege is supplied.
+    let admin = getenv("VYTO_MYSQL_TLS_ADMIN_DSN");
+    if (admin == "") {
+        print("note  set VYTO_MYSQL_TLS_ADMIN_DSN (a user with RELOAD) to test");
+        print("note  caching_sha2_password full authentication over TLS");
+        return;
+    }
+
+    let a = new Db(mysql(withMode(admin, "ssl-mode=REQUIRED")));
+    if (!a.ok()) { print("FAIL  admin connection: " + a.error()); return; }
+
+    // Emptying the cache makes the NEXT login take the full path.
+    let flushed = a.execRaw("FLUSH PRIVILEGES");
+    checkBool("FLUSH PRIVILEGES", flushed, true);
+
+    checkBool("caching_sha2_password full auth succeeds over TLS",
+              works(withMode(dsn, "ssl-mode=REQUIRED")), true);
+
+    // And the same login in the clear is refused with a diagnosis rather than
+    // hanging or silently sending the password.
+    if (a.execRaw("FLUSH PRIVILEGES")) {
+        let clear = withMode(dsn, "ssl-mode=DISABLED");
+        let db = new Db(mysql(clear));
+        if (db.ok()) {
+            // A mysql_native_password user gets here legitimately; only the
+            // sha2 case is the one under test, so this is a note, not a failure.
+            print("note  the plaintext login succeeded — this user is probably not");
+            print("note  caching_sha2_password, so the full-auth path was not exercised");
+        } else {
+            checkBool("and is refused in the clear with a diagnosis",
+                      db.error().index_of("full authentication") >= 0, true);
+        }
+    }
+}

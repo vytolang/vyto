@@ -31,6 +31,8 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 import { WireIo, IO_OK, io_state_name } from "vyto/db/wire/io";
+import { tlsUpgrade, tlsClientContext,
+         TLS_NO_VERIFY, TLS_VERIFY_CA, TLS_VERIFY_FULL } from "vyto/db/wire/tls";
 import { parseIntOr, sqlstateToDberr } from "vyto/db/wire";
 import { DBERR_NONE, DBERR_OPEN, DBERR_SQL, DBERR_CLOSED, DBERR_BUSY,
          DBERR_UNSUPPORTED, DBERR_MISUSE } from "vyto/db/driver";
@@ -39,7 +41,7 @@ import { PgError, PgTag, PgColumn, PgAuth,
          decodeError, decodeCommandComplete, decodeRowDescription,
          decodeParameterDescription, decodeAuth, decodeParameterStatus,
          decodeBackendKey, decodeReadyForQuery,
-         encodeStartup, encodeQuery, encodeParse, encodeDescribe, encodeBind,
+         encodeStartup, encodeSslRequest, encodeQuery, encodeParse, encodeDescribe, encodeBind,
          encodeExecute, encodeSync, encodeClose, encodeTerminate,
          encodePassword, encodeSaslInitial, encodeSaslResponse,
          PgParam, DESC_STATEMENT,
@@ -117,6 +119,15 @@ export class PgSession {
     activeSink: PgRowBuffer;
     drainCap: int;
 
+    // ---- TLS, set before connect() and read by negotiateSsl() -------------
+    //
+    // sslMode is a libpq spelling: disable, allow, prefer, require, verify-ca,
+    // verify-full. The driver validates it; this only acts on it.
+    sslMode: string;
+    sslCaFile: string;      // sslrootcert, or "" for the system trust store
+    sslHost: string;        // what the certificate must name — the DSN's host
+    tlsVersion: string;     // what was negotiated, or "" when in the clear
+
     // Held only for the duration of the handshake.
     scram: ScramClient;
 
@@ -145,6 +156,10 @@ export class PgSession {
         this.activeId = 0;
         this.activeSink = null;
         this.drainCap = 100000;
+        this.sslMode = "disable";
+        this.sslCaFile = "";
+        this.sslHost = "";
+        this.tlsVersion = "";
         this.scram = null;
         this.fixedNonce = "";
     }
@@ -276,6 +291,72 @@ export class PgSession {
         this.lastOid = 0;
     }
 
+    // ---- TLS --------------------------------------------------------------
+
+    // The SSLRequest exchange, which happens BEFORE the startup message and is
+    // the only part of the protocol that is not a tagged message: the server
+    // answers a bare 'S' or 'N' byte.
+    //
+    // False means the connection is finished and errMsg says why. True means
+    // "carry on" — which for prefer over a server with TLS off is a plaintext
+    // connection, and for everything else means this.io is now a TlsIo.
+    fn negotiateSsl(): bool {
+        let m = this.sslMode;
+
+        // disable never asks. allow means "plaintext, and TLS only if the
+        // server refuses a plaintext connection outright" — there is no refusal
+        // to observe at this point in the exchange, so it behaves as disable
+        // does, exactly as libpq's allow does against a server that accepts.
+        if (m == "" || m == "disable" || m == "allow") { return true; }
+
+        if (!this.send(encodeSslRequest())) { return false; }
+
+        let b = this.io.readByte();
+        if (b < 0) { this.transportFail(); return false; }
+
+        if (b == 0x4E) {                    // 'N' — TLS is not available here
+            if (m == "prefer") { return true; }
+            this.fail(DBERR_OPEN, "sslmode=" + m + " was requested but the server "
+                                + "does not accept TLS connections");
+            return false;
+        }
+        if (b == 0x45) {                    // 'E' — an ErrorResponse tag
+            this.fail(DBERR_OPEN, "the server answered the SSL request with an error, "
+                                + "which means it is too old to understand it");
+            return false;
+        }
+        if (b != 0x53) {                    // anything but 'S'
+            this.fail(DBERR_OPEN, "the server answered the SSL request with an "
+                                + "unexpected byte (" + str(b) + ")");
+            return false;
+        }
+
+        // require does NOT verify. That is libpq's meaning of the word and
+        // changing it here would make a DSN copied from psql behave differently
+        // in a way nobody would look for; verify-ca and verify-full are the
+        // spellings that check something, which is why they exist.
+        let level = TLS_VERIFY_FULL;
+        if (m == "require" || m == "prefer") { level = TLS_NO_VERIFY; }
+        else if (m == "verify-ca") { level = TLS_VERIFY_CA; }
+
+        let ctx = tlsClientContext(level, this.sslCaFile);
+        let t = tlsUpgrade(this.io, ctx, this.sslHost);
+
+        // There is no falling back to plaintext from here, not even for prefer:
+        // the server has already switched to expecting TLS records, so the
+        // socket cannot carry a startup message any more.
+        if (t == null || !t.ok()) {
+            let why = "the TLS handshake failed";
+            if (t != null && t.error() != "") { why = t.error(); }
+            this.fail(DBERR_OPEN, why);
+            return false;
+        }
+
+        this.io = t;
+        this.tlsVersion = t.protocolVersion();
+        return true;
+    }
+
     // ---- connecting -------------------------------------------------------
 
     // Startup packet, authentication, and the parameters the server volunteers,
@@ -287,6 +368,10 @@ export class PgSession {
             this.fail(DBERR_OPEN, "could not reach the server");
             return false;
         }
+
+        // TLS first: everything below, startup message included, has to travel
+        // over whatever transport this leaves behind.
+        if (!this.negotiateSsl()) { return false; }
 
         let kv: string[] = [];
         kv.push("user"); kv.push(user);
@@ -372,7 +457,10 @@ export class PgSession {
 
         if (a.kind == AUTH_SASL) {
             // Take plain SCRAM-SHA-256. SCRAM-SHA-256-PLUS binds the exchange
-            // to the TLS channel, and there is no TLS here to bind to.
+            // to the TLS channel; the material for that is now available —
+            // TlsConn.channelBinding("tls-server-end-point") — but the SCRAM
+            // client does not implement the PLUS variant yet, so this asks for
+            // the mechanism it can actually finish rather than one it cannot.
             let found = false;
             let i = 0;
             while (i < a.mechanisms.len) {

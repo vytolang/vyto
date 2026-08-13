@@ -48,8 +48,16 @@
 // ── WHAT IT SHARES WITH THE POSTGRES DRIVER ─────────────────────────────────
 // Every query parks the worker and no connection pool is possible (no threads,
 // pre-fork reactor); one streaming cursor per connection, with a second
-// statement draining the first; no TLS. See vyto/db/pgsql's header — the
-// reasoning is identical.
+// statement draining the first; and TLS at the cost of a linked libssl. See
+// vyto/db/pgsql's header — the reasoning is identical.
+//
+// TLS is worth more here than it is there, because two of MySQL's own
+// authentication plugins are only answerable over an encrypted transport:
+// caching_sha2_password's full exchange (the one MySQL 8 demands on a cache
+// miss, which is every first login and every restart) and
+// mysql_clear_password. Both work with ssl-mode=REQUIRED or better and fail
+// with a diagnosis without it. The default is DISABLED, which is NOT mysql(1)'s
+// default — see the driver's init for why the app decides this, not the driver.
 //
 // ── AND WHERE IT DIFFERS ────────────────────────────────────────────────────
 //
@@ -79,6 +87,18 @@ import { MyColumn, MyParam, MyReader, decodeBinaryRow, decodeError, decodeOk,
 import { decodeBinary, encodeParam } from "vyto/db/mysql/mytype";
 
 const DEFAULT_PORT: int = 3306;
+
+// The ssl-mode a DSN that says nothing gets. NOT mysql(1)'s PREFERRED,
+// deliberately: PREFERRED negotiates TLS against every local development server
+// that happens to have it on. Whether a given server speaks TLS is something the
+// app knows and this driver does not, so the app asks for it per connection with
+// ?ssl-mode= or .sslMode(...).
+//
+// Both MysqlDriver and MyOverDriver read this ONE name, because they assign
+// their fields directly rather than through super — without it the two defaults
+// would drift and the replay tests in examples/106_mywire.vt would go on
+// proving something the real driver no longer does.
+const DEFAULT_SSLMODE: string = "DISABLED";
 
 // ---------------------------------------------------------------------------
 // Statement
@@ -492,19 +512,37 @@ export class MyConn extends Conn {
 // Driver
 // ---------------------------------------------------------------------------
 
+// Canonical ssl-mode spelling, or "" when the value means nothing.
+//
+// Accepts the libpq words as well as MySQL's own, because a DSN gets copied
+// from whatever was last working and "disable" against a MySQL driver should
+// not be a silent plaintext connection under a name the driver did not
+// recognise. Anything unrecognised is refused, not guessed.
+fn normalizeSslMode(m: string): string {
+    if (m == "" || m == "DISABLED" || m == "disable" || m == "disabled") { return "DISABLED"; }
+    if (m == "PREFERRED" || m == "prefer" || m == "preferred") { return "PREFERRED"; }
+    if (m == "REQUIRED" || m == "require" || m == "required") { return "REQUIRED"; }
+    if (m == "VERIFY_CA" || m == "verify-ca" || m == "verify_ca") { return "VERIFY_CA"; }
+    if (m == "VERIFY_IDENTITY" || m == "verify-full" || m == "verify_identity"
+        || m == "verify-identity") { return "VERIFY_IDENTITY"; }
+    return "";
+}
+
 export class MysqlDriver extends Driver {
     dsn: string;
     timeoutMs: int;
     cacheCap: int;
     drainCap: int;
     ssl: string;
+    sslCa: string;
 
     fn init(dsn: string) {
         this.dsn = dsn;
         this.timeoutMs = 30000;
         this.cacheCap = 64;
         this.drainCap = 100000;
-        this.ssl = "disable";
+        this.ssl = DEFAULT_SSLMODE;
+        this.sslCa = "";
     }
 
     override fn name(): string { return "mysql"; }
@@ -512,7 +550,23 @@ export class MysqlDriver extends Driver {
     builder fn timeout(ms: int) { this.timeoutMs = ms; return this; }
     builder fn stmtCache(n: int) { this.cacheCap = n; return this; }
     builder fn drainLimit(n: int) { this.drainCap = n; return this; }
+
+    // The MySQL spellings, with the MySQL meanings. Lowercase and the libpq-ish
+    // aliases are accepted too, because a DSN gets copied from wherever it was
+    // last working:
+    //
+    //   DISABLED          plaintext, and never ask
+    //   PREFERRED         TLS if the server offers it, plaintext if not. NOT verified
+    //   REQUIRED          TLS or fail. NOT verified — stops an eavesdropper,
+    //                     not an impostor
+    //   VERIFY_CA         TLS or fail, and the chain must verify
+    //   VERIFY_IDENTITY   TLS or fail, chain verified, and the certificate must
+    //                     name the host that was dialled. Use this one.
     builder fn sslMode(m: string) { this.ssl = m; return this; }
+
+    // A PEM bundle of roots to trust IN ADDITION to the system store. Also
+    // settable per DSN as ?ssl-ca=, matching mysql(1).
+    builder fn sslCaFile(path: string) { this.sslCa = path; return this; }
 
     override fn connect(): Conn {
         let d = parseDsn(this.dsn, "127.0.0.1", DEFAULT_PORT);
@@ -520,12 +574,12 @@ export class MysqlDriver extends Driver {
             return deadConn("vyto/db/mysql: " + d.error(), DBERR_OPEN);
         }
 
-        let mode = d.opt("ssl-mode", d.opt("sslmode", this.ssl));
-        if (mode != "disable" && mode != "DISABLED" && mode != "prefer") {
+        let mode = normalizeSslMode(d.opt("ssl-mode", d.opt("sslmode", this.ssl)));
+        if (mode == "") {
             return deadConn(
-                "vyto/db/mysql: ssl-mode=" + mode + " was requested but this driver has no TLS. "
-                + "lib/vyto/crypto/openssl is a stub in which every entry point panics; until it "
-                + "is implemented, use ssl-mode=disable and a trusted network.",
+                "vyto/db/mysql: ssl-mode=" + d.opt("ssl-mode", d.opt("sslmode", this.ssl))
+                + " is not a mode this driver knows. Use DISABLED, PREFERRED, REQUIRED, "
+                + "VERIFY_CA or VERIFY_IDENTITY.",
                 DBERR_UNSUPPORTED);
         }
 
@@ -537,6 +591,10 @@ export class MysqlDriver extends Driver {
 
         let sess = new MySession(io);
         sess.drainCap = this.drainCap;
+        sess.sslMode = mode;
+        sess.sslCaFile = d.opt("ssl-ca", this.sslCa);
+        // The name the certificate has to carry is the one the DSN dialled.
+        sess.sslHost = d.host;
 
         let user = d.user;
         if (user == "") { user = d.opt("user", ""); }
@@ -641,7 +699,10 @@ export class MyOverDriver extends MysqlDriver {
         this.timeoutMs = 30000;
         this.cacheCap = 64;
         this.drainCap = 100000;
-        this.ssl = "disable";
+        // The SAME constant MysqlDriver uses — see pgsqlOver's init. A replay
+        // with no ssl-mode in its DSN is a test OF the default.
+        this.ssl = DEFAULT_SSLMODE;
+        this.sslCa = "";
         this.io = io;
     }
 
@@ -653,6 +714,11 @@ export class MyOverDriver extends MysqlDriver {
 
         let sess = new MySession(this.io);
         sess.drainCap = this.drainCap;
+        // Honoured so the CLIENT half of the SSL negotiation is testable: a
+        // recorded server can advertise CLIENT_SSL and the 32-byte SSLRequest
+        // packet the driver emits can be asserted byte for byte.
+        sess.sslMode = normalizeSslMode(d.opt("ssl-mode", d.opt("sslmode", this.ssl)));
+        sess.sslHost = d.host;
         if (!sess.connect(user, d.pass, d.database)) {
             let msg = sess.errMsg;
             if (msg == "") { msg = "vyto/db/mysql: the connection failed"; }

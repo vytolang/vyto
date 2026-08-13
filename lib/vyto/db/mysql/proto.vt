@@ -386,6 +386,27 @@ export fn decodeHandshake(body: byte[]): MyHandshake {
     return h;
 }
 
+// SSLRequest — the first 32 bytes of HandshakeResponse41 and nothing else.
+//
+// MySQL has no separate TLS negotiation message. The client sends the fixed
+// header of the handshake response with CLIENT_SSL set and STOPS THERE, both
+// sides switch to TLS, and then the FULL handshake response — including the
+// username and the credential — is sent again inside the encrypted stream. That
+// is the entire point: the truncation is what keeps the credential out of the
+// clear.
+//
+// The packet sequence number keeps counting across the upgrade; it does not
+// restart. A driver that resets it here desynchronizes on the very next read.
+export fn encodeSslRequestPacket(caps: int, maxPacket: int, charset: int): byte[] {
+    let w = byteWriter(32);
+    w.u32le(caps);
+    w.u32le(maxPacket);
+    w.u8(charset);
+    let i = 0;
+    while (i < 23) { w.u8(0); i += 1; }           // reserved
+    return w.take();
+}
+
 // HandshakeResponse41.
 export fn encodeHandshakeResponse(caps: int, maxPacket: int, charset: int,
                                   user: string, authResponse: byte[],

@@ -46,8 +46,9 @@ while (c.next()) { total += c.row().getInt("n"); }
 | `vyto/db/sqlite` ⚙ | the SQLite driver. **Vendored**, nothing to install |
 | `vyto/db/wire` | byte-level floor shared by the network drivers: frame building, endian conversion, tolerant parsing, DSN parsing |
 | `vyto/db/wire/io` | the framed transport — `WireIo`, `SockIo`, and `MemIo` for testing without a server |
-| `vyto/db/pgsql` | the PostgreSQL driver. **Pure Vyto**, speaks the v3 wire protocol; no libpq, nothing to install |
-| `vyto/db/mysql` | the MySQL / MariaDB driver. **Pure Vyto**, speaks the client-server protocol; no libmysqlclient, nothing to install, no GPL question |
+| `vyto/db/wire/tls` ⚙ | `TlsIo`, the same transport with TLS under it. Its own module so that importing `vyto/db` links no libssl |
+| `vyto/db/pgsql` ⚙ | the PostgreSQL driver. **Pure Vyto**, speaks the v3 wire protocol; no libpq. Needs `libssl-dev`, for TLS |
+| `vyto/db/mysql` ⚙ | the MySQL / MariaDB driver. **Pure Vyto**, speaks the client-server protocol; no libmysqlclient and no GPL question. Needs `libssl-dev`, for TLS |
 
 `import { … } from "vyto/db"` re-exports all of it except a driver. Importing an
 individual module pulls in less.
@@ -424,12 +425,35 @@ the exchange to the TLS channel.
 
 ### Six things to know before you rely on it
 
-**There is no TLS.** `lib/vyto/crypto/openssl` is a stub in which every entry
-point panics, so this connects in the clear. `sslmode=require` is *refused*
-rather than quietly downgraded — connecting unencrypted when encryption was
-asked for is the one failure a caller must never get without being told. That
-rules out most managed providers (RDS, Neon, Supabase) for now. The place TLS
-plugs in is `WireIo.requestSsl()`, which is written and returns false.
+**TLS works, and it links libssl.** The driver imports `vyto/db/wire/tls`,
+which imports `vyto/crypto/openssl`, so every program using it links `libssl`
+and `libcrypto` and needs `libssl-dev` to build — the same bargain `vyto/net`
+makes for libcurl. `sslmode` takes the libpq words and means the libpq things:
+
+| `sslmode` | Transport | Verified |
+|---|---|---|
+| `disable` *(default)* | plaintext | — |
+| `allow` | plaintext | — |
+| `prefer` | TLS if offered, else plaintext | no |
+| `require` | TLS or fail | no |
+| `verify-ca` | TLS or fail | chain |
+| `verify-full` | TLS or fail | chain **and** hostname |
+
+**The default is `disable`, and libpq's is `prefer`.** That difference is
+deliberate. `prefer` puts an SSLRequest round trip in front of every connection
+to a server that has TLS off, which is every local development database and the
+whole of this suite; and whether a given server speaks TLS is something the
+application knows and the driver does not. So the driver does not guess — ask
+for TLS where you know the server has it, per connection, with `?sslmode=` or
+`.sslMode(...)`. MySQL's `ssl-mode` defaults to `DISABLED` for the same reason.
+
+`require` deliberately does not verify — that is what the word means in libpq,
+and copying a DSN from `psql` should not change its meaning. **Use
+`verify-full`.** `?sslrootcert=` (or `.sslRootCertFile(path)`) adds a CA bundle
+to the system trust store, which is what a managed provider's downloadable
+`.pem` is for. A mode this driver does not know is refused rather than guessed
+at, because guessing means an unencrypted connection under a DSN that asked for
+encryption.
 
 **`lastInsertId()` is always 0.** Not a gap in this driver: PostgreSQL 12
 removed OIDs from ordinary tables, and the `INSERT` tag's oid field is the only
@@ -527,7 +551,7 @@ The dialect and schema sections render Postgres and MySQL SQL while linking only
 SQLite — which is why all four dialects live in `vyto/db/dialect` rather than in
 the driver packages.
 
-`examples/105_pgwire.vt` — 326 assertions, in the golden suite, and **it needs no
+`examples/105_pgwire.vt` — 335 assertions, in the golden suite, and **it needs no
 PostgreSQL**. Because the driver is pure Vyto, its codec is a set of pure
 functions over `byte[]`, so every message it builds is asserted against a
 hand-computed byte string from the protocol specification, and every message it

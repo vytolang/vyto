@@ -1,13 +1,13 @@
 // vyto/crypto/openssl — OpenSSL bindings: TLS, X.509, and the primitives the
 // pure-Vyto modules do not cover.
 //
-// STATUS: STUB. Every entry point below panics. The shapes are here so callers
-// and the shim can be designed against something concrete, and so the decisions
-// that are expensive to reverse — package layout, provisioning, error handling,
-// object ownership — are settled before the first line of C is written. Nothing
-// in this file links anything yet; there is deliberately no extern "C" block
-// and no #link, so importing it costs nothing and fails loudly rather than
-// silently returning wrong bytes.
+// STATUS: the TLS path is implemented. TlsContext, TlsConn, X.509 parsing,
+// chain verification and hostname matching all work against native/src/
+// ossl_shim.c. What is NOT implemented yet still panics rather than returning
+// wrong bytes: ossl_digest, ossl_hmac, ossl_seal, ossl_open, and everything
+// under "keys" (Pkey, ossl_genkey, ossl_pkey_from_pem, ossl_pkey_to_pem,
+// ossl_sign, ossl_verify). Those are a later pass; vyto/crypto already covers
+// the primitives they duplicate, which is why TLS went first.
 //
 // The reason this exists is TLS. vyto/net gets HTTPS today by linking libcurl,
 // which is a whole HTTP client dragged in for its TLS; a raw `Socket` cannot be
@@ -117,6 +117,88 @@
 //   stapling, CMS/PKCS#7, and anything that needs a callback from C into Vyto
 //   until the fn-pointer story is settled (examples/cbwrap shows the mechanism).
 
+// ---- linking ----------------------------------------------------------------
+//
+// Linux links the distro's libssl-dev. macOS and Windows have no system
+// OpenSSL headers, and there is no #cflags pragma to point at a Homebrew or
+// vcpkg prefix — the only include paths a shim gets are native/src and
+// native/<triple>/include (src/main.c) — so both are provisioned instead:
+// native/provision-openssl.sh drops headers into native/<triple>/include and
+// the library into native/<triple>/, where the prebuilt scan finds it.
+//
+// ssl is declared before crypto because the link line is emitted in
+// declaration order (src/main.c) and a static link needs that order.
+#link "ssl" if "linux"
+#link "crypto" if "linux"
+
+extern "C" {
+    fn vossl_version(out: cstring, cap: i32): i32;
+    fn vossl_available(): i32;
+
+    fn vossl_ctx_client(verify: i32): rawptr;
+    fn vossl_ctx_server(chain: cstring, key: cstring, err: cstring, cap: i32): rawptr;
+    fn vossl_ctx_min_version(ctx: rawptr, v: cstring): i32;
+    fn vossl_ctx_alpn(ctx: rawptr, csv: cstring): i32;
+    fn vossl_ctx_ca_file(ctx: rawptr, path: cstring): i32;
+    fn vossl_ctx_free(ctx: rawptr);
+
+    fn vossl_conn_new(ctx: rawptr, fd: i32, host: cstring): rawptr;
+    fn vossl_handshake(c: rawptr, err: cstring, cap: i32): i32;
+    fn vossl_read(c: rawptr, dst: rawptr, n: i32): i32;
+    fn vossl_write(c: rawptr, src: rawptr, off: i32, n: i32): i32;
+    fn vossl_proto_version(c: rawptr, out: cstring, cap: i32): i32;
+    fn vossl_alpn_selected(c: rawptr, out: cstring, cap: i32): i32;
+    fn vossl_peer_cert(c: rawptr): rawptr;
+    fn vossl_last_error(c: rawptr, out: cstring, cap: i32): i32;
+    fn vossl_conn_shutdown(c: rawptr): i32;
+    fn vossl_conn_free(c: rawptr);
+
+    fn vossl_cert_from_pem(pem: cstring): rawptr;
+    fn vossl_cert_from_der(der: rawptr, n: i32): rawptr;
+    fn vossl_cert_subject(x: rawptr, out: cstring, cap: i32): i32;
+    fn vossl_cert_issuer(x: rawptr, out: cstring, cap: i32): i32;
+    fn vossl_cert_serial(x: rawptr, out: cstring, cap: i32): i32;
+    fn vossl_cert_not_before(x: rawptr): i64;
+    fn vossl_cert_not_after(x: rawptr): i64;
+    fn vossl_cert_san_count(x: rawptr): i32;
+    fn vossl_cert_san_at(x: rawptr, i: i32, out: cstring, cap: i32): i32;
+    fn vossl_cert_matches_host(x: rawptr, host: cstring): i32;
+    fn vossl_cert_fingerprint(x: rawptr, out32: rawptr): i32;
+    fn vossl_cert_free(x: rawptr);
+
+    fn vossl_store_new(): rawptr;
+    fn vossl_store_add(store: rawptr, x: rawptr): i32;
+    fn vossl_store_free(store: rawptr);
+    fn vossl_chain_new(): rawptr;
+    fn vossl_chain_add(chain: rawptr, x: rawptr): i32;
+    fn vossl_chain_free(chain: rawptr);
+    fn vossl_verify_chain(store: rawptr, untrusted: rawptr, leaf: rawptr,
+                         err: cstring, cap: i32): i32;
+}
+
+// ---- status codes -----------------------------------------------------------
+//
+// What readInto/writeFrom/handshakeStep return. Mirrors the VOSSL_* values in
+// native/src/ossl_shim.h.
+//
+// The want-read / want-write SPLIT is the part that matters. TLS is not a byte
+// pipe: an SSL read can need the socket to become WRITABLE (a TLS 1.3 key
+// update, a renegotiation) and an SSL write can need it READABLE. Code that
+// always waits for readability after a blocked read will hang, and only on a
+// long-lived connection under load, which is the worst way to find out.
+export const OSSL_WANT_READ:  int = -1;
+export const OSSL_WANT_WRITE: int = -2;
+export const OSSL_FAILED:     int = -3;
+
+// What tls_client() and its two siblings ask the shim for.
+const VERIFY_NONE:  int = 0;
+const VERIFY_CHAIN: int = 1;
+const VERIFY_FULL:  int = 2;
+
+const ERR_CAP:  int = 512;
+const NAME_CAP: int = 1024;
+const FP_SIZE:  int = 32;
+
 // ---- result shapes ----------------------------------------------------------
 
 // A byte string that may not exist, plus the reason when it does not. Mirrors
@@ -135,23 +217,33 @@ export class OsslResult {
     }
 }
 
-// ---- stubs ------------------------------------------------------------------
+// ---- not implemented yet ----------------------------------------------------
+//
+// The primitives and the key handling are a later pass. They panic rather than
+// returning an empty result, because a caller that mistakes a zero-length
+// ciphertext for success is exactly the failure this package is meant to avoid,
+// and because vyto/crypto already implements everything in this section that
+// has a pure-Vyto equivalent.
 
 fn todo(what: string) {
-    panic("vyto/crypto/openssl: " + what + " is not implemented yet — this module is a stub, see its header");
+    panic("vyto/crypto/openssl: " + what + " is not implemented yet — the TLS path is"
+        + " done, the primitives are not; see this module's header");
 }
+
+// ---- library ----------------------------------------------------------------
 
 // Runtime version of the linked library, e.g. "OpenSSL 3.0.13 30 Jan 2024".
-// First thing to implement: it proves the link works and the version floor is met.
+// Proves the link works and that the version floor is met.
 export fn ossl_version(): string {
-    todo("ossl_version");
-    return "";
+    let buf = bytes(256);
+    vossl_version(buf as cstring, 256 as i32);
+    return str(buf as cstring);
 }
 
-// True once the library is initialised and the default provider is loaded.
+// True once the library is initialised and its error strings are loaded. False
+// on a freestanding build, where the shim compiles to stubs.
 export fn ossl_available(): bool {
-    todo("ossl_available");
-    return false;
+    return (vossl_available() as int) == 1;
 }
 
 // ---- digests ----------------------------------------------------------------
@@ -237,6 +329,57 @@ export fn ossl_verify(key: Pkey, algo: string, data: byte[], sig: byte[]): bool 
 
 // ---- X.509 ------------------------------------------------------------------
 
+// Grow-and-retry around one shim getter. Each of these is written out rather
+// than sharing a helper because the FFI has no shape for passing the shim
+// function itself; vyto/intl's run_norm / run_case are the same three lines
+// twice for the same reason.
+fn certSubjectOf(h: rawptr): string {
+    let buf = bytes(NAME_CAP);
+    let n = vossl_cert_subject(h, buf as cstring, NAME_CAP as i32) as int;
+    if (n >= NAME_CAP) {
+        buf = bytes(n + 1);
+        vossl_cert_subject(h, buf as cstring, (n + 1) as i32);
+    }
+    return str(buf as cstring);
+}
+
+fn certIssuerOf(h: rawptr): string {
+    let buf = bytes(NAME_CAP);
+    let n = vossl_cert_issuer(h, buf as cstring, NAME_CAP as i32) as int;
+    if (n >= NAME_CAP) {
+        buf = bytes(n + 1);
+        vossl_cert_issuer(h, buf as cstring, (n + 1) as i32);
+    }
+    return str(buf as cstring);
+}
+
+fn certSerialOf(h: rawptr): string {
+    let buf = bytes(NAME_CAP);
+    let n = vossl_cert_serial(h, buf as cstring, NAME_CAP as i32) as int;
+    if (n >= NAME_CAP) {
+        buf = bytes(n + 1);
+        vossl_cert_serial(h, buf as cstring, (n + 1) as i32);
+    }
+    return str(buf as cstring);
+}
+
+fn certSansOf(h: rawptr): string[] {
+    let out: string[] = [];
+    let n = vossl_cert_san_count(h) as int;
+    let i = 0;
+    while (i < n) {
+        let buf = bytes(NAME_CAP);
+        let k = vossl_cert_san_at(h, i as i32, buf as cstring, NAME_CAP as i32) as int;
+        if (k >= NAME_CAP) {
+            buf = bytes(k + 1);
+            vossl_cert_san_at(h, i as i32, buf as cstring, (k + 1) as i32);
+        }
+        out.push(str(buf as cstring));
+        i += 1;
+    }
+    return out;
+}
+
 // A parsed certificate. Accessors return already-extracted Vyto values rather
 // than lazily reaching into the X509 — so a chain can be reported on after the
 // context that produced it is gone.
@@ -249,19 +392,60 @@ export class Cert {
     serial: string;
     sans: string[];     // subjectAltName entries, the ones hostname checks use
 
-    fn init() {
-        todo("Cert");
+    // Takes the raw X509 the shim produced and owns it from here. Nothing
+    // outside this module should construct one; the four entry points below and
+    // TlsConn.peerCert() are the ways to get a Cert.
+    fn init(h: rawptr) {
+        this.handle = h;
+        this.subject = "";
+        this.issuer = "";
+        this.serial = "";
+        this.sans = [];
+        this.notBefore = 0;
+        this.notAfter = 0;
+        if (h == null) { return; }
+        // Read everything now. The fields outlive the X509 this way, which is
+        // what lets an error message name the certificate that failed after the
+        // connection that carried it has been closed.
+        this.subject = certSubjectOf(h);
+        this.issuer = certIssuerOf(h);
+        this.serial = certSerialOf(h);
+        this.sans = certSansOf(h);
+        this.notBefore = vossl_cert_not_before(h) as int;
+        this.notAfter = vossl_cert_not_after(h) as int;
+    }
+
+    fn ok(): bool { return this.handle != null; }
+
+    // SHA-256 over the DER form. What certificate pinning compares, and what
+    // channel binding is built from.
+    fn fingerprint(): byte[] {
+        if (this.handle == null) { return bytes(0); }
+        let out = bytes(FP_SIZE);
+        if ((vossl_cert_fingerprint(this.handle, out as rawptr) as int) != 1) { return bytes(0); }
+        return out;
+    }
+
+    deinit {
+        if (this.handle != null) {
+            vossl_cert_free(this.handle);
+            this.handle = null;
+        }
     }
 }
 
+// Parse one PEM certificate. Null when the text is not a certificate.
 export fn cert_from_pem(pem: string): Cert {
-    todo("cert_from_pem");
-    return new Cert();
+    let h = vossl_cert_from_pem(pem.cstr());
+    if (h == null) { return null; }
+    return new Cert(h);
 }
 
 export fn cert_from_der(der: byte[]): Cert {
-    todo("cert_from_der");
-    return new Cert();
+    if (der.len == 0) { return null; }
+    let h = vossl_cert_from_der(der as rawptr, der.len as i32);
+    if (h == null) { return null; }
+    return new Cert(h);
 }
 
 // Verify `leaf` against `roots`, with `intermediates` available to build the
@@ -270,15 +454,45 @@ export fn cert_from_der(der: byte[]): Cert {
 // two are independently wrong in practice and a combined call hides which one
 // a caller forgot.
 export fn cert_verify_chain(leaf: Cert, intermediates: Cert[], roots: Cert[]): OsslResult {
-    todo("cert_verify_chain");
-    return new OsslResult(false, bytes(0), "");
+    if (leaf == null || leaf.handle == null) {
+        return new OsslResult(false, bytes(0), "there is no certificate to verify");
+    }
+    let store = vossl_store_new();
+    if (store == null) {
+        return new OsslResult(false, bytes(0), "OpenSSL is not available");
+    }
+    let i = 0;
+    while (i < roots.len) {
+        if (roots[i] != null && roots[i].handle != null) {
+            vossl_store_add(store, roots[i].handle);
+        }
+        i += 1;
+    }
+
+    let chain = vossl_chain_new();
+    i = 0;
+    while (i < intermediates.len) {
+        if (intermediates[i] != null && intermediates[i].handle != null) {
+            vossl_chain_add(chain, intermediates[i].handle);
+        }
+        i += 1;
+    }
+
+    let buf = bytes(ERR_CAP);
+    let ok = vossl_verify_chain(store, chain, leaf.handle,
+                                buf as cstring, ERR_CAP as i32) as int;
+    vossl_chain_free(chain);
+    vossl_store_free(store);
+
+    if (ok == 1) { return new OsslResult(true, bytes(0), ""); }
+    return new OsslResult(false, bytes(0), str(buf as cstring));
 }
 
 // RFC 6125 hostname matching against SAN, falling back to CN only when there is
 // no SAN. Wildcards match one label and never the public suffix.
 export fn cert_matches_host(cert: Cert, host: string): bool {
-    todo("cert_matches_host");
-    return false;
+    if (cert == null || cert.handle == null || host == "") { return false; }
+    return (vossl_cert_matches_host(cert.handle, host.cstr()) as int) == 1;
 }
 
 // ---- TLS --------------------------------------------------------------------
@@ -290,17 +504,82 @@ export class TlsContext {
     isServer: bool;
     minVersion: string;     // "TLS1.2", "TLS1.3"
     alpn: string[];
+    err: string;
 
-    fn init() {
-        todo("TlsContext");
+    fn init(h: rawptr, server: bool, err: string) {
+        this.handle = h;
+        this.isServer = server;
+        this.minVersion = "TLS1.2";
+        this.alpn = [];
+        this.err = err;
+    }
+
+    fn ok(): bool { return this.handle != null; }
+
+    // Refuse anything below `v`. TLS 1.2 is the floor a context starts at;
+    // raising it to "TLS1.3" is the only other value that means anything, since
+    // 1.0 and 1.1 are not offered at all.
+    fn setMinVersion(v: string): bool {
+        if (this.handle == null) { return false; }
+        if ((vossl_ctx_min_version(this.handle, v.cstr()) as int) != 1) { return false; }
+        this.minVersion = v;
+        return true;
+    }
+
+    // Offer these protocols, most preferred first. On a server this is also the
+    // preference order used to pick from what the client offered.
+    fn setAlpn(protos: string[]): bool {
+        if (this.handle == null || protos.len == 0) { return false; }
+        let csv = "";
+        let i = 0;
+        while (i < protos.len) {
+            if (i > 0) { csv = csv + ","; }
+            csv = csv + protos[i];
+            i += 1;
+        }
+        if ((vossl_ctx_alpn(this.handle, csv.cstr()) as int) != 1) { return false; }
+        this.alpn = protos;
+        return true;
+    }
+
+    // Trust the roots in this PEM file INSTEAD of relying only on the system
+    // store. What a managed database's downloadable CA bundle is for.
+    fn trustFile(path: string): bool {
+        if (this.handle == null) { return false; }
+        return (vossl_ctx_ca_file(this.handle, path.cstr()) as int) == 1;
+    }
+
+    deinit {
+        if (this.handle != null) {
+            vossl_ctx_free(this.handle);
+            this.handle = null;
+        }
     }
 }
 
 // A client context that verifies the chain against the system trust store and
 // checks the hostname. This is the one to use.
 export fn tls_client(): TlsContext {
-    todo("tls_client");
-    return new TlsContext();
+    let h = vossl_ctx_client(VERIFY_FULL as i32);
+    if (h == null) {
+        return new TlsContext(null, false, "no TLS client context: OpenSSL could not load a trust store");
+    }
+    return new TlsContext(h, false, "");
+}
+
+// A client context that verifies the chain but NOT the hostname.
+//
+// This exists for one reason: PostgreSQL's sslmode=verify-ca and MySQL's
+// ssl-mode=VERIFY_CA are exactly this, and expressing them by disabling all
+// verification would be a far larger hole than they ask for. It is still weaker
+// than tls_client(): an attacker holding any certificate your trust store
+// chains to can impersonate the server. Prefer tls_client().
+export fn tls_client_verify_chain_only(): TlsContext {
+    let h = vossl_ctx_client(VERIFY_CHAIN as i32);
+    if (h == null) {
+        return new TlsContext(null, false, "no TLS client context: OpenSSL could not load a trust store");
+    }
+    return new TlsContext(h, false, "");
 }
 
 // A client context that verifies NOTHING: no chain, no hostname, no expiry.
@@ -311,13 +590,28 @@ export fn tls_client(): TlsContext {
 // an attacker who can route packets, it is worth less than plaintext, because
 // plaintext does not persuade anyone they are safe.
 export fn tls_client_insecure_no_verification(): TlsContext {
-    todo("tls_client_insecure_no_verification");
-    return new TlsContext();
+    let h = vossl_ctx_client(VERIFY_NONE as i32);
+    if (h == null) {
+        return new TlsContext(null, false, "no TLS client context: OpenSSL is not available");
+    }
+    return new TlsContext(h, false, "");
 }
 
+// A server context. Both arguments are PEM TEXT, not paths: where the
+// certificate and key live is the app's decision — a file, a secret manager, an
+// embedded asset — and this layer holds no opinion about it.
+//
+// `certChainPem` is the leaf first, then any intermediates, concatenated.
 export fn tls_server(certChainPem: string, keyPem: string): TlsContext {
-    todo("tls_server");
-    return new TlsContext();
+    let buf = bytes(ERR_CAP);
+    let h = vossl_ctx_server(certChainPem.cstr(), keyPem.cstr(),
+                             buf as cstring, ERR_CAP as i32);
+    if (h == null) {
+        let e = str(buf as cstring);
+        if (e == "") { e = "the server context could not be built"; }
+        return new TlsContext(null, true, e);
+    }
+    return new TlsContext(h, true, "");
 }
 
 // A TLS connection over an existing socket. `fd` is a vyto/net Socket's
@@ -327,57 +621,217 @@ export class TlsConn {
     handle: rawptr;
     fd: int;
     host: string;
+    err: string;
 
-    fn init() {
-        todo("TlsConn");
+    // A strong reference, deliberately. The SSL this holds was created from the
+    // context's SSL_CTX and does not keep it alive by itself, so a context that
+    // went out of scope in the caller would be freed underneath a live
+    // connection. This is an owning forward reference, not a back-reference, so
+    // it is not the kind that has to be `weak`.
+    ctx: TlsContext;
+
+    fn init(h: rawptr, fd: int, host: string, ctx: TlsContext) {
+        this.handle = h;
+        this.fd = fd;
+        this.host = host;
+        this.ctx = ctx;
+        this.err = "";
     }
 
-    // Blocking handshake. Returns the negotiated protocol on success
-    // ("TLSv1.3"), or ok=false with the error queue's reason.
+    fn ok(): bool { return this.handle != null; }
+
+    // One handshake attempt. Returns 1 when the handshake is complete,
+    // OSSL_WANT_READ / OSSL_WANT_WRITE when it needs the socket to become
+    // readable or writable, or 0 on failure with lastError() explaining.
+    //
+    // This is the primitive, not handshake(): on a non-blocking socket — which
+    // is what every caller in this tree uses — the handshake is a loop of
+    // step-then-wait, and the direction to wait for is the return value. Waiting
+    // for readability after a want-write is a hang.
+    fn handshakeStep(): int {
+        if (this.handle == null) {
+            this.err = "the TLS connection is closed";
+            return 0;
+        }
+        let buf = bytes(ERR_CAP);
+        let r = vossl_handshake(this.handle, buf as cstring, ERR_CAP as i32) as int;
+        if (r == 0) { this.err = str(buf as cstring); }
+        return r;
+    }
+
+    // Blocking handshake, for a socket that is actually in blocking mode.
+    // ok=true when it completed, ok=false with the reason when it did not; the
+    // protocol that was negotiated is protocolVersion(), not part of the result,
+    // because a byte[] is the wrong shape for a name.
+    //
+    // Every caller in this tree uses handshakeStep() instead, because every
+    // socket in this tree is non-blocking. This is here for a caller whose
+    // socket is not.
     fn handshake(): OsslResult {
-        todo("TlsConn.handshake");
-        return new OsslResult(false, bytes(0), "");
+        let r = this.handshakeStep();
+        if (r == 1) { return new OsslResult(true, bytes(0), ""); }
+        if (r == OSSL_WANT_READ || r == OSSL_WANT_WRITE) {
+            return new OsslResult(false, bytes(0),
+                "the handshake would block; this socket is non-blocking, so drive "
+                + "handshakeStep() and wait for the direction it asks for");
+        }
+        return new OsslResult(false, bytes(0), this.err);
+    }
+
+    // Read into a caller's buffer. Returns the count, 0 for a clean close, or
+    // one of OSSL_WANT_READ / OSSL_WANT_WRITE / OSSL_FAILED.
+    //
+    // This is the bulk path and it allocates nothing: the buffer is the
+    // caller's and reaches C as a pointer. read() below is the convenient one.
+    fn readInto(dst: byte[], n: int): int {
+        if (this.handle == null) { return OSSL_FAILED; }
+        if (n <= 0 || dst.len < n) { return OSSL_FAILED; }
+        return vossl_read(this.handle, dst as rawptr, n as i32) as int;
+    }
+
+    // Write src[off..off+n). Returns the count written, which MAY BE SHORT, or
+    // one of OSSL_WANT_READ / OSSL_WANT_WRITE / OSSL_FAILED.
+    fn writeFrom(src: byte[], off: int, n: int): int {
+        if (this.handle == null) { return OSSL_FAILED; }
+        if (n <= 0 || off < 0 || off + n > src.len) { return OSSL_FAILED; }
+        return vossl_write(this.handle, src as rawptr, off as i32, n as i32) as int;
     }
 
     fn read(max: int): OsslResult {
-        todo("TlsConn.read");
-        return new OsslResult(false, bytes(0), "");
+        if (max <= 0) {
+            return new OsslResult(false, bytes(0), "the read size must be positive");
+        }
+        let buf = bytes(max);
+        let n = this.readInto(buf, max);
+        if (n > 0) {
+            let out = bytes(n);
+            let i = 0;
+            while (i < n) { out[i] = buf[i]; i += 1; }
+            return new OsslResult(true, out, "");
+        }
+        if (n == 0) {
+            return new OsslResult(false, bytes(0), "the peer closed the TLS connection");
+        }
+        if (n == OSSL_WANT_READ || n == OSSL_WANT_WRITE) {
+            return new OsslResult(false, bytes(0), "the read would block");
+        }
+        return new OsslResult(false, bytes(0), this.lastError());
     }
 
     fn write(data: byte[]): OsslResult {
-        todo("TlsConn.write");
-        return new OsslResult(false, bytes(0), "");
+        if (data.len == 0) { return new OsslResult(true, bytes(0), ""); }
+        let off = 0;
+        while (off < data.len) {
+            let n = this.writeFrom(data, off, data.len - off);
+            if (n > 0) { off += n; continue; }
+            if (n == OSSL_WANT_READ || n == OSSL_WANT_WRITE) {
+                return new OsslResult(false, bytes(0), "the write would block");
+            }
+            return new OsslResult(false, bytes(0), this.lastError());
+        }
+        return new OsslResult(true, bytes(0), "");
     }
 
-    // The peer's certificate, for callers that want to pin or inspect it.
+    // The peer's certificate, for callers that want to pin or inspect it. Null
+    // when the peer sent none.
     fn peerCert(): Cert {
-        todo("TlsConn.peerCert");
-        return new Cert();
+        if (this.handle == null) { return null; }
+        let x = vossl_peer_cert(this.handle);
+        if (x == null) { return null; }
+        return new Cert(x);
+    }
+
+    // The protocol that was negotiated, e.g. "TLSv1.3". Empty before the
+    // handshake completes.
+    fn protocolVersion(): string {
+        if (this.handle == null) { return ""; }
+        let buf = bytes(64);
+        vossl_proto_version(this.handle, buf as cstring, 64 as i32);
+        return str(buf as cstring);
     }
 
     // The ALPN protocol the peer agreed to, empty when none was negotiated.
     fn alpnSelected(): string {
-        todo("TlsConn.alpnSelected");
-        return "";
+        if (this.handle == null) { return ""; }
+        let buf = bytes(256);
+        let n = vossl_alpn_selected(this.handle, buf as cstring, 256 as i32) as int;
+        if (n >= 256) {
+            buf = bytes(n + 1);
+            vossl_alpn_selected(this.handle, buf as cstring, (n + 1) as i32);
+        }
+        return str(buf as cstring);
+    }
+
+    // Why the last read, write or handshake failed.
+    fn lastError(): string {
+        if (this.handle == null) { return "the TLS connection is closed"; }
+        let buf = bytes(ERR_CAP);
+        vossl_last_error(this.handle, buf as cstring, ERR_CAP as i32);
+        let e = str(buf as cstring);
+        if (e == "") { return this.err; }
+        return e;
+    }
+
+    // RFC 5929 channel binding material, for an authentication exchange that
+    // binds itself to this connection — PostgreSQL's SCRAM-SHA-256-PLUS is the
+    // caller this exists for.
+    //
+    // Only "tls-server-end-point" is supported, and it is computed as SHA-256
+    // over the server certificate. RFC 5929 says to use the certificate's own
+    // signature hash when that is stronger than SHA-1; every certificate in
+    // circulation is signed with SHA-256 or better, so this is that rule with
+    // the dead branch removed rather than a simplification of it.
+    fn channelBinding(kind: string): OsslResult {
+        if (this.handle == null) {
+            return new OsslResult(false, bytes(0), "the TLS connection is closed");
+        }
+        if (kind != "tls-server-end-point") {
+            return new OsslResult(false, bytes(0), "unsupported channel binding: " + kind);
+        }
+        let c = this.peerCert();
+        if (c == null) {
+            return new OsslResult(false, bytes(0), "the peer sent no certificate");
+        }
+        let fp = c.fingerprint();
+        if (fp.len != FP_SIZE) {
+            return new OsslResult(false, bytes(0), "the certificate could not be hashed");
+        }
+        return new OsslResult(true, fp, "");
     }
 
     // Sends close_notify before dropping the socket. Skipping it is what makes
     // the other end report a truncation error instead of a clean close.
+    //
+    // The socket itself is NOT closed: this layer never opened it, and the owner
+    // of the fd is the one that closes it.
     fn close() {
-        todo("TlsConn.close");
+        if (this.handle != null) {
+            vossl_conn_shutdown(this.handle);
+            vossl_conn_free(this.handle);
+            this.handle = null;
+        }
     }
+
+    deinit { this.close(); }
 }
 
 // Wrap a connected socket and drive the client handshake. `host` is used for
 // both SNI and hostname verification — passing the IP when the certificate
 // names the DNS name is the usual cause of a verification failure that looks
 // like a chain problem.
+//
+// This does NOT perform the handshake; call handshakeStep() until it answers 1.
+// Returns null when the connection could not be created at all.
 export fn tls_connect(ctx: TlsContext, fd: int, host: string): TlsConn {
-    todo("tls_connect");
-    return new TlsConn();
+    if (ctx == null || ctx.handle == null || fd < 0) { return null; }
+    let h = vossl_conn_new(ctx.handle, fd as i32, host.cstr());
+    if (h == null) { return null; }
+    return new TlsConn(h, fd, host, ctx);
 }
 
 export fn tls_accept(ctx: TlsContext, fd: int): TlsConn {
-    todo("tls_accept");
-    return new TlsConn();
+    if (ctx == null || ctx.handle == null || fd < 0) { return null; }
+    let h = vossl_conn_new(ctx.handle, fd as i32, "".cstr());
+    if (h == null) { return null; }
+    return new TlsConn(h, fd, "", ctx);
 }

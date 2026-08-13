@@ -1,0 +1,96 @@
+// The sslmode ladder against a real PostgreSQL with TLS turned on.
+//
+// NOT part of `make test` — run by tests/run_tests_pgsql.sh with VYTO_PG_DSN
+// pointing at a TLS-enabled server. examples/107_tls.vt already proves the
+// handshake, the certificate parsing and the hostname rules against fixtures;
+// what only a real server can prove is that PostgreSQL accepts the SSLRequest
+// this driver emits, answers 'S', and then speaks the v3 protocol inside the
+// TLS records — which is a different thing from speaking it on a socket.
+//
+// The DSN's own sslmode is IGNORED here: every mode is exercised by rewriting
+// the query string, so one DSN drives the whole table.
+
+import { Db, select } from "vyto/db";
+import { pgsql } from "vyto/db/pgsql";
+import { getenv } from "vyto/os";
+
+fn checkBool(name: string, got: bool, want: bool) {
+    if (got == want) {
+        print("ok    " + name);
+    } else {
+        print("FAIL  " + name + " (got " + str(got) + ", want " + str(want) + ")");
+    }
+}
+
+// The DSN with its sslmode replaced. Everything before the '?' is kept; any
+// existing query string is dropped, because a leftover sslmode would decide the
+// answer instead of the one under test.
+fn withMode(dsn: string, extra: string): string {
+    let base = dsn;
+    let q = dsn.index_of("?");
+    if (q >= 0) { base = dsn.slice(0, q); }
+    return base + "?" + extra;
+}
+
+// Connect and run one trivial query, so a "connection" that cannot actually
+// carry a message counts as a failure.
+fn works(dsn: string): bool {
+    let db = new Db(pgsql(dsn));
+    if (!db.ok()) { return false; }
+    let r = db.raw("select 1 as one", []);
+    return r.ok() && r.rows.len == 1;
+}
+
+fn why(dsn: string): string {
+    let db = new Db(pgsql(dsn));
+    if (db.ok()) { return "(connected)"; }
+    return db.error();
+}
+
+fn main() {
+    let dsn = getenv("VYTO_PG_DSN");
+    if (dsn == "") { print("FAIL  VYTO_PG_DSN is not set"); return; }
+
+    // Plaintext still works. A driver that gained TLS and lost the ability to
+    // connect without it has broken every existing caller.
+    checkBool("sslmode=disable", works(withMode(dsn, "sslmode=disable")), true);
+
+    // The default. Against a TLS-enabled server this IS encrypted.
+    checkBool("sslmode=prefer", works(withMode(dsn, "sslmode=prefer")), true);
+
+    // Encryption without identity checking.
+    checkBool("sslmode=require", works(withMode(dsn, "sslmode=require")), true);
+
+    // verify-ca and verify-full need the server's CA in the trust store. A
+    // stock postgres container signs itself, so these are expected to FAIL
+    // without VYTO_PG_SSLROOTCERT and to pass with it — both directions are
+    // asserted, because a verify-full that passes against a self-signed
+    // certificate is the single worst outcome this whole feature can have.
+    let ca = getenv("VYTO_PG_SSLROOTCERT");
+    if (ca == "") {
+        checkBool("verify-full rejects an untrusted certificate",
+                  works(withMode(dsn, "sslmode=verify-full")), false);
+        print("      " + why(withMode(dsn, "sslmode=verify-full")));
+        print("note  set VYTO_PG_SSLROOTCERT to the server's CA to test the passing side");
+    } else {
+        checkBool("sslmode=verify-ca with the CA",
+                  works(withMode(dsn, "sslmode=verify-ca&sslrootcert=" + ca)), true);
+        checkBool("sslmode=verify-full with the CA",
+                  works(withMode(dsn, "sslmode=verify-full&sslrootcert=" + ca)), true);
+
+        // The certificate names the host it was issued for, so dialling the
+        // same server by a name it does not claim must fail the hostname check
+        // even though the chain is fine. This is the difference between
+        // verify-ca and verify-full, and the only test that proves it.
+        let other = getenv("VYTO_PG_WRONGHOST");
+        if (other != "") {
+            checkBool("verify-full rejects the wrong hostname",
+                      works(other + "?sslmode=verify-full&sslrootcert=" + ca), false);
+            checkBool("verify-ca accepts the same connection",
+                      works(other + "?sslmode=verify-ca&sslrootcert=" + ca), true);
+        }
+    }
+
+    // A typo must not become a plaintext connection.
+    checkBool("an unknown mode is refused", works(withMode(dsn, "sslmode=yes")), false);
+}
