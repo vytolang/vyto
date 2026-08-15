@@ -85,6 +85,54 @@ strong. `lib/vyto/ui/core.vt` is the toolkit-wide example to copy from:
 [`docs/classes.md`](classes.md) §7 for the full construction/`deinit`
 interaction.
 
+### Reading a `weak` field gives you an optional
+
+Because a `weak` slot reads as `null` once its target is gone, **loading one
+yields a value the checker refuses to let you dereference until you have tested
+it**:
+
+```vyto
+fn render(s: Painter, th: Theme) {
+    this.win.skin.button.paint(...);     // error: 'this.win' is a weak
+                                         // reference and may be null here
+}
+```
+
+That is not a style rule. Before it existed, the toolkit carried 52 unchecked
+weak dereferences, and one of them — `Button.render` reading `this.win.skin` —
+was a real segfault the moment a widget was painted before the window had
+adopted it. A `weak` field that is *designed* to become null should not fault
+when it does.
+
+Every ordinary way of checking narrows the path for the rest of that branch:
+
+```vyto
+if (this.win != null) { this.win.redraw(); }        // inside the branch
+if (this.win == null) { return; }                    // …and after an exiting guard
+this.win != null && this.win.mods != 0               // right of a short-circuit
+while (this.win != null) { ... }                     // in the loop body
+let w = this.win; if (w == null) { return; }         // bound, then checked
+```
+
+Writing to the path drops what was known about it, so this is refused:
+
+```vyto
+if (this.win == null) { return; }
+this.win = null;
+return this.win.n;                       // error — the check no longer holds
+```
+
+**One deliberate hole:** a narrowing on `this.win` survives a call, and a call
+could in principle null that field. Invalidating on every call would reject
+`if (this.win != null) { this.win.layout(); this.win.redraw(); }`, which is the
+shape the rule exists to make safe. TypeScript makes the same trade. Bind a
+local when a callee might really clear the field — a local cannot be reached
+that way.
+
+The check covers *dereferences*: reading a member, calling a method. Passing a
+possibly-null reference along is still allowed, because it is still a valid
+reference — it is only unsafe to follow.
+
 **Closures capture by value**, which mitigates but doesn't eliminate this:
 a click handler can call methods on a captured class instance (instances
 are references, so the capture is a retained pointer) but can't mutate a

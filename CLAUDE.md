@@ -64,6 +64,13 @@ Break cycles with `weak`, a real keyword (`src/lex.c:9`). It compiles to
 (`src/emit.c:1349`, `src/emit.c:1734`), so a weak slot reads as null once the
 target is gone rather than dangling.
 
+**Reading a `weak` field gives an optional, and the checker enforces it.**
+`this.win.skin` is a compile error; test the path first (`if (this.win != null)`,
+an early `if (this.win == null) { return; }`, a `&&` short-circuit, or bind a
+local and check it). Writing to the path drops the narrowing. The rule exists
+because a weak slot is *designed* to read null, so faulting on it is the wrong
+failure mode — see `docs/memory.md` §3 and `tests/errors/weak_deref.vt`.
+
 **Any back-reference — child to parent, part to owner — must be `weak`.** The
 toolkit does this consistently and it is the pattern to copy:
 

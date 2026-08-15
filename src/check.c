@@ -402,6 +402,7 @@ typedef struct Scope {
 } Scope;
 
 #define MAX_REGIONS 256
+#define MAX_NARROW 64
 typedef struct Ctx {
     Module *mod;
     FnDecl *fn;          /* function whose body is being checked */
@@ -422,7 +423,151 @@ typedef struct Ctx {
     const char *rstack_name[MAX_REGIONS];
     int rstack_loopdepth[MAX_REGIONS]; /* loop_depth when this arena was entered */
     int rstack_n;
+    /* Paths proven non-null on the current control-flow path — see "weak loads
+       are optional" below. A stack: entering a narrowed branch marks it,
+       leaving resets to the mark. */
+    const char *nn[MAX_NARROW];
+    int nn_n;
 } Ctx;
+
+/* ---------------- weak loads are optional ----------------
+ *
+ * A weak slot reads as null once its target is gone (that is the whole point of
+ * `weak`), so LOADING one yields a value that may be null. Dereferencing it
+ * without a check is a null dereference in the emitted C — a segfault inside
+ * whatever function happened to touch it, with nothing naming the cause.
+ *
+ * So a load is marked `nullable`, and member access / method call / indexing
+ * through a nullable value is refused unless the checker can see it was tested.
+ *
+ * ── WHAT COUNTS AS A TEST ─────────────────────────────────────────────────
+ *
+ * A *path* — `w`, `this.win`, `this.status.win` — is narrowed to non-null by:
+ *
+ *     if (p != null) { ...here... }
+ *     if (p == null) { return; } ...here...      (the block must exit)
+ *     p != null && ...here...
+ *     while (p != null) { ...here... }
+ *
+ * and un-narrowed by assigning to that path or to anything it is built on.
+ *
+ * ── THE ONE DELIBERATE HOLE ───────────────────────────────────────────────
+ *
+ * A narrowing on `this.win` survives a call, and a call could in principle set
+ * that field to null. Invalidating on every call would reject
+ * `if (this.win != null) { this.win.layout(); this.win.redraw(); }` — the shape
+ * this rule exists to make safe — and would push every caller into rebinding a
+ * local first. TypeScript makes the same trade for the same reason. Binding a
+ * local (`let w = this.win;`) is immune, and is the pattern to reach for when a
+ * called function might really clear the field.
+ */
+
+/* A canonical key for a simple path expression: `x`, `this`, `this.a.b`.
+   NULL when the expression is anything else (a call, an index, arithmetic) —
+   those are not narrowable, because there is nothing stable to name. */
+static const char *path_key(Expr *e) {
+    switch (e->kind) {
+    case EX_IDENT: return e->name;
+    case EX_THIS:  return intern("this");
+    case EX_MEMBER: {
+        const char *b = path_key(e->lhs);
+        if (!b) return NULL;
+        return intern(arena_printf(&g_arena, "%s.%s", b, e->name));
+    }
+    default: return NULL;
+    }
+}
+
+static int nn_mark(Ctx *c) { return c->nn_n; }
+static void nn_reset(Ctx *c, int mark) { c->nn_n = mark; }
+
+static bool nn_has(Ctx *c, const char *key) {
+    if (!key) return false;
+    for (int i = 0; i < c->nn_n; i++)
+        if (c->nn[i] == key) return true;
+    return false;
+}
+
+static void nn_add(Ctx *c, const char *key) {
+    if (!key || nn_has(c, key)) return;
+    if (c->nn_n < MAX_NARROW) c->nn[c->nn_n++] = key;
+}
+
+/* Assigning to `key` invalidates what was known about it AND about everything
+   reached through it: `this.win = x` must forget `this.win.surf`. */
+static void nn_clear(Ctx *c, const char *key) {
+    if (!key) return;
+    size_t n = strlen(key);
+    int w = 0;
+    for (int i = 0; i < c->nn_n; i++) {
+        const char *k = c->nn[i];
+        bool killed = (k == key) || (strlen(k) > n && strncmp(k, key, n) == 0 && k[n] == '.');
+        if (!killed) c->nn[w++] = k;
+    }
+    c->nn_n = w;
+}
+
+/* Paths that are non-null when `cond` is true (want_true) or false. */
+static void nn_collect(Ctx *c, Expr *cond, bool want_true) {
+    if (!cond) return;
+    switch (cond->kind) {
+    case EX_UN:
+        if (cond->op == T_NOT) nn_collect(c, cond->lhs, !want_true);
+        return;
+    case EX_BIN:
+        if (cond->op == T_ANDAND) {
+            /* both hold when the conjunction is true */
+            if (want_true) { nn_collect(c, cond->lhs, true); nn_collect(c, cond->rhs, true); }
+            return;
+        }
+        if (cond->op == T_OROR) {
+            /* both fail when the disjunction is false */
+            if (!want_true) { nn_collect(c, cond->lhs, false); nn_collect(c, cond->rhs, false); }
+            return;
+        }
+        if (cond->op == T_NEQ || cond->op == T_EQ) {
+            bool proves_nonnull = (cond->op == T_NEQ) == want_true;
+            if (!proves_nonnull) return;
+            if (cond->rhs && cond->rhs->kind == EX_NULL) nn_add(c, path_key(cond->lhs));
+            else if (cond->lhs && cond->lhs->kind == EX_NULL) nn_add(c, path_key(cond->rhs));
+            return;
+        }
+        return;
+    default:
+        return;
+    }
+}
+
+/* Whether a block always leaves by its last statement — the shape that makes an
+   early guard (`if (p == null) { return; }`) narrow everything after it. */
+static bool block_exits(Stmt **body, int n) {
+    if (n <= 0) return false;
+    Stmt *last = body[n - 1];
+    switch (last->kind) {
+    case ST_RETURN: case ST_BREAK: case ST_CONTINUE:
+        return true;
+    case ST_IF:
+        return last->els && block_exits(last->body, last->nbody)
+                         && block_exits(last->els, last->nels);
+    case ST_BLOCK:
+        return block_exits(last->body, last->nbody);
+    default:
+        return false;
+    }
+}
+
+/* Refuse a dereference of a value that may be null. `e` is the receiver. */
+static void require_nonnull(Ctx *c, Expr *e, Type *t, const char *what) {
+    if (!t || !t->nullable) return;
+    if (nn_has(c, path_key(e))) return;
+    const char *p = path_key(e);
+    if (p)
+        fatal_at(e->loc,
+                 "'%s' is a weak reference and may be null here — check it before "
+                 "%s, e.g. `if (%s != null) { ... }`, or bind it first: "
+                 "`let x = %s; if (x == null) { return; }`", p, what, p, p);
+    fatal_at(e->loc, "this weak reference may be null here — check it before %s", what);
+}
 
 /* region `a` outlives region `b` iff a is the heap (0), equals b, or lexically
    encloses b (an ancestor in the region tree). A pointer from a location in
@@ -1531,6 +1676,7 @@ static Type *check_call(Ctx *c, Expr *e, Type *expected) {
 
     if (callee->kind == EX_MEMBER) {
         Type *recv = check_expr(c, callee->lhs, NULL);
+        require_nonnull(c, callee->lhs, recv, "calling a method on it");
         const char *n = callee->name;
         /* builtin methods are positional-only; class/struct methods below keep
            named-argument support via check_args_against */
@@ -2003,6 +2149,7 @@ static Type *check_call(Ctx *c, Expr *e, Type *expected) {
 
 static Type *check_member(Ctx *c, Expr *e) {
     Type *recv = check_expr(c, e->lhs, NULL);
+    require_nonnull(c, e->lhs, recv, "reading a member");
     const char *n = e->name;
     if (n == intern("len") &&
         (recv->kind == TY_STRING || recv->kind == TY_ARRAY || recv->kind == TY_MAP)) {
@@ -2053,10 +2200,15 @@ static Type *check_member(Ctx *c, Expr *e) {
         e->ref = REF_FIELD;
         e->cls = owner;
         Type *t = f->type;
-        if (t->weak) { /* loading a weak field yields a normal (borrowed) reference */
+        if (t->weak) {
+            /* Loading a weak field yields a borrowed reference — and one that
+               may be null, because that is what a weak slot does once its
+               target is gone. Carrying that in the type is what lets the
+               dereference sites below refuse an unchecked use. */
             Type *s = NEW(Type);
             *s = *t;
             s->weak = false;
+            s->nullable = true;
             t = s;
         }
         return e->type = t;
@@ -2210,7 +2362,13 @@ static Type *check_expr(Ctx *c, Expr *e, Type *expected) {
     }
     case EX_BIN: {
         Type *lt = check_expr(c, e->lhs, NULL);
+        /* `p != null && p.f` — the right operand only runs when the left held,
+           so it is checked under that knowledge (and the mirror for `||`). */
+        int nn_bin_mark = nn_mark(c);
+        if (e->op == T_ANDAND) nn_collect(c, e->lhs, true);
+        else if (e->op == T_OROR) nn_collect(c, e->lhs, false);
         Type *rt = check_expr(c, e->rhs, lt->kind == TY_NULL ? NULL : lt);
+        nn_reset(c, nn_bin_mark);
         if (lt->kind == TY_NULL) { lt = check_expr(c, e->lhs, rt); }
         /* Fold an untyped integer constant to the float operand (Go-style). */
         if (type_is_float(lt) && !type_is_float(rt) && is_int_const_expr(e->rhs)) {
@@ -2283,6 +2441,9 @@ static Type *check_expr(Ctx *c, Expr *e, Type *expected) {
     case EX_ASSIGN: {
         Expr *lhs = e->lhs;
         Type *lt;
+        /* Whatever was known about this path (and anything reached through it)
+           stops being true the moment it is written to. */
+        nn_clear(c, path_key(lhs));
         if (lhs->kind == EX_IDENT) {
             Local *l = lookup_value(c, lhs, lhs->name);
             if (!l) {
@@ -2658,6 +2819,11 @@ static void check_stmt(Ctx *c, Stmt *s) {
         if (t->kind == TY_VOID) fatal_at(s->loc, "cannot store void");
         if (t->kind == TY_NULL) fatal_at(s->loc, "cannot infer type from null; annotate the let");
         s->local = define_local(c, s->name, t, false, s->loc);
+        /* Copying a value that is already known to be non-null gives a binding
+           that is known to be non-null: `let w = this.win;` inside a guarded
+           branch needs no second check. Outside one, `w` stays an optional and
+           has to be checked — which is the whole point of binding it. */
+        if (t->nullable && nn_has(c, path_key(s->init))) nn_add(c, s->name);
         /* value-region of the binding: where the object it holds actually lives.
            null is region-polymorphic — a null accumulator declared in an arena
            takes that arena (so it can later hold arena values); at heap scope it
@@ -2669,27 +2835,41 @@ static void check_stmt(Ctx *c, Stmt *s) {
     case ST_EXPR:
         check_expr(c, s->expr, NULL);
         return;
-    case ST_IF:
+    case ST_IF: {
         check_expr(c, s->expr, NULL);
         if (s->expr->type->kind != TY_BOOL) fatal_at(s->expr->loc, "if condition must be bool");
+        int mark = nn_mark(c);
+        nn_collect(c, s->expr, true);       /* the then-branch knows the test held */
         scope_push(c);
         check_block(c, s->body, s->nbody);
         scope_pop(c);
+        nn_reset(c, mark);
         if (s->els) {
+            nn_collect(c, s->expr, false);  /* and the else-branch knows it did not */
             scope_push(c);
             check_block(c, s->els, s->nels);
             scope_pop(c);
+            nn_reset(c, mark);
         }
+        /* `if (p == null) { return; }` — past an exiting branch, the other side
+           of the test holds for the rest of the enclosing block. */
+        if (block_exits(s->body, s->nbody)) nn_collect(c, s->expr, false);
+        else if (s->els && block_exits(s->els, s->nels)) nn_collect(c, s->expr, true);
         return;
-    case ST_WHILE:
+    }
+    case ST_WHILE: {
         check_expr(c, s->expr, NULL);
         if (s->expr->type->kind != TY_BOOL) fatal_at(s->expr->loc, "while condition must be bool");
         c->loop_depth++;
+        int mark = nn_mark(c);
+        nn_collect(c, s->expr, true);
         scope_push(c);
         check_block(c, s->body, s->nbody);
         scope_pop(c);
+        nn_reset(c, mark);
         c->loop_depth--;
         return;
+    }
     case ST_FOR_RANGE:
         check_expr(c, s->range_lo, NULL);
         want(c, s->range_lo, ty_int(), "range");

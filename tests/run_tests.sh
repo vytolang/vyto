@@ -309,6 +309,18 @@ for src in tests/errors/*.vt; do
     fi
 done
 
+# --- weak loads are optional: every narrowing shape compiles and runs ---
+# The negative half is tests/errors/weak_deref*.vt. This is the half that has to
+# keep working: a rule nobody can satisfy is worse than no rule.
+got=$(./vytoc run tests/fixtures/weak_narrow.vt 2>&1)
+if [ "$got" = "$(printf 'unset -1 -1\nset 7 14 7 7 7 7 7 7')" ]; then
+    echo "PASS weak_narrowing"
+else
+    echo "FAIL weak_narrowing"
+    echo "  got: $got"
+    fail=1
+fi
+
 # --- integer overflow: checked (traps) in debug, wraps in --release ---
 got=$(./vytoc run tests/fixtures/overflow_trap.vt 2>&1)
 if echo "$got" | grep -q "integer overflow in '+'"; then

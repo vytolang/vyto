@@ -31,6 +31,13 @@ typedef enum TypeKind {
 struct Type {
     TypeKind kind;
     bool weak;
+    /* This VALUE may be null and must be checked before it is dereferenced.
+       Set by the checker when a weak field is loaded: a weak slot reads as null
+       once its target is gone, so every load of one is an optional. It is a
+       property of the loaded value, not of the declaration — `weak` says how
+       the slot is stored, `nullable` says what the reader has to do about it.
+       Ignored by type_identical: a nullable T is still a T for assignment. */
+    bool nullable;
     Type *elem;         /* array elem / map value */
     Type *ret;          /* fn return */
     Type **params;      /* fn params */
