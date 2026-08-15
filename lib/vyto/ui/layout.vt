@@ -363,16 +363,40 @@ export class Center extends Box {
 export class SizedBox extends Box {
     w: float;
     h: float;
+    // Optional background, 0 = none. Painting a region — a sidebar, a toolbar
+    // strip — otherwise means reaching for Container, whose arrange hands its
+    // child the child's own MEASURED height and collapses any panel built
+    // around an Expanded (layout.vt's own note below). SizedBox already passes
+    // its rect through, so this is the box that can both size and fill.
+    bg: int;
 
     fn init(w: float, h: float, child: Widget) {
         super.init();
         this.w = w;
         this.h = h;
+        this.bg = 0;
         if (child != null) { this.add(child); }
     }
 
+    // new SizedBox(320, 0, panel).fill(th.surface_sunken)
+    builder fn fill(color: int) { this.bg = color; return this; }
+
     override fn measure(s: Painter, th: Theme): Size {
         return Size(this.w, this.h);
+    }
+
+    // Chrome, not render: the partial-repaint walk (render_within) paints a
+    // container's chrome and then recurses per child — it never calls render()
+    // — so a background painted in render() would appear on full redraws only
+    // and vanish the first time something inside it repainted.
+    override fn draw_chrome(s: Painter, th: Theme) {
+        if (this.bg != 0) { s.fill(this.bounds, this.bg); }
+    }
+
+    override fn render(s: Painter, th: Theme) {
+        this.draw_chrome(s, th);
+        for (let c in this.children) { c.draw(s, th); }
+        this.draw_exiting(s, th);
     }
 
     override fn arrange(s: Painter, th: Theme, r: Rect) {

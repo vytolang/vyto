@@ -79,7 +79,7 @@ import { Driver, Conn, Stmt, STEP_ROW, STEP_DONE, STEP_ERR,
          DBERR_UNSUPPORTED } from "vyto/db/driver";
 import { Dialect, MysqlDialect, mysqlDialect } from "vyto/db/dialect";
 import { Value, dbNull, DB_NULL } from "vyto/db/value";
-import { WireIo, SockIo, dialTcp } from "vyto/db/wire/io";
+import { WireIo, SockIo, dialTcp, dialTcpEx } from "vyto/db/wire/io";
 import { Dsn, parseDsn } from "vyto/db/wire";
 import { MySession, MyRowBuffer, MyPrepared } from "vyto/db/mysql/session";
 import { MyColumn, MyParam, MyReader, decodeBinaryRow, decodeError, decodeOk,
@@ -531,6 +531,7 @@ fn normalizeSslMode(m: string): string {
 export class MysqlDriver extends Driver {
     dsn: string;
     timeoutMs: int;
+    connTimeoutMs: int;
     cacheCap: int;
     drainCap: int;
     ssl: string;
@@ -539,6 +540,9 @@ export class MysqlDriver extends Driver {
     fn init(dsn: string) {
         this.dsn = dsn;
         this.timeoutMs = 30000;
+        // 0 means "follow timeoutMs" — what this did before the two were
+        // separable. See connectTimeout().
+        this.connTimeoutMs = 0;
         this.cacheCap = 64;
         this.drainCap = 100000;
         this.ssl = DEFAULT_SSLMODE;
@@ -547,7 +551,24 @@ export class MysqlDriver extends Driver {
 
     override fn name(): string { return "mysql"; }
 
+    // How long to wait for a REPLY. 0 waits forever, which is the right setting
+    // for a caller that can cancel: a query may legitimately run for an hour,
+    // and a read deadline that fires on it does not "time out the query" — it
+    // tears down the connection, losing the session, its transaction and its
+    // temporary tables, and reports it as a server that stopped answering.
     builder fn timeout(ms: int) { this.timeoutMs = ms; return this; }
+
+    // How long to wait for the TCP CONNECT. 0 follows timeout(). Separate
+    // because the two answer different questions: a connect that has not
+    // completed in seconds never will, while a slow reply may just be work in
+    // progress.
+    builder fn connectTimeout(ms: int) { this.connTimeoutMs = ms; return this; }
+
+    fn connectDeadline(): int {
+        if (this.connTimeoutMs > 0) { return this.connTimeoutMs; }
+        return this.timeoutMs;
+    }
+
     builder fn stmtCache(n: int) { this.cacheCap = n; return this; }
     builder fn drainLimit(n: int) { this.drainCap = n; return this; }
 
@@ -583,7 +604,7 @@ export class MysqlDriver extends Driver {
                 DBERR_UNSUPPORTED);
         }
 
-        let io = dialTcp(d.host, d.port, this.timeoutMs);
+        let io = dialTcpEx(d.host, d.port, this.connectDeadline(), this.timeoutMs);
         if (io == null) {
             return deadConn("vyto/db/mysql: could not connect to " + d.host + ":" + str(d.port),
                             DBERR_OPEN);
@@ -730,6 +751,42 @@ export class MyOverDriver extends MysqlDriver {
         cn.cacheCap = this.cacheCap;
         return cn;
     }
+}
+
+// Stop the statement running on another connection, identified by the id its
+// MyConn.connectionId() reported. Returns "" on success, or why it failed.
+//
+// Same shape as PostgreSQL's cancel and for the same reason: the connection
+// running the query is blocked inside it and the server is not reading that
+// socket, so the only way in is a SECOND connection. Unlike PostgreSQL this one
+// is an ordinary authenticated session running an ordinary statement, so it
+// needs credentials — hence the DSN — and it does report failure.
+//
+// KILL QUERY, never KILL: QUERY ends the statement and leaves the session, its
+// transaction and its temporary tables alive. Plain KILL ends the connection,
+// which is the thing cancellation exists to avoid.
+//
+// It goes over execRaw (COM_QUERY), not Db.raw. `raw` prepares everything, and
+// MySQL rejects a number of statements over the prepared-statement protocol —
+// the same trap that makes db.raw("begin") silently not start a transaction.
+export fn myKill(dsn: string, connectionId: int, timeoutMs: int): string {
+    if (connectionId == 0) {
+        return "vyto/db/mysql: no connection id — nothing to cancel";
+    }
+    let d = mysql(dsn);
+    d.timeout(timeoutMs);
+    let cn = d.connect();
+    if (cn == null) { return "vyto/db/mysql: could not open a connection to cancel on"; }
+    if (!cn.isOpen()) {
+        let why = cn.errorMessage();
+        return "vyto/db/mysql: could not open a connection to cancel on: " + why;
+    }
+    // The id is an int, so it cannot carry SQL — no quoting question here.
+    let ok = cn.execRaw("KILL QUERY " + str(connectionId));
+    let err = "";
+    if (!ok) { err = cn.errorMessage(); }
+    cn.close();
+    return err;
 }
 
 // The dialect is real without the driver: query and schema rendering for MySQL

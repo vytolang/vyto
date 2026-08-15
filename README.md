@@ -757,8 +757,10 @@ Two behavioural differences worth knowing before you port an app:
 
 - **`os/worker` on Windows is a re-exec pool, not `fork()`.** Workers are the
   same executable relaunched with `VYTO_WORKER_*` in the environment, re-running
-  `main` until they reach `new WorkerPool(...)` and divert into serve mode. So
-  **anything `main()` does before building the pool runs once per worker.**
+  `main` until they divert into serve mode. So **anything `main()` does before
+  that point runs once per worker.** Call `workerEntry(job)` as the first
+  statement of `main` and that point is the first line — which also lets the
+  pool be built later, or a dead worker be replaced with `respawn()`.
 - **`vyto/net` and `vyto/intl` do not compile for `android-arm64`** — their shims
   include curl and the ICU headers unconditionally. Android apps use
   `vyto/mobile/android/{net,intl}` instead, which is why nothing in the tree

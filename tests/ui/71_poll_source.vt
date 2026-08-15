@@ -1,0 +1,64 @@
+// Window.add_poll_source: noticing work that finishes somewhere else.
+//
+// A query running in a forked worker never reaches this window as an event —
+// Surface owns the wait and knows nothing about a worker's socket. Before poll
+// sources the only way to notice one was Widget.ticker(), which is a looping
+// Tween, which repaints the entire window every frame for however long the
+// query takes. A 30-second query meant 1800 full repaints to deliver one
+// result.
+//
+// So the contract has two halves and this asserts both:
+//
+//   1. the callback runs once per turn of the loop while registered, and
+//   2. it does NOT repaint — the window paints when the callback asks it to,
+//      which is when there is finally something to show.
+//
+// The second half is what a ticker cannot do, and it is the reason this exists
+// rather than a helper over ticker().
+import { Window, Painter, Theme, Size, Widget } from "vyto/ui";
+
+class Panel extends Widget {
+    renders: int;
+    polls: int;
+
+    fn init() {
+        super.init();
+        this.renders = 0;
+        this.polls = 0;
+    }
+
+    override fn measure(s: Painter, th: Theme): Size { return Size(50.0, 50.0); }
+
+    override fn render(s: Painter, th: Theme) {
+        this.renders += 1;
+        s.fill(this.bounds, th.primary);
+    }
+}
+
+fn main() {
+    let win = new Window("Poll", 200, 200);
+    let w = new Panel();
+    win.root = w;
+
+    // Stand-in for "is the worker's result ready yet?" — the callback a real
+    // runner installs. It looks, finds nothing, and returns without drawing.
+    let self = w;
+    let id = win.add_poll_source(() => { self.polls += 1; });
+    print("registered=" + win.poll_sources());
+
+    win.run();
+
+    // One callback per loop turn, for every scripted event.
+    print("polled=" + (w.polls > 0));
+    print("polled_every_turn=" + (w.polls >= 12));
+
+    // The whole point: all those turns produced no repaints beyond the ones
+    // startup and the scripted events already owed. A ticker-driven pump would
+    // put this in the dozens.
+    print("did_not_repaint=" + (w.renders <= 2));
+
+    // Removing the last source is what lets the loop go back to blocking in
+    // wait() instead of waking on a 16ms timer forever.
+    win.remove_poll_source(id);
+    print("after_remove=" + win.poll_sources());
+}

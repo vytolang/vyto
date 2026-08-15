@@ -11,7 +11,7 @@
 import { Surface, Rect, contains, rgb, rgba, with_alpha, alpha_of, mix,
           EV_EXPOSE, EV_KEY, EV_KEY_UP, EV_MOUSE_DOWN, EV_MOUSE_UP, EV_MOUSE_MOVE, EV_MOUSE_WHEEL, EV_MOUSE_RDOWN,
           EV_RESIZE, EV_CLOSE, EV_TIMER, EV_VSYNC, MOD_SHIFT,
-          KEY_ESC, KEY_TAB } from "vyto/surface";
+          KEY_ESC, KEY_TAB, KEY_F1, KEY_F12, MOD_CTRL, MOD_ALT } from "vyto/surface";
 import { Animator, Tween, AnimatedFloat } from "vyto/ui/anim";
 import { Spring } from "vyto/anim";
 import { Scrollbar, SIDE_TOP, SIDE_RIGHT, SIDE_BOTTOM, SIDE_LEFT } from "vyto/ui/scrollbar";
@@ -20,6 +20,7 @@ import { ease_linear, ease_in_quad, ease_out_quad, ease_in_out_quad,
          ease_out_back, ease_out_bounce, ease_in_out_sine } from "vyto/anim";
 import { Path } from "vyto/geom/path";
 import { Reactive, effect, Effect } from "vyto/reactive";
+import { monoMs } from "vyto/util/time";
 
 export struct Size {
     w: float;
@@ -141,9 +142,21 @@ export fn scale_px(v: float, f: float): float {
 
 // A soft focus glow: a 2px stroke_round just outside the control, painted in
 // the theme's rgba focus_ring color. The lean tier falls back to a 1px frame.
+// The focus halo, drawn FLUSH with the control's own border rather than
+// standing off from it.
+//
+// It used to sit at inset -2 with a 2px stroke, which spans -3..-1 while a 1px
+// border spans -0.5..+0.5 — a clear 0.5px gap, and on a rounded corner the two
+// arcs have different curvature so the gap opens up and reads as a second
+// outline. On a focused text field that is the whole visual: two rings and a
+// strip of background between them.
+//
+// -1.5 with a 3px stroke spans -3..0, so the halo's inner edge meets the
+// border's outer edge. Same outer extent as before (chrome_overhang still
+// covers it), same weight, one edge.
 export fn paint_focus_ring(s: Painter, th: Theme, r: Rect, radius: float) {
-    let ring = rect_inset(r, -2.0);
-    s.stroke_round(ring, radius + 2.0, 2.0, th.focus_ring);
+    let ring = rect_inset(r, -1.5);
+    s.stroke_round(ring, radius + 1.5, 3.0, th.focus_ring);
 }
 
 // Resolve the visible fill of a control from its interaction state: the resting
@@ -892,6 +905,90 @@ export fn lerpf(a: float, b: float, t: float): float {
     return a + (b - a) * u;
 }
 
+// Button emphasis. A screen full of filled buttons has no hierarchy — the eye
+// cannot find the one action that matters — so a button says how loud it is and
+// the chrome decides what that looks like.
+//
+//   BTN_FILLED  the skin's own button: gradient/fill, elevation, bold label.
+//               At most one per region.
+//   BTN_TONAL   a quiet filled surface with a hairline border and NO shadow.
+//               Toolbars, secondary actions, anything that appears in groups.
+//   BTN_GHOST   nothing at rest; a tint on hover. Pagers, icon-ish actions,
+//               anything repeated many times in a row.
+export const BTN_FILLED: int = 0;
+export const BTN_TONAL: int = 1;
+export const BTN_GHOST: int = 2;
+
+// ------------------------------------------------------------- CaretBlink
+//
+// A blinking text caret, shared by every widget that draws one.
+//
+// It is a TIMER, not an animation. `Widget.ticker` is passive — it never
+// repaints on its own account — and its callback runs once per frame, so the
+// interval is enforced here against the clock and `invalidate()` is called only
+// on the frame the caret actually flips. A looping `animate()` would repaint
+// the widget 60 times a second to toggle one 1px bar, which is enough to pin a
+// core on a window that is doing nothing but holding a cursor.
+//
+// The widget reference is `weak`: the widget owns the CaretBlink, the blink's
+// ticker closure captures the widget, and a strong link there is a cycle that
+// nothing collects (CLAUDE.md's rule for any back-reference).
+//
+// 530ms is the interval every desktop toolkit landed on.
+export const CARET_BLINK_MS: int = 530;
+
+export class CaretBlink {
+    on: bool;
+    last: int;          // monoMs at the last flip
+    tw: Tween;
+    w: weak Widget;
+
+    fn init() {
+        this.on = true;
+        this.last = 0;
+        this.tw = null;
+    }
+
+    // Begin blinking for `w`. Idempotent, and always starts the caret SOLID:
+    // a caret that appears mid-blink reads as a glitch rather than a cursor.
+    fn start(w: Widget) {
+        this.on = true;
+        this.last = monoMs() as int;
+        if (this.tw != null) { return; }
+        this.w = w;
+        let self = this;
+        this.tw = w.ticker(CARET_BLINK_MS, () => { self.tick(); });
+    }
+
+    fn tick() {
+        let now = monoMs() as int;
+        if (now - this.last < CARET_BLINK_MS) { return; }
+        this.last = now;
+        this.on = !this.on;
+        let w = this.w;
+        if (w != null) { w.invalidate(); }
+    }
+
+    fn stop() {
+        if (this.tw != null) { this.tw.cancel(); this.tw = null; }
+        this.w = null;
+        this.on = true;
+    }
+
+    // Typing, or moving the caret: show it solid and restart the phase. A caret
+    // that blinks off under the key you are pressing looks like dropped input.
+    fn wake() {
+        this.on = true;
+        this.last = monoMs() as int;
+        let w = this.w;
+        if (w != null) { w.invalidate(); }
+    }
+
+    // Draw the caret? True when not blinking at all (no ticker running) so a
+    // widget that never called start() is unaffected.
+    fn visible(): bool { return this.tw == null || this.on; }
+}
+
 export class ButtonChrome {
     // State-responsive elevation (D3): a resting button sits at `rest`, rises
     // toward `rest+1` under hover, and sinks toward the surface when pressed —
@@ -937,6 +1034,37 @@ export class ButtonChrome {
         if (st.focus > 0.0) { skin.focus.paint(s, th, r, radius); }
         this.draw_label(s, r, label, dim(th.on_primary, th.disabled_fg, st), WEIGHT_BOLD);
     }
+
+    // The entry point Button actually calls.
+    //
+    // BTN_FILLED delegates to paint(), so every skin keeps its own identity for
+    // the loud button without knowing this exists. The quiet variants are drawn
+    // here, deliberately skin-independent: they are defined by *absence* —
+    // no gradient, no elevation, no sheen — and a per-skin interpretation of
+    // absence is just noise creeping back in.
+    virtual fn paint_variant(s: Painter, th: Theme, r: Rect, label: string,
+                             st: WidgetState, skin: Skin, variant: int) {
+        if (variant == BTN_FILLED) { this.paint(s, th, r, label, st, skin); return; }
+        let radius = th.radius_md;
+
+        if (variant == BTN_TONAL) {
+            // A surface, not a shape shouting for attention: the secondary fill
+            // deepening slightly under hover and press.
+            let lift = st.hover * 0.05 + st.press * 0.09;
+            let fill = mix(th.secondary, th.on_secondary, lift);
+            s.fill_round(r, radius, dim(fill, th.disabled, st));
+            s.stroke_round(r, radius, 1, dim(th.border, th.disabled, st));
+        } else {
+            // Ghost: the background until touched.
+            let a = st.hover * 0.07 + st.press * 0.06;
+            if (a > 0.004) { s.fill_round(r, radius, mix(th.surface, th.on_surface, a)); }
+        }
+
+        if (st.focus > 0.0) { skin.focus.paint(s, th, r, radius); }
+        let fg = th.on_secondary;
+        if (variant == BTN_GHOST) { fg = th.on_surface; }
+        this.draw_label(s, r, label, dim(fg, th.disabled_fg, st), WEIGHT_MED);
+    }
 }
 
 // Bordered/rounded input-box shape shared by TextField, TextArea, Dropdown
@@ -953,11 +1081,20 @@ export class FieldChrome {
         let bg = mix(th.surface_raised, mix(th.surface_raised, th.on_surface, 0.04),
                      st.hover * (1.0 - st.focus));
         s.fill_round(r, radius, bg);
-        // border: hover lifts it toward on_surface, focus overrides to primary.
+        // border: hover lifts it toward on_surface, focus overrides to primary
+        // AND thickens it. That thickening IS the focus indicator — a field
+        // does not also get the halo ring.
+        //
+        // It used to get both, and the two never read as one edge: the ring is
+        // the primary at alpha ~150 over the page, the border is the primary at
+        // full strength, so a focused field showed a pale band wrapped around a
+        // dark line. Flush or not, that is two edges. A button can carry the
+        // ring because its fill is solid primary and the halo reads as bloom
+        // around it; a field is mostly background, and there the halo is just a
+        // second stripe.
         let hov_border = mix(th.border, mix(th.border, th.on_surface, 0.20), st.hover);
         let border = mix(hov_border, th.primary, st.focus);
-        s.stroke_round(r, radius, 1, dim(border, th.disabled, st));
-        if (st.focus > 0.0) { skin.focus.paint(s, th, r, radius); }
+        s.stroke_round(r, radius, lerpf(1.0, 2.0, st.focus), dim(border, th.disabled, st));
     }
 }
 
@@ -2297,6 +2434,14 @@ export class Widget {
         return false;
     }
 
+    // Should Tab go to this widget instead of moving focus?
+    //
+    // False everywhere by default — Tab is focus traversal and a widget that
+    // swallows it traps the keyboard. True only while a widget is itself a set
+    // of fields the user is walking through: DataTable's filter row is one box
+    // per column, and Tab there means "the next box", not "leave the grid".
+    virtual fn wants_tab(): bool { return false; }
+
     // Does focusing this widget mean the user wants to type into it?
     //
     // False for everything that merely takes focus — a Button, a Checkbox, a
@@ -2420,6 +2565,9 @@ export class Window {
     // startup appears in place rather than every widget animating in at once.
     live: bool;
     close_on_esc: bool;
+    // App-level shortcuts: (key, text) → consumed. See app_chord for when this
+    // is asked before the focused widget and when it is asked after.
+    onShortcut: fn(int, string): bool;
     dirty: Rect;        // accumulated repaint region (valid when has_dirty)
     has_dirty: bool;
     // Vsync gating. When vsync_on, redraw()/repaint() only record what is owed
@@ -2454,6 +2602,12 @@ export class Window {
     last_click_y: int;
     last_click_w: weak Widget;
     animations: Animator[]; // WS9c: active animators; run() ticks the wait clock only while non-empty
+    // Poll sources: work happening OUTSIDE this process that the window has to
+    // notice. See add_poll_source. They gate the wait clock the same way
+    // animations do, and unlike an animation they never imply a repaint.
+    poll_cbs: fn()[];
+    poll_ids: int[];
+    poll_next_id: int;
     mods: int;           // MOD_* bitmask at the event being dispatched — widgets
                          // read it via Widget.mods() in on_key/on_click/on_drag
     scale: float;        // UI scale factor (1.0 = 96dpi); themes are scaled by
@@ -2467,12 +2621,70 @@ export class Window {
         this.theme = new Theme();
         this.skin = new Skin();
         this.animations = [];
+        this.poll_cbs = [];
+        this.poll_ids = [];
+        this.poll_next_id = 1;
         this.toasts = [];
         this.focusables = [];
         this.focus_i = -1;
         this.close_on_esc = true;
         this.scale = this.surf.scale();
         this.rt = new Reactive();
+    }
+
+    // Watch something the window cannot be woken by: a worker process finishing
+    // a query, a socket, a child's output. `body` runs once per pass of the
+    // event loop for as long as the source is registered, and the loop stops
+    // blocking indefinitely while any source exists — it takes the same ~60Hz
+    // timed wait that an animation does. Returns an id for remove_poll_source.
+    //
+    // Register on submit, remove on completion. **Not** for a timer, and not
+    // for anything long-lived: a source left registered means an idle app never
+    // goes back to blocking in wait(), which is a wakeup every 16ms forever.
+    // With none registered the loop blocks exactly as it did before this
+    // existed.
+    //
+    // It does NOT repaint. That is the difference between this and driving the
+    // same work from a looping Tween, which is what apps reach for otherwise: a
+    // Tween redraws the whole window every frame for the entire life of the
+    // query. If the callback changes something visible, it calls redraw() or
+    // invalidate() itself, when there is actually something to show.
+    //
+    // Why a timed wait and not the fds themselves: Surface owns its wait and
+    // exposes no descriptor, and two of the four backends have none to expose
+    // (Win32 waits on a message queue, Android on a Looper). A poll source
+    // costs a timer wakeup only while work is outstanding — which is precisely
+    // when the app is showing a progress indicator and animating anyway.
+    fn add_poll_source(body: fn()): int {
+        let id = this.poll_next_id;
+        this.poll_next_id += 1;
+        this.poll_cbs.push(body);
+        this.poll_ids.push(id);
+        return id;
+    }
+
+    fn remove_poll_source(id: int) {
+        let i = 0;
+        while (i < this.poll_ids.len) {
+            if (this.poll_ids[i] == id) {
+                this.poll_ids.remove_at(i);
+                this.poll_cbs.remove_at(i);
+                return;
+            }
+            i += 1;
+        }
+    }
+
+    fn poll_sources(): int { return this.poll_ids.len; }
+
+    // Run every source once. Callbacks may remove sources (a query that just
+    // finished removes its own), so this iterates over a snapshot rather than
+    // the live array — mutating it mid-walk would skip the next one.
+    fn pump_poll_sources() {
+        if (this.poll_cbs.len == 0) { return; }
+        let snapshot: fn()[] = [];
+        for (let cb in this.poll_cbs) { snapshot.push(cb); }
+        for (let cb in snapshot) { cb(); }
     }
 
     // Bind reactive state to the UI: `body` reads signals/computeds and updates
@@ -2900,7 +3112,9 @@ export class Window {
             }
             return;
         }
-        if (k == KEY_TAB) {
+        if (k == KEY_TAB && this.focus_wants_tab(k, ch)) {
+            // consumed inside the focused widget
+        } else if (k == KEY_TAB) {
             let old = this.focused_widget();
             // Shift+Tab walks focus backwards.
             if ((this.mods & MOD_SHIFT) != 0) { this.focus_prev(); }
@@ -2926,13 +3140,45 @@ export class Window {
                     this.repaint();
                 }
             }
+        } else if (this.app_chord(k) && this.fire_shortcut(k, ch)) {
+            // consumed by the app
         } else {
             let f = this.focused_widget();
             if (f != null && f.on_key(k, ch)) {
                 this.mark_dirty(f.bounds);
                 this.repaint();
+            } else {
+                // Nothing focused wanted it: the app gets last refusal, so a
+                // bare key can still be a shortcut without stealing typing.
+                this.fire_shortcut(k, ch);
             }
         }
+    }
+
+    fn focus_wants_tab(k: int, ch: string): bool {
+        let f = this.focused_widget();
+        if (f == null || !f.wants_tab()) { return false; }
+        if (!f.on_key(k, ch)) { return false; }
+        this.mark_dirty(f.bounds);
+        this.repaint();
+        return true;
+    }
+
+    // Keys the APP is asked about before the focused widget sees them: function
+    // keys, and Ctrl/Alt chords. Both are app-level by convention and no text
+    // field needs them, so claiming them early cannot swallow typing — while
+    // plain keys (Home, PageUp, letters) still belong to whatever has focus and
+    // only reach the app if that widget passes.
+    fn app_chord(k: int): bool {
+        if (k >= KEY_F1 && k <= KEY_F12) { return true; }
+        return (this.mods & MOD_CTRL) != 0 || (this.mods & MOD_ALT) != 0;
+    }
+
+    fn fire_shortcut(k: int, ch: string): bool {
+        if (this.onShortcut == null) { return false; }
+        if (!this.onShortcut(k, ch)) { return false; }
+        this.redraw();
+        return true;
     }
 
     fn on_mouse_ev(x: int, y: int) {
@@ -3146,7 +3392,17 @@ export class Window {
     // Set the current hover widget, dirtying the previous and new one when
     // they differ so each repaints with/without its hover overlay.
     fn set_hover(w: Widget) {
-        if (w == this.hover_w) { return; }
+        if (w == this.hover_w) {
+            // Same WIDGET, but hover inside it may still have moved: a tree row,
+            // a grid row, a calendar day. Those widgets mark themselves dirty
+            // from hit(), and invalidate() only accumulates a region — it never
+            // asks for a present — so without this the highlight changed in the
+            // back buffer and never reached the screen. The symptom is a hover
+            // that "works for a few rows and then stops": it was only ever
+            // visible when some unrelated event happened to repaint.
+            if (this.has_dirty) { this.repaint(); }
+            return;
+        }
         let old = this.hover_w;
         this.hover_w = w;
         if (old != null) {
@@ -3272,10 +3528,19 @@ export class Window {
                 if (rem < 1) { rem = 1; }
                 ev = this.surf.wait_timeout(rem);
                 last_ms = this.surf.now_ms();
+            } else if (this.poll_ids.len > 0) {
+                // Work is outstanding somewhere this window cannot be woken by,
+                // so it cannot block indefinitely — see add_poll_source. No tick
+                // and no repaint: nothing here is animating.
+                ev = this.surf.wait_timeout(16);
+                last_ms = this.surf.now_ms();
             } else {
                 ev = this.surf.wait();
                 last_ms = this.surf.now_ms(); // idle wait: don't bank the gap
             }
+            // Before dispatch, so a source that finishes work can update state
+            // the event about to be handled will read.
+            this.pump_poll_sources();
             this.mods = this.surf.mods();
             // long-press: press still held, unmoved, past the threshold.
             if (this.press_w != null && !this.dragging && !this.long_press_fired

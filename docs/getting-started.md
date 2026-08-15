@@ -252,11 +252,23 @@ Windows 10 and later ship it; Windows 7 needs KB2999226.
 
 **Parallelism**: `vyto/os/worker` builds, but it is a **re-exec pool rather than
 `fork()`** — Windows has no `fork`. Workers are the same executable relaunched
-with `VYTO_WORKER_*` in the environment, re-running `main` until they reach
-`new WorkerPool(...)` and divert into serve mode, over a loopback socket with a
-`BCryptGenRandom` token handshake. The consequence is real and worth designing
-around: **anything `main()` does before it builds the pool runs once per
-worker.** Keep setup that must happen once behind the pool's construction.
+with `VYTO_WORKER_*` in the environment, re-running `main` until they divert
+into serve mode, over a loopback socket with a `BCryptGenRandom` token
+handshake. The consequence is real and worth designing around: **anything
+`main()` does before that point runs once per worker.**
+
+The fix is one line, and it is worth taking on every platform:
+
+```vyto
+fn main() {
+    workerEntry((input) => heavyCompute(input));   // returns instantly in the parent
+    ...
+}
+```
+
+A re-launched worker serves jobs there and never returns, so nothing above it
+can run twice. It also decouples the pool from startup — build it after a window
+is open, or call `respawn()` to replace a worker that died.
 
 **Memory mapping**: `vyto/mmap` builds everywhere. POSIX `mmap` covers Linux and
 Android; Windows goes through `CreateFileMapping`/`MapViewOfFile`. One thing the

@@ -28,6 +28,32 @@
 // per worker too**, so keep side effects (printing, writing files, opening
 // listeners) after the WorkerPool is built, and keep the job closure's captured
 // state reconstructible.
+//
+// `workerEntry(job)` removes that ordering constraint. Called as the first thing
+// main() does, it serves jobs and never returns in a re-launched worker, so the
+// pool can then be built anywhere — after a window is open, or a second time to
+// replace a dead worker. Without it, a pool constructed late means every Windows
+// worker re-runs everything before it, up to and including opening a window.
+//
+//     fn main() {
+//         workerEntry((input) => heavyCompute(input));   // returns instantly in the parent
+//         ...
+//     }
+//
+// ## Affinity, and the control channel
+//
+// submit() routes to whichever worker is free, which is right for stateless
+// jobs and wrong for anything that accumulates state in the child — an open
+// connection, a transaction, a temp file. checkout() reserves a worker; every
+// submitTo() on it lands in the same process, and release() hands it back.
+//
+// Each worker also has a **control channel** beside its data channel. The data
+// channel is request/response, so a worker running a job is not reading it and
+// cannot be reached over it. Control is the way in: the parent can write to a
+// busy worker (`ctlSend`), and the child can push state out mid-job
+// (`workerControlSend`) rather than only in its result. It carries opaque bytes;
+// what they mean is the caller's business. Cancelling a long job is what it is
+// for, and it is the only mechanism that can express it.
 
 import { PollSet, POLL_READ } from "vyto/net/socket";
 import { Deque } from "vyto/coll/deque";
@@ -40,12 +66,15 @@ import { Deque } from "vyto/coll/deque";
 extern "C" {
     fn w_spawn(slot: i32): i32;
     fn w_last_pid(): i32;
+    fn w_last_ctl_fd(): i32;
     fn w_worker_channel(): i32;
+    fn w_worker_control(): i32;
     fn w_close(fd: i32);
     fn w_exit(code: i32);
     fn w_write_frame(fd: i32, buf: cstring, n: i32): i32;
     fn w_read_len(fd: i32): i32;
     fn w_read_bytes(fd: i32, buf: cstring, n: i32): i32;
+    fn w_poll_readable(fd: i32, timeoutMs: i32): i32;
     fn w_reap(pid: i32);
 }
 
@@ -57,9 +86,16 @@ export class Result {
 }
 
 export class WorkerPool {
-    fds: int[];         // parent-side socket per worker
+    // Parallel arrays, one entry per SLOT. A slot index is stable for the life
+    // of the pool: a dead worker leaves its slot in place with fds[i] == -1
+    // rather than being spliced out. That matters because checkout() hands a
+    // slot index to a caller who may hold it across many jobs — compacting the
+    // arrays under it would silently re-point that handle at another worker.
+    fds: int[];         // parent-side data socket per worker, -1 when dead
+    ctl: int[];         // parent-side control socket per worker, -1 when dead
     pids: int[];        // child pids, for reaping
     busy: bool[];       // worker i currently running a job
+    held: bool[];       // worker i reserved by checkout(), off-limits to submit()
     ticketOf: int[];    // worker i -> its running ticket (-1 when idle)
     // Backlog for when every worker is busy. Deques rather than arrays because
     // this is a FIFO: `remove_at(0)` on an array shifts every remaining entry,
@@ -68,42 +104,64 @@ export class WorkerPool {
     pendingTk: Deque<int>;     // their tickets
     nextTicket: int;
     ps: PollSet;        // internal loop for map/poll convenience
+    // Retained so respawn() can re-enter the child loop. Held as a field rather
+    // than an init parameter for exactly that reason: without it nothing in the
+    // object graph could rebuild a worker.
+    job: fn(byte[]): byte[];
 
     fn init(n: int, job: fn(byte[]): byte[]) {
         this.fds = [];
+        this.ctl = [];
         this.pids = [];
         this.busy = [];
+        this.held = [];
         this.ticketOf = [];
         this.pending = new Deque<byte[]>(16, null);
         this.pendingTk = new Deque<int>(16, 0);
         this.nextTicket = 0;
         this.ps = new PollSet();
+        this.job = job;
 
         // A re-launched worker process (Windows) arrives here holding an
         // identically-constructed `job`: it serves that instead of building a
         // pool of its own, and never returns. On fork platforms the channel is
         // only set in the child after w_spawn, so this is a no-op there.
-        let ch = w_worker_channel() as int;
-        if (ch >= 0) { runChild(ch, job); }
+        // workerEntry() does the same thing earlier, and is the better place.
+        workerEntry(job);
 
         let i = 0;
         while (i < n) {
-            let pfd = w_spawn(i as i32) as int;
-            if (pfd == 0) {
-                // fork platforms: this is the child. Serve jobs forever.
-                runChild(w_worker_channel() as int, job);
-                // runChild never returns (it _exits), so control never reaches here.
-            }
-            if (pfd > 0) {
-                this.fds.push(pfd);
-                this.pids.push(w_last_pid() as int);
-                this.busy.push(false);
-                this.ticketOf.push(-1);
-                this.ps.addFd(pfd, POLL_READ);
-            }
-            // pfd < 0: spawn failed — drop this worker and carry on
+            this.fds.push(-1);
+            this.ctl.push(-1);
+            this.pids.push(0);
+            this.busy.push(false);
+            this.held.push(false);
+            this.ticketOf.push(-1);
+            // A slot that fails to spawn stays dead rather than shrinking the
+            // pool, so respawn() can retry it later.
+            this.spawnInto(i);
             i += 1;
         }
+    }
+
+    // Fill slot `w` with a freshly spawned worker. In the forked child this
+    // never returns. False when the spawn failed.
+    fn spawnInto(w: int): bool {
+        let pfd = w_spawn(w as i32) as int;
+        if (pfd == 0) {
+            // fork platforms: this is the child. Serve jobs forever.
+            runChild(w_worker_channel() as int, w_worker_control() as int, this.job);
+            // runChild never returns (it _exits), so control never reaches here.
+        }
+        if (pfd < 0) { return false; }
+        this.fds[w] = pfd;
+        this.ctl[w] = w_last_ctl_fd() as int;
+        this.pids[w] = w_last_pid() as int;
+        this.busy[w] = false;
+        this.held[w] = false;
+        this.ticketOf[w] = -1;
+        this.ps.addFd(pfd, POLL_READ);
+        return true;
     }
 
     // Queue a job. Returns a ticket that identifies its Result. Runs
@@ -170,7 +228,7 @@ export class WorkerPool {
         let k = 0;
         while (k < inputs.len) { results.push(bytes(0)); k += 1; }
         let done = 0;
-        while (done < inputs.len && this.fds.len > 0) {
+        while (done < inputs.len && this.size() > 0) {
             let batch = this.poll(-1);
             for (let r in batch) {
                 results[r.ticket - base] = r.output;
@@ -181,31 +239,169 @@ export class WorkerPool {
     }
 
     // The parent-side worker fds — register these in your own PollSet to fold
-    // worker results into an existing event loop.
+    // worker results into an existing event loop. Dead slots are omitted, so
+    // this is a snapshot: re-read it after a retirement or a respawn.
     fn workerFds(): int[] {
         let out: int[] = [];
-        for (let f in this.fds) { out.push(f); }
+        for (let f in this.fds) { if (f >= 0) { out.push(f); } }
         return out;
     }
 
-    fn size(): int { return this.fds.len; }
+    // Live workers. `slots()` counts dead ones too, and is what indexes the
+    // checkout/submitTo/respawn family.
+    fn size(): int {
+        let n = 0;
+        for (let f in this.fds) { if (f >= 0) { n += 1; } }
+        return n;
+    }
+    fn slots(): int { return this.fds.len; }
+    fn alive(w: int): bool { return w >= 0 && w < this.fds.len && this.fds[w] >= 0; }
     fn pendingCount(): int { return this.pending.len(); }
+
+    // ---- affinity ---------------------------------------------------------
+
+    // Reserve a worker. Its slot index is stable for the pool's life and every
+    // submitTo() on it runs in the same process, so state built by one job — an
+    // open connection, a transaction, a temp table — is still there for the
+    // next. submit() will not route to it until release(). -1 if none is free.
+    fn checkout(): int {
+        let i = 0;
+        while (i < this.fds.len) {
+            if (this.fds[i] >= 0 && !this.held[i] && !this.busy[i]) {
+                this.held[i] = true;
+                return i;
+            }
+            i += 1;
+        }
+        return -1;
+    }
+
+    // Hand a reserved worker back to the general pool. Its state goes with it —
+    // the next job to land there inherits whatever the last one left behind.
+    fn release(w: int) {
+        if (w < 0 || w >= this.held.len) { return; }
+        this.held[w] = false;
+        if (!this.busy[w] && this.fds[w] >= 0) { this.drainOne(w); }
+    }
+
+    // Queue a job on one specific worker, held or not. Returns its ticket, or
+    // -1 if the slot is dead or already running something: a pinned worker runs
+    // one job at a time by construction, and silently queueing behind the
+    // current one would hide that from a caller who needs the ordering.
+    fn submitTo(w: int, input: byte[]): int {
+        if (w < 0 || w >= this.fds.len) { return -1; }
+        if (this.fds[w] < 0 || this.busy[w]) { return -1; }
+        let tk = this.nextTicket;
+        this.nextTicket += 1;
+        this.dispatch(w, tk, input);
+        return tk;
+    }
+
+    // Kill a worker outright and mark its slot dead. The blunt instrument: it
+    // ends whatever the child was doing, and everything that child held —
+    // connection, transaction, cursor — dies with it. Prefer telling the job to
+    // stop over its control channel; reach for this when it will not.
+    fn kill(w: int) {
+        if (w < 0 || w >= this.fds.len || this.fds[w] < 0) { return; }
+        this.retire(w);
+    }
+
+    // Rebuild a dead slot with a fresh worker. False if the slot is still alive
+    // or the spawn failed. The new child is a copy of THIS process as it is now,
+    // not as it was at startup — on fork platforms that means it must not be
+    // holding anything the child would inherit and misuse (an X connection, a
+    // half-written file). It is also a fork from a process that may since have
+    // become multi-threaded, which is only safe while the child does nothing but
+    // read its channel and run the job.
+    fn respawn(w: int): bool {
+        if (w < 0 || w >= this.fds.len) { return false; }
+        if (this.fds[w] >= 0) { return false; }
+        return this.spawnInto(w);
+    }
+
+    // ---- control channel --------------------------------------------------
+
+    // The parent-side control fd for a worker, or -1. Poll it for readability to
+    // learn the child has sent something; the data fd says nothing about it.
+    fn ctlFd(w: int): int {
+        if (w < 0 || w >= this.ctl.len) { return -1; }
+        return this.ctl[w];
+    }
+    fn ctlFds(): int[] {
+        let out: int[] = [];
+        for (let f in this.ctl) { if (f >= 0) { out.push(f); } }
+        return out;
+    }
+
+    // Send opaque bytes to a worker, running or idle. This is the only channel a
+    // busy worker can be reached on.
+    fn ctlSend(w: int, b: byte[]): bool {
+        let fd = this.ctlFd(w);
+        if (fd < 0) { return false; }
+        return w_write_frame(fd as i32, b as cstring, b.len as i32) as int == 0;
+    }
+
+    // Whether a control message from worker `w` is waiting.
+    fn ctlReady(w: int): bool { return this.ctlWait(w, 0); }
+
+    // Wait up to timeoutMs for one (0 polls, negative blocks). For a caller
+    // without an event loop to fold ctlFds() into.
+    fn ctlWait(w: int, timeoutMs: int): bool {
+        let fd = this.ctlFd(w);
+        if (fd < 0) { return false; }
+        return w_poll_readable(fd as i32, timeoutMs as i32) as int == 1;
+    }
+
+    // Every worker with a control message waiting. One syscall per live worker,
+    // which is the right shape for a pool of a handful; a pool of hundreds
+    // should register ctlFds() in its own PollSet instead.
+    fn ctlPending(): int[] {
+        let out: int[] = [];
+        let i = 0;
+        while (i < this.ctl.len) {
+            if (this.ctlReady(i)) { out.push(i); }
+            i += 1;
+        }
+        return out;
+    }
+
+    // Read one control message. Null when the slot is dead or the child closed
+    // its end. Call only after ctlReady/ctlPending says there is one: readable
+    // means a frame has begun, and this reads it to the end.
+    fn ctlRecv(w: int): byte[] {
+        let fd = this.ctlFd(w);
+        if (fd < 0) { return null; }
+        let len = w_read_len(fd as i32) as int;
+        if (len < 0) { return null; }
+        let buf = bytes(len);
+        if (len > 0) {
+            if (w_read_bytes(fd as i32, buf as cstring, len as i32) as int != 0) { return null; }
+        }
+        return buf;
+    }
+
+    // ---- internals --------------------------------------------------------
 
     fn dispatch(w: int, tk: int, input: byte[]) {
         this.busy[w] = true;
         this.ticketOf[w] = tk;
         w_write_frame(this.fds[w] as i32, input as cstring, input.len as i32);
     }
-    // Remove a dead worker: close + reap it and drop it from every parallel
-    // array so freeWorker/dispatch never route a job to a corpse.
+    // Retire a dead (or killed) worker: close both channels, reap it, and mark
+    // the slot dead IN PLACE so freeWorker/dispatch never route a job to a
+    // corpse. The slot is not removed — see the field comment: indices handed
+    // out by checkout() have to stay meaning the same worker.
     fn retire(w: int) {
         this.ps.removeFd(this.fds[w]);
         w_close(this.fds[w] as i32);
+        w_close(this.ctl[w] as i32);
         w_reap(this.pids[w] as i32);
-        this.fds.remove_at(w);
-        this.pids.remove_at(w);
-        this.busy.remove_at(w);
-        this.ticketOf.remove_at(w);
+        this.fds[w] = -1;
+        this.ctl[w] = -1;
+        this.pids[w] = 0;
+        this.busy[w] = false;
+        this.held[w] = false;
+        this.ticketOf[w] = -1;
     }
     fn drainOne(w: int) {
         if (!this.pending.is_empty()) {
@@ -216,10 +412,14 @@ export class WorkerPool {
     }
     fn freeWorker(): int {
         let i = 0;
-        while (i < this.busy.len) { if (!this.busy[i]) { return i; } i += 1; }
+        while (i < this.busy.len) {
+            if (this.fds[i] >= 0 && !this.busy[i] && !this.held[i]) { return i; }
+            i += 1;
+        }
         return -1;
     }
     fn workerOf(fd: int): int {
+        if (fd < 0) { return -1; }
         let i = 0;
         while (i < this.fds.len) { if (this.fds[i] == fd) { return i; } i += 1; }
         return -1;
@@ -228,16 +428,66 @@ export class WorkerPool {
     deinit {
         // Closing the parent fd makes each child hit EOF and _exit; reap them.
         let i = 0;
-        while (i < this.fds.len) { w_close(this.fds[i] as i32); i += 1; }
+        while (i < this.fds.len) {
+            w_close(this.fds[i] as i32);
+            w_close(this.ctl[i] as i32);
+            i += 1;
+        }
         i = 0;
         while (i < this.pids.len) { w_reap(this.pids[i] as i32); i += 1; }
     }
 }
 
+// Serve jobs if this process was launched as a worker, otherwise return at once.
+// Call it as the FIRST thing main() does: on Windows a worker is this executable
+// re-launched, so everything main() runs before this point runs once per worker
+// too. Getting that wrong is not subtle — a pool built after a window opens
+// means every worker opens a window.
+//
+// It also decouples spawning from startup, which is what lets respawn() replace
+// a worker at any point in the program's life.
+export fn workerEntry(job: fn(byte[]): byte[]) {
+    let ch = w_worker_channel() as int;
+    if (ch >= 0) { runChild(ch, w_worker_control() as int, job); }
+}
+
+// ---- child-side control channel -------------------------------------------
+// These are for use INSIDE a job, in the worker process. In the parent they all
+// no-op, because there is no control channel to a process that has none.
+
+// This worker's control fd, or -1 in the parent. Hand it to something that has
+// to watch for a signal without going back through Vyto — a C progress callback
+// polling for "stop" is the motivating case.
+export fn workerControlFd(): int { return w_worker_control() as int; }
+
+// Push bytes to the parent mid-job. The result frame reports what a job
+// produced; this reports what it is DOING, at the moment it starts doing it —
+// state the parent may need before the job can possibly finish.
+export fn workerControlSend(b: byte[]): bool {
+    let fd = w_worker_control() as int;
+    if (fd < 0) { return false; }
+    return w_write_frame(fd as i32, b as cstring, b.len as i32) as int == 0;
+}
+
+// Read one control message from the parent, waiting up to timeoutMs (0 polls,
+// negative blocks). Null when nothing arrived, or the channel is gone.
+export fn workerControlRecv(timeoutMs: int): byte[] {
+    let fd = w_worker_control() as int;
+    if (fd < 0) { return null; }
+    if (w_poll_readable(fd as i32, timeoutMs as i32) as int != 1) { return null; }
+    let len = w_read_len(fd as i32) as int;
+    if (len < 0) { return null; }
+    let buf = bytes(len);
+    if (len > 0) {
+        if (w_read_bytes(fd as i32, buf as cstring, len as i32) as int != 0) { return null; }
+    }
+    return buf;
+}
+
 // The child side: read a job frame, run it, write the result frame, repeat
 // until the parent closes the socket. Never returns — _exits so the child never
 // falls back into caller code.
-fn runChild(fd: int, job: fn(byte[]): byte[]) {
+fn runChild(fd: int, ctlFd: int, job: fn(byte[]): byte[]) {
     while (true) {
         let n = w_read_len(fd as i32) as int;
         if (n < 0) { break; } // parent closed (EOF) or error
@@ -248,5 +498,6 @@ fn runChild(fd: int, job: fn(byte[]): byte[]) {
         let out = job(input);
         if (w_write_frame(fd as i32, out as cstring, out.len as i32) as int != 0) { break; }
     }
+    w_close(ctlFd as i32);
     w_exit(0 as i32);
 }

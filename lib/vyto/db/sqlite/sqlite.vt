@@ -63,6 +63,10 @@ extern "C" {
     fn vdb_changes(db: rawptr): i32;
     fn vdb_exec(db: rawptr, sql: cstring): i32;
     fn vdb_busy_timeout(db: rawptr, ms: i32): i32;
+    fn vdb_interrupt(db: rawptr);
+    fn vdb_set_cancel_fd(db: rawptr, fd: i32): i32;
+    fn vdb_cancel_pending(db: rawptr): i32;
+    fn vdb_clear_cancel(db: rawptr);
 }
 
 // Two-pass read of a buffer-filling shim call: ask, and if the answer did not
@@ -242,6 +246,43 @@ export class SqliteConn extends Conn {
 
     override fn inTx(): bool { return this.txOpen; }
     override fn setInTx(v: bool) { this.txOpen = v; }
+
+    // ---- cancellation -----------------------------------------------------
+    //
+    // SQLite runs a query to completion inside step(), and Vyto has no threads,
+    // so nothing in this process can interrupt it from the outside. What CAN is
+    // a file descriptor: `watchCancel` installs a progress handler in the shim
+    // that polls one every few thousand VM instructions and aborts the statement
+    // the moment it becomes readable. Point it at a pipe fed by whoever wants to
+    // cancel — the worker control channel is exactly this — and a long scan
+    // becomes interruptible from another process.
+    //
+    // A cancelled statement fails with DBERR_CANCELLED. The connection is
+    // untouched and any open transaction is still open: this ends a statement,
+    // not a session. Call `clearCancel()` before running the next one.
+    fn watchCancel(fd: int): bool {
+        if (this.h == null) { return false; }
+        return vdb_set_cancel_fd(this.h, fd as i32) as int == 0;
+    }
+    fn stopWatchingCancel() {
+        if (this.h != null) { vdb_set_cancel_fd(this.h, -1 as i32); }
+    }
+    // Whether the last statement stopped because it was asked to.
+    fn cancelled(): bool {
+        if (this.h == null) { return false; }
+        return vdb_cancel_pending(this.h) as int == 1;
+    }
+    // Release the latch. Until this is called every statement aborts at once —
+    // deliberately, so a cancel cannot be half-observed.
+    fn clearCancel() {
+        if (this.h != null) { vdb_clear_cancel(this.h); }
+    }
+    // Direct interrupt. Only reaches a query if called while another thread is
+    // inside step(), which is not something Vyto can arrange on its own — it is
+    // here for a caller that can (a signal handler, an embedder's thread).
+    fn interrupt() {
+        if (this.h != null) { vdb_interrupt(this.h); }
+    }
 
     // The statement cache. Keyed on the SQL text, holding the statements
     // strongly — and the statements hold NO reference back, which is what keeps

@@ -35,6 +35,7 @@
 #define VDB_ERR_CLOSED      5
 #define VDB_ERR_UNSUPPORTED 6
 #define VDB_ERR_MISUSE      7
+#define VDB_ERR_CANCELLED   8
 
 /* Step outcomes, mirroring STEP_* in driver.vt. */
 #define VDB_STEP_ROW  0
@@ -75,11 +76,28 @@ long long  vdb_last_insert_rowid(void *db)          { (void)db; return 0; }
 int        vdb_changes(void *db)                    { (void)db; return 0; }
 int        vdb_exec(void *db, const char *sql)      { (void)db; (void)sql; return -1; }
 int        vdb_busy_timeout(void *db, int ms)       { (void)db; (void)ms; return -1; }
+void       vdb_interrupt(void *db)                  { (void)db; }
+int        vdb_set_cancel_fd(void *db, int fd)      { (void)db; (void)fd; return -1; }
+int        vdb_cancel_pending(void *db)             { (void)db; return 0; }
+void       vdb_clear_cancel(void *db)               { (void)db; }
 
 #else
 
 #include "sqlite3/sqlite3.h"
 #include <string.h>
+
+#include <stdint.h>
+#ifdef _WIN32
+#include <winsock2.h>
+#else
+#include <poll.h>
+#include <unistd.h>
+#include <errno.h>
+#endif
+
+/* Defined at the bottom with the rest of the cancellation machinery; vdb_close
+ * needs it early to release the connection's slot. */
+int vdb_set_cancel_fd(void *db, int fd);
 
 /* SQLite result code -> our class. Extended codes carry the base in the low
  * byte, so mask before comparing: SQLITE_CONSTRAINT_UNIQUE is 2067, and a
@@ -91,6 +109,10 @@ static int vdb_map_err(int rc) {
         case SQLITE_ROW:
         case SQLITE_DONE:       return VDB_ERR_NONE;
         case SQLITE_CONSTRAINT: return VDB_ERR_CONSTRAINT;
+        /* Both routes to a stopped statement land here — sqlite3_interrupt and a
+         * progress handler returning non-zero raise the same code — so one
+         * mapping covers both. NOT busy: nobody should retry this. */
+        case SQLITE_INTERRUPT:  return VDB_ERR_CANCELLED;
         case SQLITE_BUSY:
         case SQLITE_LOCKED:     return VDB_ERR_BUSY;
         case SQLITE_CANTOPEN:
@@ -131,6 +153,10 @@ void *vdb_open(const char *path, int readonly, int create) {
  * handle outright. */
 int vdb_close(void *db) {
     if (!db) return 0;
+    /* Release the cancel slot first: the table is keyed by handle address, and
+     * a later connection allocated at the same address would otherwise inherit
+     * this one's latch and abort its first statement. */
+    vdb_set_cancel_fd(db, -1);
     return sqlite3_close_v2((sqlite3 *)db) == SQLITE_OK ? 0 : -1;
 }
 
@@ -318,6 +344,137 @@ int vdb_exec(void *db, const char *sql) {
 int vdb_busy_timeout(void *db, int ms) {
     if (!db) return -1;
     return sqlite3_busy_timeout((sqlite3 *)db, ms) == SQLITE_OK ? 0 : -1;
+}
+
+/* ---- cancellation --------------------------------------------------------
+ *
+ * SQLite has no timeout and no "stop this query" message: a long scan runs to
+ * completion inside sqlite3_step, and the calling thread is inside that call.
+ * There are exactly two ways out, and this exposes both.
+ *
+ * sqlite3_interrupt is the direct one, but it has to be called from ANOTHER
+ * thread while step() is running — which a language with no threads cannot do.
+ * It is still exported here for the case where it can be reached (a signal
+ * handler, a second entry point into the same process).
+ *
+ * The usable one is a progress handler: SQLite calls it every N virtual-machine
+ * instructions, and a non-zero return aborts the statement with SQLITE_INTERRUPT.
+ * That gives a running query somewhere to check for "stop" — and since the
+ * checker lives here in C, it can watch a file descriptor without the query ever
+ * returning to Vyto. Point that fd at a pipe from whoever wants to cancel (the
+ * parent process, over a worker's control channel) and a query becomes
+ * interruptible from outside the process running it.
+ *
+ * The signal is LATCHED, and this is not incidental. The byte on the fd is
+ * consumed on the first sighting; without that it stays readable forever and
+ * every subsequent statement on the connection would abort the moment it began.
+ * Clearing the latch is the caller's explicit act, so a cancel ends exactly one
+ * statement and the connection stays usable — which is the whole reason to
+ * cancel a query rather than kill the process running it. */
+
+/* Roughly every 20k VM instructions: sub-millisecond in practice, while keeping
+ * the poll syscall far off the hot path. */
+#define VDB_PROGRESS_OPS 20000
+#define VDB_CANCEL_SLOTS 16
+
+typedef struct {
+    void *db;       /* which connection, or NULL for a free slot */
+    int   fd;       /* watched for readability; -1 disables */
+    int   flagged;  /* latch: seen, consumed, still in force */
+} vdb_cancel;
+
+static vdb_cancel g_cancel[VDB_CANCEL_SLOTS];
+
+static vdb_cancel *vdb_cancel_find(void *db) {
+    for (int i = 0; i < VDB_CANCEL_SLOTS; i++) {
+        if (g_cancel[i].db == db) return &g_cancel[i];
+    }
+    return 0;
+}
+
+/* 1 = readable, 0 = not, and any error reads as "not" so a broken pipe cannot
+ * masquerade as a cancel and abort every query on the connection. */
+static int vdb_readable(int fd) {
+    if (fd < 0) return 0;
+#ifdef _WIN32
+    fd_set rf;
+    struct timeval tv;
+    FD_ZERO(&rf);
+    FD_SET((SOCKET)(intptr_t)fd, &rf);
+    tv.tv_sec = 0;
+    tv.tv_usec = 0;
+    return select(0, &rf, 0, 0, &tv) > 0 ? 1 : 0;
+#else
+    struct pollfd p;
+    int rc;
+    p.fd = fd;
+    p.events = POLLIN;
+    p.revents = 0;
+    do { rc = poll(&p, 1, 0); } while (rc < 0 && errno == EINTR);
+    return rc > 0 ? 1 : 0;
+#endif
+}
+
+static void vdb_drain(int fd) {
+    char sink[64];
+#ifdef _WIN32
+    recv((SOCKET)(intptr_t)fd, sink, (int)sizeof sink, 0);
+#else
+    ssize_t r;
+    do { r = read(fd, sink, sizeof sink); } while (r < 0 && errno == EINTR);
+#endif
+}
+
+static int vdb_progress(void *p) {
+    vdb_cancel *c = (vdb_cancel *)p;
+    if (!c) return 0;
+    if (c->flagged) return 1;
+    if (vdb_readable(c->fd)) {
+        vdb_drain(c->fd);
+        c->flagged = 1;
+        return 1;
+    }
+    return 0;
+}
+
+/* Ask SQLite to abandon whatever `db` is running. Only does anything when
+ * called while another thread is inside step(); see the note above. */
+void vdb_interrupt(void *db) {
+    if (db) sqlite3_interrupt((sqlite3 *)db);
+}
+
+/* Watch `fd` for a cancel signal on this connection. fd < 0 removes the handler.
+ * 0 on success, -1 if the table is full (or db is null). */
+int vdb_set_cancel_fd(void *db, int fd) {
+    if (!db) return -1;
+    vdb_cancel *c = vdb_cancel_find(db);
+    if (fd < 0) {
+        if (c) {
+            sqlite3_progress_handler((sqlite3 *)db, 0, 0, 0);
+            c->db = 0; c->fd = -1; c->flagged = 0;
+        }
+        return 0;
+    }
+    if (!c) c = vdb_cancel_find(0);
+    if (!c) return -1;
+    c->db = db;
+    c->fd = fd;
+    c->flagged = 0;
+    sqlite3_progress_handler((sqlite3 *)db, VDB_PROGRESS_OPS, vdb_progress, c);
+    return 0;
+}
+
+/* Whether the latch is set — i.e. whether the last statement stopped because
+ * someone asked, rather than because it failed. */
+int vdb_cancel_pending(void *db) {
+    vdb_cancel *c = vdb_cancel_find(db);
+    return (c && c->flagged) ? 1 : 0;
+}
+
+/* Release the latch so the connection accepts statements again. */
+void vdb_clear_cancel(void *db) {
+    vdb_cancel *c = vdb_cancel_find(db);
+    if (c) c->flagged = 0;
 }
 
 #endif /* VT_NO_LIBC */

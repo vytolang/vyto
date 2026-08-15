@@ -665,6 +665,28 @@ long ct_cell_str(void *h, long vrow, int col, char *buf, long cap) {
     return snprintf(buf, (size_t)cap, "%g", cell_num(c, row));
 }
 
+/* The full formatted byte length of a cell, without writing it anywhere.
+   ct_cell_str truncates to the caller's buffer — correct for a rendered cell,
+   which is clipped to a column anyway — so a caller that needs the WHOLE value
+   (a value viewer, a CSV export, the clipboard) asks for the length first and
+   sizes its buffer to it. A null cell is 0, the same as ct_cell_str writes. */
+long ct_cell_len(void *h, long vrow, int col) {
+    CT *t = (CT *)h;
+    if (!t || vrow < 0 || vrow >= t->vlen || col < 0 || col >= t->ncol) return 0;
+    int64_t row = t->idx[vrow];
+    Col *c = &t->cols[col];
+    if (col_is_null(c, row)) return 0;
+    if (c->kind == CT_STR) return (long)c->slen[row];
+    if (c->kind == CT_CAT) { int32_t l; cat_str(c, row, &l); return (long)l; }
+    if (c->kind == CT_BOOL) return ((uint8_t *)c->data)[row] ? 4 : 5;
+    {
+        char buf[64];
+        if (kind_is_int(c->kind))
+            return (long)snprintf(buf, sizeof buf, "%lld", (long long)cell_num(c, row));
+        return (long)snprintf(buf, sizeof buf, "%g", cell_num(c, row));
+    }
+}
+
 long long ct_cell_i64(void *h, long vrow, int col) {
     CT *t = (CT *)h;
     if (!t || vrow < 0 || vrow >= t->vlen || col < 0 || col >= t->ncol) return 0;
@@ -802,12 +824,32 @@ void ct_filter_i64(void *h, int col, int op, long long operand) {
     ct_filter_f64(h, col, op, (double)operand);
 }
 
-/* case-sensitive substring (returns 1 if `needle` occurs in [p,p+n)). */
+/* ASCII lower-case. Deliberately ASCII-only: a real Unicode fold needs case
+   tables (and for Turkish, a locale), which is vyto/intl's job and not something
+   a filter over a million rows should be paying for per byte. Non-ASCII bytes
+   pass through untouched, so UTF-8 text still matches exactly. */
+static unsigned char lc(unsigned char c) {
+    return (c >= 'A' && c <= 'Z') ? (unsigned char)(c + 32) : c;
+}
+
+static int mem_eq_ci(const char *a, const char *b, int32_t n) {
+    for (int32_t i = 0; i < n; i++) {
+        if (lc((unsigned char)a[i]) != lc((unsigned char)b[i])) return 0;
+    }
+    return 1;
+}
+
+/* Case-INSENSITIVE substring (returns 1 if `needle` occurs in [p,p+n)).
+   Searching a grid is a "find it" gesture, not a regex: a user typing `orders`
+   and being shown nothing because the value is `Orders` reads as a broken
+   search box, and every other tool folds case here. Exact-case matching is
+   still available through a filter with op 0 (equals). */
 static int mem_contains(const char *p, int32_t n, const char *needle, int32_t nn) {
     if (nn == 0) return 1;
     if (nn > n) return 0;
+    unsigned char n0 = lc((unsigned char)needle[0]);
     for (int32_t i = 0; i + nn <= n; i++) {
-        if (p[i] == needle[0] && memcmp(p + i, needle, (size_t)nn) == 0) return 1;
+        if (lc((unsigned char)p[i]) == n0 && mem_eq_ci(p + i, needle, nn)) return 1;
     }
     return 0;
 }
@@ -826,6 +868,8 @@ void ct_filter_str(void *h, int col, int op, const char *needle) {
         int32_t n;
         if (c->kind == CT_CAT) { p = cat_str(c, row, &n); }
         else { p = c->arena + c->soff[row]; n = c->slen[row]; }
+        /* equals stays EXACT (it is the "this value, precisely" filter);
+           contains folds case, like the search box. */
         int hit = (op == 0) ? (n == nn && memcmp(p, needle, (size_t)nn) == 0)
                             : mem_contains(p, n, needle, nn);
         if (hit) t->idx[w++] = row;
@@ -834,7 +878,8 @@ void ct_filter_str(void *h, int col, int op, const char *needle) {
 }
 
 /* global text search: keep a row if `needle` occurs in ANY column's text
-   (string arena, or the snprintf'd form of a scalar). Case-sensitive. */
+   (string arena, or the snprintf'd form of a scalar). Case-insensitive over
+   ASCII — see mem_contains. */
 void ct_search(void *h, const char *needle) {
     CT *t = (CT *)h;
     if (!t || !needle) return;

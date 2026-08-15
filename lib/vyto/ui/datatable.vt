@@ -15,12 +15,14 @@
 // formatted on demand from the engine), and does its sort/filter natively — so
 // it does not fall over as the row/column counts grow.
 
-import { Widget, Painter, Theme, Size } from "vyto/ui/core";
+import { Widget, Painter, Theme, Size, CaretBlink } from "vyto/ui/core";
+import { utf8_prev, utf8_next } from "vyto/util/helper";
 import { SearchField } from "vyto/ui/form";
 import { Menu, MenuPopup } from "vyto/ui/menu";
 import { Rect, contains, mix, KEY_UP, KEY_DOWN, KEY_HOME, KEY_END,
          KEY_LEFT, KEY_RIGHT, KEY_ENTER, KEY_BACKSPACE, KEY_ESC,
-         KEY_PAGEUP, KEY_PAGEDOWN, MOD_SHIFT, MOD_CTRL } from "vyto/surface";
+         KEY_PAGEUP, KEY_PAGEDOWN, KEY_DELETE, KEY_TAB,
+         MOD_SHIFT, MOD_CTRL } from "vyto/surface";
 import { DataFrame, CK_STR, CK_CAT, CK_BOOL, CK_F64, CK_F32,
          OP_EQ, OP_LT, OP_LE, OP_GT, OP_GE, OP_CONTAINS,
          AGG_SUM, AGG_MIN, AGG_MAX, AGG_AVG, AGG_COUNT } from "vyto/data/frame";
@@ -40,6 +42,21 @@ const VR_DATA: int = 0;      // a data row (vr_row = view index)
 const VR_GROUP: int = 1;     // a group header (vr_row = first view index, vr_gend = end)
 const VR_DETAIL: int = 2;    // a row's expanded detail panel (vr_row = view index)
 
+// The leading bytes of a cell, for width measurement only.
+//
+// A fit pass measures `sample` rows x every column, and a text cell can hold a
+// 4 KB JSON blob — shaping that to find a width no column will ever be given is
+// pure waste. 256 bytes is far past any sane max_w at any font size, and the
+// cut backs off UTF-8 continuation bytes so a multi-byte glyph is never split.
+const FIT_MEASURE_CAP: int = 256;
+
+fn measure_head(s: string): string {
+    if (s.len <= FIT_MEASURE_CAP) { return s; }
+    let n = FIT_MEASURE_CAP;
+    while (n > 0 && (s[n] & 0xC0) == 0x80) { n = n - 1; }
+    return s.slice(0, n);
+}
+
 // One rendered column: a fixed pixel `width`, text `align` (0/1/2 = L/C/R), and
 // the source `col` index into the DataFrame.
 export class DtColumn {
@@ -51,6 +68,11 @@ export class DtColumn {
     visible: bool;      // hidden columns take zero width and are skipped
     min_w: float;       // floor for interactive resize
     filter_text: string; // raw text in this column's inline filter box
+    // A muted annotation drawn after the header text — a source type, a unit,
+    // anything about the column rather than in it. Deliberately NOT part of
+    // `title`: exportCsv writes titles as the CSV header row, so folding this
+    // into the title would put it in the exported data. "" draws nothing.
+    type_tag: string;
     // Optional custom cell text: (df, vrow, dfcol) → string. Null = the engine's
     // formatted cellStr. Use for currency / dates / percentages / any per-column
     // presentation the raw value doesn't carry.
@@ -68,6 +90,7 @@ export class DtColumn {
         this.visible = true;
         this.min_w = 40;
         this.filter_text = "";
+        this.type_tag = "";
     }
 }
 
@@ -123,7 +146,32 @@ export class DataTable extends Widget {
     sel_set: int[];     // multi-selection: source rows (empty = only `selected`)
     onSelect: fn(int);  // called with the selected visible-row index
     onActivate: fn(int); // double-click / Enter on a row (visible-row index)
+    // The focused cell moved: (visible row, rendered column position). Fires
+    // only while cell_focus is on, and only when both coordinates are real —
+    // a value viewer has nothing to show for "no row selected".
+    onCell: fn(int, int);
+    // Right-click on a header: (rendered column position, absolute x, y).
+    onHeaderContext: fn(int, int, int);
+    // Right-click on a body cell: (visible row, rendered column position, x, y).
+    // The row is selected and the cell cursor moved there first — a menu must
+    // act on what it points at.
+    onCellContext: fn(int, int, int, int);
+    // Selected COLUMNS, as rendered positions. Independent of the row
+    // selection: a grid is a table, and "these three columns" is as real a
+    // thing to want as "these three rows" — copying a key column out, or
+    // eyeballing two figures side by side without the twelve between them.
+    col_sel: int[];
+    // The USER changed the sort (header click). Reads `sort_cols`/`sort_dirs`
+    // rather than taking arguments, so a multi-key sort arrives whole. The
+    // widget has already sorted the rows it holds; this exists for an owner
+    // whose frame is one page of something larger, where sorting the page is
+    // not sorting the data. sortColumn() does NOT fire it — a programmatic
+    // sort is the owner's own doing, and re-firing would recurse.
+    onSort: fn();
     search: SearchField;
+    // An optional app widget beside the search box — a scope selector, a mode
+    // switch. Null (the default) leaves the header exactly as it was.
+    search_accessory: Widget;
     // presentation toggles
     zebra: bool;        // alternating row background
     grid: bool;         // vertical column dividers
@@ -134,6 +182,19 @@ export class DataTable extends Widget {
     // interactive column-op state (header drag): resize a column by its right
     // edge, or reorder by dragging its body. press_idx defers a header click to
     // release so a drag can pre-empt the sort.
+    // One-shot fit-to-content, armed by fitOnRender(). It has to happen inside
+    // render() because measuring text needs the live Painter, and a caller
+    // building a grid has no painter yet — the widths would otherwise stay at
+    // autoColumns()'s 90/160/70 guesses whatever the data actually is.
+    fit_rows: int;      // rows to sample, 0 = disabled
+    fit_max_w: float;   // ceiling for any one column
+    fit_done: bool;
+
+    // Appended to the footer's row count. For a total the widget cannot know:
+    // the frame holds one page, and how many rows the *server* has — or which
+    // page this is — is the caller's fact, not the grid's. "" appends nothing.
+    footer_note: string;
+
     resize_idx: int;    // column position being resized, -1
     press_idx: int;     // header column pending sort on release, -1
     drag_col: int;      // column position being reordered, -1
@@ -144,6 +205,8 @@ export class DataTable extends Widget {
     checkboxes: bool;   // show a leading checkbox selection gutter
     filter_row: bool;   // show the inline per-column filter row
     filter_edit: int;   // column position whose filter box is being edited, -1
+    filt_caret: int;    // byte offset of the caret within that box's text
+    filt_blink: CaretBlink;
     highlight_search: bool; // underline/behind-fill the matched substring in cells
     totals_row: bool;   // pinned aggregate row above the footer
     // cell cursor + inline cell editing
@@ -192,12 +255,17 @@ export class DataTable extends Widget {
         this.aggs = [];
         this.agg_col = -1;
         this.sel_set = [];
+        this.col_sel = [];
         this.zebra = true;
         this.grid = true;
         this.na_text = "–";
         this.loading = false;
         this.empty_text = "No rows";
         this.empty_filtered = "No matches";
+        this.fit_rows = 0;
+        this.fit_max_w = 0.0;
+        this.fit_done = false;
+        this.footer_note = "";
         this.resize_idx = -1;
         this.press_idx = -1;
         this.drag_col = -1;
@@ -207,6 +275,8 @@ export class DataTable extends Widget {
         this.checkboxes = false;
         this.filter_row = false;
         this.filter_edit = -1;
+        this.filt_caret = 0;
+        this.filt_blink = new CaretBlink();
         this.highlight_search = true;
         this.totals_row = false;
         this.cell_focus = false;
@@ -233,6 +303,7 @@ export class DataTable extends Widget {
         this.add_scrollbar(SIDE_BOTTOM);   // horizontal, snaps to the bottom
         this.search = new SearchField("Search");
         this.add(this.search);
+        this.search_accessory = null;
         let self = this;
         this.search.onChange = (q) => { self.set_query(q); };
         this.autoColumns();
@@ -252,6 +323,57 @@ export class DataTable extends Widget {
             let c = new DtColumn(this.df.colName(i), w, i);
             if (!text && k != CK_BOOL) { c.align = 2; } // numerics right-aligned
             this.cols.push(c);
+        }
+        this.rebuild_colx();
+    }
+
+    // ---- fit to content ----------------------------------------------------
+
+    // Size every visible column to the widest of its header and the first
+    // `sample` rows, capped at `max_w`. Runs once, on the next render, because
+    // measuring text needs a live Painter.
+    //
+    // autoColumns() has to guess — 160px for text, 90 for a number — since it
+    // runs at construction with no metrics available. That guess is right for a
+    // synthetic demo and wrong for real data, where an id column wastes half
+    // its width and a URL column overflows.
+    //
+    // `sample` bounds the cost: the whole point of this widget is that a
+    // million rows are affordable, and measuring a million cells is not.
+    // Columns stay resizable afterwards; this only picks the starting width.
+    fn fitOnRender(sample: int, max_w: float) {
+        this.fit_rows = sample;
+        this.fit_max_w = max_w;
+        this.fit_done = false;
+        this.invalidate();
+    }
+
+    fn fitColumns(s: Painter, sample: int, max_w: float) {
+        let n = this.df.viewLen();
+        if (sample > n) { sample = n; }
+        for (let i in 0..this.cols.len) {
+            let c = this.cols[i];
+            if (!c.visible) { continue; }
+            // The header is drawn BOLD (draw() sets weight 2 around it) and a
+            // bold string is several percent wider — measure it that way or
+            // every fitted column is a little too tight for its own title.
+            // +26 leaves room for the sort arrow the header may draw.
+            s.set_weight(2);
+            let w = s.text_width(c.title) + 26.0;
+            s.set_weight(0);
+            // +12: the gap the tag needs from the title, or it is drawn at a
+            // width the fit itself made too tight and then dropped. The tag
+            // draws at the normal weight, so it is measured at that one.
+            if (c.type_tag != "") { w += s.text_width(c.type_tag) + 12.0; }
+            let r = 0;
+            while (r < sample) {
+                let tw = s.text_width(measure_head(this.cell_text(r, c))) + 16.0;
+                if (tw > w) { w = tw; }
+                r += 1;
+            }
+            if (w > max_w) { w = max_w; }
+            if (w < c.min_w) { w = c.min_w; }
+            c.width = w;
         }
         this.rebuild_colx();
     }
@@ -514,23 +636,83 @@ export class DataTable extends Widget {
 
     // Key handling while a filter box has focus. Returns true (swallows the key)
     // for the whole editing session.
+    // A filter box is a text field, so it edits like one: a caret you can move,
+    // and insertion where the caret is. It used to append and backspace off the
+    // end only — fine for typing a word once, useless for fixing the `>` in
+    // `>1000` without retyping the number.
     fn edit_filter_key(k: int, ch: string): bool {
         let c = this.cols[this.filter_edit];
-        if (k == KEY_ENTER) { this.filter_edit = -1; this.invalidate(); return true; }
-        if (k == KEY_ESC) { c.filter_text = ""; this.apply_filter_text(this.filter_edit); this.filter_edit = -1; this.invalidate(); return true; }
+        let t = c.filter_text;
+        this.filt_blink.wake();
+        if (this.filt_caret > t.len) { this.filt_caret = t.len; }
+
+        if (k == KEY_ENTER) { this.stop_filter_edit(); return true; }
+        if (k == KEY_ESC) {
+            c.filter_text = "";
+            this.apply_filter_text(this.filter_edit);
+            this.stop_filter_edit();
+            return true;
+        }
+        if (k == KEY_LEFT) {
+            if (this.filt_caret > 0) { this.filt_caret = utf8_prev(t, this.filt_caret); }
+            this.invalidate();
+            return true;
+        }
+        if (k == KEY_RIGHT) {
+            if (this.filt_caret < t.len) { this.filt_caret = utf8_next(t, this.filt_caret); }
+            this.invalidate();
+            return true;
+        }
+        if (k == KEY_HOME) { this.filt_caret = 0; this.invalidate(); return true; }
+        if (k == KEY_END) { this.filt_caret = t.len; this.invalidate(); return true; }
         if (k == KEY_BACKSPACE) {
-            if (c.filter_text.len > 0) {
-                c.filter_text = c.filter_text.slice(0, c.filter_text.len - 1);
+            if (this.filt_caret > 0) {
+                let p = utf8_prev(t, this.filt_caret);
+                c.filter_text = t.slice(0, p) + t.slice(this.filt_caret, t.len);
+                this.filt_caret = p;
                 this.apply_filter_text(this.filter_edit);
             }
             return true;
         }
+        if (k == KEY_DELETE) {
+            if (this.filt_caret < t.len) {
+                let n = utf8_next(t, this.filt_caret);
+                c.filter_text = t.slice(0, this.filt_caret) + t.slice(n, t.len);
+                this.apply_filter_text(this.filter_edit);
+            }
+            return true;
+        }
+        // Tab walks to the next filter box, which is how a row of them is
+        // meant to be filled in.
+        if (k == KEY_TAB) {
+            let dir = 1;
+            if ((this.mods() & MOD_SHIFT) != 0) { dir = -1; }
+            let j = this.filter_edit + dir;
+            while (j >= 0 && j < this.cols.len && !this.cols[j].visible) { j += dir; }
+            if (j >= 0 && j < this.cols.len) { this.start_filter_edit(j); }
+            else { this.stop_filter_edit(); }
+            return true;
+        }
         if (ch.len > 0 && (this.mods() & MOD_CTRL) == 0) {
-            c.filter_text = c.filter_text + ch;
+            c.filter_text = t.slice(0, this.filt_caret) + ch + t.slice(this.filt_caret, t.len);
+            this.filt_caret += ch.len;
             this.apply_filter_text(this.filter_edit);
             return true;
         }
         return true;
+    }
+
+    fn start_filter_edit(ci: int) {
+        this.filter_edit = ci;
+        this.filt_caret = this.cols[ci].filter_text.len;
+        this.filt_blink.start(this);
+        this.invalidate();
+    }
+
+    fn stop_filter_edit() {
+        this.filter_edit = -1;
+        this.filt_blink.stop();
+        this.invalidate();
     }
 
     fn draw_filter_cell(s: Painter, th: Theme, ci: int, cx: float, fby: float) {
@@ -545,6 +727,14 @@ export class DataTable extends Widget {
         let color = th.on_surface;
         if (txt == "") { txt = "filter…"; color = th.on_surface_subtle; }
         s.text_in(r, 6, txt, color);
+
+        if (this.filter_edit == ci && this.filt_blink.visible()) {
+            let upto = c.filter_text;
+            if (this.filt_caret < upto.len) { upto = upto.slice(0, this.filt_caret); }
+            let cx2 = r.x + 6 + s.text_width(upto);
+            let ch2 = s.font_height();
+            s.fill(Rect(cx2, r.y + (r.h - ch2) / 2.0, 1, ch2), th.primary);
+        }
     }
 
     // ---- header context menu ---------------------------------------------
@@ -584,6 +774,87 @@ export class DataTable extends Widget {
         return null;
     }
 
+    // Put an app widget beside the search box. It becomes a child, so it draws
+    // and hit-tests like any other; pass null to remove one.
+    fn setSearchAccessory(w: Widget) {
+        if (this.search_accessory != null) { this.drop_child(this.search_accessory); }
+        this.search_accessory = w;
+        if (w != null) { this.add(w); }
+        this.invalidate();
+    }
+
+    // ---- column selection -------------------------------------------------
+
+    fn columnSelected(pos: int): bool {
+        for (let c in this.col_sel) {
+            if (c == pos) { return true; }
+        }
+        return false;
+    }
+
+    fn selectionColumnCount(): int { return this.col_sel.len; }
+
+    // Replace the column selection with one column.
+    fn selectColumn(pos: int) {
+        if (pos < 0 || pos >= this.cols.len) { return; }
+        this.col_sel = [pos];
+        this.invalidate();
+    }
+
+    // Add or remove one column, for a ctrl-click style multi-select.
+    fn toggleColumn(pos: int) {
+        if (pos < 0 || pos >= this.cols.len) { return; }
+        let keep: int[] = [];
+        let found = false;
+        for (let c in this.col_sel) {
+            if (c == pos) { found = true; } else { keep.push(c); }
+        }
+        if (!found) { keep.push(pos); }
+        this.col_sel = keep;
+        this.invalidate();
+    }
+
+    fn clearColumnSelection() {
+        if (this.col_sel.len == 0) { return; }
+        this.col_sel = [];
+        this.invalidate();
+    }
+
+    // The selected columns, every visible row, as TSV — the column counterpart
+    // of selectionTsv. Full values, not the drawn text: what leaves the grid is
+    // the data.
+    fn columnsTsv(): string {
+        if (this.col_sel.len == 0) { return ""; }
+        let sb = new StringBuilder(256);
+        let first = true;
+        for (let ci in 0..this.cols.len) {
+            if (!this.columnSelected(ci) || !this.cols[ci].visible) { continue; }
+            if (!first) { sb.append("\t"); }
+            sb.append(this.cols[ci].title);
+            first = false;
+        }
+        sb.append("\n");
+        let vlen = this.df.viewLen();
+        for (let r in 0..vlen) {
+            first = true;
+            for (let ci in 0..this.cols.len) {
+                let c = this.cols[ci];
+                if (!this.columnSelected(ci) || !c.visible) { continue; }
+                if (!first) { sb.append("\t"); }
+                sb.append(this.cell_text_full(r, c));
+                first = false;
+            }
+            sb.append("\n");
+        }
+        return sb.toString();
+    }
+
+    fn copyColumns(): string {
+        let t = this.columnsTsv();
+        if (t != "" && this.win != null) { this.win.surf.set_clipboard(t); }
+        return t;
+    }
+
     // ---- CSV export / clipboard copy -------------------------------------
 
     // The current view (visible rows × visible columns) as CSV text, header
@@ -603,7 +874,10 @@ export class DataTable extends Widget {
         for (let r in 0..vlen) {
             for (let ci in 0..this.cols.len) {
                 let c = this.cols[ci];
-                if (c.visible) { w.field(this.cell_text(r, c)); }
+                // full, not the drawn text: a CSV is data, and writing the
+                // 255 bytes that fit on screen would be silent truncation on
+                // the way out.
+                if (c.visible) { w.field(this.cell_text_full(r, c)); }
             }
             w.endRow();
         }
@@ -628,7 +902,7 @@ export class DataTable extends Widget {
                 let c = this.cols[ci];
                 if (!c.visible) { continue; }
                 if (!firstCol) { sb.append("\t"); }
-                sb.append(this.cell_text(rows[ri], c));
+                sb.append(this.cell_text_full(rows[ri], c));
                 firstCol = false;
             }
             sb.append("\n");
@@ -661,10 +935,24 @@ export class DataTable extends Widget {
     // columns and scrolling the focused column into view.
     fn move_cursor(dir: int) {
         let ci = this.cur_col;
-        if (ci < 0) { ci = this.first_vis_pos(); this.cur_col = ci; this.ensure_col_visible(ci); this.invalidate(); return; }
+        if (ci < 0) {
+            ci = this.first_vis_pos(); this.cur_col = ci; this.ensure_col_visible(ci);
+            this.notify_cell(); this.invalidate(); return;
+        }
         let j = ci + dir;
         while (j >= 0 && j < this.cols.len && !this.cols[j].visible) { j += dir; }
-        if (j >= 0 && j < this.cols.len) { this.cur_col = j; this.ensure_col_visible(j); this.invalidate(); }
+        if (j >= 0 && j < this.cols.len) {
+            this.cur_col = j; this.ensure_col_visible(j);
+            this.notify_cell(); this.invalidate();
+        }
+    }
+
+    // One place that fires onCell, so every path that moves the cursor or the
+    // selection reports the same pair.
+    fn notify_cell() {
+        if (this.onCell == null || !this.cell_focus) { return; }
+        if (this.selected < 0 || this.cur_col < 0) { return; }
+        this.onCell(this.selected, this.cur_col);
     }
 
     // Scroll horizontally so scrolling column position `ci` is fully visible.
@@ -932,9 +1220,24 @@ export class DataTable extends Widget {
 
     // The text a cell draws: a column's custom formatter if set, else the
     // engine's formatted value.
+    // The DRAW path's text. Bounded at 255 bytes by DataFrame.cellStr, because
+    // a drawn cell is clipped to its column and shaping a 4 KB value once per
+    // frame per visible row is exactly the cost this widget exists to avoid.
     fn cell_text(vrow: int, c: DtColumn): string {
         if (c.format != null) { return c.format(this.df, vrow, c.col); }
         return this.df.cellStr(vrow, c.col);
+    }
+
+    // The DATA path's text: the whole value, never truncated. Copy, CSV export
+    // and any value viewer read through this — what leaves the grid is the
+    // value, not what happened to fit on screen.
+    //
+    // A per-column formatter is presentation, so it still wins: it is given the
+    // frame and reads whatever it needs, and a formatter that truncates is the
+    // app saying so.
+    fn cell_text_full(vrow: int, c: DtColumn): string {
+        if (c.format != null) { return c.format(this.df, vrow, c.col); }
+        return this.df.cellStrFull(vrow, c.col);
     }
 
     // Install a per-column formatter (df, vrow, dfcol) → string on rendered
@@ -1273,6 +1576,26 @@ export class DataTable extends Widget {
         this.invalidate();
     }
 
+    // Show a sort WITHOUT performing one: the header arrow moves, the rows do
+    // not.
+    //
+    // For an owner whose frame is one page of a larger result, ordered by the
+    // server. Re-sorting such a page locally is not a no-op and can be wrong in
+    // both directions: a text column under a case-insensitive server collation
+    // orders differently from a byte-wise sort, and a numeric column the engine
+    // handed back as text (MySQL's DECIMAL) would sort as words. The rows
+    // arrived in the right order; this only says so.
+    fn markSort(col: int, asc: bool) {
+        if (col < 0) { this.sort_cols = []; this.sort_dirs = []; }
+        else {
+            let d = 1; if (!asc) { d = -1; }
+            this.sort_cols = [col];
+            this.sort_dirs = [d];
+        }
+        this.sync_sort_compat();
+        this.invalidate();
+    }
+
     fn set_sort(dfcol: int, additive: bool) {
         if (additive) {
             let at = this.sort_rank(dfcol);
@@ -1289,6 +1612,7 @@ export class DataTable extends Widget {
         this.sync_sort_compat();
         this.apply_view();
         this.invalidate();
+        if (this.onSort != null) { this.onSort(); }
     }
 
     // Index of `dfcol` within the active sort keys, or -1. Also drives the
@@ -1305,10 +1629,16 @@ export class DataTable extends Widget {
 
     // ---- layout -----------------------------------------------------------
 
+    // A PREFERRED width, not the content's. This widget scrolls horizontally,
+    // so its content width is not a size it needs — and Row/Column have no
+    // shrink: a flex child is given `natural + share`, so a natural of 900
+    // pushed every panel holding a wide grid past its parent, clipping whatever
+    // sat to its right (a search box, a pager, a toolbar). 560 is wide enough
+    // to read several columns and narrow enough to leave the parent in charge.
     override fn measure(s: Painter, th: Theme): Size {
         let w = this.scroll_content_w() + 2.0;
         if (w < 320) { w = 320; }
-        if (w > 900) { w = 900; }
+        if (w > 560) { w = 560; }
         return Size(w, DT_SEARCH_H + DT_HDR_H + this.row_h * 10 + DT_FOOT_H);
     }
 
@@ -1316,25 +1646,97 @@ export class DataTable extends Widget {
         this.layout_to(r);
         let sw = 220.0;
         if (sw > r.w - 16.0) { sw = r.w - 16.0; }
-        this.search.arrange(s, th, Rect(r.right() - sw - 8, r.y + 4, sw, s.font_height() + 12));
+        let h = s.font_height() + 12;
+        let sx = r.right() - sw - 8;
+        // The accessory takes the right edge and the search box shifts left of
+        // it. An app that wants to say something ABOUT the search — a scope, a
+        // mode — has nowhere else to put it: the field is the widget's own, and
+        // a control for it parked on the far side of the panel reads as
+        // unrelated. It follows the box rather than leading it, because it
+        // qualifies an answer the user has already started typing.
+        if (this.search_accessory != null) {
+            let aw = this.search_accessory.measure(s, th).w;
+            if (aw > r.w - sw - 24.0) { aw = r.w - sw - 24.0; }
+            if (aw > 0.0) {
+                this.search_accessory.arrange(s, th, Rect(r.right() - aw - 8, r.y + 4, aw, h));
+                sx = r.right() - aw - sw - 16;
+            }
+        }
+        this.search.arrange(s, th, Rect(sx, r.y + 4, sw, h));
         this.clamp();
     }
 
     // ---- draw -------------------------------------------------------------
 
+    // ── WHY THIS CLIPS, AND WHY NOTHING ELSE WILL DO ────────────────────────
+    //
+    // Painter.text_in does NOT clip to the rect it is given — it computes a
+    // baseline and draws, so a cell wider than its column paints straight over
+    // its neighbours and over the grid divider. With short synthetic values
+    // that never shows; against a real table (a URL column, a JSON `details`
+    // column) every row becomes overprinted mush and the column edges — the
+    // thing you have to grab to resize — become invisible.
+    //
+    // The per-row clip in draw_row_cells is the scroll pane, not the cell: it
+    // stops a column bleeding out of the *widget*, not out of its own column.
+    //
+    // Eliding instead would be wrong twice over. cell_text() is what Copy and
+    // Export CSV read, so eliding there truncates the data on its way out; and
+    // elide_last measures once per character removed, which on a 4 KB cell is
+    // thousands of text_width calls per cell per frame.
+    //
+    // So: one clip per drawn cell. Only on-screen cells are drawn — about 30
+    // rows x the visible columns — and the alternative is a grid that lies
+    // about what is in it.
     fn draw_cell(s: Painter, c: DtColumn, cx: float, y: float, h: float, text: string, color: int) {
         let pad = 8.0;
         if (c.align == 1) { pad = (c.width - s.text_width(text)) / 2; }
         else if (c.align == 2) { pad = c.width - s.text_width(text) - 8; }
         if (pad < 4) { pad = 4; }
+        // 1px short of the divider, so a full-width cell cannot paint over it.
+        s.clip_push(Rect(cx, y, c.width - 1, h), 0.0);
         s.text_in(Rect(cx, y, c.width, h), pad, text, color);
+        s.clip_pop();
     }
 
     // One header cell at screen x `cx`: title, grid divider, sort arrow + badge.
     fn draw_header_cell(s: Painter, th: Theme, ci: int, cx: float, hy: float) {
         let c = this.cols[ci];
         if (this.col_w(c) == 0.0) { return; }
+        if (this.columnSelected(ci)) {
+            s.fill(Rect(cx, hy, c.width, DT_HDR_H), mix(th.surface_sunken, th.primary, 0.18));
+        }
         this.draw_cell(s, c, cx, hy, DT_HDR_H, c.title, th.on_surface);
+        // The tag goes to the opposite end of the cell from the title, muted:
+        // a left-aligned title (text) puts it on the right, a right-aligned one
+        // (numbers) puts it on the left. Anything else would have the two
+        // strings meet in the middle and overprint at some column width.
+        //
+        // Dropped rather than squeezed when they would collide — a half-drawn
+        // type is worse than none. 18px on the right stays clear of the sort
+        // arrow.
+        // The tag is drawn at the normal weight — the caller set weight 2 for
+        // the header — so it reads as an annotation and not as a second title.
+        // Both widths are measured at the weight each is drawn in: a bold title
+        // is ~8% wider, which is enough to make a tag that fits by arithmetic
+        // collide on screen.
+        if (c.type_tag != "" && c.align != 1) {
+            let titlew = s.text_width(c.title);
+            s.set_weight(0);
+            let tw = s.text_width(c.type_tag);
+            let tx = c.width - 18.0 - tw;               // left title: tag on the right
+            let clear = tx - (8.0 + titlew) >= 6.0;
+            if (c.align == 2) {
+                tx = 8.0;                               // right title: tag on the left
+                clear = (c.width - 8.0 - titlew) - (tx + tw) >= 6.0;
+            }
+            if (clear) {
+                s.clip_push(Rect(cx, hy, c.width - 1, DT_HDR_H), 0.0);
+                s.text_in(Rect(cx, hy, c.width, DT_HDR_H), tx, c.type_tag, th.on_surface_muted);
+                s.clip_pop();
+            }
+            s.set_weight(2);        // back to the header weight the caller set
+        }
         if (this.grid) { s.line(cx + c.width, hy + 4, cx + c.width, hy + DT_HDR_H - 4, th.divider); }
         let rank = this.sort_rank(c.col);
         if (rank >= 0) {
@@ -1395,6 +1797,13 @@ export class DataTable extends Widget {
     fn draw_body_cell(s: Painter, th: Theme, vrow: int, ci: int, cx: float, ry: float, rh: float) {
         let c = this.cols[ci];
         if (this.col_w(c) == 0.0) { return; }
+        // A selected column tints its whole height. Lighter than the row
+        // selection on purpose: where the two cross, the row still wins — a
+        // selected row is what an action operates on, a selected column is a
+        // reading aid.
+        if (this.columnSelected(ci)) {
+            s.fill(Rect(cx, ry, c.width, rh), mix(th.surface_raised, th.primary, 0.10));
+        }
         if (c.cellBg != null) {
             let bg = c.cellBg(this.df, vrow, c.col);
             if (bg != 0) { s.fill(Rect(cx, ry, c.width, rh), bg); }
@@ -1527,6 +1936,14 @@ export class DataTable extends Widget {
         // rebuild the visual model with the live painter (real text metrics for
         // wrap), then re-clamp against the resulting content height.
         if (this.has_visual() && this.vis_dirty) { this.rebuild_visual(s); this.clamp(); }
+
+        // One-shot fit-to-content: the first frame is where a Painter first
+        // exists, so it is the first place the real widths can be known.
+        if (this.fit_rows > 0 && !this.fit_done) {
+            this.fit_done = true;
+            this.fitColumns(s, this.fit_rows, this.fit_max_w);
+            this.clamp();
+        }
 
         let hy = b.y + DT_SEARCH_H;
         let base = this.base_x();
@@ -1708,6 +2125,7 @@ export class DataTable extends Widget {
         s.line(b.x, fy, b.right(), fy, th.divider);
         let label = str(vlen) + " rows";
         if (vlen != this.df.nrow()) { label = str(vlen) + " of " + str(this.df.nrow()) + " rows"; }
+        if (this.footer_note != "") { label = label + "   ·   " + this.footer_note; }
         // the aggregates already have their own row when totals is on — don't
         // repeat them (and mangle) in the footer.
         if (!this.totals_row) {
@@ -1720,6 +2138,7 @@ export class DataTable extends Widget {
         s.text_in(Rect(b.x + 8, fy, b.w - 16, DT_FOOT_H), 0, label, th.on_surface_muted);
 
         this.search.draw(s, th);
+        if (this.search_accessory != null) { this.search_accessory.draw(s, th); }
     }
 
     // Repaint the whole widget on any overlapping dirty rect (same reason as
@@ -1783,7 +2202,7 @@ export class DataTable extends Widget {
         let hy = b.y + DT_SEARCH_H;
         this.resize_idx = -1; this.press_idx = -1; this.drag_col = -1; this.drag_to = -1;
         this.drag_px = fx;
-        this.filter_edit = -1;   // any click blurs the filter box unless it re-focuses below
+        if (this.filter_edit >= 0) { this.stop_filter_edit(); }   // any click blurs the box unless it re-focuses below
         // checkbox gutter: header toggles select-all, a row toggles its own row
         if (this.checkboxes && fx >= b.x && fx < b.x + DT_CB_W) {
             if (fy >= hy && fy < hy + DT_HDR_H) {
@@ -1803,7 +2222,7 @@ export class DataTable extends Widget {
             if (fy >= fby && fy < fby + DT_FILT_H) {
                 if (!(this.checkboxes && fx < b.x + DT_CB_W)) {
                     let fci = this.col_at_content(this.content_x_at(fx));
-                    if (fci >= 0) { this.filter_edit = fci; }
+                    if (fci >= 0) { this.start_filter_edit(fci); }
                 }
                 this.invalidate();
                 return true;
@@ -1814,6 +2233,13 @@ export class DataTable extends Widget {
             let edge = this.resize_edge_at(cxContent);
             if (edge >= 0) { this.resize_idx = edge; return true; }   // resize, not sort
             let ci = this.col_at_content(cxContent);
+            // Ctrl+click selects the column instead of sorting it — the mouse
+            // path for col_sel. Plain click still sorts, because that is what a
+            // header click means everywhere.
+            if (ci >= 0 && (this.mods() & MOD_CTRL) != 0) {
+                this.toggleColumn(ci);
+                return true;
+            }
             if (ci >= 0) { this.press_idx = ci; }                     // pending sort / reorder
             return true;
         }
@@ -1833,6 +2259,7 @@ export class DataTable extends Widget {
                 let cc = this.col_at_content(this.content_x_at(fx));
                 if (cc >= 0) { this.cur_col = cc; }
             }
+            this.notify_cell();
             if (this.onSelect != null) { this.onSelect(vrow); }
             this.invalidate();
         }
@@ -1854,17 +2281,40 @@ export class DataTable extends Widget {
         return false;
     }
 
-    // Right-click on a header column opens its actions menu.
+    // Right-click. The header band opens the column menu — the app's, through
+    // onHeaderContext, or the built-in one when the app has no opinion. The
+    // body selects the row and the cell under the cursor and then hands over to
+    // onCellContext.
+    //
+    // Selecting first is not a nicety: a menu whose "Copy cell" copies a
+    // different cell than the one it is pointing at is worse than no menu.
+    // Tab belongs to the filter row while one of its boxes is being edited.
+    override fn wants_tab(): bool { return this.filter_edit >= 0; }
+
     override fn on_context(x: int, y: int): bool {
         let fx = x as float; let fy = y as float;
         let b = this.bounds;
         let hy = b.y + DT_SEARCH_H;
+
         if (fy >= hy && fy < hy + DT_HDR_H) {
             if (this.checkboxes && fx >= b.x && fx < b.x + DT_CB_W) { return false; }
             let ci = this.col_at_content(this.content_x_at(fx));
-            if (ci >= 0) { this.open_header_menu(ci, fx, hy + DT_HDR_H); return true; }
+            if (ci < 0) { return false; }
+            if (this.onHeaderContext != null) { this.onHeaderContext(ci, x, y); return true; }
+            this.open_header_menu(ci, fx, hy + DT_HDR_H);
+            return true;
         }
-        return false;
+
+        if (this.onCellContext == null) { return false; }
+        let vrow = this.row_at(y);
+        if (vrow < 0) { return false; }
+        this.select_click(vrow);
+        let cc = this.col_at_content(this.content_x_at(fx));
+        if (this.cell_focus && cc >= 0) { this.cur_col = cc; }
+        this.notify_cell();
+        this.invalidate();
+        this.onCellContext(vrow, cc, x, y);
+        return true;
     }
 
     // Header drags: a moving press past the slop starts either a column resize
@@ -1970,6 +2420,7 @@ export class DataTable extends Widget {
         this.sel_src = this.df.srcRow(v);
         this.sel_set = [this.sel_src];   // keyboard nav is a single selection
         this.ensure_visible(v);
+        this.notify_cell();
         if (this.onSelect != null) { this.onSelect(v); }
         this.invalidate();
         return true;
@@ -2019,6 +2470,10 @@ export class DataTable extends Widget {
     override fn drop_handlers() {
         this.onSelect = null;
         this.onActivate = null;
+        this.onCell = null;
+        this.onSort = null;
+        this.onHeaderContext = null;
+        this.onCellContext = null;
         this.detailText = null;
         for (let i in 0..this.cols.len) { this.cols[i].format = null; this.cols[i].cellBg = null; }
     }

@@ -33,7 +33,7 @@
 // Conn — pollFd(), a step that can yield — not a reinterpretation of this one.
 // ─────────────────────────────────────────────────────────────────────────────
 
-import { Socket, PollSet, RecvResult, socket_connect,
+import { Socket, PollSet, RecvResult, socket_connect, socket_connect_async,
          POLL_READ, POLL_WRITE } from "vyto/net/socket";
 
 // What state the transport is in. `err` carries the prose; this is what the
@@ -299,10 +299,48 @@ export class SockIo extends WireIo {
 
 // Connect, or return null. The caller turns that into a Conn whose isOpen() is
 // false — a driver never returns a null Conn (driver.vt:130-133).
+//
+// The connect is non-blocking and bounded by timeoutMs, which is not a
+// refinement: socket_connect() is a blocking connect(2) with no deadline of its
+// own, so a host that is merely unroutable — a VPN down, a typo'd address, a
+// firewall dropping rather than refusing — hangs for the kernel's SYN retry
+// budget, over two minutes on Linux. A driver's timeout() did nothing about
+// that, because it only ever reached SockIo, which the code had not got to yet.
+//
+// timeoutMs <= 0 means wait as long as the kernel would.
 export fn dialTcp(host: string, port: int, timeoutMs: int): SockIo {
-    let s = socket_connect(host, port);
+    return dialTcpEx(host, port, timeoutMs, timeoutMs);
+}
+
+// Connect and read deadlines set separately, because they answer different
+// questions and one number cannot serve both.
+//
+// A connect that has not completed in a few seconds is not going to; a REPLY
+// that has not arrived in a few seconds may simply be a query that is still
+// running, and a DBA tool exists to run those. Collapsing the two means either
+// tolerating a two-minute hang on an unroutable host, or tearing down the
+// connection under a legitimate long query — which loses its session, its
+// transaction and its temp tables, and reports it as "timed out waiting for the
+// server" rather than as the timeout it actually was.
+//
+// readMs <= 0 waits forever for a reply. That is the right setting for a caller
+// that can cancel — a query with no deadline is fine when there is a button
+// that stops it.
+export fn dialTcpEx(host: string, port: int, connectMs: int, readMs: int): SockIo {
+    if (connectMs <= 0) {
+        let s = socket_connect(host, port);
+        if (s == null) { return null; }
+        return new SockIo(s, readMs);
+    }
+    let s = socket_connect_async(host, port);
     if (s == null) { return null; }
-    return new SockIo(s, timeoutMs);
+    // Writable means the handshake finished — or failed. connResult tells which,
+    // and skipping it would hand back a socket whose every operation errors.
+    let ps = new PollSet();
+    ps.add(s, POLL_WRITE);
+    if (ps.wait(connectMs) <= 0) { s.close(); return null; }
+    if (s.connResult() != 0) { s.close(); return null; }
+    return new SockIo(s, readMs);
 }
 
 // ---------------------------------------------------------------------------

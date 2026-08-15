@@ -3,6 +3,7 @@
 // SegmentedControl, Stepper, Dropdown, ProgressBar.
 
 import { Widget, Painter, Theme, Size, BoxConstraints, bcLoose, WidgetState, ws,
+         BTN_FILLED, BTN_TONAL, BTN_GHOST, CaretBlink,
          WEIGHT_REG, WEIGHT_BOLD, EASE_LINEAR, EASE_OUT_CUBIC, b2f } from "vyto/ui/core";
 import { Tween } from "vyto/ui/anim";
 import { SelectionModel, SelectionAction, col_at_x, select_word,
@@ -24,11 +25,15 @@ fn is_text_input(w: Widget, ch: string): bool {
 export class Label extends Widget {
     text: string;
     strong: bool;   // ink when true, muted when false
+    // Packed colour override, 0 = the theme's. For a label whose colour IS the
+    // information — a severity, an environment tag — rather than styling.
+    color: int;
 
     fn init(text: string) {
         super.init();
         this.text = text;
         this.strong = true;
+        this.color = 0;
     }
 
     override fn measure(s: Painter, th: Theme): Size {
@@ -39,6 +44,7 @@ export class Label extends Widget {
         let color = th.type_color_body;
         let weight = th.type_body_weight;
         if (!this.strong) { color = th.type_color_caption; weight = th.type_caption_weight; }
+        if (this.color != 0) { color = this.color; }
         s.set_weight(weight);
         s.text_in(this.bounds, 0, this.text, color);
         s.set_weight(WEIGHT_REG);
@@ -52,6 +58,10 @@ export class Button extends Widget {
     onClick: fn(Button);
     lift: float;        // 0..1 hover-lift amount, animated on enter/leave
     lift_tw: Tween;     // in-flight lift animation (cancelled on re-trigger)
+    // BTN_FILLED / BTN_TONAL / BTN_GHOST — how loud this button is. See
+    // ButtonChrome.paint_variant. Filled is the default so nothing changes for
+    // a caller that never asked.
+    variant: int;
 
     fn init(label: string) {
         super.init();
@@ -59,7 +69,13 @@ export class Button extends Widget {
         this.value = label;   // default: value mirrors the label
         this.focusable = true;
         this.lift = 0.0;
+        this.variant = BTN_FILLED;
     }
+
+    // new Button("Refresh").tonal()
+    builder fn tonal() { this.variant = BTN_TONAL; return this; }
+    builder fn ghost() { this.variant = BTN_GHOST; return this; }
+    builder fn filled() { this.variant = BTN_FILLED; return this; }
 
     // Set the logical value independent of the display label. Returns this for
     // fluent construction: new Button("OK").with_value("confirm").
@@ -81,14 +97,21 @@ export class Button extends Widget {
     }
 
     override fn render(s: Painter, th: Theme) {
-        // subtle hover-lift: raise the chrome up to 3px while hovered. Hit
-        // bounds are unchanged — this is purely visual. The offset is
-        // sub-pixel: it used to truncate to an int and visibly step 0→1→2→3.
-        let dy = this.lift * 3.0;
+        let win = this.win;
+        if (win == null) { return; }
+        // subtle hover-lift: raise the chrome while hovered. Hit bounds are
+        // unchanged — this is purely visual. The offset is sub-pixel: it used
+        // to truncate to an int and visibly step 0→1→2→3.
+        //
+        // Only a filled button lifts. A tonal or ghost button has no shadow to
+        // lift away from, so moving it just makes the label jitter.
+        let dy = this.lift * 1.5;
+        if (this.variant != BTN_FILLED) { dy = 0.0; }
         let r = this.bounds;
         if (dy > 0.0) { r = r.offset(0.0, -dy); }
-        this.win.skin.button.paint(s, th, r, this.label,
-                                   this.ui_state(false), this.win.skin);
+        win.skin.button.paint_variant(s, th, r, this.label,
+                                      this.ui_state(false), win.skin,
+                                      this.variant);
     }
 
     // Self-animate the lift toward `target` (0 or 1), interrupting any
@@ -134,6 +157,7 @@ export class TextField extends Widget {
     // Selection: anchor is the fixed end, caret tracks the moving end (focus).
     sel: SelectionModel;
     selectionActions: SelectionAction[]; // app-supplied extra toolbar buttons
+    blink: CaretBlink;
     // horizontal padding of the text area — subclasses (SearchField) widen these
     // to inset leading/trailing icons. Default 8 on both sides.
     pad_l: float;
@@ -144,6 +168,7 @@ export class TextField extends Widget {
         this.text = "";
         this.placeholder = placeholder;
         this.caret = 0;
+        this.blink = new CaretBlink();
         this.scroll_x = 0.0;
         this.focusable = true;
         this.pad_l = 8;
@@ -211,7 +236,9 @@ export class TextField extends Widget {
     // (SearchField) can reuse it and overlay their own chrome (super.draw isn't
     // callable in Vyto). Uses pad_l/pad_r so leading/trailing icons get room.
     fn draw_field(s: Painter, th: Theme) {
-        this.win.skin.field.paint_box(s, th, this.bounds, this.ui_state(false), this.win.skin);
+        let win = this.win;
+        if (win == null) { return; }
+        win.skin.field.paint_box(s, th, this.bounds, this.ui_state(false), win.skin);
         let avail = this.bounds.w - this.pad_l - this.pad_r;
         if (avail < 8) { avail = 8; }
         // caret-follow horizontal scroll: keep the caret inside the box
@@ -243,14 +270,18 @@ export class TextField extends Widget {
             s.text_in(this.bounds, this.pad_l - this.scroll_x, this.text, th.on_surface);
         }
         s.clip_pop();
-        if (this.focused) {
+        if (this.focused && this.blink.visible()) {
             let cx = this.bounds.x + this.pad_l + caret_off - this.scroll_x;
             let cy = this.bounds.center_y(s.font_height());
             s.fill(Rect(cx, cy, 1, s.font_height()), th.primary);
         }
     }
 
+    override fn on_focus(): bool { this.blink.start(this); return false; }
+    override fn on_blur(): bool { this.blink.stop(); return false; }
+
     override fn on_click(x: int, y: int): bool {
+        this.blink.wake();
         // precise caret placement: metrics via win.surf (see offset_at)
         let off = this.offset_at(x);
         this.caret = off;
@@ -288,6 +319,7 @@ export class TextField extends Widget {
     }
 
     override fn on_key(k: int, ch: string): bool {
+        this.blink.wake();      // never blink off under the key being pressed
         return this.handle_key(k, ch);
     }
 
@@ -390,6 +422,7 @@ export class TextField extends Widget {
 
     override fn drop_handlers() {
         this.onSubmit = null;
+        this.blink.stop();
         if (this.sel != null) { this.sel.drop(); }
     }
 }
@@ -451,6 +484,7 @@ export class SearchField extends TextField {
     override fn drop_handlers() {
         this.onSubmit = null;
         this.onChange = null;
+        this.blink.stop();
         if (this.sel != null) { this.sel.drop(); }
     }
 }
@@ -489,10 +523,12 @@ export class Checkbox extends Widget {
     }
 
     override fn render(s: Painter, th: Theme) {
+        let win = this.win;
+        if (win == null) { return; }
         let box = 16.0;
         let by = this.bounds.center_y(box);
         let br = Rect(this.bounds.x, by, box, box);
-        this.win.skin.toggle.paint_checkbox(s, th, br, this.ui_state(this.checked), this.win.skin);
+        win.skin.toggle.paint_checkbox(s, th, br, this.ui_state(this.checked), win.skin);
         let tr = Rect(this.bounds.x + box + 6, this.bounds.y,
                       this.bounds.w - box - 6, this.bounds.h);
         s.set_weight(th.type_body_weight);
@@ -592,12 +628,14 @@ export class ListBox extends Widget {
     }
 
     override fn render(s: Painter, th: Theme) {
+        let win = this.win;
+        if (win == null) { return; }
         let radius = th.radius_md;
         s.fill_round(this.bounds, radius, th.surface_raised);
         let border = th.border;
         if (this.focused) {
             border = th.primary;
-            this.win.skin.focus.paint(s, th, this.bounds, radius);
+            win.skin.focus.paint(s, th, this.bounds, radius);
         }
         s.stroke_round(this.bounds, radius, 1, border);
         let b = this.bounds;
@@ -700,10 +738,24 @@ export class TextArea extends Widget {
     // (caret_row, caret_col) pair is the moving end (== sel.focus).
     sel: SelectionModel;
     selectionActions: SelectionAction[];
+    // A viewer rather than an editor: the caret, the selection, Ctrl+C and
+    // scrolling all still work, and every key that would change the buffer is
+    // swallowed. set_text() still writes — read-only is about the user, not
+    // about the app that owns the widget.
+    readonly: bool;
+    blink: CaretBlink;
+    // Whether the next draw should scroll the caret back into view. True after
+    // anything that moves the caret, false after a wheel scroll — otherwise a
+    // wheel scroll is undone by the very next frame, which is what "it will not
+    // scroll" looks like from the outside.
+    follow_caret: bool;
 
     fn init() {
         super.init();
         this.lines = [""];
+        this.readonly = false;
+        this.blink = new CaretBlink();
+        this.follow_caret = true;
         this.focusable = true;
         this.line_h = 15;
         this.view_rows = 1;
@@ -814,6 +866,7 @@ export class TextArea extends Widget {
         this.caret_row = 0;
         this.caret_col = 0;
         this.top = 0;
+        this.follow_caret = true;   // a new value starts at its own top
         this.rev += 1;
         if (this.sel != null) { this.sel.clear(); }
     }
@@ -927,8 +980,31 @@ export class TextArea extends Widget {
         return Size(360.0, lh * rows as float + 2.0 * TA_PAD);
     }
 
+    // Keys a read-only area refuses. Ctrl+C and Ctrl+A are not among them —
+    // copying out is the whole point of a viewer.
+    fn ro_blocks(k: int, ch: string): bool {
+        if (k == KEY_ENTER || k == KEY_BACKSPACE || k == KEY_DELETE) { return true; }
+        if (this.win != null && (this.win.mods & MOD_CTRL) != 0) {
+            return k == 120 || k == 118;        // Ctrl+X, Ctrl+V
+        }
+        return is_text_input(this, ch);
+    }
+
+    // Three visual rows per notch, and the caret stops dragging the view back.
+    // A TextArea holding a 4 KB value is otherwise readable only three lines at
+    // a time, by arrow key, which is not reading.
+    override fn on_scroll(delta: int): bool {
+        this.follow_caret = false;
+        this.top += delta * 3;
+        this.invalidate();
+        return true;
+    }
+
     override fn on_key(k: int, ch: string): bool {
         let shift = this.win != null && (this.win.mods & MOD_SHIFT) != 0;
+        this.blink.wake();
+        this.follow_caret = true;
+        if (this.readonly && this.ro_blocks(k, ch)) { return true; }
         // clipboard shortcuts: act on the selection when there is one, else
         // fall back to the caret line (the historical behaviour)
         if (this.win != null && (this.win.mods & MOD_CTRL) != 0) {
@@ -1092,8 +1168,13 @@ export class TextArea extends Widget {
         return false;
     }
 
+    override fn on_focus(): bool { this.blink.start(this); return false; }
+    override fn on_blur(): bool { this.blink.stop(); return false; }
+
     override fn on_click(x: int, y: int): bool {
         // precise caret placement (x->col via win.surf metrics), collapse sel
+        this.blink.wake();
+        this.follow_caret = true;
         let off = this.offset_at(x, y);
         this.set_caret_offset(off);
         this.sel.set(off, off);
@@ -1129,6 +1210,8 @@ export class TextArea extends Widget {
     }
 
     override fn render(s: Painter, th: Theme) {
+        let win = this.win;
+        if (win == null) { return; }
         this.line_h = s.font_height() + 2.0;
         let inner_h = this.bounds.h - 2.0 * TA_PAD;
         let inner_w = this.bounds.w - 2.0 * TA_PAD;
@@ -1144,20 +1227,26 @@ export class TextArea extends Widget {
             this.wrapped_rev = this.rev;
         }
 
-        // keep the caret visible
+        // keep the caret visible — but only when the caret is what moved
         let caret_vrow = this.visual_row_of(this.caret_row, this.caret_col);
-        if (caret_vrow < this.top) { this.top = caret_vrow; }
-        if (caret_vrow >= this.top + this.view_rows) {
-            this.top = caret_vrow - this.view_rows + 1;
+        if (this.follow_caret) {
+            if (caret_vrow < this.top) { this.top = caret_vrow; }
+            if (caret_vrow >= this.top + this.view_rows) {
+                this.top = caret_vrow - this.view_rows + 1;
+            }
         }
+        let max_top = this.wrap_count - this.view_rows;
+        if (max_top < 0) { max_top = 0; }
+        if (this.top > max_top) { this.top = max_top; }
+        if (this.top < 0) { this.top = 0; }
 
-        let field = this.win.skin.field;
+        let field = win.skin.field;
         // TextArea has no hover concept, so pin the hover amount off while
         // keeping the (animated) focus state — matches its original
         // unconditional non-tinted box fill exactly.
         let st = this.ui_state(false);
         st.hover = 0.0;
-        field.paint_box(s, th, this.bounds, st, this.win.skin);
+        field.paint_box(s, th, this.bounds, st, win.skin);
         // mask overflow so wrapped/long rows don't paint past the rounded box —
         // radius must track paint_box's, or the clip visibly mismatches the
         // border once a skin changes it.
@@ -1203,7 +1292,7 @@ export class TextArea extends Widget {
             s.text(ox, ty, piece, th.ink);
         }
         // caret
-        if (this.focused && caret_vrow >= this.top
+        if (this.focused && this.blink.visible() && caret_vrow >= this.top
             && caret_vrow < this.top + this.view_rows) {
             let li = this.wrap_map[caret_vrow];
             let col = this.wrap_col[caret_vrow];
@@ -1218,6 +1307,7 @@ export class TextArea extends Widget {
 
     override fn drop_handlers() {
         this.onChange = null;
+        this.blink.stop();
         if (this.sel != null) { this.sel.drop(); }
     }
 }
@@ -1248,10 +1338,12 @@ export class RadioButton extends Widget {
     }
 
     override fn render(s: Painter, th: Theme) {
+        let win = this.win;
+        if (win == null) { return; }
         let box = 16.0;
         let by = this.bounds.center_y(box);
         let br = Rect(this.bounds.x, by, box, box);
-        this.win.skin.toggle.paint_radio(s, th, br, this.ui_state(this.selected), this.win.skin);
+        win.skin.toggle.paint_radio(s, th, br, this.ui_state(this.selected), win.skin);
         let tr = Rect(this.bounds.x + box + 6, this.bounds.y,
                       this.bounds.w - box - 6, this.bounds.h);
         s.set_weight(th.type_body_weight);
@@ -1373,12 +1465,14 @@ export class Switch extends Widget {
     }
 
     override fn render(s: Painter, th: Theme) {
+        let win = this.win;
+        if (win == null) { return; }
         let sw = this.sw_w(s);
         let sh = this.sw_h(s);
         let bx = this.bounds.x;
         let by = this.bounds.center_y(sh);
         let br = Rect(bx, by, sw, sh);
-        this.win.skin.toggle.paint_switch(s, th, br, this.ui_state(this.on), this.win.skin);
+        win.skin.toggle.paint_switch(s, th, br, this.ui_state(this.on), win.skin);
         // label
         let lbl = "off";
         if (this.on) { lbl = "on"; }
@@ -1457,6 +1551,8 @@ export class SegmentedControl extends Widget {
     }
 
     override fn render(s: Painter, th: Theme) {
+        let win = this.win;
+        if (win == null) { return; }
         let n = this.labels.len;
         if (n == 0) { return; }
         let sh = this.bounds.h;
@@ -1464,7 +1560,7 @@ export class SegmentedControl extends Widget {
         let w = this.bounds.w;
         let radius = th.radius_md;
         // backdrop pill: surface_sunken track the segments sit in
-        this.win.skin.track.paint_track(s, th, this.bounds, radius, th.surface_sunken);
+        win.skin.track.paint_track(s, th, this.bounds, radius, th.surface_sunken);
         // Segments split the full control width evenly. Each cell's right
         // edge is computed the same way as the next cell's left edge, so they
         // share an exact boundary and no seam can open between them — this
@@ -1479,7 +1575,7 @@ export class SegmentedControl extends Widget {
             if (i == this.selected) {
                 let top = th.primary;
                 if (this.pressed) { top = th.primary_press; }
-                this.win.skin.track.paint_fill(s, th, sr, radius, top, th.primary_700);
+                win.skin.track.paint_fill(s, th, sr, radius, top, th.primary_700);
                 s.set_weight(WEIGHT_BOLD);
                 s.text_in(sr, 0, this.labels[i], th.on_primary);
                 s.set_weight(WEIGHT_REG);
@@ -1491,7 +1587,7 @@ export class SegmentedControl extends Widget {
                 s.text_in(sr, 0, this.labels[i], col);
             }
         }
-        if (this.focused) { this.win.skin.focus.paint(s, th, this.bounds, radius); }
+        if (this.focused) { win.skin.focus.paint(s, th, this.bounds, radius); }
     }
 
     // hit-test a segment index from absolute x — used for per-segment hover.
@@ -1582,6 +1678,8 @@ export class Stepper extends Widget {
     }
 
     override fn render(s: Painter, th: Theme) {
+        let win = this.win;
+        if (win == null) { return; }
         this.cached_btn_w = this.btn_w(s);
         let bh = s.font_height() + 12.0;
         let by = this.bounds.center_y(bh);
@@ -1594,7 +1692,7 @@ export class Stepper extends Widget {
         // shared surface: a single rounded panel with the value centered. No
         // focus ring here (unlike other FieldChrome consumers) — Stepper's
         // ring is drawn last, after its text, matching its original order.
-        this.win.skin.field.paint_box(s, th, this.bounds, ws(false, false, false, false, this.disabled), this.win.skin);
+        win.skin.field.paint_box(s, th, this.bounds, ws(false, false, false, false, this.disabled), win.skin);
         // minus / plus buttons read as soft square icons
         let mr = Rect(x0, by, t1 - x0, bh);
         let pr = Rect(t2, by, x0 + w - t2, bh);
@@ -1609,7 +1707,7 @@ export class Stepper extends Widget {
         s.set_weight(WEIGHT_BOLD);
         s.text_in(vr, 0, "" + this.value, th.on_surface);
         s.set_weight(WEIGHT_REG);
-        if (this.focused) { this.win.skin.focus.paint(s, th, this.bounds, radius); }
+        if (this.focused) { win.skin.focus.paint(s, th, this.bounds, radius); }
     }
 
     override fn on_click(x: int, y: int): bool {
@@ -1689,10 +1787,12 @@ export class Dropdown extends Widget {
     }
 
     override fn render(s: Painter, th: Theme) {
+        let win = this.win;
+        if (win == null) { return; }
         // note: pre-Chrome this tinted bg on hover even while focused; unified
         // with TextField's stricter `hovered && !focused` (focus border already
         // communicates state, so redundant hover tint is a wash either way).
-        this.win.skin.field.paint_box(s, th, this.bounds, this.ui_state(false), this.win.skin);
+        win.skin.field.paint_box(s, th, this.bounds, this.ui_state(false), win.skin);
         let label = "";
         if (this.selected >= 0 && this.selected < this.labels.len) {
             label = this.labels[this.selected];
@@ -1752,20 +1852,23 @@ class DropdownPopup extends Widget {
     }
 
     fn choose() {
+        let win = this.win;
+        if (win == null) { return; }
         if (this.sel < 0 || this.sel >= this.dd.labels.len) { return; }
         // Capture references before dismiss_overlay() drops us from the
         // Window's overlay slot — after that, `this` may be freed.
         let dd = this.dd;
         let sel = this.sel;
-        let w = this.win;
-        w.dismiss_overlay();
+        win.dismiss_overlay();
         dd.pick(sel);
     }
 
     override fn render(s: Painter, th: Theme) {
+        let win = this.win;
+        if (win == null) { return; }
         let radius = th.radius_md;
         // elevated dropdown menu: a soft shadow trails the panel
-        this.win.skin.panel.paint(s, th, this.bounds, radius, th.surface_raised, th.border, 2);
+        win.skin.panel.paint(s, th, this.bounds, radius, th.surface_raised, th.border, 2);
         for (let i in 0..this.dd.labels.len) {
             let r = Rect(this.bounds.x + 2.0, this.bounds.y + 1.0 + (i as float) * this.row_h,
                          this.bounds.w - 4, this.row_h);
@@ -1832,10 +1935,12 @@ export class ProgressBar extends Widget {
     }
 
     override fn render(s: Painter, th: Theme) {
+        let win = this.win;
+        if (win == null) { return; }
         let radius = th.radius_md;
         let track = this.bg;
         if (track < 0) { track = th.surface_sunken; }
-        this.win.skin.track.paint_track(s, th, this.bounds, radius, track);
+        win.skin.track.paint_track(s, th, this.bounds, radius, track);
         let f = this.fill;
         if (f < 0) { f = th.primary; }
         if (!this.indeterminate && this.tween != null) {
@@ -1858,14 +1963,14 @@ export class ProgressBar extends Widget {
             let travel = this.bounds.w - band_w;
             let fx = this.bounds.x + this.sweep_t * travel;
             let fr = Rect(fx, this.bounds.y, band_w, this.bounds.h);
-            this.win.skin.track.paint_fill(s, th, fr, radius, f, th.primary_700);
+            win.skin.track.paint_fill(s, th, fr, radius, f, th.primary_700);
             return;
         }
         let fw = this.bounds.w * this.progress;
         if (fw > 2.0) {
             // gradient fill for depth (rich tier); the leading edge stays rounded
             let fr = Rect(this.bounds.x, this.bounds.y, fw, this.bounds.h);
-            this.win.skin.track.paint_fill(s, th, fr, radius, f, th.primary_700);
+            win.skin.track.paint_fill(s, th, fr, radius, f, th.primary_700);
         }
     }
 }
@@ -1947,6 +2052,8 @@ export class Slider extends Widget {
     }
 
     override fn render(s: Painter, th: Theme) {
+        let win = this.win;
+        if (win == null) { return; }
         let r = this.thumb_r();
         let gh = 4.0;
         let along = this.value * this.travel();
@@ -1967,9 +2074,9 @@ export class Slider extends Widget {
             groove = Rect(this.bounds.x + r, cy - gh / 2.0, this.travel(), gh);
             fr = Rect(groove.x, groove.y, along, gh);
         }
-        this.win.skin.track.paint_track(s, th, groove, gh / 2.0, th.surface_sunken);
+        win.skin.track.paint_track(s, th, groove, gh / 2.0, th.surface_sunken);
         if (fr.w > 0.0 && fr.h > 0.0) {
-            this.win.skin.track.paint_fill(s, th, fr, gh / 2.0, th.primary, th.primary_700);
+            win.skin.track.paint_fill(s, th, fr, gh / 2.0, th.primary, th.primary_700);
         }
         // thumb
         let tr = r;

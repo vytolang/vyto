@@ -1,0 +1,135 @@
+// Pinning a worker, talking to it while it is busy, and replacing it when it
+// dies. WorkerPool.submit() routes to whichever worker is free, which is right
+// for stateless jobs and wrong the moment a job leaves something behind in the
+// child — an open connection, a transaction, a temp file. Three mechanisms
+// cover that, and this exercises all three:
+//
+//   checkout()/submitTo()  one slot, one process, state survives between jobs
+//   ctlSend()/ctlRecv()    reach a worker that is MID-JOB, over a second channel
+//   kill()/respawn()       replace a worker without disturbing anyone's index
+//
+// The child keeps a counter no other process can see, so "count=3" is proof the
+// same process ran all three jobs — not an assertion about it.
+
+import { WorkerPool, workerEntry, workerControlSend, workerControlRecv } from "vyto/os/worker";
+
+// Per-process state. The parent builds one; every forked child gets its own
+// copy and diverges from that moment on. Nothing is shared.
+class Tally {
+    n: int;
+    fn init() { this.n = 0; }
+}
+
+fn main() {
+    let st = new Tally();
+    let job: fn(byte[]): byte[] = (input) => serve(st, input);
+
+    // First thing in main, before anything with a side effect. On Windows a
+    // worker is this executable re-launched, so everything above this line runs
+    // once per worker too.
+    workerEntry(job);
+
+    let pool = new WorkerPool(3, job);
+    print("workers=" + pool.size() + " slots=" + pool.slots());
+
+    // ---- affinity ---------------------------------------------------------
+    // Reserve one worker and run three jobs on it. The counter climbing 1,2,3
+    // is only possible if all three ran in the same process.
+    let w = pool.checkout();
+    print("pinned slot=" + w);
+    let i = 0;
+    while (i < 3) {
+        print("  pinned -> " + text(pool, run(pool, w, "inc")));
+        i += 1;
+    }
+
+    // A general submit() must not land on the held worker. It reports count=1
+    // because it reached a process that has never run a job; had it been routed
+    // to the pinned one it would say count=4.
+    let tk = pool.submit(strBytes("inc"));
+    print("unpinned -> " + text(pool, await(pool, tk)));
+
+    // ---- control channel --------------------------------------------------
+    // A job that reports something the instant it starts, rather than making
+    // the parent wait for the result frame to learn it.
+    let tk2 = pool.submitTo(w, strBytes("announce"));
+    pool.ctlWait(w, -1);
+    print("control <- " + str(pool.ctlRecv(w) as cstring));
+    print("announce -> " + text(pool, await(pool, tk2)));
+
+    // The one that matters: the worker is inside a job and blocked. The data
+    // channel cannot reach it — it is not reading that until it answers. The
+    // control channel can, and this is how a long query gets cancelled.
+    let tk3 = pool.submitTo(w, strBytes("wait"));
+    pool.ctlSend(w, strBytes("stop"));
+    print("wait -> " + text(pool, await(pool, tk3)));
+
+    // ---- kill and respawn -------------------------------------------------
+    // Kill the pinned worker. Its slot stays in place, dead, so nothing else's
+    // index moves; the pool is one worker lighter until it is rebuilt.
+    pool.kill(w);
+    print("after kill: workers=" + pool.size() + " slots=" + pool.slots()
+          + " alive=" + str(pool.alive(w)));
+
+    // Two statements, deliberately: binary operands evaluate right to left, so
+    // reading size() in the same expression as respawn() would report the count
+    // from before the respawn.
+    let back = pool.respawn(w);
+    print("respawn=" + str(back) + " workers=" + pool.size());
+    // Same slot index, brand new process: the counter is back to zero, which is
+    // the point — the state that made affinity useful is genuinely gone.
+    print("  respawned -> " + text(pool, run(pool, w, "inc")));
+    pool.release(w);
+}
+
+// Submit to a pinned worker and block for its answer.
+fn run(pool: WorkerPool, w: int, cmd: string): byte[] {
+    return await(pool, pool.submitTo(w, strBytes(cmd)));
+}
+
+// Block until `tk` comes back. Real code folds poll() into an event loop
+// instead; an example wants deterministic output.
+fn await(pool: WorkerPool, tk: int): byte[] {
+    while (true) {
+        for (let r in pool.poll(-1)) {
+            if (r.ticket == tk) { return r.output; }
+        }
+        if (pool.size() == 0) { return bytes(0); }
+    }
+    return bytes(0);
+}
+
+fn text(pool: WorkerPool, b: byte[]): string {
+    if (b == null || b.len == 0) { return "(worker died)"; }
+    return str(b as cstring);
+}
+
+// ---- the child side -------------------------------------------------------
+
+fn serve(st: Tally, input: byte[]): byte[] {
+    let cmd = str(input as cstring);
+    if (cmd == "inc") {
+        st.n += 1;
+        return strBytes("count=" + st.n);
+    }
+    if (cmd == "announce") {
+        // Out-of-band, while the job is still running. The parent can act on
+        // this before the job could possibly have finished.
+        workerControlSend(strBytes("job started, count=" + st.n));
+        return strBytes("announced");
+    }
+    if (cmd == "wait") {
+        // Blocked, and unreachable over the data channel until it answers.
+        let msg = workerControlRecv(-1);
+        if (msg == null) { return strBytes("channel closed"); }
+        return strBytes("woke on '" + str(msg as cstring) + "'");
+    }
+    return strBytes("?" + cmd);
+}
+
+fn strBytes(s: string): byte[] {
+    let b = bytes(s.len);
+    let i = 0;
+    while (i < s.len) { b[i] = s[i] as byte; i += 1; }
+    return b;
+}

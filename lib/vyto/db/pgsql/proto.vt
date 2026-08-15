@@ -94,6 +94,7 @@ export const FMT_BINARY: int = 1;
 // 3.0. The startup packet's version field, and the only version this speaks.
 export const PROTOCOL_3_0: int = 196608;      // (3 << 16) | 0
 const SSL_REQUEST_CODE:    int = 80877103;    // (1234 << 16) | 5679
+const CANCEL_REQUEST_CODE: int = 80877102;    // (1234 << 16) | 5678
 
 // ---------------------------------------------------------------------------
 // Reading a body
@@ -217,6 +218,26 @@ export fn encodeSslRequest(): byte[] {
     let w = byteWriter(8);
     w.u32be(8);
     w.u32be(SSL_REQUEST_CODE);
+    return w.take();
+}
+
+// CancelRequest. Like SslRequest it is untyped — length and code, no message
+// byte — and unlike every other message here it does NOT go on the connection
+// it cancels: that connection is busy running the query, and PostgreSQL is not
+// reading it. It goes on a SECOND, fresh connection, which sends this and
+// nothing else, then closes.
+//
+// The pid and key are the pair the server handed out in BackendKeyData at
+// startup (session.vt), and they are the only authentication the request has —
+// which is why the server answers nothing at all, on purpose. A reply would tell
+// an attacker whether a guess was right. Success is observed on the *original*
+// connection, as the query failing with SQLSTATE 57014.
+export fn encodeCancelRequest(pid: int, key: int): byte[] {
+    let w = byteWriter(16);
+    w.u32be(16);
+    w.u32be(CANCEL_REQUEST_CODE);
+    w.u32be(pid);
+    w.u32be(key);
     return w.take();
 }
 

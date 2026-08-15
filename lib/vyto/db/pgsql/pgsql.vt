@@ -87,11 +87,12 @@ import { Driver, Conn, Stmt, STEP_ROW, STEP_DONE, STEP_ERR,
 import { Dialect, PgDialect, pgDialect } from "vyto/db/dialect";
 import { Value, dbNull, DB_NULL } from "vyto/db/value";
 import { WireIo } from "vyto/db/wire/io";
-import { SockIo, dialTcp } from "vyto/db/wire/io";
+import { SockIo, dialTcp, dialTcpEx } from "vyto/db/wire/io";
 import { Dsn, parseDsn } from "vyto/db/wire";
 import { PgSession, PgRowBuffer, PgPrepared, PgMsg } from "vyto/db/pgsql/session";
 import { PgColumn, PgRow, PgParam, decodeDataRow, decodeError,
          decodeCommandComplete, decodeRowDescription, decodeReadyForQuery,
+         encodeCancelRequest,
          B_DATA_ROW, B_CMD_COMPLETE, B_BIND_DONE, B_ERROR, B_READY,
          B_EMPTY_QUERY, B_PORTAL_SUSP, B_ROW_DESC, B_NO_DATA,
          FMT_TEXT } from "vyto/db/pgsql/proto";
@@ -423,9 +424,16 @@ export class PgConn extends Conn {
         return this.sess.param(name);
     }
 
+    // The pid/key pair BackendKeyData handed out at startup. Together they are
+    // the credential a CancelRequest presents, and they are only useful as a
+    // pair — see pgCancel below, and encodeCancelRequest in proto.vt.
     fn backendPid(): int {
         if (this.sess == null) { return 0; }
         return this.sess.backendPid;
+    }
+    fn backendKey(): int {
+        if (this.sess == null) { return 0; }
+        return this.sess.backendKey;
     }
 
     // The transport, for a caller building something this API does not cover.
@@ -546,6 +554,7 @@ export class PgDriver extends Driver {
     appName: string;
     timeZone: string;
     timeoutMs: int;
+    connTimeoutMs: int;
     cacheCap: int;
     drainCap: int;
     ssl: string;
@@ -560,6 +569,9 @@ export class PgDriver extends Driver {
         // A local file read cannot hang forever; a TCP read can. SqliteDriver
         // defaults its busy timeout to 0 for that reason and this cannot.
         this.timeoutMs = 30000;
+        // 0 means "follow timeoutMs", which is what this did before the two
+        // were separable — see connectTimeout().
+        this.connTimeoutMs = 0;
         this.cacheCap = 64;
         this.drainCap = 100000;
         this.ssl = DEFAULT_SSLMODE;
@@ -578,8 +590,30 @@ export class PgDriver extends Driver {
     // something else is fine; leaving it to server configuration is not.
     builder fn timezone(s: string) { this.timeZone = s; return this; }
 
-    // 0 waits forever.
+    // How long to wait for a REPLY. 0 waits forever.
+    //
+    // Waiting forever is the right setting for a caller that can cancel: a query
+    // may legitimately run for an hour, and a read deadline that fires on it
+    // does not "time out the query" — it tears down the connection, losing the
+    // session, its transaction and its temp tables, and reports it as a server
+    // that stopped answering. Set this only when there is nothing to stop a
+    // runaway statement.
     builder fn timeout(ms: int) { this.timeoutMs = ms; return this; }
+
+    // How long to wait for the TCP CONNECT. 0 follows timeout().
+    //
+    // Separate because the two answer different questions. A connect that has
+    // not completed in a few seconds is not going to; a reply that has not
+    // arrived in a few seconds may just be a query still running. One number
+    // cannot mean both without either tolerating a two-minute hang on an
+    // unroutable host or killing legitimate work.
+    builder fn connectTimeout(ms: int) { this.connTimeoutMs = ms; return this; }
+
+    // The connect deadline actually in force.
+    fn connectDeadline(): int {
+        if (this.connTimeoutMs > 0) { return this.connTimeoutMs; }
+        return this.timeoutMs;
+    }
 
     // Prepared statements kept per connection. 0 disables the cache.
     builder fn stmtCache(n: int) { this.cacheCap = n; return this; }
@@ -629,7 +663,7 @@ export class PgDriver extends Driver {
                 DBERR_UNSUPPORTED);
         }
 
-        let io = dialTcp(d.host, d.port, this.timeoutMs);
+        let io = dialTcpEx(d.host, d.port, this.connectDeadline(), this.timeoutMs);
         if (io == null) {
             return deadConn("vyto/db/pgsql: could not connect to " + d.host + ":" + str(d.port),
                             DBERR_OPEN);
@@ -754,6 +788,36 @@ export class PgOverDriver extends PgDriver {
         cn.cacheCap = this.cacheCap;
         return cn;
     }
+}
+
+// Ask the server to stop whatever the session identified by (pid, key) is
+// running. Returns "" on success, or why it could not be sent.
+//
+// This opens its OWN connection and that is not an implementation detail — it
+// is the entire mechanism. The connection running the query is blocked inside
+// it and PostgreSQL is not reading that socket, so a cancel can only arrive out
+// of band. The pid and key come from the busy connection's backendPid() and
+// backendKey(), captured at ITS startup, so a caller has to have kept them.
+//
+// Sending is not the same as cancelling. The server replies nothing whatsoever
+// — deliberately, since a reply would confirm a guessed key — and simply closes.
+// The outcome shows up on the original connection, as its query failing with
+// SQLSTATE 57014, which this driver reports as DBERR_CANCELLED. A query that
+// finished a microsecond earlier cancels nothing and reports the same "".
+//
+// Plaintext: no TLS handshake is attempted. A server whose pg_hba requires
+// hostssl for this address will drop the request, so cancellation over an
+// SSL-only link needs the TLS path built out first.
+export fn pgCancel(host: string, port: int, pid: int, key: int, timeoutMs: int): string {
+    if (pid == 0) { return "vyto/db/pgsql: no backend pid — nothing to cancel"; }
+    let io = dialTcp(host, port, timeoutMs);
+    if (io == null) {
+        return "vyto/db/pgsql: could not reach " + host + ":" + str(port) + " to cancel";
+    }
+    let sent = io.writeAll(encodeCancelRequest(pid, key));
+    io.close();
+    if (!sent) { return "vyto/db/pgsql: the cancel request could not be sent"; }
+    return "";
 }
 
 // The dialect is real without the driver: query and schema rendering for

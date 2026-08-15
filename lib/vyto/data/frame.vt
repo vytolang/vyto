@@ -43,6 +43,7 @@ extern "C" {
     fn ct_src_row(h: rawptr, vrow: i64): i64;
     fn ct_col_kind(h: rawptr, col: i32): i32;
     fn ct_cell_str(h: rawptr, vrow: i64, col: i32, buf: cstring, cap: i64): i64;
+    fn ct_cell_len(h: rawptr, vrow: i64, col: i32): i64;
     fn ct_cell_i64(h: rawptr, vrow: i64, col: i32): i64;
     fn ct_cell_f64(h: rawptr, vrow: i64, col: i32): f64;
     fn ct_set_cell_i64(h: rawptr, vrow: i64, col: i32, v: i64);
@@ -188,11 +189,38 @@ export class DataFrame {
     // ---- cell read (by VISIBLE row, post filter+sort) ---------------------
 
     // Formatted text of a visible cell — the only string a rendered cell costs.
+    //
+    // **Truncated at 255 bytes**, deliberately: this is the draw path, a cell is
+    // clipped to its column, and a 4 KB value shaped once per frame per visible
+    // row is the cost the columnar model exists to avoid. Anything that needs
+    // the value itself — a viewer, an export, the clipboard — must use
+    // cellStrFull, which is bounded by the value and not by the buffer.
     fn cellStr(vrow: int, col: int): string {
         if (this.scratch == null) { this.scratch = bytes(256); }
         let n = ct_cell_str(this.h, vrow as i64, col as i32, this.scratch as cstring, 256) as int;
         if (n <= 0) { return ""; }
         return str(this.scratch as cstring);
+    }
+
+    // The full byte length of a visible cell's formatted text. 0 for a null.
+    fn cellLen(vrow: int, col: int): int {
+        return ct_cell_len(this.h, vrow as i64, col as i32) as int;
+    }
+
+    // The whole cell, however long. One length query, then one read into a
+    // buffer sized to the answer — the string lives in the arena already, so
+    // this copies it once and does not materialise anything else.
+    //
+    // Short cells still take the cached 256-byte scratch, so the common case
+    // costs exactly what cellStr costs.
+    fn cellStrFull(vrow: int, col: int): string {
+        let n = this.cellLen(vrow, col);
+        if (n <= 0) { return ""; }
+        if (n < 256) { return this.cellStr(vrow, col); }
+        let buf = bytes(n + 1);
+        let got = ct_cell_str(this.h, vrow as i64, col as i32, buf as cstring, (n + 1) as i64) as int;
+        if (got <= 0) { return ""; }
+        return str(buf as cstring);
     }
     fn cellInt(vrow: int, col: int): int { return ct_cell_i64(this.h, vrow as i64, col as i32) as int; }
     fn cellFloat(vrow: int, col: int): float { return ct_cell_f64(this.h, vrow as i64, col as i32); }

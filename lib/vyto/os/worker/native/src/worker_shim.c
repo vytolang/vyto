@@ -22,7 +22,19 @@
    written/read in full by the loops below, so a job's input and result never
    tear across a partial read. The parent never packs a struct across FFI: the
    fd comes back from w_spawn as a plain int and the pid via a paired accessor,
-   which is safe because the parent spawns sequentially. */
+   which is safe because the parent spawns sequentially.
+
+   Every worker gets a SECOND channel beside the data one: the control channel.
+   The data channel is strictly request/response and a busy worker is, by
+   definition, not reading it — so there is no way to reach a worker mid-job over
+   it, which is what cancelling one requires. The control channel carries opaque
+   bytes in both directions and is never part of the job protocol: the parent can
+   write to it while a job runs, and the child can hand back out-of-band state
+   (a backend pid, a cancel key) the instant it has it rather than at the end.
+
+   On POSIX that is a second socketpair from the same fork. On Windows the child
+   connects back to the parent's listener twice, data first, and both connections
+   present the token. */
 
 #ifdef _WIN32
 #ifndef _WIN32_WINNT
@@ -39,12 +51,14 @@
 #include <unistd.h>
 #include <sys/wait.h>
 #include <signal.h>
+#include <poll.h>
 #endif
 
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
 #include <stdio.h>
+#include <errno.h>
 
 /* ---- transport compatibility ---------------------------------------------
    Same int-fd contract on both sides; on Windows the int is a SOCKET, which
@@ -70,9 +84,13 @@ void w_close(int fd) { if (fd >= 0) w_closefd(fd); }
    handlers, which would otherwise double-flush buffers inherited by the fork. */
 void w_exit(int code) { _exit(code); }
 
+/* A signal arriving mid-transfer must not look like a broken worker: EINTR is a
+   "try again", not an error, and these loops are the only thing standing between
+   a stray signal and a retired process. */
 static int write_all(int fd, const char *p, size_t n) {
     while (n) {
         int w = w_write(fd, p, n);
+        if (w < 0 && errno == EINTR) continue;
         if (w <= 0) return -1;
         p += w; n -= (size_t)w;
     }
@@ -82,6 +100,7 @@ static int write_all(int fd, const char *p, size_t n) {
 static int read_all(int fd, char *p, size_t n) {
     while (n) {
         int r = w_read(fd, p, n);
+        if (r < 0 && errno == EINTR) continue;
         if (r == 0) return 1;
         if (r < 0) return -1;
         p += r; n -= (size_t)r;
@@ -89,9 +108,42 @@ static int read_all(int fd, char *p, size_t n) {
     return 0;
 }
 
+/* The largest frame either side will write or accept. The wire length is a
+   uint32 but every reader here returns it as an int, so anything at or above
+   2^31 would come back negative and be misread as EOF. Capping well below that
+   turns a corrupt or hostile length into a clean error instead of a bogus
+   allocation. 1 GiB is far past any real job payload. */
+#define W_MAX_FRAME (1 << 30)
+
+/* Wait for `fd` to become readable. 1 = readable, 0 = timed out, -1 = error.
+   timeoutMs < 0 blocks forever, 0 polls. Used to check a control channel
+   without committing to a read that would block. */
+int w_poll_readable(int fd, int timeoutMs) {
+    if (fd < 0) return -1;
+#ifdef _WIN32
+    fd_set rf;
+    FD_ZERO(&rf);
+    FD_SET(W_FD(fd), &rf);
+    struct timeval tv;
+    tv.tv_sec = timeoutMs / 1000;
+    tv.tv_usec = (timeoutMs % 1000) * 1000;
+    int rc = select(0, &rf, NULL, NULL, timeoutMs < 0 ? NULL : &tv);
+#else
+    struct pollfd p;
+    p.fd = fd;
+    p.events = POLLIN;
+    p.revents = 0;
+    int rc;
+    do { rc = poll(&p, 1, timeoutMs); } while (rc < 0 && errno == EINTR);
+#endif
+    if (rc < 0) return -1;
+    return rc > 0 ? 1 : 0;
+}
+
 /* Write a length-prefixed frame. 0 ok, -1 error. */
 int w_write_frame(int fd, const char *buf, int n) {
     if (n < 0) n = 0;
+    if (n > W_MAX_FRAME) return -1;
     uint32_t len = (uint32_t)n;
     unsigned char hdr[4] = { (unsigned char)(len >> 24), (unsigned char)(len >> 16),
                              (unsigned char)(len >> 8), (unsigned char)len };
@@ -100,14 +152,18 @@ int w_write_frame(int fd, const char *buf, int n) {
     return 0;
 }
 
-/* Read the next frame's length. >=0 length, -1 = peer closed (EOF), -2 = error. */
+/* Read the next frame's length. >=0 length, -1 = peer closed (EOF), -2 = error.
+   A length past W_MAX_FRAME is reported as an error rather than returned: the
+   caller would otherwise allocate on a number it never sanity-checked. */
 int w_read_len(int fd) {
     unsigned char hdr[4];
     int r = read_all(fd, (char *)hdr, 4);
     if (r == 1) return -1;
     if (r < 0) return -2;
-    return (int)(((uint32_t)hdr[0] << 24) | ((uint32_t)hdr[1] << 16) |
-                 ((uint32_t)hdr[2] << 8) | (uint32_t)hdr[3]);
+    uint32_t len = ((uint32_t)hdr[0] << 24) | ((uint32_t)hdr[1] << 16) |
+                   ((uint32_t)hdr[2] << 8) | (uint32_t)hdr[3];
+    if (len > (uint32_t)W_MAX_FRAME) return -2;
+    return (int)len;
 }
 /* Read `n` payload bytes into buf (call right after w_read_len). 0 ok, -1 error. */
 int w_read_bytes(int fd, char *buf, int n) {
@@ -118,28 +174,46 @@ int w_read_bytes(int fd, char *buf, int n) {
 static int g_last_pid = -1;
 int w_last_pid(void) { return g_last_pid; }
 
+/* The parent-side control fd of the worker w_spawn just created. Paired
+   accessor, same contract as w_last_pid: valid until the next w_spawn, which is
+   safe because the parent spawns sequentially. */
+static int g_last_ctl = -1;
+int w_last_ctl_fd(void) { return g_last_ctl; }
+
 /* ===================== POSIX: fork ======================================== */
 #ifndef _WIN32
 
 static int g_channel = -1;
+static int g_ctl_channel = -1;
 int w_worker_channel(void) { return g_channel; }
+int w_worker_control(void) { return g_ctl_channel; }
 
-/* Spawn one worker. In the parent returns the parent-side fd (or -1 on
-   failure); in the forked child returns 0, with the channel fd available from
-   w_worker_channel(). `slot` is unused here — fork needs no addressing. */
+/* Spawn one worker. In the parent returns the parent-side data fd (or -1 on
+   failure), with its control fd at w_last_ctl_fd(); in the forked child returns
+   0, with both fds available from w_worker_channel()/w_worker_control().
+   `slot` is unused here — fork needs no addressing. */
 int w_spawn(int slot) {
     (void)slot;
-    int sv[2];
+    int sv[2], cv[2];
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) return -1;
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, cv) != 0) {
+        close(sv[0]); close(sv[1]);
+        return -1;
+    }
     pid_t pid = fork();
-    if (pid < 0) { close(sv[0]); close(sv[1]); return -1; }
+    if (pid < 0) {
+        close(sv[0]); close(sv[1]); close(cv[0]); close(cv[1]);
+        return -1;
+    }
     if (pid == 0) {
-        close(sv[0]);       /* child keeps only its own end */
+        close(sv[0]); close(cv[0]);   /* child keeps only its own ends */
         g_channel = sv[1];
+        g_ctl_channel = cv[1];
         return 0;
     }
-    close(sv[1]);           /* parent keeps only its own end */
+    close(sv[1]); close(cv[1]);       /* parent keeps only its own ends */
     g_last_pid = (int)pid;
+    g_last_ctl = cv[0];
     return sv[0];
 }
 
@@ -188,9 +262,29 @@ static int w_token(char *out, int n) {
     return 0;
 }
 
-/* This process's channel, if it was launched as a worker. Resolved once, on
-   first call: connect back to the parent's loopback port and prove identity
-   with the token. -1 means "not a worker" (the normal case). */
+/* One connection back to the parent's listener, authenticated with the token.
+   INVALID_SOCKET on any failure. */
+static SOCKET w_connect_back(const char *port, const char *tok) {
+    SOCKET s = socket(AF_INET, SOCK_STREAM, 0);
+    if (s == INVALID_SOCKET) return INVALID_SOCKET;
+    struct sockaddr_in a;
+    memset(&a, 0, sizeof a);
+    a.sin_family = AF_INET;
+    a.sin_port = htons((unsigned short)atoi(port));
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (connect(s, (struct sockaddr *)&a, sizeof a) != 0) { closesocket(s); return INVALID_SOCKET; }
+    if (send(s, tok, W_TOKEN_HEX, 0) != W_TOKEN_HEX) { closesocket(s); return INVALID_SOCKET; }
+    return s;
+}
+
+static int g_ctl_channel = -1;
+int w_worker_control(void) { return g_ctl_channel; }
+
+/* This process's channels, if it was launched as a worker. Resolved once, on
+   first call: connect back to the parent's loopback port twice — data first,
+   then control — proving identity with the token each time. The parent accepts
+   in the same order, which is what pairs the two. -1 means "not a worker" (the
+   normal case). */
 int w_worker_channel(void) {
     static int ch = -2;                 /* -2 = not yet resolved */
     if (ch != -2) return ch;
@@ -201,26 +295,47 @@ int w_worker_channel(void) {
     if (!port || !*port || !tok || !*tok) return ch;
     if (wsa_ready() != 0) return ch;
 
-    SOCKET s = socket(AF_INET, SOCK_STREAM, 0);
-    if (s == INVALID_SOCKET) return ch;
-    struct sockaddr_in a;
-    memset(&a, 0, sizeof a);
-    a.sin_family = AF_INET;
-    a.sin_port = htons((unsigned short)atoi(port));
-    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    if (connect(s, (struct sockaddr *)&a, sizeof a) != 0) { closesocket(s); return ch; }
-    if (send(s, tok, W_TOKEN_HEX, 0) != W_TOKEN_HEX) { closesocket(s); return ch; }
-    ch = W_INT(s);
+    SOCKET d = w_connect_back(port, tok);
+    if (d == INVALID_SOCKET) return ch;
+    SOCKET c = w_connect_back(port, tok);
+    if (c == INVALID_SOCKET) { closesocket(d); return ch; }
+    g_ctl_channel = W_INT(c);
+    ch = W_INT(d);
     return ch;
 }
 
+/* First free slot in the process table, appending if none was freed. Respawn
+   makes reuse matter: without it a long-running parent that replaces workers
+   walks g_nprocs to W_MAX_WORKERS and then cannot spawn at all. -1 if full.
+   Side-effect free — the caller commits by writing g_procs[i] and, when the slot
+   was an append, bumping g_nprocs — so it doubles as a "would this fit?" probe. */
+static int w_proc_slot(void) {
+    for (int i = 0; i < g_nprocs; i++) { if (!g_procs[i]) return i; }
+    if (g_nprocs >= W_MAX_WORKERS) return -1;
+    return g_nprocs;
+}
+
+/* Accept one connection and require the token, so a local process that races the
+   child onto the port cannot become our worker. INVALID_SOCKET on failure. */
+static SOCKET w_accept_auth(SOCKET lsn, const char *tok) {
+    SOCKET c = accept(lsn, NULL, NULL);
+    if (c == INVALID_SOCKET) return INVALID_SOCKET;
+    char got[W_TOKEN_HEX];
+    if (read_all(W_INT(c), got, W_TOKEN_HEX) != 0 || memcmp(got, tok, W_TOKEN_HEX) != 0) {
+        closesocket(c);
+        return INVALID_SOCKET;
+    }
+    return c;
+}
+
 /* Spawn one worker process: listen on an ephemeral loopback port, re-launch
-   this executable with the port and token in its environment, then accept the
-   connection back. Returns the parent-side fd, or -1. Never returns 0 — there
-   is no child return path on Windows. */
+   this executable with the port and token in its environment, then accept its
+   two connections back (data, then control). Returns the parent-side data fd
+   with the control fd at w_last_ctl_fd(), or -1. Never returns 0 — there is no
+   child return path on Windows. */
 int w_spawn(int slot) {
     if (wsa_ready() != 0) return -1;
-    if (g_nprocs >= W_MAX_WORKERS) return -1;
+    if (w_proc_slot() < 0) return -1;
 
     SOCKET lsn = socket(AF_INET, SOCK_STREAM, 0);
     if (lsn == INVALID_SOCKET) return -1;
@@ -232,7 +347,7 @@ int w_spawn(int slot) {
     int fd = -1;
     char tok[W_TOKEN_HEX + 1];
     if (bind(lsn, (struct sockaddr *)&a, sizeof a) != 0) goto done;
-    if (listen(lsn, 1) != 0) goto done;
+    if (listen(lsn, 2) != 0) goto done;          /* data + control */
 
     int alen = sizeof a;
     if (getsockname(lsn, (struct sockaddr *)&a, &alen) != 0) goto done;
@@ -270,20 +385,30 @@ int w_spawn(int slot) {
     if (!ok) goto unset;
     CloseHandle(pi.hThread);
 
-    /* Accept exactly one connection and require the token, so a local process
-       that races the child onto the port cannot become our worker. */
-    SOCKET c = accept(lsn, NULL, NULL);
+    /* Two authenticated connections, in the order the child makes them: data
+       first, then control. Anything short of both is a half-built worker, so it
+       is torn down rather than handed back. */
+    SOCKET c = w_accept_auth(lsn, tok);
     if (c == INVALID_SOCKET) { TerminateProcess(pi.hProcess, 1); CloseHandle(pi.hProcess); goto unset; }
-    char got[W_TOKEN_HEX];
-    if (read_all(W_INT(c), got, sizeof got) != 0 || memcmp(got, tok, sizeof got) != 0) {
+    SOCKET cc = w_accept_auth(lsn, tok);
+    if (cc == INVALID_SOCKET) {
         closesocket(c);
         TerminateProcess(pi.hProcess, 1);
         CloseHandle(pi.hProcess);
         goto unset;
     }
 
-    g_procs[g_nprocs] = pi.hProcess;
-    g_last_pid = ++g_nprocs;   /* 1-based index, so 0 never looks like a pid */
+    int ps = w_proc_slot();
+    if (ps < 0) {
+        closesocket(c); closesocket(cc);
+        TerminateProcess(pi.hProcess, 1);
+        CloseHandle(pi.hProcess);
+        goto unset;
+    }
+    g_procs[ps] = pi.hProcess;
+    if (ps == g_nprocs) g_nprocs++;
+    g_last_pid = ps + 1;       /* 1-based index, so 0 never looks like a pid */
+    g_last_ctl = W_INT(cc);
     fd = W_INT(c);
 
 unset:

@@ -6,8 +6,9 @@
 
 import { Widget, Painter, Theme, Size, BoxConstraints } from "vyto/ui/core";
 import { SearchField, Button } from "vyto/ui/form";
+import { SIDE_BOTTOM } from "vyto/ui/scrollbar";
 import { Rect, contains, mix, KEY_UP, KEY_DOWN, KEY_LEFT, KEY_RIGHT,
-         KEY_ENTER, KEY_SPACE } from "vyto/surface";
+         KEY_ENTER, KEY_SPACE, MOD_SHIFT } from "vyto/surface";
 
 // ---- string helpers (no generics / stdlib string compare) ----------------
 
@@ -79,10 +80,24 @@ export class TreeView extends Widget {
     flat: TreeNode[];   // visible nodes, rebuilt each layout/draw
     depth: int[];
     selected: int;      // index into flat (-1 none)
+    hover: int;         // index into flat under the cursor (-1 none)
     scroll: float;      // pixel scroll
     onSelect: fn(TreeNode);
+    // Fired when a node is expanded by its chevron or by Right. onSelect does
+    // NOT fire on a chevron — expanding and selecting are different acts — so
+    // an app that fills a level lazily has no other way to hear about it, and
+    // the chevron silently opens a node it never got to populate.
+    onExpand: fn(TreeNode);
+    // Right-click on a row: (node, absolute x, absolute y). The row under the
+    // cursor is selected first, because a context menu that acts on something
+    // other than what it is pointing at is how people delete the wrong thing.
+    onContext: fn(TreeNode, int, int);
     view_w: float;
     view_h: float;
+    // Widest row drawn, in content pixels (indent + label). Measured during
+    // render, because measuring every label needs a Painter and a tree holding
+    // a schema is thousands of nodes — only the visible ones are ever measured.
+    content_w: float;
 
     fn init() {
         super.init();
@@ -90,10 +105,24 @@ export class TreeView extends Widget {
         this.flat = [];
         this.depth = [];
         this.selected = -1;
+        this.hover = -1;
         this.scroll = 0;
         this.focusable = true;
         this.view_w = 240;
         this.view_h = 240;
+        this.content_w = 0;
+        // Horizontal only. A deep tree of long identifiers — a schema qualified
+        // database name, a 60-character table — runs off the right edge of a
+        // fixed-width dock, and the alternative to scrolling it is eliding the
+        // end of every name, which is the half a DBA needs.
+        this.add_scrollbar(SIDE_BOTTOM);
+    }
+
+    // The horizontal bar reads this; vertical scrolling stays on `scroll`,
+    // which predates the base-widget offsets and is what row_at() works in.
+    override fn scroll_content_w(): float {
+        if (this.content_w < this.bounds.w) { return this.bounds.w; }
+        return this.content_w;
     }
 
     fn add_root(n: TreeNode) { this.roots.push(n); }
@@ -132,13 +161,16 @@ export class TreeView extends Widget {
     }
 
     override fn render(s: Painter, th: Theme) {
+        let win = this.win;
+        if (win == null) { return; }
         this.rebuild();
         this.clamp_scroll();
         s.fill_round(this.bounds, th.radius_md, th.surface_raised);
         s.stroke_round(this.bounds, th.radius_md, 1, th.border);
-        if (this.focused) { this.win.skin.focus.paint(s, th, this.bounds, th.radius_md); }
+        if (this.focused) { win.skin.focus.paint(s, th, this.bounds, th.radius_md); }
         s.clip_push(this.bounds, th.radius_md);
         let on = th.on_surface;
+        let widest = 0.0;
         for (let i in 0..this.flat.len) {
             let ry = this.bounds.y + 2.0 - this.scroll + (i as float) * TREE_ROW_H;
             if (ry + TREE_ROW_H < this.bounds.y || ry > this.bounds.bottom()) { continue; }
@@ -147,9 +179,14 @@ export class TreeView extends Widget {
             if (i == this.selected) {
                 s.fill_round(Rect(this.bounds.x + 2, ry, this.bounds.w - 4, TREE_ROW_H - 2),
                              th.radius_sm, th.selection);
+            } else if (i == this.hover) {
+                // Same weight as DataTable's hover row, so a tree and a grid
+                // side by side track the cursor identically.
+                s.fill_round(Rect(this.bounds.x + 2, ry, this.bounds.w - 4, TREE_ROW_H - 2),
+                             th.radius_sm, mix(th.surface_raised, th.on_surface, 0.04));
             }
             let ind = 10.0 + (d as float) * 16.0;
-            let cx = this.bounds.x + ind;
+            let cx = this.bounds.x + ind - this.scroll_off_x;
             let cy = ry + TREE_ROW_H / 2.0;
             if (!n.leaf()) {
                 if (n.expanded) {
@@ -160,10 +197,19 @@ export class TreeView extends Widget {
                     s.line_w(cx + 2, cy, cx - 2, cy + 4, 2, on);
                 }
             }
-            let tr = Rect(this.bounds.x + ind + 14, ry, this.bounds.w - ind - 16, TREE_ROW_H);
+            let tx = this.bounds.x + ind + 14 - this.scroll_off_x;
+            let tw = s.text_width(n.label);
+            if (ind + 14 + tw + 8 > widest) { widest = ind + 14 + tw + 8; }
+            // The rect is the row's own width from the text's left edge, not
+            // the widget's: with a horizontal offset the text may start left of
+            // the widget and text_in would otherwise clip it away.
+            let tr = Rect(tx, ry, tw + 4, TREE_ROW_H);
             s.text_in(tr, 0, n.label, on);
         }
         s.clip_pop();
+        this.content_w = widest;
+        this.scroll_clamp();
+        this.paint_scrollbars(s, th);
     }
 
     fn row_at(py: int): int {
@@ -173,15 +219,45 @@ export class TreeView extends Widget {
         return r;
     }
 
+    // Hover tracking rides on hit-testing, the same way DataTable's does: the
+    // window hit-tests on every motion event, so there is no second traversal.
+    override fn hit(px: int, py: int): Widget {
+        if (this.disabled || !contains(this.bounds, px, py)) { return null; }
+        let h = this.row_at(py);
+        // Don't leave a row highlighted while the cursor is over the scrollbar.
+        if (this.scrollbar_hit(px, py)) { h = -1; }
+        if (h != this.hover) { this.hover = h; this.invalidate(); }
+        return this;
+    }
+
+    override fn on_hover_leave(): bool {
+        if (this.hover != -1) { this.hover = -1; return true; }
+        return false;
+    }
+
+    override fn on_context(x: int, y: int): bool {
+        let i = this.row_at(y);
+        if (i < 0) { return false; }
+        this.selected = i;
+        this.invalidate();
+        if (this.onContext != null) { this.onContext(this.flat[i], x, y); }
+        return true;
+    }
+
     override fn on_click(x: int, y: int): bool {
+        // The bar first, or a press on the thumb selects whatever row is behind
+        // it. TreeView overrides on_click, so the base's scrollbar handling has
+        // to be called explicitly.
+        if (this.scrollbar_press(x, y)) { return true; }
         let i = this.row_at(y);
         if (i < 0) { return false; }
         this.selected = i;
         let n = this.flat[i];
         let d = this.depth[i];
-        let chev = this.bounds.x + 10.0 + (d as float) * 16.0;
+        let chev = this.bounds.x + 10.0 + (d as float) * 16.0 - this.scroll_off_x;
         if (!n.leaf() && x as float < chev + 12.0) {
             n.expanded = !n.expanded;
+            if (n.expanded && this.onExpand != null) { this.onExpand(n); }
         } else if (this.onSelect != null) {
             this.onSelect(n);
         }
@@ -199,7 +275,10 @@ export class TreeView extends Widget {
         }
         if (k == KEY_RIGHT) {
             let n = this.cur();
-            if (n != null && !n.leaf() && !n.expanded) { n.expanded = true; }
+            if (n != null && !n.leaf() && !n.expanded) {
+                n.expanded = true;
+                if (this.onExpand != null) { this.onExpand(n); }
+            }
             return true;
         }
         if (k == KEY_LEFT) {
@@ -216,6 +295,12 @@ export class TreeView extends Widget {
     }
 
     override fn on_scroll(delta: int): bool {
+        // Shift+wheel pans, the convention everywhere a horizontal axis exists.
+        if (this.win != null && (this.win.mods & MOD_SHIFT) != 0) {
+            this.scroll_off_x += (delta as float) * 24.0;
+            this.scroll_clamp();
+            return true;
+        }
         this.scroll += (delta as float) * TREE_ROW_H;
         this.clamp_scroll();
         return true;
@@ -223,6 +308,8 @@ export class TreeView extends Widget {
 
     override fn drop_handlers() {
         this.onSelect = null;
+        this.onExpand = null;
+        this.onContext = null;
     }
 }
 

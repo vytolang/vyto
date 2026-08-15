@@ -20,7 +20,8 @@
 // Nothing here prints a version, a timestamp, an address, or a random value, so
 // the golden survives a dependency bump.
 
-import { encodeStartup, encodeSslRequest, encodeQuery, encodeParse, encodeDescribe,
+import { encodeStartup, encodeSslRequest, encodeCancelRequest,
+         encodeQuery, encodeParse, encodeDescribe,
          encodeBind, encodeExecute, encodeSync, encodeFlush, encodeClose,
          encodeTerminate, encodePassword, encodeSaslInitial, encodeSaslResponse,
          decodeRowDescription, decodeParameterDescription, decodeDataRow,
@@ -108,6 +109,14 @@ fn encoders() {
     // 8-byte length and the magic 80877103 (0x04d2162f). Answered with a bare
     // 'S' or 'N' byte, not a message.
     check("SSLRequest", hex(encodeSslRequest()), "0000000804d2162f");
+
+    // Also untyped, and one less than SSLRequest's magic: 80877102 (0x04d2162e),
+    // then the pid and secret key from BackendKeyData. It goes on a SECOND
+    // connection — the one running the query is not being read — and the server
+    // answers nothing at all, so these sixteen bytes are the entire exchange.
+    // pid 12345 = 0x00003039, key 67890 = 0x00010932.
+    check("CancelRequest", hex(encodeCancelRequest(12345, 67890)),
+          "0000001004d2162e0000303900010932");
 
     // 'Q' (0x51), length 13 = 4 + len("SELECT 1\0").
     check("Query", hex(encodeQuery("SELECT 1")), "510000000d53454c454354203100");
@@ -257,7 +266,9 @@ fn errors() {
     check("40001 serialization failure", dberr_name(sqlstateToDberr("40001")), "busy");
     check("40P01 deadlock",              dberr_name(sqlstateToDberr("40P01")), "busy");
     check("55P03 lock not available",    dberr_name(sqlstateToDberr("55P03")), "busy");
-    check("57014 query canceled",        dberr_name(sqlstateToDberr("57014")), "busy");
+    // Cancelled, not busy. The three above invite a retry; this one is the
+    // statement somebody asked to stop, and retrying would undo the ask.
+    check("57014 query canceled",        dberr_name(sqlstateToDberr("57014")), "cancelled");
     check("28P01 bad password",          dberr_name(sqlstateToDberr("28P01")), "open");
     check("3D000 no such database",      dberr_name(sqlstateToDberr("3D000")), "open");
     check("08006 connection failure",    dberr_name(sqlstateToDberr("08006")), "closed");
