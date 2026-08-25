@@ -6,6 +6,9 @@ import { Widget, Painter, Theme, Size, BoxConstraints, bcLoose, WidgetState, ws,
          BTN_FILLED, BTN_TONAL, BTN_GHOST, CaretBlink,
          WEIGHT_REG, WEIGHT_BOLD, EASE_LINEAR, EASE_OUT_CUBIC, b2f } from "vyto/ui/core";
 import { Tween } from "vyto/ui/anim";
+// The right-click Cut/Copy/Paste menu every text widget here opens. menu.vt
+// imports only core and surface, so this is not a cycle.
+import { Menu, MenuPopup } from "vyto/ui/menu";
 import { SelectionModel, SelectionAction, col_at_x, select_word,
          open_selection_toolbar } from "vyto/ui/selection";
 import { utf8_prev, utf8_next } from "vyto/util/helper";
@@ -219,6 +222,87 @@ export class TextField extends Widget {
         return true;
     }
 
+    // ---- clipboard, as methods rather than as key handlers -----------------
+    //
+    // The keyboard and the right-click menu are two ways to ask for the same
+    // thing, and a menu that reimplemented "copy" would be a second definition
+    // of it — one of which would eventually stop matching. So the key handler
+    // calls these too.
+    //
+    // Each acts on the selection when there is one and falls back to the whole
+    // field when there is not, which is what Ctrl+C has always done here.
+
+    fn clip_copy() {
+        if (this.win == null) { return; }
+        if (!this.sel.empty()) { this.win.surf.set_clipboard(this.sel.selected_text()); }
+        else { this.win.surf.set_clipboard(this.text); }
+    }
+
+    fn clip_cut() {
+        if (this.win == null) { return; }
+        if (!this.sel.empty()) {
+            this.win.surf.set_clipboard(this.sel.selected_text());
+            this.delete_selection();
+        } else {
+            this.win.surf.set_clipboard(this.text);
+            this.text = "";
+            this.caret = 0;
+        }
+        this.fire_edit();
+    }
+
+    fn clip_paste() {
+        if (this.win == null) { return; }
+        // A single-line field: newlines flatten to spaces rather than being
+        // dropped, so pasting two lines keeps the word boundary.
+        let t = this.win.surf.clipboard().replace("\r", "").replace("\n", " ");
+        this.delete_selection();
+        if (t.len > 0) {
+            this.text = this.text.slice(0, this.caret) + t
+                      + this.text.slice(this.caret, this.text.len);
+            this.caret += t.len;
+        }
+        this.fire_edit();
+    }
+
+    fn select_all() {
+        this.sel.set(0, this.text.len);
+        this.caret = this.text.len;
+    }
+
+    // Fired after an edit that did NOT come through on_key — a menu Cut or
+    // Paste. SearchField and any app field that watches every keystroke
+    // override it, or a live preview would go stale exactly when the text was
+    // changed by mouse instead of by keyboard.
+    virtual fn fire_edit() { }
+
+    // Right-click: Cut / Copy / Paste / Select all, at the pointer.
+    //
+    // The items that cannot act are ABSENT rather than greyed — MenuItem has no
+    // disabled state, and a menu that lists Paste with an empty clipboard is
+    // making a promise it will not keep.
+    override fn on_context(x: int, y: int): bool {
+        let w = this.win;
+        if (w == null) { return false; }
+        let self = this;
+        let m = new Menu("");
+        let has = !this.sel.empty();
+        let editable = !this.disabled;
+        if (has && editable) { m.add("Cut").onSelect = () => { self.clip_cut(); self.invalidate(); }; }
+        let copyLabel = "Copy";
+        if (!has) { copyLabel = "Copy all"; }
+        m.add(copyLabel).onSelect = () => { self.clip_copy(); };
+        if (editable && w.surf.clipboard().len > 0) {
+            m.add("Paste").onSelect = () => { self.clip_paste(); self.invalidate(); };
+        }
+        if (this.text.len > 0) {
+            m.add("Select all").onSelect = () => { self.select_all(); self.invalidate(); };
+        }
+        if (m.items.len == 0) { return false; }
+        w.open_overlay(new MenuPopup(m, x as float, y as float));
+        return true;
+    }
+
     fn show_toolbar(px: float) {
         if (this.win == null || this.sel.empty()) { return; }
         open_selection_toolbar(this, this.sel, px, this.bounds.y, this.selectionActions);
@@ -330,38 +414,10 @@ export class TextField extends Widget {
         // clipboard shortcuts: act on the selection when there is one, else
         // fall back to the whole field (the historical behaviour)
         if (this.win != null && (this.win.mods & MOD_CTRL) != 0) {
-            if (k == 99) { // Ctrl+C
-                if (!this.sel.empty()) { this.win.surf.set_clipboard(this.sel.selected_text()); }
-                else { this.win.surf.set_clipboard(this.text); }
-                return true;
-            }
-            if (k == 120) { // Ctrl+X
-                if (!this.sel.empty()) {
-                    this.win.surf.set_clipboard(this.sel.selected_text());
-                    this.delete_selection();
-                } else {
-                    this.win.surf.set_clipboard(this.text);
-                    this.text = "";
-                    this.caret = 0;
-                }
-                return true;
-            }
-            if (k == 118) { // Ctrl+V
-                // single-line field: newlines flatten to spaces
-                let t = this.win.surf.clipboard().replace("\r", "").replace("\n", " ");
-                this.delete_selection();
-                if (t.len > 0) {
-                    this.text = this.text.slice(0, this.caret) + t
-                              + this.text.slice(this.caret, this.text.len);
-                    this.caret += t.len;
-                }
-                return true;
-            }
-            if (k == 97) { // Ctrl+A — select all
-                this.sel.set(0, this.text.len);
-                this.caret = this.text.len;
-                return true;
-            }
+            if (k == 99) { this.clip_copy(); return true; }     // Ctrl+C
+            if (k == 120) { this.clip_cut(); return true; }     // Ctrl+X
+            if (k == 118) { this.clip_paste(); return true; }   // Ctrl+V
+            if (k == 97) { this.select_all(); return true; }    // Ctrl+A
         }
         if (k == KEY_ENTER) {
             if (this.onSubmit != null && this.text.len > 0) {
@@ -443,6 +499,11 @@ export class SearchField extends TextField {
     fn fire_change() {
         if (this.onChange != null) { this.onChange(this.text); }
     }
+
+    // A Cut or Paste from the context menu changes the text without passing
+    // through on_key, so the incremental search would keep showing results for
+    // what was there before.
+    override fn fire_edit() { this.fire_change(); }
 
     override fn render(s: Painter, th: Theme) {
         this.draw_field(s, th);
@@ -990,6 +1051,91 @@ export class TextArea extends Widget {
         return is_text_input(this, ch);
     }
 
+    // ---- clipboard, as methods rather than as key handlers -----------------
+    //
+    // Shared by Ctrl+C/X/V and by the right-click menu, so the two cannot drift
+    // apart. Each acts on the selection when there is one and falls back to the
+    // caret's line when there is not, which is what the keys have always done.
+
+    fn clip_copy() {
+        if (this.win == null) { return; }
+        if (!this.sel.empty()) { this.win.surf.set_clipboard(this.sel.selected_text()); }
+        else { this.win.surf.set_clipboard(this.lines[this.caret_row]); }
+    }
+
+    fn clip_cut() {
+        if (this.win == null || this.readonly) { return; }
+        if (!this.sel.empty()) {
+            this.win.surf.set_clipboard(this.sel.selected_text());
+            this.delete_selection();
+            return;
+        }
+        this.win.surf.set_clipboard(this.lines[this.caret_row]);
+        this.remove_row(this.caret_row);
+        if (this.caret_row >= this.lines.len) { this.caret_row = this.lines.len - 1; }
+        this.caret_col = 0;
+        this.changed();
+    }
+
+    fn clip_paste() {
+        if (this.win == null || this.readonly) { return; }
+        this.delete_selection();
+        let line = this.lines[this.caret_row];
+        let t = this.win.surf.clipboard().replace("\r", "");
+        if (t.len == 0) { return; }
+        let ls = t.split("\n");
+        let before = line.slice(0, this.caret_col);
+        let after = line.slice(this.caret_col, line.len);
+        if (ls.len == 1) {
+            this.lines[this.caret_row] = before + ls[0] + after;
+            this.caret_col = before.len + ls[0].len;
+        } else {
+            let out: string[] = [];
+            for (let i in 0..this.lines.len) {
+                if (i == this.caret_row) {
+                    out.push(before + ls[0]);
+                    for (let j in 1..ls.len - 1) { out.push(ls[j]); }
+                    out.push(ls[ls.len - 1] + after);
+                } else {
+                    out.push(this.lines[i]);
+                }
+            }
+            this.lines = out;
+            this.caret_row += ls.len - 1;
+            this.caret_col = ls[ls.len - 1].len;
+        }
+        this.changed();
+    }
+
+    fn select_all() {
+        this.sel.set(0, this.text().len);
+        this.set_caret_offset(this.text().len);
+        this.sel.focus = this.sel.hi();
+    }
+
+    // Right-click: the same four, at the pointer. A read-only area — the value
+    // viewer, the DDL screen — offers Copy and Select all and nothing that
+    // would change text it does not let you change.
+    override fn on_context(x: int, y: int): bool {
+        let w = this.win;
+        if (w == null) { return false; }
+        let self = this;
+        let m = new Menu("");
+        let has = !this.sel.empty();
+        if (has && !this.readonly) {
+            m.add("Cut").onSelect = () => { self.clip_cut(); self.invalidate(); };
+        }
+        let copyLabel = "Copy";
+        if (!has) { copyLabel = "Copy line"; }
+        m.add(copyLabel).onSelect = () => { self.clip_copy(); };
+        if (!this.readonly && w.surf.clipboard().len > 0) {
+            m.add("Paste").onSelect = () => { self.clip_paste(); self.invalidate(); };
+        }
+        m.add("Select all").onSelect = () => { self.select_all(); self.invalidate(); };
+        w.open_overlay(new MenuPopup(m, x as float, y as float));
+        return true;
+    }
+
     // Three visual rows per notch, and the caret stops dragging the view back.
     // A TextArea holding a 4 KB value is otherwise readable only three lines at
     // a time, by arrow key, which is not reading.
@@ -1008,62 +1154,10 @@ export class TextArea extends Widget {
         // clipboard shortcuts: act on the selection when there is one, else
         // fall back to the caret line (the historical behaviour)
         if (this.win != null && (this.win.mods & MOD_CTRL) != 0) {
-            if (k == 99) { // Ctrl+C
-                if (!this.sel.empty()) { this.win.surf.set_clipboard(this.sel.selected_text()); }
-                else { this.win.surf.set_clipboard(this.lines[this.caret_row]); }
-                return true;
-            }
-            if (k == 97) { // Ctrl+A — select all
-                this.sel.set(0, this.text().len);
-                this.set_caret_offset(this.text().len);
-                this.sel.focus = this.sel.hi();
-                return true;
-            }
-            if (k == 120) { // Ctrl+X
-                if (!this.sel.empty()) {
-                    this.win.surf.set_clipboard(this.sel.selected_text());
-                    this.delete_selection();
-                    return true;
-                }
-                this.win.surf.set_clipboard(this.lines[this.caret_row]);
-                this.remove_row(this.caret_row);
-                if (this.caret_row >= this.lines.len) {
-                    this.caret_row = this.lines.len - 1;
-                }
-                this.caret_col = 0;
-                this.changed();
-                return true;
-            }
-            if (k == 118) { // Ctrl+V
-                this.delete_selection();
-                let line = this.lines[this.caret_row];
-                let t = this.win.surf.clipboard().replace("\r", "");
-                if (t.len > 0) {
-                    let ls = t.split("\n");
-                    let before = line.slice(0, this.caret_col);
-                    let after = line.slice(this.caret_col, line.len);
-                    if (ls.len == 1) {
-                        this.lines[this.caret_row] = before + ls[0] + after;
-                        this.caret_col = before.len + ls[0].len;
-                    } else {
-                        let out: string[] = [];
-                        for (let i in 0..this.lines.len) {
-                            if (i == this.caret_row) {
-                                out.push(before + ls[0]);
-                                for (let j in 1..ls.len - 1) { out.push(ls[j]); }
-                                out.push(ls[ls.len - 1] + after);
-                            } else {
-                                out.push(this.lines[i]);
-                            }
-                        }
-                        this.lines = out;
-                        this.caret_row += ls.len - 1;
-                        this.caret_col = ls[ls.len - 1].len;
-                    }
-                    this.changed();
-                }
-                return true;
-            }
+            if (k == 99) { this.clip_copy(); return true; }     // Ctrl+C
+            if (k == 97) { this.select_all(); return true; }    // Ctrl+A
+            if (k == 120) { this.clip_cut(); return true; }     // Ctrl+X
+            if (k == 118) { this.clip_paste(); return true; }   // Ctrl+V
         }
         if (k == KEY_ENTER) {
             this.delete_selection();

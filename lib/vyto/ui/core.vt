@@ -2225,6 +2225,29 @@ export class Widget {
         c.release_all();
     }
 
+    // Un-parent a child WITHOUT tearing it down — no drop_handlers, no
+    // cancelled tweens, no recursion.
+    //
+    // ── WHY THIS EXISTS ─────────────────────────────────────────────────────
+    //
+    // `drop_child` releases, and release_all recurses: every Button.onClick,
+    // every TextField.onSubmit, every DataTable.onSort in the subtree is set to
+    // null. That is right when a subtree is being discarded, and it is the only
+    // thing that breaks the closure cycles a widget tree accumulates.
+    //
+    // It is wrong when an app is SWAPPING between screens it keeps. Detach with
+    // drop_child, re-add later, and what comes back is a tree that draws
+    // perfectly and answers no clicks — a bug with no symptom until someone
+    // presses something. Use this for a subtree you still own, and call
+    // `release_all()` yourself at the point you genuinely discard it.
+    //
+    // Re-adding is `add()`, and `Window.layout` re-runs `propagate_win` over
+    // it; `begin_enter` is idempotent, so a re-mounted subtree does not replay
+    // its entrance.
+    fn detach_child(c: Widget) {
+        this.children = without(this.children, c);
+    }
+
     // Drop exiting children whose exit spring has settled at 0.
     fn prune_exiting() {
         if (this.exiting == null) { return; }

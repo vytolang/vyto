@@ -221,6 +221,27 @@ win.root = col([
 > — set it only where it's actually needed, since it costs the partial-repaint
 > optimization for everything under it.
 
+> **`drop_child` tears the subtree DOWN; `detach_child` only un-parents it.**
+> `drop_child` calls `release_all()`, which recurses the subtree nulling every
+> `Button.onClick`, every `TextField.onSubmit`, every `DataTable.onSort` — the
+> only thing that breaks the closure cycles a widget tree accumulates, and
+> exactly right when the subtree is being discarded. It is the wrong call for
+> an app that SWAPS between screens it keeps: detach with `drop_child`, re-add
+> later, and what comes back draws perfectly and answers no clicks. Nothing
+> reports it, because a dead handler has no appearance. Use `detach_child` for
+> a subtree you still own and call `release_all()` yourself when you genuinely
+> drop it.
+
+> **`TextField`, `TextArea` and any subclass answer a right-click with a
+> Cut / Copy / Paste / Select all menu**, built from the same `clip_copy` /
+> `clip_cut` / `clip_paste` / `select_all` methods `Ctrl+C/X/V/A` call — one
+> implementation, two triggers, so they cannot drift. Items that cannot act
+> are **absent** rather than greyed (`MenuItem` has no disabled state): a
+> read-only `TextArea` offers no Cut and no Paste, and an empty clipboard
+> offers no Paste at all. A subclass that watches every keystroke — `SearchField`
+> does — should override `fire_edit()`, which is what the menu path calls in
+> place of a keystroke.
+
 > **`vyto/ui` never imports `vyto/gfx`, and that's load-bearing, not
 > incidental.** It's what lets an app that only uses the lean tier skip
 > linking blend2d entirely. Don't add a `vyto/gfx` import to anything under

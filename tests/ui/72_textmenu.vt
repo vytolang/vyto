@@ -1,0 +1,107 @@
+// Right-click Cut / Copy / Paste on the text widgets.
+//
+// The menu and Ctrl+C/X/V are two triggers for ONE implementation — clip_copy,
+// clip_cut, clip_paste and select_all on TextField and TextArea. A menu that
+// reimplemented them would be a second definition of copy, and the two would
+// drift. What is checked here: both triggers reach the same methods, the items
+// offered match what the widget can actually do, and a read-only area offers
+// neither of the two that write.
+//
+// Driven by calling on_context directly rather than through the event loop: a
+// menu item's position is a pixel coordinate, and this is about which items
+// exist and what they do.
+import { Window, Column, TextField, TextArea, SizedBox } from "vyto/ui";
+import { MenuPopup } from "vyto/ui/menu";
+import { MOD_CTRL } from "vyto/surface";
+
+fn labels(win: Window): string {
+    let o = win.overlay;
+    if (o == null) { return "(no menu)"; }
+    let p = o as MenuPopup;
+    if (p == null) { return "(not a menu)"; }
+    let out: string[] = [];
+    for (let it in p.menu.items) { out.push(it.label); }
+    return out.join(" | ");
+}
+
+// Choose an item the way MenuPopup does: dismiss first, then fire — so an
+// item that opens another overlay can.
+fn fire(win: Window, label: string): bool {
+    let o = win.overlay;
+    if (o == null) { return false; }
+    let p = o as MenuPopup;
+    if (p == null) { return false; }
+    for (let it in p.menu.items) {
+        if (it.label == label) {
+            win.dismiss_overlay();
+            it.fire();
+            return true;
+        }
+    }
+    win.dismiss_overlay();
+    return false;
+}
+
+fn show(s: string): string { return s.replace("\n", "\\n"); }
+
+fn main() {
+    let win = new Window("Text menu", 400, 240);
+    let field = new TextField("type here");
+    field.set_text("hello world");
+    let area = new TextArea();
+    area.set_text("first line\nsecond line");
+    let ro = new TextArea();
+    ro.set_text("read only");
+    ro.readonly = true;
+    win.root = new Column([
+        new SizedBox(0, 40, field),
+        new SizedBox(0, 60, area),
+        new SizedBox(0, 60, ro),
+    ]);
+    win.layout();
+
+    print("-- a field with no selection --");
+    field.on_context(10, 10);
+    print("menu: " + labels(win));
+    fire(win, "Copy all");
+    print("clip: " + show(win.surf.clipboard()));
+
+    print("-- a field with a selection --");
+    field.sel.set(0, 5);
+    field.on_context(10, 10);
+    print("menu: " + labels(win));
+    fire(win, "Cut");
+    print("clip: " + show(win.surf.clipboard()));
+    print("text: " + show(field.text));
+
+    print("-- paste into a text area --");
+    area.on_context(10, 60);
+    print("menu: " + labels(win));
+    fire(win, "Paste");
+    print("text: " + show(area.text()));
+
+    print("-- the same, from the keyboard --");
+    // Ctrl+C over the caret line, with no selection: the two triggers share one
+    // implementation, so this must answer exactly what "Copy line" does.
+    area.sel.clear();
+    area.caret_row = 0;
+    area.caret_col = 0;
+    win.mods = MOD_CTRL;
+    area.on_key(99, "");                // Ctrl+C
+    win.mods = 0;
+    print("clip: " + show(win.surf.clipboard()));
+
+    print("-- a read-only area --");
+    ro.on_context(10, 120);
+    print("menu: " + labels(win));
+    fire(win, "Copy line");
+    print("clip: " + show(win.surf.clipboard()));
+    print("text: " + show(ro.text()) + "   (unchanged)");
+
+    print("-- a field with an empty clipboard offers no Paste --");
+    win.surf.set_clipboard("");
+    field.sel.clear();
+    field.on_context(10, 10);
+    print("menu: " + labels(win));
+    win.dismiss_overlay();
+}
