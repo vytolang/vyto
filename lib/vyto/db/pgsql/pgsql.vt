@@ -506,6 +506,21 @@ export class PgConn extends Conn {
         return this.sess.simpleQuery(sql);
     }
 
+    // Db.raw calls this after a schema change. PostgreSQL is loud about the
+    // case — "cached plan must not change result type" on the next execute —
+    // so this turns an error the user did not cause into no error at all.
+    // Deallocating rather than merely forgetting: a named prepared statement
+    // lives on the server until it is closed.
+    override fn flushStatements() {
+        let i = 0;
+        while (i < this.cacheStmt.len) {
+            this.cacheStmt[i].finalize();
+            i += 1;
+        }
+        this.cacheSql = [];
+        this.cacheStmt = [];
+    }
+
     override fn changes(): int {
         if (this.sess == null) { return 0; }
         return this.sess.lastRows;

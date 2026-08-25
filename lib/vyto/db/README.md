@@ -200,6 +200,16 @@ force interpolating the table name, through the `quoteIdent` that panics.
 > index whose `origin` is not `IDX_APPDEF` was created by the engine to enforce
 > a `UNIQUE` constraint or a primary key — `isImplicit()` says so.
 
+> **`ForeignKey.name` is the constraint's own name, and `""` where there is not
+> one to have.** SQLite's `pragma_foreign_key_list` does not report it, so it is
+> always empty there; PostgreSQL gives `pg_constraint.conname` and MySQL
+> `KEY_COLUMN_USAGE.CONSTRAINT_NAME`. It matters because a constraint is
+> *dropped by name* on both network engines — `ALTER TABLE t DROP FOREIGN KEY c`
+> and `ALTER TABLE t DROP CONSTRAINT c` — and there is no second handle to fall
+> back on. `isNamed()` is the test; a caller with no name should refuse rather
+> than invent one. Rows sharing an `id` are one multi-column constraint and all
+> carry the same name.
+
 **`TableInfo.toTable()` bridges to the DDL builder and is lossy on purpose.** It
 exists for "make something like this elsewhere", not for round-tripping. It
 drops the exact type string (`NUMERIC(10,2)` re-renders as `REAL`), collations,
@@ -347,6 +357,29 @@ two entries. An application with many distinct statement shapes should raise
 > **`Db.rawCursor` does not release its statement — only the `Cursor` does**,
 > on `close()`, on running to completion, or in `deinit`. A cursor abandoned
 > mid-scan holds a statement out of the pool until it drops.
+
+### A cached statement outlives the shape it was compiled against
+
+`Db.raw` finalizes the whole cache after any statement whose leading keyword is
+`ALTER`, `DROP`, `CREATE`, `RENAME` or `TRUNCATE` (`db.vt` `changesShape`,
+`Conn.flushStatements`). That is a correctness measure, not tidiness, and each
+engine gets it wrong differently:
+
+| Engine | Without the flush |
+|---|---|
+| **SQLite** | **silent.** `ALTER TABLE t ADD COLUMN c` and then the *same* `select * from t` reports the columns as they were — the new one is simply absent |
+| PostgreSQL | `cached plan must not change result type` |
+| MySQL | 1615, `Prepared statement needs to be re-prepared` |
+
+The SQLite case was measured through this package's own CLI with no application
+code involved: the cache is keyed on the SQL text, `sqlite3_prepare_v2`
+re-prepares on the next `step`, but the column list was read from the previous
+compilation. Changing one byte of the statement — a doubled space — made it
+correct, which is how it was found.
+
+**A schema changed by another connection is still not detectable**, and neither
+this nor anything else here will catch it. What the flush guarantees is that a
+program does not read its *own* DDL back through a stale statement.
 
 ### `COUNT(*)` is a full table scan
 

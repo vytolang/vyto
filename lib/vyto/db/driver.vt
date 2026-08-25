@@ -79,6 +79,18 @@ export class Stmt {
 
     virtual fn step(): int { return STEP_ERR; }
 
+    // The column shape. Known after prepare() for almost everything, which is
+    // what lets Db.raw and Db.rawCursor name the columns before the first
+    // step() — but it is only guaranteed to be right once step() has returned
+    // STEP_ROW. MySQL answers `num_columns = 0` at COM_STMT_PREPARE for a
+    // statement whose result shape the server does not settle until execute
+    // (SHOW CREATE TABLE, SHOW WARNINGS, CALL), and sends the real definitions
+    // with the execute reply.
+    //
+    // A driver in that position must install the late definitions before the
+    // first row is readable. vyto/db re-reads the names at that point, so a
+    // driver that does is correct and one that does not yields rows with no
+    // cells — which reads as an empty answer rather than as a failure.
     virtual fn columnCount(): int { return 0; }
     virtual fn columnName(i: int): string { return ""; }
     virtual fn columnValue(i: int): Value { return dbNull(); }
@@ -110,6 +122,28 @@ export class Conn {
 
     // Run SQL that returns no rows. Used for DDL, BEGIN/COMMIT and PRAGMA.
     virtual fn execRaw(sql: string): bool { return false; }
+
+    // Finalize and forget every cached prepared statement.
+    //
+    // ── WHY A CACHE HAS TO BE DROPPABLE ─────────────────────────────────────
+    //
+    // A prepared statement carries the result shape it was compiled against.
+    // Change the table under it and every engine gets this wrong in its own
+    // way: SQLite hands back the OLD column list with no error at all (an
+    // `ALTER TABLE t ADD COLUMN c` followed by the same `select * from t`
+    // reports the columns as they were, and the added one is simply missing),
+    // PostgreSQL raises "cached plan must not change result type", and MySQL
+    // answers 1615 "Prepared statement needs to be re-prepared".
+    //
+    // The SQLite case is the dangerous one because it is silent, and it is not
+    // hypothetical: it was measured through vyto/db's own CLI, with no
+    // application code in the way.
+    //
+    // Db.raw calls this after any statement that changes a schema, which is the
+    // one thing this library can see. A schema changed by ANOTHER connection is
+    // not detectable here and is the caller's to notice — but doing our own DDL
+    // and then reading our own stale shape is not something to leave to them.
+    virtual fn flushStatements() { }
 
     virtual fn lastInsertId(): int { return 0; }
     virtual fn changes(): int { return 0; }

@@ -229,6 +229,15 @@ export class ForeignKey {
     // the position within it.
     id: int;
     seq: int;
+    // The constraint's own name, and "" when there is not one to have.
+    //
+    // SQLite's pragma_foreign_key_list does not report it at all, so it is
+    // always "" there. On the two network engines it is what the server calls
+    // the constraint — the name `ALTER TABLE … DROP FOREIGN KEY` and
+    // `DROP CONSTRAINT` require, and the only handle on a constraint that
+    // exists once you want to remove one. Both catalogs had it in hand and
+    // were ordering by it while selecting everything else.
+    name: string;
     refTable: string;
     fromCol: string;
     // "" when the reference named no parent column and so implicitly targets
@@ -240,6 +249,7 @@ export class ForeignKey {
     fn init(id: int, seq: int) {
         this.id = id;
         this.seq = seq;
+        this.name = "";
         this.refTable = "";
         this.fromCol = "";
         this.toCol = "";
@@ -248,6 +258,11 @@ export class ForeignKey {
     }
 
     fn isImplicitTarget(): bool { return this.toCol.len == 0; }
+
+    // A name the constraint can be addressed by, or "" when it has none. The
+    // caller that wants to DROP one has to refuse rather than invent a name:
+    // guessing produces a statement the server rejects at best.
+    fn isNamed(): bool { return this.name.len > 0; }
 }
 
 // ---- triggers -----------------------------------------------------------
@@ -574,7 +589,11 @@ export fn readIndexColumnRow(r: Row): IndexColumn {
     return c;
 }
 
-// id, seq, refTable, fromCol, toCol, onUpdate, onDelete
+// id, seq, refTable, fromCol, toCol, onUpdate, onDelete, name
+//
+// `name` is last so the column order every dialect already emitted is
+// untouched, and it is read defensively: a Dialect outside this package can
+// still return the seven columns this function has always taken.
 export fn readForeignKeyRow(r: Row): ForeignKey {
     let f = new ForeignKey(r.at(0).asInt(), r.at(1).asInt());
     f.refTable = r.at(2).asString();
@@ -582,6 +601,7 @@ export fn readForeignKeyRow(r: Row): ForeignKey {
     f.toCol = r.at(4).asString();
     f.onUpdate = r.at(5).asString();
     f.onDelete = r.at(6).asString();
+    if (r.len() > 7) { f.name = r.at(7).asString(); }
     return f;
 }
 

@@ -271,7 +271,12 @@ export class SqliteDialect extends Dialect {
     // `table`, `from` and `to` are keywords, so they need quoting — which
     // SQLITE_DQS=0 makes unambiguously an identifier rather than a string.
     override fn introspectForeignKeysSql(): string {
-        return "SELECT id, seq, \"table\", \"from\", \"to\", on_update, on_delete "
+        // '' AS name: pragma_foreign_key_list reports no constraint name, and
+        // SQLite cannot ALTER a foreign key anyway, so there is nothing the
+        // name would be used for. The column is present so every dialect
+        // answers the same shape.
+        return "SELECT id, seq, \"table\", \"from\", \"to\", on_update, on_delete, "
+             + "'' AS name "
              + "FROM pragma_foreign_key_list(?) ORDER BY id, seq";
     }
 
@@ -429,13 +434,18 @@ export class PgDialect extends Dialect {
              + " ORDER BY u.ord";
     }
 
-    // id, seq, refTable, fromCol, toCol, onUpdate, onDelete.
+    // id, seq, refTable, fromCol, toCol, onUpdate, onDelete, name.
     //
     // The action words match what SQLite's pragma_foreign_key_list emits
     // verbatim. `id` groups the columns of one multi-column constraint, which is
     // ForeignKey.id's documented meaning (introspect.vt:222). PostgreSQL always
     // names the referenced columns, so toCol is never empty here and
     // isImplicitTarget() is always false — a benign difference from SQLite.
+    //
+    // `conname` is the constraint's real name and the only thing
+    // ALTER TABLE … DROP CONSTRAINT can be given. It was already the sort key
+    // in all but name — the query ordered by con.oid and grouped by it — so
+    // selecting it costs nothing.
     override fn introspectForeignKeysSql(): string {
         return "SELECT (dense_rank() OVER (ORDER BY con.oid))::int - 1 AS id,"
              + " (u.ord::int - 1) AS seq, rc.relname AS reftable,"
@@ -445,7 +455,8 @@ export class PgDialect extends Dialect {
              + " WHEN 'd' THEN 'SET DEFAULT' ELSE '' END AS onupdate,"
              + " CASE con.confdeltype WHEN 'a' THEN 'NO ACTION' WHEN 'r' THEN 'RESTRICT'"
              + " WHEN 'c' THEN 'CASCADE' WHEN 'n' THEN 'SET NULL'"
-             + " WHEN 'd' THEN 'SET DEFAULT' ELSE '' END AS ondelete"
+             + " WHEN 'd' THEN 'SET DEFAULT' ELSE '' END AS ondelete,"
+             + " con.conname AS name"
              + " FROM pg_constraint con"
              + " JOIN pg_class c ON c.oid = con.conrelid"
              + " JOIN pg_class rc ON rc.oid = con.confrelid"
@@ -609,17 +620,23 @@ export class MysqlDialect extends Dialect {
              + " ORDER BY s.SEQ_IN_INDEX";
     }
 
-    // id, seq, refTable, fromCol, toCol, onUpdate, onDelete.
+    // id, seq, refTable, fromCol, toCol, onUpdate, onDelete, name.
     //
     // The action words match what SQLite's pragma_foreign_key_list emits, which
     // is what REFERENTIAL_CONSTRAINTS already stores them as.
+    //
+    // `id` is a DENSE_RANK over CONSTRAINT_NAME, so the name was already the
+    // thing being grouped by — it was simply never selected. It is what
+    // ALTER TABLE … DROP FOREIGN KEY takes, and MySQL accepts no other handle
+    // on a constraint.
     override fn introspectForeignKeysSql(): string {
         return "SELECT (DENSE_RANK() OVER (ORDER BY k.CONSTRAINT_NAME) - 1) AS id,"
              + " (k.ORDINAL_POSITION - 1) AS seq,"
              + " k.REFERENCED_TABLE_NAME AS reftable,"
              + " k.COLUMN_NAME AS fromcol,"
              + " COALESCE(k.REFERENCED_COLUMN_NAME, '') AS tocol,"
-             + " r.UPDATE_RULE AS onupdate, r.DELETE_RULE AS ondelete"
+             + " r.UPDATE_RULE AS onupdate, r.DELETE_RULE AS ondelete,"
+             + " k.CONSTRAINT_NAME AS name"
              + " FROM information_schema.KEY_COLUMN_USAGE k"
              + " JOIN information_schema.REFERENTIAL_CONSTRAINTS r"
              + " ON r.CONSTRAINT_SCHEMA = k.CONSTRAINT_SCHEMA"

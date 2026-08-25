@@ -142,6 +142,7 @@ export class Cursor {
         if (this.done || this.st == null) { return false; }
         let s = this.st.step();
         if (s == STEP_ROW) {
+            this.names = namesAtFirstRow(this.st, this.names);
             this.cur = snapshot(this.st, this.names);
             return true;
         }
@@ -243,6 +244,80 @@ fn columnNamesOf(st: Stmt): string[] {
     return names;
 }
 
+// The column names, re-read at the first row when the prepare could not give
+// them.
+//
+// Every driver here reports its columns from prepare, which is what lets raw()
+// and rawCursor() name them before the first step() — except that MySQL's
+// COM_STMT_PREPARE answers `num_columns = 0` for a statement whose result shape
+// the server does not know until execute: SHOW CREATE TABLE, SHOW WARNINGS,
+// CALL. The real column definitions then arrive with the execute reply, and the
+// driver installs them (mysql.vt openResult), so by the first STEP_ROW the
+// count is right.
+//
+// A names list captured too early is not merely unlabelled: snapshot() walks
+// `names`, so zero names means zero CELLS, and the caller sees a row that
+// exists and is empty. That is a silent wrong answer, which is why this is
+// re-read rather than left to the caller to notice.
+fn namesAtFirstRow(st: Stmt, names: string[]): string[] {
+    if (names.len > 0) { return names; }
+    return columnNamesOf(st);
+}
+
+// Whether a statement changes the shape of something a prepared statement may
+// have been compiled against.
+//
+// Deliberately loose, and it costs nothing to be wrong in the safe direction: a
+// false positive finalizes a few cached statements that would have been fine,
+// and a false negative is a silently wrong result set. The keywords are the
+// ones that alter a schema — CREATE and DROP because a view or an index behind
+// a cached plan is exactly as load-bearing as a column.
+//
+// See Conn.flushStatements for what goes wrong without this, per engine.
+fn changesShape(sql: string): bool {
+    let i = skipSqlLeading(sql);
+    let w = "";
+    while (i < sql.len) {
+        let c = sql[i];
+        if (c == 32 || c == 9 || c == 10 || c == 13) { break; }
+        if (c >= 97 && c <= 122) { w = w + str_of_byte(c - 32); }
+        else { w = w + str_of_byte(c); }
+        if (w.len > 8) { return false; }
+        i += 1;
+    }
+    return w == "ALTER" || w == "DROP" || w == "CREATE" || w == "RENAME"
+        || w == "TRUNCATE";
+}
+
+fn str_of_byte(c: int): string {
+    let b = bytes(1);
+    b[0] = c as byte;
+    return strbytes(b, 1);
+}
+
+// Past leading whitespace, `-- ...` line comments and `/* ... */` blocks: the
+// keyword is usually the first token but need not be the first byte, and an
+// optimizer hint is a comment.
+fn skipSqlLeading(s: string): int {
+    let i = 0;
+    while (i < s.len) {
+        let c = s[i];
+        if (c == 32 || c == 9 || c == 10 || c == 13) { i += 1; continue; }
+        if (c == 45 && i + 1 < s.len && s[i + 1] == 45) {
+            while (i < s.len && s[i] != 10) { i += 1; }
+            continue;
+        }
+        if (c == 47 && i + 1 < s.len && s[i + 1] == 42) {
+            i += 2;
+            while (i + 1 < s.len && !(s[i] == 42 && s[i + 1] == 47)) { i += 1; }
+            i += 2;
+            continue;
+        }
+        break;
+    }
+    return i;
+}
+
 export class Db {
     cn: Conn;
 
@@ -311,6 +386,7 @@ export class Db {
         while (running) {
             let s = st.step();
             if (s == STEP_ROW) {
+                r.names = namesAtFirstRow(st, r.names);
                 r.rows.push(snapshot(st, r.names));
             } else {
                 if (s == STEP_ERR) {
@@ -326,6 +402,12 @@ export class Db {
         // them is free and a caller who asks on a SELECT gets 0.
         r.affected = this.cn.changes();
         r.insertId = this.cn.lastInsertId();
+
+        // Our own DDL invalidates every statement compiled against the old
+        // shape. Done AFTER release, so the statement just used goes back to
+        // the cache and is then finalized with the rest rather than being left
+        // behind as the one stale entry.
+        if (r.ok() && changesShape(sql)) { this.cn.flushStatements(); }
         return r;
     }
 

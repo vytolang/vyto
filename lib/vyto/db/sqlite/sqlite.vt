@@ -340,6 +340,22 @@ export class SqliteConn extends Conn {
         return (vdb_exec(this.h, sql.cstr()) as int) == 0;
     }
 
+    // Finalize and forget every cached statement. SQLite is the engine where
+    // NOT doing this after a schema change is silent: sqlite3_prepare_v2
+    // re-prepares the statement on the next step, but the column list was read
+    // from the old compilation, so `select *` after an ADD COLUMN reports the
+    // columns as they were and the new one is simply absent. Db.raw calls this
+    // after our own DDL; see Conn.flushStatements.
+    override fn flushStatements() {
+        let i = 0;
+        while (i < this.cacheStmt.len) {
+            this.cacheStmt[i].finalize();
+            i += 1;
+        }
+        this.cacheSql = [];
+        this.cacheStmt = [];
+    }
+
     override fn lastInsertId(): int {
         if (this.h == null) { return 0; }
         return vdb_last_insert_rowid(this.h) as int;
