@@ -1881,6 +1881,135 @@ static void emit_stmt(Em *em, Stmt *s) {
 
 /* ---------------- functions ---------------- */
 
+/* Cross-module inlining of small value-struct methods.
+ *
+ * One .c/.o per module means a call to Vec3.cross() from another module is a
+ * real call across a translation unit, and no C compiler can see through it.
+ * For a value type that costs more than the arithmetic it performs: the
+ * rasterizer spike measured ~2x against hand C, all of it per-triangle geom
+ * calls (see local/docs/RASTER3D-SPIKE.md), while its per-pixel loop was at
+ * parity.
+ *
+ * So: emit qualifying struct methods as `static inline` in the module HEADER
+ * instead of the .c, letting every consumer inline them. The bar is
+ * deliberately strict — this is a body duplicated into every TU that includes
+ * the header, so it must be small, pure arithmetic with no runtime calls, no
+ * refcounting and no control flow beyond a straight-line `return`.
+ *
+ * Conditions, all required:
+ *   - a STRUCT method (value receiver; classes are refcounted)
+ *   - non-generic, non-virtual, not extern, no captures
+ *   - returns a non-ref value; every param and the receiver non-ref
+ *   - body is only ST_LET / ST_RETURN, at most INLINE_MAX_STMTS of them
+ *   - no allocation, no closures, no calls other than to other inline-able
+ *     value-struct methods and math builtins
+ */
+#define INLINE_MAX_STMTS 6
+
+static bool inline_expr_ok(Expr *e);
+
+static bool inline_exprs_ok(Expr **xs, int n) {
+    for (int i = 0; i < n; i++)
+        if (!inline_expr_ok(xs[i])) return false;
+    return true;
+}
+
+/* Whether a callee may appear inside an inline-able body. Only another
+   inline-able value-struct method: anything else may pull in the runtime, and
+   a call we cannot see through defeats the point anyway. */
+static bool fn_is_inlinable(FnDecl *fd);
+
+static bool inline_expr_ok(Expr *e) {
+    if (!e) return true;
+    /* A ref-typed subexpression means refcounting, which the header form must
+       never carry. */
+    if (e->type && type_is_ref(e->type)) return false;
+    switch (e->kind) {
+    case EX_INT: case EX_FLOAT: case EX_BOOL: case EX_NULL:
+    case EX_THIS:
+        return true;
+    case EX_IDENT:
+        /* locals, params and consts only — a global could be anything. */
+        return e->ref == REF_LOCAL || e->ref == REF_PARAM || e->ref == REF_CONST;
+    case EX_UN:
+        return inline_expr_ok(e->lhs);
+    case EX_BIN:
+        return inline_expr_ok(e->lhs) && inline_expr_ok(e->rhs);
+    case EX_AS:
+        return inline_expr_ok(e->lhs);
+    case EX_MEMBER:
+        /* field read off a value struct (this.x, v.y) */
+        return e->ref == REF_FIELD && inline_expr_ok(e->lhs);
+    case EX_CALL:
+        /* struct construction — Vec3(x, y, z) — is an EX_CALL with sd set and
+           ref left REF_NONE by the checker (src/check.c:1654-1668). */
+        if (e->sd && e->ref == REF_NONE) return inline_exprs_ok(e->args, e->nargs);
+        if (e->is_super_call) return false;
+        if (e->ref == REF_METHOD) {
+            FnDecl *m = e->method;
+            if (!m || !m->sowner || m->vslot >= 0) return false;
+            if (!fn_is_inlinable(m)) return false;
+            return inline_expr_ok(e->lhs->lhs) && inline_exprs_ok(e->args, e->nargs);
+        }
+        if (e->ref == REF_GLOBAL_FN) {
+            FnDecl *fd = e->decl ? e->decl->fn : NULL;
+            if (!fn_is_inlinable(fd)) return false;
+            return inline_exprs_ok(e->args, e->nargs);
+        }
+        return false;   /* builtins, extern, closures, vtable dispatch */
+    default:
+        return false;   /* strings, arrays, maps, index, new, arrow, strconv */
+    }
+}
+
+static bool inline_body_ok(Stmt **body, int nbody) {
+    if (nbody == 0 || nbody > INLINE_MAX_STMTS) return false;
+    bool saw_return = false;
+    for (int i = 0; i < nbody; i++) {
+        Stmt *s = body[i];
+        switch (s->kind) {
+        case ST_LET:
+            if (s->decl_type && type_is_ref(s->decl_type)) return false;
+            if (s->local && s->local->type && type_is_ref(s->local->type)) return false;
+            if (!inline_expr_ok(s->init)) return false;
+            break;
+        case ST_RETURN:
+            if (!inline_expr_ok(s->expr)) return false;
+            saw_return = true;
+            break;
+        default:
+            return false;   /* if/while/for/switch/arena/break/... */
+        }
+    }
+    return saw_return;
+}
+
+/* The shared gate. Memoized: the predicate recurses through calls, and both
+   the header pass and the body pass ask the same question. */
+static bool fn_is_inlinable(FnDecl *fd) {
+    if (!fd) return false;
+    if (fd->inline_state != 0) return fd->inline_state > 0;
+    /* Mark in-progress as "no" so a recursive method terminates conservatively
+       (and stays out of the header, which is what we want for one anyway). */
+    fd->inline_state = -1;
+
+    if (!fd->sowner) return false;              /* value structs only */
+    if (fd->owner) return false;                /* class method: refcounted */
+    if (fd->is_virtual || fd->is_override) return false;
+    if (fd->is_extern || fd->is_builder) return false;
+    if (fd->ntyparams > 0) return false;        /* uninstantiated template */
+    if (fd->ncaptures > 0) return false;
+    if (fd->has_region) return false;
+    if (!fd->ret || fd->ret->kind == TY_VOID) return false;
+    if (type_is_ref(fd->ret)) return false;
+    for (int i = 0; i < fd->nparams; i++)
+        if (type_is_ref(fd->params[i].type)) return false;
+    if (!inline_body_ok(fd->body, fd->nbody)) return false;
+
+    fd->inline_state = 1;
+    return true;
+}
+
 static char *fn_proto(FnDecl *fd, bool with_names) {
     SBuf sb;
     sb_init(&sb);
@@ -1926,6 +2055,9 @@ static void emit_fn(Em *base, FnDecl *fd, ClassDecl *cls, SBuf *dst) {
     emit_stmts(&em, fd->body, fd->nbody);
     escope_release(&em, em.scope);
 
+    /* An inline-able value method's body lives in the module header instead,
+       so other modules can see through the call (see fn_is_inlinable). */
+    if (fn_is_inlinable(fd)) sb_puts(dst, "static inline ");
     sb_printf(dst, "%s {\n", fn_proto(fd, true));
     sb_puts(dst, pre.data);
     sb_puts(dst, out.data);
@@ -2306,13 +2438,22 @@ void emit_module(Module *m, bool is_entry, bool checks, EntryMode mode, SBuf *h,
             }
             break;
         case D_STRUCT:
+            /* An inline-able method gets its whole BODY appended to this header
+               by the source pass below. Its declaration here must therefore
+               also say `static inline`: C requires every declaration of a
+               static function to agree, and one inline method may call another
+               that is declared later in the file (Rect.center_x from
+               Rect.center — see lib/vyto/surface). Emitting all the prototypes
+               up front is what makes that legal regardless of order. */
             if (d->sd->ntyparams > 0) {
                 for (StructDecl *it = d->sd->next_inst; it; it = it->next_inst)
                     for (int mi = 0; mi < it->nmethods; mi++)
-                        sb_printf(h, "%s;\n", fn_proto(it->methods[mi], false));
+                        sb_printf(h, "%s%s;\n", fn_is_inlinable(it->methods[mi]) ? "static inline " : "",
+                                  fn_proto(it->methods[mi], false));
             } else {
                 for (int mi = 0; mi < d->sd->nmethods; mi++)
-                    sb_printf(h, "%s;\n", fn_proto(d->sd->methods[mi], false));
+                    sb_printf(h, "%s%s;\n", fn_is_inlinable(d->sd->methods[mi]) ? "static inline " : "",
+                              fn_proto(d->sd->methods[mi], false));
             }
             break;
         case D_CONST: {
@@ -2342,7 +2483,9 @@ void emit_module(Module *m, bool is_entry, bool checks, EntryMode mode, SBuf *h,
         default: break;
         }
     }
-    sb_puts(h, "#endif\n");
+    /* NB: the include guard is closed at the END of this function, not here —
+       the source pass below still appends `static inline` method bodies to the
+       header, and they must land inside the guard. */
 
     /* ---------- source ---------- */
     SBuf aux, code;
@@ -2361,13 +2504,18 @@ void emit_module(Module *m, bool is_entry, bool checks, EntryMode mode, SBuf *h,
             } else emit_fn(&base, d->fn, NULL, &code);
         }
         else if (d->kind == D_STRUCT) {
+            /* An inline-able method's body goes to the HEADER so every module
+               that includes it can inline the call; the rest stay in the .c.
+               The header pass above skipped the prototype for exactly these. */
             if (d->sd->ntyparams > 0) {
                 for (StructDecl *it = d->sd->next_inst; it; it = it->next_inst)
                     for (int mi = 0; mi < it->nmethods; mi++)
-                        emit_fn(&base, it->methods[mi], NULL, &code);
+                        emit_fn(&base, it->methods[mi], NULL,
+                                fn_is_inlinable(it->methods[mi]) ? h : &code);
             } else {
                 for (int mi = 0; mi < d->sd->nmethods; mi++)
-                    emit_fn(&base, d->sd->methods[mi], NULL, &code);
+                    emit_fn(&base, d->sd->methods[mi], NULL,
+                            fn_is_inlinable(d->sd->methods[mi]) ? h : &code);
             }
         }
         else if (d->kind == D_CLASS) {
@@ -2387,6 +2535,9 @@ void emit_module(Module *m, bool is_entry, bool checks, EntryMode mode, SBuf *h,
             }
         }
     }
+
+    /* Close the include guard now that the inline method bodies are in. */
+    sb_puts(h, "#endif\n");
 
     sb_printf(c, "#include \"mod_%s.h\"\n", m->name);
     for (int i = 0; i < inc.n; i++)

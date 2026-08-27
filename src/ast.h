@@ -276,6 +276,10 @@ struct FnDecl {
     Loc first_use;                  /* first instantiating call site (diagnostics) */
     bool sig_resolved;              /* template sig resolved on demand (idempotent) */
     const char *cname;              /* memoized mangled name (instances) */
+    /* emit: memoized fn_is_inlinable() — 0 unasked, 1 yes, -1 no. Small pure
+       value-struct methods go in the module header as `static inline` so other
+       modules can inline them (src/emit.c). */
+    int inline_state;
 };
 
 typedef struct Field {
