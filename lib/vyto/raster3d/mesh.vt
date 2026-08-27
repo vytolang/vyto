@@ -1,0 +1,326 @@
+// vyto/raster3d/mesh — geometry and materials for the software rasterizer.
+//
+// A Mesh is struct-of-arrays, not an array of vertex objects: positions,
+// normals and UVs are flat float[] buffers and a triangle is three indices
+// into them. That is the arena rule from CLAUDE.md applied to geometry — a
+// 65k-triangle mesh built one object per vertex would pay 33k allocation
+// headers and 33k refcount lifetimes for data that is never individually
+// referenced. Here it is three buffers and an index array.
+//
+// The types in this file are deliberately renderer-neutral. They describe
+// geometry and surface appearance, not how either is drawn, so a future
+// vyto/gl can consume the same Mesh (positions is already the shape
+// glBufferData wants) instead of inventing a parallel vocabulary.
+
+import { Vec3, Mat4 } from "vyto/geom";
+import { sqrt, sin, cos, PI } from "vyto/math";
+
+// ---- shading models -------------------------------------------------------
+// Deliberately an enum and not a shader source string: a CPU rasterizer cannot
+// execute a shader, and putting one in the shared vocabulary would make these
+// types un-implementable for the very renderer they were written for.
+
+export const SHADE_UNLIT: int = 0;    // flat fill with the material colour
+export const SHADE_FLAT: int = 1;     // one normal per triangle (faceted)
+export const SHADE_GOURAUD: int = 2;  // per-vertex normals, interpolated
+
+// ---- Material -------------------------------------------------------------
+
+export struct Material {
+    color: int;          // 0xRRGGBB base albedo
+    shading: int;        // SHADE_*
+    doubleSided: bool;   // skip backface culling for this mesh
+    ambient: float;      // 0..1 floor so unlit faces are not pure black
+}
+
+export fn material(color: int): Material {
+    return Material(color, SHADE_FLAT, false, 0.12);
+}
+
+export fn material_shaded(color: int, shading: int): Material {
+    return Material(color, shading, false, 0.12);
+}
+
+// ---- Mesh -----------------------------------------------------------------
+//
+// positions/normals/uvs are parallel: vertex i owns positions[i*3 .. i*3+2],
+// normals[i*3 .. i*3+2] and uvs[i*2 .. i*2+1]. normals and uvs may be empty,
+// which the rasterizer reads as "this mesh has none" rather than as an error —
+// a flat-shaded untextured mesh needs neither.
+
+export class Mesh {
+    positions: float[];
+    normals: float[];
+    uvs: float[];
+    indices: int[];
+
+    fn init(positions: float[], normals: float[], uvs: float[], indices: int[]) {
+        this.positions = positions;
+        this.normals = normals;
+        this.uvs = uvs;
+        this.indices = indices;
+    }
+
+    fn vertexCount(): int { return this.positions.len / 3; }
+    fn triangleCount(): int { return this.indices.len / 3; }
+    fn hasNormals(): bool { return this.normals.len == this.positions.len; }
+    fn hasUVs(): bool { return this.uvs.len * 3 == this.positions.len * 2; }
+
+    fn position(i: int): Vec3 {
+        return Vec3(this.positions[i * 3], this.positions[i * 3 + 1], this.positions[i * 3 + 2]);
+    }
+
+    fn normal(i: int): Vec3 {
+        return Vec3(this.normals[i * 3], this.normals[i * 3 + 1], this.normals[i * 3 + 2]);
+    }
+
+    // Recompute per-vertex normals by area-weighted averaging of the incident
+    // face normals. Needed before SHADE_GOURAUD on a mesh built without them;
+    // the primitives below already supply their own analytic normals, which are
+    // exact where this is an approximation.
+    fn computeNormals() {
+        let nv = this.vertexCount();
+        let acc: float[] = [];
+        acc.reserve(nv * 3);
+        for (let i in 0..(nv * 3)) { acc.push(0.0); }
+
+        let tris = this.triangleCount();
+        for (let t in 0..(tris)) {
+            let i0 = this.indices[t * 3];
+            let i1 = this.indices[t * 3 + 1];
+            let i2 = this.indices[t * 3 + 2];
+            let p0 = this.position(i0);
+            let p1 = this.position(i1);
+            let p2 = this.position(i2);
+            // Not normalized: the cross product's length is twice the triangle
+            // area, which is exactly the weight a smooth normal wants.
+            let n = p1.sub(p0).cross(p2.sub(p0));
+            let idx: int[] = [i0, i1, i2];
+            for (let k in 0..(3)) {
+                let v = idx[k];
+                acc[v * 3] = acc[v * 3] + n.x;
+                acc[v * 3 + 1] = acc[v * 3 + 1] + n.y;
+                acc[v * 3 + 2] = acc[v * 3 + 2] + n.z;
+            }
+        }
+
+        for (let v in 0..(nv)) {
+            let x = acc[v * 3];
+            let y = acc[v * 3 + 1];
+            let z = acc[v * 3 + 2];
+            let len = sqrt(x * x + y * y + z * z);
+            if (len > 0.0) {
+                acc[v * 3] = x / len;
+                acc[v * 3 + 1] = y / len;
+                acc[v * 3 + 2] = z / len;
+            }
+        }
+        this.normals = acc;
+    }
+}
+
+// ---- MeshBuilder ----------------------------------------------------------
+//
+// Accumulates vertices and triangles, then hands over the finished buffers.
+// Every primitive below is built through this, so a caller assembling a scene
+// from several primitives uses the same path the library does.
+
+export class MeshBuilder {
+    positions: float[];
+    normals: float[];
+    uvs: float[];
+    indices: int[];
+
+    fn init() {
+        this.positions = [];
+        this.normals = [];
+        this.uvs = [];
+        this.indices = [];
+    }
+
+    // Returns the new vertex's index, which is what the caller needs to build
+    // triangles against it.
+    fn vertex(p: Vec3, n: Vec3, u: float, v: float): int {
+        let idx = this.positions.len / 3;
+        this.positions.push(p.x); this.positions.push(p.y); this.positions.push(p.z);
+        this.normals.push(n.x); this.normals.push(n.y); this.normals.push(n.z);
+        this.uvs.push(u); this.uvs.push(v);
+        return idx;
+    }
+
+    fn triangle(a: int, b: int, c: int) {
+        this.indices.push(a); this.indices.push(b); this.indices.push(c);
+    }
+
+    // Two triangles over four corners, wound a-b-c / a-c-d.
+    fn quad(a: int, b: int, c: int, d: int) {
+        this.triangle(a, b, c);
+        this.triangle(a, c, d);
+    }
+
+    fn reserveVertices(n: int) {
+        this.positions.reserve(n * 3);
+        this.normals.reserve(n * 3);
+        this.uvs.reserve(n * 2);
+    }
+
+    fn reserveTriangles(n: int) { this.indices.reserve(n * 3); }
+
+    fn build(): Mesh {
+        return new Mesh(this.positions, this.normals, this.uvs, this.indices);
+    }
+}
+
+// ---- primitives -----------------------------------------------------------
+//
+// Winding is counter-clockwise when seen from outside, which is what the
+// rasterizer's signed-area backface test expects. Every primitive carries
+// analytic normals and UVs.
+
+// A UV sphere of the given radius. `segments` runs around the equator,
+// `rings` from pole to pole. 64x32 is a good default: 4096 triangles, smooth
+// at typical sizes.
+export fn sphere(radius: float, segments: int, rings: int): Mesh {
+    let b = new MeshBuilder();
+    b.reserveVertices((rings + 1) * (segments + 1));
+    b.reserveTriangles(rings * segments * 2);
+
+    for (let r in 0..(rings + 1)) {
+        let phi = PI * (r as float) / (rings as float);
+        let sinPhi = sin(phi);
+        let cosPhi = cos(phi);
+        for (let s in 0..(segments + 1)) {
+            let theta = 2.0 * PI * (s as float) / (segments as float);
+            // The unit-sphere position doubles as the surface normal.
+            let n = Vec3(sinPhi * cos(theta), cosPhi, sinPhi * sin(theta));
+            b.vertex(n.scale(radius), n,
+                     (s as float) / (segments as float),
+                     (r as float) / (rings as float));
+        }
+    }
+
+    // phi runs north-to-south while theta runs counter-clockwise in xz, so the
+    // naive (a, a+stride, a+1) order comes out facing INWARD. A closed sphere
+    // hides that — it is symmetric, so the silhouette looks right while the lit
+    // side is the far one. Wound outward here.
+    let stride = segments + 1;
+    for (let r in 0..(rings)) {
+        for (let s in 0..(segments)) {
+            let a = r * stride + s;
+            let c = a + stride;
+            b.triangle(a, a + 1, c);
+            b.triangle(a + 1, c + 1, c);
+        }
+    }
+    return b.build();
+}
+
+// An axis-aligned box centred on the origin. Corners are not shared between
+// faces: each face needs its own normal, so a cube is 24 vertices, not 8.
+export fn box(w: float, h: float, d: float): Mesh {
+    let b = new MeshBuilder();
+    b.reserveVertices(24);
+    b.reserveTriangles(12);
+
+    let x = w * 0.5;
+    let y = h * 0.5;
+    let z = d * 0.5;
+
+    // (normal, and the four corners in CCW order seen from outside)
+    let faces: float[] = [
+        // nx ny nz,  then 4 corners as x y z
+         0.0, 0.0, 1.0,  -x,-y, z,   x,-y, z,   x, y, z,  -x, y, z,   // +z
+         0.0, 0.0,-1.0,   x,-y,-z,  -x,-y,-z,  -x, y,-z,   x, y,-z,   // -z
+         1.0, 0.0, 0.0,   x,-y, z,   x,-y,-z,   x, y,-z,   x, y, z,   // +x
+        -1.0, 0.0, 0.0,  -x,-y,-z,  -x,-y, z,  -x, y, z,  -x, y,-z,   // -x
+         0.0, 1.0, 0.0,  -x, y, z,   x, y, z,   x, y,-z,  -x, y,-z,   // +y
+         0.0,-1.0, 0.0,  -x,-y,-z,   x,-y,-z,   x,-y, z,  -x,-y, z    // -y
+    ];
+
+    // 15 floats per face: 3 normal + 12 corner
+    for (let f in 0..(6)) {
+        let o = f * 15;
+        let n = Vec3(faces[o], faces[o + 1], faces[o + 2]);
+        let i0 = b.vertex(Vec3(faces[o + 3], faces[o + 4], faces[o + 5]), n, 0.0, 0.0);
+        let i1 = b.vertex(Vec3(faces[o + 6], faces[o + 7], faces[o + 8]), n, 1.0, 0.0);
+        let i2 = b.vertex(Vec3(faces[o + 9], faces[o + 10], faces[o + 11]), n, 1.0, 1.0);
+        let i3 = b.vertex(Vec3(faces[o + 12], faces[o + 13], faces[o + 14]), n, 0.0, 1.0);
+        b.quad(i0, i1, i2, i3);
+    }
+    return b.build();
+}
+
+export fn cube(size: float): Mesh { return box(size, size, size); }
+
+// A flat grid on the xz plane, facing +y. `divisions` per side; 1 gives two
+// triangles. Useful as a ground plane and as a texture-mapping test surface.
+export fn plane(w: float, d: float, divisions: int): Mesh {
+    let n = divisions;
+    if (n < 1) { n = 1; }
+    let b = new MeshBuilder();
+    b.reserveVertices((n + 1) * (n + 1));
+    b.reserveTriangles(n * n * 2);
+
+    let up = Vec3(0.0, 1.0, 0.0);
+    for (let r in 0..(n + 1)) {
+        let tv = (r as float) / (n as float);
+        for (let c in 0..(n + 1)) {
+            let tu = (c as float) / (n as float);
+            b.vertex(Vec3((tu - 0.5) * w, 0.0, (tv - 0.5) * d), up, tu, tv);
+        }
+    }
+
+    let stride = n + 1;
+    for (let r in 0..(n)) {
+        for (let c in 0..(n)) {
+            let a = r * stride + c;
+            b.quad(a, a + stride, a + stride + 1, a + 1);
+        }
+    }
+    return b.build();
+}
+
+// A capped cylinder along the y axis. `segments` around the circumference.
+export fn cylinder(radius: float, height: float, segments: int): Mesh {
+    let b = new MeshBuilder();
+    let hy = height * 0.5;
+    b.reserveVertices(segments * 2 + segments * 2 + 2);
+    b.reserveTriangles(segments * 4);
+
+    // side wall: normals point straight out, so top and bottom rings share them
+    for (let s in 0..(segments + 1)) {
+        let t = (s as float) / (segments as float);
+        let theta = 2.0 * PI * t;
+        let n = Vec3(cos(theta), 0.0, sin(theta));
+        b.vertex(Vec3(n.x * radius, -hy, n.z * radius), n, t, 0.0);
+        b.vertex(Vec3(n.x * radius, hy, n.z * radius), n, t, 1.0);
+    }
+    for (let s in 0..(segments)) {
+        let a = s * 2;               // a = bottom[s], a+1 = top[s]
+        b.quad(a, a + 1, a + 3, a + 2);
+    }
+
+    // caps: a fan around a centre vertex, with the cap's own flat normal
+    let up = Vec3(0.0, 1.0, 0.0);
+    let down = Vec3(0.0, -1.0, 0.0);
+    let topC = b.vertex(Vec3(0.0, hy, 0.0), up, 0.5, 0.5);
+    let botC = b.vertex(Vec3(0.0, -hy, 0.0), down, 0.5, 0.5);
+    for (let s in 0..(segments + 1)) {
+        let theta = 2.0 * PI * (s as float) / (segments as float);
+        let cx = cos(theta);
+        let cz = sin(theta);
+        b.vertex(Vec3(cx * radius, hy, cz * radius), up, cx * 0.5 + 0.5, cz * 0.5 + 0.5);
+        b.vertex(Vec3(cx * radius, -hy, cz * radius), down, cx * 0.5 + 0.5, cz * 0.5 + 0.5);
+    }
+    // Theta runs counter-clockwise in the xz plane looking DOWN the +y axis,
+    // which is clockwise when seen from above — so the top fan walks the ring
+    // backwards to come out counter-clockwise from outside, and the bottom fan
+    // walks it forwards. Getting this backwards leaves both caps facing inward:
+    // the lid renders black and the floor is visible through it.
+    let ringStart = topC + 2;
+    for (let s in 0..(segments)) {
+        b.triangle(topC, ringStart + (s + 1) * 2, ringStart + s * 2);
+        b.triangle(botC, ringStart + s * 2 + 1, ringStart + (s + 1) * 2 + 1);
+    }
+    return b.build();
+}

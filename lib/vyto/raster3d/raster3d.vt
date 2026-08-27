@@ -1,0 +1,454 @@
+// vyto/raster3d — a software 3D rasterizer in pure Vyto.
+//
+// Triangle fill with a depth buffer, perspective-correct interpolation,
+// near-plane clipping, backface culling, flat/Gouraud shading and texture
+// sampling. No native code, no GPU, and deliberately no dependency on
+// vyto/gfx: the framebuffer is a plain i32[] this module owns, handed to
+// Surface.blit(). That keeps it working on every surface backend, including
+// fbdev and headless, where blend2d is not present.
+//
+// This is what makes vyto/geom's Mat4 and vyto/geo's 3D layer *visible*.
+// blend2d is a 2D rasterizer with no depth buffer, so it can only do
+// painter's-algorithm sorting — exact for a convex body, wrong the moment
+// geometry interpenetrates.
+//
+// ---------------------------------------------------------------------------
+// What this is for, measured rather than hoped (local/docs/RASTER3D-SPIKE.md)
+//
+//   * 720p full-screen at 60fps, including heavy geometry: 65k triangles at
+//     100% coverage measured 70fps.
+//   * 1080p at 60fps for a WIDGET-SIZED view. Full-screen 1080p is ~40-48fps.
+//
+// That ceiling is not a Vyto limitation: the same rasterizer hand-written in C
+// manages only 57fps on the 1080p heavy case. Single-threaded scalar
+// rasterization of 2 megapixels costs what it costs. A full-screen 1080p 3D
+// application wants a GPU.
+//
+// Rendering is deterministic — all f64 scalar math, no driver — so
+// Framebuffer.hash() is a stable golden for tests. That property is the reason
+// this module exists before any GL backend.
+// ---------------------------------------------------------------------------
+
+import { Vec3, Vec4, Mat4, mat4Identity } from "vyto/geom";
+import { Rect, Surface } from "vyto/surface";
+import { sqrt } from "vyto/math";
+import { Mesh, Material, SHADE_UNLIT, SHADE_FLAT, SHADE_GOURAUD } from "vyto/raster3d/mesh";
+import { Texture } from "vyto/raster3d/texture";
+
+// Depth of an empty pixel. Not an infinity: a finite sentinel keeps every
+// comparison an ordinary float compare.
+const DEPTH_EMPTY: float = 1.0e30;
+
+// ---- Camera ---------------------------------------------------------------
+//
+// Both matrices come from vyto/geom, which already documents the conventions
+// this module inherits: right-handed, looking down -z, clip depth in [-1, 1].
+// Build them with mat4LookAt / mat4Perspective / mat4Ortho.
+
+export struct Camera {
+    view: Mat4;
+    proj: Mat4;
+}
+
+export fn camera(view: Mat4, proj: Mat4): Camera { return Camera(view, proj); }
+
+// ---- Light ----------------------------------------------------------------
+//
+// One directional light. `dir` points FROM the surface TOWARD the light, which
+// is the convention that makes the shading dot product read naturally.
+
+export struct Light {
+    dir: Vec3;
+    intensity: float;
+}
+
+export fn light(dir: Vec3, intensity: float): Light {
+    return Light(dir.normalized(), intensity);
+}
+
+// ---- Framebuffer ----------------------------------------------------------
+
+export class Framebuffer {
+    color: i32[];      // 0xRRGGBB, row-major, width*height
+    depth: f32[];      // f32, not float: a third less memory for the same image
+    width: int;
+    height: int;
+
+    fn init(width: int, height: int) {
+        this.width = width;
+        this.height = height;
+        let n = width * height;
+        this.color = [];
+        this.color.reserve(n);
+        this.depth = [];
+        this.depth.reserve(n);
+        let empty = DEPTH_EMPTY as f32;
+        for (let i in 0..(n)) {
+            this.color.push(0 as i32);
+            this.depth.push(empty);
+        }
+    }
+
+    fn clear(rgb: int) {
+        this.color.fill(rgb as i32);
+        this.depth.fill(DEPTH_EMPTY as f32);
+    }
+
+    // Colour only. For a frame that redraws every pixel anyway, skipping the
+    // depth clear would be wrong — stale depths would reject new geometry.
+    fn clearColor(rgb: int) { this.color.fill(rgb as i32); }
+
+    fn pixel(x: int, y: int): int {
+        if (x < 0 || y < 0 || x >= this.width || y >= this.height) { return 0; }
+        return this.color[y * this.width + x] as int;
+    }
+
+    // Present to a surface. The framebuffer is a real Vyto array, so this is
+    // the ordinary Surface.blit path — no rawptr, no native buffer.
+    fn blitTo(s: Surface, dst: Rect) {
+        s.blit(this.color, this.width, this.height, dst);
+    }
+
+    fn blitToOrigin(s: Surface) {
+        s.blit(this.color, this.width, this.height,
+               Rect(0.0, 0.0, this.width as float, this.height as float));
+    }
+
+    // FNV-1a over the visible pixels — the golden-test fingerprint. Masked to
+    // 32 bits so it prints the same on every platform.
+    fn hash(): int {
+        let h = 2166136261;
+        let n = this.color.len;
+        for (let i in 0..(n)) {
+            h = (h ^ (this.color[i] as int)) & 0xFFFFFFFF;
+            h = (h * 16777619) & 0xFFFFFFFF;
+        }
+        return h;
+    }
+}
+
+// ---- clip-space vertex ----------------------------------------------------
+//
+// One vertex on its way through the pipeline. Carried as a value struct so the
+// clipper can build new ones without allocating.
+
+struct ClipVertex {
+    pos: Vec4;      // clip space, before the perspective divide
+    nrm: Vec3;      // world-space normal (Gouraud)
+    u: float;
+    v: float;
+}
+
+fn cv_lerp(a: ClipVertex, b: ClipVertex, t: float): ClipVertex {
+    return ClipVertex(a.pos.lerp(b.pos, t),
+                      a.nrm.lerp(b.nrm, t),
+                      a.u + (b.u - a.u) * t,
+                      a.v + (b.v - a.v) * t);
+}
+
+// ---- Renderer -------------------------------------------------------------
+
+export class Renderer {
+    fb: Framebuffer;
+    cam: Camera;
+    lt: Light;
+    tex: Texture;          // null = untextured
+    trianglesDrawn: int;   // per-frame counters, reset by beginFrame
+    pixelsWritten: int;
+
+    fn init(fb: Framebuffer) {
+        this.fb = fb;
+        this.cam = Camera(mat4Identity(), mat4Identity());
+        this.lt = light(Vec3(0.4, 0.7, 0.6), 1.0);
+        this.tex = null;
+        this.trianglesDrawn = 0;
+        this.pixelsWritten = 0;
+    }
+
+    fn setCamera(c: Camera) { this.cam = c; }
+    fn setLight(l: Light) { this.lt = l; }
+    fn setTexture(t: Texture) { this.tex = t; }
+
+    fn beginFrame(clearColor: int) {
+        this.fb.clear(clearColor);
+        this.trianglesDrawn = 0;
+        this.pixelsWritten = 0;
+    }
+
+    // Draw a mesh with a model transform. This is the whole public entry point:
+    // everything below it is the pipeline.
+    fn draw(mesh: Mesh, model: Mat4, mat: Material) {
+        let mvp = this.cam.proj.mul(this.cam.view).mul(model);
+        let smooth = mat.shading == SHADE_GOURAUD && mesh.hasNormals();
+        let uvd = mesh.hasUVs() && this.tex != null;
+        let tris = mesh.triangleCount();
+
+        for (let t in 0..(tris)) {
+            let i0 = mesh.indices[t * 3];
+            let i1 = mesh.indices[t * 3 + 1];
+            let i2 = mesh.indices[t * 3 + 2];
+
+            let p0 = mesh.position(i0);
+            let p1 = mesh.position(i1);
+            let p2 = mesh.position(i2);
+
+            // Flat shading needs one world-space normal for the whole face.
+            // Derive it from the geometry rather than the vertex normals, so a
+            // mesh without normals still shades.
+            let faceN = Vec3(0.0, 0.0, 1.0);
+            if (mat.shading != SHADE_UNLIT) {
+                faceN = model.transformDirection(p1.sub(p0).cross(p2.sub(p0))).normalized();
+            }
+
+            let n0 = faceN;
+            let n1 = faceN;
+            let n2 = faceN;
+            if (smooth) {
+                n0 = model.transformDirection(mesh.normal(i0)).normalized();
+                n1 = model.transformDirection(mesh.normal(i1)).normalized();
+                n2 = model.transformDirection(mesh.normal(i2)).normalized();
+            }
+
+            let u0 = 0.0; let v0 = 0.0;
+            let u1 = 0.0; let v1 = 0.0;
+            let u2 = 0.0; let v2 = 0.0;
+            if (uvd) {
+                u0 = mesh.uvs[i0 * 2]; v0 = mesh.uvs[i0 * 2 + 1];
+                u1 = mesh.uvs[i1 * 2]; v1 = mesh.uvs[i1 * 2 + 1];
+                u2 = mesh.uvs[i2 * 2]; v2 = mesh.uvs[i2 * 2 + 1];
+            }
+
+            let a = ClipVertex(mvp.mulVec4(Vec4(p0.x, p0.y, p0.z, 1.0)), n0, u0, v0);
+            let b = ClipVertex(mvp.mulVec4(Vec4(p1.x, p1.y, p1.z, 1.0)), n1, u1, v1);
+            let c = ClipVertex(mvp.mulVec4(Vec4(p2.x, p2.y, p2.z, 1.0)), n2, u2, v2);
+
+            this.clipAndRaster(a, b, c, mat, uvd);
+        }
+    }
+
+    // Near-plane clipping, then rasterize whatever survives.
+    //
+    // This is the step the pipeline cannot skip. A vertex behind the eye has
+    // w <= 0, and dividing by it flips the projected point to the wrong side of
+    // the screen — geometry that should be off-screen smears across it. Dropping
+    // such triangles entirely instead makes objects vanish as they cross the
+    // camera. So the triangle is clipped in homogeneous space BEFORE the divide,
+    // producing 0, 1 or 2 triangles.
+    //
+    // The plane is the NEAR plane (z >= -w, i.e. w + z >= 0), not w > 0. Those
+    // are not interchangeable: clipping at w > eps places the new vertices
+    // essentially at the eye, where 1/w is ~1e5 and the projected coordinates
+    // land astronomically off-screen — the triangle survives clipping and then
+    // rasterizes to nothing, which looks exactly like clipping not running at
+    // all. Clipping at the near plane puts them on it, where 1/w is finite and
+    // the projection is well-conditioned.
+    fn clipAndRaster(a: ClipVertex, b: ClipVertex, c: ClipVertex,
+                     mat: Material, textured: bool) {
+        let da = a.pos.w + a.pos.z;
+        let db = b.pos.w + b.pos.z;
+        let dc = c.pos.w + c.pos.z;
+
+        let inA = da > 0.0;
+        let inB = db > 0.0;
+        let inC = dc > 0.0;
+        let nIn = 0;
+        if (inA) { nIn += 1; }
+        if (inB) { nIn += 1; }
+        if (inC) { nIn += 1; }
+
+        if (nIn == 0) { return; }
+        if (nIn == 3) { this.rasterTri(a, b, c, mat, textured); return; }
+
+        // Rotate the triangle so the odd vertex out lands in a known slot,
+        // preserving the cyclic order (a,b,c)->(b,c,a) so the winding — and so
+        // the facing test downstream — survives the rotation.
+        let p = a; let q = b; let r = c;
+        let dp = da; let dq = db; let dr = dc;
+
+        if (nIn == 1) {
+            // Put the single INSIDE vertex first.
+            if (inB) { p = b; q = c; r = a; dp = db; dq = dc; dr = da; }
+            if (inC) { p = c; q = a; r = b; dp = dc; dq = da; dr = db; }
+            // p inside, q and r outside: one triangle, p to the two crossings.
+            // The crossing parameter is where the signed distance hits zero.
+            let tq = dp / (dp - dq);
+            let tr = dp / (dp - dr);
+            this.rasterTri(p, cv_lerp(p, q, tq), cv_lerp(p, r, tr), mat, textured);
+            return;
+        }
+
+        // nIn == 2: put the single OUTSIDE vertex first. The remaining quad is
+        // two triangles.
+        //
+        // These tests must read the ORIGINAL inA/inB/inC, not flags copied into
+        // rotated locals — a rotation that updates the vertices but not the
+        // flags silently clips against the wrong vertex and emits nothing,
+        // which looks exactly like clipping being unnecessary.
+        if (inB == false) { p = b; q = c; r = a; dp = db; dq = dc; dr = da; }
+        if (inC == false) { p = c; q = a; r = b; dp = dc; dq = da; dr = db; }
+        // p outside, q and r inside
+        let tq = dp / (dp - dq);
+        let tr = dp / (dp - dr);
+        let pq = cv_lerp(p, q, tq);   // crossing on edge p->q
+        let pr = cv_lerp(p, r, tr);   // crossing on edge p->r
+        // The surviving region is the quad q -> r -> pr -> pq, in that order:
+        // walking the original p->q->r->p loop and substituting the two
+        // crossings for the part outside. Fan it from q. Taking the other
+        // diagonal (pq,q,r)+(pq,r,pr) reverses the first triangle's orientation,
+        // so backface culling silently drops everything the clipper produced.
+        this.rasterTri(q, r, pr, mat, textured);
+        this.rasterTri(q, pr, pq, mat, textured);
+    }
+
+    // Project to screen space and fill. Everything reaching here is in front of
+    // the near plane, so the divide is safe.
+    fn rasterTri(a: ClipVertex, b: ClipVertex, c: ClipVertex,
+                 mat: Material, textured: bool) {
+        let halfW = (this.fb.width as float) * 0.5;
+        let halfH = (this.fb.height as float) * 0.5;
+
+        let iwa = 1.0 / a.pos.w;
+        let iwb = 1.0 / b.pos.w;
+        let iwc = 1.0 / c.pos.w;
+
+        let ax = (a.pos.x * iwa + 1.0) * halfW;
+        let ay = (1.0 - a.pos.y * iwa) * halfH;
+        let bx = (b.pos.x * iwb + 1.0) * halfW;
+        let by = (1.0 - b.pos.y * iwb) * halfH;
+        let cx = (c.pos.x * iwc + 1.0) * halfW;
+        let cy = (1.0 - c.pos.y * iwc) * halfH;
+
+        // Signed area decides facing. Note the sign convention: projection
+        // flips y (screen y grows downward), which REVERSES the winding, so a
+        // triangle that is counter-clockwise in world space — front-facing —
+        // has a NEGATIVE screen-space area here. Culling `area <= 0` would
+        // therefore cull exactly the faces meant to be visible, which shows up
+        // as objects rendering only where they happen to be back-lit.
+        // A double-sided material keeps either sign and flips the edge
+        // functions so the coverage test below still works.
+        let area = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
+        let flip = -1.0;
+        if (area >= 0.0) {
+            if (mat.doubleSided == false) { return; }
+            if (area == 0.0) { return; }
+            flip = 1.0;
+        }
+        let invArea = flip / area;
+
+        let minX = clampInt(imin3(ax as int, bx as int, cx as int), 0, this.fb.width - 1);
+        let maxX = clampInt(imax3(ax as int, bx as int, cx as int) + 1, 0, this.fb.width - 1);
+        let minY = clampInt(imin3(ay as int, by as int, cy as int), 0, this.fb.height - 1);
+        let maxY = clampInt(imax3(ay as int, by as int, cy as int) + 1, 0, this.fb.height - 1);
+        if (minX > maxX || minY > maxY) { return; }
+
+        this.trianglesDrawn += 1;
+
+        // Per-vertex shade, computed once. For SHADE_FLAT all three are equal,
+        // so the interpolation below costs the same either way and the inner
+        // loop needs no branch on the shading model.
+        let sa = this.shadeOf(a.nrm, mat);
+        let sb = this.shadeOf(b.nrm, mat);
+        let sc = this.shadeOf(c.nrm, mat);
+
+        // Perspective-correct interpolation carries attributes divided by w and
+        // reconstructs them with the interpolated 1/w.
+        let ua = a.u * iwa; let va = a.v * iwa;
+        let ub = b.u * iwb; let vb = b.v * iwb;
+        let uc = c.u * iwc; let vc = c.v * iwc;
+        let sa_w = sa * iwa; let sb_w = sb * iwb; let sc_w = sc * iwc;
+
+        let written = 0;
+        let baseColor = mat.color;
+        let tex = this.tex;
+
+        for (let y in minY..(maxY + 1)) {
+            let py = (y as float) + 0.5;
+            let rowBase = y * this.fb.width;
+            let px0 = (minX as float) + 0.5;
+
+            // Edge functions evaluated once per row, then incremented across x.
+            let w0 = ((cx - bx) * (py - by) - (cy - by) * (px0 - bx)) * flip;
+            let w1 = ((ax - cx) * (py - cy) - (ay - cy) * (px0 - cx)) * flip;
+            let w2 = ((bx - ax) * (py - ay) - (by - ay) * (px0 - ax)) * flip;
+            let dw0 = -(cy - by) * flip;
+            let dw1 = -(ay - cy) * flip;
+            let dw2 = -(by - ay) * flip;
+
+            for (let x in minX..(maxX + 1)) {
+                if (w0 >= 0.0 && w1 >= 0.0 && w2 >= 0.0) {
+                    let l0 = w0 * invArea;
+                    let l1 = w1 * invArea;
+                    let l2 = w2 * invArea;
+                    let iw = l0 * iwa + l1 * iwb + l2 * iwc;
+                    let z = 1.0 / iw;
+                    let i = rowBase + x;
+                    if (z < (this.fb.depth[i] as float)) {
+                        let shade = (l0 * sa_w + l1 * sb_w + l2 * sc_w) * z;
+                        let rgb = baseColor;
+                        if (textured && tex != null) {
+                            let u = (l0 * ua + l1 * ub + l2 * uc) * z;
+                            let v = (l0 * va + l1 * vb + l2 * vc) * z;
+                            rgb = tex.sample(u, v);
+                        }
+                        this.fb.depth[i] = z as f32;
+                        this.fb.color[i] = modulate(rgb, shade) as i32;
+                        written += 1;
+                    }
+                }
+                w0 += dw0;
+                w1 += dw1;
+                w2 += dw2;
+            }
+        }
+        this.pixelsWritten += written;
+    }
+
+    // Lambert term against the directional light, floored at the material's
+    // ambient so a face turned away is dark rather than black.
+    fn shadeOf(n: Vec3, mat: Material): float {
+        if (mat.shading == SHADE_UNLIT) { return 1.0; }
+        let d = n.dot(this.lt.dir) * this.lt.intensity;
+        if (d < 0.0) { d = 0.0; }
+        let s = mat.ambient + (1.0 - mat.ambient) * d;
+        if (s > 1.0) { return 1.0; }
+        return s;
+    }
+}
+
+// ---- helpers --------------------------------------------------------------
+
+fn imin3(a: int, b: int, c: int): int {
+    let m = a;
+    if (b < m) { m = b; }
+    if (c < m) { m = c; }
+    return m;
+}
+
+fn imax3(a: int, b: int, c: int): int {
+    let m = a;
+    if (b > m) { m = b; }
+    if (c > m) { m = c; }
+    return m;
+}
+
+fn clampInt(v: int, lo: int, hi: int): int {
+    if (v < lo) { return lo; }
+    if (v > hi) { return hi; }
+    return v;
+}
+
+// Scale a 0xRRGGBB colour by a 0..1 shade factor.
+fn modulate(rgb: int, s: float): int {
+    let t = s;
+    if (t < 0.0) { t = 0.0; }
+    if (t > 1.0) { t = 1.0; }
+    let r = (((rgb >> 16) & 0xFF) as float) * t;
+    let g = (((rgb >> 8) & 0xFF) as float) * t;
+    let b = ((rgb & 0xFF) as float) * t;
+    return ((r as int) << 16) | ((g as int) << 8) | (b as int);
+}
+
+// Pack 0..255 components into 0xRRGGBB.
+export fn rgb(r: int, g: int, b: int): int {
+    return ((r & 0xFF) << 16) | ((g & 0xFF) << 8) | (b & 0xFF);
+}

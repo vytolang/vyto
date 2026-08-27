@@ -1,0 +1,130 @@
+// vyto/raster3d/texture — a sampled image for the software rasterizer.
+//
+// Pixels are a plain i32[] of 0xRRGGBB, row-major, width*height long. There is
+// deliberately no decoder here: PNG/JPEG decoding lives in vyto/gfx (blend2d),
+// and raster3d must not depend on vyto/gfx — that dependency would drag a
+// native library into a module whose whole point is that it needs none, and
+// would break the fbdev and headless backends where blend2d is absent.
+//
+// So the caller supplies pixels. Decode with vyto/gfx if it is available,
+// generate them procedurally, or read a raw file.
+
+// ---- filtering ------------------------------------------------------------
+
+export const FILTER_NEAREST: int = 0;
+export const FILTER_BILINEAR: int = 1;
+
+// ---- wrapping -------------------------------------------------------------
+
+export const WRAP_REPEAT: int = 0;
+export const WRAP_CLAMP: int = 1;
+
+export class Texture {
+    pixels: i32[];
+    width: int;
+    height: int;
+    filter: int;
+    wrap: int;
+
+    fn init(pixels: i32[], width: int, height: int) {
+        this.pixels = pixels;
+        this.width = width;
+        this.height = height;
+        this.filter = FILTER_BILINEAR;
+        this.wrap = WRAP_REPEAT;
+    }
+
+    fn setFilter(f: int) { this.filter = f; }
+    fn setWrap(w: int) { this.wrap = w; }
+
+    // Map a texel coordinate into range according to the wrap mode. Repeat
+    // uses a floored modulo so negative coordinates wrap correctly rather than
+    // reflecting, which a plain % would do.
+    fn wrapX(x: int): int {
+        if (this.wrap == WRAP_CLAMP) {
+            if (x < 0) { return 0; }
+            if (x >= this.width) { return this.width - 1; }
+            return x;
+        }
+        let m = x % this.width;
+        if (m < 0) { m += this.width; }
+        return m;
+    }
+
+    fn wrapY(y: int): int {
+        if (this.wrap == WRAP_CLAMP) {
+            if (y < 0) { return 0; }
+            if (y >= this.height) { return this.height - 1; }
+            return y;
+        }
+        let m = y % this.height;
+        if (m < 0) { m += this.height; }
+        return m;
+    }
+
+    fn texel(x: int, y: int): int {
+        return this.pixels[this.wrapY(y) * this.width + this.wrapX(x)] as int;
+    }
+
+    // Sample at normalised (u, v), origin top-left. Returns 0xRRGGBB.
+    fn sample(u: float, v: float): int {
+        if (this.filter == FILTER_NEAREST) {
+            return this.texel((u * (this.width as float)) as int,
+                              (v * (this.height as float)) as int);
+        }
+        // Bilinear: -0.5 puts the sample at the texel centre, so a 1:1 blit
+        // reproduces the source exactly instead of shifting half a texel.
+        let fx = u * (this.width as float) - 0.5;
+        let fy = v * (this.height as float) - 0.5;
+        let x0 = floorInt(fx);
+        let y0 = floorInt(fy);
+        let tx = fx - (x0 as float);
+        let ty = fy - (y0 as float);
+
+        let c00 = this.texel(x0, y0);
+        let c10 = this.texel(x0 + 1, y0);
+        let c01 = this.texel(x0, y0 + 1);
+        let c11 = this.texel(x0 + 1, y0 + 1);
+
+        let top = lerpRGB(c00, c10, tx);
+        let bot = lerpRGB(c01, c11, tx);
+        return lerpRGB(top, bot, ty);
+    }
+}
+
+// Floor toward negative infinity. A plain `as int` truncates toward zero,
+// which puts a seam at every negative texel boundary.
+fn floorInt(v: float): int {
+    let i = v as int;
+    if ((v < 0.0) && ((i as float) != v)) { return i - 1; }
+    return i;
+}
+
+fn lerpRGB(a: int, b: int, t: float): int {
+    let ar = (a >> 16) & 0xFF;
+    let ag = (a >> 8) & 0xFF;
+    let ab = a & 0xFF;
+    let br = (b >> 16) & 0xFF;
+    let bg = (b >> 8) & 0xFF;
+    let bb = b & 0xFF;
+    let r = (ar as float) + ((br - ar) as float) * t;
+    let g = (ag as float) + ((bg - ag) as float) * t;
+    let bl = (ab as float) + ((bb - ab) as float) * t;
+    return ((r as int) << 16) | ((g as int) << 8) | (bl as int);
+}
+
+// A procedural checkerboard — a texture with no file and no decoder, which
+// makes it the right thing for tests and for checking UV orientation.
+export fn checker(size: int, cells: int, a: int, b: int): Texture {
+    let px: i32[] = [];
+    px.reserve(size * size);
+    let cell = size / cells;
+    if (cell < 1) { return new Texture(px, 0, 0); }
+    for (let y in 0..(size)) {
+        for (let x in 0..(size)) {
+            let on = ((x / cell) + (y / cell)) % 2 == 0;
+            if (on) { px.push(a as i32); } else { px.push(b as i32); }
+        }
+    }
+    return new Texture(px, size, size);
+}

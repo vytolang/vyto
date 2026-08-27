@@ -1,0 +1,76 @@
+// vyto/raster3d — software 3D rendering with a depth buffer.
+//
+// Renders into an i32[] framebuffer this program owns, so it needs no window,
+// no GPU and no native library. Every number printed below is a stable golden:
+// the rasterizer is pure scalar f64 arithmetic, so the same input produces the
+// same pixels on every platform.
+
+import { Framebuffer, Renderer, camera, light, rgb } from "vyto/raster3d/raster3d";
+import { sphere, cube, cylinder, plane, material, material_shaded,
+         SHADE_FLAT, SHADE_GOURAUD, SHADE_UNLIT } from "vyto/raster3d/mesh";
+import { checker, FILTER_NEAREST } from "vyto/raster3d/texture";
+import { Vec3, mat4Identity, mat4Perspective, mat4LookAt,
+         mat4RotationY, mat4Translation } from "vyto/geom";
+
+fn main() {
+    let fb = new Framebuffer(200, 150);
+    let r = new Renderer(fb);
+    let proj = mat4Perspective(1.0472, 200.0 / 150.0, 0.1, 100.0);
+    r.setCamera(camera(mat4LookAt(Vec3(0.0, 0.0, 3.0), Vec3(0.0, 0.0, 0.0),
+                                  Vec3(0.0, 1.0, 0.0)), proj));
+    r.setLight(light(Vec3(0.4, 0.7, 0.6), 1.0));
+
+    // A faceted sphere: one normal per triangle.
+    r.beginFrame(0x101418);
+    r.draw(sphere(1.0, 24, 12), mat4Identity(), material(0x4FA3D1));
+    print("flat sphere    tris=" + r.trianglesDrawn + " px=" + r.pixelsWritten);
+
+    // The same sphere with interpolated vertex normals — same geometry, no
+    // visible facets.
+    r.beginFrame(0x101418);
+    r.draw(sphere(1.0, 24, 12), mat4Identity(), material_shaded(0x4FA3D1, SHADE_GOURAUD));
+    print("smooth sphere  tris=" + r.trianglesDrawn + " px=" + r.pixelsWritten);
+
+    // Backface culling: a cube shows at most three of its six faces.
+    r.beginFrame(0x101418);
+    r.draw(cube(1.4), mat4RotationY(0.6), material(0xD98F4F));
+    print("cube           tris=" + r.trianglesDrawn + " px=" + r.pixelsWritten);
+
+    r.beginFrame(0x101418);
+    r.draw(cylinder(0.8, 1.6, 16), mat4RotationY(0.3), material(0x7FBF7F));
+    print("cylinder       tris=" + r.trianglesDrawn + " px=" + r.pixelsWritten);
+
+    // Two spheres that interpenetrate. This is the case a 2D rasterizer cannot
+    // do: painter's-algorithm sorting has no answer for geometry that passes
+    // through other geometry, and only a depth buffer resolves it per pixel.
+    r.beginFrame(0x101418);
+    r.draw(sphere(0.9, 20, 10), mat4Translation(Vec3(-0.4, 0.0, 0.0)), material(0xCC5555));
+    let firstPass = r.pixelsWritten;
+    r.draw(sphere(0.9, 20, 10), mat4Translation(Vec3(0.4, 0.0, 0.3)), material(0x55AA55));
+    print("two spheres    tris=" + r.trianglesDrawn + " px=" + r.pixelsWritten
+          + " (second added " + (r.pixelsWritten - firstPass) + ")");
+
+    // Perspective-correct texture mapping: without the 1/w correction the
+    // checker would bend across the diagonal of each quad.
+    let tex = checker(64, 8, 0xFFFFFF, 0x333333);
+    tex.setFilter(FILTER_NEAREST);
+    r.setTexture(tex);
+    r.setCamera(camera(mat4LookAt(Vec3(0.0, 2.5, 2.5), Vec3(0.0, 0.0, 0.0),
+                                  Vec3(0.0, 1.0, 0.0)), proj));
+    r.beginFrame(0x101418);
+    r.draw(plane(3.0, 3.0, 1), mat4Identity(), material_shaded(0xFFFFFF, SHADE_UNLIT));
+    print("textured plane tris=" + r.trianglesDrawn + " px=" + r.pixelsWritten);
+    r.setTexture(null);
+
+    // Near-plane clipping: a ground triangle running from in front of the
+    // camera to behind it. Unclipped, the behind-the-eye vertex would project
+    // to the wrong side of the screen and smear across it.
+    r.setCamera(camera(mat4LookAt(Vec3(0.0, 1.0, 0.0), Vec3(0.0, 0.0, -2.0),
+                                  Vec3(0.0, 1.0, 0.0)), proj));
+    r.beginFrame(0x101418);
+    r.draw(plane(12.0, 12.0, 1), mat4Identity(), material_shaded(0x6699DD, SHADE_UNLIT));
+    print("clipped ground tris=" + r.trianglesDrawn + " px=" + r.pixelsWritten);
+
+    // The colour buffer's fingerprint. Deterministic, so it is the golden.
+    print("final hash     " + fb.hash());
+}
