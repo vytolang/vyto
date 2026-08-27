@@ -429,11 +429,13 @@ fi
 # descriptor, so the WINDOW owns the blocking call and the reactor sweeps its
 # fds afterwards at zero timeout).
 #
-# Output is deliberately environment-independent — identical with or without a
-# display — so the golden holds on CI, which has neither X11 nor a Windows box.
-# The waiter path is exercised even here, since it cannot be tested on the two
-# platforms it exists for.
-got=$(./vytoc run tests/fixtures/reactor_surface.vt 2>&1)
+# Run under VS_HEADLESS, like every other surface-touching test here: CI has no
+# X server at all, and Surface.init panics rather than degrading (surface.vt:228).
+# The assertions are written to hold on either backend, so running it headless
+# costs no coverage of the branch that matters — the waiter path is the one
+# headless takes, and it is also the one Win32 and Android take, neither of
+# which this suite can reach.
+got=$(VS_HEADLESS=1 VS_EVENTS=/dev/null ./vytoc run tests/fixtures/reactor_surface.vt 2>&1)
 if [ "$got" = "$(cat tests/fixtures/reactor_surface.expected)" ]; then
     echo "PASS reactor_surface"
 else
