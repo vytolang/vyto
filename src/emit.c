@@ -415,6 +415,15 @@ static char *emit_hof(Em *em, Expr *e, Expr *recv, bool *fresh) {
        site (panics with a source location, like push/pop) */
     char *rv = arena_printf(&g_arena, "vt_arr_nn(%s, \"%s\", %d)", ex_b(em, recv), esc, line);
 
+    /* Every loop below is `for (i = 0; i < src->len; i++)` with the element
+       load immediately after the condition, so i is in bounds by construction
+       and the element read needs no per-iteration bounds check — the same
+       argument ST_FOR_EACH already makes (see the raw-slot read there).
+       src->data and src->len are re-read every iteration, so a closure that
+       grows or clears the array underneath the loop stays correct: the loop
+       simply sees the new length. Verified for both directions.
+       vt_arr_nn above has already rejected a null receiver. */
+
     switch ((BuiltinKind)e->builtin) {
     case B_ARR_MAP: {
         const char *U = c_type(ft->ret);
@@ -423,11 +432,11 @@ static char *emit_hof(Em *em, Expr *e, Expr *recv, bool *fresh) {
             "static VtArray* __vt_hof%d(VtArray* src, VtClosure* f) {\n"
             "    VtArray* dst = vt_arr_new((int32_t)sizeof(%s), %s);\n"
             "    for (int64_t i = 0; i < src->len; i++) {\n"
-            "        %s e = *(%s*)vt_arr_at(src, i, \"%s\", %d);\n"
+            "        %s e = ((%s*)src->data)[i];\n"
             "        %s r = ((%s)f->fn)(f->env, e);\n"
             "        vt_arr_push(dst, &r);\n%s"
             "    }\n    return dst;\n}\n",
-            id, U, uref ? "true" : "false", T, T, esc, line, U, sig,
+            id, U, uref ? "true" : "false", T, T, U, sig,
             uref ? "        vt_release(r);\n" : "");
         *fresh = true;
         return arena_printf(&g_arena, "__vt_hof%d(%s, %s)", id, rv, ex_b(em, fn));
@@ -438,10 +447,10 @@ static char *emit_hof(Em *em, Expr *e, Expr *recv, bool *fresh) {
             "static VtArray* __vt_hof%d(VtArray* src, VtClosure* f) {\n"
             "    VtArray* dst = vt_arr_new((int32_t)sizeof(%s), %s);\n"
             "    for (int64_t i = 0; i < src->len; i++) {\n"
-            "        %s e = *(%s*)vt_arr_at(src, i, \"%s\", %d);\n"
+            "        %s e = ((%s*)src->data)[i];\n"
             "        if (((%s)f->fn)(f->env, e)) vt_arr_push(dst, &e);\n"
             "    }\n    return dst;\n}\n",
-            id, T, tref ? "true" : "false", T, T, esc, line, sig);
+            id, T, tref ? "true" : "false", T, T, sig);
         *fresh = true;
         return arena_printf(&g_arena, "__vt_hof%d(%s, %s)", id, rv, ex_b(em, fn));
     }
@@ -451,12 +460,12 @@ static char *emit_hof(Em *em, Expr *e, Expr *recv, bool *fresh) {
         sb_printf(ax,
             "static %s __vt_hof%d(VtArray* src, %s acc, VtClosure* f) {\n%s"
             "    for (int64_t i = 0; i < src->len; i++) {\n"
-            "        %s e = *(%s*)vt_arr_at(src, i, \"%s\", %d);\n"
+            "        %s e = ((%s*)src->data)[i];\n"
             "        %s nv = ((%s)f->fn)(f->env, acc, e);\n%s"
             "        acc = nv;\n"
             "    }\n    return acc;\n}\n",
             U, id, U, uref ? arena_printf(&g_arena, "    acc = (%s)vt_retain(acc);\n", U) : "",
-            T, T, esc, line, U, sig, uref ? "        vt_release(acc);\n" : "");
+            T, T, U, sig, uref ? "        vt_release(acc);\n" : "");
         *fresh = uref;
         return arena_printf(&g_arena, "__vt_hof%d(%s, %s, %s)", id, rv,
                             ex_v(em, a[0], ft->ret), ex_b(em, fn));
@@ -465,10 +474,10 @@ static char *emit_hof(Em *em, Expr *e, Expr *recv, bool *fresh) {
         sb_printf(ax,
             "static void __vt_hof%d(VtArray* src, VtClosure* f) {\n"
             "    for (int64_t i = 0; i < src->len; i++) {\n"
-            "        %s e = *(%s*)vt_arr_at(src, i, \"%s\", %d);\n"
+            "        %s e = ((%s*)src->data)[i];\n"
             "        ((%s)f->fn)(f->env, e);\n"
             "    }\n}\n",
-            id, T, T, esc, line, sig);
+            id, T, T, sig);
         *fresh = false;
         return arena_printf(&g_arena, "__vt_hof%d(%s, %s)", id, rv, ex_b(em, fn));
     case B_ARR_FIND_INDEX:
@@ -484,10 +493,10 @@ static char *emit_hof(Em *em, Expr *e, Expr *recv, bool *fresh) {
         sb_printf(ax,
             "static %s __vt_hof%d(VtArray* src, VtClosure* f) {\n"
             "    for (int64_t i = 0; i < src->len; i++) {\n"
-            "        %s e = *(%s*)vt_arr_at(src, i, \"%s\", %d);\n"
+            "        %s e = ((%s*)src->data)[i];\n"
             "        %s"
             "    }\n%s}\n",
-            ret_t, id, T, T, esc, line, testln, dflt);
+            ret_t, id, T, T, testln, dflt);
         *fresh = false;
         return arena_printf(&g_arena, "__vt_hof%d(%s, %s)", id, rv, ex_b(em, fn));
     }
