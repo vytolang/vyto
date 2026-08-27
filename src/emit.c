@@ -1096,8 +1096,17 @@ static char *ex(Em *em, Expr *e, bool *fresh) {
                                 ex_b(em, e->rhs), c_escape(e->loc.file, strlen(e->loc.file)),
                                 e->loc.line);
         Type *et = e->lhs->type->elem;
-        return arena_printf(&g_arena, "(*(%s*)vt_arr_at(%s, %s, \"%s\", %d))", c_type(et),
-                            ex_b(em, e->lhs), ex_b(em, e->rhs),
+        /* Index a typed pointer instead of offsetting a char* by
+           i * elem_size: the element scale is a compile-time constant here, so
+           this folds into an addressing mode and the loop vectorizes. Same
+           bounds check either way — vt_arr_ati returns the index (vyto_rt.h).
+           The array fragment is bound to a temp first because it may be an
+           arbitrary expression (a call), and it is named twice below. */
+        const char *ta = newtemp(em, e->lhs->type, false);
+        char *af = ex_b(em, e->lhs);
+        char *idx = ex_b(em, e->rhs);
+        return arena_printf(&g_arena, "(%s = %s, ((%s*)%s->data)[vt_arr_ati(%s, %s, \"%s\", %d)])",
+                            ta, af, c_type(et), ta, ta, idx,
                             c_escape(e->loc.file, strlen(e->loc.file)), e->loc.line);
     }
     case EX_UN: {
@@ -1478,14 +1487,14 @@ static void emit_assign(Em *em, Expr *e) {
         const char *lo, *hi;
         if (ck_compound && int_bounds(et, &lo, &hi)) {
             ind(em);
-            sb_printf(em->out, "%s = %s(*(%s*)vt_arr_at(%s, %s, %s), %s, %s, %s, %s);\n", tv,
-                      ck_fn, c_type(et), ta, ti, fl, ex_v(em, e->rhs, et), lo, hi, fl);
+            sb_printf(em->out, "%s = %s(((%s*)%s->data)[vt_arr_ati(%s, %s, %s)], %s, %s, %s, %s);\n",
+                      tv, ck_fn, c_type(et), ta, ta, ti, fl, ex_v(em, e->rhs, et), lo, hi, fl);
         } else {
             /* the compound operator minus its trailing '=' is the plain binary op */
             char *bop = arena_strndup(&g_arena, cop, strlen(cop) - 1);
             ind(em);
-            sb_printf(em->out, "%s = *(%s*)vt_arr_at(%s, %s, %s) %s %s;\n", tv, c_type(et), ta, ti,
-                      fl, bop, ex_v(em, e->rhs, et));
+            sb_printf(em->out, "%s = ((%s*)%s->data)[vt_arr_ati(%s, %s, %s)] %s %s;\n", tv,
+                      c_type(et), ta, ta, ti, fl, bop, ex_v(em, e->rhs, et));
         }
     }
     ind(em);
@@ -1493,9 +1502,14 @@ static void emit_assign(Em *em, Expr *e) {
         /* non-ref element: no retain/release, so store inline through the
            inlined bounds-checked slot — lets the C compiler hoist/vectorize
            instead of emitting an out-of-line vt_arr_set call per element.
-           vt_arr_wr, not vt_arr_at: same compare plus one predicted-away branch
-           that turns a store into a read-only view into a panic. */
-        sb_printf(em->out, "*(%s*)vt_arr_wr(%s, %s, %s) = %s;\n", c_type(et), ta, ti, fl, tv);
+           vt_arr_wri, not vt_arr_ati: same compare plus one predicted-away
+           branch that turns a store into a read-only view into a panic.
+           Indexing a typed pointer rather than offsetting a char* folds the
+           element scale at compile time — see vt_arr_wri in vyto_rt.h. `ta`
+           and `ti` are already spilled to temps above, so naming them twice
+           here evaluates nothing twice. */
+        sb_printf(em->out, "((%s*)%s->data)[vt_arr_wri(%s, %s, %s)] = %s;\n", c_type(et), ta, ta,
+                  ti, fl, tv);
     else
         sb_printf(em->out, "vt_arr_set(%s, %s, &%s, %s);\n", ta, ti, tv, fl);
     if (str_append) {

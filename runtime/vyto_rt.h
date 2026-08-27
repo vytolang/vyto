@@ -234,6 +234,32 @@ static inline void *vt_arr_wr(VtArray *a, int64_t i, const char *file, int line)
     if (a->readonly) vt_arr_ro(file, line);
     return a->data + i * a->elem_size;
 }
+
+/* The same two checks, but returning the INDEX rather than the byte address,
+ * so the caller can subscript a typed pointer: `((double*)a->data)[VT_AT(...)]`.
+ *
+ * Identical safety, materially better code. The address form above must load
+ * `elem_size` and multiply by it at runtime, because it is generic over the
+ * element type. The emitter always knows the concrete C element type at the
+ * access site (`c_type(et)`), so folding the scale into the subscript turns a
+ * load-and-multiply into a constant shift the C compiler can fold into an
+ * addressing mode -- which is also what lets it vectorize the loop.
+ *
+ * Measured on a 1920x1080 depth-tested fill: 2.17ms -> 1.73ms per frame, with
+ * unchecked raw pointers at 1.69ms. So this reaches raw-pointer speed while
+ * keeping every bounds and readonly check. See local/docs/RASTER3D-SPIKE.md.
+ *
+ * `a` is evaluated once by the caller (the emitter spills it to a temp), so
+ * these are safe to use from a macro-free call site. */
+static inline int64_t vt_arr_ati(VtArray *a, int64_t i, const char *file, int line) {
+    if (!a || (uint64_t)i >= (uint64_t)a->len) vt_arr_oob(a, i, file, line);
+    return i;
+}
+static inline int64_t vt_arr_wri(VtArray *a, int64_t i, const char *file, int line) {
+    if (!a || (uint64_t)i >= (uint64_t)a->len) vt_arr_oob(a, i, file, line);
+    if (a->readonly) vt_arr_ro(file, line);
+    return i;
+}
 void vt_arr_set(VtArray *a, int64_t i, const void *elem, const char *file, int line);
 
 /* ---- maps (string keys, 8-byte value slots) ---- */
