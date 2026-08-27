@@ -376,7 +376,20 @@ int vpoll_wait(struct PollSet *ps, int timeout_ms) {
     if (ps->rcap == 0) pollset_grow_ready(ps);
     if (ps->rcap == 0) return -1;
     int n = epoll_wait(ps->epfd, ps->ready, ps->rcap, timeout_ms);
-    if (n < 0) { ps->nready = 0; return -1; }
+    /* EINTR is NOT an error: a signal arrived while blocked. epoll_wait is
+       explicitly non-restartable, so SA_RESTART does not cover it and every
+       caller would otherwise see a bare -1 indistinguishable from a real
+       failure -- which ends an event loop on the first signal the process
+       receives.
+
+       Reported as 0 ready fds, i.e. exactly a timeout. A caller that must know
+       a signal landed watches a self-pipe (vyto/os/reactor), which becomes
+       readable on the NEXT wait; returning 0 here simply lets the loop go
+       round again and see it. */
+    if (n < 0) {
+        ps->nready = 0;
+        return (errno == EINTR) ? 0 : -1;
+    }
     /* if we filled the buffer there may be more; grow for next round */
     if (n == ps->rcap) pollset_grow_ready(ps);
     ps->nready = n;
@@ -491,7 +504,18 @@ int vpoll_wait(struct PollSet *ps, int timeout_ms) {
     }
 #endif
     int n = vs_poll(ps->fds, (vs_nfds)ps->nfds, timeout_ms);
-    if (n <= 0) return n;
+    /* Same EINTR rule as the epoll arm above: a signal is not a failure, and
+       collapsing it into -1 ends an event loop on the first signal received.
+       poll(2) is non-restartable regardless of SA_RESTART. (WSAPoll has no
+       EINTR -- Windows has no such delivery -- so this is POSIX-only in
+       practice, but the check is harmless there.) */
+    if (n < 0) {
+#ifndef _WIN32
+        if (errno == EINTR) return 0;
+#endif
+        return -1;
+    }
+    if (n == 0) return 0;
     if (ps->rcap < ps->nfds) {
         int *nr = (int *)realloc(ps->ready, (size_t)ps->nfds * sizeof *nr);
         if (!nr) return -1;
