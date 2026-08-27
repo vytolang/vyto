@@ -543,6 +543,24 @@ long long vs_now_ms(void) {
     return (long long)ts.tv_sec * 1000LL + ts.tv_nsec / 1000000LL;
 }
 
+/* No waitable descriptor: this backend blocks in pthread_cond_timedwait on an
+ * event queue the Java side pushes into, not on a socket. An external event
+ * loop cannot select() on a condvar, so -1 is the honest answer and the caller
+ * falls back to a bounded vs_wait_timeout — which is also what keeps the
+ * paused-app battery behaviour intact (vs_wait_timeout swallows the timeout
+ * while backgrounded; an fd-driven loop outside would not know to). */
+int vs_event_fd(void *s) { (void)s; return -1; }
+
+/* Events already queued by the Java side, without touching the condvar. */
+int vs_events_pending(void *s) {
+    (void)s;
+    int n;
+    pthread_mutex_lock(&S.lock);
+    n = S.count;
+    pthread_mutex_unlock(&S.lock);
+    return n;
+}
+
 int vs_scale_pct(void) {
     /* $VYTO_SCALE first, matching every other backend (vsurf.c:50-57), so a
      * device can be forced to a known scale for screenshot comparison. */

@@ -727,6 +727,22 @@ int vs_wait_timeout(void *vs, int ms) {
     }
 }
 
+/* Win32 has no waitable descriptor for window events: the loop blocks in
+   MsgWaitForMultipleObjectsEx on a thread message queue, which is a kernel
+   object of a different kind and cannot be handed to select/poll/epoll.
+   Reporting -1 rather than faking one is what keeps the caller honest — it
+   falls back to a bounded vs_wait_timeout, the same thing
+   Window.add_poll_source does today.
+
+   (A real integration here would invert the loop: hand the reactor's next
+   timeout to MsgWaitForMultipleObjectsEx and let IT be the blocking wait, with
+   the socket set polled at zero timeout after. That is a Win32-shaped design,
+   not an fd, which is precisely why this returns -1.) */
+int vs_event_fd(void *vs) { (void)vs; return -1; }
+
+/* Messages already decoded into the queue by a previous PeekMessage. */
+int vs_events_pending(void *vs) { (void)vs; return evq_len; }
+
 void *vs_native_display(void *vs) {
     (void)vs;
     return NULL; /* no display concept on Win32 */
@@ -2184,6 +2200,45 @@ int vs_wait_timeout(void *vs, int ms) {
         if (rc <= 0) return VS_EV_TIMER; /* timeout or interrupted: tick */
         /* data ready: loop and drain via XPending */
     }
+}
+
+/* The descriptor this surface's events arrive on, or -1 where the backend has
+   none to give.
+
+   X11 is the one backend with a real answer: the display connection is a
+   socket, so an external event loop can select() on it alongside its own fds
+   and call vs_poll() when it fires. That is what lets vyto/os/reactor drive a
+   window and a set of sockets from ONE wait instead of polling the window on a
+   timer.
+
+   -1 is not a failure, it is "this backend cannot be waited on from outside":
+   Win32 blocks in MsgWaitForMultipleObjectsEx on a message queue and Android
+   on a pthread condvar, and neither is a descriptor. Callers fall back to a
+   bounded vs_wait_timeout there, which is exactly what Window.add_poll_source
+   already does. Adding this is additive to the ABI — no existing entry point
+   changes shape.
+
+   IMPORTANT: readable does NOT mean an event is ready. Xlib buffers, so bytes
+   on the socket may be a partial message, and conversely XPending() can have
+   events queued with nothing on the socket. A caller must check the queue
+   before blocking, not only after the fd fires. */
+int vs_event_fd(void *vs) {
+    VSurf *s = vs;
+    if (!s) return -1;
+    if (s->fb_on) return -1;   /* fbdev: reads /dev/input, not a single fd */
+    if (!s->dpy) return -1;    /* headless */
+    return ConnectionNumber(s->dpy);
+}
+
+/* Events already decoded and waiting, independent of the socket. Xlib's own
+   queue can be non-empty with nothing readable on the connection — the bytes
+   were consumed by an earlier read — so an external loop that blocked purely
+   on the fd would sleep with events in hand. Check this first, every pass. */
+int vs_events_pending(void *vs) {
+    VSurf *s = vs;
+    if (!s || s->fb_on || !s->dpy) return 0;
+    XFlush(s->dpy);
+    return XPending(s->dpy);
 }
 
 int vs_scale_pct(void) {

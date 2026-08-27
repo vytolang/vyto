@@ -422,6 +422,27 @@ else
     fail=1
 fi
 
+# --- vyto/os/reactor: a window and sockets from one loop (phase 4) ---
+#
+# Both arrangements: the fd path (X11 exposes the display socket, so the window
+# is just another watched fd) and the waiter path (Win32/Android have no
+# descriptor, so the WINDOW owns the blocking call and the reactor sweeps its
+# fds afterwards at zero timeout).
+#
+# Output is deliberately environment-independent — identical with or without a
+# display — so the golden holds on CI, which has neither X11 nor a Windows box.
+# The waiter path is exercised even here, since it cannot be tested on the two
+# platforms it exists for.
+got=$(./vytoc run tests/fixtures/reactor_surface.vt 2>&1)
+if [ "$got" = "$(cat tests/fixtures/reactor_surface.expected)" ]; then
+    echo "PASS reactor_surface"
+else
+    echo "FAIL reactor_surface"
+    echo "--- expected ---"; cat tests/fixtures/reactor_surface.expected
+    echo "--- got ---"; printf '%s\n' "$got"
+    fail=1
+fi
+
 # --- vyto/geom: Vec2/Vec3/Vec4 value types (pure Vyto — always runs) ---
 got=$(./vytoc run tests/fixtures/geom_vec.vt 2>&1)
 if [ "$got" = "$(cat tests/fixtures/geom_vec.expected)" ]; then

@@ -11,6 +11,7 @@ import { vs_open, vs_close, vs_width, vs_height, vs_set_title,
           vs_wait, vs_poll, vs_wait_timeout, vs_key, vs_text, vs_x, vs_y, vs_wheel,
           vs_mods, vs_now_ms, vs_scale_pct, vs_set_vsync, vs_blit_rect, vs_present_rect,
           vs_clip_set, vs_clip_clear, vs_clipboard_get, vs_clipboard_set,
+          vs_event_fd, vs_events_pending,
           vs_native_display, vs_native_window, vs_native_gc } from "vsurf";
 
 // Event classes returned by Surface.wait(). Values mirror VS_EV_* in
@@ -304,6 +305,27 @@ export class Surface {
     // Blocks up to ms; returns EV_TIMER if it elapses with no input. The tick
     // source for game loops: draw, present, then wait_timeout(frame_ms).
     fn wait_timeout(ms: int): int { return vs_wait_timeout(this.h, ms as i32); }
+
+    // The descriptor this surface's events arrive on, or **-1 where there is
+    // none**. Only X11 has one: the display connection is a socket, so an
+    // external event loop (vyto/os/reactor) can wait on it beside its own fds
+    // and drive a window and a set of sockets from ONE blocking call.
+    //
+    // Win32 blocks on a thread message queue and Android on a pthread condvar.
+    // Neither is a descriptor, and -1 says so rather than faking one — the
+    // caller falls back to a bounded wait_timeout, which is what
+    // Window.add_poll_source already does on every backend.
+    //
+    // **Readable does not mean an event is ready.** Xlib buffers: bytes on the
+    // socket may be a partial message, and events can sit decoded in Xlib's
+    // queue with nothing readable on the socket at all. Always drain with
+    // eventsPending()/poll() before blocking, never only after the fd fires.
+    fn eventFd(): int { return vs_event_fd(this.h) as int; }
+
+    // Events already decoded and waiting, independent of the descriptor. The
+    // companion eventFd() needs: a loop that blocked purely on the fd would
+    // sleep with events in hand.
+    fn eventsPending(): int { return vs_events_pending(this.h) as int; }
     // Ask the backend for an EV_VSYNC once per display refresh while `on`.
     //
     // Returns whether the backend really drives a vsync clock. **A caller that

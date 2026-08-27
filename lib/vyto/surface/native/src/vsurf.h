@@ -146,6 +146,23 @@ int vs_wheel(void);       /* last VS_EV_MOUSE_WHEEL delta (positive = down) */
 void vs_clipboard_set(void *s, const char *text);
 const char *vs_clipboard_get(void *s);
 
+/* The descriptor this surface's events arrive on, or -1 where the backend has
+   none. Lets an external event loop (vyto/os/reactor) wait on a window and a
+   set of sockets in ONE blocking call instead of polling the window on a timer.
+
+   X11 returns the display connection socket. Win32 (-1) blocks on a thread
+   message queue and Android (-1) on a pthread condvar; neither is a descriptor,
+   and callers fall back to a bounded vs_wait_timeout there.
+
+   Readable does NOT mean an event is ready: Xlib buffers, so check
+   vs_events_pending() before blocking, not only after the fd fires. */
+int vs_event_fd(void *s);
+
+/* Events already decoded and waiting, independent of the descriptor. Xlib's
+   queue can be non-empty with nothing readable on the connection, so a loop
+   that blocked purely on the fd would sleep holding events. */
+int vs_events_pending(void *s);
+
 /* escape hatches: native handles for the "drop one layer" case */
 void *vs_native_display(void *s);
 unsigned long vs_native_window(void *s);
