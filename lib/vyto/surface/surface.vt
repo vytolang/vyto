@@ -11,7 +11,7 @@ import { vs_open, vs_close, vs_width, vs_height, vs_set_title,
           vs_wait, vs_poll, vs_wait_timeout, vs_key, vs_text, vs_x, vs_y, vs_wheel,
           vs_mods, vs_now_ms, vs_scale_pct, vs_set_vsync, vs_blit_rect, vs_present_rect,
           vs_clip_set, vs_clip_clear, vs_clipboard_get, vs_clipboard_set,
-          vs_event_fd, vs_events_pending,
+          vs_event_fd, vs_events_pending, vs_wait_timeout_fds, vs_can_wait_fds,
           vs_native_display, vs_native_window, vs_native_gc } from "vsurf";
 
 // Event classes returned by Surface.wait(). Values mirror VS_EV_* in
@@ -326,6 +326,32 @@ export class Surface {
     // companion eventFd() needs: a loop that blocked purely on the fd would
     // sleep with events in hand.
     fn eventsPending(): int { return vs_events_pending(this.h) as int; }
+
+    // Block up to `ms` for a window event OR readability on any of `fds`.
+    // Returns an EV_* exactly as wait_timeout does — and EV_TIMER covers both
+    // "the timeout elapsed" and "one of your fds is ready", so **check your own
+    // descriptors on every return**, not only on EV_TIMER.
+    //
+    // This is what lets a window waiting on work that finishes elsewhere — a
+    // forked worker, a socket — block properly instead of waking on a timer to
+    // ask. Where the backend cannot do it (see canWaitFds) it degrades to a
+    // plain bounded wait, which is exactly the polling the caller would have
+    // written by hand, so the call is always correct and sometimes cheaper.
+    //
+    // Takes plain descriptors rather than a PollSet so that vyto/ui can use it
+    // without importing vyto/net: a fd is just a number, and the toolkit must
+    // not depend on the networking tree.
+    fn waitTimeoutFds(ms: int, fds: int[]): int {
+        if (fds.len == 0) { return this.wait_timeout(ms); }
+        return vs_wait_timeout_fds(this.h, ms as i32, fds as rawptr,
+                                   fds.len as i32) as int;
+    }
+
+    // Whether waitTimeoutFds really waits on the given descriptors, or falls
+    // back to a bounded poll. True on X11; false on Win32, Android, fbdev and
+    // headless. A caller that wants to block indefinitely when idle must check
+    // this first — where it is false, it still needs a timer ceiling.
+    fn canWaitFds(): bool { return vs_can_wait_fds(this.h) as int != 0; }
     // Ask the backend for an EV_VSYNC once per display refresh while `on`.
     //
     // Returns whether the backend really drives a vsync clock. **A caller that

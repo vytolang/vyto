@@ -551,6 +551,21 @@ long long vs_now_ms(void) {
  * while backgrounded; an fd-driven loop outside would not know to). */
 int vs_event_fd(void *s) { (void)s; return -1; }
 
+/* Cannot fold caller fds into a condvar wait, so this degrades to the bounded
+ * wait — the same 16ms polling the caller would otherwise do by hand.
+ *
+ * Deliberately NOT reimplemented as a select() over the fds alone: that would
+ * lose the paused-app behaviour above, where vs_wait_timeout blocks
+ * indefinitely instead of ticking so a backgrounded app stops burning battery.
+ * Correctness of the lifecycle beats power on the path that is already the
+ * fallback. */
+int vs_wait_timeout_fds(void *s, int ms, const int *fds, int n) {
+    (void)fds; (void)n;
+    return vs_wait_timeout(s, ms);
+}
+
+int vs_can_wait_fds(void *s) { (void)s; return 0; }
+
 /* Events already queued by the Java side, without touching the condvar. */
 int vs_events_pending(void *s) {
     (void)s;

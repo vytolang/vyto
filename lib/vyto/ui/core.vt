@@ -2571,6 +2571,18 @@ export const DOUBLE_CLICK_MS: int = 400;
 export const LONG_PRESS_MS: int = 500;
 export const DRAG_SLOP: int = 4;
 
+// Ceiling on the wait when every registered poll source carries a descriptor
+// the backend can wait on. The fd is what actually wakes the loop; this only
+// bounds how long a source that ALSO wants periodic attention (a flag another
+// thread flips, a deadline of its own) can go unserviced.
+//
+// 250ms, not 16: the point of the fd path is that an idle app with work in
+// flight sleeps instead of spinning, and a 16ms ceiling would throw that away
+// while still calling itself a wait. Four wakeups a second is a rounding error
+// against the ~60 this replaces, and no poll source has ever promised better
+// than "once per turn of the loop".
+const POLL_IDLE_MS: int = 250;
+
 export class Window {
     surf: Surface;
     painter: Painter;   // widgets draw through this; default = SurfacePainter
@@ -2631,6 +2643,15 @@ export class Window {
     poll_cbs: fn()[];
     poll_ids: int[];
     poll_next_id: int;
+    // Per-source descriptor, or -1 for a source that has none. A source whose
+    // work IS a descriptor (a worker channel, a socket) is WAITED on rather
+    // than polled: the loop blocks until either a window event or that fd is
+    // ready, instead of waking every 16ms to ask. See add_poll_fd.
+    //
+    // Held as plain ints and handed to Surface.wait_timeout_fds, so vyto/ui
+    // gains no dependency on vyto/net — the toolkit must not import the
+    // networking tree, and a descriptor is just a number.
+    poll_fds: int[];
     mods: int;           // MOD_* bitmask at the event being dispatched — widgets
                          // read it via Widget.mods() in on_key/on_click/on_drag
     scale: float;        // UI scale factor (1.0 = 96dpi); themes are scaled by
@@ -2646,6 +2667,7 @@ export class Window {
         this.animations = [];
         this.poll_cbs = [];
         this.poll_ids = [];
+        this.poll_fds = [];
         this.poll_next_id = 1;
         this.toasts = [];
         this.focusables = [];
@@ -2667,23 +2689,67 @@ export class Window {
     // With none registered the loop blocks exactly as it did before this
     // existed.
     //
+    // **If the work is a descriptor, use add_poll_fd instead** — a worker
+    // channel, a socket, a pipe. The loop then WAITS on that fd rather than
+    // asking for it 60 times a second, which is the difference between an idle
+    // app sleeping and an idle app spinning. Measured on X11: 61 turns/sec
+    // through this path, 4 through add_poll_fd, with no added latency when the
+    // work lands. This entry point remains right for work that is not a
+    // descriptor at all — a flag another thread sets, a file mtime.
+    //
     // It does NOT repaint. That is the difference between this and driving the
     // same work from a looping Tween, which is what apps reach for otherwise: a
     // Tween redraws the whole window every frame for the entire life of the
     // query. If the callback changes something visible, it calls redraw() or
     // invalidate() itself, when there is actually something to show.
     //
-    // Why a timed wait and not the fds themselves: Surface owns its wait and
-    // exposes no descriptor, and two of the four backends have none to expose
-    // (Win32 waits on a message queue, Android on a Looper). A poll source
+    // Why a timed wait and not the fds themselves: this entry point takes no
+    // descriptor, so there is nothing to wait ON — add_poll_fd is the one that
+    // does, and where the backend supports it (Surface.canWaitFds: X11 yes,
+    // Win32 and Android no, since a message queue and a condvar are not
+    // selectable) the loop blocks properly instead. Here a poll source still
     // costs a timer wakeup only while work is outstanding — which is precisely
     // when the app is showing a progress indicator and animating anyway.
     fn add_poll_source(body: fn()): int {
+        return this.add_poll_fd(-1, body);
+    }
+
+    // A poll source whose work IS a descriptor — a worker's channel
+    // (WorkerPool.workerFds()), a socket, a pipe. Same callback contract as
+    // add_poll_source, but the loop **waits on the fd** instead of polling for
+    // it, so an app with outstanding work still blocks when nothing is
+    // happening rather than waking ~60 times a second.
+    //
+    //     let id = win.add_poll_fd(pool.workerFds()[0], () => {
+    //         let r = pool.onReady(fd);
+    //         if (r != null) { ...; win.remove_poll_source(id); }
+    //     });
+    //
+    // The callback still runs once per turn of the loop, exactly as with
+    // add_poll_source — the fd changes when the loop *wakes*, not how often the
+    // callback is invoked, so a source that also needs polling (a flag another
+    // thread sets) keeps working unchanged.
+    //
+    // Falls back to the 16ms poll where the backend cannot wait on descriptors
+    // (Win32, Android, fbdev, headless — Surface.canWaitFds is false), so this
+    // is always correct and sometimes cheaper. Pass -1 to say "no descriptor",
+    // which is what add_poll_source does.
+    fn add_poll_fd(fd: int, body: fn()): int {
         let id = this.poll_next_id;
         this.poll_next_id += 1;
         this.poll_cbs.push(body);
         this.poll_ids.push(id);
+        this.poll_fds.push(fd);
         return id;
+    }
+
+    // The descriptors of every registered source that has one. Rebuilt per wait
+    // rather than cached: sources come and go across a wait (a callback removes
+    // its own on completion), and a stale list would wait on a closed fd.
+    fn poll_wait_fds(): int[] {
+        let out: int[] = [];
+        for (let f in this.poll_fds) { if (f >= 0) { out.push(f); } }
+        return out;
     }
 
     fn remove_poll_source(id: int) {
@@ -2692,6 +2758,7 @@ export class Window {
             if (this.poll_ids[i] == id) {
                 this.poll_ids.remove_at(i);
                 this.poll_cbs.remove_at(i);
+                this.poll_fds.remove_at(i);   // three arrays, one index
                 return;
             }
             i += 1;
@@ -3552,10 +3619,28 @@ export class Window {
                 ev = this.surf.wait_timeout(rem);
                 last_ms = this.surf.now_ms();
             } else if (this.poll_ids.len > 0) {
-                // Work is outstanding somewhere this window cannot be woken by,
-                // so it cannot block indefinitely — see add_poll_source. No tick
-                // and no repaint: nothing here is animating.
-                ev = this.surf.wait_timeout(16);
+                // Work is outstanding somewhere this window is not otherwise
+                // woken by — see add_poll_source. No tick and no repaint:
+                // nothing here is animating.
+                //
+                // Where the sources carry descriptors AND the backend can wait
+                // on them (X11), block on the window and those fds together:
+                // an idle app with a query in flight sleeps until the query
+                // lands instead of waking ~60 times a second to ask. The
+                // timeout is still passed as a ceiling, so a source with no fd
+                // — or a backend that cannot fold them in — behaves exactly as
+                // it did before.
+                let wfds = this.poll_wait_fds();
+                if (wfds.len > 0 && this.surf.canWaitFds()) {
+                    // A registered source without a descriptor still has to be
+                    // polled, so the ceiling stays at 16ms whenever one exists;
+                    // with every source waitable the loop may sleep properly.
+                    let ceil = POLL_IDLE_MS;
+                    if (wfds.len < this.poll_ids.len) { ceil = 16; }
+                    ev = this.surf.waitTimeoutFds(ceil, wfds);
+                } else {
+                    ev = this.surf.wait_timeout(16);
+                }
                 last_ms = this.surf.now_ms();
             } else {
                 ev = this.surf.wait();

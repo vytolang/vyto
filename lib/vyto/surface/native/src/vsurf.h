@@ -163,6 +163,26 @@ int vs_event_fd(void *s);
    that blocked purely on the fd would sleep holding events. */
 int vs_events_pending(void *s);
 
+/* Block up to ms for a window event OR readability on any of `n` caller fds.
+   Returns a VS_EV_* exactly as vs_wait_timeout does; VS_EV_TIMER covers both
+   "the timeout elapsed" and "one of your fds is ready", so check your own
+   descriptors on every return.
+
+   Lets a GUI app waiting on work that finishes elsewhere — a forked worker, a
+   socket — block properly instead of waking on a timer to ask. X11 folds the
+   fds into the select it already performs; Win32 and Android cannot (a C
+   runtime fd is not a WaitForMultipleObjects handle, and a condvar is not
+   selectable) and degrade to the plain bounded wait, which is the same polling
+   the caller would have done by hand.
+
+   fds==NULL or n<=0 is exactly vs_wait_timeout. */
+int vs_wait_timeout_fds(void *s, int ms, const int *fds, int n);
+
+/* Whether vs_wait_timeout_fds really waits on the caller's fds (1) or degrades
+   to a bounded poll (0). Callers use it to decide whether they may block
+   indefinitely or must keep a timer ceiling. */
+int vs_can_wait_fds(void *s);
+
 /* escape hatches: native handles for the "drop one layer" case */
 void *vs_native_display(void *s);
 unsigned long vs_native_window(void *s);

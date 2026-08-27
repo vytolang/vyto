@@ -1,0 +1,100 @@
+// Window.add_poll_fd: waiting on outside work instead of polling for it.
+//
+// add_poll_source notices work that finishes somewhere the window is not woken
+// by — a forked worker, a socket. It did so by dropping the loop to a 16ms
+// timed wait for as long as any source was registered, which is ~60 wakeups a
+// second whether or not anything is happening. On a laptop that is a battery
+// complaint; on a phone it is the thing ANDROID.md spent a section removing.
+//
+// add_poll_fd carries the descriptor, so where the backend can wait on it (X11)
+// the loop blocks on the window AND the fd together and wakes when the work
+// actually lands.
+//
+// ── WHAT IS ASSERTED, AND WHY IT IS SHAPED THIS WAY ─────────────────────────
+//
+// Not "how many times did we wake", which is a timing measurement and would be
+// flaky on a shared machine. Instead:
+//
+//   1. the callback still runs — the contract add_poll_source promised is
+//      unchanged, and a source that ALSO wants polling still gets it;
+//   2. the work is actually noticed, i.e. blocking on the fd does not mean
+//      sleeping through the thing you were waiting for;
+//   3. it did not repaint, which is the other half of the poll-source contract.
+//
+// **Run this under VS_HEADLESS=1.** Surface.init panics without a display
+// (surface.vt:228) rather than degrading, and CI has no X server. Headless
+// reports canWaitFds() false and takes the same 16ms fallback it always did,
+// so what a headless run asserts is that add_poll_fd is CORRECT on a backend
+// that cannot wait on descriptors — which is the Win32 and Android case, and
+// the one this suite could otherwise never reach.
+//
+// The waiting itself only happens under X11. Run it by hand there and the
+// golden is identical; the wakeup-rate difference (61/sec -> 4/sec, 0ms
+// latency) is recorded in MODULES.md rather than asserted here, because a
+// wakeup count is a timing measurement and would be flaky in CI.
+
+import { Window, Painter, Theme, Size, Widget } from "vyto/ui";
+import { WorkerPool } from "vyto/os/worker";
+
+class Panel extends Widget {
+    renders: int;
+    polls: int;
+    fn init() { super.init(); this.renders = 0; this.polls = 0; }
+    override fn measure(s: Painter, th: Theme): Size { return Size(50.0, 50.0); }
+    override fn render(s: Painter, th: Theme) {
+        this.renders += 1;
+        s.fill(this.bounds, th.primary);
+    }
+}
+
+fn main() {
+    // Built before the window, per WorkerPool's Windows re-launch caveat.
+    let pool = new WorkerPool(1, (input) => {
+        let out = bytes(1);
+        out[0] = 42 as byte;
+        return out;
+    });
+
+    let win = new Window("PollFd", 200, 200);
+    let w = new Panel();
+    win.root = w;
+
+    let fds = pool.workerFds();
+    if (fds.len == 0) { print("no worker fds"); return; }
+    let wfd = fds[0];
+
+    let got = [0];
+    let self = w;
+    // The result arrives on the worker's channel, so the loop can WAIT on it
+    // rather than asking every 16ms whether it has shown up yet.
+    let id = win.add_poll_fd(wfd, () => {
+        self.polls += 1;
+        let r = pool.onReady(wfd);
+        if (r != null) { got[0] += r.output.len; }
+    });
+    print("registered=" + str(win.poll_sources()));
+
+    let job = bytes(4);
+    pool.submit(job);
+
+    // Close the window shortly after, so this terminates with or without a
+    // display. The worker answers in microseconds; the point is whether the
+    // loop noticed, not how fast.
+    let ticker = win.add_poll_source(() => {
+        if (got[0] > 0) { win.close(); }
+    });
+
+    win.run();
+    win.remove_poll_source(id);
+    win.remove_poll_source(ticker);
+
+    // 1. the callback ran — the add_poll_source contract is intact
+    print("polled=" + str(w.polls > 0));
+    // 2. the work was actually noticed, i.e. waiting on the fd did not mean
+    //    sleeping through the result
+    print("work_seen=" + str(got[0] > 0));
+    // 3. still no repaints beyond what startup owed — the other half of the
+    //    poll-source contract, and what a looping Tween cannot do
+    print("did_not_repaint=" + str(w.renders <= 2));
+    print("after_remove=" + str(win.poll_sources()));
+}

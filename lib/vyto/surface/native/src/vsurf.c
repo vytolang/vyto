@@ -727,6 +727,20 @@ int vs_wait_timeout(void *vs, int ms) {
     }
 }
 
+/* No fd folding on Win32: a C runtime fd is not a WaitForMultipleObjects
+   handle, and MsgWaitForMultipleObjectsEx takes the latter. (A *socket* could
+   be bridged with WSAEventSelect, but a poll source is not necessarily a
+   socket -- a worker channel here is a pipe -- so bridging would work for some
+   callers and silently not others.)
+
+   Degrades to the bounded wait, which is exactly the 16ms polling the caller
+   would have done anyway: correct, just not power-optimal. vs_can_wait_fds()
+   reports which behaviour a caller is getting. */
+int vs_wait_timeout_fds(void *vs, int ms, const int *fds, int n) {
+    (void)fds; (void)n;
+    return vs_wait_timeout(vs, ms);
+}
+
 /* Win32 has no waitable descriptor for window events: the loop blocks in
    MsgWaitForMultipleObjectsEx on a thread message queue, which is a kernel
    object of a different kind and cannot be handed to select/poll/epoll.
@@ -742,6 +756,8 @@ int vs_event_fd(void *vs) { (void)vs; return -1; }
 
 /* Messages already decoded into the queue by a previous PeekMessage. */
 int vs_events_pending(void *vs) { (void)vs; return evq_len; }
+
+int vs_can_wait_fds(void *vs) { (void)vs; return 0; }
 
 void *vs_native_display(void *vs) {
     (void)vs;
@@ -2202,6 +2218,62 @@ int vs_wait_timeout(void *vs, int ms) {
     }
 }
 
+/* Block up to ms for a window event OR readability on any of `n` caller fds.
+   Returns a VS_EV_* as vs_wait_timeout does; VS_EV_TIMER covers both "the
+   timeout elapsed" and "one of your fds is ready", so the caller checks its
+   own descriptors on every return regardless.
+
+   ── WHY THIS EXISTS ─────────────────────────────────────────────────────────
+   A GUI app waiting on work that finishes elsewhere -- a forked worker, a
+   socket -- otherwise has to poll on a timer, because Surface owns the
+   blocking call and knows nothing about the caller's descriptors. That is a
+   wakeup every 16ms for as long as the work is outstanding.
+
+   Folding the fds into the select the X11 backend was already doing lets the
+   app block properly: it sleeps until the window says something or the work
+   lands, and burns nothing in between.
+
+   fds==NULL/n<=0 is exactly vs_wait_timeout, and the two share this body. */
+int vs_wait_timeout_fds(void *vs, int ms, const int *fds, int n) {
+    VSurf *s = vs;
+    if (s->fb_on) return fb_next(s, 1, ms >= 0 ? ms : 0);
+    if (!s->dpy) return headless_wait(&s->w, &s->h);
+    int xfd = ConnectionNumber(s->dpy);
+    for (;;) {
+        XFlush(s->dpy);
+        while (XPending(s->dpy)) {
+            XEvent e;
+            XNextEvent(s->dpy, &e);
+            int r = x11_deliver(s, &e);
+            if (r >= 0) return r;
+        }
+        fd_set rf;
+        FD_ZERO(&rf);
+        FD_SET(xfd, &rf);
+        int maxfd = xfd;
+        for (int i = 0; i < n; i++) {
+            int f = fds[i];
+            /* FD_SETSIZE is the hard ceiling of select(2); a descriptor past it
+               corrupts the caller's stack rather than failing, so skip it. A UI
+               app watching >1024 fds wants vyto/os/reactor, not this. */
+            if (f < 0 || f >= FD_SETSIZE) continue;
+            FD_SET(f, &rf);
+            if (f > maxfd) maxfd = f;
+        }
+        struct timeval tv;
+        tv.tv_sec = ms / 1000;
+        tv.tv_usec = (ms % 1000) * 1000;
+        int rc = select(maxfd + 1, &rf, NULL, NULL, &tv);
+        if (rc <= 0) return VS_EV_TIMER;   /* timeout or interrupted: tick */
+        /* One of the caller's fds, not the display: report a tick so the
+           caller looks at its own descriptors. Checking the X fd explicitly
+           (rather than assuming) keeps a ready worker from being mistaken for
+           window input and sent round the XPending drain, which would block. */
+        if (!FD_ISSET(xfd, &rf)) return VS_EV_TIMER;
+        /* display data ready: loop and drain via XPending */
+    }
+}
+
 /* The descriptor this surface's events arrive on, or -1 where the backend has
    none to give.
 
@@ -2239,6 +2311,15 @@ int vs_events_pending(void *vs) {
     if (!s || s->fb_on || !s->dpy) return 0;
     XFlush(s->dpy);
     return XPending(s->dpy);
+}
+
+/* Whether vs_wait_timeout_fds really waits on the caller's fds, or degrades to
+   a bounded poll. True only on X11 (and only for a real window: fbdev and
+   headless have no display select to fold into). A caller uses this to decide
+   whether it may block indefinitely or must keep a timer ceiling. */
+int vs_can_wait_fds(void *vs) {
+    VSurf *s = vs;
+    return (s && !s->fb_on && s->dpy) ? 1 : 0;
 }
 
 int vs_scale_pct(void) {

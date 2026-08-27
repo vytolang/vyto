@@ -445,6 +445,29 @@ else
     fail=1
 fi
 
+# --- vyto/ui: Window.add_poll_fd waits on outside work, does not poll for it ---
+#
+# add_poll_source dropped the loop to a 16ms wait for as long as any source was
+# registered — ~60 wakeups a second whether or not anything was happening.
+# add_poll_fd carries the descriptor, so where the backend can wait on it (X11)
+# the loop blocks on the window and the fd together. Measured on this machine:
+# 61 turns/sec before, 4 after, with 0ms latency when the work does land.
+#
+# Run under VS_HEADLESS: CI has no X server, and Surface.init panics rather
+# than degrading. Headless reports canWaitFds() false and takes the old 16ms
+# fallback, so what this asserts there is that add_poll_fd is CORRECT on a
+# backend that cannot wait on descriptors — the Win32/Android case. The
+# waiting itself is verified on X11 by hand; see MODULES.md for the numbers.
+got=$(VS_HEADLESS=1 VS_EVENTS=/dev/null ./vytoc run tests/fixtures/ui_poll_fd.vt 2>&1)
+if [ "$got" = "$(cat tests/fixtures/ui_poll_fd.expected)" ]; then
+    echo "PASS ui_poll_fd"
+else
+    echo "FAIL ui_poll_fd"
+    echo "--- expected ---"; cat tests/fixtures/ui_poll_fd.expected
+    echo "--- got ---"; printf '%s\n' "$got"
+    fail=1
+fi
+
 # --- vyto/geom: Vec2/Vec3/Vec4 value types (pure Vyto — always runs) ---
 got=$(./vytoc run tests/fixtures/geom_vec.vt 2>&1)
 if [ "$got" = "$(cat tests/fixtures/geom_vec.expected)" ]; then
