@@ -1,0 +1,169 @@
+// vyto/os/reactor — one loop over sockets, timers and forked workers.
+//
+// This is the proof that the reactor extracted from vyto/net/server is general
+// enough to carry that server's loop shape without being that server. Four
+// things run in ONE thread, in one wait() loop:
+//
+//   1. a listener accepting connections
+//   2. several client connections served concurrently
+//   3. a repeating timer and a one-shot timer
+//   4. a forked worker pool, whose result fds are watched like any other fd
+//
+// (4) is the point of putting the reactor in vyto/os rather than vyto/net:
+// fork gives cores, the reactor gives concurrency, and a worker's channel is
+// just a descriptor. The two compose in one loop with no threads anywhere.
+
+import { Reactor } from "vyto/os/reactor";
+import { socket_listen, socket_connect, Socket, POLL_READ } from "vyto/net/socket";
+import { WorkerPool } from "vyto/os/worker";
+
+// Connections the loop is holding, indexed by fd (the same dense-fd table
+// server.vt uses).
+class Conns {
+    slots: Socket[];
+    fn init() { this.slots = []; }
+    fn put(fd: int, s: Socket) {
+        while (this.slots.len <= fd) { this.slots.push(null); }
+        this.slots[fd] = s;
+    }
+    fn get(fd: int): Socket {
+        if (fd < 0 || fd >= this.slots.len) { return null; }
+        return this.slots[fd];
+    }
+    fn drop(fd: int) { if (fd >= 0 && fd < this.slots.len) { this.slots[fd] = null; } }
+}
+
+// Registering a connection is a top-level function rather than an inline
+// closure inside the accept callback: v0.1 has no nested closures, so a
+// callback that installs another callback has to hand off to a function. This
+// is the shape any non-trivial reactor program takes in Vyto today.
+fn arm_conn(rx: Reactor, conns: Conns, cfd: int, served: int[]) {
+    rx.watch(cfd, POLL_READ, (rfd, rev) => {
+        let s = conns.get(rfd);
+        if (s == null) { return false; }
+        let rr = s.tryRecv(256);
+        // wouldBlock is a spurious wakeup, not a close: keep watching.
+        if (rr.wouldBlock()) { return true; }
+        if (rr.status <= 0) { return false; }          // EOF or error: retire
+        s.trySend(rr.data);                            // echo
+        served[0] += 1;
+        conns.drop(rfd);
+        s.close();
+        return false;                  // retire this fd
+    });
+}
+
+fn main() {
+    // The worker pool is built FIRST: on Windows a worker is this executable
+    // re-launched, so it re-runs main() up to this constructor. Anything with a
+    // side effect — printing, opening a listener — has to come after it.
+    let pool = new WorkerPool(2, (input) => {
+        // The "CPU work" a reactor must never do inline: doing it here parks
+        // no fds, because it is not this process.
+        let total = 0;
+        for (let i in 0..input.len) { total += input[i] as int; }
+        let out = bytes(1);
+        out[0] = (total % 251) as byte;
+        return out;
+    });
+
+    let rx = new Reactor();
+    let conns = new Conns();
+
+    let srv = socket_listen(0);
+    if (srv == null) { print("bind failed"); return; }
+    srv.setNonBlocking(true);
+    let port = srv.localPort();
+
+    let served = [0];
+    let ticks = [0];
+    let worker_results = [0];
+
+    // ---- 1. the listener --------------------------------------------------
+    // Drain the accept queue on each wakeup: one readable event can cover many
+    // pending connections, and stopping after one leaves the rest until the
+    // next wakeup. Returning true keeps the listener watched.
+    rx.watch(srv.fd as int, POLL_READ, (fd, ev) => {
+        while (true) {
+            let c = srv.tryAccept();
+            if (c == null) { break; }          // queue drained
+            c.setNonBlocking(true);
+            let cfd = c.fd as int;
+            conns.put(cfd, c);
+            // ---- 2. one connection ---------------------------------------
+            // Echo what arrives, then retire by returning false. The loop does
+            // the unwatching — a callback that unwatched itself would leave a
+            // stale fd in the ready list still being iterated.
+            arm_conn(rx, conns, cfd, served);
+        }
+        return true;
+    });
+
+    // ---- 3. timers --------------------------------------------------------
+    // A repeater. Deadlines advance from the previous deadline rather than from
+    // now, so this does not drift outward when the loop is busy.
+    let tick_id = rx.every(10, () => { ticks[0] += 1; });
+
+    // A one-shot that cancels the repeater, proving cancel() by id. The stop
+    // condition below waits for this to have happened, so the socket and worker
+    // work (which finishes in microseconds) does not end the loop before the
+    // timers have shown anything.
+    let cancelled = [false];
+    rx.after(60, () => { rx.cancel(tick_id); cancelled[0] = true; });
+
+    // ---- 4. the worker pool ----------------------------------------------
+    // A worker's channel is an ordinary descriptor, so it joins the same loop.
+    // onReady() hands back the finished Result and dispatches whatever is
+    // queued behind it.
+    for (let wfd in pool.workerFds()) {
+        rx.watch(wfd, POLL_READ, (fd, ev) => {
+            let r = pool.onReady(fd);
+            if (r != null) { worker_results[0] += r.output.len; }
+            return true;
+        });
+    }
+    let job = bytes(4);
+    for (let i in 0..4) { job[i] = 10 as byte; }
+    pool.submit(job);
+    pool.submit(job);
+
+    // ---- clients ----------------------------------------------------------
+    // Blocking connect/send is fine: the bytes sit in the kernel until the loop
+    // drains them.
+    let cs: Socket[] = [];
+    for (let i in 0..3) {
+        let c = socket_connect("127.0.0.1", port);
+        if (c == null) { print("connect failed"); return; }
+        c.sendText("req-" + str(i));
+        cs.push(c);
+    }
+
+    // ---- stop condition ---------------------------------------------------
+    // A supervising timer ends the loop once everything has landed, and doubles
+    // as the hang guard: with no fd traffic at all this still fires and stops.
+    rx.every(5, () => {
+        if (served[0] >= 3 && worker_results[0] >= 2 && cancelled[0]) { rx.stop(); }
+    });
+    rx.after(4000, () => { rx.stop(); });
+
+    rx.run();
+
+    print("served=" + str(served[0]));
+    print("worker_bytes=" + str(worker_results[0]));
+    // The repeater ran for ~60ms at 10ms before being cancelled. Asserted as a
+    // band, not a count: it is wall-clock work on a shared machine, and a exact
+    // number here would be a flaky test rather than a stronger one.
+    print("ticked_then_stopped=" + str(ticks[0] >= 3 && ticks[0] <= 12));
+    // The three connection fds retired themselves by returning false; the
+    // listener and the two worker fds returned true and are still watched.
+    // That distinction IS the retirement contract, so assert the number rather
+    // than "nothing is left".
+    print("still_watched=" + str(rx.watch_count()));
+    // Two survive: the 5ms supervisor and the 4000ms hang guard that never
+    // fired. The 10ms repeater was cancelled and the 60ms one-shot fired, and
+    // both are gone — a cancel or a one-shot that leaked would show 3 or 4.
+    print("timers_left=" + str(rx.timer_count()));
+
+    for (let c in cs) { c.close(); }
+    srv.close();
+}

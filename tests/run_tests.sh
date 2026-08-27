@@ -358,6 +358,70 @@ else
     fail=1
 fi
 
+# --- vyto/os/reactor: the loop shape vyto/net/server runs on ---
+#
+# The gate that says the extracted reactor could carry that server before one
+# line of it is refactored: accept-drain, fd-indexed dispatch, retire-on-false,
+# POLL_WRITE arm/disarm, and the idle sweep, all against the public API.
+#
+# spurious_write=0 is the assertion that matters. A socket is almost always
+# writable, so a POLL_WRITE left armed fires on every wakeup and spins the loop
+# at 100% CPU (server.vt:2002-2011). Fault-injected to confirm the check is not
+# vacuous: deleting the disarm makes it report 53, not 0.
+got=$(./vytoc run tests/fixtures/reactor_server_shape.vt 2>&1)
+if [ "$got" = "$(cat tests/fixtures/reactor_server_shape.expected)" ]; then
+    echo "PASS reactor_server_shape"
+else
+    echo "FAIL reactor_server_shape"
+    echo "--- expected ---"; cat tests/fixtures/reactor_server_shape.expected
+    echo "--- got ---"; printf '%s\n' "$got"
+    fail=1
+fi
+
+# --- vyto/os/reactor: the self-pipe wakeup and signal routing ---
+got=$(./vytoc run tests/fixtures/reactor_wakeup.vt 2>&1)
+if [ "$got" = "$(cat tests/fixtures/reactor_wakeup.expected)" ]; then
+    echo "PASS reactor_wakeup"
+else
+    echo "FAIL reactor_wakeup"
+    echo "--- expected ---"; cat tests/fixtures/reactor_wakeup.expected
+    echo "--- got ---"; printf '%s\n' "$got"
+    fail=1
+fi
+
+# --- vyto/os/reactor: EINTR — a signal while blocked in epoll_wait ---
+#
+# Needs a REAL external signal: raise(3) from a timer runs after wait() has
+# already returned and never produces the EINTR this covers. So the binary is
+# built, backgrounded, and signalled from here.
+#
+# Before the fix in socket_shim.c, the first signal a process received killed
+# its event loop silently (exit 0). Reverting that arm makes this print
+# got=0 / survived_eintr=false.
+if ./vytoc build tests/fixtures/reactor_eintr.vt \
+        -o tests/tmp/reactor_eintr >/dev/null 2>&1; then
+    tests/tmp/reactor_eintr > tests/tmp/reactor_eintr.out 2>&1 &
+    eintr_pid=$!
+    # Let it reach run() and block. The guard timer is 10s, so this is ample.
+    sleep 2
+    kill -USR1 "$eintr_pid" 2>/dev/null
+    sleep 1
+    kill -USR1 "$eintr_pid" 2>/dev/null
+    wait "$eintr_pid" 2>/dev/null
+    got=$(cat tests/tmp/reactor_eintr.out 2>/dev/null)
+    if [ "$got" = "$(cat tests/fixtures/reactor_eintr.expected)" ]; then
+        echo "PASS reactor_eintr"
+    else
+        echo "FAIL reactor_eintr"
+        echo "--- expected ---"; cat tests/fixtures/reactor_eintr.expected
+        echo "--- got ---"; printf '%s\n' "$got"
+        fail=1
+    fi
+else
+    echo "FAIL reactor_eintr (build)"
+    fail=1
+fi
+
 # --- vyto/geom: Vec2/Vec3/Vec4 value types (pure Vyto — always runs) ---
 got=$(./vytoc run tests/fixtures/geom_vec.vt 2>&1)
 if [ "$got" = "$(cat tests/fixtures/geom_vec.expected)" ]; then

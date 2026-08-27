@@ -1,0 +1,40 @@
+// EINTR: a signal delivered while the reactor is BLOCKED in epoll_wait.
+//
+// Driven by tests/run_tests.sh, which builds this, runs it, and sends two
+// SIGUSR1 from the shell. It cannot be an in-process test: raise(3) from a
+// timer callback runs AFTER wait() has already returned, so it never produces
+// the EINTR this is about. The signal has to arrive while the loop is asleep,
+// which means it has to come from another process.
+//
+// ── THE BUG ─────────────────────────────────────────────────────────────────
+//
+// epoll_wait returns -1/EINTR when a signal lands while it is blocked, and it
+// is explicitly NOT restartable -- SA_RESTART does not cover it. vpoll_wait
+// collapsed that into a bare -1, indistinguishable from a real error, and
+// Reactor.tick() ends the loop on a negative wait.
+//
+// So the FIRST signal a process received killed its event loop, silently, with
+// exit code 0. Nothing caught it because no test had ever sent a signal to a
+// running loop.
+//
+// Fault-injected both ways: with socket_shim.c's EINTR arm reverted to a bare
+// `return -1`, this prints got=0 / survived_eintr=false instead of got=2.
+
+import { Reactor, SIGUSR1 } from "vyto/os/reactor";
+
+fn main() {
+    let rx = new Reactor();
+    rx.wakeable();
+    let got = [0];
+    // Stops itself on the SECOND signal: one delivery could be luck, two means
+    // the loop genuinely resumed after being interrupted.
+    rx.onSignal(SIGUSR1, (s) => { got[0] += 1; if (got[0] >= 2) { rx.stop(); } });
+    // Long enough that the loop is really asleep in epoll_wait, and that a
+    // wedged run fails by timing out rather than hanging the suite forever.
+    rx.after(10000, () => { print("TIMEOUT_GUARD"); rx.stop(); });
+    print("ready");
+    rx.run();
+    print("got=" + str(got[0]));
+    print("survived_eintr=" + str(got[0] == 2));
+    rx.close();
+}

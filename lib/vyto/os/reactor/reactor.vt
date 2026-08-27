@@ -1,0 +1,582 @@
+// vyto/os/reactor — one poll loop over file descriptors and timers, with
+// closure callbacks. The event loop Vyto uses in place of async/await.
+//
+//     let rx = new Reactor();
+//     rx.watch(sock.fd as int, POLL_READ, (fd, ev) => { ... return true; });
+//     rx.after(500, () => { print("half a second"); });
+//     rx.run();                                  // blocks until stop()
+//
+// There is no scheduler, no futures, no coroutines and no compiler support:
+// a callback runs to completion on the loop's own thread, so a blocking call
+// inside one parks every other fd this reactor holds. That is the honest
+// contract of a single-threaded reactor and it is why `vyto/os/worker` exists
+// beside it — CPU work goes to a forked worker, whose result fd comes back
+// here as just another watched descriptor.
+//
+// ── WHAT THIS IS EXTRACTED FROM ─────────────────────────────────────────────
+//
+// `vyto/net/server` has run a reactor of exactly this shape in production since
+// before this module existed: 41-56k concurrent connections per worker, with
+// pre-fork over SO_REUSEPORT for the cores. Every non-obvious rule below was
+// paid for there and is carried across deliberately rather than rediscovered:
+//
+//   - POLL_WRITE is armed only while there is something to write. Leaving it
+//     armed makes every wakeup report the socket ready and spins the loop.
+//   - A handler that returns false is retired by the loop, never by itself:
+//     removing an fd from the ready list mid-iteration is how a loop ends up
+//     dispatching a stale fd.
+//   - `wait()` is bounded by the next timer deadline, not by a constant. An
+//     idle reactor with no timers blocks indefinitely and burns nothing.
+//
+// server.vt is NOT built on this yet, on purpose. This module is proved against
+// it (tests/fixtures + examples/107_reactor.vt reproduce its loop shape) before
+// a working server is refactored onto it. See MODULES.md.
+//
+// ── WHAT IT DOES NOT DO ─────────────────────────────────────────────────────
+//
+// **No async file I/O.** epoll answers for sockets and pipes; a regular file is
+// always "ready" and a read on it blocks in the kernel regardless. Disk work
+// belongs in a worker (`vyto/os/worker`), whose channel fd is pollable. This is
+// not an omission to be filled in later — it is what the syscall offers.
+
+// POLL_READ / POLL_WRITE are not re-exported — there is no re-export syntax,
+// and duplicating them as new constants here would create two spellings of one
+// kernel bit. Import them from vyto/net/socket alongside this module, the way
+// vyto/os/worker does.
+import { PollSet, POLL_READ, POLL_WRITE } from "vyto/net/socket";
+import { Heap } from "vyto/coll/heap";
+import { monoMs } from "vyto/util/time";
+
+// The self-pipe wakeup. Windows needs winsock because its "pipe" is a loopback
+// socket pair — WSAPoll waits on SOCKETs only.
+#link "ws2_32" if "windows"
+
+extern "C" {
+    fn vwake_open(rfd: rawptr, wfd: rawptr): i32;
+    fn vwake_signal(wfd: i32): i32;
+    fn vwake_drain(rfd: i32): i32;
+    fn vwake_close(rfd: i32, wfd: i32);
+    fn vwake_on_signal(signo: i32): i32;
+    fn vwake_signal_count(signo: i32): i32;
+}
+
+// Signal numbers, Linux/macOS values. Passed straight to sigaction.
+export const SIGHUP: int = 1;
+export const SIGINT: int = 2;
+export const SIGQUIT: int = 3;
+export const SIGTERM: int = 15;
+export const SIGUSR1: int = 10;
+export const SIGUSR2: int = 12;
+export const SIGCHLD: int = 17;
+
+fn now_ms(): int { return monoMs() as int; }
+
+// Longest a foreign waiter (set_waiter) may block when no timer bounds it.
+//
+// With no timers pending the reactor would otherwise hand the window loop an
+// unbounded wait, and a socket that became readable would go unserviced until
+// the user happened to move the mouse. This is the ceiling on that latency.
+//
+// 100ms, not 16: this is the IDLE path — nothing animating, nothing scheduled —
+// so it is a floor of 10 wakeups/second on an app doing nothing, against 60 if
+// it were frame-paced. Network latency of up to 100ms on an otherwise idle app
+// is not perceptible; a 60Hz spin on an idle app is a battery complaint. An app
+// that wants tighter bounds registers a timer, which takes priority over this.
+const WAITER_MAX_BLOCK_MS: int = 100;
+
+// A watched descriptor: its callback, and the events it is currently
+// registered for.
+//
+// `events` mirrors what the PollSet was last told, so `arm`/`disarm` can skip
+// a redundant syscall and — more importantly — so the loop can tell an armed
+// POLL_WRITE from an unarmed one without asking the kernel.
+class Watch {
+    fd: int;
+    events: int;
+    cb: fn(int, int): bool;
+    fn init(fd: int, events: int, cb: fn(int, int): bool) {
+        this.fd = fd;
+        this.events = events;
+        this.cb = cb;
+    }
+}
+
+// A scheduled callback. `at` is an absolute monotonic ms deadline; `every` is
+// 0 for a one-shot and the interval for a repeater.
+class Timer {
+    id: int;
+    at: int;
+    every: int;
+    cb: fn();
+    cancelled: bool;
+    fn init(id: int, at: int, every: int, cb: fn()) {
+        this.id = id;
+        this.at = at;
+        this.every = every;
+        this.cb = cb;
+        this.cancelled = false;
+    }
+}
+
+export class Reactor {
+    ps: PollSet;
+    // fd -> Watch, indexed by fd. An fd is a small dense integer on every
+    // platform this runs on, so a table indexed by it beats a Map: the ready
+    // list hands back raw fds and this turns one into its watch with a single
+    // load. Holes are null. Grows to fit the highest fd ever watched.
+    slots: Watch[];
+    hi_fd: int;      // highest fd ever watched; bounds any full scan
+    nwatch: int;     // live watches, so run() can tell "idle" from "empty"
+
+    timers: Heap<Timer>;
+    // Cancellation is a flag on the Timer plus a skip at pop time, not a
+    // removal: a binary heap has no O(log n) delete-by-identity, and a
+    // cancelled timer that is never popped costs one dead object rather than a
+    // linear scan on every cancel.
+    next_timer_id: int;
+    ntimers: int;    // live (uncancelled) timers
+
+    running: bool;
+
+    // Self-pipe wakeup. -1 until wakeable() is called: a reactor that is never
+    // woken from outside should not pay two fds for the privilege.
+    wake_r: int;
+    wake_w: int;
+    // Signals routed into the pipe, and their handlers. Parallel arrays rather
+    // than a Map because this is a handful of entries scanned once per wakeup.
+    sig_nums: int[];
+    sig_cbs: fn(int)[];
+    // Runs on every wakeup-by-pipe that was not a signal — i.e. someone called
+    // wake(). Null when nobody installed one.
+    on_wake: fn();
+    // An external blocking wait that replaces PollSet.wait — see set_waiter.
+    // Null (the normal case) means this reactor owns its own blocking call.
+    waiter: fn(int);
+
+    fn init() {
+        this.ps = new PollSet();
+        this.slots = [];
+        this.hi_fd = -1;
+        this.nwatch = 0;
+        this.timers = new Heap<Timer>(16, null, (a, b) => a.at - b.at);
+        this.next_timer_id = 1;
+        this.ntimers = 0;
+        this.running = false;
+        this.wake_r = -1;
+        this.wake_w = -1;
+        this.sig_nums = [];
+        this.sig_cbs = [];
+        this.on_wake = null;
+        this.waiter = null;
+    }
+
+    // ---- descriptors ------------------------------------------------------
+
+    // Watch `fd` for `events` (POLL_READ, POLL_WRITE, or both). The callback
+    // receives the fd and the events that actually fired, and returns whether
+    // to keep watching: **false retires the fd**.
+    //
+    // Retiring is the loop's job rather than the callback's because a callback
+    // that unwatched itself would leave a stale fd in the ready list still
+    // being iterated. Returning false is checked once, after the callback is
+    // done, which is the only point at which removal is safe.
+    //
+    // The reactor does not own the fd: it never closes it. Whoever opened it
+    // closes it, and does so AFTER the watch is gone.
+    fn watch(fd: int, events: int, cb: fn(int, int): bool): bool {
+        if (fd < 0) { return false; }
+        if (!this.ps.addFd(fd, events)) { return false; }
+        this.ensure_slot(fd);
+        if (this.slots[fd] == null) { this.nwatch += 1; }
+        this.slots[fd] = new Watch(fd, events, cb);
+        if (fd > this.hi_fd) { this.hi_fd = fd; }
+        return true;
+    }
+
+    // Stop watching `fd`. Safe to call from inside that fd's own callback (the
+    // loop's post-dispatch retirement re-checks the slot), and safe on an fd
+    // that is not watched.
+    fn unwatch(fd: int) {
+        if (fd < 0 || fd > this.hi_fd) { return; }
+        if (this.slots[fd] == null) { return; }
+        this.ps.removeFd(fd);
+        this.slots[fd] = null;
+        this.nwatch -= 1;
+    }
+
+    fn is_watched(fd: int): bool {
+        if (fd < 0 || fd > this.hi_fd) { return false; }
+        return this.slots[fd] != null;
+    }
+
+    // Add POLL_WRITE to an fd already watched for reads, and drop it again.
+    //
+    // ── THE RULE THIS EXISTS FOR ────────────────────────────────────────────
+    // A socket is almost always writable, so an armed POLL_WRITE fires on every
+    // single wakeup whether or not there is anything to send. Arm it when a
+    // write goes short, disarm it the moment the buffer drains. server.vt
+    // learned this the expensive way; the pair is here so nobody has to learn
+    // it again.
+    fn arm_write(fd: int): bool { return this.set_events(fd, POLL_READ | POLL_WRITE); }
+    fn disarm_write(fd: int): bool { return this.set_events(fd, POLL_READ); }
+
+    fn set_events(fd: int, events: int): bool {
+        if (fd < 0 || fd > this.hi_fd) { return false; }
+        let w = this.slots[fd];
+        if (w == null) { return false; }
+        if (w.events == events) { return true; }   // no syscall for a no-op
+        if (!this.ps.modifyFd(fd, events)) { return false; }
+        w.events = events;
+        return true;
+    }
+
+    // Grow the slot table so `fd` indexes into it. Doubling, so a run of
+    // increasing fds costs amortized O(1) each rather than a copy per fd.
+    fn ensure_slot(fd: int) {
+        if (fd < this.slots.len) { return; }
+        let want = this.slots.len;
+        if (want < 16) { want = 16; }
+        while (want <= fd) { want = want * 2; }
+        while (this.slots.len < want) { this.slots.push(null); }
+    }
+
+    // ---- wakeup and signals -----------------------------------------------
+
+    // Arm the self-pipe, so this reactor can be woken from outside its own
+    // wait() — by wake() from another thread, or by a signal.
+    //
+    // Idempotent. Costs two fds, so it is opt-in: a reactor driven only by its
+    // own sockets and timers never needs it.
+    //
+    // The read end is watched like any other fd, which is the entire trick —
+    // "something happened elsewhere" becomes an ordinary readable descriptor,
+    // and the loop needs no special case beyond draining it.
+    fn wakeable(): bool {
+        if (this.wake_r >= 0) { return true; }
+        // Two i32 out-params. Vyto has no & operator, so a 1-element array is
+        // the out-param idiom (`xs as rawptr` is documented in CLAUDE.md).
+        let rbuf: i32[] = [0 as i32];
+        let wbuf: i32[] = [0 as i32];
+        if (vwake_open(rbuf as rawptr, wbuf as rawptr) as int != 0) { return false; }
+        this.wake_r = rbuf[0] as int;
+        this.wake_w = wbuf[0] as int;
+        let self = this;
+        if (!this.watch(this.wake_r, POLL_READ, (fd, ev) => {
+            // Drain first: every queued byte, or the fd stays readable and the
+            // loop spins. The count is not the number of events — N wakeups
+            // coalesce into as few as one byte — so it is deliberately unused
+            // beyond "something arrived".
+            vwake_drain(fd as i32);
+            self.dispatch_signals();
+            return true;
+        })) {
+            vwake_close(this.wake_r as i32, this.wake_w as i32);
+            this.wake_r = -1;
+            this.wake_w = -1;
+            return false;
+        }
+        return true;
+    }
+
+    // Break this reactor out of wait(), from anywhere: another thread, or the
+    // loop itself. Safe to call at any time; a wakeup already pending is not
+    // duplicated.
+    //
+    // NOT safe from a signal handler — a Vyto closure allocates and refcounts
+    // are non-atomic. Route signals with on_signal() instead, which writes the
+    // byte from C and runs the callback on the loop's own stack.
+    fn wake(): bool {
+        if (this.wake_w < 0) { return false; }
+        return vwake_signal(this.wake_w as i32) as int == 0;
+    }
+
+    // Install a callback for a plain wake() — one that was not a signal.
+    fn onWake(cb: fn()) { this.on_wake = cb; }
+
+    // Deliver `signo` to `cb`, on the loop's own stack.
+    //
+    // ── WHAT THE C SIDE ACTUALLY DOES ───────────────────────────────────────
+    // The installed handler increments a counter and writes one byte. That is
+    // all it may legally do: a handler runs between two arbitrary instructions,
+    // where malloc may hold a lock the interrupted code was inside, so a Vyto
+    // callback there would deadlock or corrupt the arena. The byte makes the
+    // pipe readable, the loop wakes, and `cb` runs HERE — where allocation is
+    // legal again.
+    //
+    // Requires wakeable(); calling it first is the caller's job so the two-fd
+    // cost stays explicit. Windows returns false: it has no sigaction, and
+    // SetConsoleCtrlHandler delivers on another thread, which would need its
+    // own design rather than a silent half-answer.
+    fn onSignal(signo: int, cb: fn(int)): bool {
+        if (this.wake_r < 0) { return false; }
+        if (vwake_on_signal(signo as i32) as int != 0) { return false; }
+        this.sig_nums.push(signo);
+        this.sig_cbs.push(cb);
+        return true;
+    }
+
+    // Read each routed signal's count and fire its callback that many times.
+    //
+    // A count rather than a flag, because two SIGCHLDs are two children to
+    // reap. Called only from the wake fd's own callback, so a Vyto closure
+    // never runs in handler context.
+    fn dispatch_signals() {
+        let any = false;
+        for (let i in 0..this.sig_nums.len) {
+            let n = vwake_signal_count(this.sig_nums[i] as i32) as int;
+            if (n <= 0) { continue; }
+            any = true;
+            let cb = this.sig_cbs[i];
+            let signo = this.sig_nums[i];
+            for (let k in 0..n) { cb(signo); }
+        }
+        // A wakeup with no signal behind it was a wake() call.
+        if (!any && this.on_wake != null) { this.on_wake(); }
+    }
+
+    // ---- external wait source (the UI seam) --------------------------------
+
+    // Hand the loop's blocking wait to somebody else.
+    //
+    // ── THE PROBLEM THIS SOLVES ─────────────────────────────────────────────
+    //
+    // A GUI app has two event sources that each want to own the blocking call:
+    // the window (Surface.wait_timeout) and the reactor (PollSet.wait). Only
+    // one can block. Run them in sequence and each starves the other; poll
+    // both on a timer and the app never idles.
+    //
+    // The fd case is easy and is NOT this: where the surface exposes a
+    // descriptor (X11 does, Surface.eventFd), watch() it like any other fd and
+    // there is nothing to arrange. This exists for the two backends that have
+    // no descriptor to give — Win32 waits on a thread message queue, Android
+    // on a pthread condvar — where the only way to have one blocking call is
+    // to let THEIRS be it.
+    //
+    // `waiter(ms)` must block up to `ms` and return promptly. The reactor
+    // computes `ms` from its own next timer deadline, so timers stay accurate;
+    // after the waiter returns, the fd set is polled at zero timeout, so
+    // sockets are still serviced every pass.
+    //
+    //     rx.set_waiter((ms) => { win.surf.wait_timeout(ms); });
+    //
+    // Cost: one non-blocking PollSet.wait per iteration of the foreign loop —
+    // a syscall, not a sleep. That is the price of two event sources and one
+    // thread, and it is why the fd path is preferred wherever it exists.
+    fn set_waiter(waiter: fn(int)) { this.waiter = waiter; }
+
+    // ---- timers -----------------------------------------------------------
+
+    // Run `cb` once, `ms` from now. Returns an id for cancel().
+    fn after(ms: int, cb: fn()): int { return this.add_timer(ms, 0, cb); }
+
+    // Run `cb` every `ms`. The next firing is scheduled from the deadline that
+    // just passed, not from now, so a slow callback does not make the interval
+    // drift outward forever.
+    //
+    // A callback that consistently outruns its own interval would schedule
+    // deadlines already in the past and starve the fds, so the next deadline is
+    // floored at now: the timer degrades to "as often as possible" instead of
+    // monopolising the loop.
+    fn every(ms: int, cb: fn()): int {
+        let iv = ms;
+        if (iv < 1) { iv = 1; }
+        return this.add_timer(iv, iv, cb);
+    }
+
+    fn add_timer(ms: int, iv: int, cb: fn()): int {
+        let d = ms;
+        if (d < 0) { d = 0; }
+        let id = this.next_timer_id;
+        this.next_timer_id += 1;
+        this.timers.push(new Timer(id, now_ms() + d, iv, cb));
+        this.ntimers += 1;
+        return id;
+    }
+
+    // Cancel a timer by id. A cancelled timer is flagged and skipped when it
+    // reaches the top of the heap rather than being removed — see the field
+    // comment. Cancelling an already-fired one-shot is a no-op.
+    fn cancel(id: int) {
+        let n = this.timers.len();
+        for (let i in 0..n) {
+            let t = this.timers.at(i);
+            if (t.id == id && !t.cancelled) {
+                t.cancelled = true;
+                this.ntimers -= 1;
+                return;
+            }
+        }
+    }
+
+    // ms until the next timer is due: -1 when there is none (block forever),
+    // 0 when one is already overdue. This is what bounds wait(), and it is the
+    // whole reason an idle reactor costs nothing.
+    fn next_timeout(): int {
+        while (!this.timers.is_empty()) {
+            let t = this.timers.peek();
+            if (t.cancelled) { this.timers.pop(); continue; }
+            let d = t.at - now_ms();
+            if (d < 0) { d = 0; }
+            return d;
+        }
+        return -1;
+    }
+
+    // Fire every timer whose deadline has passed. Repeaters are re-pushed.
+    //
+    // The heap is drained by deadline, so a callback that adds a timer due
+    // immediately would be picked up by the next iteration of this same loop.
+    // `budget` bounds that: without it, a repeater with interval 0 would spin
+    // here forever and never return to the fds.
+    fn fire_timers() {
+        let budget = this.timers.len() + 8;
+        let t0 = now_ms();
+        while (budget > 0 && !this.timers.is_empty()) {
+            budget -= 1;
+            let t = this.timers.peek();
+            if (t.cancelled) { this.timers.pop(); continue; }
+            if (t.at > t0) { break; }
+            this.timers.pop();
+            if (t.every > 0) {
+                // From the deadline, not from now — see every().
+                let nxt = t.at + t.every;
+                let floor = now_ms();
+                if (nxt < floor) { nxt = floor; }
+                t.at = nxt;
+                this.timers.push(t);
+            } else {
+                this.ntimers -= 1;
+            }
+            t.cb();
+        }
+    }
+
+    // ---- the loop ---------------------------------------------------------
+
+    // One iteration: wait (bounded by the next timer), fire due timers,
+    // dispatch ready fds. Returns false when the loop should end — stop() was
+    // called, the poll set errored, or there is nothing left to wait for.
+    //
+    // Exposed so a caller with its own outer loop — a UI frame loop, a test —
+    // can drive the reactor without surrendering control to run().
+    fn tick(): bool {
+        if (!this.running) { return false; }
+        // Nothing watched and nothing scheduled: waiting would block forever
+        // on an event that cannot arrive. Ending is the only honest answer.
+        //
+        // work_count(), not nwatch: the wake pipe is a watched fd, so counting
+        // it here would keep a loop with no remaining work alive forever
+        // waiting on a byte nobody is going to send.
+        // A waiter is itself a reason to keep going: the foreign loop it wraps
+        // (a window) is an event source this reactor cannot see or count.
+        if (this.work_count() == 0 && this.ntimers == 0 && this.waiter == null) {
+            return false;
+        }
+
+        let n = 0;
+        if (this.waiter != null) {
+            // Somebody else owns the blocking call. Give them our deadline, so
+            // timers stay accurate, then sweep the fds without blocking —
+            // otherwise a socket would wait for the next window event.
+            let ms = this.next_timeout();
+            // -1 means "no timer": the foreign waiter still must not block
+            // forever, or a socket that becomes readable would sit unserved
+            // until the user moved the mouse. A bounded wait is the honest
+            // ceiling on that latency.
+            if (ms < 0) { ms = WAITER_MAX_BLOCK_MS; }
+            this.waiter(ms);
+            n = this.ps.wait(0);
+        } else {
+            n = this.ps.wait(this.next_timeout());
+        }
+        if (n < 0) { return false; }
+
+        // Timers first: a timer that is due and an fd that is ready in the same
+        // wakeup should see the timer's effect, since its deadline came first.
+        this.fire_timers();
+        if (!this.running) { return false; }
+
+        for (let i in 0..n) {
+            let fd = this.ps.readyFd(i);
+            if (fd < 0 || fd > this.hi_fd) { continue; }
+            let w = this.slots[fd];
+            // Null here is normal, not a bug: an earlier callback in THIS same
+            // ready list may have unwatched this fd. Dispatching it would hand
+            // a callback an fd its owner has already retired and possibly
+            // closed.
+            if (w == null) { continue; }
+            let ev = this.ps.readyEvents(i);
+            let keep = w.cb(fd, ev);
+            // Re-read the slot: the callback may have unwatched this fd (in
+            // which case there is nothing to retire) or even re-watched it with
+            // a different callback (in which case retiring would kill the new
+            // one).
+            if (!keep && this.slots[fd] == w) { this.unwatch(fd); }
+        }
+        return this.running;
+    }
+
+    // Run until stop(), until nothing is left to wait for, or until the poll
+    // set errors.
+    fn run() {
+        this.running = true;
+        while (this.tick()) { }
+        this.running = false;
+    }
+
+    // Ask the loop to end. Safe from inside a callback: the current tick
+    // finishes dispatching what it already has, then run() returns.
+    //
+    // From ANOTHER thread this sets the flag but does not break a blocked
+    // wait(), so the loop keeps sleeping until something else wakes it. Pair it
+    // with wake() (after wakeable()) when stopping from outside:
+    //
+    //     rx.stop(); rx.wake();
+    //
+    // From a signal handler, neither is safe to call directly — route the
+    // signal with onSignal() and call stop() from that callback, which runs on
+    // the loop's own stack.
+    fn stop() { this.running = false; }
+
+    // Close the self-pipe. Not a deinit: a Reactor is normally dropped when the
+    // program is ending, and an explicit close is what a long-lived process
+    // that builds and discards reactors needs.
+    fn close() {
+        if (this.wake_r < 0) { return; }
+        this.unwatch(this.wake_r);
+        vwake_close(this.wake_r as i32, this.wake_w as i32);
+        this.wake_r = -1;
+        this.wake_w = -1;
+    }
+
+    fn watch_count(): int { return this.nwatch; }
+    fn timer_count(): int { return this.ntimers; }
+    fn is_wakeable(): bool { return this.wake_r >= 0; }
+
+    // Watched fds that represent real pending work, which is what tick() ends
+    // the loop on. The wake pipe is a watched fd like any other, so nwatch
+    // alone answers this wrong in BOTH directions:
+    //
+    //   - A loop whose sockets are all retired but which is still wakeable
+    //     would never exit, blocking forever on a byte nobody will send.
+    //   - A daemon whose ONLY event source is a signal — no sockets, no
+    //     timers, which is exactly the shape vyto/signal is for — would exit
+    //     instantly instead of waiting for SIGTERM.
+    //
+    // So the pipe counts as work precisely when something is routed through it:
+    // a registered signal, or an onWake handler. Bare wakeable() with neither
+    // is a reactor nobody has asked to be woken, and it should not keep the
+    // loop alive on its own.
+    fn work_count(): int {
+        let n = this.nwatch;
+        if (this.wake_r >= 0) {
+            n -= 1;
+            if (this.sig_nums.len > 0 || this.on_wake != null) { n += 1; }
+        }
+        return n;
+    }
+
+    deinit { this.close(); }
+}
+
+export fn reactor(): Reactor { return new Reactor(); }

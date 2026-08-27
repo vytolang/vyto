@@ -1,0 +1,229 @@
+// Proof that vyto/os/reactor expresses vyto/net/server's loop.
+//
+// server.vt is NOT built on the reactor (see reactor.vt's header). This is the
+// gate that says it COULD be: every structural element of that loop is
+// reproduced here against the extracted API, so the abstraction is known to fit
+// a real 41-56k-connection server before one is refactored onto it.
+//
+// The five things checked, each mapped to what it is in server.vt:
+//
+//   1. accept-drain      — one wakeup covers many pending connections
+//   2. per-fd dispatch   — a dense fd table, not a Map (server.vt `slots[]`)
+//   3. retire-on-dead    — the LOOP unwatches, never the callback
+//   4. POLL_WRITE arm/disarm — armed only while there is output pending
+//   5. idle sweep        — a timer drops connections past their deadline
+//
+// (4) is the one that matters most and the one examples/107_reactor.vt does not
+// reach: a socket is almost always writable, so an armed POLL_WRITE fires on
+// EVERY wakeup and spins the loop at 100% CPU. server.vt:2002-2011 carries the
+// comment; this asserts the extracted API can honour it.
+
+import { Reactor } from "vyto/os/reactor";
+import { socket_listen, socket_connect, Socket,
+         POLL_READ, POLL_WRITE } from "vyto/net/socket";
+import { monoMs } from "vyto/util/time";
+
+fn now_ms(): int { return monoMs() as int; }
+
+// One connection's state — the reactor holds fds, the app holds meaning.
+class Conn {
+    sock: Socket;
+    deadline: int;
+    want_write: bool;
+    pending: string;      // unsent output; non-empty means POLL_WRITE is wanted
+    fn init(s: Socket, deadline: int) {
+        this.sock = s;
+        this.deadline = deadline;
+        this.want_write = false;
+        this.pending = "";
+    }
+}
+
+// server.vt's `slots[]`: an fd-indexed table. An fd is a small dense integer,
+// so this beats a Map — the ready list hands back a raw fd and this turns it
+// into its Conn with one load.
+class Table {
+    slots: Conn[];
+    live: int;
+    hi_fd: int;
+    fn init() { this.slots = []; this.live = 0; this.hi_fd = -1; }
+    fn put(fd: int, c: Conn) {
+        while (this.slots.len <= fd) { this.slots.push(null); }
+        if (this.slots[fd] == null) { this.live += 1; }
+        this.slots[fd] = c;
+        if (fd > this.hi_fd) { this.hi_fd = fd; }
+    }
+    fn get(fd: int): Conn {
+        if (fd < 0 || fd >= this.slots.len) { return null; }
+        return this.slots[fd];
+    }
+    fn drop(fd: int) {
+        if (fd < 0 || fd >= this.slots.len) { return; }
+        if (this.slots[fd] != null) { this.live -= 1; }
+        this.slots[fd] = null;
+    }
+}
+
+// Counters, in 1-element arrays because closures capture by value.
+class Stats {
+    accepted: int[];
+    served: int[];
+    write_armed: int[];     // times POLL_WRITE was armed
+    write_disarmed: int[];  // times it was dropped again
+    spurious_write: int[];  // POLL_WRITE fired with nothing to send — the bug
+    swept: int[];
+    fn init() {
+        this.accepted = [0]; this.served = [0];
+        this.write_armed = [0]; this.write_disarmed = [0];
+        this.spurious_write = [0]; this.swept = [0];
+    }
+}
+
+// (3) Retirement: this returns false when the connection is done, and the LOOP
+// unwatches it. A callback that unwatched itself would leave a stale fd in the
+// ready list still being iterated — the exact bug the contract prevents.
+fn arm_conn(rx: Reactor, t: Table, st: Stats, fd: int) {
+    rx.watch(fd, POLL_READ, (rfd, ev) => {
+        let c = t.get(rfd);
+        if (c == null) { return false; }
+
+        // (4) The writable half. server.vt's rule: POLL_WRITE is armed only
+        // while there is something to write. If it fires with an empty buffer
+        // the loop is spinning, so that is counted as a defect rather than
+        // tolerated.
+        if ((ev & POLL_WRITE) != 0) {
+            if (c.pending.len == 0) {
+                st.spurious_write[0] += 1;
+            } else {
+                c.sock.trySendText(c.pending);
+                c.pending = "";
+            }
+            if (c.pending.len == 0 && c.want_write) {
+                c.want_write = false;
+                rx.disarm_write(rfd);
+                st.write_disarmed[0] += 1;
+            }
+            if (c.pending.len == 0) {
+                st.served[0] += 1;
+                t.drop(rfd);
+                c.sock.close();
+                return false;                 // retire
+            }
+            return true;
+        }
+
+        let rr = c.sock.tryRecv(256);
+        if (rr.wouldBlock()) { return true; }  // spurious wakeup, not a close
+        if (rr.status <= 0) {                  // EOF: peer went away
+            t.drop(rfd);
+            c.sock.close();
+            return false;
+        }
+        // Queue a reply and arm the writable side rather than sending inline.
+        // Sending here would work on a loopback socket and hide the arm/disarm
+        // path entirely, which is the thing under test.
+        c.pending = "echo";
+        if (!c.want_write) {
+            c.want_write = true;
+            rx.arm_write(rfd);
+            st.write_armed[0] += 1;
+        }
+        return true;
+    });
+}
+
+fn main() {
+    let rx = new Reactor();
+    let t = new Table();
+    let st = new Stats();
+
+    let srv = socket_listen(0);
+    if (srv == null) { print("bind failed"); return; }
+    srv.setNonBlocking(true);
+    let port = srv.localPort();
+
+    // (1) Accept-drain: accept until it fails. One readable event on a listener
+    // can cover many queued connections; stopping after one leaves the rest
+    // until the next wakeup.
+    rx.watch(srv.fd as int, POLL_READ, (fd, ev) => {
+        while (true) {
+            let c = srv.tryAccept();
+            if (c == null) { break; }
+            c.setNonBlocking(true);
+            let cfd = c.fd as int;
+            t.put(cfd, new Conn(c, now_ms() + 2000));
+            st.accepted[0] += 1;
+            arm_conn(rx, t, st, cfd);
+        }
+        return true;
+    });
+
+    // (5) The idle sweep — server.vt's Slowloris defence, as a timer rather
+    // than an inline `now - last_sweep` check. Bounded by hi_fd, because
+    // scanning the whole table to find a handful of live entries was measured
+    // as 99.7% waste there.
+    rx.every(50, () => {
+        let now = now_ms();
+        for (let f in 0..t.hi_fd + 1) {
+            let c = t.get(f);
+            if (c == null) { continue; }
+            if (now > c.deadline) {
+                rx.unwatch(f);
+                c.sock.close();
+                t.drop(f);
+                st.swept[0] += 1;
+            }
+        }
+    });
+
+    // Three clients that speak, plus one that connects and says nothing —
+    // the Slowloris shape the sweep exists for.
+    let cs: Socket[] = [];
+    for (let i in 0..3) {
+        let c = socket_connect("127.0.0.1", port);
+        if (c == null) { print("connect failed"); return; }
+        c.sendText("req");
+        cs.push(c);
+    }
+    let mute = socket_connect("127.0.0.1", port);
+    if (mute == null) { print("connect failed"); return; }
+    cs.push(mute);
+
+    // Stop once the three talkers are served AND the mute one has been swept.
+    // Waiting on the sweep is what makes (5) an assertion rather than a hope.
+    rx.every(5, () => {
+        if (st.served[0] >= 3 && st.swept[0] >= 1) { rx.stop(); }
+    });
+    // Hang guard. The mute connection's deadline is 2000ms, so this must be
+    // comfortably clear of it or the sweep would never get to run.
+    rx.after(6000, () => { rx.stop(); });
+
+    // Shorten the mute connection's deadline so the sweep fires quickly. Its
+    // fd is the highest accepted, and the sweep runs every 50ms.
+    rx.after(100, () => {
+        for (let f in 0..t.hi_fd + 1) {
+            let c = t.get(f);
+            if (c != null && c.pending.len == 0 && !c.want_write) {
+                c.deadline = now_ms() - 1;
+            }
+        }
+    });
+
+    rx.run();
+
+    print("accepted=" + str(st.accepted[0]));
+    print("served=" + str(st.served[0]));
+    print("swept=" + str(st.swept[0]));
+    // The arm/disarm discipline: armed once per reply, dropped once per reply.
+    print("write_armed=" + str(st.write_armed[0]));
+    print("write_disarmed=" + str(st.write_disarmed[0]));
+    // THE assertion. Non-zero means POLL_WRITE stayed armed with an empty
+    // buffer and the loop was spinning on a writable socket.
+    print("spurious_write=" + str(st.spurious_write[0]));
+    // Every connection retired; only the listener is still watched.
+    print("still_watched=" + str(rx.watch_count()));
+    print("live_conns=" + str(t.live));
+
+    for (let c in cs) { c.close(); }
+    srv.close();
+}

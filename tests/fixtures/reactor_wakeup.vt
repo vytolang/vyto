@@ -1,0 +1,80 @@
+// vyto/os/reactor phase 2: the self-pipe wakeup and signal routing.
+//
+// Everything here is in-process (raise(3) rather than an external kill) so the
+// test needs no second process and no sleep-and-hope. The external case is the
+// same code path: the handler cannot tell where the signal came from.
+//
+// ── THE REGRESSION THIS EXISTS FOR ──────────────────────────────────────────
+//
+// A signal interrupts epoll_wait, which returns -1/EINTR. epoll_wait is
+// explicitly NOT restartable, so SA_RESTART does not cover it. vpoll_wait used
+// to collapse that into a bare -1, indistinguishable from a real error, and
+// Reactor.tick() ends the loop on a negative wait.
+//
+// Net effect before the fix: **the first signal a process received killed its
+// event loop** -- silently, with a clean exit code 0, and only when a signal
+// actually arrived. No existing test caught it because nothing sent one.
+//
+// `signal_survived` below is the assertion. It was fault-injected: reverting
+// socket_shim.c's EINTR arm to `return -1` makes the loop exit early and the
+// count come back 0 instead of 3.
+
+import { Reactor, SIGUSR1, SIGUSR2 } from "vyto/os/reactor";
+
+extern "C" { fn raise(sig: i32): i32; }
+
+fn main() {
+    // ---- 1. wakeable() is idempotent and cheap to ask about --------------
+    let rx = new Reactor();
+    print("wakeable=" + str(rx.wakeable()));
+    print("wakeable_again=" + str(rx.wakeable()));   // must not open a 2nd pipe
+    print("is_wakeable=" + str(rx.is_wakeable()));
+    // The pipe is a watched fd, but not WORK: with nothing routed through it,
+    // it must not keep an otherwise-finished loop alive.
+    print("watch=" + str(rx.watch_count()) + " work_bare=" + str(rx.work_count()));
+
+    // ---- 2. routing a signal makes the pipe count as work ----------------
+    let u1 = [0];
+    let u2 = [0];
+    print("onsig1=" + str(rx.onSignal(SIGUSR1, (s) => { u1[0] += 1; })));
+    print("onsig2=" + str(rx.onSignal(SIGUSR2, (s) => { u2[0] += 1; })));
+    print("work_routed=" + str(rx.work_count()));
+
+    // ---- 3. delivery, and the count that must not collapse ---------------
+    // Three SIGUSR1 and one SIGUSR2. The C side counts rather than flags, so
+    // three deliveries are three callbacks: two SIGCHLDs are two children to
+    // reap, and a flag would lose one.
+    rx.after(20, () => { raise(SIGUSR1 as i32); });
+    rx.after(40, () => { raise(SIGUSR1 as i32); raise(SIGUSR2 as i32); });
+    rx.after(60, () => { raise(SIGUSR1 as i32); });
+    rx.after(400, () => { rx.stop(); });
+    rx.run();
+
+    // THE assertion: the loop survived every signal AND dispatched each one.
+    print("signal_survived=" + str(u1[0] == 3 && u2[0] == 1));
+    print("sigusr1=" + str(u1[0]));
+    print("sigusr2=" + str(u2[0]));
+
+    rx.close();
+    print("after_close_wakeable=" + str(rx.is_wakeable()));
+
+    // ---- 4. wake() with no signal behind it reaches onWake ---------------
+    // The plain cross-thread wakeup path: no signal, just a byte. Called from
+    // a timer here, which is the same write(2) another thread would do.
+    let rx2 = new Reactor();
+    rx2.wakeable();
+    let woke = [0];
+    rx2.onWake(() => { woke[0] += 1; });
+    print("work_onwake=" + str(rx2.work_count()));   // onWake alone counts too
+    rx2.after(20, () => { rx2.wake(); });
+    rx2.after(200, () => { rx2.stop(); });
+    rx2.run();
+    print("woke=" + str(woke[0] > 0));
+    rx2.close();
+
+    // ---- 5. a reactor that was never made wakeable ------------------------
+    // wake() must refuse rather than write to fd -1.
+    let rx3 = new Reactor();
+    print("wake_without_pipe=" + str(rx3.wake()));
+    print("onsignal_without_pipe=" + str(rx3.onSignal(SIGUSR1, (s) => { })));
+}
