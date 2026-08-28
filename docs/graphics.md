@@ -36,7 +36,7 @@ whichever tier it wants at runtime.
 
 ## 2. `vyto/geom` — the math, no drawing
 
-```vyto
+```js
 import { Vec2, Vec3, Vec4, Mat4, mat4Identity, mat4Perspective } from "vyto/geom";
 import { Path } from "vyto/geom/path";
 ```
@@ -87,7 +87,7 @@ is drawing in 3D."
 
 ### `Path` — backend-neutral vector path
 
-```vyto
+```js
 import { Path } from "vyto/geom/path";
 ```
 
@@ -103,7 +103,7 @@ renderer-neutral — both the lean and rich tiers accept the same `Path`.
 
 ## 3. `vyto/surface` — window, pixel canvas, events (lean 2D)
 
-```vyto
+```js
 import { Surface, rgb, Rect } from "vyto/surface";
 ```
 
@@ -153,7 +153,7 @@ KEY_F12`, modifier masks `MOD_SHIFT/CTRL/ALT/SUPER`.
 `Surface` has no circle primitive — `fill`/`frame` are rect-only on this
 tier (§4's `Canvas` has `fillCircle`).
 
-```vyto
+```js
 import { Surface, Rect, rgb } from "vyto/surface";
 
 fn main() {
@@ -170,7 +170,7 @@ on `Surface.fill` + events + a timer, no `vyto/ui` and no `vyto/gfx`.
 
 ## 4. `vyto/gfx` — rich 2D drawing (blend2d)
 
-```vyto
+```js
 import { Canvas } from "vyto/gfx";
 ```
 
@@ -213,7 +213,7 @@ Colors are packed `0xAARRGGBB`; a bare `0xRRGGBB` is fully transparent — use
 No window needed — a `Canvas` is an off-screen raster surface on its own;
 `writePPM` is enough to see the result without wiring up a `Surface`.
 
-```vyto
+```js
 import { Canvas } from "vyto/gfx";
 
 fn main() {
@@ -252,7 +252,7 @@ pixels, not stacked translucent rects; notes blur isn't yet exposed through
 
 ## 5. `vyto/ui` `Painter` — the seam
 
-```vyto
+```js
 import { Painter, Window } from "vyto/ui";
 ```
 

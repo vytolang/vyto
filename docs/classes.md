@@ -11,7 +11,7 @@ where the behaviour isn't obvious from reading `.vt` source alone.
 
 ## 1. Declaring one
 
-```vyto
+```js
 class Shape {
     name: string;
     fn init(name: string) { this.name = name; }
@@ -32,7 +32,7 @@ field values (`src/emit.c:1132`).
 
 ## 2. Construction
 
-```vyto
+```js
 let s = new Shape("circle");
 ```
 
@@ -41,7 +41,7 @@ the nearest ancestor that has one) declares it — `init` is optional and,
 unlike fields, is inherited by lookup, not copied
 (`src/check.c:2372-2378`):
 
-```vyto
+```js
 for (ClassDecl *k = cd; k && !ctor; k = k->parent) ctor = k->ctor;
 ```
 
@@ -63,7 +63,7 @@ compiler is free to inline it. Mark it `virtual` to get dynamic dispatch —
 one indirect call through the class's vtable — and `override` in a subclass
 to replace it:
 
-```vyto
+```js
 class Circle extends Shape {
     r: float;
     fn init(r: float) { super.init("circle"); this.r = r; }
@@ -102,7 +102,7 @@ neither one can recurse back into an override:
 **`super.init(...)`** — only inside your own `init`, calls the parent's
 constructor first. Required before touching inherited fields:
 
-```vyto
+```js
 fn init(r: float) { super.init("circle"); this.r = r; }
 ```
 
@@ -110,7 +110,7 @@ fn init(r: float) { super.init("circle"); this.r = r; }
 implementation of that name directly, letting an `override` extend the base
 behavior instead of copying its body (`src/check.c:1298-1321`):
 
-```vyto
+```js
 override fn area(): float {
     return super.area() + extra;   // base implementation, then extend it
 }
@@ -127,7 +127,7 @@ A method declared `builder` always returns `this`, typed as the **receiver's
 concrete type at the call site** — not the declaring class — so a chain
 survives through a subclass:
 
-```vyto
+```js
 class Node {
     tag: string;
     kids: Node[];
@@ -171,7 +171,7 @@ observer stored back onto its subject) leaks silently, with nothing to catch
 it. `weak` is a real keyword that applies **only to class types**
 (`src/check.c:240` — `'weak' applies only to class types`):
 
-```vyto
+```js
 class Widget {
     parent: weak Widget;   // back-reference: does not keep the parent alive
 }
@@ -187,7 +187,7 @@ this same cycle and the full refcounting model.
 
 ## 8. Checked downcasts
 
-```vyto
+```js
 let shapes: Shape[] = [new Circle(1.0)];
 let c = shapes[0] as Circle;
 ```
@@ -205,7 +205,7 @@ There's no iterator interface to implement. A class with `fn len(): int` and
 builds the equivalent index loop for you, calling `at` virtually if you
 declared it that way:
 
-```vyto
+```js
 class Steps {
     n: int;
     fn init(n: int) { this.n = n; }
@@ -237,7 +237,7 @@ the right two method names.
 
 ## 10. Generic classes
 
-```vyto
+```js
 class Box<T> {
     val: T;
     fn get(): T { return this.val; }
@@ -258,7 +258,7 @@ bump-allocates the instance in that lexical region instead of the normal
 refcounted heap; the whole region is freed in one shot when its block ends,
 with no per-object destructor teardown:
 
-```vyto
+```js
 class Node { value: int; next: Node; }
 
 arena {

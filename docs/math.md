@@ -19,7 +19,7 @@ for FFI calls (see [`docs/types.md`](types.md) §2). Every function signature
 in this document is exact about which type it wants; mixing them without a
 cast is a type error, not a silent conversion.
 
-```vyto
+```js
 let n: int = 7;
 let x: float = n as float;      // 7.0 — widening, always exact
 
@@ -34,7 +34,7 @@ For the away-from-toward-zero distinction, `vyto/math`'s `floor`/`ceil`/
 `round`/`trunc` (§1) operate on `float` and return `float` — round or floor
 *before* casting to `int` if truncation-toward-zero isn't what you want:
 
-```vyto
+```js
 (round(-3.9) as int)   // -4
 (-3.9 as int)          // -3 — different answer, same input
 ```
@@ -44,7 +44,7 @@ For the away-from-toward-zero distinction, `vyto/math`'s `floor`/`ceil`/
 (9007199254740992) loses precision on the cast to `float` — and casting back
 to `int` does not recover the original value:
 
-```vyto
+```js
 let big: int = 9007199254740993;         // 2^53 + 1
 (big as float) as int                    // 9007199254740992 — the +1 is gone
 ```
@@ -60,7 +60,7 @@ functions (`fabs`/`fmin`/`fmax`) and cast the result.
 
 ## 1. Basic — `vyto/math`
 
-```vyto
+```js
 import { sqrt, pow, sin, PI } from "vyto/math";
 ```
 
@@ -139,7 +139,7 @@ libm is float-only; these fill the gap for `int`.
 
 ### Descriptive statistics — `vyto/math/stats`
 
-```vyto
+```js
 import { mean, stddev, correlation } from "vyto/math/stats";
 ```
 
@@ -178,7 +178,7 @@ input instead of panicking.
 
 ### Random numbers — `vyto/math/random`
 
-```vyto
+```js
 import { rng, shuffle, choice } from "vyto/math/random";
 
 let r = rng(42);
@@ -211,7 +211,7 @@ below instead).
 
 ### Secure random numbers — `vyto/math/securerandom`
 
-```vyto
+```js
 import { secureBytes, secureBelow, secureToken } from "vyto/math/securerandom";
 
 let key = secureBytes(32);
@@ -246,7 +246,7 @@ in; every other file in this package stays pure Vyto.
 
 ## 3. Advanced — `vyto/math/algebra`
 
-```vyto
+```js
 import { matrixIdentity, matrixFromRows, vdot } from "vyto/math/algebra";
 
 let a = matrixFromRows([[2.0, 1.0], [1.0, 3.0]]);

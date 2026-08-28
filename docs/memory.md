@@ -49,7 +49,7 @@ Two shapes cause this in practice:
 **Parent/child back-references.** A widget tree, a DOM-like structure, any
 "child points back to its owner" relationship:
 
-```vyto
+```js
 class Widget {
     children: Widget[];   // owns them — strong, correct
     parent: weak Widget;  // points back — must be weak
@@ -69,7 +69,7 @@ a `string` or an array, only a `class` reference). A `weak` field is not
 counted in the target's refcount, and reads as `null` once the target is
 actually freed rather than dangling:
 
-```vyto
+```js
 sb_printf(dst, "    vt_weak_drop((void**)&self->f_%s);\n", ...)   // deinit
 sb_printf(em->out, "vt_weak_set((void**)&%s, %s);\n", ...)        // assignment
 ```
@@ -91,7 +91,7 @@ Because a `weak` slot reads as `null` once its target is gone, **loading one
 yields a value the checker refuses to let you dereference until you have tested
 it**:
 
-```vyto
+```js
 fn render(s: Painter, th: Theme) {
     this.win.skin.button.paint(...);     // error: 'this.win' is a weak
                                          // reference and may be null here
@@ -106,7 +106,7 @@ when it does.
 
 Every ordinary way of checking narrows the path for the rest of that branch:
 
-```vyto
+```js
 if (this.win != null) { this.win.redraw(); }        // inside the branch
 if (this.win == null) { return; }                    // …and after an exiting guard
 this.win != null && this.win.mods != 0               // right of a short-circuit
@@ -116,7 +116,7 @@ let w = this.win; if (w == null) { return; }         // bound, then checked
 
 Writing to the path drops what was known about it, so this is refused:
 
-```vyto
+```js
 if (this.win == null) { return; }
 this.win = null;
 return this.win.n;                       // error — the check no longer holds
@@ -149,7 +149,7 @@ bump-allocates instead: every `new` inside the block lands in one region,
 and the whole region is freed in a single pointer bump at the block's end,
 with **no** per-object destructor call:
 
-```vyto
+```js
 class Node { value: int; next: Node; }
 
 fn main() {

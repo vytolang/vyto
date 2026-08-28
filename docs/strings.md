@@ -17,7 +17,7 @@ to C cannot represent them, which is why `str()` and `strbytes()` differ (§4).
 **One rule causes most string bugs: everything below counts bytes, not
 characters.**
 
-```vyto
+```js
 "héllo".len              // 6 — six bytes, five characters
 "héllo".char_at(1)       // a broken half of "é", not "é"
 "héllo"[1]               // 195 — the first byte of é's two-byte encoding
@@ -54,7 +54,7 @@ No import needed. `s` is the receiver throughout.
 `==` and `!=` compare strings by value. **There is no `<` on strings** — `a < b`
 is a type error, not a byte comparison. Ordering comes from `byte_comp`:
 
-```vyto
+```js
 byte_comp(a, alo, ahi, b, blo, bhi): int
 ```
 
@@ -66,7 +66,7 @@ panic or an out-of-buffer read.
 
 For whole strings, reach for the wrapper instead of spelling out the bounds:
 
-```vyto
+```js
 import { str_cmp } from "vyto/util/sort";
 
 names.sort((a, b) => str_cmp(a, b));      // the way to sort a string[]
@@ -77,7 +77,7 @@ inside a larger buffer. Slicing it out first would allocate two strings *per
 comparison* — and a sort makes `n log n` of them — whereas `byte_comp` reads the
 bytes where they are:
 
-```vyto
+```js
 // names held as (offset, len) into one big response buffer
 idx.sort((x, y) => byte_comp(raw, off[x], off[x] + len[x],
                              raw, off[y], off[y] + len[y]));
@@ -137,7 +137,7 @@ Those panic because a malformed number in a literal is a bug. When the input is
 versions in `vyto/cli`, which follow the library-wide "panic hard, sentinel
 soft" rule:
 
-```vyto
+```js
 import { parse_int, parse_float, parse_bool } from "vyto/cli";
 
 let out: int[] = [0];                          // note: one element, not []
@@ -163,7 +163,7 @@ rejects surrounding whitespace, and rejects hex rather than silently reading
 with no formatting call. Each `+` allocates, so a loop that concatenates is
 quadratic. For that, use `StringBuilder` from `vyto/util/text`:
 
-```vyto
+```js
 import { stringBuilder } from "vyto/util/text";
 
 let sb = stringBuilder(4096);                 // initial capacity in bytes
@@ -235,7 +235,7 @@ is the reference.
 **Hold a `Regex`** when the pattern is used more than once — compiling is the
 expensive half, matching is cheap:
 
-```vyto
+```js
 import { Regex } from "vyto/regex";
 
 let re = new Regex("(?<user>\\w+)@(?<host>[\\w.]+)", 0);
@@ -250,7 +250,7 @@ m.start();                                     // 5
 through a 64-entry process-local cache keyed on (pattern, flags), so a pattern
 in a loop is still compiled once:
 
-```vyto
+```js
 import { rx_find, rx_test, rx_replace_all, rx_split } from "vyto/regex";
 
 rx_test("^\\d+$", "4711");                     // true
@@ -315,7 +315,7 @@ Two of these are worth calling out because getting them wrong is silent.
 **`rx_quote` when the pattern came from a user.** Without it, `a.*b` typed into
 a search box is a wildcard and `(a+)+$` is a denial of service:
 
-```vyto
+```js
 rx_count(rx_quote(userInput), haystack);      // literal, and safe
 ```
 
@@ -328,7 +328,7 @@ and an offset test would wrongly report no full match.
 `replaceFn`'s callback must be assigned to a typed target before the call and
 cannot capture `this` — both are v0.1 language limits:
 
-```vyto
+```js
 let redact: fn(Match): string = (m) => m.named("user") + "@***";
 mail.replaceFn(log, redact);
 ```
@@ -384,7 +384,7 @@ Every `Regex` gets a backtracking budget: `RX_DEFAULT_MATCH_LIMIT` (1 000 000),
 `RX_DEFAULT_DEPTH_LIMIT` (10 000), `RX_DEFAULT_HEAP_KB` (16 384). The classic
 exponential blowup fails fast instead of hanging:
 
-```vyto
+```js
 let evil = new Regex("(a+)+$", 0);
 evil.find("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa!").errorCode();  // RX_ERR_LIMIT
 ```

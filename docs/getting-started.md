@@ -152,7 +152,7 @@ from the target type), or a **bound method** — `obj.method`, which carries its
 receiver, so the handler can reach that object's state without capturing
 anything:
 
-```vyto
+```js
 class App {
     hits: int;
     fn health(req: ServerRequest, res: ServerResponse) {
@@ -259,7 +259,7 @@ handshake. The consequence is real and worth designing around: **anything
 
 The fix is one line, and it is worth taking on every platform:
 
-```vyto
+```js
 fn main() {
     workerEntry((input) => heavyCompute(input));   // returns instantly in the parent
     ...
@@ -322,7 +322,7 @@ package 'vyto_gfx' ships prebuilt native libraries, but none for windows-x64
 Windows. Vendor the typeface into the app instead and embed it with
 `--with-assets` — `apps/charts` and `apps/motiondemo` both do this:
 
-```vyto
+```js
 import { appDir } from "vyto/os";
 
 fn font_path(): string {

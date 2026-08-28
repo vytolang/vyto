@@ -23,7 +23,7 @@ refcounting actually costs, the cycle gotcha, and arenas, see
 `int` and `float` never auto-coerce into each other or into the fixed-width
 family below — every conversion is an explicit `as` cast:
 
-```vyto
+```js
 let n: int = 7;
 let x: float = n as float;   // widening, always exact
 let i: int = 3.9 as int;     // 3 — truncates toward zero, like C
@@ -38,7 +38,7 @@ overflow panics with a file:line message rather than wrapping. `--release`
 opts into fast two's-complement wrapping instead. Unsigned arithmetic always
 wraps, in both build modes, by definition:
 
-```vyto
+```js
 let u: u32 = 4294967295;
 let w: u32 = u + 1;      // wraps to 0 — defined, unchecked, both modes
 ```
@@ -102,7 +102,7 @@ Both accept `null`.
 A growable, reference-counted array. Declared and indexed like C, one
 dimension at a time (`string[][]` is an array of arrays):
 
-```vyto
+```js
 let nums: int[] = [10, 20, 30];
 nums.push(40);
 print(str(nums[nums.len - 1]));   // 40
@@ -141,7 +141,7 @@ print(str(nums[nums.len - 1]));   // 40
 
 Keys are always `string` (v0.1). Constructed with `new`:
 
-```vyto
+```js
 let m = new Map<string, int>();
 m.set("a", 1);
 print(str(m.get_or("a", 0)));
@@ -175,7 +175,7 @@ Bloom filter, graph) in [`vyto/ds/README.md`](../lib/vyto/ds/README.md).
 A `struct` is copied on assignment, parameter pass, and return — no refcount,
 no allocation for the copy:
 
-```vyto
+```js
 struct Point { x: float; y: float; }
 
 fn scaled(p: Point): Point { return Point(p.x * 2.0, p.y * 2.0); }
@@ -202,7 +202,7 @@ A `class` is heap-allocated and reference-counted (`src/ast.h:25` —
 `TY_CLASS` is one of the reference kinds). Supports single inheritance,
 `virtual`/`override`, an `init` constructor, and a deterministic `deinit`:
 
-```vyto
+```js
 class Shape {
     name: string;
     fn init(name: string) { this.name = name; }
@@ -227,7 +227,7 @@ let c = shapes[0] as Circle;   // checked downcast
 non-virtual call, so it can't recurse back into the override), letting an
 override extend the base behavior instead of copying its body:
 
-```vyto
+```js
 override fn area(): float {
     return super.area() + extra;   // base implementation, then extend it
 }
@@ -242,7 +242,7 @@ which is a real keyword and applies **only** to class types
 (`src/check.c:240`): it reads as `null` once the target is gone instead of
 dangling.
 
-```vyto
+```js
 parent: weak Widget;
 ```
 
@@ -261,7 +261,7 @@ things satisfy it: a closure literal (`(x, y) => x > y`), a named top-level
 function, a generic function (instantiated from the target's types), or a
 bound method (`obj.method` — carries its receiver, so it needs no capture):
 
-```vyto
+```js
 let cmp: fn(int, int): bool = (x, y) => x > y;
 s.get("/health", app.health);   // bound method, no arrow needed
 ```
@@ -278,7 +278,7 @@ reference-cycle trap of storing a bound method back onto its own receiver.
 
 Functions, structs, and classes can take type parameters:
 
-```vyto
+```js
 fn id<T>(x: T): T { return x; }
 
 struct Pair<A, B> {
