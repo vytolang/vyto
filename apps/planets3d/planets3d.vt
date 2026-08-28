@@ -1,0 +1,441 @@
+// planets3d — the solar system, rendered on the CPU with vyto/raster3d.
+//
+// Eight planets on real elliptical orbits, computed from actual orbital
+// elements (semi-major axis, eccentricity, inclination, period) rather than
+// circles, so Mercury's eccentricity and Pluto-like inclinations show. Solved
+// with Kepler's equation each frame.
+//
+// No GPU, no native library, no vyto/gfx. vyto/raster3d draws into an i32[]
+// this program owns and blits to a Surface, so it runs anywhere Vyto runs --
+// X11, Win32, the Linux framebuffer, headless.
+//
+// Controls:
+//   drag / arrows   orbit the camera        [ ]       slower / faster
+//   +  -            zoom                    space     pause
+//   O               orbit rings on/off      L         planet labels on/off
+//   A               2x antialiasing on/off  R         reset the view
+//   ESC             quit
+//
+// Two things are deliberately not to scale, and both have to be:
+//   * Orbital radii are compressed by au^0.45. A true-scale system is mostly
+//     empty space -- Neptune is 78x Mercury's orbit -- so linear scaling either
+//     buries the inner four in one pixel or pushes Neptune off-screen.
+//   * Planet radii are hugely exaggerated. At true scale Earth is about 1/12000
+//     of its orbit, which is well under one pixel at any usable zoom.
+// The orbital MECHANICS are real: elements, Kepler's equation, and the relative
+// periods are all as published, so the inner planets really do lap the outer
+// ones and eccentric orbits really do sweep faster at perihelion.
+
+import { Surface, Rect,
+         EV_TIMER, EV_KEY, EV_CLOSE, EV_EXPOSE, EV_RESIZE,
+         EV_MOUSE_DOWN, EV_MOUSE_UP, EV_MOUSE_MOVE,
+         KEY_UP, KEY_DOWN, KEY_LEFT, KEY_RIGHT, KEY_ESC, KEY_SPACE } from "vyto/surface";
+import { Framebuffer, Renderer, camera, light } from "vyto/raster3d/raster3d";
+import { Mesh, Material, sphere, material_shaded,
+         SHADE_GOURAUD, SHADE_UNLIT } from "vyto/raster3d/mesh";
+import { Vec3, Vec4, Mat4, mat4Perspective, mat4LookAt,
+         mat4Translation, mat4ScalingUniform } from "vyto/geom";
+import { sin, cos, sqrt, pow, PI } from "vyto/math";
+
+const WIN_W: int = 900;
+const WIN_H: int = 640;
+const TICK_MS: int = 16;
+
+const C_SPACE: int = 0x05070C;
+const C_HUD: int = 0xC8D2DC;
+const C_HUD_DIM: int = 0x6E7A86;
+const C_PANEL: int = 0x0B0E14;
+const C_ORBIT: int = 0x1E2A3A;
+
+// ---- the solar system -----------------------------------------------------
+//
+// a       semi-major axis, AU
+// e       eccentricity
+// incl    inclination to the ecliptic, radians
+// period  orbital period, Earth years
+// radius  drawn radius in scene units (exaggerated; see the header)
+// color   0xRRGGBB
+//
+// Held as parallel arrays rather than an array of objects: this is the same
+// struct-of-arrays shape vyto/raster3d uses for meshes, and it keeps the whole
+// system in six small buffers.
+
+class System {
+    name: string[];
+    a: float[];
+    e: float[];
+    incl: float[];
+    period: float[];
+    radius: float[];
+    color: int[];
+
+    fn init() {
+        this.name   = ["Mercury", "Venus", "Earth", "Mars",
+                       "Jupiter", "Saturn", "Uranus", "Neptune"];
+        this.a      = [0.387, 0.723, 1.000, 1.524, 5.203, 9.537, 19.191, 30.069];
+        this.e      = [0.2056, 0.0068, 0.0167, 0.0934, 0.0484, 0.0542, 0.0472, 0.0086];
+        // Real inclinations to the ecliptic, in radians.
+        this.incl   = [0.1222, 0.0592, 0.0000, 0.0323, 0.0227, 0.0435, 0.0135, 0.0309];
+        this.period = [0.241, 0.615, 1.000, 1.881, 11.862, 29.457, 84.011, 164.79];
+        this.radius = [0.20, 0.29, 0.31, 0.23, 0.72, 0.63, 0.47, 0.45];
+        this.color  = [0x9A8478, 0xD9B382, 0x4F8FD1, 0xC1583A,
+                       0xD8A967, 0xE0C88A, 0x8FD1D9, 0x5A7FD9];
+    }
+
+    fn count(): int { return this.name.len; }
+}
+
+// Compress the orbital radii. True scale puts Neptune 78x further out than
+// Mercury, which either buries the inner planets in one pixel or pushes
+// Neptune off-screen. A power law keeps the ordering and the relative gaps
+// legible while fitting everything in view.
+fn scaledRadius(au: float): float {
+    // au^0.45, fitted so Mercury lands at 1.20 scene units and Neptune at 8.50.
+    // A gentler exponent than the obvious sqrt: it keeps the inner four visibly
+    // apart (1.20 / 1.59 / 1.84 / 2.22) while still fitting Neptune in frame.
+    return 1.839 * pow(au, 0.450);
+}
+
+// Solve Kepler's equation M = E - e sin E for the eccentric anomaly E.
+// Newton-Raphson; five iterations is ample for e < 0.25 and converges to
+// double precision well before that.
+fn keplerE(M: float, e: float): float {
+    let E = M;
+    for (let i in 0..(5)) {
+        let f = E - e * sin(E) - M;
+        let fp = 1.0 - e * cos(E);
+        if (fp == 0.0) { return E; }
+        E -= f / fp;
+    }
+    return E;
+}
+
+// Heliocentric position of planet i at time t (Earth years), in scene units.
+fn planetPos(sys: System, i: int, t: float): Vec3 {
+    let a = scaledRadius(sys.a[i]);
+    let e = sys.e[i];
+    // Mean anomaly advances uniformly; the true anomaly does not, which is
+    // what makes an eccentric planet sweep faster at perihelion.
+    let M = 2.0 * PI * t / sys.period[i];
+    let E = keplerE(M, e);
+    // Position in the orbital plane, focus at the origin.
+    let x = a * (cos(E) - e);
+    let z = a * sqrt(1.0 - e * e) * sin(E);
+    // Tilt out of the ecliptic.
+    let incl = sys.incl[i];
+    return Vec3(x, z * sin(incl), z * cos(incl));
+}
+
+class App {
+    fb: Framebuffer;      // presented, always window-sized
+    big: Framebuffer;     // 2x render target when antialiasing (null otherwise)
+    ss: bool;             // supersample on?
+    r: Renderer;
+    sys: System;
+    ball: Mesh;      // one sphere mesh, scaled per planet
+    sun: Mesh;
+
+    yaw: float;
+    pitch: float;
+    dist: float;
+
+    dragging: bool;
+    lastX: int;
+    lastY: int;
+
+    t: float;        // simulation time, Earth years
+    rate: float;     // years per second of wall clock
+    paused: bool;
+    showOrbits: bool;
+    showLabels: bool;
+
+    frames: int;
+    lastMs: i64;
+    fps: float;
+
+    fn init(w: int, h: int) {
+        this.fb = new Framebuffer(w, h);
+        // Supersampling on by default here: this scene covers ~12k pixels, so
+        // 4x the fill is still comfortably interactive. shapes3d, which fills
+        // a quarter-million, cannot afford it.
+        this.ss = true;
+        this.big = new Framebuffer(w * 2, h * 2);
+        this.r = new Renderer(this.big);
+        this.sys = new System();
+        // One mesh reused for every planet at a different scale. Eight separate
+        // meshes would be eight times the geometry for identical spheres.
+        this.ball = sphere(1.0, 20, 10);
+        this.sun = sphere(1.0, 28, 14);
+        this.resetView();
+        this.dragging = false;
+        this.lastX = 0;
+        this.lastY = 0;
+        this.t = 0.0;
+        this.rate = 0.25;
+        this.paused = false;
+        this.showOrbits = true;
+        this.showLabels = true;
+        this.frames = 0;
+        this.lastMs = 0;
+        this.fps = 0.0;
+    }
+
+    fn resetView() {
+        this.yaw = 0.5;
+        this.pitch = 0.42;
+        this.dist = 18.5;
+    }
+
+    fn resize(w: int, h: int) {
+        if (w < 16 || h < 16) { return; }
+        if (w == this.fb.width && h == this.fb.height) { return; }
+        this.fb = new Framebuffer(w, h);
+        this.big = new Framebuffer(w * 2, h * 2);
+        this.r.fb = this.target();
+    }
+
+    // The buffer the renderer draws into: the 2x one when antialiasing, else
+    // the presented one directly.
+    fn target(): Framebuffer {
+        if (this.ss) { return this.big; }
+        return this.fb;
+    }
+
+    fn setSupersample(on: bool) {
+        this.ss = on;
+        this.r.fb = this.target();
+    }
+
+    fn orbit(dyaw: float, dpitch: float) {
+        this.yaw += dyaw;
+        this.pitch += dpitch;
+        // Never reach the pole: mat4LookAt's cross product collapses when the
+        // view direction is parallel to `up`.
+        if (this.pitch > 1.5) { this.pitch = 1.5; }
+        if (this.pitch < 0.05) { this.pitch = 0.05; }
+    }
+
+    fn zoom(d: float) {
+        this.dist *= d;
+        if (this.dist < 3.0) { this.dist = 3.0; }
+        if (this.dist > 60.0) { this.dist = 60.0; }
+    }
+
+    fn eye(): Vec3 {
+        return Vec3(this.dist * cos(this.pitch) * sin(this.yaw),
+                    this.dist * sin(this.pitch),
+                    this.dist * cos(this.pitch) * cos(this.yaw));
+    }
+
+    fn viewProj(): Mat4 {
+        let w = this.fb.width;
+        let h = this.fb.height;
+        return mat4Perspective(0.9, (w as float) / (h as float), 0.1, 400.0)
+                 .mul(mat4LookAt(this.eye(), Vec3(0.0, 1.1, 0.0), Vec3(0.0, 1.0, 0.0)));
+    }
+
+    fn render() {
+        // Aspect comes from the presented size, which is the same ratio as the
+        // 2x target by construction — using either is fine, but naming fb makes
+        // it obvious the image is not stretched by the supersample factor.
+        this.r.setCamera(camera(
+            mat4LookAt(this.eye(), Vec3(0.0, 1.1, 0.0), Vec3(0.0, 1.0, 0.0)),
+            mat4Perspective(0.9, (this.fb.width as float) / (this.fb.height as float),
+                            0.1, 400.0)));
+        this.r.beginFrame(C_SPACE);
+
+        // The sun is the light source, so it is drawn unlit — a lit sphere at
+        // the light's own position would be shaded by its own direction vector,
+        // which is meaningless.
+        this.r.setLight(light(Vec3(0.0, 1.0, 0.0), 1.0));
+        this.r.draw(this.sun, mat4ScalingUniform(0.95),
+                    material_shaded(0xFFD98A, SHADE_UNLIT));
+
+        let n = this.sys.count();
+        for (let i in 0..(n)) {
+            let p = planetPos(this.sys, i, this.t);
+            // Light each planet from the sun: the direction from the planet
+            // toward the origin. That gives real crescents on the far side.
+            let toSun = p.neg().normalized();
+            this.r.setLight(light(toSun, 1.0));
+            // Ambient 0.34 rather than the library default 0.12. A planet
+            // between the camera and the sun really is showing us its night
+            // side -- physically right, and it renders as a black disc. Lifting
+            // the floor keeps every planet identifiable while the terminator
+            // still reads as a crescent.
+            this.r.draw(this.ball,
+                        mat4Translation(p).mul(mat4ScalingUniform(this.sys.radius[i])),
+                        Material(this.sys.color[i], SHADE_GOURAUD, false, 0.34));
+        }
+    }
+}
+
+// ---- 2D overlay -----------------------------------------------------------
+//
+// Orbit rings and labels are drawn with Surface's own 2D calls on top of the
+// blitted 3D framebuffer, not as geometry. A ring is a closed curve one pixel
+// wide: rasterizing it as triangles would be far more work for a worse result.
+
+// Project a world point to screen. Returns false when it is behind the camera,
+// where the perspective divide would flip it to the wrong side.
+fn project(mvp: Mat4, p: Vec3, w: int, h: int, out: float[]): bool {
+    let c = mvp.mulVec4(Vec4(p.x, p.y, p.z, 1.0));
+    if (c.w <= 0.0001) { return false; }
+    let iw = 1.0 / c.w;
+    out[0] = (c.x * iw + 1.0) * (w as float) * 0.5;
+    out[1] = (1.0 - c.y * iw) * (h as float) * 0.5;
+    return true;
+}
+
+fn drawOrbits(s: Surface, a: App) {
+    let mvp = a.viewProj();
+    let w = a.fb.width;
+    let h = a.fb.height;
+    let n = a.sys.count();
+    let p0: float[] = [0.0, 0.0];
+    let p1: float[] = [0.0, 0.0];
+
+    for (let i in 0..(n)) {
+        // Sample the ellipse in eccentric anomaly, which spaces the samples
+        // evenly around the shape rather than bunching them at perihelion.
+        let segs = 96;
+        let prevOK = false;
+        for (let k in 0..(segs + 1)) {
+            let E = 2.0 * PI * (k as float) / (segs as float);
+            let ax = scaledRadius(a.sys.a[i]);
+            let e = a.sys.e[i];
+            let x = ax * (cos(E) - e);
+            let z = ax * sqrt(1.0 - e * e) * sin(E);
+            let incl = a.sys.incl[i];
+            let pt = Vec3(x, z * sin(incl), z * cos(incl));
+
+            let ok = project(mvp, pt, w, h, p1);
+            if (ok && prevOK) {
+                s.line(p0[0] as int, p0[1] as int, p1[0] as int, p1[1] as int, C_ORBIT);
+            }
+            p0[0] = p1[0];
+            p0[1] = p1[1];
+            prevOK = ok;
+        }
+    }
+}
+
+fn drawLabels(s: Surface, a: App) {
+    let mvp = a.viewProj();
+    let w = a.fb.width;
+    let h = a.fb.height;
+    let n = a.sys.count();
+    let sp: float[] = [0.0, 0.0];
+    for (let i in 0..(n)) {
+        let p = planetPos(a.sys, i, a.t);
+        if (project(mvp, p, w, h, sp)) {
+            let x = sp[0] as int;
+            let y = sp[1] as int;
+            if (x > -40 && y > 60 && x < w && y < h) {
+                s.text(x + 8, y - 6, a.sys.name[i], C_HUD_DIM);
+            }
+        }
+    }
+}
+
+fn hud(s: Surface, a: App) {
+    s.fill(Rect(0.0, 0.0, s.width() as float, 60.0), C_PANEL);
+
+    let years = a.t as int;
+    let line1 = "planets3d — " + str(a.fb.width) + "x" + str(a.fb.height)
+              + "   year " + str(years)
+              + "   " + str(a.r.trianglesDrawn) + " tris";
+    if (a.fps > 0.0) {
+        line1 = line1 + "   " + str((a.fps * 10.0) as int as float / 10.0) + " fps";
+    }
+    s.text(10, 20, line1, C_HUD);
+
+    let mode = "speed " + str((a.rate * 100.0) as int as float / 100.0) + " yr/s";
+    if (a.ss) { mode = mode + "   AA 2x"; } else { mode = mode + "   AA off"; }
+    if (a.paused) { mode = mode + "   PAUSED"; }
+    if (a.showOrbits == false) { mode = mode + "   orbits off"; }
+    if (a.showLabels == false) { mode = mode + "   labels off"; }
+    s.text(10, 40, mode, C_HUD_DIM);
+
+    s.text(10, s.height() - 12,
+           "drag/arrows orbit   +/- zoom   [ ] speed   A antialias   O orbits   L labels   R reset   space pause   ESC quit",
+           C_HUD_DIM);
+}
+
+fn frame(s: Surface, a: App) {
+    a.render();
+    if (a.ss) { a.big.resolve2xTo(a.fb); }
+    a.fb.blitToOrigin(s);
+    if (a.showOrbits) { drawOrbits(s, a); }
+    if (a.showLabels) { drawLabels(s, a); }
+    hud(s, a);
+    s.present();
+
+    a.frames += 1;
+    let now = s.now_ms();
+    if (a.lastMs == 0) { a.lastMs = now; }
+    let dt = now - a.lastMs;
+    if (dt >= 1000) {
+        a.fps = (a.frames as float) * 1000.0 / (dt as float);
+        a.frames = 0;
+        a.lastMs = now;
+    }
+}
+
+fn main() {
+    let s = new Surface("Vyto Planets 3D — raster3d", WIN_W, WIN_H);
+    let a = new App(s.width(), s.height());
+
+    frame(s, a);
+
+    let running = true;
+    while (running) {
+        let ev = s.wait_timeout(TICK_MS);
+
+        if (ev == EV_TIMER) {
+            if (a.paused == false) {
+                a.t += a.rate * (TICK_MS as float) / 1000.0;
+            }
+            frame(s, a);
+        } else if (ev == EV_KEY) {
+            let k = s.key();
+            if (k == KEY_ESC) { running = false; }
+            else if (k == KEY_LEFT) { a.orbit(-0.08, 0.0); frame(s, a); }
+            else if (k == KEY_RIGHT) { a.orbit(0.08, 0.0); frame(s, a); }
+            else if (k == KEY_UP) { a.orbit(0.0, 0.05); frame(s, a); }
+            else if (k == KEY_DOWN) { a.orbit(0.0, -0.05); frame(s, a); }
+            else if (k == KEY_SPACE) { a.paused = !a.paused; frame(s, a); }
+            else if (k == 43 || k == 61) { a.zoom(0.88); frame(s, a); }    // + =
+            else if (k == 45) { a.zoom(1.14); frame(s, a); }               // -
+            else if (k == 91) { a.rate = a.rate * 0.6; frame(s, a); }      // [
+            else if (k == 93) { a.rate = a.rate * 1.6; frame(s, a); }      // ]
+            else if (k == 111 || k == 79) { a.showOrbits = !a.showOrbits; frame(s, a); } // o/O
+            else if (k == 108 || k == 76) { a.showLabels = !a.showLabels; frame(s, a); } // l/L
+            else if (k == 114 || k == 82) { a.resetView(); frame(s, a); }  // r/R
+            else if (k == 97 || k == 65) { a.setSupersample(!a.ss); frame(s, a); } // a/A
+        } else if (ev == EV_MOUSE_DOWN) {
+            a.dragging = true;
+            a.lastX = s.mouse_x();
+            a.lastY = s.mouse_y();
+        } else if (ev == EV_MOUSE_UP) {
+            a.dragging = false;
+        } else if (ev == EV_MOUSE_MOVE) {
+            if (a.dragging) {
+                let mx = s.mouse_x();
+                let my = s.mouse_y();
+                a.orbit(((mx - a.lastX) as float) * 0.01,
+                        ((my - a.lastY) as float) * -0.01);
+                a.lastX = mx;
+                a.lastY = my;
+                frame(s, a);
+            }
+        } else if (ev == EV_RESIZE) {
+            a.resize(s.width(), s.height());
+            frame(s, a);
+        } else if (ev == EV_EXPOSE) {
+            frame(s, a);
+        } else if (ev == EV_CLOSE) {
+            running = false;
+        }
+    }
+}

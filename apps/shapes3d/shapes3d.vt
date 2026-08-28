@@ -1,0 +1,312 @@
+// shapes3d — a spinning 3D scene rendered entirely on the CPU.
+//
+// Five primitives orbiting a textured ground plane, lit by one directional
+// light, with a depth buffer resolving every overlap per pixel. No GPU, no
+// native library, no vyto/gfx: vyto/raster3d draws into an i32[] it owns and
+// this program blits that to a Surface.
+//
+// Controls:
+//   arrows / drag   orbit the camera        W / S     move the light
+//   +  -            zoom                    space     pause
+//   1 2 3           flat / smooth / unlit   T         toggle the texture
+//   B               nearest / bilinear filtering (bilinear costs ~2x a frame)
+//   ESC             quit
+//
+// The window is 800x600 and the framebuffer matches it, so this is the
+// full-screen-at-720p-class workload vyto/raster3d is measured for. Resizing
+// rebuilds the framebuffer to match.
+
+import { Surface, Rect,
+         EV_TIMER, EV_KEY, EV_CLOSE, EV_EXPOSE, EV_RESIZE,
+         EV_MOUSE_DOWN, EV_MOUSE_UP, EV_MOUSE_MOVE,
+         KEY_UP, KEY_DOWN, KEY_LEFT, KEY_RIGHT, KEY_ESC, KEY_SPACE } from "vyto/surface";
+import { Framebuffer, Renderer, camera, light } from "vyto/raster3d/raster3d";
+import { Mesh, sphere, cube, cylinder, plane, material, material_shaded,
+         SHADE_FLAT, SHADE_GOURAUD, SHADE_UNLIT } from "vyto/raster3d/mesh";
+import { Texture, checker, FILTER_NEAREST, FILTER_BILINEAR } from "vyto/raster3d/texture";
+import { Vec3, mat4Identity, mat4Perspective, mat4LookAt,
+         mat4RotationY, mat4RotationX, mat4Translation } from "vyto/geom";
+import { sin, cos, PI } from "vyto/math";
+
+const WIN_W: int = 800;
+const WIN_H: int = 600;
+const TICK_MS: int = 16;      // ~60Hz; the renderer is the real limit
+
+const C_BG: int = 0x0E1116;
+const C_HUD: int = 0xC8D2DC;
+const C_HUD_DIM: int = 0x6E7A86;
+const C_PANEL: int = 0x161B22;
+
+// The scene, built once. Rebuilding a mesh every frame would allocate for no
+// reason — geometry is static, only the transforms move.
+class Scene {
+    ball: Mesh;
+    box: Mesh;
+    rod: Mesh;
+    ground: Mesh;
+    small: Mesh;
+
+    fn init() {
+        this.ball = sphere(0.75, 32, 16);
+        this.box = cube(1.05);
+        this.rod = cylinder(0.42, 1.5, 20);
+        this.ground = plane(9.0, 9.0, 1);
+        this.small = sphere(0.42, 20, 10);
+    }
+}
+
+class App {
+    fb: Framebuffer;
+    r: Renderer;
+    scene: Scene;
+
+    // camera orbit
+    yaw: float;
+    pitch: float;
+    dist: float;
+
+    // interaction
+    dragging: bool;
+    lastX: int;
+    lastY: int;
+
+    spin: float;
+    paused: bool;
+    shading: int;
+    textured: bool;
+    lightAngle: float;
+    tex: Texture;
+    bilinear: bool;
+    frames: int;
+    lastMs: i64;
+    fps: float;
+
+    fn init(w: int, h: int) {
+        this.fb = new Framebuffer(w, h);
+        this.r = new Renderer(this.fb);
+        this.scene = new Scene();
+        this.yaw = 0.6;
+        this.pitch = 0.42;
+        this.dist = 7.5;
+        this.dragging = false;
+        this.lastX = 0;
+        this.lastY = 0;
+        this.spin = 0.0;
+        this.paused = false;
+        this.shading = SHADE_GOURAUD;
+        this.textured = true;
+        this.lightAngle = 0.9;
+        this.frames = 0;
+        this.lastMs = 0;
+        this.fps = 0.0;
+        // Built once. checker() allocates a 64x64 i32[]; rebuilding it every
+        // frame would allocate 4096 ints per frame for an image that never
+        // changes.
+        this.tex = checker(64, 8, 0xE8EDF2, 0x2A3138);
+        // Nearest by default, and that is not a cosmetic choice: bilinear costs
+        // four texel fetches and three lerps per covered pixel, and the ground
+        // plane covers most of the screen. Measured on this scene at 800x600,
+        // bilinear is 22.0 ms/frame (45 fps) against 9.8 ms (102 fps) for
+        // nearest -- more than half the frame. Press B to see it.
+        this.bilinear = false;
+        this.tex.setFilter(FILTER_NEAREST);
+    }
+
+    // Rebuild the framebuffer when the window changes size. The Renderer holds
+    // a reference to it, so it has to be told about the new one.
+    fn resize(w: int, h: int) {
+        if (w < 16 || h < 16) { return; }
+        if (w == this.fb.width && h == this.fb.height) { return; }
+        this.fb = new Framebuffer(w, h);
+        this.r.fb = this.fb;
+    }
+
+    fn orbit(dyaw: float, dpitch: float) {
+        this.yaw += dyaw;
+        this.pitch += dpitch;
+        // Stop just short of the poles: at exactly +/-pi/2 the view direction
+        // is parallel to `up` and mat4LookAt's cross product collapses.
+        let lim = 1.5;
+        if (this.pitch > lim) { this.pitch = lim; }
+        if (this.pitch < -0.15) { this.pitch = -0.15; }
+    }
+
+    fn zoom(d: float) {
+        this.dist += d;
+        if (this.dist < 3.0) { this.dist = 3.0; }
+        if (this.dist > 20.0) { this.dist = 20.0; }
+    }
+
+    fn render() {
+        let w = this.fb.width;
+        let h = this.fb.height;
+
+        let eye = Vec3(this.dist * cos(this.pitch) * sin(this.yaw),
+                       this.dist * sin(this.pitch),
+                       this.dist * cos(this.pitch) * cos(this.yaw));
+        this.r.setCamera(camera(
+            mat4LookAt(eye, Vec3(0.0, 0.0, 0.0), Vec3(0.0, 1.0, 0.0)),
+            mat4Perspective(1.0472, (w as float) / (h as float), 0.1, 100.0)));
+
+        this.r.setLight(light(Vec3(cos(this.lightAngle), 0.85, sin(this.lightAngle)), 1.0));
+        this.r.beginFrame(C_BG);
+
+        // Ground first. Textured and unlit so the checker reads clearly; it is
+        // also the surface that shows off perspective-correct UV.
+        if (this.textured) { this.r.setTexture(this.tex); }
+        else { this.r.setTexture(null); }
+        this.r.draw(this.scene.ground,
+                    mat4Translation(Vec3(0.0, -1.25, 0.0)),
+                    material_shaded(0xFFFFFF, SHADE_UNLIT));
+        this.r.setTexture(null);
+
+        let sh = this.shading;
+
+        // Centre sphere, spinning in place.
+        this.r.draw(this.scene.ball,
+                    mat4RotationY(this.spin),
+                    material_shaded(0x4FA3D1, sh));
+
+        // Cube and cylinder orbiting it, each also rotating on its own axis, so
+        // they pass in front of and behind the sphere — the depth buffer, not
+        // draw order, decides what is visible.
+        let orbit = 3.2;
+        let bx = orbit * cos(this.spin);
+        let bz = orbit * sin(this.spin);
+        this.r.draw(this.scene.box,
+                    mat4Translation(Vec3(bx, 0.55, bz))
+                        .mul(mat4RotationY(this.spin * 1.7))
+                        .mul(mat4RotationX(this.spin * 0.9)),
+                    material_shaded(0xD98F4F, sh));
+
+        let cx = orbit * cos(this.spin + PI);
+        let cz = orbit * sin(this.spin + PI);
+        this.r.draw(this.scene.rod,
+                    mat4Translation(Vec3(cx, 0.0, cz)).mul(mat4RotationX(1.15)),
+                    material_shaded(0x7FBF7F, sh));
+
+        // Two small spheres on a tighter, faster orbit, deliberately close
+        // enough to the centre sphere to interpenetrate it. A painter's
+        // -algorithm renderer cannot draw this correctly at any draw order.
+        let k = 1.05;
+        this.r.draw(this.scene.small,
+                    mat4Translation(Vec3(k * cos(this.spin * 2.3), 0.55,
+                                          k * sin(this.spin * 2.3))),
+                    material_shaded(0xCC5E7A, sh));
+        this.r.draw(this.scene.small,
+                    mat4Translation(Vec3(k * cos(this.spin * 2.3 + PI), -0.55,
+                                          k * sin(this.spin * 2.3 + PI))),
+                    material_shaded(0xB07FD9, sh));
+    }
+
+    fn shadingName(): string {
+        if (this.shading == SHADE_FLAT) { return "flat"; }
+        if (this.shading == SHADE_GOURAUD) { return "smooth"; }
+        return "unlit";
+    }
+}
+
+fn hud(s: Surface, a: App) {
+    // A panel behind the text so it stays readable over bright geometry.
+    s.fill(Rect(0.0, 0.0, s.width() as float, 62.0), C_PANEL);
+
+    let line1 = "vyto/raster3d  " + str(a.fb.width) + "x" + str(a.fb.height)
+              + "   " + str(a.r.trianglesDrawn) + " tris"
+              + "   " + str(a.r.pixelsWritten / 1000) + "k px";
+    if (a.fps > 0.0) {
+        line1 = line1 + "   " + str((a.fps * 10.0) as int as float / 10.0) + " fps";
+    }
+    s.text(10, 20, line1, C_HUD);
+
+    let mode = "shading: " + a.shadingName();
+    if (a.textured) {
+        if (a.bilinear) { mode = mode + "   texture: bilinear"; }
+        else { mode = mode + "   texture: nearest"; }
+    } else { mode = mode + "   texture: off"; }
+    if (a.paused) { mode = mode + "   PAUSED"; }
+    s.text(10, 40, mode, C_HUD_DIM);
+
+    s.text(10, s.height() - 12,
+           "drag/arrows orbit   +/- zoom   W/S light   1/2/3 shading   T texture   B filter   space pause   ESC quit",
+           C_HUD_DIM);
+}
+
+fn frame(s: Surface, a: App) {
+    a.render();
+    a.fb.blitToOrigin(s);
+    hud(s, a);
+    s.present();
+
+    // FPS over a whole second, so the number is steady enough to read.
+    a.frames += 1;
+    let now = s.now_ms();
+    if (a.lastMs == 0) { a.lastMs = now; }
+    let dt = now - a.lastMs;
+    if (dt >= 1000) {
+        a.fps = (a.frames as float) * 1000.0 / (dt as float);
+        a.frames = 0;
+        a.lastMs = now;
+    }
+}
+
+fn main() {
+    let s = new Surface("Vyto 3D — raster3d demo", WIN_W, WIN_H);
+    let a = new App(s.width(), s.height());
+
+    frame(s, a);
+
+    let running = true;
+    while (running) {
+        let ev = s.wait_timeout(TICK_MS);
+
+        if (ev == EV_TIMER) {
+            if (a.paused == false) { a.spin += 0.012; }
+            frame(s, a);
+        } else if (ev == EV_KEY) {
+            let k = s.key();
+            if (k == KEY_ESC) { running = false; }
+            else if (k == KEY_LEFT) { a.orbit(-0.08, 0.0); frame(s, a); }
+            else if (k == KEY_RIGHT) { a.orbit(0.08, 0.0); frame(s, a); }
+            else if (k == KEY_UP) { a.orbit(0.0, 0.05); frame(s, a); }
+            else if (k == KEY_DOWN) { a.orbit(0.0, -0.05); frame(s, a); }
+            else if (k == KEY_SPACE) { a.paused = !a.paused; frame(s, a); }
+            else if (k == 43 || k == 61) { a.zoom(-0.5); frame(s, a); }   // + and =
+            else if (k == 45) { a.zoom(0.5); frame(s, a); }               // -
+            else if (k == 49) { a.shading = SHADE_FLAT; frame(s, a); }    // 1
+            else if (k == 50) { a.shading = SHADE_GOURAUD; frame(s, a); } // 2
+            else if (k == 51) { a.shading = SHADE_UNLIT; frame(s, a); }   // 3
+            else if (k == 116 || k == 84) { a.textured = !a.textured; frame(s, a); }  // t/T
+            else if (k == 98 || k == 66) {                                           // b/B
+                a.bilinear = !a.bilinear;
+                if (a.bilinear) { a.tex.setFilter(FILTER_BILINEAR); }
+                else { a.tex.setFilter(FILTER_NEAREST); }
+                frame(s, a);
+            }
+            else if (k == 119 || k == 87) { a.lightAngle -= 0.15; frame(s, a); }      // w/W
+            else if (k == 115 || k == 83) { a.lightAngle += 0.15; frame(s, a); }      // s/S
+        } else if (ev == EV_MOUSE_DOWN) {
+            a.dragging = true;
+            a.lastX = s.mouse_x();
+            a.lastY = s.mouse_y();
+        } else if (ev == EV_MOUSE_UP) {
+            a.dragging = false;
+        } else if (ev == EV_MOUSE_MOVE) {
+            if (a.dragging) {
+                let mx = s.mouse_x();
+                let my = s.mouse_y();
+                a.orbit(((mx - a.lastX) as float) * 0.01,
+                        ((my - a.lastY) as float) * -0.01);
+                a.lastX = mx;
+                a.lastY = my;
+                frame(s, a);
+            }
+        } else if (ev == EV_RESIZE) {
+            a.resize(s.width(), s.height());
+            frame(s, a);
+        } else if (ev == EV_EXPOSE) {
+            frame(s, a);
+        } else if (ev == EV_CLOSE) {
+            running = false;
+        }
+    }
+}

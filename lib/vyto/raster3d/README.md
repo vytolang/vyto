@@ -32,9 +32,6 @@ Vyto limitation — the same rasterizer hand-written in C manages only 57 fps on
 the 1080p heavy case. Single-threaded scalar rasterization of two megapixels
 costs what it costs. That workload wants a GPU.
 
-Full measurements, including the C comparison, in
-`local/docs/RASTER3D-SPIKE.md`.
-
 ## Quick start
 
 ```vyto
@@ -66,10 +63,11 @@ surface.present();
 | `Material` | colour, shading model, double-sidedness, ambient floor |
 | `Texture` | `i32[]` pixels, nearest/bilinear, repeat/clamp |
 
-`Mesh` is deliberately struct-of-arrays rather than an array of vertex objects
-— the arena rule from the root `CLAUDE.md`. A 65k-triangle mesh built one
-object per vertex would pay 33k allocation headers and 33k refcount lifetimes
-for data that is never individually referenced.
+`Mesh` is deliberately struct-of-arrays rather than an array of vertex objects.
+Bulk data belongs in contiguous buffers with elements addressed by index, not
+one allocation per element: a 65k-triangle mesh built one object per vertex
+would pay 33k allocation headers and 33k refcount lifetimes for data that is
+never individually referenced.
 
 Primitives: `sphere`, `cube`, `box`, `plane`, `cylinder`, or build your own with
 `MeshBuilder`.
@@ -95,6 +93,39 @@ It is not free in precision: `f32` depth z-fights sooner than `f64` when the
 far/near ratio is large. If you see z-fighting, **move the near plane out**
 before anything else — near/far of 0.1/100 is far more forgiving than
 0.001/10000.
+
+## Antialiasing — supersampling, not a second renderer
+
+Edges are hard-cut: a pixel is inside a triangle or it is not. To smooth them
+without giving up correctness, render into a framebuffer twice as large in each
+axis and box-filter it down:
+
+```vyto
+let big = new Framebuffer(w * 2, h * 2);   // render target
+let out = new Framebuffer(w, h);           // presented
+let r = new Renderer(big);
+... draw ...
+big.resolve2xTo(out);
+out.blitToOrigin(surface);
+```
+
+**The depth buffer is untouched**, so interpenetration and occlusion stay
+exact. That is the difference from routing the triangles through a 2D vector
+rasterizer such as blend2d: that also gives smooth edges, but it has no depth
+buffer, so it forces painter's-algorithm sorting — correct only while nothing
+interpenetrates.
+
+**Cost is inherent: 4x the pixels is roughly 4x the fill.** Measured at
+800x600 on the shapes3d scene, 14.8 -> 61.5 ms/frame. On a scene with low
+coverage it is cheap enough to leave on: `apps/planets3d` covers ~12k pixels
+and runs at **64 fps with 2x AA** against 277 fps without. `apps/shapes3d`,
+which fills a quarter-million pixels behind a full-screen textured ground,
+cannot afford it. Measure before enabling.
+
+`resolve2xTo` is a fixed 2x rather than a general NxN on purpose: the four taps
+become straight-line code with no loop over a runtime factor, and the divide by
+four becomes a shift. That is worth **5.1x** — the general NxN version measured
+19.6 ms at 800x600 against 3.85 ms for this one.
 
 ## Determinism
 

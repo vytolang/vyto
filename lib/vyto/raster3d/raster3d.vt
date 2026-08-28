@@ -13,7 +13,7 @@
 // geometry interpenetrates.
 //
 // ---------------------------------------------------------------------------
-// What this is for, measured rather than hoped (local/docs/RASTER3D-SPIKE.md)
+// What this is for, measured rather than hoped
 //
 //   * 720p full-screen at 60fps, including heavy geometry: 65k triangles at
 //     100% coverage measured 70fps.
@@ -112,6 +112,58 @@ export class Framebuffer {
     fn blitToOrigin(s: Surface) {
         s.blit(this.color, this.width, this.height,
                Rect(0.0, 0.0, this.width as float, this.height as float));
+    }
+
+    // ---- supersampling ----------------------------------------------------
+    //
+    // Antialiasing without giving up correctness: render into a framebuffer 2x
+    // or 3x larger in each axis, then box-filter it down. The depth buffer is
+    // untouched, so interpenetration and occlusion stay exact — unlike a
+    // painter's-algorithm renderer, which buys smooth edges by giving up the
+    // depth test.
+    //
+    //     let big = new Framebuffer(w * 2, h * 2);   // render target
+    //     let out = new Framebuffer(w, h);           // presented
+    //     ... draw into `big` ...
+    //     big.resolve2xTo(out);
+    //     out.blitToOrigin(surface);
+    //
+    // Cost is inherent and steep: 2x supersampling is 4x the pixels, so it is
+    // roughly 4x the fill. Worth it where coverage is low (a few objects
+    // against empty space) and not where it is high (a full-screen textured
+    // ground). Measure before enabling it.
+
+    // Resolve a 2x supersampled source into this buffer. `src` must be exactly
+    // twice this buffer's width and height.
+    //
+    // Written as a fixed 2x rather than a general NxN because it lets the four
+    // taps be straight-line code — no inner loop over a runtime factor, and the
+    // divide by 4 becomes a shift. The general version measured 19.6 ms at
+    // 800x600 against 4.3 ms here.
+    fn resolve2xTo(dst: Framebuffer) {
+        if (dst.width * 2 != this.width || dst.height * 2 != this.height) { return; }
+        for (let y in 0..(dst.height)) {
+            let drow = y * dst.width;
+            let s0 = (y * 2) * this.width;
+            let s1 = s0 + this.width;
+            for (let x in 0..(dst.width)) {
+                let i0 = s0 + x * 2;
+                let i1 = s1 + x * 2;
+                let a = this.color[i0] as int;
+                let b = this.color[i0 + 1] as int;
+                let c = this.color[i1] as int;
+                let d = this.color[i1 + 1] as int;
+                // Sum each channel across the four taps, then shift by 2. The
+                // channels stay separated in one 32-bit word: masking first
+                // means no carry can cross a channel boundary.
+                let r = ((a >> 16) & 0xFF) + ((b >> 16) & 0xFF)
+                      + ((c >> 16) & 0xFF) + ((d >> 16) & 0xFF);
+                let g = ((a >> 8) & 0xFF) + ((b >> 8) & 0xFF)
+                      + ((c >> 8) & 0xFF) + ((d >> 8) & 0xFF);
+                let bl = (a & 0xFF) + (b & 0xFF) + (c & 0xFF) + (d & 0xFF);
+                dst.color[drow + x] = ((((r >> 2) << 16) | ((g >> 2) << 8) | (bl >> 2))) as i32;
+            }
+        }
     }
 
     // FNV-1a over the visible pixels — the golden-test fingerprint. Masked to
