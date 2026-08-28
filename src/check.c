@@ -2589,6 +2589,23 @@ static Type *check_expr(Ctx *c, Expr *e, Type *expected) {
         t->elem = elem;
         return e->type = t;
     }
+    case EX_TSTR: {
+        /* Even indices are the literal chunks; odd ones are the holes. A hole
+           converts to string exactly as `+` does, so this reuses strconv and
+           adds no new type rules. */
+        for (int i = 0; i < e->nargs; i++) {
+            Type *ht = check_expr(c, e->args[i], NULL);
+            if ((i & 1) == 0) continue;
+            if (!str_convertible(ht)) {
+                if (ht->kind == TY_CSTRING)
+                    fatal_at(e->args[i]->loc,
+                             "cannot interpolate cstring into a string — wrap it: str(x)");
+                fatal_at(e->args[i]->loc, "cannot interpolate %s into a string", type_str(ht));
+            }
+            e->args[i] = strconv(e->args[i]);
+        }
+        return e->type = ty_string();
+    }
     case EX_AS: {
         Type *src = check_expr(c, e->lhs, NULL);
         resolve_type(e->cast_type, c->mod);
@@ -3182,6 +3199,9 @@ static void check_const(Module *m, Decl *d) {
     Expr *e = d->const_init;
     /* null stays as-is (rawptr/cstring consts); string literals stay as-is (emitted as
        immortal strings); everything else folds to a numeric/bool literal. */
+    if (e->kind == EX_TSTR)
+        fatal_at(e->loc, "a const initializer must be a constant; "
+                         "a template literal with holes is not");
     if (e->kind != EX_NULL && e->kind != EX_STR) fold_const_decl(d);
     e = d->const_init;
     Ctx c = {0};

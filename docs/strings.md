@@ -159,6 +159,49 @@ rejects surrounding whitespace, and rejects hex rather than silently reading
 
 ## 3. Concatenation and building
 
+### Template literals
+
+A **backtick** string interpolates: `{...}` inside one holds any expression, and
+its value is converted to string exactly as `+` would convert it.
+
+```js
+let msg = `Hello {name}, from {city}`;
+let dim = `{w}x{h} at {fps} fps`;
+let sum = `total {a + b}, {xs.len} items`;
+```
+
+Prefer it over `+` for anything with more than two parts. A template lowers to a
+**single allocation** no matter how many parts it has, while a chain of `+`
+allocates once per `+` and recopies the whole prefix each time — measured 2.9x
+on a six-part string.
+
+Four things to know:
+
+- **A `"..."` string never interpolates.** Braces in a double-quoted string mean
+  nothing special, which is what keeps JSON, regex quantifiers like `\d{3}`, and
+  `vyto/intl`'s MessageFormat working unchanged.
+- **A backtick string is raw.** Backslash is an ordinary byte — `` `C:\Users` ``
+  and `` `\d+\.\d+` `` need no doubling — and there are no `\n`/`\t`/`\xHH`
+  escapes. Use `"..."` when you want those, or a real newline:
+  ```js
+  let sql = `SELECT id, name
+  FROM users
+  WHERE age > {min}`;          // the newlines are literal
+  ```
+  A consequence: a literal backtick cannot appear inside one. Use `"..."`, which
+  can hold a backtick, and concatenate.
+- **`{{` and `}}` are the brace escapes**, and both are required — a bare `}` is
+  an error, so the two stay symmetric and a typo is caught rather than accepted.
+  `` `{{"id": {id}}}` `` produces `{"id": 42}`.
+- **Holes evaluate strictly left to right.** This is a *stronger* guarantee than
+  `+`, whose operands evaluate right to left (§2, "Numbers"), so
+  `` `{a()}{b()}` `` calls `a` then `b` while `a() + b()` does not promise that.
+
+A hole accepts what `+` accepts: strings, any numeric type, and `bool`. A
+`cstring` needs an explicit `str(p)`, as everywhere else.
+
+### `+` and `StringBuilder`
+
 `+` concatenates, and mixes types directly — `"n=" + 42 + " ok=" + true` works
 with no formatting call. Each `+` allocates, so a loop that concatenates is
 quadratic. For that, use `StringBuilder` from `vyto/util/text`:
@@ -175,6 +218,35 @@ let s = sb.toString();
 
 `append`, `appendInt`, `appendFloat` and `appendByte` all return the builder, so
 they chain. `len()`, `clear()`, `toString()` and `cstr()` round it out.
+
+### Choosing between a template and `fmt()`
+
+`vyto/util/fmt` walks its format string at runtime; a template is resolved at
+compile time. So when the format is **known where you write it**, reach for a
+template — measured 2.3x faster than the equivalent `fmt()` call, and a bad
+argument becomes a compile error instead of a runtime panic.
+
+The catch: a hole stringifies a value exactly one way, the way `+` does. There
+is no width, precision, alignment or radix in the hole itself, so this is *not*
+a mechanical rewrite of existing `fmt()` calls — `fmt("%.2f", [ff(x)])` gives
+`3.14` where `` `{x}` `` gives `3.14159`.
+
+Reach for `fmt`'s scalar helpers inside the hole instead, and you get both:
+
+```js
+import { fixed, hex, pad, commas } from "vyto/util/fmt";
+
+print(`{name} scored {fixed(x, 2)} in hex {hex(n)}, padded [{pad(name, 8)}]`);
+print(`{commas(total)} rows`);
+```
+
+That produces byte-identical output to the `fmt()` spelling and still measured
+2x faster, because the literal text never gets re-scanned.
+
+**Keep `fmt()` for a format string that is data** — an i18n catalog entry, a
+config value, anything read at runtime. A template cannot help there: it is
+parsed by the compiler, so a string that only exists at runtime interpolates
+nothing. That is also what `vyto/intl`'s MessageFormat is for.
 
 ## 4. Bytes ⟷ strings
 

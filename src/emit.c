@@ -1232,6 +1232,32 @@ static char *ex(Em *em, Expr *e, bool *fresh) {
         sb_free(&sb);
         return out;
     }
+    case EX_TSTR: {
+        *fresh = true;
+        /* Fill a function-scoped array, then join it in one allocation. The
+           parts are filled by a comma-expression rather than passed as call
+           arguments on purpose: the comma operator is a sequence point, so the
+           holes evaluate strictly left to right, while C leaves the order of
+           function arguments unspecified. (Note this is a *stronger* guarantee
+           than `+`, whose operands go right to left — see docs/strings.md.)
+
+           Every part goes through ex_b, which spills a freshly-built string
+           into an owned temp released at the end of the statement and passes a
+           borrowed one straight through; chunk literals are immortals, so they
+           need neither. vt_str_join borrows, so there is no new ownership rule
+           here at all. */
+        const char *pa = arena_printf(&g_arena, "_p%d", em->tempc++);
+        sb_printf(em->pre, "    VtString* %s[%d];\n", pa, e->nargs);
+        SBuf sb;
+        sb_init(&sb);
+        sb_puts(&sb, "(");
+        for (int i = 0; i < e->nargs; i++)
+            sb_printf(&sb, "%s[%d] = %s, ", pa, i, ex_b(em, e->args[i]));
+        sb_printf(&sb, "vt_str_join(%d, %s))", e->nargs, pa);
+        char *out = arena_strdup(&g_arena, sb.data);
+        sb_free(&sb);
+        return out;
+    }
     case EX_AS: {
         Type *src = e->lhs->type, *dst = e->type;
         if (src->kind == TY_CLASS && dst->kind == TY_CLASS) {

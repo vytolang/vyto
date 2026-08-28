@@ -23,6 +23,13 @@ typedef enum TokKind {
     T_OROR, T_ANDAND, T_EQ, T_NEQ, T_LT, T_LE, T_GT, T_GE,
     T_PLUS, T_MINUS, T_STAR, T_SLASH, T_PERCENT, T_NOT,
     T_AMP, T_PIPE, T_CARET, T_TILDE, T_SHL, T_SHR,
+    /* template literals: `chunk{ expr }chunk{ expr }chunk` lexes as a run of
+       chunk tokens with the holes lexed as ordinary tokens in between. All four
+       carry their chunk bytes in sval/slen, like T_STRING. */
+    T_TSTR_START,  /* `chunk{  — opening backtick, a hole follows */
+    T_TSTR_MID,    /* }chunk{  — between two holes */
+    T_TSTR_END,    /* }chunk`  — final chunk, closing backtick */
+    T_TSTR_WHOLE,  /* `chunk`  — a whole template with no holes */
 } TokKind;
 
 typedef struct Token {
@@ -35,6 +42,11 @@ typedef struct Token {
     size_t slen;         /* T_STRING length (may contain NUL) */
 } Token;
 
+/* Nesting cap for templates-inside-holes. It exists so tbrace can be a fixed
+   array: the parser snapshots the whole Lexer by value to speculate and rolls
+   back by struct assignment (parse.c:264), so every field here must be POD. */
+#define VT_MAX_TEMPLATE_DEPTH 8
+
 typedef struct Lexer {
     const char *src;
     const char *p;
@@ -43,6 +55,11 @@ typedef struct Lexer {
     Token tok;   /* current */
     Token ahead; /* one-token lookahead buffer */
     bool has_ahead;
+    /* Template-literal state. tdepth is how many templates are currently open;
+       tbrace[d] counts the '{' nesting *inside the current hole* of template d,
+       so a block or a nested template in a hole does not end it early. */
+    int tdepth;
+    int tbrace[VT_MAX_TEMPLATE_DEPTH];
 } Lexer;
 
 void lex_init(Lexer *lx, const char *file, const char *src);

@@ -162,8 +162,11 @@ examples: `lib/vyto/surface/vsurf.vt`, `examples/greeter/greeter.vt`.
 
 ## Things that will bite you
 
-**Binary operands evaluate right to left.** Documented at `docs/strings.md:114`.
-Never chain side effects in one expression.
+**Binary operands evaluate right to left.** Documented at `docs/strings.md` §2.
+Never chain side effects in one expression. The one exception is a **template
+literal**, whose holes evaluate left to right — the emitted join fills a parts
+array through comma operators, which are sequence points, so `` `{a()}{b()}` ``
+is ordered where `a() + b()` is not.
 
 **`native/src/*.c` is globbed flat and every file compiles on every target.**
 There is no per-file platform filter. A platform-specific source must wrap its

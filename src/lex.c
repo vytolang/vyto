@@ -67,6 +67,55 @@ static int hexval(int c) {
     return -1;
 }
 
+/* Scan the literal text of a template literal up to the next hole or the
+   closing backtick. `opening` is true when the caller just consumed the opening
+   '`', false when it consumed the '}' that ended a hole.
+
+   A template is RAW: backslash is an ordinary byte and a newline is kept
+   verbatim, which is what makes SQL, regexes, paths and multi-line text
+   pleasant. The only escapes are '{{' and '}}'. A bare '}' is an error so the
+   two stay symmetric and a typo does not pass silently. */
+static void scan_tstr_chunk(Lexer *lx, Token *t, bool opening) {
+    SBuf sb;
+    sb_init(&sb);
+    for (;;) {
+        int ch = lx_getc(lx);
+        if (!ch) fatal_at(t->loc, "unterminated template literal");
+        if (ch == '{') {
+            if (lx_look(lx) == '{') { lx_getc(lx); sb_putc(&sb, '{'); continue; }
+            if (opening) {
+                if (lx->tdepth >= VT_MAX_TEMPLATE_DEPTH)
+                    fatal_at(t->loc, "template literals nested too deeply (max %d)",
+                             VT_MAX_TEMPLATE_DEPTH);
+                lx->tbrace[lx->tdepth] = 0;
+                lx->tdepth++;
+            }
+            t->kind = opening ? T_TSTR_START : T_TSTR_MID;
+            break;
+        }
+        if (ch == '}') {
+            if (lx_look(lx) == '}') { lx_getc(lx); sb_putc(&sb, '}'); continue; }
+            /* Point at the '}' itself, not the backtick: when the template was
+               never closed this is the first brace of the enclosing block, and
+               the column is the only clue to which of the two it is. */
+            Loc at = {lx->file, lx->line, lx->col - 1};
+            fatal_at(at, "unmatched '}' in template literal — write '}}' for a "
+                         "literal '}', or close the template with a backtick");
+        }
+        if (ch == '`') {
+            /* An opening backtick that reaches its close without ever opening a
+               hole is a plain literal; it never touched tdepth, so don't pop. */
+            if (opening) t->kind = T_TSTR_WHOLE;
+            else { t->kind = T_TSTR_END; lx->tdepth--; }
+            break;
+        }
+        sb_putc(&sb, (char)ch);
+    }
+    t->sval = arena_strndup(&g_arena, sb.data, sb.len);
+    t->slen = sb.len;
+    sb_free(&sb);
+}
+
 static void scan(Lexer *lx, Token *t) {
     skip_ws(lx);
     t->loc.file = lx->file;
@@ -167,12 +216,33 @@ static void scan(Lexer *lx, Token *t) {
         return;
     }
 
+    if (c == '`') {
+        lx_getc(lx);
+        scan_tstr_chunk(lx, t, true);
+        return;
+    }
+
     lx_getc(lx);
     switch (c) {
     case '(': t->kind = T_LPAREN; return;
     case ')': t->kind = T_RPAREN; return;
-    case '{': t->kind = T_LBRACE; return;
-    case '}': t->kind = T_RBRACE; return;
+    /* Inside a template hole, braces are counted so that a block or a nested
+       template does not end the hole early; only the unmatched '}' does, and it
+       resumes chunk scanning. Outside a template (tdepth == 0) both are exactly
+       as they were — this path carries every block in the language. */
+    case '{':
+        if (lx->tdepth > 0) lx->tbrace[lx->tdepth - 1]++;
+        t->kind = T_LBRACE; return;
+    case '}':
+        if (lx->tdepth > 0) {
+            if (lx->tbrace[lx->tdepth - 1] > 0) {
+                lx->tbrace[lx->tdepth - 1]--;
+                t->kind = T_RBRACE; return;
+            }
+            scan_tstr_chunk(lx, t, false); /* the '}' is already consumed */
+            return;
+        }
+        t->kind = T_RBRACE; return;
     case '[': t->kind = T_LBRACKET; return;
     case ']': t->kind = T_RBRACKET; return;
     case ',': t->kind = T_COMMA; return;
@@ -271,6 +341,8 @@ const char *tok_desc(TokKind k) {
     case T_INT: return "integer literal";
     case T_FLOAT: return "float literal";
     case T_STRING: return "string literal";
+    case T_TSTR_START: case T_TSTR_MID: case T_TSTR_END: case T_TSTR_WHOLE:
+        return "template literal";
     case T_LPAREN: return "'('"; case T_RPAREN: return "')'";
     case T_LBRACE: return "'{'"; case T_RBRACE: return "'}'";
     case T_LBRACKET: return "'['"; case T_RBRACKET: return "']'";

@@ -85,6 +85,8 @@ typedef enum ExprKind {
     EX_NEW,      /* name/cdecl + args, or map_new */
     EX_ARROW,    /* closure literal: fn_lit */
     EX_ARRAYLIT, /* args = elements */
+    EX_TSTR,     /* template literal: args alternate chunk/hole, always odd,
+                    args[even] are EX_STR chunks, args[odd] are the holes */
     EX_AS,       /* lhs as cast_type */
     EX_STRCONV,  /* checker-inserted: to-string of lhs */
 } ExprKind;

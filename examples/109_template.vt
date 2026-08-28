@@ -1,0 +1,82 @@
+// Template literals: `text {expr} text`, JavaScript style.
+//
+// A backtick string interpolates; a "..." string never does, so JSON, regexes
+// and ICU MessageFormat keep working untouched. Backticks are RAW — backslash
+// is an ordinary byte — and a newline inside one is kept verbatim, so multi-line
+// text needs no escaping. The only escapes are {{ and }}.
+//
+// The whole thing lowers to one vt_str_join: a single allocation, no matter how
+// many parts. Chained + costs one allocation per +, each recopying the prefix.
+
+class Counter {
+    n: int;
+    fn init() { this.n = 0; }
+    fn bump(): int { this.n = this.n + 1; return this.n; }
+}
+
+fn twice(x: int): int { return x * 2; }
+fn make(): string { return "fresh"; }
+
+fn main() {
+    let name = "Ada";
+    let city = "London";
+    let w = 1920;
+    let h = 1080;
+    let fps = 59.94;
+    let ok = true;
+
+    // the basics
+    print(`Hello {name}, from {city}`);
+    print(`{w}x{h} at {fps} fps`);
+    print(`ok={ok}`);
+
+    // holes are arbitrary expressions
+    print(`sum={w + h}`);
+    print(`len={name.len}`);
+    print(`upper={name.to_upper()}`);
+    print(`call={twice(21)}`);
+
+    // a hole that is already a string borrows; one that allocates is released
+    print(`borrowed={name} fresh={make()}`);
+
+    // shapes: adjacent holes, leading hole, trailing hole, no holes, empty
+    print(`{name}{city}`);
+    print(`{name} trails`);
+    print(`leads {city}`);
+    print(`no holes at all`);
+    print(`empty=[` + `` + `]`);
+
+    // {{ and }} are the brace escapes
+    print(`{{literal braces}} around {name}`);
+    print(`{{{name}}}`);
+
+    // a newline in the source is a newline in the string
+    print(`line one
+line two with {name}`);
+
+    // backslashes are raw: this prints a, backslash, n, b
+    print(`raw a\nb`);
+
+    // a "..." string inside a hole is lexed normally, so its braces and
+    // backticks are just bytes
+    let m = new Map<string, string>();
+    m.set("k", "a}b{c");
+    print(`nested string: {m.get("k")}`);
+
+    // templates nest
+    print(`outer {`inner {w}`} end`);
+
+    // postfix works on a template
+    print(`chars={`{name} of {city}`.len}`);
+
+    // holes evaluate strictly LEFT TO RIGHT — note that `+` operands go right
+    // to left (docs/strings.md), so this is a stronger guarantee, not the same
+    let c = new Counter();
+    print(`{c.bump()}{c.bump()}{c.bump()}`);
+
+    // in a loop: the parts array is function-scoped and the temps are released
+    // each statement, so this neither leaks nor grows
+    let acc = "";
+    for (let i in 0..4) { acc += `{i},`; }
+    print(acc);
+}

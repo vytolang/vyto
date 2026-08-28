@@ -720,6 +720,27 @@ VtString *vt_str_concat(VtString *a, VtString *b) {
     return s;
 }
 
+/* Join n parts in a single allocation — what a template literal lowers to.
+   Chaining vt_str_concat instead costs one allocation per part and recopies the
+   whole prefix each time; this measures once and copies once.
+
+   Parts are BORROWED: neither retained nor released. The caller owns them (the
+   emitter spills each freshly-built part into a temp it releases at the end of
+   the statement, and literal chunks are immortals). NULL counts as empty, as in
+   vt_str_concat above. */
+VtString *vt_str_join(int n, VtString **parts) {
+    int64_t total = 0;
+    for (int i = 0; i < n; i++)
+        if (parts[i]) total += parts[i]->len;
+    VtString *s = str_alloc(total);
+    char *d = s->data;
+    for (int i = 0; i < n; i++) {
+        VtString *p = parts[i];
+        if (p && p->len) { memcpy(d, p->data, (size_t)p->len); d += p->len; }
+    }
+    return s;
+}
+
 bool vt_str_eq(VtString *a, VtString *b) {
     if (a == b) return true;
     if (!a || !b) return false;

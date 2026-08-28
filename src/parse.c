@@ -366,6 +366,38 @@ static Expr *parse_primary(Parser *p) {
         e->slen = p->lx.tok.slen;
         advance(p);
         return e;
+    case T_TSTR_WHOLE:
+        /* A template with no holes is just a literal — make it one, so it gets
+           the immortal-string treatment and stays usable as a switch case value
+           and as a default argument. */
+        e = new_expr(p, EX_STR);
+        e->sval = p->lx.tok.sval;
+        e->slen = p->lx.tok.slen;
+        advance(p);
+        return e;
+    case T_TSTR_START: {
+        /* START (expr MID)* expr END — the lexer emits an empty chunk token for
+           `{a}` and for the gap in `{a}{b}`, so args comes out alternating and
+           odd-length with no padding needed here. */
+        e = new_expr(p, EX_TSTR);
+        PtrVec parts = {0};
+        for (;;) {
+            Expr *chunk = new_expr(p, EX_STR);
+            chunk->sval = p->lx.tok.sval;
+            chunk->slen = p->lx.tok.slen;
+            bool last = cur(p) == T_TSTR_END;
+            pv_push(&parts, chunk);
+            advance(p);
+            if (last) break;
+            pv_push(&parts, parse_expr(p));
+            if (cur(p) != T_TSTR_MID && cur(p) != T_TSTR_END)
+                fatal_at(ploc(p), "expected '}' to close the template hole, got %s",
+                         tok_desc(cur(p)));
+        }
+        e->args = (Expr **)parts.items;
+        e->nargs = parts.len;
+        return e;
+    }
     case T_TRUE: case T_FALSE:
         e = new_expr(p, EX_BOOL);
         e->ival = cur(p) == T_TRUE;
