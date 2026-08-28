@@ -1083,6 +1083,11 @@ int ct_derive(void *h, const char *name, int op, int a, int b) {
 
 /* ------------------------------------------------------------- group by */
 
+/* Defined with the join, which introduced them; group-by hashes keys the same
+   way so the two agree on what "the same key" means. */
+static uint32_t key_hash(const Col *c, int64_t row);
+static int key_eq(const Col *ca, int64_t a, const Col *cb, int64_t b);
+
 /* Group the visible rows by nkeys key columns; for each group compute nagg
    aggregates (aggcols[i]/aggkinds[i] = an AGG_* kind, aggargs[i] read only
    for AGG_PERCENTILE, p in 0..1). Returns a NEW CT*: the key columns (a
@@ -1093,12 +1098,12 @@ int ct_derive(void *h, const char *name, int op, int a, int b) {
    lets the DataFrame-adoption bridge on the Vyto side populate names[]/
    kinds[] purely by reflecting on the returned handle.
 
-   Never mutates the source table's view: `t->idx` is copied to a scratch
-   buffer before being sorted by the key columns (via ct_msort_buf) to cluster
-   identical keys contiguously, then a single linear scan over that scratch
-   buffer finds each group's [start,end) range via cmp_col. Each range is
-   reduced with reduce_range, which independently handles its own subrange
-   sort for the percentile/count-distinct kinds -- no second grouping pass. */
+   Never mutates the source table's view: the grouping works from a scratch
+   copy of `t->idx`, hashing each row's key to a group id and counting-sorting
+   the rows into group order so each group occupies a contiguous [start,end)
+   range. Each range is reduced with reduce_range, which independently handles
+   its own subrange sort for the percentile/count-distinct kinds -- no second
+   grouping pass. See the block below for why this hashes rather than sorts. */
 void *ct_group_by(void *h, const long long *keycols, int nkeys,
                    const long long *aggcols, const long long *aggkinds,
                    const double *aggargs, int nagg) {
@@ -1133,37 +1138,181 @@ void *ct_group_by(void *h, const long long *keycols, int nkeys,
 
     if (t->vlen == 0) return out;
 
+    /* Cluster identical keys into contiguous ranges of `grp`, then reduce each
+       range. Sorting the rows does that, but it costs O(n log n) comparisons to
+       find what is usually a handful of groups -- at 100M rows the sort was
+       ~4x the rest of the operation put together. Instead hash each row's key
+       to a group id in one linear pass, then counting-sort the rows by that id:
+       O(n), no key comparisons at all beyond one per distinct group.
+
+       Only the GROUPS are then sorted (by their representative row), so the
+       result stays ascending by key exactly as before. That sort is over the
+       distinct-key count, not the row count -- 20 elements here, not 100M.
+
+       Falls back to the comparison sort if any allocation fails, so a low
+       memory condition degrades in speed rather than returning a wrong
+       answer. */
     int32_t *grp = (int32_t *)malloc((size_t)t->vlen * sizeof(int32_t));
     if (!grp) return out;
-    memcpy(grp, t->idx, (size_t)t->vlen * sizeof(int32_t));
-    ct_msort_buf(t, grp, t->vlen, kbuf, kdirs, nkeys);
 
-    int64_t start = 0;
-    while (start < t->vlen) {
-        int64_t end = start + 1;
-        while (end < t->vlen) {
-            int diff = 0;
-            for (int i = 0; i < nkeys; i++) {
-                if (cmp_col(&t->cols[kbuf[i]], grp[start], grp[end]) != 0) { diff = 1; break; }
+    int64_t ngrp = 0;
+    int32_t *gid = (int32_t *)malloc((size_t)t->vlen * sizeof(int32_t));
+    /* The bucket array is sized to the DISTINCT-key count, not the row count:
+       grouping exists to collapse many rows into few groups, and a table sized
+       2*nrow would cost more memory than the rows themselves (1 GB at 100M
+       rows) to hold a handful of entries. Start small and grow as groups are
+       discovered -- see the rehash below. */
+    int64_t nb = 1024;
+    int32_t *head = (int32_t *)malloc((size_t)nb * sizeof(int32_t));
+    /* one representative absolute row per group, grown as groups are found */
+    int64_t repcap = 1024;
+    int32_t *rep = (int32_t *)malloc((size_t)repcap * sizeof(int32_t));
+    int32_t *gnext = (int32_t *)malloc((size_t)repcap * sizeof(int32_t));
+    uint32_t *ghash = (uint32_t *)malloc((size_t)repcap * sizeof(uint32_t));
+
+    if (gid && head && rep && gnext && ghash) {
+        for (int64_t i = 0; i < nb; i++) head[i] = -1;
+        uint32_t hmask = (uint32_t)(nb - 1);
+
+        for (int64_t i = 0; i < t->vlen && ngrp >= 0; i++) {
+            int64_t row = t->idx[i];
+            /* combine the key columns' hashes; one column is the common case */
+            uint32_t hv = 2166136261u;
+            for (int k = 0; k < nkeys; k++) {
+                uint32_t kh = key_hash(&t->cols[kbuf[k]], row);
+                hv = (hv ^ kh) * 16777619u;
             }
-            if (diff) break;
-            end++;
+            uint32_t b = hv & hmask;
+            int32_t g = head[b];
+            while (g >= 0) {
+                int same = 1;
+                for (int k = 0; k < nkeys; k++) {
+                    Col *kc = &t->cols[kbuf[k]];
+                    if (!key_eq(kc, row, kc, rep[g])) { same = 0; break; }
+                }
+                if (same) break;
+                g = gnext[g];
+            }
+            if (g < 0) {
+                if (ngrp == repcap) {
+                    int64_t nc2 = repcap * 2;
+                    int32_t *nr = (int32_t *)realloc(rep, (size_t)nc2 * sizeof(int32_t));
+                    if (nr) rep = nr;
+                    int32_t *nn = (int32_t *)realloc(gnext, (size_t)nc2 * sizeof(int32_t));
+                    if (nn) gnext = nn;
+                    uint32_t *ng = (uint32_t *)realloc(ghash, (size_t)nc2 * sizeof(uint32_t));
+                    if (ng) ghash = ng;
+                    if (!nr || !nn || !ng) { ngrp = -1; break; }
+                    repcap = nc2;
+                }
+                g = (int32_t)ngrp++;
+                rep[g] = (int32_t)row;
+                ghash[g] = hv;
+                gnext[g] = head[b];
+                head[b] = g;
+                /* Keep the load factor under 1/2; rehash from ghash[] so no key
+                   is re-read from the columns. */
+                if (ngrp * 2 > nb) {
+                    int64_t nn2 = nb * 2;
+                    int32_t *nh = (int32_t *)realloc(head, (size_t)nn2 * sizeof(int32_t));
+                    if (!nh) { ngrp = -1; break; }
+                    head = nh; nb = nn2; hmask = (uint32_t)(nb - 1);
+                    for (int64_t x = 0; x < nb; x++) head[x] = -1;
+                    for (int64_t x = 0; x < ngrp; x++) {
+                        uint32_t bb = ghash[x] & hmask;
+                        gnext[x] = head[bb];
+                        head[bb] = (int32_t)x;
+                    }
+                }
+            }
+            gid[i] = g;
         }
+    } else {
+        ngrp = -1;
+    }
 
-        ct_begin_row(out);
-        for (int i = 0; i < nkeys; i++) {
-            emit_cell(out, i, &t->cols[kbuf[i]], grp[start]);
+    if (ngrp < 0) {
+        /* allocation failed somewhere: use the comparison sort instead */
+        free(gid); free(head); free(rep); free(gnext); free(ghash);
+        memcpy(grp, t->idx, (size_t)t->vlen * sizeof(int32_t));
+        ct_msort_buf(t, grp, t->vlen, kbuf, kdirs, nkeys);
+        int64_t start = 0;
+        while (start < t->vlen) {
+            int64_t end = start + 1;
+            while (end < t->vlen) {
+                int diff = 0;
+                for (int i = 0; i < nkeys; i++) {
+                    if (cmp_col(&t->cols[kbuf[i]], grp[start], grp[end]) != 0) { diff = 1; break; }
+                }
+                if (diff) break;
+                end++;
+            }
+            ct_begin_row(out);
+            for (int i = 0; i < nkeys; i++) emit_cell(out, i, &t->cols[kbuf[i]], grp[start]);
+            for (int i = 0; i < nagg; i++) {
+                double p = aggargs ? aggargs[i] : 0.0;
+                double v = reduce_range(t, grp, start, end, (int)aggcols[i], (int)aggkinds[i], p);
+                ct_set_f64(out, nkeys + i, v);
+            }
+            ct_end_row(out);
+            start = end;
         }
-        for (int i = 0; i < nagg; i++) {
-            double p = aggargs ? aggargs[i] : 0.0;
-            double v = reduce_range(t, grp, start, end, (int)aggcols[i], (int)aggkinds[i], p);
-            ct_set_f64(out, nkeys + i, v);
+        free(grp);
+        return out;
+    }
+
+    /* Order the groups by key, so the emitted rows stay ascending as before.
+       ct_msort_buf sorts row indices, and rep[] holds one row per group, so
+       sorting a copy of rep[] orders the groups themselves. */
+    int32_t *gorder = (int32_t *)malloc((size_t)(ngrp > 0 ? ngrp : 1) * sizeof(int32_t));
+    int32_t *grank = (int32_t *)malloc((size_t)(ngrp > 0 ? ngrp : 1) * sizeof(int32_t));
+    int64_t *gstart = (int64_t *)malloc((size_t)(ngrp + 1) * sizeof(int64_t));
+    if (!gorder || !grank || !gstart) {
+        free(gorder); free(grank); free(gstart);
+        free(gid); free(head); free(rep); free(gnext); free(ghash); free(grp);
+        return out;
+    }
+    for (int64_t g = 0; g < ngrp; g++) gorder[g] = rep[g];
+    ct_msort_buf(t, gorder, ngrp, kbuf, kdirs, nkeys);
+    /* gorder[i] is a representative row; map it back to its group id via a
+       second pass over rep[] -- ngrp is small, and this keeps the mapping
+       independent of how the hash happened to number the groups. */
+    for (int64_t i = 0; i < ngrp; i++) {
+        for (int64_t g = 0; g < ngrp; g++) {
+            if (rep[g] == gorder[i]) { grank[g] = (int32_t)i; break; }
+        }
+    }
+
+    /* Counting sort the visible rows into group-rank order. */
+    for (int64_t i = 0; i <= ngrp; i++) gstart[i] = 0;
+    for (int64_t i = 0; i < t->vlen; i++) gstart[grank[gid[i]] + 1]++;
+    for (int64_t i = 0; i < ngrp; i++) gstart[i + 1] += gstart[i];
+    {
+        int64_t *fill = (int64_t *)malloc((size_t)(ngrp + 1) * sizeof(int64_t));
+        if (!fill) {
+            free(gorder); free(grank); free(gstart);
+            free(gid); free(head); free(rep); free(gnext); free(ghash); free(grp);
+            return out;
+        }
+        memcpy(fill, gstart, (size_t)(ngrp + 1) * sizeof(int64_t));
+        for (int64_t i = 0; i < t->vlen; i++) grp[fill[grank[gid[i]]]++] = t->idx[i];
+        free(fill);
+    }
+
+    for (int64_t i = 0; i < ngrp; i++) {
+        int64_t start = gstart[i], end = gstart[i + 1];
+        ct_begin_row(out);
+        for (int k = 0; k < nkeys; k++) emit_cell(out, k, &t->cols[kbuf[k]], grp[start]);
+        for (int k = 0; k < nagg; k++) {
+            double p = aggargs ? aggargs[k] : 0.0;
+            double v = reduce_range(t, grp, start, end, (int)aggcols[k], (int)aggkinds[k], p);
+            ct_set_f64(out, nkeys + k, v);
         }
         ct_end_row(out);
-
-        start = end;
     }
-    free(grp);
+
+    free(gorder); free(grank); free(gstart);
+    free(gid); free(head); free(rep); free(gnext); free(ghash); free(grp);
     return out;
 }
 
@@ -1333,6 +1482,303 @@ void *ct_join(void *h, void *other, int leftkey, int rightkey, int kind) {
     }
     jhash_free(&jh);
     return out;
+}
+
+/* ------------------------------------------------------------- csv ingest */
+
+/* Bulk CSV load, straight from file bytes into the column buffers.
+
+   The Vyto-side loader (frame.vt loadCsvWith) is correct but allocates per row:
+   a string per line, a CsvReader per record, an array per row and a string per
+   field. At 100M rows that dominates — measured ~70% of load time, none of it
+   spent on the columns. This path keeps one reusable field buffer and feeds
+   auto_feed_str/text_store directly with (ptr,len) into the read buffer, so a
+   row of N fields costs zero allocations once the columns have grown.
+
+   Field semantics match CsvReader exactly, because the two must agree on any
+   file: RFC 4180 quoting (a quoted field may hold delimiters and newlines, ""
+   is one literal quote), LF and CRLF both accepted, blank and comment lines
+   skipped, optional surrounding-space trim. An unterminated quote ends the
+   record rather than failing the load, as the Vyto reader does.
+
+   Ragged rows resolve to the widest row seen: a short row leaves its missing
+   trailing fields NULL (distinct from a present-but-empty field, which is a
+   zero-length string), and a row wider than the header grows the schema with
+   col<N>, back-filling every earlier row as NULL for it.
+
+   Reads through a fixed window rather than mmap: coltable.c depends only on
+   stdlib today, and this keeps it building unchanged on Windows and under
+   --freestanding, where <sys/mman.h> is unavailable. Sequential fread over a
+   1 MB window is not measurably slower than a mapping for a single forward
+   pass. */
+
+#define CSV_BUFSZ (1 << 20)   /* file read window */
+
+typedef struct {
+    FILE *f;
+    char *buf;          /* read window */
+    size_t len, pos;    /* bytes live in buf / cursor into it */
+    int eof;
+    char *fld;          /* reusable field accumulator (quoted fields only) */
+    size_t fcap;
+} CsvIn;
+
+/* Refill the window, preserving nothing: callers copy out anything they need
+   before advancing. Returns 0 at end of input. */
+static int csv_fill(CsvIn *in) {
+    if (in->eof) return 0;
+    size_t got = fread(in->buf, 1, CSV_BUFSZ, in->f);
+    in->len = got;
+    in->pos = 0;
+    if (got < CSV_BUFSZ) in->eof = 1;
+    return got > 0;
+}
+
+static int csv_peek(CsvIn *in) {
+    if (in->pos >= in->len && !csv_fill(in)) return -1;
+    return (unsigned char)in->buf[in->pos];
+}
+
+static int csv_get(CsvIn *in) {
+    int c = csv_peek(in);
+    if (c >= 0) in->pos++;
+    return c;
+}
+
+static int csv_reserve_fld(CsvIn *in, size_t need) {
+    if (need <= in->fcap) return 1;
+    size_t n = in->fcap ? in->fcap : 256;
+    while (n < need) n *= 2;
+    char *nb = (char *)realloc(in->fld, n);
+    if (!nb) return 0;
+    in->fld = nb; in->fcap = n;
+    return 1;
+}
+
+/* Read one field. On return, out/outn describe its bytes — either directly
+   into the read window (the common unquoted case, zero copy) or into in->fld
+   (quoted, or an unquoted field straddling a window boundary). *eor is set
+   when a line break ended the field, *eof when input ran out. */
+static int csv_field(CsvIn *in, int delim, int quote, int trim,
+                     const char **out, int32_t *outn, int *eor, int *eof) {
+    *eor = 0; *eof = 0;
+    int c = csv_peek(in);
+    if (c < 0) { *eof = 1; *out = ""; *outn = 0; return 0; }
+
+    if (trim) {
+        while ((c = csv_peek(in)) == ' ' || c == '\t') {
+            if (c == delim) break;
+            in->pos++;
+        }
+    }
+
+    if (csv_peek(in) == quote) {
+        in->pos++;                       /* opening quote */
+        size_t n = 0;
+        for (;;) {
+            c = csv_get(in);
+            if (c < 0) break;            /* unterminated: take what we have */
+            if (c == quote) {
+                if (csv_peek(in) == quote) { in->pos++; }   /* "" -> one quote */
+                else break;                                  /* closing quote */
+            }
+            if (!csv_reserve_fld(in, n + 1)) return 0;
+            in->fld[n++] = (char)c;
+        }
+        /* padding after the closing quote is padding, not content */
+        while ((c = csv_peek(in)) == ' ' || c == '\t') {
+            if (c == delim) break;
+            in->pos++;
+        }
+        *out = in->fld ? in->fld : "";
+        *outn = (int32_t)n;
+    } else {
+        /* Unquoted: hand back a pointer into the window when the field does not
+           straddle a refill, which is the overwhelmingly common case. */
+        size_t start = in->pos;
+        int spans = 0;
+        size_t n = 0;
+        for (;;) {
+            if (in->pos >= in->len) {
+                if (in->pos > start) {          /* carry the partial field out */
+                    size_t have = in->pos - start;
+                    if (!csv_reserve_fld(in, n + have)) return 0;
+                    memcpy(in->fld + n, in->buf + start, have);
+                    n += have;
+                    spans = 1;
+                }
+                if (!csv_fill(in)) break;
+                start = 0;
+                continue;
+            }
+            c = (unsigned char)in->buf[in->pos];
+            if (c == delim || c == '\n' || c == '\r') break;
+            in->pos++;
+        }
+        if (spans) {
+            size_t have = in->pos - start;
+            if (have) {
+                if (!csv_reserve_fld(in, n + have)) return 0;
+                memcpy(in->fld + n, in->buf + start, have);
+                n += have;
+            }
+            *out = in->fld ? in->fld : "";
+            *outn = (int32_t)n;
+        } else {
+            *out = in->buf + start;
+            *outn = (int32_t)(in->pos - start);
+        }
+        if (trim) {
+            const char *p = *out;
+            int32_t ln = *outn;
+            while (ln > 0 && (p[ln - 1] == ' ' || p[ln - 1] == '\t')) ln--;
+            *outn = ln;
+        }
+    }
+
+    c = csv_peek(in);
+    if (c < 0) { *eof = 1; *eor = 1; return 1; }
+    if (c == delim) { in->pos++; return 1; }
+    if (c == '\r') { in->pos++; if (csv_peek(in) == '\n') in->pos++; *eor = 1; return 1; }
+    if (c == '\n') { in->pos++; *eor = 1; return 1; }
+    return 1;
+}
+
+/* Skip blank lines and, when `comment` is nonzero, comment lines. */
+static void csv_skip_blank(CsvIn *in, int comment) {
+    for (;;) {
+        int c = csv_peek(in);
+        if (c < 0) return;
+        if (c == '\n') { in->pos++; continue; }
+        if (c == '\r') { in->pos++; if (csv_peek(in) == '\n') in->pos++; continue; }
+        if (comment && c == comment) {
+            while ((c = csv_get(in)) >= 0 && c != '\n') { }
+            continue;
+        }
+        return;
+    }
+}
+
+/* Feed one field's bytes into column `col` of the row being built. Mirrors
+   ct_set_str, minus the handle lookup — this is the inner loop.
+
+   `s` must be NUL-terminated at s[n]: parse_scalar classifies through
+   strtoll/strtod, which scan past `n` and would otherwise run into the next
+   field, so every "24.5;Lagos" would classify as text rather than a float.
+   The caller terminates in place (see ct_load_csv). */
+static void csv_store(CT *t, int col, const char *s, int32_t n) {
+    Col *c = &t->cols[col];
+    if (c->nullbits) col_set_null(c, t->nrow, t->cap, 0);
+    if (c->promotable) { auto_feed_str(c, t->nrow, t->nrow, t->cap, s, n); return; }
+    if (c->kind == CT_CAT) {
+        int code = cat_intern(c, s, n);
+        if (code >= 0) ((int32_t *)c->data)[t->nrow] = code;
+        return;
+    }
+    if (c->kind == CT_STR) { str_append(c, t->nrow, s, n); return; }
+    int64_t iv; double dv;
+    int k = parse_scalar(s, n, &iv, &dv);
+    if (k == 0) scalar_put_i(c, t->nrow, iv);
+    else if (k == 1) scalar_put_f(c, t->nrow, dv);
+}
+
+/* Load `path` into a fresh table. `hasHeader` takes column names from the first
+   record, otherwise they are col0, col1, … . Every column is CK_AUTO, so the
+   engine infers and narrows each one from the data exactly as the Vyto loader
+   does. Returns NULL if the file cannot be opened. */
+void *ct_load_csv(const char *path, int delim, int quote, int comment,
+                  int trimspace, int hasheader) {
+    if (!path) return NULL;
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+
+    CsvIn in;
+    in.f = f;
+    in.buf = (char *)malloc(CSV_BUFSZ);
+    in.len = 0; in.pos = 0; in.eof = 0;
+    in.fld = NULL; in.fcap = 0;
+    if (!in.buf) { fclose(f); return NULL; }
+
+    CT *t = (CT *)ct_new(0);
+    if (!t) { free(in.buf); fclose(f); return NULL; }
+
+    /* Pre-size from the file's byte length and the first record's width, so the
+       column buffers double a handful of times instead of log2(nrow) times. */
+    long long fsize = 0;
+    if (fseek(f, 0, SEEK_END) == 0) { fsize = ftell(f); fseek(f, 0, SEEK_SET); }
+
+    const char *fs; int32_t fn; int eor, eof;
+    int sized = 0;
+
+    if (hasheader) {
+        csv_skip_blank(&in, comment);
+        eor = 0;
+        while (!eor) {
+            if (!csv_field(&in, delim, quote, trimspace, &fs, &fn, &eor, &eof)) break;
+            char *nm = (char *)malloc((size_t)fn + 1);
+            if (nm) { memcpy(nm, fs, (size_t)fn); nm[fn] = 0; ct_add_col(t, nm, CT_AUTO); free(nm); }
+            if (eof) break;
+        }
+    }
+
+    for (;;) {
+        csv_skip_blank(&in, comment);
+        if (csv_peek(&in) < 0) break;
+
+        int col = 0;
+        int64_t rowbytes = 0;
+        eor = 0;
+        ct_begin_row(t);
+        while (!eor) {
+            if (!csv_field(&in, delim, quote, trimspace, &fs, &fn, &eor, &eof)) break;
+            rowbytes += fn + 1;
+            /* csv_store classifies through strtoll/strtod, which need a
+               terminator. The window byte just past the field is the delimiter
+               or newline we already consumed, so it is ours to stamp — except
+               at the very end of the window, where we copy out instead. */
+            if (fs >= in.buf && fs + fn < in.buf + CSV_BUFSZ) {
+                ((char *)fs)[fn] = 0;
+            } else if (fs != in.fld) {
+                if (!csv_reserve_fld(&in, (size_t)fn + 1)) break;
+                memcpy(in.fld, fs, (size_t)fn);
+                in.fld[fn] = 0;
+                fs = in.fld;
+            } else {
+                if (!csv_reserve_fld(&in, (size_t)fn + 1)) break;
+                in.fld[fn] = 0;
+                fs = in.fld;
+            }
+            if (col >= t->ncol) {
+                /* No header, or a row wider than the header: name it col<N>.
+                   ct_add_col back-fills earlier rows with a zero default, but
+                   for a load those rows had no such field at all — mark them
+                   null so a late column reads missing rather than 0/"". */
+                char nm[32];
+                snprintf(nm, sizeof nm, "col%d", col);
+                int64_t built = t->nrow;
+                int nc = ct_add_col(t, nm, CT_AUTO);
+                if (nc < 0) break;
+                for (int64_t r = 0; r < built; r++)
+                    col_set_null(&t->cols[nc], r, t->cap, 1);
+            }
+            csv_store(t, col, fs, fn);
+            col++;
+            if (eof) break;
+        }
+        /* A genuinely short row is missing, not empty. */
+        for (int c = col; c < t->ncol; c++) col_set_null(&t->cols[c], t->nrow, t->cap, 1);
+        ct_end_row(t);
+
+        if (!sized && rowbytes > 0 && fsize > 0) {
+            sized = 1;
+            ct_grow(t, fsize / rowbytes + 16);
+        }
+    }
+
+    free(in.fld);
+    free(in.buf);
+    fclose(f);
+    return t;
 }
 
 /* ------------------------------------------------------------- free */

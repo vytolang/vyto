@@ -23,9 +23,9 @@
 // thousands-of-columns scale as nrow*ncol*8, so size accordingly. The DataFrame
 // owns the native store; ARC deinit frees it once (same pattern as File).
 
-import { bufReader, file_size } from "vyto/io/file";
+import { bufReader } from "vyto/io/file";
 import { json_parse, json_each, JsonValue } from "vyto/util/json";
-import { csv_each_file_with, csv_dialect, Dialect } from "vyto/util/csv";
+import { csv_dialect, Dialect } from "vyto/util/csv";
 
 extern "C" {
     fn ct_new(ncap: i64): rawptr;
@@ -62,6 +62,8 @@ extern "C" {
     fn ct_group_by(h: rawptr, keycols: rawptr, nkeys: i32,
                     aggcols: rawptr, aggkinds: rawptr, aggargs: rawptr, nagg: i32): rawptr;
     fn ct_join(h: rawptr, other: rawptr, leftkey: i32, rightkey: i32, kind: i32): rawptr;
+    fn ct_load_csv(path: cstring, delim: i32, quote: i32, comment: i32,
+                   trimspace: i32, hasheader: i32): rawptr;
     fn ct_col_name(h: rawptr, col: i32, buf: cstring, cap: i64): i64;
     fn ct_set_null(h: rawptr, col: i32);
     fn ct_is_null(h: rawptr, vrow: i64, col: i32): i32;
@@ -357,59 +359,34 @@ export fn dataFrame(cap: int): DataFrame { return new DataFrame(cap); }
 // the first line names the columns; otherwise they are col0, col1, … . Bounded
 // memory.
 //
-// Records come from vyto/util/csv rather than line.split(","), so a quoted
-// field containing a comma, a doubled quote or a newline loads correctly — the
-// three things the old split-based reader got wrong on any file a spreadsheet
-// produced.
+// Full RFC 4180 records, not line.split(","), so a quoted field containing a
+// comma, a doubled quote or a newline loads correctly — the three things a
+// split-based reader gets wrong on any file a spreadsheet produced.
 export fn loadCsv(path: string, hasHeader: bool): DataFrame {
     return loadCsvWith(path, hasHeader, csv_dialect());
 }
 
 // loadCsv for a non-comma flavour: pass csv_tsv(), csv_semicolon(), or a
 // Dialect from csv_sniff().
+// The parse runs natively (ct_load_csv), reading file bytes straight into the
+// column buffers. The Vyto reader in vyto/util/csv is correct but allocates a
+// string per line, a reader per record and a string per field; at tens of
+// millions of rows that cost dominates the load and none of it lands in the
+// columns. The two agree on quoting, embedded newlines, CRLF, comments and
+// short/long rows — csv_each_file_with remains the right tool for streaming a
+// file you are not loading into a frame.
 export fn loadCsvWith(path: string, hasHeader: bool, d: Dialect): DataFrame {
+    let trim = 0;
+    if (d.trimSpace) { trim = 1; }
+    let head = 0;
+    if (hasHeader) { head = 1; }
+    let h = ct_load_csv(path.cstr(), d.delim as i32, d.quote as i32,
+                        d.comment as i32, trim as i32, head as i32);
     let df = new DataFrame(0);
-    let names: string[] = [];
-    // Closures capture by value, so the two pieces of mutable state ride in
-    // 1-element arrays (the json_each idiom); `df` and `names` are reference
-    // types, so mutating through them is visible without one.
-    let wantHeader = [hasHeader];
-    let sized = [false];
-    csv_each_file_with(path, d, (row) => {
-        if (wantHeader[0]) {
-            wantHeader[0] = false;
-            for (let i in 0..row.len) { names.push(row[i].trim()); }
-        } else {
-            if (df.ncol() == 0) {
-                for (let i in 0..row.len) {
-                    let nm = "col" + str(i);
-                    if (i < names.len) { nm = names[i]; }
-                    df.addColumn(nm, CK_AUTO);   // engine infers + narrows from the data
-                }
-            }
-            if (!sized[0]) {
-                sized[0] = true;
-                // Reserve from file size / first-row byte length — a rough row
-                // count, so the column buffers grow once rather than log n times.
-                let rowLen = row.len;    // one delimiter per field, plus the newline
-                for (let i in 0..row.len) { rowLen += row[i].len; }
-                let sz = file_size(path);
-                if (sz > 0 && rowLen > 0) { df.reserve(sz / rowLen + 16); }
-            }
-            append_csv_row(df, row);
-        }
-    });
+    // An unopenable file yields an empty frame rather than panicking, matching
+    // the old reader's soft failure.
+    if (h != null) { df.adopt(h); }
     return df;
-}
-
-fn append_csv_row(df: DataFrame, fields: string[]) {
-    df.beginRow();
-    let n = df.ncol();
-    for (let i in 0..n) {
-        if (i < fields.len) { df.setStr(i, fields[i]); }   // CK_AUTO classifies the field
-        else { df.setNull(i); }   // a genuinely short row -- not the same as a present-but-empty field
-    }
-    df.endRow();
 }
 
 // ---- JSON ingest ----------------------------------------------------------
