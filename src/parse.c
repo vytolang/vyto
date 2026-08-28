@@ -782,6 +782,34 @@ static FnDecl *parse_fn(Parser *p, bool is_extern) {
     return fd;
 }
 
+/* enum Color { Red, Green = 5, Blue }
+   An explicit value is any constant expression (folded by the checker); an
+   unvalued variant continues from the previous value + 1, C-style, so both a
+   plain tag set and a pinned wire protocol are spellable. */
+static EnumDecl *parse_enum(Parser *p) {
+    EnumDecl *ed = NEW(EnumDecl);
+    ed->loc = ploc(p);
+    ed->module = p->mod;
+    expect(p, T_ENUM);
+    ed->name = expect_ident(p);
+    expect(p, T_LBRACE);
+    PtrVec vars = {0};
+    while (cur(p) != T_RBRACE) {
+        EnumVariant *v = NEW(EnumVariant);
+        v->loc = ploc(p);
+        v->name = expect_ident(p);
+        if (accept(p, T_ASSIGN)) v->init = parse_expr(p);
+        pv_push(&vars, v);
+        if (!accept(p, T_COMMA)) break;
+    }
+    expect(p, T_RBRACE);
+    if (vars.len == 0) fatal_at(ed->loc, "enum '%s' has no variants", ed->name);
+    ed->nvariants = vars.len;
+    ed->variants = arena_alloc(&g_arena, sizeof(EnumVariant) * (size_t)vars.len);
+    for (int i = 0; i < vars.len; i++) ed->variants[i] = *(EnumVariant *)vars.items[i];
+    return ed;
+}
+
 static StructDecl *parse_struct(Parser *p, bool is_extern) {
     StructDecl *sd = NEW(StructDecl);
     sd->loc = ploc(p);
@@ -850,13 +878,40 @@ static ClassDecl *parse_class(Parser *p) {
             fatal_at(ploc(p), "generic base classes are not supported yet");
     }
     expect(p, T_LBRACE);
-    PtrVec fields = {0}, methods = {0};
+    PtrVec fields = {0}, methods = {0}, consts = {0};
     while (cur(p) != T_RBRACE) {
+        /* `const NAME: T = expr;` — a namespaced constant, reached as Type.NAME.
+           Folded by the checker exactly like a module const. */
+        if (cur(p) == T_CONST) {
+            Decl *cdl = NEW(Decl);
+            cdl->kind = D_CONST;
+            cdl->loc = ploc(p);
+            cdl->module = p->mod;
+            advance(p);
+            cdl->name = expect_ident(p);
+            expect(p, T_COLON);
+            cdl->const_type = parse_type(p);
+            expect(p, T_ASSIGN);
+            cdl->const_init = parse_expr(p);
+            expect(p, T_SEMI);
+            pv_push(&consts, cdl);
+            continue;
+        }
+        bool is_static = accept(p, T_STATIC);
         bool is_builder = accept(p, T_BUILDER);
         bool is_virtual = accept(p, T_VIRTUAL);
         bool is_override = !is_virtual && accept(p, T_OVERRIDE);
         if (is_builder && (is_virtual || is_override))
             fatal_at(ploc(p), "builder methods cannot be virtual/override");
+        /* A static has no receiver, so there is nothing to dispatch on. */
+        if (is_static && (is_virtual || is_override))
+            fatal_at(ploc(p), "a static method cannot be virtual/override "
+                              "(it has no receiver to dispatch on)");
+        if (is_static && is_builder)
+            fatal_at(ploc(p), "a static method cannot be a builder "
+                              "(it has no receiver to return)");
+        if (is_static && cur(p) != T_FN)
+            fatal_at(ploc(p), "expected 'fn' after 'static'");
         if (cur(p) == T_DEINIT) {
             if (is_builder) fatal_at(ploc(p), "deinit cannot be a builder");
             if (is_virtual || is_override) fatal_at(ploc(p), "deinit cannot be virtual/override");
@@ -874,8 +929,10 @@ static ClassDecl *parse_class(Parser *p) {
             m->is_virtual = is_virtual;
             m->is_override = is_override;
             m->is_builder = is_builder;
+            m->is_static = is_static;
             advance(p);
             if (cur(p) == T_INIT) {
+                if (is_static) fatal_at(ploc(p), "init cannot be static");
                 if (is_builder) fatal_at(ploc(p), "init cannot be a builder");
                 if (is_virtual || is_override) fatal_at(ploc(p), "init cannot be virtual/override");
                 advance(p);
@@ -919,6 +976,8 @@ static ClassDecl *parse_class(Parser *p) {
     for (int i = 0; i < fields.len; i++) cd->fields[i] = *(Field *)fields.items[i];
     cd->nmethods = methods.len;
     cd->methods = (FnDecl **)methods.items;
+    cd->nconsts = consts.len;
+    cd->consts = (Decl **)consts.items;
     p->typarams = save_tp; p->ntyparams = save_ntp;
     return cd;
 }
@@ -1002,6 +1061,11 @@ Module *parse_module(const char *path, const char *modname, const char *src) {
             d = new_decl(&p, D_STRUCT);
             d->sd = parse_struct(&p, false);
             d->name = d->sd->name;
+            break;
+        case T_ENUM:
+            d = new_decl(&p, D_ENUM);
+            d->ed = parse_enum(&p);
+            d->name = d->ed->name;
             break;
         case T_CLASS:
             d = new_decl(&p, D_CLASS);

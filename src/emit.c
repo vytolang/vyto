@@ -63,6 +63,7 @@ static void mangle_into(SBuf *sb, Type *t) {
         for (int i = 0; i < t->nparams; i++) { sb_printf(sb, "_"); mangle_into(sb, t->params[i]); }
         sb_printf(sb, "_r_"); mangle_into(sb, t->ret); sb_printf(sb, "_E");
         return;
+    case TY_ENUM: sb_printf(sb, "e_%s", t->edecl->name); return;
     case TY_STRUCT: {
         StructDecl *sd = t->sdecl;
         if (sd->generic_origin) {
@@ -139,6 +140,7 @@ static const char *c_type(Type *t) {
     case TY_ARRAY: return "VtArray*";
     case TY_MAP: return "VtMap*";
     case TY_FN: return "VtClosure*";
+    case TY_ENUM: return "int64_t";   /* an enum is an int at runtime */
     case TY_STRUCT: return struct_cname(t->sdecl);
     case TY_CLASS: return arena_printf(&g_arena, "%s*", class_cname(t->cdecl));
     case TY_NAMED: case TY_TYPARAM: break;
@@ -548,6 +550,35 @@ static char *emit_call(Em *em, Expr *e, bool *fresh) {
         Expr **a = e->args;
         Expr *recv = e->lhs && e->lhs->kind == EX_MEMBER ? e->lhs->lhs : NULL;
         switch ((BuiltinKind)e->builtin) {
+        case B_ENUM_NAME: {
+            /* One lookup function per enum, written into aux on first use, so an
+               enum whose name is never asked for costs nothing in the binary.
+               The strings are immortal (rc = -1), so the result is borrowed and
+               there is nothing to release. */
+            EnumDecl *ed = recv->type->edecl;
+            if (!ed->name_tbl_emitted) {
+                ed->name_tbl_emitted = true;
+                SBuf *ax = em->aux;
+                sb_printf(ax, "static VtString* v_enm_%s_%s_name(int64_t v) {\n",
+                          ed->module->name, ed->name);
+                sb_printf(ax, "    static VtString* _n[%d];\n", ed->nvariants);
+                sb_printf(ax, "    switch (v) {\n");
+                for (int i = 0; i < ed->nvariants; i++) {
+                    const char *vn = ed->variants[i].name;
+                    sb_printf(ax, "    case %lldLL: return _n[%d] ? _n[%d] "
+                                  ": (_n[%d] = vt_str_immortal(\"%s\", %d));\n",
+                              (long long)ed->variants[i].value, i, i, i,
+                              c_escape(vn, strlen(vn)), (int)strlen(vn));
+                }
+                sb_printf(ax, "    }\n");
+                /* Unreachable for a value that came from a variant; a value cast
+                   in from an int in a release build can land here. */
+                sb_printf(ax, "    return vt_str_immortal(\"?\", 1);\n}\n");
+            }
+            *fresh = false;   /* immortal: borrowed, nothing to release */
+            return arena_printf(&g_arena, "v_enm_%s_%s_name(%s)",
+                                ed->module->name, ed->name, ex_b(em, recv));
+        }
         case B_PRINT:
             *fresh = false;
             return arena_printf(&g_arena, "vt_print(%s)", ex_b(em, a[0]));
@@ -907,6 +938,14 @@ static char *emit_call(Em *em, Expr *e, bool *fresh) {
         FnDecl *fd = e->decl->fn;
         return arena_printf(&g_arena, "%s(%s)", fn_cname(fd),
                             args_list(em, e->args, e->nargs, fd->params, NULL));
+    }
+
+    /* A class static has no receiver and cannot be virtual, so it is a plain
+       direct call — the same C a module-level fn produces. */
+    if (e->ref == REF_STATIC_FN) {
+        FnDecl *sm = e->method;
+        return arena_printf(&g_arena, "%s(%s)", fn_cname(sm),
+                            args_list(em, e->args, e->nargs, sm->params, NULL));
     }
 
     if (e->ref == REF_METHOD) {
@@ -1269,6 +1308,25 @@ static char *ex(Em *em, Expr *e, bool *fresh) {
         }
         if (src->kind == TY_ARRAY) /* byte[] as cstring/rawptr: borrowed buffer view */
             return arena_printf(&g_arena, "((%s)vt_arr_data(%s))", c_type(dst), ex_b(em, e->lhs));
+        /* int -> enum: the value may have come from C or a file, so a debug
+           build checks it really names a variant. The comparison chain is
+           emitted inline rather than calling a runtime helper, so a sparse or
+           explicitly-valued enum needs no table. Compiles away in --release. */
+        if (g_checks && dst->kind == TY_ENUM && type_is_int(src)) {
+            EnumDecl *ed = dst->edecl;
+            const char *tv = newtemp(em, dst, false);
+            SBuf sb;
+            sb_init(&sb);
+            sb_printf(&sb, "(%s = %s, (", tv, ex_b(em, e->lhs));
+            for (int i = 0; i < ed->nvariants; i++)
+                sb_printf(&sb, "%s%s == %lldLL", i ? " || " : "", tv,
+                          (long long)ed->variants[i].value);
+            sb_printf(&sb, ") ? %s : vt_ck_enum(%s, \"%s\", \"%s\", %d))", tv, tv,
+                      ed->name, c_escape(e->loc.file, strlen(e->loc.file)), e->loc.line);
+            char *out = arena_strdup(&g_arena, sb.data);
+            sb_free(&sb);
+            return out;
+        }
         return arena_printf(&g_arena, "((%s)(%s))", c_type(dst), ex_b(em, e->lhs));
     }
     case EX_STRCONV:
@@ -2064,7 +2122,8 @@ static char *fn_proto(FnDecl *fd, bool with_names) {
     sb_init(&sb);
     sb_printf(&sb, "%s %s(", c_type(fd->ret), fn_cname(fd));
     bool first = true;
-    if (fd->owner) {
+    /* A static belongs to a class for naming only: no receiver, so no self. */
+    if (fd->owner && !fd->is_static) {
         sb_printf(&sb, "%s* self", class_cname(fd->owner));
         first = false;
     } else if (fd->sowner) {

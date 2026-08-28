@@ -91,10 +91,60 @@ class Circle extends Shape {
   three-level hierarchy's leaf class carries every ancestor's virtual slots.
 
 Inheritance is **single** — one `extends`, no interfaces or traits to
-declare. See §7 for how Vyto gets interface-like polymorphism (`for-in`)
+declare. See §10 for how Vyto gets interface-like polymorphism (`for-in`)
 without either.
 
-## 4. `super`
+## 4. `static` members and class constants
+
+A class can hold members reached through the *type* rather than an instance —
+namespacing, with no runtime cost of any kind:
+
+```js
+class Vec2 {
+    x: float;
+    y: float;
+    const DIMS: int = 2;
+    const NAME: string = "vec2";
+
+    static fn dot(a: Vec2, b: Vec2): float { return a.x * b.x + a.y * b.y; }
+    static fn origin(): Vec2 { return new Vec2(0.0, 0.0); }
+
+    fn init(x: float, y: float) { this.x = x; this.y = y; }
+    fn len2(): float { return Vec2.dot(this, this); }
+}
+
+let d = Vec2.dot(p, q);
+let n = Vec2.DIMS;
+```
+
+**A static method compiles to a direct C call** — no receiver, no `this`
+parameter, no vtable lookup. It is byte-for-byte the same call a module-level
+`fn` produces; the class name is purely a namespace. A **class constant** folds
+to a literal at compile time and does not exist at runtime at all.
+
+The rules follow from having no receiver:
+
+- `this` inside a `static fn` is an error — take the value as a parameter.
+- A static cannot be `virtual` or `override`: there is nothing to dispatch on.
+- A static cannot be a `builder`: there is no receiver to return.
+- Both are reached **only** as `Type.member`, never bare inside the class body.
+- A static is found on a base class too, by plain lexical lookup up the parent
+  chain — `Sub.tag()` finds `Base`'s `tag`.
+
+Calling an instance method through the class name is an error that says so:
+
+```
+K.m()   // error: 'm' is an instance method of 'K'; call it on a value,
+        //        or declare it 'static'
+```
+
+**Mutable static properties do not exist**, deliberately. Vyto has no mutable
+global state anywhere — module-level `let` is rejected too — so there is no
+cross-module initialization order to reason about, nothing for `fork()`-based
+workers to share by accident, and no ref-counted global with no scope to be
+released at.
+
+## 5. `super`
 
 Two distinct forms, both resolved statically (not through the vtable) so
 neither one can recurse back into an override:
@@ -121,7 +171,7 @@ base class"` / `"base class has no method '%s'"`), and neither is currently
 usable inside a closure — call the base method outside it and pass the
 result in instead (`src/check.c:1304-1306`).
 
-## 5. `builder` methods
+## 6. `builder` methods
 
 A method declared `builder` always returns `this`, typed as the **receiver's
 concrete type at the call site** — not the declaring class — so a chain
@@ -149,7 +199,7 @@ let p = new Panel("root").add(new Node("a")).spacing(8);   // .add is Node's,
 return statement is allowed (`src/check.c:2723-2725`) — and it can't declare
 a return type or be `virtual`/`override` (`src/parse.c:826-862`).
 
-## 6. `deinit` and teardown order
+## 7. `deinit` and teardown order
 
 `deinit` runs deterministically, the moment the last strong reference drops
 — there's no GC pause and no finalizer queue. The generated destructor runs,
@@ -164,7 +214,7 @@ So a field is still valid for reading throughout your own `deinit` body, and
 you never write field cleanup by hand — only whatever *other* side effect
 (closing a file handle, logging) belongs in the body.
 
-## 7. `weak` — breaking reference cycles
+## 8. `weak` — breaking reference cycles
 
 Vyto has **no cycle collector**: a strong reference cycle (parent ↔ child,
 observer stored back onto its subject) leaks silently, with nothing to catch
@@ -185,7 +235,7 @@ follows this consistently — `parent: weak Widget`, `win: weak Window`,
 See [`docs/memory.md`](memory.md) §3 for the closure/bound-method variant of
 this same cycle and the full refcounting model.
 
-## 8. Checked downcasts
+## 9. Checked downcasts
 
 ```js
 let shapes: Shape[] = [new Circle(1.0)];
@@ -198,7 +248,7 @@ instance isn't actually a `Circle` or subclass — it's a real runtime check,
 not a reinterpret cast. Upcasting (subclass → ancestor) is free — a plain C
 pointer cast, no check needed, since it can't fail.
 
-## 9. Duck-typed iteration: `len()` / `at()`
+## 10. Duck-typed iteration: `len()` / `at()`
 
 There's no iterator interface to implement. A class with `fn len(): int` and
 `fn at(i: int): T` can be used directly in `for (let x in c)` — the compiler
@@ -235,7 +285,7 @@ This is deliberately name-based, not a declared trait, so a class written
 before this feature existed becomes iterable retroactively just by having
 the right two method names.
 
-## 10. Generic classes
+## 11. Generic classes
 
 ```js
 class Box<T> {
@@ -245,13 +295,13 @@ class Box<T> {
 ```
 
 Monomorphized like generic structs and functions (see
-[`docs/types.md`](types.md) §10) — one restriction specific to classes: a
+[`docs/types.md`](types.md) §11) — one restriction specific to classes: a
 generic class's base, if it has one, **must be non-generic**
 (`src/check.c:1027-1028`, `"generic base classes are not supported yet"`).
 `class Derived<T> extends Base<T>` doesn't work yet; `class Derived<T>
 extends Base` (a concrete, non-generic `Base`) does.
 
-## 11. Arena-allocated instances
+## 12. Arena-allocated instances
 
 `new@name ClassName(...)` (or bare `new` inside an `arena { }` block)
 bump-allocates the instance in that lexical region instead of the normal
@@ -280,7 +330,7 @@ avoid — everyday classes should just use `new`. See
 compile-time escape checks, and §5 for the bulk-allocation trap arenas are
 meant to solve.
 
-## 12. What classes are *not* for
+## 13. What classes are *not* for
 
 FFI structs — a Vyto type whose layout matches a C struct exactly — are
 `struct`, always, even if you'd reach for a class in ordinary code. See

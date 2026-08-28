@@ -11,6 +11,7 @@ typedef struct Module Module;
 typedef struct FnDecl FnDecl;
 typedef struct ClassDecl ClassDecl;
 typedef struct StructDecl StructDecl;
+typedef struct EnumDecl EnumDecl;
 
 /* ---------------- types ---------------- */
 
@@ -21,6 +22,7 @@ typedef enum TypeKind {
     TY_STRING, TY_CSTRING, TY_RAWPTR, TY_NULL,
     TY_TYPARAM, /* reference to an in-scope generic type parameter; ->name */
     TY_NAMED,   /* unresolved identifier, resolved by checker */
+    TY_ENUM,    /* ->edecl; an int at runtime, distinct to the checker */
     TY_STRUCT,  /* ->sdecl */
     TY_CLASS,   /* ->cdecl; ->weak flag on reference site */
     TY_ARRAY,   /* ->elem */
@@ -46,6 +48,7 @@ struct Type {
     Loc loc;
     StructDecl *sdecl;
     ClassDecl *cdecl;
+    EnumDecl *edecl;
 };
 
 static inline bool type_is_ref(const Type *t) {
@@ -95,6 +98,7 @@ typedef enum {
     /* resolved meaning of an EX_IDENT / EX_MEMBER / EX_CALL, set by checker */
     REF_NONE, REF_LOCAL, REF_PARAM, REF_GLOBAL_FN, REF_CONST, REF_FIELD,
     REF_METHOD, REF_BUILTIN, REF_CAPTURE, REF_EXTERN_FN,
+    REF_STATIC_FN,          /* class static: ->method, direct call, no receiver */
     REF_METHOD_VAL, /* obj.method as a value: closure bound to obj */
 } RefKind;
 
@@ -136,6 +140,7 @@ struct Expr {
 typedef enum BuiltinKind {
     B_NONE, B_PRINT, B_PANIC, B_STR,
     B_LEN,          /* .len on string/array/map */
+    B_ENUM_NAME,    /* .name() on an enum value */
     B_PUSH, B_POP,  /* array */
     B_MAP_SET, B_MAP_GET, B_MAP_HAS, B_MAP_REMOVE,
     B_CSTR,         /* string.cstr() */
@@ -185,6 +190,9 @@ typedef enum StmtKind {
 
 /* One arm of a switch. `nvalues == 0 && is_default` is the default arm; the
    values of a multi-value arm (`case 2, 3:`) all run the same body. */
+/* Set by the checker when a switch over an enum covers every variant: such a
+   switch is total, so it counts as returning on every path even with no
+   default arm. */
 typedef struct SwitchArm {
     Loc loc;
     Expr **values;
@@ -220,6 +228,7 @@ struct Stmt {
     /* switch: subject is `expr` */
     SwitchArm *arms;
     int narms;
+    bool switch_total;         /* checker: enum switch covering every variant */
     int region;                /* ST_ARENA: region id assigned by checker (names _rgn<id>) */
 };
 
@@ -248,6 +257,7 @@ struct FnDecl {
     Stmt **body;
     int nbody;
     bool is_virtual, is_override, is_extern, is_builder;
+    bool is_static;         /* class static: no receiver, direct call */
     ClassDecl *owner;       /* method owner, NULL for free fn */
     StructDecl *sowner;     /* struct method owner, NULL otherwise */
     Module *module;
@@ -291,6 +301,25 @@ typedef struct Field {
     ClassDecl *owner_class; /* defining class (for casts), set by checker */
 } Field;
 
+/* An enum is an int at runtime; the checker keeps it a distinct type. Variants
+   carry an explicit value or continue from the previous one + 1, C-style, so a
+   wire protocol's numbers can be pinned. */
+typedef struct EnumVariant {
+    const char *name;
+    Expr *init;         /* explicit `= expr`, NULL to continue from the previous */
+    int64_t value;      /* filled by the checker */
+    Loc loc;
+} EnumVariant;
+
+struct EnumDecl {
+    const char *name;
+    Loc loc;
+    EnumVariant *variants;
+    int nvariants;
+    Module *module;
+    bool name_tbl_emitted;  /* emit: the .name() lookup is written once, on first use */
+};
+
 struct StructDecl {
     const char *name;
     Loc loc;
@@ -321,6 +350,10 @@ struct ClassDecl {
     int nfields;
     FnDecl **methods;
     int nmethods;
+    /* `const NAME: T = expr;` in a class body — namespaced constants, reached
+       only as Type.NAME. Folded exactly like a module const. */
+    Decl **consts;
+    int nconsts;
     FnDecl *ctor;           /* init */
     Stmt **deinit_body;
     int ndeinit;
@@ -339,7 +372,7 @@ struct ClassDecl {
 };
 
 typedef enum DeclKind {
-    D_FN, D_STRUCT, D_CLASS, D_CONST, D_IMPORT, D_EXTERN_FN, D_LINK,
+    D_FN, D_STRUCT, D_CLASS, D_ENUM, D_CONST, D_IMPORT, D_EXTERN_FN, D_LINK,
 } DeclKind;
 
 struct Decl {
@@ -350,6 +383,7 @@ struct Decl {
     FnDecl *fn;             /* D_FN, D_EXTERN_FN */
     StructDecl *sd;         /* D_STRUCT */
     ClassDecl *cd;          /* D_CLASS */
+    EnumDecl *ed;           /* D_ENUM */
     Type *const_type;       /* D_CONST */
     Expr *const_init;
     int fold_state;         /* D_CONST folding: 0 none, 1 in-progress, 2 done */

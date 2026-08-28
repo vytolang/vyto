@@ -1,0 +1,108 @@
+// Enums and static members.
+//
+// An enum is a distinct type that is an int at runtime — one machine word, no
+// allocation, no refcount. Variants are reached as `Color.Red`, never bare, so
+// they cannot collide with anything.
+//
+// The point is exhaustiveness: a `switch` over an enum must handle every
+// variant or say `default`. Adding a variant later breaks every switch that
+// forgot it, which is exactly what a group of `const int` tags cannot do.
+//
+// Class statics are the same idea for namespacing: `Vec2.dot(a, b)` is a plain
+// direct C call, no receiver and no vtable, identical to a module-level fn.
+
+enum Color { Red, Green, Blue }
+
+// Values can be pinned, so a wire protocol's numbers survive reordering.
+// An unvalued variant continues from the previous one + 1, C-style.
+enum PgMsg { Auth = 82, BackendKey = 75, Ready = 90 }
+enum Mixed { A, B = 10, C, D = 3 }
+
+class Vec2 {
+    x: float;
+    y: float;
+    const DIMS: int = 2;
+    const NAME: string = "vec2";
+
+    static fn dot(a: Vec2, b: Vec2): float { return a.x * b.x + a.y * b.y; }
+    static fn origin(): Vec2 { return new Vec2(0.0, 0.0); }
+
+    fn init(x: float, y: float) { this.x = x; this.y = y; }
+    fn len2(): float { return Vec2.dot(this, this); }   // static from an instance method
+}
+
+class Base {
+    static fn tag(): string { return "base"; }
+    fn init() {}
+}
+class Sub extends Base {
+    fn init() {}
+}
+
+// An exhaustive switch is total, so this returns on every path with no default.
+fn describe(c: Color): string {
+    switch (c) {
+        case Color.Red:   { return "red"; }
+        case Color.Green: { return "green"; }
+        case Color.Blue:  { return "blue"; }
+    }
+}
+
+fn main() {
+    // variants and ordinals
+    print(`red={Color.Red as int} green={Color.Green as int} blue={Color.Blue as int}`);
+
+    // explicit and continued values
+    print(`auth={PgMsg.Auth as int} key={PgMsg.BackendKey as int}`);
+    print(`mixed={Mixed.A as int},{Mixed.B as int},{Mixed.C as int},{Mixed.D as int}`);
+
+    // exhaustive switch, no default needed
+    print(describe(Color.Red) + " " + describe(Color.Green) + " " + describe(Color.Blue));
+
+    // a switch with default need not be exhaustive
+    let c = Color.Blue;
+    switch (c) {
+        case Color.Red: { print("was red"); }
+        default:        { print("was not red"); }
+    }
+
+    // sparse values switch fine — C handles non-contiguous cases natively
+    let m = PgMsg.Ready;
+    switch (m) {
+        case PgMsg.Auth:       { print("auth"); }
+        case PgMsg.BackendKey: { print("key"); }
+        case PgMsg.Ready:      { print("ready"); }
+    }
+
+    // equality, same enum only
+    print(`eq={Color.Red == Color.Red} ne={Color.Red != Color.Blue}`);
+
+    // enums are distinct types: a Color is not an int and not a Level
+    let k: Color = Color.Green;
+    print(`k={k as int}`);
+
+    // an int becomes an enum only through an explicit cast, range-checked in
+    // debug builds because the value may have come from C or a file
+    let raw = 2;
+    let back = raw as Color;
+    print("back " + describe(back));
+
+    // an enum as an array index, via `as int`
+    let names = ["Red", "Green", "Blue"];
+    print("name " + names[Color.Green as int]);
+
+    // .name() on a value, count() on the type. The name table is emitted once
+    // per enum and only if something asks, so an enum nobody names costs
+    // nothing; the strings are immortal, so nothing allocates per call.
+    print(`name={Color.Blue.name()} count={Color.count()}`);
+    print(`pinned={PgMsg.Auth.name()} of {PgMsg.count()}`);
+
+    // class statics: constants and methods
+    let p = new Vec2(3.0, 4.0);
+    print(`dot={Vec2.dot(p, p)} len2={p.len2()}`);
+    print(`dims={Vec2.DIMS} name={Vec2.NAME}`);
+    print(`origin.x={Vec2.origin().x}`);
+
+    // a static is found on a base class too
+    print("inherited " + Sub.tag());
+}

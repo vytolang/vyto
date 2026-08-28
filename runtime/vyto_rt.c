@@ -591,6 +591,15 @@ static void vt_div_zero(const char *file, int line, const char *op) {
     vt_panic_c(file, line, msg);
 }
 
+/* `n as SomeEnum` in a debug build: the caller has already compared v against
+   every variant inline, so reaching here means it names none of them. */
+int64_t vt_ck_enum(int64_t v, const char *ename, const char *file, int line) {
+    char msg[96];
+    vt_snprintf(msg, sizeof msg, "%lld is not a variant of enum '%s'", (long long)v, ename);
+    vt_panic_c(file, line, msg);
+    return v;
+}
+
 /* Signed divide/modulo: trap zero divisor (would SIGFPE) and the INT_MIN/-1
    overflow (C UB), then range-check the quotient against the target type. */
 int64_t vt_ck_div(int64_t a, int64_t b, int64_t lo, int64_t hi, const char *file, int line) {

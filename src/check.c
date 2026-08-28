@@ -27,6 +27,7 @@ static TypeKind norm_kind(TypeKind k) {
 bool type_identical(const Type *a, const Type *b) {
     if (norm_kind(a->kind) != norm_kind(b->kind)) return false;
     switch (a->kind) {
+    case TY_ENUM: return a->edecl == b->edecl;
     case TY_STRUCT: return a->sdecl == b->sdecl;
     case TY_CLASS: return a->cdecl == b->cdecl;
     case TY_TYPARAM: return a->name == b->name;
@@ -51,6 +52,7 @@ static const char *type_str(const Type *t) {
     case TY_U8: return "u8"; case TY_U16: return "u16"; case TY_U32: return "u32"; case TY_U64: return "u64";
     case TY_CLONG: return "clong"; case TY_CULONG: return "culong";
     case TY_F32: return "f32"; case TY_F64: return "f64";
+    case TY_ENUM: return t->edecl->name;
     case TY_STRUCT: return t->sdecl->name;
     case TY_CLASS: return t->cdecl->name;
     case TY_ARRAY: return arena_printf(&g_arena, "%s[]", type_str(t->elem));
@@ -160,7 +162,7 @@ static Decl *mod_lookup_own(Module *m, const char *name) {
     for (int i = 0; i < m->ndecls; i++) {
         Decl *d = m->decls[i];
         switch (d->kind) {
-        case D_FN: case D_STRUCT: case D_CLASS: case D_CONST: case D_EXTERN_FN:
+        case D_FN: case D_STRUCT: case D_CLASS: case D_ENUM: case D_CONST: case D_EXTERN_FN:
             if (d->name == name) return d;
             break;
         default: break;
@@ -225,6 +227,10 @@ static void resolve_type(Type *t, Module *m) {
                 t->kind = TY_CLASS; t->cdecl = inst;
             } else { t->kind = TY_CLASS; t->cdecl = d->cd; }
         }
+        else if (d->kind == D_ENUM) {
+            if (t->nparams > 0) fatal_at(t->loc, "'%s' is not a generic type", t->name);
+            t->kind = TY_ENUM; t->edecl = d->ed;
+        }
         else fatal_at(t->loc, "'%s' is not a type", t->name);
         break;
     }
@@ -275,6 +281,8 @@ static bool valid_extern_field(const Type *t) {
     }
 }
 
+static void resolve_enum(EnumDecl *ed, Module *m);
+
 static void resolve_module_sigs(Module *m) {
     for (int i = 0; i < m->ndecls; i++) {
         Decl *d = m->decls[i];
@@ -285,6 +293,9 @@ static void resolve_module_sigs(Module *m) {
             break;
         case D_CONST:
             resolve_type(d->const_type, m);
+            break;
+        case D_ENUM:
+            resolve_enum(d->ed, m);
             break;
         case D_STRUCT: {
             StructDecl *sd = d->sd;
@@ -1440,6 +1451,24 @@ static void check_closure_call(Ctx *c, Expr *e, Type *fnty) {
     e->type = fnty->ret;
 }
 
+/* Find a static method on cd or any ancestor. Statics are not dispatched, so
+   this is plain lexical lookup up the parent chain. */
+static FnDecl *class_find_static(ClassDecl *cd, const char *name) {
+    for (ClassDecl *k = cd; k; k = k->parent)
+        for (int i = 0; i < k->nmethods; i++)
+            if (k->methods[i]->name == name && k->methods[i]->is_static)
+                return k->methods[i];
+    return NULL;
+}
+
+/* Likewise for a class constant. */
+static Decl *class_find_const(ClassDecl *cd, const char *name) {
+    for (ClassDecl *k = cd; k; k = k->parent)
+        for (int i = 0; i < k->nconsts; i++)
+            if (k->consts[i]->name == name) return k->consts[i];
+    return NULL;
+}
+
 static Type *check_call(Ctx *c, Expr *e, Type *expected) {
     if (e->is_super_call && e->name != intern("init")) {
         /* super.<method>(...): call the base implementation directly, so an
@@ -1675,8 +1704,50 @@ static Type *check_call(Ctx *c, Expr *e, Type *expected) {
     }
 
     if (callee->kind == EX_MEMBER) {
+        /* `MyClass.staticFn(...)` — the base names a class, not a value, so this
+           runs before the receiver below would be evaluated as one. */
+        if (callee->lhs->kind == EX_IDENT && !lookup_value(c, callee->lhs, callee->lhs->name)) {
+            Decl *td = mod_lookup(c->mod, callee->lhs->name);
+            if (td && td->kind == D_ENUM) {
+                /* Color.count() — how many variants. A compile-time literal;
+                   the enum itself never reaches runtime. */
+                if (callee->name != intern("count"))
+                    fatal_at(e->loc, "enum '%s' has no static method '%s' "
+                                     "(only count(); .name() is called on a value)",
+                             td->ed->name, callee->name);
+                if (e->nargs != 0) fatal_at(e->loc, "count() takes no arguments");
+                e->kind = EX_INT;
+                e->ival = td->ed->nvariants;
+                return e->type = ty_int();
+            }
+            if (td && td->kind == D_CLASS) {
+                FnDecl *sm = class_find_static(td->cd, callee->name);
+                if (sm) {
+                    e->ref = REF_STATIC_FN;
+                    e->method = sm;
+                    e->cls = td->cd;
+                    check_args_against(c, e, sm->params, sm->nparams, callee->name);
+                    return e->type = sm->ret;
+                }
+                if (class_find_method(td->cd, callee->name))
+                    fatal_at(e->loc, "'%s' is an instance method of '%s'; "
+                                     "call it on a value, or declare it 'static'",
+                             callee->name, td->cd->name);
+                fatal_at(e->loc, "class '%s' has no static method '%s'",
+                         td->cd->name, callee->name);
+            }
+        }
         Type *recv = check_expr(c, callee->lhs, NULL);
         require_nonnull(c, callee->lhs, recv, "calling a method on it");
+        if (recv->kind == TY_ENUM) {
+            if (callee->name != intern("name"))
+                fatal_at(e->loc, "enum '%s' has no method '%s' (only .name())",
+                         recv->edecl->name, callee->name);
+            if (e->nargs != 0) fatal_at(e->loc, "name() takes no arguments");
+            e->ref = REF_BUILTIN;
+            e->builtin = B_ENUM_NAME;
+            return e->type = ty_string();
+        }
         const char *n = callee->name;
         /* builtin methods are positional-only; class/struct methods below keep
            named-argument support via check_args_against */
@@ -2148,6 +2219,62 @@ static Type *check_call(Ctx *c, Expr *e, Type *expected) {
 }
 
 static Type *check_member(Ctx *c, Expr *e) {
+    /* `Type.member` — an enum variant, a class static or a class constant. The
+       base names a *declaration*, not a value, so this has to run before
+       check_expr below, which would report "unknown name 'Color'". Mirrors how
+       the D_CONST paths resolve a name to its decl rather than evaluating it. */
+    if (e->lhs->kind == EX_IDENT && !lookup_value(c, e->lhs, e->lhs->name)) {
+        Decl *td = mod_lookup(c->mod, e->lhs->name);
+        if (td && td->kind == D_ENUM) {
+            EnumDecl *ed = td->ed;
+            for (int i = 0; i < ed->nvariants; i++)
+                if (ed->variants[i].name == e->name) {
+                    /* fold to the ordinal: an enum is an int at runtime */
+                    e->kind = EX_INT;
+                    e->ival = ed->variants[i].value;
+                    Type *t = mk_type(TY_ENUM);
+                    t->edecl = ed;
+                    return e->type = t;
+                }
+            fatal_at(e->loc, "enum '%s' has no variant '%s'", ed->name, e->name);
+        }
+        if (td && td->kind == D_CLASS) {
+            ClassDecl *cd = td->cd;
+            Decl *kd = class_find_const(cd, e->name);
+            if (kd) {
+                /* Substitute the initializer in place, the way an enum variant
+                   folds to its ordinal. A class const is pure namespacing, so
+                   nothing about it needs to reach the emitter. */
+                resolve_type(kd->const_type, c->mod);
+                Expr *lit = kd->const_init;
+                if (lit->kind == EX_INT || lit->kind == EX_FLOAT || lit->kind == EX_STR ||
+                    lit->kind == EX_BOOL) {
+                    e->kind = lit->kind;
+                    e->ival = lit->ival; e->fval = lit->fval;
+                    e->sval = lit->sval; e->slen = lit->slen;
+                    return e->type = kd->const_type;
+                }
+                const char *save = g_fold_what;
+                g_fold_what = "class constant";
+                CVal cv = fold_const_expr(c->mod, lit);
+                g_fold_what = save;
+                if (cv.kind == 0) { e->kind = EX_INT; e->ival = cv.i; }
+                else if (cv.kind == 1) { e->kind = EX_FLOAT; e->fval = cv.f; }
+                else { e->kind = EX_BOOL; e->ival = cv.i != 0; }
+                return e->type = kd->const_type;
+            }
+            FnDecl *sm = class_find_static(cd, e->name);
+            if (sm) {
+                e->ref = REF_STATIC_FN;
+                e->method = sm;
+                e->cls = cd;
+                return e->type = fn_type_of(sm);
+            }
+            fatal_at(e->loc, "class '%s' has no static member '%s' "
+                             "(instance members are reached through a value)",
+                     cd->name, e->name);
+        }
+    }
     Type *recv = check_expr(c, e->lhs, NULL);
     require_nonnull(c, e->lhs, recv, "reading a member");
     const char *n = e->name;
@@ -2276,6 +2403,9 @@ static Type *check_expr(Ctx *c, Expr *e, Type *expected) {
             fatal_at(e->loc, "closures cannot capture 'this' in v0.1 "
                              "(bind it first: `let self = this;` outside the closure, "
                              "then use `self`)");
+        if (c->fn && c->fn->is_static)
+            fatal_at(e->loc, "'this' in a static method (a static has no receiver) "
+                             "— take the value as a parameter instead");
         if (!c->cls && !(c->fn && c->fn->sowner))
             fatal_at(e->loc, "'this' outside a method");
         Local *l = scope_find(c->scope, intern("this"));
@@ -2417,7 +2547,8 @@ static Type *check_expr(Ctx *c, Expr *e, Type *expected) {
             if (type_identical(lt, rt) &&
                 (type_is_num(lt) || lt->kind == TY_BOOL || lt->kind == TY_STRING ||
                  lt->kind == TY_CLASS || lt->kind == TY_CSTRING || lt->kind == TY_RAWPTR ||
-                 lt->kind == TY_FN || lt->kind == TY_ARRAY || lt->kind == TY_MAP))
+                 lt->kind == TY_FN || lt->kind == TY_ARRAY || lt->kind == TY_MAP ||
+                 lt->kind == TY_ENUM))   /* same enum only; type_identical compares edecl */
                 ok = true;
             if (lt->kind == TY_NULL || rt->kind == TY_NULL) {
                 Type *other = lt->kind == TY_NULL ? rt : lt;
@@ -2616,6 +2747,16 @@ static Type *check_expr(Ctx *c, Expr *e, Type *expected) {
                 fatal_at(e->loc, "unrelated classes %s and %s", type_str(src), type_str(dst));
             return e->type = dst;
         }
+        /* An enum is an int underneath, so both directions are legal but must
+           be explicit: outbound for FFI and array indexing, inbound because the
+           value may come from C or a file and is not trusted to be a variant.
+           The inbound direction is range-checked in debug builds (see emit). */
+        if (src->kind == TY_ENUM && type_is_num(dst)) return e->type = dst;
+        if (type_is_int(src) && dst->kind == TY_ENUM) return e->type = dst;
+        if (src->kind == TY_ENUM && dst->kind == TY_ENUM)
+            fatal_at(e->loc, "cannot cast between enums (%s and %s are distinct); "
+                             "go through int if that is really intended",
+                     type_str(src), type_str(dst));
         if ((src->kind == TY_CSTRING && dst->kind == TY_RAWPTR) ||
             (src->kind == TY_RAWPTR && dst->kind == TY_CSTRING))
             return e->type = dst;
@@ -2767,9 +2908,11 @@ static bool case_str(Ctx *c, Expr *e, const char **sval, size_t *slen) {
 static void check_switch(Ctx *c, Stmt *s) {
     Type *t = check_expr(c, s->expr, NULL);
     bool is_str = t->kind == TY_STRING;
+    bool is_enum = t->kind == TY_ENUM;
     if (t->kind == TY_BOOL) fatal_at(s->expr->loc, "switch on a bool: use if/else");
-    if (!is_str && !type_is_int(t))
-        fatal_at(s->expr->loc, "switch needs an int or a string (got %s)", type_str(t));
+    if (!is_str && !is_enum && !type_is_int(t))
+        fatal_at(s->expr->loc, "switch needs an int, a string or an enum (got %s)",
+                 type_str(t));
     if (s->narms == 0) fatal_at(s->loc, "switch has no arms");
 
     /* Values are folded and recorded here so duplicates can be compared and the
@@ -2821,6 +2964,38 @@ static void check_switch(Ctx *c, Stmt *s) {
         scope_push(c);
         check_block(c, arm->body, arm->nbody);
         scope_pop(c);
+    }
+
+    /* Exhaustiveness, the reason enums exist: a variant added later must break
+       every switch that does not handle it. `default` opts out — without that a
+       catch-all would be unwritable. Values (not positions) are compared, so a
+       sparse or explicitly-valued enum works unchanged. */
+    if (is_enum && !seen_default) {
+        EnumDecl *ed = t->edecl;
+        s->switch_total = true;   /* cleared below if a variant turns out missing */
+        const char *missing[8];
+        int nmissing = 0, total_missing = 0;
+        for (int vi = 0; vi < ed->nvariants; vi++) {
+            bool covered = false;
+            for (int k = 0; k < nseen && !covered; k++)
+                if (ints[k] == ed->variants[vi].value) covered = true;
+            if (covered) continue;
+            total_missing++;
+            if (nmissing < 8) missing[nmissing++] = ed->variants[vi].name;
+        }
+        if (total_missing > 0) {
+            SBuf sb;
+            sb_init(&sb);
+            for (int k = 0; k < nmissing; k++)
+                sb_printf(&sb, "%s%s.%s", k ? ", " : "", ed->name, missing[k]);
+            if (total_missing > nmissing)
+                sb_printf(&sb, ", and %d more", total_missing - nmissing);
+            char *list = arena_strdup(&g_arena, sb.data);
+            sb_free(&sb);
+            s->switch_total = false;
+            fatal_at(s->loc, "switch on enum '%s' does not handle %s "
+                             "— add the arm(s), or a 'default'", ed->name, list);
+        }
     }
 }
 
@@ -3031,15 +3206,15 @@ static bool stmt_returns(Stmt *s) {
         return s->expr->kind == EX_BOOL && s->expr->ival &&
                !block_has_break(s->body, s->nbody);
     case ST_SWITCH: {
-        /* A switch guarantees a return only with a default arm and every arm
-           returning — there is no exhaustiveness check, so a subject value
-           matching nothing must be assumed possible. */
+        /* A switch guarantees a return when every arm returns AND the subject
+           cannot escape it: either a default arm catches the rest, or it is an
+           enum switch the checker proved covers every variant. */
         bool has_default = false;
         for (int a = 0; a < s->narms; a++) {
             if (s->arms[a].is_default) has_default = true;
             if (!stmts_return(s->arms[a].body, s->arms[a].nbody)) return false;
         }
-        return has_default;
+        return has_default || s->switch_total;
     }
     default: return false;
     }
@@ -3193,6 +3368,35 @@ static CVal fold_const_decl(Decl *d) {
     e->lhs = e->rhs = NULL;
     d->fold_state = 2;
     return v;
+}
+
+/* Give every variant its value. Runs during signature resolution, before any
+   body is checked, because a switch arm may name a variant and case values are
+   folded during body checking. */
+static void resolve_enum(EnumDecl *ed, Module *m) {
+    int64_t next = 0;
+    for (int i = 0; i < ed->nvariants; i++) {
+        EnumVariant *v = &ed->variants[i];
+        if (v->init) {
+            const char *save = g_fold_what;
+            g_fold_what = "enum variant value";
+            CVal cv = fold_const_expr(m, v->init);
+            g_fold_what = save;
+            if (cv.kind != 0)
+                fatal_at(v->loc, "enum variant value must be an integer constant");
+            v->value = cv.i;
+        } else {
+            v->value = next;
+        }
+        next = v->value + 1;
+        for (int k = 0; k < i; k++) {
+            if (ed->variants[k].name == v->name)
+                fatal_at(v->loc, "duplicate variant '%s' in enum '%s'", v->name, ed->name);
+            if (ed->variants[k].value == v->value)
+                fatal_at(v->loc, "duplicate value %lld in enum '%s' (variant '%s' has it)",
+                         (long long)v->value, ed->name, ed->variants[k].name);
+        }
+    }
 }
 
 static void check_const(Module *m, Decl *d) {

@@ -188,7 +188,7 @@ print("p.x still " + p.x);   // p is untouched — r was a copy
 
 (`examples/02_structs.vt`) Structs take value-receiver methods (`fn` bodies
 that read `this` but never let it escape by reference) and can be generic
-(§9). Because a struct is a plain value, it's **not** nullable and array
+(§11). Because a struct is a plain value, it's **not** nullable and array
 `.contains()`/`.index_of()` refuse struct-element arrays.
 
 `extern "C" { struct Foo { ... } }` declares a struct whose layout matches a
@@ -196,7 +196,93 @@ C struct exactly, for FFI use — see
 [`docs/native-bindings.md`](native-bindings.md), where `vytobind` generates
 these automatically from headers.
 
-## 8. `class` — reference types
+## 8. `enum` — a closed set of named values
+
+An enum is a **distinct type that is an int at runtime** — one machine word, no
+allocation, no reference counting. Variants are always reached through the enum
+name, so they cannot collide with anything:
+
+```js
+enum Color { Red, Green, Blue }        // ordinals 0, 1, 2
+
+let c: Color = Color.Green;
+```
+
+The point of it is **exhaustiveness**. A `switch` over an enum must handle every
+variant, or say `default`:
+
+```js
+fn describe(c: Color): string {
+    switch (c) {
+        case Color.Red:   { return "red"; }
+        case Color.Green: { return "green"; }
+        case Color.Blue:  { return "blue"; }
+    }
+}
+```
+
+Miss one and it is a compile error naming what you missed, so **adding a variant
+later breaks every switch that forgot it** — which a group of `const int` tags
+can never do. An exhaustive switch is also *total*, so the function above needs
+no unreachable `default` just to satisfy the return checker.
+
+Values can be pinned, which is what makes an enum usable for a wire protocol or
+a C ABI. An unvalued variant continues from the previous one + 1, C-style:
+
+```js
+enum PgMsg { Auth = 82, BackendKey = 75, Ready = 90 }
+enum Mixed { A, B = 10, C, D = 3 }      // 0, 10, 11, 3
+```
+
+Two variants may not share a value, and duplicate names are rejected.
+
+An enum is its own type, not an int and not another enum:
+
+```js
+let n: int = Color.Red;        // error: expected int, got Color
+let x = Color.Red + 1;         // error: arithmetic on an enum
+let b = Color.Red == Level.Low; // error: cannot compare Color and Level
+```
+
+`==` and `!=` work between values of the *same* enum. Ordering (`<`, `>`) does
+not — an enum is a set, not a range. Arithmetic is rejected outright rather than
+half-supported, because bitflags are a separate feature.
+
+To cross into or out of the integer world, write the cast:
+
+```js
+gfx_set_mode(mode as i32);          // out to FFI
+let name = names[Color.Green as int];  // out, to index an array
+let k = raw as Color;               // in — checked in debug builds
+```
+
+The inbound direction is **range-checked in debug builds** and panics with the
+offending value if it names no variant, because such a value typically came from
+C, a file, or the network. In `--release` the check compiles away entirely.
+
+Two accessors come with every enum:
+
+```js
+print(Color.Blue.name());     // "Blue"  — the variant's own spelling
+print(str(Color.count()));    // 3       — how many variants there are
+```
+
+`count()` is a compile-time literal; the enum type does not exist at runtime at
+all. `.name()` is a lookup written **once per enum, and only if something asks
+for it** — an enum whose name is never taken costs nothing in the binary. The
+strings it returns are immortal, so calling it in a loop allocates nothing.
+
+`.name()` is called on a *value* and `count()` on the *type*; asking the wrong
+one which is which gives an error saying so.
+
+**Ordinals are not a wire format.** Reordering variants renumbers the ones that
+follow. If a number has to survive across a version boundary, pin it explicitly
+as `PgMsg` does above.
+
+An enum field on a class is zero-initialized like every other value type, so it
+defaults to whichever variant has value 0 — declare a sensible one first.
+
+## 9. `class` — reference types
 
 A `class` is heap-allocated and reference-counted (`src/ast.h:25` —
 `TY_CLASS` is one of the reference kinds). Supports single inheritance,
@@ -246,7 +332,7 @@ dangling.
 parent: weak Widget;
 ```
 
-See [`docs/classes.md`](classes.md) §7 for the full rule and worked examples
+See [`docs/classes.md`](classes.md) §8 for the full rule and worked examples
 from `vyto/ui`.
 
 For the full picture — construction and `init` inheritance, `virtual`/
@@ -254,7 +340,7 @@ For the full picture — construction and `init` inheritance, `virtual`/
 downcasts, duck-typed `for-in` iteration, generic classes, and
 arena-allocated instances — see [`docs/classes.md`](classes.md).
 
-## 9. `fn(...)` — function values
+## 10. `fn(...)` — function values
 
 A first-class function type, written `fn(ParamTypes...): RetType`. Four
 things satisfy it: a closure literal (`(x, y) => x > y`), a named top-level
@@ -274,7 +360,7 @@ reference-cycle trap of storing a bound method back onto its own receiver.
 
 `null` is a valid `fn` value.
 
-## 10. Generics
+## 11. Generics
 
 Functions, structs, and classes can take type parameters:
 
@@ -300,7 +386,7 @@ build caching). Two restrictions worth knowing before reaching for them:
 **no bounds** (a type parameter can't require "implements X"), and a generic
 class may only extend a **non-generic** base.
 
-## 11. `null`
+## 12. `null`
 
 There's no separate optional/nullable wrapper type — `null` is a value of
 every reference type: `string`, arrays, `Map`, `class`, `fn`, plus the FFI
@@ -308,7 +394,7 @@ pointer types `rawptr` and `cstring`. It is **not** valid for `struct`s or
 any value type (`int`, `float`, `bool`, `byte`) — those have no representable
 "absent" state.
 
-## 12. Casts — `as`
+## 13. Casts — `as`
 
 The one and only conversion operator, used for: `int`↔`float` widening/
 truncation, narrowing to an FFI-shaped type, `string`↔`cstring` (via the
