@@ -10,6 +10,57 @@ fail=0
 # runs earlier) writes an events file into it.
 mkdir -p tests/tmp
 
+# ---- parallel section runner -----------------------------------------------
+#
+# Every case in a parallel section compiles its own C, which is the expensive
+# part and is CPU-bound. That is safe because .vyto-cache is keyed by ENTRY FILE
+# (src/main.c), so two programs in one directory never write the same mod_*.c —
+# before that, concurrent builds raced and failed intermittently with
+# `undefined reference` to stdlib symbols.
+#
+# Cache safety is necessary but not sufficient: a section may only be run this
+# way if its cases share no other mutable state. Sections that deliberately
+# manipulate a shared cache (cross-compile, freestanding, the db driver
+# contagion checks) or write to a fixed tests/tmp path stay sequential.
+#
+# Usage:  par_run <section-name> <worker-script-body-file> < list-of-args
+# Each worker writes its whole verdict to tests/tmp/<section>/<key>, which is
+# then replayed in sorted order — so a FAIL's expected/got block can never
+# interleave with another worker's output, and the log reads identically run to
+# run regardless of who finished first.
+TEST_JOBS=${VYTO_TEST_JOBS:-$(nproc 2>/dev/null || echo 4)}
+
+par_dir() { echo "tests/tmp/par_$1"; }
+
+# par_begin <section>: fresh results dir, emit its path
+par_begin() {
+    d=$(par_dir "$1"); rm -rf "$d"; mkdir -p "$d"; echo "$d"
+}
+
+# par_run <section> <worker>: run the worker over stdin, $1 = one input line.
+# The worker is a standalone script, not a function: `xargs` starts a fresh
+# shell that would not inherit one.
+par_run() {
+    _d=$(par_dir "$1"); _w="$_d/.worker"
+    cat > "$_w"; chmod +x "$_w"
+    if [ -s "$_d/.queue" ]; then
+        # -d '\n': one QUEUE LINE is one argument. Without it xargs splits on
+        # any whitespace, which silently shreds a line that carries fields or a
+        # path containing a space.
+        xargs -d '\n' -P "$TEST_JOBS" -n1 "$_w" < "$_d/.queue"
+    fi
+    rm -f "$_w" "$_d/.queue"
+}
+
+# par_finish <section>: replay verdicts sorted, then recover the failure flag
+# (it cannot cross a pipe or subshell).
+par_finish() {
+    _d=$(par_dir "$1")
+    for _f in $(ls "$_d" 2>/dev/null | sort); do cat "$_d/$_f"; done
+    if grep -rq '^FAIL ' "$_d" 2>/dev/null; then fail=1; fi
+    rm -rf "$_d"
+}
+
 # --- prepare the greeter package: prebuilt .so + vytobind-generated binding ---
 triple=linux-x64   # matches vyto_triple() on this CI/dev box
 mkdir -p "examples/greeter/native/$triple"
@@ -267,84 +318,61 @@ fi
 
 # --- run all examples against golden output ---
 #
-# Run in parallel: each example compiles its own C (the whole point of the
-# suite) and that is CPU-bound, so this is the section worth spreading over
-# cores. Safe because .vyto-cache is keyed by ENTRY FILE (src/main.c) — two
-# examples in examples/ no longer write the same mod_*.c. Before that they did,
-# and a parallel run failed intermittently with `undefined reference` to stdlib
-# symbols, which is exactly the kind of flake that makes a suite worthless.
-#
-# Each example's verdict is written to its own file rather than to stdout, so a
-# FAIL's expected/got block cannot interleave with another worker's output. The
-# `fail` flag cannot cross a subshell, so it is recovered by grepping after.
-examples_par=${VYTO_TEST_JOBS:-$(nproc 2>/dev/null || echo 4)}
-rm -rf tests/tmp/exres
-mkdir -p tests/tmp/exres
-
-# The worker. A standalone script, not a shell function: `xargs sh -c` starts a
-# fresh shell that would not inherit one.
-cat > tests/tmp/exres/.worker <<'WORKER'
-#!/bin/sh
-src="$1"
-name=$(basename "$src" .vt)
-out="tests/tmp/exres/$name"
-got=$(./vytoc run "$src" 2>&1)
-if [ "$got" = "$(cat "examples/$name.expected")" ]; then
-    echo "PASS $name" > "$out"
-else
-    { echo "FAIL $name"
-      echo "--- expected ---"
-      cat "examples/$name.expected"
-      echo "--- got ---"
-      printf '%s\n' "$got"
-    } > "$out"
-fi
-WORKER
-chmod +x tests/tmp/exres/.worker
-
+# Parallel: see par_run at the top of this file for why this is safe.
+d=$(par_begin examples)
 # Look for the golden BEFORE running. The 18 hardware examples (51-69) have
 # none, because asserting on them needs a device: a USB port to plug into, a
 # sensor, a camera. Several block waiting for one that is not there --
 # 69_uevent watches the kernel for a full 10s, a third of the entire examples
-# run. Checking first skips them without paying for them.
-# A SKIP is a verdict too, so it is written as one — into the same results dir
-# the workers use, so the replay below prints everything in one sorted pass.
-: > tests/tmp/exres/.queue
+# run. Checking first skips them without paying for them. A SKIP is a verdict
+# too, so it is written as one into the same results dir.
+: > "$d/.queue"
 for src in examples/[0-9]*.vt; do
     name=$(basename "$src" .vt)
     if [ ! -f "examples/$name.expected" ]; then
-        echo "SKIP $name (no .expected)" > "tests/tmp/exres/$name"
+        echo "SKIP $name (no .expected)" > "$d/$name"
     else
-        printf '%s\n' "$src" >> tests/tmp/exres/.queue
+        printf '%s\n' "$src" >> "$d/.queue"
     fi
 done
-
-[ -s tests/tmp/exres/.queue ] &&
-    xargs -P "$examples_par" -n1 tests/tmp/exres/.worker < tests/tmp/exres/.queue
-rm -f tests/tmp/exres/.queue tests/tmp/exres/.worker
-
-# Replay verdicts sorted, so the log reads identically whatever order the
-# workers finished in, then recover the failure flag (it cannot cross a pipe).
-for f in $(ls tests/tmp/exres 2>/dev/null | sort); do cat "tests/tmp/exres/$f"; done
-grep -rq '^FAIL ' tests/tmp/exres 2>/dev/null && fail=1
+par_run examples <<'WORKER'
+#!/bin/sh
+src="$1"; name=$(basename "$src" .vt); out="tests/tmp/par_examples/$name"
+got=$(./vytoc run "$src" 2>&1)
+if [ "$got" = "$(cat "examples/$name.expected")" ]; then
+    echo "PASS $name" > "$out"
+else
+    { echo "FAIL $name"; echo "--- expected ---"; cat "examples/$name.expected"
+      echo "--- got ---"; printf '%s\n' "$got"; } > "$out"
+fi
+WORKER
+par_finish examples
 
 # --- compile-error golden tests: each .vt must fail to build with its message ---
+# Parallel: compile-only, no link, no run, no shared state beyond the
+# per-entry cache. See par_run at the top of this file.
+d=$(par_begin errors)
+: > "$d/.queue"
 for src in tests/errors/*.vt; do
     [ -f "$src" ] || continue
     name=$(basename "$src" .vt)
-    expected="tests/errors/$name.expected-error"
-    [ -f "$expected" ] || continue
-    # first diagnostic line, with the file:line prefix stripped for portability
-    got=$(./vytoc build "$src" 2>&1 | sed -n '1p' | sed 's/^[^ ]*: error:/error:/')
-    if [ "$got" = "$(cat "$expected")" ]; then
-        echo "PASS err_$name"
-    else
-        echo "FAIL err_$name"
-        echo "  expected: $(cat "$expected")"
-        echo "  got:      $got"
-        fail=1
-    fi
+    [ -f "tests/errors/$name.expected-error" ] || continue
+    printf '%s\n' "$src" >> "$d/.queue"
 done
+par_run errors <<'WORKER'
+#!/bin/sh
+src="$1"; name=$(basename "$src" .vt)
+expected="tests/errors/$name.expected-error"; out="tests/tmp/par_errors/$name"
+# first diagnostic line, with the file:line prefix stripped for portability
+got=$(./vytoc build "$src" 2>&1 | sed -n '1p' | sed 's/^[^ ]*: error:/error:/')
+if [ "$got" = "$(cat "$expected")" ]; then
+    echo "PASS err_$name" > "$out"
+else
+    { echo "FAIL err_$name"; echo "  expected: $(cat "$expected")"
+      echo "  got:      $got"; } > "$out"
+fi
+WORKER
+par_finish errors
 
 # --- weak loads are optional: every narrowing shape compiles and runs ---
 # The negative half is tests/errors/weak_deref*.vt. This is the half that has to
@@ -958,6 +986,11 @@ fi
 #     unwritable. Grep-style rather than a golden, because a panic aborts the
 #     process and truncates stdout. Without these the read-only cases would be
 #     a bare SIGSEGV with no file, line or message. ---
+# SEQUENTIAL, deliberately. Every case writes and then mmaps the SAME file,
+# tests/tmp/mmap_g.bin (mmap_guards.vt:14), so two of them running at once
+# truncate the mapping out from under each other — mmap_guard_store failed that
+# way exactly once in a parallel run. The per-entry cache makes concurrent
+# BUILDS safe; it says nothing about a fixture that shares a data file.
 for c in push pop insert remove_at extend reserve clear; do
     if ./vytoc run tests/fixtures/mmap_guards.vt -- "$c" 2>&1 |
            grep -q "$c on a fixed-length array view"; then
@@ -1270,6 +1303,9 @@ mkdir -p tests/ui/.vyto-cache
 touch "$ui_stamp"
 
 # --- vyto/ui headless golden tests (VS_HEADLESS backend, scripted events) ---
+# Parallel: per-test .events/.expected, no shared writes. See par_run above.
+ui_d=$(par_begin ui)
+: > "$ui_d/.queue"
 for src in tests/ui/[0-9]*.vt; do
     name=$(basename "$src" .vt)
     # Charts live in tests/run_tests_charts.sh (make test-charts). They are 21
@@ -1284,31 +1320,38 @@ for src in tests/ui/[0-9]*.vt; do
     # coverage. 53/54_dragscroll stay here — they exercise core.vt's on_drag,
     # not the mobile package.
     case "$name" in *_chart_*|*_mobile_*) continue ;; esac
-    got=$(VS_HEADLESS=1 VS_EVENTS="tests/ui/$name.events" ./vytoc run "$src" 2>&1)
-    if [ "$got" = "$(cat "tests/ui/$name.expected")" ]; then
-        echo "PASS ui_$name"
-    else
-        echo "FAIL ui_$name"
-        echo "--- expected ---"
-        cat "tests/ui/$name.expected"
-        echo "--- got ---"
-        printf '%s\n' "$got"
-        fail=1
-    fi
+    printf '%s\n' "$name" >> "$ui_d/.queue"
 done
+par_run ui <<'WORKER'
+#!/bin/sh
+name="$1"; out="tests/tmp/par_ui/$name"
+got=$(VS_HEADLESS=1 VS_EVENTS="tests/ui/$name.events" ./vytoc run "tests/ui/$name.vt" 2>&1)
+if [ "$got" = "$(cat "tests/ui/$name.expected")" ]; then
+    echo "PASS ui_$name" > "$out"
+else
+    { echo "FAIL ui_$name"; echo "--- expected ---"; cat "tests/ui/$name.expected"
+      echo "--- got ---"; printf '%s\n' "$got"; } > "$out"
+fi
+WORKER
+par_finish ui
 
 # --- vyto/ui named golden tests: TextArea + menus (no env needed) ---
+uin_d=$(par_begin uinamed)
 for name in textarea menu gallery scale spring disabled motion layout_anim transition dark_theme ripple; do
-    got=$(VS_HEADLESS=1 VS_EVENTS="tests/ui/$name.events" ./vytoc run "tests/ui/$name.vt" 2>&1)
-    if [ "$got" = "$(cat "tests/ui/$name.expected")" ]; then
-        echo "PASS ui_$name"
-    else
-        echo "FAIL ui_$name"
-        echo "--- expected ---"; cat "tests/ui/$name.expected"
-        echo "--- got ---"; printf '%s\n' "$got"
-        fail=1
-    fi
+    printf '%s\n' "$name" >> "$uin_d/.queue"
 done
+par_run uinamed <<'WORKER'
+#!/bin/sh
+name="$1"; out="tests/tmp/par_uinamed/$name"
+got=$(VS_HEADLESS=1 VS_EVENTS="tests/ui/$name.events" ./vytoc run "tests/ui/$name.vt" 2>&1)
+if [ "$got" = "$(cat "tests/ui/$name.expected")" ]; then
+    echo "PASS ui_$name" > "$out"
+else
+    { echo "FAIL ui_$name"; echo "--- expected ---"; cat "tests/ui/$name.expected"
+      echo "--- got ---"; printf '%s\n' "$got"; } > "$out"
+fi
+WORKER
+par_finish uinamed
 
 # --- render snapshots: rasterize real widget trees through the rich tier
 #     (blend2d) and assert on a hash of the pixels. The goldens above cover
@@ -1317,23 +1360,30 @@ done
 #     On failure the frames are dumped as PPMs under tests/tmp/snap so the
 #     change can be inspected — a hash says a frame moved, not how.
 mkdir -p tests/tmp
+# Parallel: the PPM dump on failure goes to a per-test dir, so workers never
+# collide even when several fail at once. See par_run above.
+snap_d=$(par_begin uisnap)
+: > "$snap_d/.queue"
 for src in tests/ui/snap_*.vt; do
     [ -e "$src" ] || continue
-    name=$(basename "$src" .vt)
-    got=$(VS_HEADLESS=1 VS_EVENTS="tests/ui/$name.events" ./vytoc run "$src" 2>&1)
-    if [ "$got" = "$(cat "tests/ui/$name.expected")" ]; then
-        echo "PASS ui_$name"
-    else
-        echo "FAIL ui_$name"
-        echo "--- expected ---"; cat "tests/ui/$name.expected"
-        echo "--- got ---"; printf '%s\n' "$got"
-        rm -rf "tests/tmp/snap/$name"; mkdir -p "tests/tmp/snap/$name"
-        VS_HEADLESS=1 VS_EVENTS="tests/ui/$name.events" \
-            VYTO_SNAP_DIR="tests/tmp/snap/$name" ./vytoc run "$src" >/dev/null 2>&1
-        echo "--- frames written to tests/tmp/snap/$name ---"
-        fail=1
-    fi
+    printf '%s\n' "$(basename "$src" .vt)" >> "$snap_d/.queue"
 done
+par_run uisnap <<'WORKER'
+#!/bin/sh
+name="$1"; src="tests/ui/$name.vt"; out="tests/tmp/par_uisnap/$name"
+got=$(VS_HEADLESS=1 VS_EVENTS="tests/ui/$name.events" ./vytoc run "$src" 2>&1)
+if [ "$got" = "$(cat "tests/ui/$name.expected")" ]; then
+    echo "PASS ui_$name" > "$out"
+else
+    rm -rf "tests/tmp/snap/$name"; mkdir -p "tests/tmp/snap/$name"
+    VS_HEADLESS=1 VS_EVENTS="tests/ui/$name.events" \
+        VYTO_SNAP_DIR="tests/tmp/snap/$name" ./vytoc run "$src" >/dev/null 2>&1
+    { echo "FAIL ui_$name"; echo "--- expected ---"; cat "tests/ui/$name.expected"
+      echo "--- got ---"; printf '%s\n' "$got"
+      echo "--- frames written to tests/tmp/snap/$name ---"; } > "$out"
+fi
+WORKER
+par_finish uisnap
 
 # --- framebuffer backend, file target: render a known pattern into a raw
 #     XRGB8888 file and verify it byte-for-byte (no display or fb device) ---
