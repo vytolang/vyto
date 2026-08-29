@@ -672,13 +672,31 @@ int main(int argc, char **argv) {
     Module *entry = load_module(input);
     check_all(g_modules, entry);
 
-    /* ---- emit C into the cache dir (per-target subdir for explicit targets) ---- */
-    const char *cache = arena_printf(&g_arena, "%s/.vyto-cache", dir_of(input));
+    /* ---- emit C into the cache dir (per-target subdir for explicit targets) ----
+     *
+     * The cache is keyed by the ENTRY FILE, not just its directory:
+     *
+     *     examples/.vyto-cache/107_reactor/mod_vyto_os_worker.c
+     *     examples/.vyto-cache/14_layout/mod_vyto_ui_core.c
+     *
+     * Two programs in one directory emit DIFFERENT C for the same stdlib module,
+     * because a generic instantiation is attached to the module that declared the
+     * generic (check.c, instantiate_fn) and only what the program actually uses
+     * gets compiled. One program's `Deque<byte[]>` and another's `Deque<int>` both
+     * want to be mod_vyto_coll_deque.c. Sharing the directory made them overwrite
+     * each other, which is why two builds in the same directory could not run
+     * concurrently and why a sequential run could serve a stale object.
+     *
+     * Per entry file, they simply never meet. That is what lets the test suite
+     * run examples in parallel — see tests/run_tests.sh. */
+    const char *cache_root = arena_printf(&g_arena, "%s/.vyto-cache", dir_of(input));
+    mkdir(cache_root, 0755);
+    const char *cache = arena_printf(&g_arena, "%s/%s", cache_root, stem_of(input));
     /* --clean: discard this input's cache and build from scratch. The escape
        hatch for a cache that is serving a stale object — see the incremental
        rules further down, which decide per module from the *generated* C, not
-       from .vt mtimes. Scoped to this one cache dir, so it can't touch a
-       sibling project's build. */
+       from .vt mtimes. Scoped to this one entry file's cache, so it can't touch
+       a sibling program's build, let alone a sibling project's. */
     if (clean) {
         char *rm = arena_printf(&g_arena, "rm -rf %s", cache);
         if (run_cmd(rm, verbose) != 0) fatal("cannot clear cache %s", cache);

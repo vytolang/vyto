@@ -39,10 +39,10 @@ else
 fi
 
 # --- cross-compile driver logic (host cc standing in as the cross compiler) ---
-rm -rf examples/.vyto-cache/linux-x64
+rm -rf examples/.vyto-cache/01_hello/linux-x64
 if ./vytoc build examples/01_hello.vt --target linux-x64 --cc cc >/dev/null &&
-   [ -x examples/.vyto-cache/linux-x64/01_hello ] &&
-   [ "$(examples/.vyto-cache/linux-x64/01_hello | head -1)" = "hello, vyto" ]; then
+   [ -x examples/.vyto-cache/01_hello/linux-x64/01_hello ] &&
+   [ "$(examples/.vyto-cache/01_hello/linux-x64/01_hello | head -1)" = "hello, vyto" ]; then
     echo "PASS cross_target_cache"
 else
     echo "FAIL cross_target_cache"
@@ -266,30 +266,67 @@ else
 fi
 
 # --- run all examples against golden output ---
+#
+# Run in parallel: each example compiles its own C (the whole point of the
+# suite) and that is CPU-bound, so this is the section worth spreading over
+# cores. Safe because .vyto-cache is keyed by ENTRY FILE (src/main.c) — two
+# examples in examples/ no longer write the same mod_*.c. Before that they did,
+# and a parallel run failed intermittently with `undefined reference` to stdlib
+# symbols, which is exactly the kind of flake that makes a suite worthless.
+#
+# Each example's verdict is written to its own file rather than to stdout, so a
+# FAIL's expected/got block cannot interleave with another worker's output. The
+# `fail` flag cannot cross a subshell, so it is recovered by grepping after.
+examples_par=${VYTO_TEST_JOBS:-$(nproc 2>/dev/null || echo 4)}
+rm -rf tests/tmp/exres
+mkdir -p tests/tmp/exres
+
+# The worker. A standalone script, not a shell function: `xargs sh -c` starts a
+# fresh shell that would not inherit one.
+cat > tests/tmp/exres/.worker <<'WORKER'
+#!/bin/sh
+src="$1"
+name=$(basename "$src" .vt)
+out="tests/tmp/exres/$name"
+got=$(./vytoc run "$src" 2>&1)
+if [ "$got" = "$(cat "examples/$name.expected")" ]; then
+    echo "PASS $name" > "$out"
+else
+    { echo "FAIL $name"
+      echo "--- expected ---"
+      cat "examples/$name.expected"
+      echo "--- got ---"
+      printf '%s\n' "$got"
+    } > "$out"
+fi
+WORKER
+chmod +x tests/tmp/exres/.worker
+
+# Look for the golden BEFORE running. The 18 hardware examples (51-69) have
+# none, because asserting on them needs a device: a USB port to plug into, a
+# sensor, a camera. Several block waiting for one that is not there --
+# 69_uevent watches the kernel for a full 10s, a third of the entire examples
+# run. Checking first skips them without paying for them.
+# A SKIP is a verdict too, so it is written as one — into the same results dir
+# the workers use, so the replay below prints everything in one sorted pass.
+: > tests/tmp/exres/.queue
 for src in examples/[0-9]*.vt; do
     name=$(basename "$src" .vt)
-    expected="examples/$name.expected"
-    # Look for the golden BEFORE running. The 18 hardware examples (51-69) have
-    # none, because asserting on them needs a device: a USB port to plug into, a
-    # sensor, a camera. Several block waiting for one that is not there --
-    # 69_uevent watches the kernel for a full 10s, a third of the entire
-    # examples run. Checking first skips them without paying for them.
-    if [ ! -f "$expected" ]; then
-        echo "SKIP $name (no .expected)"
-        continue
-    fi
-    got=$(./vytoc run "$src" 2>&1)
-    if [ "$got" = "$(cat "$expected")" ]; then
-        echo "PASS $name"
+    if [ ! -f "examples/$name.expected" ]; then
+        echo "SKIP $name (no .expected)" > "tests/tmp/exres/$name"
     else
-        echo "FAIL $name"
-        echo "--- expected ---"
-        cat "$expected"
-        echo "--- got ---"
-        printf '%s\n' "$got"
-        fail=1
+        printf '%s\n' "$src" >> tests/tmp/exres/.queue
     fi
 done
+
+[ -s tests/tmp/exres/.queue ] &&
+    xargs -P "$examples_par" -n1 tests/tmp/exres/.worker < tests/tmp/exres/.queue
+rm -f tests/tmp/exres/.queue tests/tmp/exres/.worker
+
+# Replay verdicts sorted, so the log reads identically whatever order the
+# workers finished in, then recover the failure flag (it cannot cross a pipe).
+for f in $(ls tests/tmp/exres 2>/dev/null | sort); do cat "tests/tmp/exres/$f"; done
+grep -rq '^FAIL ' tests/tmp/exres 2>/dev/null && fail=1
 
 # --- compile-error golden tests: each .vt must fail to build with its message ---
 for src in tests/errors/*.vt; do
@@ -383,8 +420,8 @@ fi
 # rather than running it — an unguarded null deref is a segfault, not an output.
 rm -rf tests/fixtures/.vyto-cache
 ./vytoc build tests/fixtures/null_deref_trap.vt --release >/dev/null 2>&1
-if [ -f tests/fixtures/.vyto-cache/mod_null_deref_trap.c ] &&
-   ! grep -q "vt_ck_ptr" tests/fixtures/.vyto-cache/mod_null_deref_trap.c; then
+nd=tests/fixtures/.vyto-cache/null_deref_trap/mod_null_deref_trap.c
+if [ -f "$nd" ] && ! grep -q "vt_ck_ptr" "$nd"; then
     echo "PASS null_deref_release_unchecked"
 else
     echo "FAIL null_deref_release_unchecked (vt_ck_ptr survived --release)"
@@ -1489,7 +1526,7 @@ fi
 
 # --- prebuilt .so deployment: exe must run from a copied-out directory ---
 out=$(./vytoc build examples/09_prebuilt_so.vt) || fail=1
-if [ -f "examples/.vyto-cache/libgreeter.so" ]; then
+if [ -f "examples/.vyto-cache/09_prebuilt_so/libgreeter.so" ]; then
     echo "PASS so_deployed_next_to_exe"
 else
     echo "FAIL so_deployed_next_to_exe"
