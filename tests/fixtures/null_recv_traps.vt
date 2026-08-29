@@ -1,0 +1,40 @@
+// Used by run_tests.sh: a null receiver must PANIC naming the call site, in
+// debug AND release. Each of these was a bare segfault before.
+//
+// Three separate causes, all reached from ordinary Vyto:
+//
+//   1. builtin string methods — vt_str_* dereference the receiver immediately
+//   2. array indexing — `((T*)a->data)[vt_arr_ati(...)]` loaded `->data` before
+//      the subscript was evaluated, so a null array faulted there before the
+//      check inside vt_arr_ati could run. Correct code, unreachable guard.
+//   3. calling a null fn value — `((VtClosure*)f)->fn`
+//
+// Selected by argument so one fixture covers every case; run_tests.sh invokes
+// it once per case and greps the panic text.
+fn main() {
+    let which = args();
+    if (which.len == 0) { print("usage: null_recv_traps <case>"); return; }
+    let c = which[0];
+
+    if (c == "str") {
+        let s: string = null;
+        print(s.to_upper());
+    }
+    if (c == "arr_read") {
+        let a: int[] = null;
+        print("" + a[0]);
+    }
+    if (c == "arr_write") {
+        let a: int[] = null;
+        a[0] = 1;
+    }
+    if (c == "arr_compound") {
+        let a: int[] = null;
+        a[0] += 1;
+    }
+    if (c == "closure") {
+        let f: fn(): int = null;
+        print("" + f());
+    }
+    print("no trap fired");
+}

@@ -350,6 +350,25 @@ else
     fail=1
 fi
 
+# --- null receivers panic instead of segfaulting, in debug AND release ---
+# Each of these was a bare segfault. The array cases are the subtle one: the
+# bounds check existed but `((T*)a->data)[vt_arr_ati(...)]` loaded `->data`
+# before the subscript ran, so a null array faulted before the check could.
+for mode in "" "--release"; do
+    tag=$([ -z "$mode" ] && echo debug || echo release)
+    for case in str:to_upper arr_read:index arr_write:index arr_compound:index \
+                closure:"a function call"; do
+        c=${case%%:*}; want=${case#*:}
+        got=$(./vytoc run tests/fixtures/null_recv_traps.vt $mode -- "$c" 2>&1)
+        if echo "$got" | grep -q "panic: .*$want"; then
+            echo "PASS null_recv_${c}_${tag}"
+        else
+            echo "FAIL null_recv_${c}_${tag} (expected a panic naming '$want', got: $got)"
+            fail=1
+        fi
+    done
+done
+
 # --- null deref: named panic in debug, check compiled out in --release ---
 # Covers the deliberate hole in the weak rule (docs/memory.md §3): a
 # possibly-null reference may be passed along, so the checker cannot catch this.

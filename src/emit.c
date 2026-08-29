@@ -332,6 +332,20 @@ static char *guard_ptr(char *frag, Type *t, const char *what, Loc loc) {
                         c_escape(loc.file, strlen(loc.file)), loc.line);
 }
 
+/* Null-check the receiver of a builtin method. The runtime helpers dereference
+   it immediately, so without this a null receiver faults inside the runtime
+   with nothing naming the call site. Unlike guard_ptr this is NOT gated on
+   g_checks: a null receiver is a program bug at any optimisation level, and the
+   check is one predicted-not-taken compare on an already-loaded pointer. */
+static char *guard_recv(Em *em, Expr *recv, const char *what, Loc loc) {
+    char *f = ex_b(em, recv);
+    if (!recv->type || !type_is_ref(recv->type)) return f;
+    /* cast back: vt_ck_recv is typeless so one helper covers every receiver */
+    return arena_printf(&g_arena, "((%s)vt_ck_recv(%s, \"%s\", \"%s\", %d))",
+                        c_type(recv->type), f, what,
+                        c_escape(loc.file, strlen(loc.file)), loc.line);
+}
+
 static char *cast_to(char *frag, Type *from, Type *to) {
     if (!to || !from) return frag;
     if (from->kind == TY_CLASS && to->kind == TY_CLASS && from->cdecl != to->cdecl)
@@ -758,54 +772,54 @@ static char *emit_call(Em *em, Expr *e, bool *fresh) {
             return arena_printf(&g_arena, "(vt_len(%s, \"%s\", %d) == 0)", ex_b(em, recv),
                                 c_escape(e->loc.file, strlen(e->loc.file)), e->loc.line);
         case B_STR_CONTAINS:
-            return arena_printf(&g_arena, "vt_str_contains(%s, %s)", ex_b(em, recv), ex_b(em, a[0]));
+            return arena_printf(&g_arena, "vt_str_contains(%s, %s)", guard_recv(em, recv, "contains()", e->loc), ex_b(em, a[0]));
         case B_STR_STARTS_WITH:
-            return arena_printf(&g_arena, "vt_str_starts_with(%s, %s)", ex_b(em, recv), ex_b(em, a[0]));
+            return arena_printf(&g_arena, "vt_str_starts_with(%s, %s)", guard_recv(em, recv, "starts_with()", e->loc), ex_b(em, a[0]));
         case B_STR_ENDS_WITH:
-            return arena_printf(&g_arena, "vt_str_ends_with(%s, %s)", ex_b(em, recv), ex_b(em, a[0]));
+            return arena_printf(&g_arena, "vt_str_ends_with(%s, %s)", guard_recv(em, recv, "ends_with()", e->loc), ex_b(em, a[0]));
         case B_STR_INDEX_OF:
-            return arena_printf(&g_arena, "vt_str_index_of(%s, %s)", ex_b(em, recv), ex_b(em, a[0]));
+            return arena_printf(&g_arena, "vt_str_index_of(%s, %s)", guard_recv(em, recv, "index_of()", e->loc), ex_b(em, a[0]));
         case B_STR_LAST_INDEX_OF:
-            return arena_printf(&g_arena, "vt_str_last_index_of(%s, %s)", ex_b(em, recv), ex_b(em, a[0]));
+            return arena_printf(&g_arena, "vt_str_last_index_of(%s, %s)", guard_recv(em, recv, "last_index_of()", e->loc), ex_b(em, a[0]));
         case B_STR_COUNT:
-            return arena_printf(&g_arena, "vt_str_count(%s, %s)", ex_b(em, recv), ex_b(em, a[0]));
+            return arena_printf(&g_arena, "vt_str_count(%s, %s)", guard_recv(em, recv, "count()", e->loc), ex_b(em, a[0]));
         case B_STR_CHAR_AT:
-            return arena_printf(&g_arena, "vt_str_char_at(%s, %s, \"%s\", %d)", ex_b(em, recv),
+            return arena_printf(&g_arena, "vt_str_char_at(%s, %s, \"%s\", %d)", guard_recv(em, recv, "char_at()", e->loc),
                                 ex_b(em, a[0]), c_escape(e->loc.file, strlen(e->loc.file)), e->loc.line);
         case B_STR_TO_UPPER:
-            return arena_printf(&g_arena, "vt_str_to_upper(%s)", ex_b(em, recv));
+            return arena_printf(&g_arena, "vt_str_to_upper(%s)", guard_recv(em, recv, "to_upper()", e->loc));
         case B_STR_TO_LOWER:
-            return arena_printf(&g_arena, "vt_str_to_lower(%s)", ex_b(em, recv));
+            return arena_printf(&g_arena, "vt_str_to_lower(%s)", guard_recv(em, recv, "to_lower()", e->loc));
         case B_STR_TRIM:
-            return arena_printf(&g_arena, "vt_str_trim(%s)", ex_b(em, recv));
+            return arena_printf(&g_arena, "vt_str_trim(%s)", guard_recv(em, recv, "trim()", e->loc));
         case B_STR_TRIM_START:
-            return arena_printf(&g_arena, "vt_str_trim_start(%s)", ex_b(em, recv));
+            return arena_printf(&g_arena, "vt_str_trim_start(%s)", guard_recv(em, recv, "trim_start()", e->loc));
         case B_STR_TRIM_END:
-            return arena_printf(&g_arena, "vt_str_trim_end(%s)", ex_b(em, recv));
+            return arena_printf(&g_arena, "vt_str_trim_end(%s)", guard_recv(em, recv, "trim_end()", e->loc));
         case B_STR_REVERSE:
-            return arena_printf(&g_arena, "vt_str_reverse(%s)", ex_b(em, recv));
+            return arena_printf(&g_arena, "vt_str_reverse(%s)", guard_recv(em, recv, "reverse()", e->loc));
         case B_STR_REPEAT:
-            return arena_printf(&g_arena, "vt_str_repeat(%s, %s, \"%s\", %d)", ex_b(em, recv),
+            return arena_printf(&g_arena, "vt_str_repeat(%s, %s, \"%s\", %d)", guard_recv(em, recv, "repeat()", e->loc),
                                 ex_b(em, a[0]), c_escape(e->loc.file, strlen(e->loc.file)),
                                 e->loc.line);
         case B_STR_PAD_START:
-            return arena_printf(&g_arena, "vt_str_pad_start(%s, %s, %s)", ex_b(em, recv),
+            return arena_printf(&g_arena, "vt_str_pad_start(%s, %s, %s)", guard_recv(em, recv, "pad_start()", e->loc),
                                 ex_b(em, a[0]), ex_b(em, a[1]));
         case B_STR_PAD_END:
-            return arena_printf(&g_arena, "vt_str_pad_end(%s, %s, %s)", ex_b(em, recv),
+            return arena_printf(&g_arena, "vt_str_pad_end(%s, %s, %s)", guard_recv(em, recv, "pad_end()", e->loc),
                                 ex_b(em, a[0]), ex_b(em, a[1]));
         case B_STR_REPLACE:
-            return arena_printf(&g_arena, "vt_str_replace(%s, %s, %s)", ex_b(em, recv),
+            return arena_printf(&g_arena, "vt_str_replace(%s, %s, %s)", guard_recv(em, recv, "replace()", e->loc),
                                 ex_b(em, a[0]), ex_b(em, a[1]));
         case B_STR_SPLIT:
-            return arena_printf(&g_arena, "vt_str_split(%s, %s)", ex_b(em, recv), ex_b(em, a[0]));
+            return arena_printf(&g_arena, "vt_str_split(%s, %s)", guard_recv(em, recv, "split()", e->loc), ex_b(em, a[0]));
         case B_STR_LINES:
-            return arena_printf(&g_arena, "vt_str_lines(%s)", ex_b(em, recv));
+            return arena_printf(&g_arena, "vt_str_lines(%s)", guard_recv(em, recv, "lines()", e->loc));
         case B_STR_TO_INT:
-            return arena_printf(&g_arena, "vt_str_to_int(%s, \"%s\", %d)", ex_b(em, recv),
+            return arena_printf(&g_arena, "vt_str_to_int(%s, \"%s\", %d)", guard_recv(em, recv, "to_int()", e->loc),
                                 c_escape(e->loc.file, strlen(e->loc.file)), e->loc.line);
         case B_STR_TO_FLOAT:
-            return arena_printf(&g_arena, "vt_str_to_float(%s, \"%s\", %d)", ex_b(em, recv),
+            return arena_printf(&g_arena, "vt_str_to_float(%s, \"%s\", %d)", guard_recv(em, recv, "to_float()", e->loc),
                                 c_escape(e->loc.file, strlen(e->loc.file)), e->loc.line);
         case B_STR_TO_FLOAT_AT:
             return arena_printf(&g_arena, "vt_str_to_float_at(%s, %s, %s, \"%s\", %d)",
@@ -1015,8 +1029,13 @@ static char *emit_call(Em *em, Expr *e, bool *fresh) {
     char *cv = ex_b(em, e->lhs);
     char *sig = fnptr_sig(ft->ret, "VtObj*", ft->params, ft->nparams, NULL);
     char *args = args_list(em, e->args, e->nargs, NULL, ft->params);
+    /* Guard the temp: `((VtClosure*)f)->fn` on a null fn value is a segfault
+       with nothing naming the call. Checked in release too — an uncallable
+       closure is a program bug at any optimisation level. */
+    char *g = arena_printf(&g_arena, "vt_ck_recv(%s, \"a function call\", \"%s\", %d)", tc,
+                           c_escape(e->loc.file, strlen(e->loc.file)), e->loc.line);
     return arena_printf(&g_arena, "(%s = %s, ((%s)((VtClosure*)%s)->fn)(((VtClosure*)%s)->env%s%s))",
-                        tc, cv, sig, tc, tc, e->nargs ? ", " : "", args);
+                        tc, cv, sig, g, tc, e->nargs ? ", " : "", args);
 }
 
 static char *ex(Em *em, Expr *e, bool *fresh) {
@@ -1166,8 +1185,15 @@ static char *ex(Em *em, Expr *e, bool *fresh) {
         const char *ta = newtemp(em, e->lhs->type, false);
         char *af = ex_b(em, e->lhs);
         char *idx = ex_b(em, e->rhs);
-        return arena_printf(&g_arena, "(%s = %s, ((%s*)%s->data)[vt_arr_ati(%s, %s, \"%s\", %d)])",
-                            ta, af, c_type(et), ta, ta, idx,
+        /* vt_arr_atp returns the checked ELEMENT POINTER. Writing
+           `((T*)a->data)[vt_arr_ati(...)]` loads `->data` before the subscript
+           is evaluated, so a null array segfaulted there before the check
+           inside vt_arr_ati could panic — correct code, unreachable guard.
+           Folding the load into the checked helper orders it properly; the
+           element scale is still a compile-time constant, so this keeps the
+           addressing mode and the loop still vectorizes. */
+        return arena_printf(&g_arena, "(%s = %s, *(%s*)vt_arr_atp(%s, %s, sizeof(%s), \"%s\", %d))",
+                            ta, af, c_type(et), ta, idx, c_type(et),
                             c_escape(e->loc.file, strlen(e->loc.file)), e->loc.line);
     }
     case EX_UN: {
@@ -1595,14 +1621,16 @@ static void emit_assign(Em *em, Expr *e) {
         const char *lo, *hi;
         if (ck_compound && int_bounds(et, &lo, &hi)) {
             ind(em);
-            sb_printf(em->out, "%s = %s(((%s*)%s->data)[vt_arr_ati(%s, %s, %s)], %s, %s, %s, %s);\n",
-                      tv, ck_fn, c_type(et), ta, ta, ti, fl, ex_v(em, e->rhs, et), lo, hi, fl);
+            sb_printf(em->out,
+                      "%s = %s(*(%s*)vt_arr_atp(%s, %s, sizeof(%s), %s), %s, %s, %s, %s);\n",
+                      tv, ck_fn, c_type(et), ta, ti, c_type(et), fl, ex_v(em, e->rhs, et), lo, hi,
+                      fl);
         } else {
             /* the compound operator minus its trailing '=' is the plain binary op */
             char *bop = arena_strndup(&g_arena, cop, strlen(cop) - 1);
             ind(em);
-            sb_printf(em->out, "%s = ((%s*)%s->data)[vt_arr_ati(%s, %s, %s)] %s %s;\n", tv,
-                      c_type(et), ta, ta, ti, fl, bop, ex_v(em, e->rhs, et));
+            sb_printf(em->out, "%s = *(%s*)vt_arr_atp(%s, %s, sizeof(%s), %s) %s %s;\n", tv,
+                      c_type(et), ta, ti, c_type(et), fl, bop, ex_v(em, e->rhs, et));
         }
     }
     ind(em);
@@ -1613,11 +1641,13 @@ static void emit_assign(Em *em, Expr *e) {
            vt_arr_wri, not vt_arr_ati: same compare plus one predicted-away
            branch that turns a store into a read-only view into a panic.
            Indexing a typed pointer rather than offsetting a char* folds the
-           element scale at compile time — see vt_arr_wri in vyto_rt.h. `ta`
+           element scale at compile time — see vt_arr_wrp in vyto_rt.h. `ta`
            and `ti` are already spilled to temps above, so naming them twice
-           here evaluates nothing twice. */
-        sb_printf(em->out, "((%s*)%s->data)[vt_arr_wri(%s, %s, %s)] = %s;\n", c_type(et), ta, ta,
-                  ti, fl, tv);
+           here evaluates nothing twice. The load goes THROUGH vt_arr_wrp
+           rather than `ta->data` so a null array panics instead of faulting on
+           `->data` before the check runs. */
+        sb_printf(em->out, "*(%s*)vt_arr_wrp(%s, %s, sizeof(%s), %s) = %s;\n", c_type(et), ta, ti,
+                  c_type(et), fl, tv);
     else
         sb_printf(em->out, "vt_arr_set(%s, %s, &%s, %s);\n", ta, ti, tv, fl);
     if (str_append) {

@@ -133,6 +133,19 @@ static inline int64_t vt_len(const void *p, const char *file, int line) {
     return ((const VtLenHdr *)p)->len;
 }
 
+/* Null-checked receiver for a builtin method call. The string/array/map helpers
+ * dereference their receiver immediately (`s->len`, `a->data`), so a null one
+ * faults inside the runtime with nothing naming the call site. Wrapping the
+ * receiver at the CALL SITE keeps the check in one place instead of threading
+ * file/line through two dozen helper signatures, and — unlike the debug-only
+ * vt_ck_ptr — this one stays in release builds, because a null receiver here is
+ * a program bug at any optimisation level. */
+VT_NORETURN void vt_null_recv(const char *what, const char *file, int line);
+static inline void *vt_ck_recv(void *p, const char *what, const char *file, int line) {
+    if (!p) vt_null_recv(what, file, line);
+    return p;
+}
+
 /* ---- strings (immutable) ---- */
 
 typedef struct VtString {
@@ -273,6 +286,21 @@ static inline void *vt_arr_wr(VtArray *a, int64_t i, const char *file, int line)
 static inline int64_t vt_arr_ati(VtArray *a, int64_t i, const char *file, int line) {
     if (!a || (uint64_t)i >= (uint64_t)a->len) vt_arr_oob(a, i, file, line);
     return i;
+}
+/* The checked ELEMENT POINTER, with the scale passed in by the caller so it
+ * stays a compile-time constant. Exists because the obvious spelling at the
+ * call site — `((T*)a->data)[vt_arr_ati(a, i, ...)]` — loads `a->data` before
+ * the subscript is evaluated, so a null array faults on `->data` before
+ * vt_arr_ati can panic. Folding the load in here orders the check first. */
+static inline void *vt_arr_atp(VtArray *a, int64_t i, size_t scale, const char *file, int line) {
+    if (!a || (uint64_t)i >= (uint64_t)a->len) vt_arr_oob(a, i, file, line);
+    return a->data + (size_t)i * scale;
+}
+/* The same element pointer, for a WRITE — adds the read-only-view check. */
+static inline void *vt_arr_wrp(VtArray *a, int64_t i, size_t scale, const char *file, int line) {
+    if (!a || (uint64_t)i >= (uint64_t)a->len) vt_arr_oob(a, i, file, line);
+    if (a->readonly) vt_arr_ro(file, line);
+    return a->data + (size_t)i * scale;
 }
 static inline int64_t vt_arr_wri(VtArray *a, int64_t i, const char *file, int line) {
     if (!a || (uint64_t)i >= (uint64_t)a->len) vt_arr_oob(a, i, file, line);
