@@ -34,12 +34,19 @@ struct Type {
     TypeKind kind;
     bool weak;
     /* This VALUE may be null and must be checked before it is dereferenced.
-       Set by the checker when a weak field is loaded: a weak slot reads as null
-       once its target is gone, so every load of one is an optional. It is a
-       property of the loaded value, not of the declaration — `weak` says how
-       the slot is stored, `nullable` says what the reader has to do about it.
+       Two sources, and the dereference rule treats them identically:
+         - the parser, from a declared `T?`;
+         - the checker, when a weak field is loaded — a weak slot reads as null
+           once its target is gone, so every load of one is an optional.
+       For a weak load it is a property of the loaded value rather than of the
+       declaration: `weak` says how the slot is stored, `nullable` says what the
+       reader has to do about it.
        Ignored by type_identical: a nullable T is still a T for assignment. */
     bool nullable;
+    /* Did `nullable` come from a weak load rather than a declared `T?`? Only
+       the diagnostic differs — the weak load clears `weak` above, so without
+       this the message cannot tell the two apart. */
+    bool from_weak;
     Type *elem;         /* array elem / map value */
     Type *ret;          /* fn return */
     Type **params;      /* fn params */

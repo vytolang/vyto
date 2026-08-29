@@ -323,6 +323,15 @@ static char *ex_b(Em *em, Expr *e) {
     return f;
 }
 
+/* Wrap a reference in a debug-build null check before it is dereferenced.
+   Compiled away under --release, exactly like the arithmetic and bounds checks.
+   `what` names the operation for the panic message. */
+static char *guard_ptr(char *frag, Type *t, const char *what, Loc loc) {
+    if (!g_checks || !t || !type_is_ref(t)) return frag;
+    return arena_printf(&g_arena, "vt_ck_ptr(%s, \"%s\", \"%s\", %d)", frag, what,
+                        c_escape(loc.file, strlen(loc.file)), loc.line);
+}
+
 static char *cast_to(char *frag, Type *from, Type *to) {
     if (!to || !from) return frag;
     if (from->kind == TY_CLASS && to->kind == TY_CLASS && from->cdecl != to->cdecl)
@@ -964,11 +973,14 @@ static char *emit_call(Em *em, Expr *e, bool *fresh) {
             char *rv = ex_b(em, recv);
             char *sig = fnptr_sig(m->ret, owner_ct, NULL, m->nparams, m->params);
             char *args = args_list(em, e->args, e->nargs, m->params, NULL);
+            /* Guard the temp, not rv: it is read three times below, and the
+               vtable load through a null receiver is the bare 0x8 segfault. */
+            char *g = guard_ptr((char *)tr, recv->type, "calling a method on it", e->loc);
             return arena_printf(&g_arena,
                                 "(%s = %s, ((%s)((VtObj*)%s)->type->vtbl[%d])((%s)%s%s%s))", tr, rv,
-                                sig, tr, m->vslot, owner_ct, tr, e->nargs ? ", " : "", args);
+                                sig, g, m->vslot, owner_ct, tr, e->nargs ? ", " : "", args);
         }
-        char *rv = ex_b(em, recv);
+        char *rv = guard_ptr(ex_b(em, recv), recv->type, "calling a method on it", e->loc);
         char *call = arena_printf(&g_arena, "%s((%s)%s%s%s)", fn_cname(m), owner_ct, rv,
                                   e->nargs ? ", " : "", args_list(em, e->args, e->nargs, m->params, NULL));
         /* a builder returns the declaring class's pointer; re-cast to the
@@ -1135,7 +1147,8 @@ static char *ex(Em *em, Expr *e, bool *fresh) {
             return arena_printf(&g_arena, "(%s).%s", ex_b(em, e->lhs), fname);
         }
         /* class field */
-        return arena_printf(&g_arena, "(((%s*)%s)->f_%s)", class_cname(e->cls), ex_b(em, e->lhs),
+        return arena_printf(&g_arena, "(((%s*)%s)->f_%s)", class_cname(e->cls),
+                            guard_ptr(ex_b(em, e->lhs), e->lhs->type, "reading a member", e->loc),
                             e->name);
     }
     case EX_INDEX: {
@@ -1524,7 +1537,9 @@ static void emit_assign(Em *em, Expr *e) {
         const char *tr = newtemp(em, lhs->lhs->type, false);
         ind(em);
         sb_printf(em->out, "%s = %s;\n", tr, ex_b(em, lhs->lhs));
-        const char *slot = arena_printf(&g_arena, "((%s*)%s)->f_%s", class_cname(lhs->cls), tr,
+        const char *slot = arena_printf(&g_arena, "((%s*)%s)->f_%s", class_cname(lhs->cls),
+                                        guard_ptr((char *)tr, lhs->lhs->type, "writing a member",
+                                                  e->loc),
                                         lhs->name);
         if (!type_is_ref(lt)) {
             const char *lo, *hi;

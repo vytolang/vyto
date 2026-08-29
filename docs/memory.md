@@ -133,6 +133,11 @@ The check covers *dereferences*: reading a member, calling a method. Passing a
 possibly-null reference along is still allowed, because it is still a valid
 reference — it is only unsafe to follow.
 
+**None of this is weak-specific.** The same narrowing shapes, the same deliberate
+hole, and the same dereference-only scope apply to any type declared `T?` — see
+[`docs/types.md`](types.md) §12. `weak T` is simply a slot the compiler knows
+reads as null on its own, so it needs no `?`.
+
 **Closures capture by value**, which mitigates but doesn't eliminate this:
 a click handler can call methods on a captured class instance (instances
 are references, so the capture is a retained pointer) but can't mutate a

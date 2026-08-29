@@ -1,0 +1,85 @@
+// Used by run_tests.sh: `T?` parses in every type position and composes with
+// arrays, maps, fn types and generics.
+//
+// The generic-CALL case is a regression guard: looks_like_type_args() in
+// parse.c whitelists the tokens legal inside a type-argument list, and a
+// missing T_QUESTION there makes `ident<W?>(null)` fail to parse while
+// `new Box<W?>(null)` still works — two different paths, only one broken.
+//
+// `T?` is NOT inert: the narrowing engine reads Type.nullable and was never
+// weak-specific, so a declared `T?` already refuses an unchecked dereference
+// and accepts every narrowing shape. What is still missing is assignability
+// (`T?` into a plain `T`, `null` into a plain `T`) — that is Phase 3.
+// Every deref below is therefore either narrowed first or on a non-null type.
+class W {
+    n: int;
+    fn init(n: int) { this.n = n; }
+}
+
+class Box<T> {
+    v: T;
+    fn init(v: T) { this.v = v; }
+}
+
+fn ident<T>(x: T): T { return x; }
+fn pair<A, B>(a: A, b: B): int { return 1; }
+
+class Holder {
+    f1: W?;                  // nullable class
+    f2: W?[];                // array of nullable
+    f3: W[]?;                // nullable array
+    f4: W?[]?;               // nullable array of nullable
+    f5: Map<string, W?>;     // nullable map value
+    f6: fn(): W?;            // fn returning nullable
+    f7: string?;             // nullable string
+    f8: weak W;              // weak still works alongside
+
+    fn init() {
+        this.f1 = null;
+        this.f2 = [];
+        this.f3 = null;
+        this.f4 = null;
+        this.f5 = new Map<string, W?>();
+        this.f6 = () => { return null; };
+        this.f7 = null;
+        this.f8 = null;
+    }
+
+    fn take(a: W?): W? { return a; }
+    virtual fn v(a: W?): int { return 0; }
+}
+
+class Sub extends Holder {
+    fn init() { super.init(); }
+    override fn v(a: W?): int { return 1; }
+}
+
+fn free(a: W?): W? { return a; }
+
+fn main() {
+    let h = new Sub();
+    print("fields " + h.f2.len);
+    // f4 is `W?[]?` — nullable, so it must be narrowed before .len
+    if (h.f4 != null) { print("f4 set"); } else { print("f4 null"); }
+
+    // every declaration position
+    let l1: W? = null;
+    let l2: W?[] = [null, new W(1), null];
+    print("local " + l2.len);
+    if (free(null) == null) { print("free null"); }
+    print("virtual " + h.v(null));
+    if (h.take(null) == null) { print("method null"); }
+
+    // generics: explicit call, nested, multi-arg, array arg, map arg
+    let g1 = ident<W?>(null);
+    let g2 = new Box<Box<W?>>(new Box<W?>(null));
+    let g3 = pair<W?, int>(null, 1);
+    let g4 = new Box<W?[]>([]);
+    let g5 = new Box<Map<string, W?>>(new Map<string, W?>());
+    print("generics " + g3);
+
+    // a '<' comparison must NOT be read as a type-argument list
+    let a = 3;
+    let b = 5;
+    print("cmp " + (a < b));
+}

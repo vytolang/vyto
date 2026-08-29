@@ -1190,6 +1190,13 @@ VT_NORETURN void vt_arr_ro(const char *file, int line) {
     vt_panic_c(file, line, "write to a read-only array view");
 }
 
+/* Cold failure path for the inlined vt_ck_ptr (see vyto_rt.h). */
+VT_NORETURN void vt_null_deref(const char *what, const char *file, int line) {
+    char buf[96];
+    vt_snprintf(buf, sizeof buf, "null reference dereferenced (%s)", what);
+    vt_panic_c(file, line, buf);
+}
+
 /* Cold failure path for the inlined vt_arr_at (see vyto_rt.h). */
 VT_NORETURN void vt_arr_oob(VtArray *a, int64_t i, const char *file, int line) {
     if (!a) vt_panic_c(file, line, "index into null array");

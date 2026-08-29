@@ -337,6 +337,42 @@ else
     fail=1
 fi
 
+# --- T? syntax: every type position, and composition with generics ---
+# Guards looks_like_type_args(): a missing T_QUESTION there breaks
+# `ident<W?>(null)` while `new Box<W?>(null)` still works.
+got=$(./vytoc run tests/fixtures/nullable_syntax.vt 2>&1)
+want=$(printf 'fields 0\nf4 null\nlocal 3\nfree null\nvirtual 1\nmethod null\ngenerics 1\ncmp true')
+if [ "$got" = "$want" ]; then
+    echo "PASS nullable_syntax"
+else
+    echo "FAIL nullable_syntax"
+    echo "  got: $got"
+    fail=1
+fi
+
+# --- null deref: named panic in debug, check compiled out in --release ---
+# Covers the deliberate hole in the weak rule (docs/memory.md §3): a
+# possibly-null reference may be passed along, so the checker cannot catch this.
+got=$(./vytoc run tests/fixtures/null_deref_trap.vt 2>&1)
+if echo "$got" | grep -q "null reference dereferenced"; then
+    echo "PASS null_deref_trap_debug"
+else
+    echo "FAIL null_deref_trap_debug (expected a panic, got: $got)"
+    fail=1
+fi
+# In --release the guard is gone: assert the emitted C carries no vt_ck_ptr,
+# rather than running it — an unguarded null deref is a segfault, not an output.
+rm -rf tests/fixtures/.vyto-cache
+./vytoc build tests/fixtures/null_deref_trap.vt --release >/dev/null 2>&1
+if [ -f tests/fixtures/.vyto-cache/mod_null_deref_trap.c ] &&
+   ! grep -q "vt_ck_ptr" tests/fixtures/.vyto-cache/mod_null_deref_trap.c; then
+    echo "PASS null_deref_release_unchecked"
+else
+    echo "FAIL null_deref_release_unchecked (vt_ck_ptr survived --release)"
+    fail=1
+fi
+rm -rf tests/fixtures/.vyto-cache
+
 # --- command-line args: args() builtin sees what follows `--` ---
 got=$(./vytoc run tests/fixtures/args_echo.vt -- alpha beta 2>&1)
 if [ "$got" = "$(printf 'n=2\nalpha\nbeta')" ]; then

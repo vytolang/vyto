@@ -17,6 +17,7 @@ typedef enum TokKind {
     T_COMMA, T_SEMI, T_COLON, T_DOT, T_DOTDOT, T_ARROW, /* => */
     T_HASH, /* # for #link */
     T_AT,   /* @ for new@region */
+    T_QUESTION, /* ? for the nullable type suffix T? */
     /* operators */
     T_ASSIGN, T_PLUSEQ, T_MINUSEQ, T_STAREQ, T_SLASHEQ, T_PERCENTEQ,
     T_AMPEQ, T_PIPEEQ, T_CARETEQ, T_SHLEQ, T_SHREQ,

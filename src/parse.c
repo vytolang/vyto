@@ -203,8 +203,26 @@ static Type *parse_base_type(Parser *p) {
     return t;
 }
 
+/* `?` marks the type it follows as nullable. It binds at each level of the
+   `[]` suffix chain, so the two readings stay distinguishable:
+
+       Widget?[]   an array (non-null) of nullable Widget
+       Widget[]?   a nullable array of non-null Widget
+
+   `weak T` is already implicitly nullable, so `weak T?` is refused rather than
+   silently accepted as a synonym. */
+static void accept_question(Parser *p, Type *t) {
+    if (cur(p) != T_QUESTION) return;
+    if (t->weak)
+        fatal_at(ploc(p), "'weak T?' is redundant — a weak reference is already "
+                          "nullable; write 'weak T'");
+    advance(p);
+    t->nullable = true;
+}
+
 static Type *parse_type(Parser *p) {
     Type *t = parse_base_type(p);
+    accept_question(p, t);
     while (cur(p) == T_LBRACKET && lex_peek(&p->lx)->kind == T_RBRACKET) {
         advance(p);
         advance(p);
@@ -212,6 +230,7 @@ static Type *parse_type(Parser *p) {
         arr->elem = t;
         arr->loc = t->loc;
         t = arr;
+        accept_question(p, t);
     }
     return t;
 }
@@ -301,7 +320,7 @@ static bool looks_like_type_args(Parser *p) {
         else if (k == T_SHR || k == T_SHREQ) angle -= 2; /* '>>' closes two levels */
         else if (k == T_IDENT || k == T_COMMA || k == T_LBRACKET || k == T_RBRACKET ||
                  k == T_MAP || k == T_FN || k == T_WEAK || k == T_COLON ||
-                 k == T_LPAREN || k == T_RPAREN) { /* allowed inside a type */ }
+                 k == T_QUESTION || k == T_LPAREN || k == T_RPAREN) { /* allowed inside a type */ }
         else break; /* any other token can't be part of a type-arg list */
         advance(p);
         if (angle <= 0) { ok = (angle == 0) && (cur(p) == T_LPAREN); break; }

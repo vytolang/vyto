@@ -43,7 +43,9 @@ bool type_identical(const Type *a, const Type *b) {
     }
 }
 
-static const char *type_str(const Type *t) {
+static const char *type_str(const Type *t);
+
+static const char *type_str_bare(const Type *t) {
     switch (t->kind) {
     case TY_VOID: return "void"; case TY_INT: return "int"; case TY_FLOAT: return "float";
     case TY_BOOL: return "bool"; case TY_BYTE: return "byte"; case TY_STRING: return "string";
@@ -75,7 +77,17 @@ static const char *type_str(const Type *t) {
     case TY_NAMED: return t->name;
     case TY_TYPARAM: return t->name;
     }
-    return "?";
+    return "<unknown>";
+}
+
+/* Render a type as written, including the `?` suffix, so a diagnostic can tell
+   `W` from `W?`. A weak LOAD is deliberately not marked: the value is nullable
+   but the declaration says `weak W`, and require_nonnull words that case
+   separately. */
+static const char *type_str(const Type *t) {
+    const char *s = type_str_bare(t);
+    if (t->nullable && !t->from_weak) return arena_printf(&g_arena, "%s?", s);
+    return s;
 }
 
 /* ---- integer width/sign rules for implicit widening ---- */
@@ -245,6 +257,13 @@ static void resolve_type(Type *t, Module *m) {
     }
     if (t->weak && t->kind != TY_CLASS)
         fatal_at(t->loc, "'weak' applies only to class types");
+    /* `T?` says "this may be null", so it is meaningless on a type that cannot
+       hold null. Refuse it rather than accept a no-op annotation — the same
+       reason `weak` is restricted above. */
+    if (t->nullable && !type_is_ref(t))
+        fatal_at(t->loc, "'%s' is not a nullable type — only references "
+                         "(class, string, array, Map, fn) can be null",
+                 type_str(t)); /* type_str renders the '?' itself */
 }
 
 static bool is_literal_default(const Expr *e) {
@@ -448,8 +467,13 @@ typedef struct Ctx {
  * without a check is a null dereference in the emitted C — a segfault inside
  * whatever function happened to touch it, with nothing naming the cause.
  *
- * So a load is marked `nullable`, and member access / method call / indexing
- * through a nullable value is refused unless the checker can see it was tested.
+ * So a load is marked `nullable`, and member access / method call through a
+ * nullable value is refused unless the checker can see it was tested.
+ *
+ * Indexing is NOT checked here, and does not need to be: `weak` applies only to
+ * class types (see resolve_type) and a class is not indexable, so no weak load
+ * can reach EX_INDEX as the indexed operand. That changes the moment `T?`
+ * extends nullability to arrays and maps — EX_INDEX needs the check then.
  *
  * ── WHAT COUNTS AS A TEST ─────────────────────────────────────────────────
  *
@@ -572,12 +596,24 @@ static void require_nonnull(Ctx *c, Expr *e, Type *t, const char *what) {
     if (!t || !t->nullable) return;
     if (nn_has(c, path_key(e))) return;
     const char *p = path_key(e);
+    /* Same rule, two sources — name the one the reader actually wrote. The weak
+       wording is byte-for-byte what tests/errors/weak_deref*.expected-error
+       diff, so it must not drift. */
+    if (t->from_weak) {
+        if (p)
+            fatal_at(e->loc,
+                     "'%s' is a weak reference and may be null here — check it before "
+                     "%s, e.g. `if (%s != null) { ... }`, or bind it first: "
+                     "`let x = %s; if (x == null) { return; }`", p, what, p, p);
+        fatal_at(e->loc, "this weak reference may be null here — check it before %s", what);
+    }
     if (p)
         fatal_at(e->loc,
-                 "'%s' is a weak reference and may be null here — check it before "
+                 "'%s' is declared '%s' and may be null here — check it before "
                  "%s, e.g. `if (%s != null) { ... }`, or bind it first: "
-                 "`let x = %s; if (x == null) { return; }`", p, what, p, p);
-    fatal_at(e->loc, "this weak reference may be null here — check it before %s", what);
+                 "`let x = %s; if (x == null) { return; }`", p, type_str(t), what, p, p);
+    fatal_at(e->loc, "this value is declared '%s' and may be null here — check it before %s",
+             type_str(t), what);
 }
 
 /* region `a` outlives region `b` iff a is the heap (0), equals b, or lexically
@@ -865,7 +901,7 @@ static Type *subst_type(Type *t, Subst *s) {
             }
         return t;
     case TY_ARRAY: { Type *n = mk_type(TY_ARRAY); n->elem = subst_type(t->elem, s); n->weak = t->weak; n->loc = t->loc; return n; }
-    case TY_MAP:   { Type *n = mk_type(TY_MAP);   n->elem = subst_type(t->elem, s); n->loc = t->loc; return n; }
+    case TY_MAP:   { Type *n = mk_type(TY_MAP);   n->elem = subst_type(t->elem, s); n->weak = t->weak; n->loc = t->loc; return n; }
     case TY_FN: {
         Type *n = mk_type(TY_FN);
         n->nparams = t->nparams;
@@ -2336,6 +2372,7 @@ static Type *check_member(Ctx *c, Expr *e) {
             *s = *t;
             s->weak = false;
             s->nullable = true;
+            s->from_weak = true;
             t = s;
         }
         return e->type = t;

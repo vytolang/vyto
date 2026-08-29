@@ -251,6 +251,9 @@ static void scan(Lexer *lx, Token *t) {
     case ':': t->kind = T_COLON; return;
     case '#': t->kind = T_HASH; return;
     case '@': t->kind = T_AT; return;
+    /* Single character on purpose: '??' (the deferred default operator) is not
+       lexed as a digraph, so adding it later stays source-compatible. */
+    case '?': t->kind = T_QUESTION; return;
     case '.':
         if (lx_look(lx) == '.') { lx_getc(lx); t->kind = T_DOTDOT; return; }
         t->kind = T_DOT; return;

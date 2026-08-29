@@ -386,13 +386,98 @@ build caching). Two restrictions worth knowing before reaching for them:
 **no bounds** (a type parameter can't require "implements X"), and a generic
 class may only extend a **non-generic** base.
 
-## 12. `null`
+## 12. `null` and `T?`
 
-There's no separate optional/nullable wrapper type — `null` is a value of
-every reference type: `string`, arrays, `Map`, `class`, `fn`, plus the FFI
-pointer types `rawptr` and `cstring`. It is **not** valid for `struct`s or
-any value type (`int`, `float`, `bool`, `byte`) — those have no representable
-"absent" state.
+`null` is a value of every reference type: `string`, arrays, `Map`, `class`,
+`fn`, plus the FFI pointer types `rawptr` and `cstring`. It is **not** valid for
+`struct`s or any value type (`int`, `float`, `bool`, `byte`) — those have no
+representable "absent" state.
+
+### `T?` — a reference that may be null
+
+A `?` suffix marks a type whose value may be null, and **the checker refuses to
+dereference one until you have tested it**:
+
+```js
+class Session {
+    cert: Cert?;                     // may be null — say so in the type
+    fn init() { this.cert = null; }
+}
+
+fn subject(s: Session): string {
+    return s.cert.subject();         // error: 's.cert' is declared 'Cert?' and
+                                     // may be null here
+}
+```
+
+The fix is any ordinary check, which narrows the path for the rest of the
+branch:
+
+```js
+if (s.cert != null) { return s.cert.subject(); }
+```
+
+This is the same machinery `weak` uses, so the narrowing shapes are identical —
+`if (p != null)`, an exiting `if (p == null) { return; }`, the right side of
+`&&`, a `while`, or binding a local and checking that. Writing to the path drops
+what was known about it. All five shapes, and the one deliberate hole (a
+narrowing survives a call), are documented once in
+[`docs/memory.md`](memory.md) §3; everything there applies verbatim to `T?`.
+
+The suffix binds tightly, so it composes without ambiguity:
+
+```js
+a: Widget?[];              // an array (never null) of nullable Widget
+b: Widget[]?;              // a nullable array of non-null Widget
+c: Map<string, Widget?>;   // nullable map values
+d: fn(): Widget?;          // a function returning a nullable Widget
+```
+
+`T?` also works as a generic type argument — `Box<Widget?>`, and the explicit
+call form `ident<Widget?>(null)`.
+
+### Where `T?` does not apply
+
+**Only reference types can be null**, so `?` on anything else is refused rather
+than silently accepted as a no-op:
+
+```js
+count: int?;               // error: 'int?' is not a nullable type
+opts: Options?;            // error, if Options is a struct
+c: Color?;                 // error, if Color is an enum
+p: rawptr?;                // error — see below
+```
+
+**`weak T` is already nullable**, so `weak T?` is refused as redundant — a weak
+slot is *designed* to read null once its target is gone, which is the whole
+point of it. Write `weak Widget`.
+
+**The FFI pointer types stay outside the model.** `rawptr` and `cstring` accept
+`null` and always will, but they cannot be written `rawptr?`. C returns NULL
+constantly and the checker cannot see into C, so annotating the boundary would
+cost every `extern "C"` signature a `?` and buy no safety. Check them by hand,
+as you would in C.
+
+### What is not enforced yet
+
+**A plain `T` is not currently a promise of non-null.** These all still compile:
+
+```js
+let w: Widget = null;      // null into a plain T
+this.plain = this.maybe;   // a T? assigned into a plain T
+take(this.maybe);          // a T? passed to a plain T parameter
+```
+
+So `T?` today buys you a **checked dereference** at the sites that declare it,
+not a guarantee that everything else is non-null. Making a plain `T` mean
+non-null is a larger change — it needs assignability rules and definite
+assignment in `init`, and it reclassifies roughly 160 `return null;` sites in
+the standard library. Until then, read `T?` as documentation that the checker
+happens to enforce at the point of use.
+
+Debug builds carry a runtime backstop for the gap: dereferencing a null
+reference panics with a file and line rather than segfaulting. It compiles out
+under `--release`, exactly like the overflow and bounds checks (§1, §5).
 
 ## 13. Casts — `as`
 

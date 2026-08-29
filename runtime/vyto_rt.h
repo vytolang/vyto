@@ -226,6 +226,23 @@ static inline void *vt_arr_at(VtArray *a, int64_t i, const char *file, int line)
 }
 /* Read-only-view failure path — cold, out-of-line, never returns. */
 VT_NORETURN void vt_arr_ro(const char *file, int line);
+
+/* Null-dereference failure path — cold, out-of-line, never returns. */
+VT_NORETURN void vt_null_deref(const char *what, const char *file, int line);
+/* Debug-build null guard on a reference about to be dereferenced. Same shape as
+ * vt_arr_ati: hot path is one predicted-not-taken compare, the panic stays
+ * out-of-line, and the emitter drops the call entirely under --release.
+ *
+ * The checker refuses most null dereferences statically, but two holes are
+ * deliberate and documented (docs/memory.md §3): a narrowing survives a call
+ * that could null the field, and a possibly-null reference may be passed along.
+ * This turns what those produce — a bare segfault at 0x8 inside whatever
+ * function touched the field — into a panic naming the file and line, which is
+ * what every other memory fault in Vyto already does. */
+static inline void *vt_ck_ptr(void *p, const char *what, const char *file, int line) {
+    if (!p) vt_null_deref(what, file, line);
+    return p;
+}
 /* The same slot, for a WRITE. One extra branch on a flag that shares a cache
    line with len (already loaded for the bounds check) and is predicted
    not-taken, so a store loop still inlines and vectorizes — while a write to a
