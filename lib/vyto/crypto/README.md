@@ -6,7 +6,7 @@ from linking anything:
 
 | Import | What it gives you | Native code |
 |--------|-------------------|-------------|
-| `vyto/crypto` | SHA-256, SHA-1, MD5, HMAC, HKDF, PBKDF2, ChaCha20-Poly1305, constant-time compare, hex | none — pure Vyto |
+| `vyto/crypto` | SHA-256, SHA-512, SHA-384, SHA-1, MD5, HMAC, HKDF, PBKDF2, ChaCha20-Poly1305, constant-time compare, hex | none — pure Vyto |
 | `vyto/crypto/argon2` | Argon2id/i/d password hashing, BLAKE2b | none — pure Vyto |
 | `vyto/crypto/ecc` | P-256 key generation, ECDSA, ECDH, point compression | micro-ecc v1.1, vendored |
 | `vyto/crypto/openssl` | TLS client and server over any socket, X.509 parsing, chain verification, RFC 6125 hostname matching, channel binding | **system** libssl/libcrypto 3.0+ |
@@ -149,7 +149,9 @@ RAM, which is the resource that does not parallelise cheaply. PBKDF2 remains in
 | Operation | Cost |
 |-----------|------|
 | SHA-256 | ~62 MB/s |
+| SHA-512 | ~101 MB/s |
 | PBKDF2-HMAC-SHA256 | ~220 000 iterations/sec |
+| PBKDF2-HMAC-SHA512 | ~167 000 iterations/sec |
 | PBKDF2 at OWASP's 600 000-iteration floor | **2.7 s** |
 | Argon2id t=3, m=16 MiB, p=1 | 88 ms |
 | Argon2id t=3, m=64 MiB, p=1 | **357 ms** |
@@ -161,7 +163,15 @@ harder to attack** — the attacker has to find 256 MiB per parallel guess
 instead of essentially nothing. That is not a tradeoff; it is better on both
 axes, which is why the recommendation is unconditional.
 
-The PBKDF2 number is roughly an order of magnitude off OpenSSL, which uses the
+**SHA-512 is the faster hash here, by about 1.5×**, which surprises people who
+read it as "SHA-256 but bigger". It processes a 128-byte block per round set
+where SHA-256 processes 64, and its 64-bit words are one machine register on
+every triple vytoc targets — where SHA-256's 32-bit arithmetic costs an extra
+mask after every operation to stay inside a signed 64-bit `int`. On a 32-bit
+target the ordering would reverse. This is throughput only: both are the same
+one-shot construction, and SHA-256 remains the more interoperable default.
+
+The PBKDF2 numbers are roughly an order of magnitude off OpenSSL, which uses the
 SHA-NI instructions. Argon2id closes that gap for the password case by making
 memory rather than hash throughput the bottleneck, so the pure-Vyto
 implementation is not meaningfully handicapped: Vyto moves ~1.5 GB/s
@@ -197,7 +207,7 @@ completeness and for reading other people's hashes.
 
 ## Tests
 
-`examples/86_crypto.vt` — 78 checks, run by `tests/run_tests.sh` like every
+`examples/86_crypto.vt` — 97 checks, run by `tests/run_tests.sh` like every
 other numbered example. Nearly all are known-answer tests against values
 published elsewhere (FIPS 180-4, RFC 4231, RFC 5869, RFC 7693, RFC 8018, RFC
 8439, RFC 9106, RFC 6979's key pair), because self-consistent crypto proves
@@ -210,10 +220,18 @@ addressing despite running the lanes sequentially. Dropping to `p=1`-only would
 have made the spec's own vectors unusable and left nothing external to check
 against.
 
-The three things checked by property rather than constant are the ones that
-cannot have constants — key generation, randomised signing, and the
-deterministic nonce that is not RFC 6979 byte-compatible. Those are covered by
-round-trips, two-party agreement, and rejection of tampered input.
+The four things checked by property rather than constant are the ones that
+cannot have constants — key generation, randomised signing, the deterministic
+nonce that is not RFC 6979 byte-compatible, and HKDF-SHA512, for which RFC 5869
+publishes no vectors at all (its appendix covers SHA-256 and SHA-1 only). Those
+are covered by round-trips, two-party agreement, domain separation, and
+rejection of tampered input.
+
+**SHA-512's own vectors are known-answer throughout**, including the 1M×`'a'`
+case that catches a 128-byte padding off-by-one and RFC 4231's case 6, whose
+131-byte key exceeds the block and forces the hash-down path — the one place a
+constant copied from the SHA-256 code (64 instead of 128) would survive every
+other test.
 
 SHA-256 exists twice in this tree — pure Vyto in `crypto.vt` and C in
 `ecc_shim.c`, where micro-ecc's deterministic signing needs to drive it through
