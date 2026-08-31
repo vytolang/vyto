@@ -14,7 +14,7 @@ the resolver.
 
 ```sh
 make                 # builds it alongside vytoc and vytobind
-make test-pack       # 31 checks, no network
+make test-pack       # 36 checks, no network
 ```
 
 It is the one payload binary written in Vyto rather than C, so `make` is a
@@ -37,6 +37,7 @@ cd myapp
 vytopack install --url=https://github.com/vytolang/vyto-kv --rev=v0.3.1
 vytopack list
 vytopack verify
+vytopack audit [name]
 vytopack cache
 ```
 
@@ -80,6 +81,7 @@ across projects.
 | `store.vt` | the cache location and the lockfile |
 | `fetch.vt` | git resolve + clone + tree copy |
 | `manifest.vt` | `vyto.json` — the `name` field only |
+| `audit.vt` | the `audit` report — patterns, not proof |
 
 ## Naming and versions
 
@@ -138,6 +140,50 @@ that the command failed. That distinction is the test: an install carrying
 `--rev='v1;touch x'` fails either way, because with validation off `git
 ls-remote` simply finds no such ref. Fault injection proved it — stubbing the
 validators to return "" left an exit-status-only check passing on every case.
+
+## `audit` — and what it is not
+
+```
+$ vytopack audit
+audit vyto-kv (vyto_modules/vyto-kv)
+  6 Vyto file(s), 2 C file(s)
+
+  WARN  (package)
+        compiles 2 native source file(s)
+        vytoc compiles and links native/src automatically, so this C becomes
+        part of your program merely by importing the package
+  WARN  native/src/shim.c:14
+        executes a shell command
+        a library that shells out can run anything the build or the program can
+```
+
+**A report, not a verdict, and not a security guarantee.** It is pattern
+matching over source text: it cannot prove a package is safe, it is evadable by
+anyone trying, and a clean report means only that the obvious things are absent.
+What it does well is answer the question a person actually has before adding a
+dependency — *does this compile C? does it open sockets? does it shell out?* —
+in ten seconds rather than an afternoon of reading.
+
+It aims at the surface that matters. `vytopack` never runs code *from* a
+package; there are no install hooks. But **`native/src/*.c` is compiled and
+linked into your program automatically by `vytoc`**, so a shim carrying
+`__attribute__((constructor))` runs before `main()` with no call site anywhere.
+That is the path an attacker takes, and it is C rather than Vyto — which is why
+the Vyto-side rules here are the shallower half.
+
+Shipped scripts are scanned too, though nothing runs them: `native/build-*.sh`
+is a real convention someone may run by hand, and a script noted only by name
+would let an obvious credential grab pass as "ships a script".
+
+**It never blocks an install.** A tool that refuses legitimate packages — and a
+C shim is legitimate — gets switched off, and then it protects nobody. `install`
+prints a one-line count at the moment trust is being decided; `audit` gives the
+detail. It exits non-zero when anything is flagged, so CI can gate on it, but
+that is a signal to look rather than a claim of malice: a networking package
+opening sockets is expected, a string library doing it is not.
+
+Signing matters more than any scanner and is still unbuilt — a scanner tells you
+what code does, signing tells you who wrote it.
 
 ## The hash
 

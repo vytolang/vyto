@@ -1,0 +1,287 @@
+// `vytopack audit` — what does this package actually reach for?
+//
+// **This is a REPORT, not a verdict, and not a security guarantee.** It is
+// pattern matching over source text. It cannot prove a package is safe, it can
+// be evaded by anyone who is trying, and a clean report means only that the
+// obvious things are absent. What it does well is answer the question a person
+// actually has before adding a dependency — "does this compile C? does it open
+// sockets? does it shell out?" — in ten seconds instead of an afternoon of
+// reading.
+//
+// It is aimed at the surface that matters. `vytopack` never runs code FROM a
+// package: there are no install hooks. But a package's native/src/*.c is
+// compiled and linked into your program automatically by vytoc, so a shim with
+// a constructor runs before main() with no call site anywhere. That is the
+// path an attacker takes, and it is C rather than Vyto — which is also why the
+// Vyto-side checks here are the shallower half.
+//
+// Deliberately NOT a blocklist that fails an install. A tool that refuses
+// legitimate packages gets disabled, and then it protects nobody. Findings are
+// ranked and printed; the human decides.
+
+import { file_exists, path_join } from "vyto/io/file";
+import { listFiles } from "vytopack/tree";
+
+// Severity, in report order. NOTE is "worth knowing", WARN is "look at this
+// before you trust it". Nothing here is an "error": the tool is not entitled
+// to that judgement.
+export const SEV_NOTE: int = 0;
+export const SEV_WARN: int = 1;
+
+export class Finding {
+    sev: int;
+    file: string;      // package-relative; "" for a whole-package observation
+    line: int;         // 1-based; 0 when not line-specific
+    what: string;
+    why: string;
+    fn init(sev: int, file: string, line: int, what: string, why: string) {
+        this.sev = sev;
+        this.file = file;
+        this.line = line;
+        this.what = what;
+        this.why = why;
+    }
+}
+
+export class Report {
+    findings: Finding[];
+    vtFiles: int;
+    cFiles: int;
+    fn init(findings: Finding[], vtFiles: int, cFiles: int) {
+        this.findings = findings;
+        this.vtFiles = vtFiles;
+        this.cFiles = cFiles;
+    }
+    fn warnings(): int {
+        let n = 0;
+        for (let i in 0..this.findings.len) {
+            if (this.findings[i].sev == SEV_WARN) { n += 1; }
+        }
+        return n;
+    }
+}
+
+// One thing to look for in C source. `why` is the point of the whole exercise:
+// a hit is only useful if the reader is told what it would mean.
+class CRule {
+    needle: string;
+    sev: int;
+    what: string;
+    why: string;
+    fn init(needle: string, sev: int, what: string, why: string) {
+        this.needle = needle;
+        this.sev = sev;
+        this.what = what;
+        this.why = why;
+    }
+}
+
+fn cRules(): CRule[] {
+    let r: CRule[] = [];
+
+    // The one that needs no call site at all.
+    r.push(new CRule("__attribute__((constructor))", SEV_WARN,
+        "runs code before main()",
+        "a constructor executes at load with nothing calling it, so merely "
+        + "linking this package runs it"));
+    r.push(new CRule("__attribute__ ((constructor))", SEV_WARN,
+        "runs code before main()",
+        "a constructor executes at load with nothing calling it"));
+    r.push(new CRule(".init_array", SEV_WARN,
+        "runs code before main()",
+        "an init_array entry is the linker-level form of a constructor"));
+
+    // Executing other programs.
+    r.push(new CRule("system(", SEV_WARN, "executes a shell command",
+        "a library that shells out can run anything the build or the program can"));
+    r.push(new CRule("popen(", SEV_WARN, "executes a shell command",
+        "popen runs its argument through /bin/sh"));
+    r.push(new CRule("execl", SEV_WARN, "executes another program", ""));
+    r.push(new CRule("execv", SEV_WARN, "executes another program", ""));
+    r.push(new CRule("execve", SEV_WARN, "executes another program", ""));
+    r.push(new CRule("posix_spawn", SEV_WARN, "executes another program", ""));
+
+    // Reaching the network. A package that has no business doing this is the
+    // classic exfiltration shape.
+    r.push(new CRule("socket(", SEV_WARN, "opens a network socket",
+        "expected in a networking package; unexpected anywhere else"));
+    r.push(new CRule("connect(", SEV_NOTE, "connects a socket", ""));
+    r.push(new CRule("getaddrinfo", SEV_NOTE, "resolves a hostname", ""));
+    r.push(new CRule("curl_easy_init", SEV_NOTE, "uses libcurl", ""));
+
+    // Loading more code at runtime, which defeats reading the source.
+    r.push(new CRule("dlopen", SEV_WARN, "loads a shared library at runtime",
+        "code loaded at runtime is not in this tree and cannot be reviewed"));
+    r.push(new CRule("LoadLibrary", SEV_WARN, "loads a DLL at runtime", ""));
+
+    // Writing outside its own tree, at BUILD time this is the dangerous one.
+    r.push(new CRule("getenv(\"HOME\")", SEV_NOTE, "reads $HOME", ""));
+    r.push(new CRule("/etc/", SEV_NOTE, "references a path under /etc", ""));
+    r.push(new CRule(".ssh", SEV_WARN, "references an .ssh path",
+        "credentials live there; a library has no reason to know that"));
+    r.push(new CRule(".bashrc", SEV_WARN, "references a shell profile",
+        "writing one is a persistence mechanism"));
+    r.push(new CRule("chmod", SEV_NOTE, "changes file permissions", ""));
+
+    // Assembly and self-modifying tricks.
+    r.push(new CRule("__asm", SEV_NOTE, "contains inline assembly",
+        "legitimate in a crypto or codec package, otherwise unusual"));
+    r.push(new CRule("mprotect", SEV_WARN, "changes memory protection",
+        "making memory executable at runtime is how shellcode runs"));
+
+    return r;
+}
+
+// Vyto-side rules. Shallower on purpose: a Vyto package cannot run anything at
+// build time, so this half is about what the SHIPPED PROGRAM will be able to
+// do, not about compromise of the build.
+class VRule {
+    needle: string;
+    sev: int;
+    what: string;
+    why: string;
+    fn init(needle: string, sev: int, what: string, why: string) {
+        this.needle = needle;
+        this.sev = sev;
+        this.what = what;
+        this.why = why;
+    }
+}
+
+fn vRules(): VRule[] {
+    let r: VRule[] = [];
+    r.push(new VRule("extern \"C\"", SEV_NOTE, "declares foreign functions",
+        "the package calls C; pair this with what its native/src does"));
+    r.push(new VRule("#link", SEV_NOTE, "links a system library", ""));
+    r.push(new VRule("from \"vyto/os\"", SEV_NOTE, "imports vyto/os",
+        "process, environment and subprocess access"));
+    r.push(new VRule("from \"vyto/net", SEV_NOTE, "imports vyto/net",
+        "the package makes network connections"));
+    r.push(new VRule("capture(", SEV_WARN, "runs a subprocess",
+        "vyto/os capture() is popen(3) — the argument reaches a shell"));
+    r.push(new VRule("run(", SEV_NOTE, "may run a subprocess",
+        "check whether this is vyto/os run(), which reaches a shell"));
+    return r;
+}
+
+// 1-based line number of the byte offset `pos`.
+fn lineAt(text: string, pos: int): int {
+    let n = 1;
+    for (let i in 0..pos) {
+        if (text[i] == 10) { n += 1; }
+    }
+    return n;
+}
+
+// Report the FIRST hit per rule per file. A package that calls system() eleven
+// times is not eleven findings — that would bury the one that matters under a
+// pile of the same one.
+fn scanText(text: string, rel: string, needle: string, sev: int,
+            what: string, why: string, out: Finding[]) {
+    let at = text.index_of(needle);
+    if (at < 0) { return; }
+    out.push(new Finding(sev, rel, lineAt(text, at), what, why));
+}
+
+// Audit the package tree rooted at `dir`.
+export fn auditTree(dir: string): Report {
+    let out: Finding[] = [];
+    let files = listFiles(dir);
+    let vt = 0;
+    let c = 0;
+
+    // The single most important fact about a package, stated whether or not
+    // any pattern matches: does merely importing it compile C into your
+    // program? vytoc does that automatically for native/src/*.c.
+    let nativeFiles: string[] = [];
+    for (let i in 0..files.len) {
+        let f = files[i];
+        if (f.contains("native/src/") && (f.ends_with(".c") || f.ends_with(".h")
+                                          || f.ends_with(".cpp"))) {
+            nativeFiles.push(f);
+        }
+    }
+    if (nativeFiles.len > 0) {
+        out.push(new Finding(SEV_WARN, "", 0,
+            "compiles " + str(nativeFiles.len) + " native source file(s)",
+            "vytoc compiles and links native/src automatically, so this C "
+            + "becomes part of your program merely by importing the package"));
+    }
+
+    let crules = cRules();
+    let vrules = vRules();
+
+    for (let i in 0..files.len) {
+        let rel = files[i];
+        let abs = path_join(dir, rel);
+        if (rel.ends_with(".c") || rel.ends_with(".h") || rel.ends_with(".cpp")) {
+            c += 1;
+            let text = readfile(abs);
+            for (let j in 0..crules.len) {
+                let ru = crules[j];
+                scanText(text, rel, ru.needle, ru.sev, ru.what, ru.why, out);
+            }
+        } else if (rel.ends_with(".vt")) {
+            vt += 1;
+            let text = readfile(abs);
+            for (let j in 0..vrules.len) {
+                let ru = vrules[j];
+                scanText(text, rel, ru.needle, ru.sev, ru.what, ru.why, out);
+            }
+        } else if (rel.ends_with(".sh") || rel.ends_with(".py")
+                   || rel.ends_with(".pl")) {
+            // Nothing here runs a shipped script — vytopack has no hooks and
+            // vytoc compiles only native/src. But `native/build-*.sh` is a
+            // real convention a person may run by hand, so the CONTENT is
+            // scanned too: the C rules (.ssh, sockets, exec) read equally well
+            // in shell, and a script noted only by name would let an obvious
+            // credential grab pass as "ships a script".
+            out.push(new Finding(SEV_NOTE, rel, 0, "ships a script",
+                "nothing runs it automatically, but check what it is for"));
+            let text = readfile(abs);
+            for (let j in 0..crules.len) {
+                let ru = crules[j];
+                scanText(text, rel, ru.needle, ru.sev, ru.what, ru.why, out);
+            }
+        }
+    }
+
+    // Warnings first, then notes; within a severity, by file.
+    out.sort((a, b) => {
+        if (a.sev != b.sev) { return b.sev - a.sev; }
+        return byte_comp(a.file, 0, a.file.len, b.file, 0, b.file.len);
+    });
+    return new Report(out, vt, c);
+}
+
+// Print a report. Returns the number of warnings, so a caller can decide what
+// an exit code should be — this module does not decide that.
+export fn printReport(r: Report, label: string): int {
+    print("audit " + label);
+    print("  " + str(r.vtFiles) + " Vyto file(s), " + str(r.cFiles)
+          + " C file(s)");
+    if (r.findings.len == 0) {
+        print("  nothing flagged");
+        print("");
+        print("  A clean report means the obvious patterns are absent. It is");
+        print("  not proof the package is safe — this is text matching, and it");
+        print("  cannot see what a determined author would hide.");
+        return 0;
+    }
+    print("");
+    for (let i in 0..r.findings.len) {
+        let f = r.findings[i];
+        let tag = "note";
+        if (f.sev == SEV_WARN) { tag = "WARN"; }
+        let loc = f.file;
+        if (loc.is_empty()) { loc = "(package)"; }
+        if (f.line > 0) { loc = loc + ":" + str(f.line); }
+        print("  " + tag + "  " + loc);
+        print("        " + f.what);
+        if (!f.why.is_empty()) { print("        " + f.why); }
+    }
+    print("");
+    print("  Findings are observations, not verdicts. A networking package");
+    print("  opening sockets is expected; a string library doing it is not.");
+    return r.warnings();
+}

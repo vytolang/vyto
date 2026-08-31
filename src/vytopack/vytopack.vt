@@ -25,6 +25,7 @@ import { cacheDir, cachePath, cacheHas, Locked, LOCK_FILE,
          lockRead, lockWrite, lockUpsert, lockFind } from "vytopack/store";
 import { haveGit, resolveRev, gitFetch, copyTree } from "vytopack/fetch";
 import { Manifest, readManifest } from "vytopack/manifest";
+import { Report, auditTree, printReport, SEV_WARN } from "vytopack/audit";
 
 const VERSION: string = "0.1.0";
 
@@ -182,6 +183,18 @@ fn cmdInstall(app: Cli): int {
     print("installed " + name + " " + rev + " -> " + dest);
     print("  rev  " + sha);
     print("  hash " + hash);
+
+    // A one-line audit summary at the moment somebody is deciding to trust
+    // this package, which is the only moment they will read it. Deliberately
+    // does not block or prompt: a tool that cries wolf on a legitimate C shim
+    // gets ignored, and then it protects nobody. Full detail on demand.
+    let rep = auditTree(dest);
+    let warns = rep.warnings();
+    if (warns > 0) {
+        print("");
+        print("  " + str(warns) + " thing(s) worth a look — run: vytopack audit "
+              + name);
+    }
     print("");
     print("import it as \"" + name + "/<module>\" — vytoc searches vyto_modules/");
     if (!dest.starts_with("vyto_modules/")) {
@@ -241,6 +254,36 @@ fn cmdVerify(app: Cli): int {
     return 0;
 }
 
+// `audit [name]` — report what installed packages reach for. With no name,
+// every package in the lock; otherwise just that one.
+fn cmdAudit(app: Cli): int {
+    let want = app.get("name");
+    let entries = lockRead(LOCK_FILE);
+    if (entries.len == 0) {
+        print("nothing to audit (no " + LOCK_FILE + " here)");
+        return 0;
+    }
+    let warned = 0;
+    let seen = 0;
+    for (let i in 0..entries.len) {
+        let e = entries[i];
+        if (!want.is_empty() && e.name != want) { continue; }
+        seen += 1;
+        if (!file_exists(e.dir)) {
+            print("audit " + e.name + ": " + e.dir + " is missing");
+            continue;
+        }
+        if (seen > 1) { print(""); }
+        warned += printReport(auditTree(e.dir), e.name + " (" + e.dir + ")");
+    }
+    if (seen == 0) { die("no package named '" + want + "' in " + LOCK_FILE); }
+    // Non-zero when something was flagged, so CI can gate on it. Findings are
+    // observations rather than failures, so this is a signal to look, not a
+    // claim that the package is malicious.
+    if (warned > 0) { return 1; }
+    return 0;
+}
+
 fn cmdCache(app: Cli): int {
     let c = cacheDir();
     if (c.is_empty()) { print("cache is disabled or unusable"); return 0; }
@@ -261,6 +304,8 @@ fn main() {
     app.command("list", "show what " + LOCK_FILE + " records");
     app.command("verify", "re-hash installed packages against " + LOCK_FILE);
     app.command("cache", "print the package cache directory");
+    let aud = app.command("audit", "report what installed packages reach for");
+    aud.positional("name", "audit only this package (default: all)").dflt("");
     app.flag("version", "print the version and exit");
 
     if (!app.parse(args())) {
@@ -273,6 +318,7 @@ fn main() {
     if (cmd == "install") { exit(cmdInstall(ins)); }
     if (cmd == "list") { exit(cmdList(app)); }
     if (cmd == "verify") { exit(cmdVerify(app)); }
+    if (cmd == "audit") { exit(cmdAudit(aud)); }
     if (cmd == "cache") { exit(cmdCache(app)); }
 
     print(app.usage());
