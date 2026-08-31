@@ -3139,6 +3139,28 @@ static void check_stmt(Ctx *c, Stmt *s) {
         c->loop_depth--;
         return;
     case ST_FOR_EACH: {
+        /* `for (let v in Color)` — the iterator names a *declaration*, not a
+           value, so this runs before check_expr below would report "'Color'
+           cannot be used as a value". Same intercept shape as Color.Red in
+           check_member. The variants are already resolved (resolve_enum runs
+           during signature resolution), so the loop needs nothing at runtime
+           beyond a static table of their values. */
+        if (s->iter->kind == EX_IDENT && !lookup_value(c, s->iter, s->iter->name)) {
+            Decl *td = mod_lookup(c->mod, s->iter->name);
+            if (td && td->kind == D_ENUM) {
+                s->kind = ST_FOR_ENUM;
+                s->iter_enum = td->ed;
+                Type *vt = mk_type(TY_ENUM);
+                vt->edecl = td->ed;
+                c->loop_depth++;
+                scope_push(c);
+                s->local = define_local(c, s->name, vt, false, s->loc);
+                check_block(c, s->body, s->nbody);
+                scope_pop(c);
+                c->loop_depth--;
+                return;
+            }
+        }
         Type *t = check_expr(c, s->iter, NULL);
         if (t->kind == TY_CLASS) { check_for_iter(c, s, t); return; }
         if (t->kind != TY_ARRAY)
@@ -3176,6 +3198,10 @@ static void check_stmt(Ctx *c, Stmt *s) {
     case ST_FOR_ITER:
         /* Never reached: check_for_iter rewrites ST_FOR_EACH into this after
            checking the whole loop, and a statement is checked exactly once. */
+        return;
+    case ST_FOR_ENUM:
+        /* Never reached, same reason: the ST_FOR_EACH case rewrites the
+           statement into this once the enum iterator is recognized. */
         return;
     case ST_SWITCH: check_switch(c, s); return;
     case ST_BREAK: case ST_CONTINUE:

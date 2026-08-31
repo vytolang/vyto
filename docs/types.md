@@ -334,6 +334,38 @@ Two rules keep the serialization unambiguous, both compile errors:
 A variant takes a string or a number, never both: they answer different
 questions, and mixing them in one enum is rejected.
 
+### Iterating an enum
+
+```js
+for (let c in Color) {
+    print(c.name());
+}
+```
+
+The loop variable is a real `Color`, so everything above works on it —
+`switch`, `.name()`, `as int`.
+
+It costs nothing. Variant values are compile-time constants, so this lowers to a
+`static const` table in read-only data plus a plain indexed loop: no allocation,
+no refcount, nothing to release. The table is written once per enum *and only if
+something iterates it*, like the name table. Because the values are constants,
+the C compiler can often fold a loop over them away entirely — a summing
+benchmark over 160M iterations measured **0.00s against 0.11s** for the same
+loop over an eight-element array, which cannot be folded because it is a heap
+object.
+
+Iteration walks the **declared variants in declaration order**, not `0..count()`
+— so a pinned or sparse enum yields its own numbers:
+
+```js
+enum PgMsg { Auth = 82, BackendKey = 75, Ready = 90 }
+
+for (let m in PgMsg) { print(str(m as int)); }   // 82, 75, 90
+```
+
+This is what the parallel `string[]` next to an enum was for; the array can
+drift from the enum, and the loop cannot.
+
 **Ordinals are not a wire format.** Reordering variants renumbers the ones that
 follow. If a number has to survive across a version boundary, pin it explicitly
 as `PgMsg` does above.

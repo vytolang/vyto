@@ -1860,6 +1860,45 @@ static void emit_stmt(Em *em, Stmt *s) {
         loop_end(em, ls);
         break;
     }
+    case ST_FOR_ENUM: {
+        /* for (let v in Color). The variant values are compile-time constants,
+           so this is a static table in rodata plus a plain indexed loop — no
+           allocation, no refcount, and nothing to release. The table is written
+           once per enum on first use, like the name and find tables, so an enum
+           nobody iterates costs nothing.
+
+           A table rather than a 0..count range because an enum may be sparse or
+           explicitly valued (PgMsg { Auth = 82, ... }); iterating the ordinals
+           would be wrong for exactly the enums whose values were pinned on
+           purpose. */
+        EnumDecl *ed = s->iter_enum;
+        if (!ed->vals_tbl_emitted) {
+            ed->vals_tbl_emitted = true;
+            SBuf *ax = em->aux;
+            sb_printf(ax, "static const int64_t v_enm_%s_%s_vals[%d] = {",
+                      ed->module->name, ed->name, ed->nvariants);
+            for (int i = 0; i < ed->nvariants; i++)
+                sb_printf(ax, "%s%lldLL", i ? ", " : "",
+                          (long long)ed->variants[i].value);
+            sb_puts(ax, "};\n");
+        }
+        const char *iv = arena_printf(&g_arena, "_i%d", em->tempc++);
+        ind(em);
+        sb_printf(em->out, "for (int64_t %s = 0; %s < %d; %s++) {\n",
+                  iv, iv, ed->nvariants, iv);
+        em->indent++;
+        EScope *ls = loop_begin(em);
+        ind(em);
+        sb_printf(em->out, "int64_t %s = v_enm_%s_%s_vals[%s];\n",
+                  s->local->cname, ed->module->name, ed->name, iv);
+        emit_stmts(em, s->body, s->nbody);
+        epop(em);
+        em->indent--;
+        ind(em);
+        sb_puts(em->out, "}\n");
+        loop_end(em, ls);
+        break;
+    }
     case ST_FOR_ITER: {
         /* for (let x in c) over a class with len()/at(i). The checker built the
            two calls as ordinary AST, so this is a plain index loop.

@@ -195,6 +195,7 @@ typedef enum BuiltinKind {
 
 typedef enum StmtKind {
     ST_LET, ST_EXPR, ST_IF, ST_WHILE, ST_FOR_RANGE, ST_FOR_EACH, ST_FOR_ITER,
+    ST_FOR_ENUM,   /* for (let v in Color): walks a static const value table */
     ST_RETURN, ST_BREAK, ST_CONTINUE, ST_BLOCK, ST_SWITCH,
     ST_ARENA,   /* arena [name] { body } — lexical region (uses Stmt.name/body) */
 } StmtKind;
@@ -232,6 +233,7 @@ struct Stmt {
     Expr *iter;                /* ST_FOR_EACH: array expr. ST_FOR_ITER: container expr */
     /* ST_FOR_ITER: the desugared index loop, built and checked by the checker.
        `for (let x in c)` becomes `c.len()` / `c.at(i)` over hidden locals. */
+    EnumDecl *iter_enum;       /* ST_FOR_ENUM: the enum being walked */
     Local *iter_local;         /* holds the container for the whole loop */
     Local *index_local;        /* the loop counter */
     Expr *len_call;            /* $c.len() */
@@ -335,6 +337,7 @@ struct EnumDecl {
     Module *module;
     bool name_tbl_emitted;  /* emit: the .name() lookup is written once, on first use */
     bool find_tbl_emitted;  /* emit: same, for the parse()/has() reverse lookup */
+    bool vals_tbl_emitted;  /* emit: same, for the for-in value table */
 };
 
 struct StructDecl {
