@@ -111,8 +111,17 @@ growing buffer instead of a fresh string per concatenation, and `clear()`
 deliberately keeps the capacity so the buffer is reused across iterations
 rather than reallocated.
 
-Concrete trap: **`readlines()` allocates a string per line.** On a large file
-call `readfile()` once and slice the single buffer instead.
+Concrete trap: **`readlines()` allocates a string per line — a memory cost, not
+a speed one.** Measured on a 55 MB / 1M-line file: **157 MB peak RSS vs 110 MB**
+for `readfile()` plus one pass over the single buffer (+43%), while wall time is
+a wash (0.13 s vs 0.14 s — `readlines()` is marginally *faster*). The size-class
+pool makes each small string a bump in a pre-allocated chunk rather than a
+`malloc`, and `vt_file_lines` reads the file once and `memchr`s through it
+(`runtime/vyto_rt.c:869`), so there is no per-line I/O or re-copy to avoid.
+
+So reach for `readfile()` when the file is large relative to available memory —
+not for throughput. Rewriting a working `readlines()` loop to chase latency is
+wasted effort and costs readability.
 
 This is a rule for bulk and unbounded data. Do not arena a handful of items —
 it costs readability, and "stupidly easy to read" is in the goal too.
