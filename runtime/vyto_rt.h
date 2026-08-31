@@ -160,6 +160,7 @@ VtString *vt_str_concat(VtString *a, VtString *b);
 VtString *vt_str_concat_int(VtString *a, int64_t v); /* fused: concat(a, from_int(v)), one alloc */
 VtString *vt_str_join(int n, VtString **parts);      /* n parts, one alloc; parts are borrowed */
 int64_t vt_ck_enum(int64_t v, const char *ename, const char *file, int line);
+int64_t vt_enum_parse_fail(VtString *s, const char *ename, const char *file, int line);
 bool vt_str_eq(VtString *a, VtString *b);
 VtString *vt_str_from_int(int64_t v);
 VtString *vt_str_from_float(double v);

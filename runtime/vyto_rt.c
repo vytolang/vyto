@@ -600,6 +600,29 @@ int64_t vt_ck_enum(int64_t v, const char *ename, const char *file, int line) {
     return v;
 }
 
+/* `Enum.parse(s)` where s names no variant. Unlike vt_ck_enum this fires in
+   release builds too: the caller asked for a variant and there is no in-band
+   value to hand back, so continuing would fabricate one. has() is the way to
+   ask without risking this. */
+int64_t vt_enum_parse_fail(VtString *s, const char *ename, const char *file, int line) {
+    char msg[160];
+    /* The name is file- or network-supplied, so bound what we echo. vt_snprintf
+       has no precision specifier, so truncate by copy; data is NUL-terminated. */
+    char got[64];
+    size_t n = s && s->len > 0 ? (size_t)s->len : 0;
+    if (n > sizeof got - 1) n = sizeof got - 1;
+    for (size_t i = 0; i < n; i++) {
+        unsigned char ch = (unsigned char)s->data[i];
+        /* The name came from outside the program; keep escape sequences out of
+           the panic line rather than letting them reach a terminal. */
+        got[i] = (ch < 0x20 || ch == 0x7f) ? '?' : (char)ch;
+    }
+    got[n] = '\0';
+    vt_snprintf(msg, sizeof msg, "\"%s\" is not a variant of enum '%s'", got, ename);
+    vt_panic_c(file, line, msg);
+    return 0;
+}
+
 /* Signed divide/modulo: trap zero divisor (would SIGFPE) and the INT_MIN/-1
    overflow (C UB), then range-check the quotient against the target type. */
 int64_t vt_ck_div(int64_t a, int64_t b, int64_t lo, int64_t hi, const char *file, int line) {

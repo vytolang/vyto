@@ -260,20 +260,79 @@ The inbound direction is **range-checked in debug builds** and panics with the
 offending value if it names no variant, because such a value typically came from
 C, a file, or the network. In `--release` the check compiles away entirely.
 
-Two accessors come with every enum:
+Four accessors come with every enum:
 
 ```js
 print(Color.Blue.name());     // "Blue"  — the variant's own spelling
 print(str(Color.count()));    // 3       — how many variants there are
+print(str(Color.has("Red"))); // true    — does that name a variant
+let c = Color.parse("Red");   // Color.Red — the inverse of .name()
 ```
 
 `count()` is a compile-time literal; the enum type does not exist at runtime at
-all. `.name()` is a lookup written **once per enum, and only if something asks
-for it** — an enum whose name is never taken costs nothing in the binary. The
-strings it returns are immortal, so calling it in a loop allocates nothing.
+all. `.name()` and the `parse()`/`has()` lookup are each written **once per
+enum, and only if something asks for them** — an enum nobody names or parses
+costs nothing in the binary. The strings `.name()` returns are immortal, so
+calling it in a loop allocates nothing.
 
-`.name()` is called on a *value* and `count()` on the *type*; asking the wrong
-one which is which gives an error saying so.
+`.name()` is called on a *value*; `count()`, `parse()` and `has()` on the
+*type*. Asking the wrong one which is which gives an error saying so.
+
+### `parse()` panics; `has()` asks
+
+`parse()` returns the enum itself, not an int, so a parsed value is exactly as
+type-safe as a written one. That is also why a name matching nothing **panics**
+rather than returning a miss: an enum is one machine word with every bit-pattern
+spoken for, so there is no in-band value left to mean "absent", and handing back
+a real variant would be inventing data.
+
+Unlike the `as Color` range check above, this panic fires in `--release` too.
+
+So `parse()` alone is right when the string is yours — a name you wrote, or one
+`.name()` produced. When it came from a file, a user, or the network, ask first:
+
+```js
+if (Color.has(s)) {
+    let c = Color.parse(s);
+    ...
+} else {
+    // your own fallback: a default, an error, a skipped record
+}
+```
+
+Both calls share one emitted lookup, so testing before parsing costs a second
+scan of a handful of names, not a second table.
+
+Matching is exact and byte-for-byte: no case folding, no trimming. `"red"` does
+not parse as `Color.Red`. Normalize before the call if you want it looser.
+
+### Variants can carry their own spelling
+
+A wire format rarely spells things the way an identifier can. Give a variant a
+string and `.name()`/`parse()` use it instead of the identifier:
+
+```js
+enum Header { ContentType = "content-type", XReal = "x-real-ip" }
+
+print(Header.ContentType.name());          // "content-type"
+print(str(Header.parse("x-real-ip") as int));  // 1
+print(str(Header.has("XReal")));           // false — the string is the name now
+```
+
+The string is **metadata, not the value**. Ordinals stay positional, exactly as
+in an untagged enum, and `as int` still gives you the ordinal. What the string
+pins is the *spelling*, which is the thing that actually crosses the wire — so
+unlike ordinals, a string-tagged enum survives having its variants reordered.
+
+Two rules keep the serialization unambiguous, both compile errors:
+
+- **All or nothing.** Tag every variant or none. A half-tagged enum would
+  serialize some variants by string and the rest by identifier.
+- **No duplicate strings**, for the same reason two variants cannot share an
+  ordinal — `parse()` could not choose, and `.name()` would lose information.
+
+A variant takes a string or a number, never both: they answer different
+questions, and mixing them in one enum is rejected.
 
 **Ordinals are not a wire format.** Reordering variants renumbers the ones that
 follow. If a number has to survive across a version boundary, pin it explicitly

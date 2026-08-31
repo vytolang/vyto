@@ -587,11 +587,16 @@ static char *emit_call(Em *em, Expr *e, bool *fresh) {
                 sb_printf(ax, "    static VtString* _n[%d];\n", ed->nvariants);
                 sb_printf(ax, "    switch (v) {\n");
                 for (int i = 0; i < ed->nvariants; i++) {
-                    const char *vn = ed->variants[i].name;
+                    /* a `= "text"` variant serializes as its string, not its
+                       identifier; parse() reads the same table back */
+                    const char *vn = ed->variants[i].text ? ed->variants[i].text
+                                                          : ed->variants[i].name;
+                    int vl = ed->variants[i].text ? ed->variants[i].textlen
+                                                  : (int)strlen(ed->variants[i].name);
                     sb_printf(ax, "    case %lldLL: return _n[%d] ? _n[%d] "
                                   ": (_n[%d] = vt_str_immortal(\"%s\", %d));\n",
                               (long long)ed->variants[i].value, i, i, i,
-                              c_escape(vn, strlen(vn)), (int)strlen(vn));
+                              c_escape(vn, (size_t)vl), vl);
                 }
                 sb_printf(ax, "    }\n");
                 /* Unreachable for a value that came from a variant; a value cast
@@ -601,6 +606,59 @@ static char *emit_call(Em *em, Expr *e, bool *fresh) {
             *fresh = false;   /* immortal: borrowed, nothing to release */
             return arena_printf(&g_arena, "v_enm_%s_%s_name(%s)",
                                 ed->module->name, ed->name, ex_b(em, recv));
+        }
+        case B_ENUM_PARSE:
+        case B_ENUM_HAS: {
+            /* The reverse of the name table, and emitted on the same terms: one
+               function per enum, written into aux on first use, shared by every
+               parse() and has() site. Returns the variant's value, or `found`
+               = 0 when the name matches nothing — the value cannot itself carry
+               "missing", since a sparse enum may legitimately contain -1. */
+            EnumDecl *ed = e->edecl;
+            if (!ed->find_tbl_emitted) {
+                ed->find_tbl_emitted = true;
+                SBuf *ax = em->aux;
+                sb_printf(ax, "static int64_t v_enm_%s_%s_find(VtString* s, int64_t* found) {\n",
+                          ed->module->name, ed->name);
+                sb_printf(ax, "    const char* d = s ? s->data : \"\";\n");
+                sb_printf(ax, "    int64_t n = s ? s->len : 0;\n");
+                sb_printf(ax, "    *found = 1;\n");
+                for (int i = 0; i < ed->nvariants; i++) {
+                    /* matches whatever .name() produced: the string if the
+                       variant declared one, else its identifier */
+                    const char *vn = ed->variants[i].text ? ed->variants[i].text
+                                                          : ed->variants[i].name;
+                    int vl = ed->variants[i].text ? ed->variants[i].textlen
+                                                  : (int)strlen(ed->variants[i].name);
+                    /* Length first, so the memcmp only runs on a real candidate. */
+                    sb_printf(ax, "    if (n == %d && !memcmp(d, \"%s\", %d)) return %lldLL;\n",
+                              vl, c_escape(vn, (size_t)vl), vl,
+                              (long long)ed->variants[i].value);
+                }
+                sb_printf(ax, "    *found = 0;\n    return 0;\n}\n");
+            }
+            *fresh = false;   /* an int either way; nothing to release */
+            const char *sarg = ex_b(em, a[0]);
+            /* The found flag has no Vyto type to hand newtemp, so declare it
+               directly in the same statement prologue newtemp writes to. */
+            const char *fv = arena_printf(&g_arena, "_t%d", em->tempc++);
+            sb_printf(em->pre, "    int64_t %s;\n", fv);
+            if (e->builtin == B_ENUM_HAS)
+                return arena_printf(&g_arena,
+                                    "(v_enm_%s_%s_find(%s, &%s), %s != 0)",
+                                    ed->module->name, ed->name, sarg, fv, fv);
+            /* parse(): a miss panics — see vt_enum_parse_fail. The argument is
+               named twice (the lookup, then the message), so bind it to a temp
+               first rather than evaluating a call expression twice. Borrowed:
+               the argument outlives this expression at its own site. */
+            const char *sv = newtemp(em, a[0]->type, false);
+            const char *rv = newtemp(em, e->type, false);
+            return arena_printf(&g_arena,
+                                "(%s = %s, %s = v_enm_%s_%s_find(%s, &%s), %s ? %s "
+                                ": vt_enum_parse_fail(%s, \"%s\", \"%s\", %d))",
+                                sv, sarg, rv, ed->module->name, ed->name, sv, fv, fv, rv,
+                                sv, ed->name,
+                                c_escape(e->loc.file, strlen(e->loc.file)), e->loc.line);
         }
         case B_PRINT:
             *fresh = false;

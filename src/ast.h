@@ -134,6 +134,8 @@ struct Expr {
     ClassDecl *cls;         /* EX_NEW class; REF_FIELD/REF_METHOD owner */
     StructDecl *sd;         /* REF_FIELD on struct */
     FnDecl *method;         /* REF_METHOD/REF_METHOD_VAL target */
+    EnumDecl *edecl;        /* B_ENUM_PARSE/B_ENUM_HAS: the enum asked, which is
+                               the *type* and so is not on any operand */
     int builtin;            /* BuiltinKind for REF_BUILTIN */
     bool is_super_call;     /* super.init(...) */
     bool region_local;      /* EX_NEW resolved to arena allocation (region > 0) */
@@ -148,6 +150,8 @@ typedef enum BuiltinKind {
     B_NONE, B_PRINT, B_PANIC, B_STR,
     B_LEN,          /* .len on string/array/map */
     B_ENUM_NAME,    /* .name() on an enum value */
+    B_ENUM_PARSE,   /* Enum.parse(s) — the variant, panics if the name is none */
+    B_ENUM_HAS,     /* Enum.has(s) — does that name a variant */
     B_PUSH, B_POP,  /* array */
     B_MAP_SET, B_MAP_GET, B_MAP_HAS, B_MAP_REMOVE,
     B_CSTR,         /* string.cstr() */
@@ -315,6 +319,11 @@ typedef struct EnumVariant {
     const char *name;
     Expr *init;         /* explicit `= expr`, NULL to continue from the previous */
     int64_t value;      /* filled by the checker */
+    /* `= "text"`: the variant's serialized spelling. Metadata, not the value —
+       the ordinal is still assigned positionally. NULL means .name()/parse()
+       use `name` above. */
+    const char *text;
+    int textlen;
     Loc loc;
 } EnumVariant;
 
@@ -325,6 +334,7 @@ struct EnumDecl {
     int nvariants;
     Module *module;
     bool name_tbl_emitted;  /* emit: the .name() lookup is written once, on first use */
+    bool find_tbl_emitted;  /* emit: same, for the parse()/has() reverse lookup */
 };
 
 struct StructDecl {

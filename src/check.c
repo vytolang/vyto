@@ -1745,16 +1745,43 @@ static Type *check_call(Ctx *c, Expr *e, Type *expected) {
         if (callee->lhs->kind == EX_IDENT && !lookup_value(c, callee->lhs, callee->lhs->name)) {
             Decl *td = mod_lookup(c->mod, callee->lhs->name);
             if (td && td->kind == D_ENUM) {
+                EnumDecl *ed = td->ed;
                 /* Color.count() — how many variants. A compile-time literal;
                    the enum itself never reaches runtime. */
-                if (callee->name != intern("count"))
-                    fatal_at(e->loc, "enum '%s' has no static method '%s' "
-                                     "(only count(); .name() is called on a value)",
-                             td->ed->name, callee->name);
-                if (e->nargs != 0) fatal_at(e->loc, "count() takes no arguments");
-                e->kind = EX_INT;
-                e->ival = td->ed->nvariants;
-                return e->type = ty_int();
+                if (callee->name == intern("count")) {
+                    if (e->nargs != 0) fatal_at(e->loc, "count() takes no arguments");
+                    e->kind = EX_INT;
+                    e->ival = ed->nvariants;
+                    return e->type = ty_int();
+                }
+                /* Color.parse(s) / Color.has(s) — the inverse of .name(), over
+                   the same variant-name table. Both are asked of the *type*, so
+                   the enum travels on e->edecl rather than on a receiver.
+
+                   parse() panics on a name that matches nothing, the way an
+                   out-of-range `as Color` does: the result is an enum, and an
+                   enum is a bare int with no room for a "missing" value. Test
+                   with has() first when the input is untrusted. */
+                bool is_parse = callee->name == intern("parse");
+                if (is_parse || callee->name == intern("has")) {
+                    if (e->nargs != 1)
+                        fatal_at(e->loc, "%s() takes 1 argument, the name to look up",
+                                 callee->name);
+                    Type *at = check_expr(c, e->args[0], ty_string());
+                    want(c, e->args[0], ty_string(), callee->name);
+                    (void)at;
+                    e->ref = REF_BUILTIN;
+                    e->builtin = is_parse ? B_ENUM_PARSE : B_ENUM_HAS;
+                    e->edecl = ed;
+                    if (!is_parse) return e->type = ty_bool();
+                    Type *t = mk_type(TY_ENUM);
+                    t->edecl = ed;
+                    return e->type = t;
+                }
+                fatal_at(e->loc, "enum '%s' has no static method '%s' "
+                                 "(only count(), parse() and has(); "
+                                 ".name() is called on a value)",
+                         ed->name, callee->name);
             }
             if (td && td->kind == D_CLASS) {
                 FnDecl *sm = class_find_static(td->cd, callee->name);
@@ -3412,19 +3439,40 @@ static CVal fold_const_decl(Decl *d) {
    folded during body checking. */
 static void resolve_enum(EnumDecl *ed, Module *m) {
     int64_t next = 0;
+    /* `= "text"` and `= 7` answer different questions — the spelling and the
+       number — so an enum picks one. Mixing them would make an unvalued variant
+       ambiguous: continue the ordinals, or take its own name as text? */
+    bool any_text = false, any_num = false;
     for (int i = 0; i < ed->nvariants; i++) {
         EnumVariant *v = &ed->variants[i];
-        if (v->init) {
+        if (v->init && v->init->kind == EX_STR) {
+            /* Metadata: the ordinal stays positional, so reordering a
+               string-tagged enum still renumbers it — the wire value here is
+               the string, which does not move. */
+            v->text = v->init->sval;
+            v->textlen = (int)v->init->slen;
+            if (v->textlen == 0)
+                fatal_at(v->loc, "enum variant '%s' has an empty string — "
+                                 "parse(\"\") could never name it", v->name);
+            v->value = next;
+            any_text = true;
+        } else if (v->init) {
             const char *save = g_fold_what;
             g_fold_what = "enum variant value";
             CVal cv = fold_const_expr(m, v->init);
             g_fold_what = save;
             if (cv.kind != 0)
-                fatal_at(v->loc, "enum variant value must be an integer constant");
+                fatal_at(v->loc, "enum variant value must be an integer constant "
+                                 "or a string literal");
             v->value = cv.i;
+            any_num = true;
         } else {
             v->value = next;
         }
+        if (any_text && any_num)
+            fatal_at(v->loc, "enum '%s' mixes string and integer variant values; "
+                             "a string names the variant and an integer numbers it, "
+                             "so an enum uses one or the other", ed->name);
         next = v->value + 1;
         for (int k = 0; k < i; k++) {
             if (ed->variants[k].name == v->name)
@@ -3432,8 +3480,28 @@ static void resolve_enum(EnumDecl *ed, Module *m) {
             if (ed->variants[k].value == v->value)
                 fatal_at(v->loc, "duplicate value %lld in enum '%s' (variant '%s' has it)",
                          (long long)v->value, ed->name, ed->variants[k].name);
+            /* Two variants with one spelling would make parse() ambiguous and
+               .name() lossy, so it is rejected the way a duplicate value is. */
+            if (v->text && ed->variants[k].text &&
+                ed->variants[k].textlen == v->textlen &&
+                memcmp(ed->variants[k].text, v->text, (size_t)v->textlen) == 0)
+                fatal_at(v->loc, "duplicate string \"%s\" in enum '%s' (variant '%s' has it)",
+                         v->text, ed->name, ed->variants[k].name);
         }
     }
+    /* Tagging is all-or-nothing, checked after the fact so an untagged variant
+       is caught wherever it sits — including before the first tagged one. An
+       untagged variant here would serialize as its identifier while its
+       siblings use their strings: a wire format half in each convention, and
+       almost always a variant someone forgot to tag. */
+    if (any_text)
+        for (int i = 0; i < ed->nvariants; i++)
+            if (!ed->variants[i].text)
+                fatal_at(ed->variants[i].loc,
+                         "enum variant '%s' needs a string like its siblings — "
+                         "otherwise it serializes as \"%s\" while the rest of "
+                         "'%s' use their own spellings",
+                         ed->variants[i].name, ed->variants[i].name, ed->name);
 }
 
 static void check_const(Module *m, Decl *d) {
