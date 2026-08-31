@@ -101,6 +101,79 @@ static const char *find_lib_dir(void) {
     return libdir = NULL;
 }
 
+/* ---- module search roots ------------------------------------------------
+ *
+ * Roots probed for an import, in order, after the importing module's own
+ * directory. Registration order is search order:
+ *
+ *   1. --modpath <dir>, repeatable, in command-line order
+ *   2. $VYTO_PATH, ':'-separated  (skipped entirely when any --modpath was
+ *      given -- flag overrides env, as VYTO_CC does in main())
+ *   3. vyto_modules/ found by walking up from the entry file's directory
+ *   4. $VYTO_HOME/lib -- the stdlib, LAST, so nothing can shadow it
+ *
+ * A root is a directory that CONTAINS packages, exactly like $VYTO_HOME/lib
+ * holds vyto/. That one rule for every source is what makes a vendored package
+ * and a --modpath one produce identical module names.
+ *
+ * Every root is canonicalized at registration, because load_module compares a
+ * realpath'd module path against it by string prefix -- a non-canonical root
+ * would silently fall through to bare-stem naming. Roots are de-duplicated by
+ * canonical path too, so one directory reached two ways (a --modpath that is
+ * also the discovered vyto_modules/, a symlink) cannot name one file twice.
+ *
+ * An unusable root is dropped, never fatal: a stale $VYTO_PATH entry must not
+ * break an otherwise fine build. This deliberately does NOT copy
+ * find_obj_cache_dir's "explicit request we cannot honour" rule -- a path list
+ * is a list of candidates, not one demand. */
+#define MAX_ROOTS 64
+
+typedef struct { const char *path; const char *why; } Root;
+
+static Root g_roots[MAX_ROOTS];
+static int g_nroots;
+
+/* Canonicalize and append. False when the directory is unusable or already
+   registered. `why` labels the root in diagnostics only. */
+static bool add_root(const char *dir, const char *why) {
+    if (!dir || !*dir || g_nroots >= MAX_ROOTS) return false;
+    char real[PATH_MAX];
+    if (!dir_exists(dir) || !realpath(dir, real)) return false;
+    const char *canon = arena_strdup(&g_arena, real);
+    for (int i = 0; i < g_nroots; i++)
+        if (strcmp(g_roots[i].path, canon) == 0) return false;
+    g_roots[g_nroots].path = canon;
+    g_roots[g_nroots].why = why;
+    g_nroots++;
+    return true;
+}
+
+/* Register every vyto_modules/ from `start_dir` up to /, nearest first, so a
+   subproject's own packages win over the enclosing project's.
+
+   Done ONCE, from the entry file's directory, not per importing module: a
+   module name must be a function of the file, not of who imported it first.
+   Per-module roots would let a package deep in vyto_modules/ see its own
+   nested vyto_modules/ and name a file against a root the entry never had,
+   making the name depend on import order.
+
+   The walk is over the canonical start dir, so ".." and symlinks in argv[2]
+   cannot send it somewhere surprising. It stops at "/" with no marker file: a
+   marker would be a second invisible rule that a bare directory of .vt files
+   could not satisfy. */
+static void add_vyto_modules_roots(const char *start_dir) {
+    char real[PATH_MAX];
+    if (!realpath(start_dir, real)) return;
+    char *d = arena_strdup(&g_arena, real);
+    for (;;) {
+        add_root(arena_printf(&g_arena, "%s/vyto_modules", d), "vyto_modules");
+        if (d[0] == '/' && d[1] == 0) break;
+        char *slash = strrchr(d, '/');
+        if (!slash) break;
+        if (slash == d) d[1] = 0; else *slash = 0;
+    }
+}
+
 /* try <dir>/<imp>.vt then the package layout <dir>/<imp>/<leaf>.vt */
 static const char *probe_import(const char *dir, const char *imp) {
     const char *p = arena_printf(&g_arena, "%s/%s.vt", dir, imp);
@@ -116,24 +189,44 @@ static void resolve_imports(Module *m, const char *basedir) {
     for (int i = 0; i < m->ndecls; i++) {
         Decl *d = m->decls[i];
         if (d->kind != D_IMPORT) continue;
+        /* the importing file's own directory first, so a local module always
+           wins; then every registered root, the stdlib among them and last */
         const char *path = probe_import(basedir, d->import_path);
+        for (int r = 0; !path && r < g_nroots; r++)
+            path = probe_import(g_roots[r].path, d->import_path);
         if (!path) {
-            const char *lib = find_lib_dir();
-            if (lib) path = probe_import(lib, d->import_path);
-            if (!path)
-                fatal_at(d->loc, "cannot resolve import \"%s\" (searched %s and %s)",
-                         d->import_path, basedir,
-                         lib ? lib : "the stdlib — none found; set VYTO_HOME");
+            /* one root per line: with four sources of roots a comma list is
+               unreadable. The colon ends line 1 because tests/run_tests.sh
+               compares only the first diagnostic line. */
+            SBuf s;
+            sb_init(&s);
+            sb_printf(&s, "\n  %s (the importing file's directory)", basedir);
+            for (int r = 0; r < g_nroots; r++)
+                sb_printf(&s, "\n  %s (%s)", g_roots[r].path, g_roots[r].why);
+            if (!find_lib_dir())
+                sb_printf(&s, "\n  (no stdlib found — set VYTO_HOME)");
+            fatal_at(d->loc, "cannot resolve import \"%s\"; searched:%s",
+                     d->import_path, s.data);
         }
         d->import_module = load_module(path);
     }
 }
 
-/* Module name for a stdlib file: the lib-relative path, sanitized, with the
-   package layout's duplicate leaf collapsed (vyto/ui/ui.vt -> vyto_ui). This
-   keeps lib module names collision-proof against user module stems. */
-static const char *lib_module_name(const char *libdir, const char *canon) {
-    const char *rel = canon + strlen(libdir);
+/* Module name for a file under a search root: the root-relative path,
+   sanitized, with the package layout's duplicate leaf collapsed
+   (lib/vyto/ui/ui.vt -> vyto_ui, vyto_modules/vytoweb/router/router.vt ->
+   vytoweb_router). Because the package directory is always a component, two
+   packages may each carry a config.vt and both still load.
+
+   The collapse only fires when the leaf equals its parent directory, so
+   vyto-kv/src/store.vt is vyto_kv_src_store, not vyto_kv_store. Stripping a
+   package's source root is a manifest concept ("modules": "src") and belongs
+   with a manifest reader, not as a directory name hardcoded here.
+
+   CONTRACT: `canon` must be under `root` -- the caller verifies the prefix,
+   and `canon + strlen(root)` is unchecked. */
+static const char *root_module_name(const char *root, const char *canon) {
+    const char *rel = canon + strlen(root);
     while (*rel == '/') rel++;
     char *p = arena_strdup(&g_arena, rel);
     char *dot = strrchr(p, '.');
@@ -341,17 +434,32 @@ static Module *load_module(const char *path) {
         if (m->path == ipath) return m;
     char *src = read_file(path, NULL);
     if (!src) fatal("cannot open %s", path);
-    const char *lib = find_lib_dir();
-    const char *mname;
-    if (lib && strncmp(path, lib, strlen(lib)) == 0 && path[strlen(lib)] == '/')
-        mname = lib_module_name(lib, path);
-    else
-        mname = sanitize(stem_of(path));
+    /* A file under a search root is named by its root-relative path; one that
+       is under none keeps its bare stem. First match wins, so an explicitly
+       given --modpath nested inside another root takes precedence -- it
+       registered earlier. `path` is canonical (realpath above) and so is every
+       root, which is what makes the prefix test sound. */
+    const char *mname = NULL;
+    for (int r = 0; r < g_nroots; r++) {
+        size_t rlen = strlen(g_roots[r].path);
+        if (strncmp(path, g_roots[r].path, rlen) == 0 && path[rlen] == '/') {
+            mname = root_module_name(g_roots[r].path, path);
+            break;
+        }
+    }
+    if (!mname) mname = sanitize(stem_of(path));
     Module *m = parse_module(path, mname, src);
-    /* duplicate module names (different dirs, same stem) would collide in C */
+    /* A module name is global: it prefixes every emitted C symbol, the header
+       guard, and the cache filenames. A collision is unbuildable, not just
+       untidy. */
     for (Module *o = g_modules; o; o = o->next)
         if (strcmp(o->name, m->name) == 0)
-            fatal("two modules share the name '%s' (%s, %s)", m->name, o->path, m->path);
+            fatal("two modules both compile to the name '%s':\n  %s\n  %s\n"
+                  "a module name is global (it prefixes every emitted C symbol), so "
+                  "these cannot be built together. A file under a package root is "
+                  "named by its root-relative path, one outside every root by its "
+                  "bare stem — move one under a root, or rename it.",
+                  m->name, o->path, m->path);
     m->next = g_modules;
     g_modules = m;
     resolve_imports(m, dir_of(path));
@@ -573,7 +681,14 @@ static void usage(void) {
             "usage:\n"
             "  vytoc build <file.vt> [-o out] [--release] [--bundle] [--verbose]\n"
             "              [--with-assets] [--target <triple>] [--cc <cmd>] [--clean]\n"
-            "              [--freestanding] [--shared] [--no-float] [--no-fs]\n"
+            "              [--modpath <dir>] [--freestanding] [--shared] [--no-float]\n"
+            "              [--no-fs]\n"
+            "    --modpath      a directory CONTAINING packages (like vyto_modules/),\n"
+            "                   searched after the importing file's own directory and\n"
+            "                   before the stdlib. Repeatable, relative to the current\n"
+            "                   directory, and overrides $VYTO_PATH (a ':'-separated\n"
+            "                   list of the same). A vyto_modules/ found by walking up\n"
+            "                   from the entry file is always searched too\n"
             "    --bundle       statically link prebuilt native libs + the C++ runtime\n"
             "                   into one self-contained exe (no shipped .so)\n"
             "    --with-assets  embed the app's assets/, conf/ and storage/ dirs into\n"
@@ -586,7 +701,8 @@ static void usage(void) {
             "                   an exported vyto_app_main() the loader calls (Android/JNI)\n"
             "    --no-float     stub float-to-string (no soft-float formatter pulled in)\n"
             "    --no-fs        drop the filesystem layer (File ops become no-ops/panics)\n"
-            "  vytoc run   <file.vt> [--release] [--verbose] [--clean] [-- args...]\n"
+            "  vytoc run   <file.vt> [--release] [--verbose] [--clean]\n"
+            "              [--modpath <dir>] [-- args...]\n"
             "targets: linux-x64 linux-arm64 macos-x64 macos-arm64 windows-x64 android-arm64\n"
             "  --cc (or VYTO_CC) overrides the C compiler; put sysroots/flags inside it,\n"
             "  e.g. --cc 'zig cc -target aarch64-linux-gnu' or (freestanding)\n"
@@ -627,6 +743,8 @@ int main(int argc, char **argv) {
     bool release = false, verbose = false, bundle = false, with_assets = false;
     bool freestanding = false, shared = false, no_float = false, no_fs = false, clean = false;
     const char *outpath = NULL, *target = NULL, *cc_override = NULL;
+    const char *modpath[MAX_ROOTS];
+    int nmodpath = 0;
     int prog_argc = 0;
     char **prog_argv = NULL;
     for (int i = 3; i < argc; i++) {
@@ -642,6 +760,10 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) outpath = argv[++i];
         else if (strcmp(argv[i], "--target") == 0 && i + 1 < argc) target = argv[++i];
         else if (strcmp(argv[i], "--cc") == 0 && i + 1 < argc) cc_override = argv[++i];
+        else if (strcmp(argv[i], "--modpath") == 0 && i + 1 < argc) {
+            if (nmodpath < MAX_ROOTS) modpath[nmodpath++] = argv[++i];
+            else i++;
+        }
         else if (strcmp(argv[i], "--") == 0) { prog_argc = argc - i - 1; prog_argv = argv + i + 1; break; }
         else usage();
     }
@@ -667,6 +789,25 @@ int main(int argc, char **argv) {
     if (do_run && cross)
         fatal("built for %s but this host is %s — copy the binary to the target "
               "or run it under an emulator (qemu/wine)", triple, host);
+
+    /* ---- module search roots ----
+     *
+     * Must be complete before the first load_module: it is the sole consumer,
+     * and a module loaded before a root was registered would be named against
+     * a shorter root list than one loaded after. */
+    for (int i = 0; i < nmodpath; i++)
+        if (!add_root(modpath[i], "--modpath") && !dir_exists(modpath[i]))
+            fprintf(stderr, "vytoc: warning: --modpath %s is not a directory\n", modpath[i]);
+    if (nmodpath == 0) {                     /* flag overrides env, cf. VYTO_CC */
+        const char *vpath = getenv("VYTO_PATH");
+        if (vpath && *vpath) {
+            char *copy = arena_strdup(&g_arena, vpath);
+            for (char *tok = strtok(copy, ":"); tok; tok = strtok(NULL, ":"))
+                add_root(tok, "VYTO_PATH");
+        }
+    }
+    add_vyto_modules_roots(dir_of(input));
+    add_root(find_lib_dir(), "the stdlib");  /* LAST: nothing shadows the stdlib */
 
     /* ---- front end ---- */
     Module *entry = load_module(input);

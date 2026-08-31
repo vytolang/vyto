@@ -179,6 +179,30 @@ during teardown, or keep the back-reference `weak`.
 - The standard library lives under `lib/vyto/` and is imported as
   `vyto/<path>` — e.g. `vyto/util/json`, `vyto/io/file`, `vyto/util/fmt`,
   `vyto/ui/chart`, `vyto/ui/datatable`.
+- Third-party packages live in a **package root** — a directory that *contains*
+  packages, exactly as `lib/` contains `vyto/`.
+
+An import is resolved by probing, in order:
+
+1. the importing file's own directory (so a local file always wins, and a
+   package's internal imports keep working wherever the package is dropped)
+2. each `--modpath <dir>`, in the order given — repeatable, relative to the
+   current directory
+3. `$VYTO_PATH`, a `:`-separated list of the same, **ignored entirely if any
+   `--modpath` was passed**
+4. `vyto_modules/`, found by walking up from the entry file's directory
+5. `$VYTO_HOME/lib` — last, so nothing can shadow the standard library
+
+Pointing at a single checkout means naming its *parent*: for a package at
+`/src/vytoweb`, pass `--modpath /src`.
+
+**A file under a package root is named by its root-relative path**, not by its
+bare stem — `vyto_modules/vytoweb/router/router.vt` is the module
+`vytoweb_router`, the same rule that makes `lib/vyto/ui/ui.vt` into `vyto_ui`.
+Because the package directory is always part of the name, two packages may each
+ship a `config.vt` and both still load. A file outside every root keeps its bare
+stem, and two of those sharing a stem is an error: a module name prefixes every
+emitted C symbol, so the collision is unbuildable.
 
 Each `.vt` file is one compilation unit, content-hash cached, with automatic
 dead-code stripping at link time — an unused import costs essentially nothing in

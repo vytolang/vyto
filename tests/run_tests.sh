@@ -328,6 +328,87 @@ else
     fail=1
 fi
 
+# --- package search path: vyto_modules/, --modpath, VYTO_PATH ---
+#
+# Sequential, like the libpath cases above: these share a .vyto-cache.
+#
+# The load-bearing case is the first one. alpha/ and beta/ each ship a
+# config.vt; before package-root-scoped module names both were named 'config'
+# and the build died with "two modules share the name", with no workaround
+# available to either package.
+pkg_want="alpha config (v1)
+beta config"
+got=$(./vytoc run tests/fixtures/modpath/main.vt 2>&1)
+if [ "$got" = "$pkg_want" ]; then
+    echo "PASS modpath_vyto_modules"
+else
+    echo "FAIL modpath_vyto_modules"
+    printf '%s\n' "$got"
+    fail=1
+fi
+
+# the vyto_modules/ walk climbs out of a nested entry directory
+got=$(./vytoc run tests/fixtures/modpath/nested/main.vt 2>&1)
+if [ "$got" = "$pkg_want" ]; then
+    echo "PASS modpath_walk_up"
+else
+    echo "FAIL modpath_walk_up"
+    printf '%s\n' "$got"
+    fail=1
+fi
+
+# a file beside the entry still shadows a package root
+got=$(./vytoc run tests/fixtures/modpath/shadow/main.vt 2>&1)
+if [ "$got" = "shadowing alpha config" ]; then
+    echo "PASS modpath_shadow"
+else
+    echo "FAIL modpath_shadow"
+    printf '%s\n' "$got"
+    fail=1
+fi
+
+# --modpath and VYTO_PATH reach a tree that is under no vyto_modules/, and a
+# missing root in the list is skipped rather than fatal
+got=$(./vytoc run tests/fixtures/vendored/app/main.vt \
+        --modpath tests/fixtures/vendored/pkgs 2>&1)
+if [ "$got" = "gamma config" ]; then
+    echo "PASS modpath_flag"
+else
+    echo "FAIL modpath_flag"
+    printf '%s\n' "$got"
+    fail=1
+fi
+got=$(VYTO_PATH=tests/fixtures/vendored/pkgs \
+        ./vytoc run tests/fixtures/vendored/app/main.vt 2>&1)
+if [ "$got" = "gamma config" ]; then
+    echo "PASS modpath_env"
+else
+    echo "FAIL modpath_env"
+    printf '%s\n' "$got"
+    fail=1
+fi
+got=$(VYTO_PATH=/nonexistent/one:tests/fixtures/vendored/pkgs \
+        ./vytoc run tests/fixtures/vendored/app/main.vt 2>&1)
+if [ "$got" = "gamma config" ]; then
+    echo "PASS modpath_missing_root_skipped"
+else
+    echo "FAIL modpath_missing_root_skipped"
+    printf '%s\n' "$got"
+    fail=1
+fi
+
+# the naming itself, which is the only direct evidence of change 2: the two
+# config.vt files emit distinct C, and a --modpath package is named exactly as
+# a vendored one would be
+if [ -f tests/fixtures/modpath/.vyto-cache/main/mod_alpha_config.c ] &&
+   [ -f tests/fixtures/modpath/.vyto-cache/main/mod_beta_config.c ] &&
+   [ -f tests/fixtures/vendored/app/.vyto-cache/main/mod_gamma_config.c ]; then
+    echo "PASS modpath_scoped_names"
+else
+    echo "FAIL modpath_scoped_names (expected mod_alpha_config.c, mod_beta_config.c, mod_gamma_config.c)"
+    fail=1
+fi
+
 # --- run all examples against golden output ---
 #
 # Parallel: see par_run at the top of this file for why this is safe.

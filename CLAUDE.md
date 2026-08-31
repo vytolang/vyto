@@ -5,7 +5,8 @@ host C compiler; there is no VM, no GC (reference counting instead), and no
 LLVM. Anywhere a C compiler exists, Vyto runs.
 
 Source files are `.vt`. The runtime prefix is `vt_*`. The install root env var
-is `VYTO_HOME`.
+is `VYTO_HOME`; `VYTO_PATH` (or `--modpath`) adds package roots to the import
+search — see "Module resolution" below.
 
 ## Goal
 
@@ -52,6 +53,34 @@ library `.vt` does not always invalidate it, so a build can validate the
 | `docs/` | user-facing docs |
 | `local/docs/` | design docs, gitignored (see CLAUDE.local.md) |
 | `vytobind` | C header → Vyto FFI binding generator |
+
+## Module resolution
+
+An import probes, in order: the **importing file's own directory** (not the
+entry file's — this is what lets a package's internal imports work wherever the
+package is dropped), then each registered **package root**, then
+`$VYTO_HOME/lib` last so nothing shadows the stdlib. Roots come from `--modpath`
+(repeatable), `$VYTO_PATH` (`:`-separated, ignored entirely if any `--modpath`
+was passed), and a `vyto_modules/` found by walking up from the entry file.
+
+**A root contains packages; it is not itself a package** — same shape as `lib/`
+holding `vyto/`. For a checkout at `/src/vytoweb`, pass `--modpath /src`.
+
+**A module name is global.** It prefixes every emitted C symbol (`v_<mod>_<n>`),
+the header guard, and the flat cache filenames `mod_<mod>.c/.h/.o`, so two
+modules sharing one is a fatal error, not a warning. A file **under a root** is
+named by its root-relative path (`vyto_modules/vytoweb/router/router.vt` →
+`vytoweb_router`, `lib/vyto/ui/ui.vt` → `vyto_ui`); a file under **no** root
+keeps its bare stem. That is what lets two packages each ship a `config.vt`.
+
+The duplicate-leaf collapse only fires when the leaf equals its parent
+(`store/store.vt` → `..._store`), so `vyto-kv/src/store.vt` is
+`vyto_kv_src_store`. Stripping a `src/` root is a manifest concept and is
+deliberately not hardcoded — see `local/docs/PACKAGING.md` §3.2.
+
+Roots are canonicalized and de-duplicated at registration. That is load-bearing,
+not hygiene: `load_module` realpath's the module path before its prefix test, so
+a non-canonical root silently falls through to bare-stem naming.
 
 ## Memory model
 
