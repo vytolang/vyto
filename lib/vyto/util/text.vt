@@ -89,6 +89,34 @@ export fn chr(code: int): string {
 // Byte value at index i (0..len-1); bounds-checked like `s[i]`.
 export fn ord(s: string, i: int): int { return s[i]; }
 
+// Number of Unicode code points in a UTF-8 string.
+//
+// The counterpart to `s.len`, which counts BYTES: "José" is 5 bytes and 4
+// characters, and any CJK input diverges immediately. A length rule shown to a
+// person — a form limit, a column width — wants this; an index into the string
+// wants `s.len`. Counting continuation bytes needs no ICU and no provisioning,
+// so this costs one pass and no allocation.
+//
+// Code points are not graphemes. Precomposed "é" (U+00E9) counts as 1, but the
+// same character written as e + U+0301 counts as 2, and a flag or a ZWJ emoji
+// counts as several — so two strings that look identical can count differently
+// unless they were normalized first. For grapheme-exact counting use
+// `graphemes()` from vyto/intl/unicode, which costs an ICU dependency; for
+// input length limits this is the right trade.
+//
+// Everything else in this module is byte-based, deliberately. There is no
+// char_slice or char_index_of here: slicing by character is a different API and
+// belongs with the rest of the Unicode work in vyto/intl.
+export fn charCount(s: string): int {
+    let n = 0;
+    let i = 0;
+    while (i < s.len) {
+        if ((s[i] & 192) != 128) { n += 1; }    // 0xC0 / 0x80
+        i += 1;
+    }
+    return n;
+}
+
 // Drop a leading `p` if present, else return `s` unchanged.
 export fn strip_prefix(s: string, p: string): string {
     if (p.len > 0 && s.starts_with(p)) { return s.slice(p.len, s.len); }
