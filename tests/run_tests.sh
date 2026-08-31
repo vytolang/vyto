@@ -610,6 +610,17 @@ else
     fail=1
 fi
 
+# --- vyto/geom/quat: orientation, slerp, Mat4 cross-checks (pure Vyto) ---
+got=$(./vytoc run tests/fixtures/geom_quat.vt 2>&1)
+if [ "$got" = "$(cat tests/fixtures/geom_quat.expected)" ]; then
+    echo "PASS geom_quat"
+else
+    echo "FAIL geom_quat"
+    echo "--- expected ---"; cat tests/fixtures/geom_quat.expected
+    echo "--- got ---"; printf '%s\n' "$got"
+    fail=1
+fi
+
 # --- vyto/math/stats: descriptive statistics over float[]/int[] (pure Vyto) ---
 got=$(./vytoc run tests/fixtures/math_stats.vt 2>&1)
 if [ "$got" = "$(cat tests/fixtures/math_stats.expected)" ]; then

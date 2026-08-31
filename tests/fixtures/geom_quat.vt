@@ -1,0 +1,187 @@
+// Pure-Vyto coverage for vyto/geom/quat. Every claim the module header makes is
+// checked here against vyto/geom's Mat4, which is independently tested by
+// geom_mat.vt — so the two agreeing is real evidence and not a tautology.
+//
+// Floats are never printed bare: the runtime prints %g at 6 significant digits
+// and the freestanding path uses a hand-rolled %g that is explicitly not
+// shortest-round-trip. Every line below prints an int or a bool.
+import { Vec3, Mat4, mat4Identity, mat4RotationX, mat4RotationY, mat4RotationZ,
+         mat4RotationAxis, mat4LookAt } from "vyto/geom";
+import { Quat, quatIdentity, quatFromAxisAngle, quatFromEuler, quatFromMat4,
+         quatLookAt, quatSlerp, quatNlerp } from "vyto/geom/quat";
+import { PI, round, fabs, sqrt } from "vyto/math";
+
+fn near(a: float, b: float, eps: float): bool { return fabs(a - b) < eps; }
+fn vnear(a: Vec3, b: Vec3, eps: float): bool { return a.dist(b) < eps; }
+fn q(x: float, scale: float): int { return round(x * scale) as int; }
+
+fn main() {
+    let ex = Vec3(1.0, 0.0, 0.0);
+    let ey = Vec3(0.0, 1.0, 0.0);
+    let ez = Vec3(0.0, 0.0, 1.0);
+    let p = Vec3(1.0, 2.0, 3.0);
+    let I = quatIdentity();
+
+    // ---- Identity ----
+    print("ident=" + q(I.x, 1.0) + "," + q(I.y, 1.0) + "," + q(I.z, 1.0)
+          + "," + q(I.w, 1.0));
+    print("identrot=" + vnear(I.rotate(p), p, 1e-15));
+    print("identmat=" + I.toMat4().approxEquals(mat4Identity(), 1e-15));
+    print("identangle=" + q(I.angle(), 1000.0));
+    print("identlen=" + q(I.len(), 1000.0));
+
+    // ---- Axis-angle round trip ----
+    // A quaternion is unit by construction, and the axis/angle read back out
+    // are the ones that went in.
+    let qy = quatFromAxisAngle(ey, PI * 0.5);
+    print("axunit=" + near(qy.len(), 1.0, 1e-15));
+    print("axaxis=" + vnear(qy.axis(), ey, 1e-15));
+    print("axangle=" + q(qy.angle(), 1000.0) + " vs " + q(PI * 0.5, 1000.0));
+    // The axis need not be normalized by the caller.
+    print("axunnorm=" + quatFromAxisAngle(Vec3(0.0, 7.0, 0.0), PI * 0.5)
+                            .approxEquals(qy, 1e-15));
+    // A zero axis is the identity, not a NaN.
+    print("axzero=" + quatFromAxisAngle(Vec3(0.0, 0.0, 0.0), PI).approxEquals(I, 1e-15));
+
+    // ---- The cross-check: quat rotation == Mat4 rotation ----
+    // If these agree for all three axes and an arbitrary one, both the
+    // quaternion algebra and the toMat4 conversion are right.
+    print("rotx=" + qmatches(quatFromAxisAngle(ex, 0.7), mat4RotationX(0.7)));
+    print("roty=" + qmatches(quatFromAxisAngle(ey, 0.7), mat4RotationY(0.7)));
+    print("rotz=" + qmatches(quatFromAxisAngle(ez, 0.7), mat4RotationZ(0.7)));
+    let arb = Vec3(1.0, 2.0, -3.0);
+    print("rotaxis=" + qmatches(quatFromAxisAngle(arb, 1.1), mat4RotationAxis(arb, 1.1)));
+
+    // rotate() must agree with the matrix it would have built.
+    let qa = quatFromAxisAngle(arb, 1.1);
+    print("rotvec=" + vnear(qa.rotate(p), mat4RotationAxis(arb, 1.1).transformPoint(p), 1e-12));
+
+    // Concrete values, so a sign flip cannot hide behind a self-consistent pair:
+    // 90 degrees about +y sends +x to -z.
+    print("rot90=" + q(qy.rotate(ex).x, 1000.0) + "," + q(qy.rotate(ex).y, 1000.0)
+          + "," + q(qy.rotate(ex).z, 1000.0));
+
+    // ---- Composition order matches Mat4.mul ----
+    // a.mul(b) applies b first. Checked against the matrices, and against
+    // rotating a vector in two steps by hand.
+    let qb = quatFromAxisAngle(ez, -0.4);
+    print("mulorder=" + qmatches(qa.mul(qb), mat4RotationAxis(arb, 1.1).mul(mat4RotationZ(-0.4))));
+    print("mulsteps=" + vnear(qa.mul(qb).rotate(p), qa.rotate(qb.rotate(p)), 1e-12));
+    // Composition is not commutative, so a test that passed both ways would be
+    // testing nothing.
+    print("mulnoncomm=" + !qa.mul(qb).approxEquals(qb.mul(qa), 1e-9));
+
+    // ---- Conjugate and inverse ----
+    print("conjundo=" + vnear(qa.conjugate().rotate(qa.rotate(p)), p, 1e-12));
+    print("invunit=" + qa.inverse().approxEquals(qa.conjugate(), 1e-15));
+    print("invmul=" + qa.mul(qa.inverse()).approxSameRotation(I, 1e-12));
+    // A non-unit quaternion: inverse still undoes it, conjugate does not.
+    let scaled = qa.scale(3.0);
+    print("invnonunit=" + vnear(scaled.mul(scaled.inverse()).rotate(p), p, 1e-12));
+    // Zero is identity, not a NaN.
+    print("invzero=" + Quat(0.0, 0.0, 0.0, 0.0).inverse().approxEquals(I, 1e-15));
+    print("normzero=" + Quat(0.0, 0.0, 0.0, 0.0).normalized().approxEquals(I, 1e-15));
+
+    // ---- quatFromMat4: all four Shepperd branches ----
+    // The branch is selected by which of trace/m00/m11/m22 is largest, so these
+    // four angles reach all four. The 180-degree cases are the ones the
+    // single-formula version divides by zero on.
+    print("fm4trace=" + roundtrip(quatFromAxisAngle(arb, 0.3)));
+    print("fm4x=" + roundtrip(quatFromAxisAngle(ex, PI)));
+    print("fm4y=" + roundtrip(quatFromAxisAngle(ey, PI)));
+    print("fm4z=" + roundtrip(quatFromAxisAngle(ez, PI)));
+    // And that those 180-degree results are finite, which is the actual claim.
+    let h = quatFromMat4(mat4RotationX(PI));
+    print("fm4finite=" + (h.len() == h.len() && near(h.len(), 1.0, 1e-12)));
+
+    // ---- lookAt ----
+    // quatLookAt is an ORIENTATION (object-to-world): it takes -z to forward.
+    // mat4LookAt is a VIEW matrix (world-to-camera), which is its inverse. The
+    // two are transposes, and asserting they are equal is the mistake the
+    // module header warns about, so it is worth pinning both directions here.
+    let fwd = Vec3(0.0, 0.0, -1.0);
+    print("lookid=" + quatLookAt(fwd, ey).approxSameRotation(I, 1e-12));
+    let dir = Vec3(1.0, 0.0, -1.0);
+    let lq = quatLookAt(dir, ey);
+    let lm = mat4LookAt(Vec3(0.0, 0.0, 0.0), dir, ey);
+    print("lookfwd=" + vnear(lq.rotate(fwd), dir.normalized(), 1e-12));
+    print("lookview=" + lq.toMat4().transposed().approxEquals(lm, 1e-12));
+    print("lookinv=" + lq.inverse().toMat4().approxEquals(lm, 1e-12));
+    print("looknotview=" + !lq.toMat4().approxEquals(lm, 1e-9));
+    // Parallel forward and up has no unique answer: identity, not NaN.
+    print("lookpar=" + quatLookAt(ey, ey).approxEquals(I, 1e-15));
+
+    // ---- Slerp ----
+    let s0 = quatFromAxisAngle(ey, 0.0);
+    let s1 = quatFromAxisAngle(ey, PI * 0.5);
+    print("slerp0=" + quatSlerp(s0, s1, 0.0).approxSameRotation(s0, 1e-12));
+    print("slerp1=" + quatSlerp(s0, s1, 1.0).approxSameRotation(s1, 1e-12));
+    // The midpoint of a slerp is the half angle exactly — that is the property
+    // an nlerp does NOT have, and the reason both exist.
+    print("slerpmid=" + q(quatSlerp(s0, s1, 0.5).angle(), 1000.0)
+          + " vs " + q(PI * 0.25, 1000.0));
+    // Constant angular velocity: three equal steps, three equal angles.
+    print("slerprate=" + q(quatSlerp(s0, s1, 0.25).angle(), 1000.0)
+          + "," + q(quatSlerp(s0, s1, 0.5).angle(), 1000.0)
+          + "," + q(quatSlerp(s0, s1, 0.75).angle(), 1000.0));
+    // Every step stays unit.
+    print("slerpunit=" + near(quatSlerp(s0, s1, 0.3).len(), 1.0, 1e-12));
+
+    // The hemisphere fix. Slerping to -q must take the SHORT path, so the
+    // midpoint is the same rotation as slerping to +q. Without the negation
+    // this goes the long way round and this line fails.
+    print("slerpshort=" + quatSlerp(s0, s1.neg(), 0.5)
+                              .approxSameRotation(quatSlerp(s0, s1, 0.5), 1e-12));
+    // A wide rotation is where the long path is unmistakable: 270 degrees the
+    // wrong way instead of 90.
+    let wide = quatFromAxisAngle(ey, PI * 1.5);
+    print("slerpwide=" + (q(quatSlerp(s0, wide, 0.5).angle(), 1000.0)
+          <= q(PI * 0.5, 1000.0)));
+
+    // Identical endpoints hit the near-parallel branch rather than dividing by
+    // a vanishing sin(omega).
+    print("slerpsame=" + quatSlerp(s1, s1, 0.5).approxSameRotation(s1, 1e-12));
+
+    // ---- Nlerp ----
+    // Same endpoints as slerp, same shortest-path behaviour, unit output — but
+    // deliberately NOT the same midpoint angle, which is the documented
+    // trade and would otherwise look like a bug in one of the two.
+    print("nlerp0=" + quatNlerp(s0, s1, 0.0).approxSameRotation(s0, 1e-12));
+    print("nlerp1=" + quatNlerp(s0, s1, 1.0).approxSameRotation(s1, 1e-12));
+    print("nlerpunit=" + near(quatNlerp(s0, s1, 0.3).len(), 1.0, 1e-12));
+    print("nlerpshort=" + quatNlerp(s0, s1.neg(), 0.5)
+                              .approxSameRotation(quatNlerp(s0, s1, 0.5), 1e-12));
+    // Equal at the ends and the middle, different in between: the eased path.
+    print("nlerpmid=" + quatNlerp(s0, s1, 0.5).approxSameRotation(
+                            quatSlerp(s0, s1, 0.5), 1e-12));
+    print("nlerpeased=" + !quatNlerp(s0, s1, 0.25).approxSameRotation(
+                              quatSlerp(s0, s1, 0.25), 1e-6));
+
+    // ---- Euler ----
+    // The header claims the order is Z(yaw) then Y(pitch) then X(roll). This is
+    // that claim, checked against the matrix chain it names.
+    let e = quatFromEuler(0.3, -0.5, 0.9);
+    let em = mat4RotationZ(0.3).mul(mat4RotationY(-0.5)).mul(mat4RotationX(0.9));
+    print("euler=" + e.toMat4().approxEquals(em, 1e-12));
+    print("eulerunit=" + near(e.len(), 1.0, 1e-15));
+    print("eulerzero=" + quatFromEuler(0.0, 0.0, 0.0).approxEquals(I, 1e-15));
+    // One axis at a time, so a mislabelled parameter cannot pass.
+    print("euleryaw=" + qmatches(quatFromEuler(0.7, 0.0, 0.0), mat4RotationZ(0.7)));
+    print("eulerpitch=" + qmatches(quatFromEuler(0.0, 0.7, 0.0), mat4RotationY(0.7)));
+    print("eulerroll=" + qmatches(quatFromEuler(0.0, 0.0, 0.7), mat4RotationX(0.7)));
+
+    // ---- q and -q are the same rotation ----
+    // The distinction approxEquals draws and approxSameRotation does not.
+    print("negsame=" + qa.neg().approxSameRotation(qa, 1e-15));
+    print("negdiffers=" + !qa.neg().approxEquals(qa, 1e-9));
+    print("negrot=" + vnear(qa.neg().rotate(p), qa.rotate(p), 1e-12));
+}
+
+// A quaternion and a matrix describing the same rotation.
+fn qmatches(a: Quat, m: Mat4): bool { return a.toMat4().approxEquals(m, 1e-12); }
+
+// Quat -> Mat4 -> Quat must return the same ROTATION. Not necessarily the same
+// representation: the matrix has forgotten which of q and -q it came from.
+fn roundtrip(a: Quat): bool {
+    return quatFromMat4(a.toMat4()).approxSameRotation(a, 1e-12);
+}

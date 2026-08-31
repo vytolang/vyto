@@ -34,6 +34,7 @@ p.moveTo(0.0, 0.0).cubicTo(10.0, 0.0, 20.0, 10.0, 20.0, 20.0).close();
 | Module | What it gives you |
 |--------|-------------------|
 | `vyto/geom` | `Vec2`, `Vec3`, `Vec4`, `Mat4` and the `mat4*` constructors. |
+| `vyto/geom/quat` | `Quat` and the `quat*` constructors — orientation, composition, slerp. |
 | `vyto/geom/path` | `Path` (move/line/quad/cubic/close), `FlatPoly`, the `PATH_*` opcodes. |
 
 `Rect` is **not** here — it is declared in `vyto/surface` along with its methods
@@ -157,6 +158,68 @@ count commas to build a rotation.
 
 ---
 
+## `vyto/geom/quat`
+
+Orientation as a unit quaternion. A `Mat4` already represents a rotation, so
+this exists for the two things a matrix is bad at: **composing** rotations
+without gimbal lock, and **interpolating** between them.
+
+```vyto
+import { Quat, quatIdentity, quatFromAxisAngle, quatSlerp } from "vyto/geom/quat";
+
+let a = quatFromAxisAngle(Vec3(0.0, 1.0, 0.0), 0.0);
+let b = quatFromAxisAngle(Vec3(0.0, 1.0, 0.0), PI * 0.5);
+quatSlerp(a, b, 0.5).rotate(Vec3(1.0, 0.0, 0.0));   // 45°, no matrix built
+quatSlerp(a, b, 0.5).toMat4();                      // when one is wanted
+```
+
+A `struct` of four floats like `Vec4`, so animating a thousand orientations per
+frame allocates nothing.
+
+| Method | Notes |
+|---|---|
+| `mul(o)` | Hamilton product. `a.mul(b)` applies **b first**, same order as `Mat4.mul`. |
+| `conjugate()` / `inverse()` | Equal for a unit quaternion; `conjugate` is the cheap one. `inverse` of a zero quaternion is the identity, not a NaN. |
+| `rotate(v: Vec3)` | Rotates without building a matrix — about half the cost for a handful of vectors. Past that, build the matrix once. |
+| `toMat4()` | The interop point. |
+| `axis()` / `angle()` | Inverse of `quatFromAxisAngle`. `angle()` is in `[0, PI]` and uses `atan2`, which keeps precision at the small angles animation spends its time in. |
+| `dot` · `len2` · `len` · `normalized` · `add` · `sub` · `scale` · `neg` | Linear-space operations, as on `Vec4`. |
+| `approxEquals(o, eps)` | Componentwise — a test on the **representation**. |
+| `approxSameRotation(o, eps)` | Whether the two are the same **rotation**, which is the usually-wanted test. |
+
+| Constructor | Notes |
+|---|---|
+| `quatIdentity()` | |
+| `quatFromAxisAngle(axis, rad)` | Axis normalized internally; a zero axis gives the identity. Matches `mat4RotationAxis`. |
+| `quatFromEuler(yaw, pitch, roll)` | Intrinsic Z-Y-X. For converting *input*; do not store orientation this way. |
+| `quatFromMat4(m)` | Shepperd's four branches — the single-formula version divides by zero at 180°. |
+| `quatLookAt(forward, up)` | An **orientation**, not a view matrix. See below. |
+| `quatSlerp(a, b, t)` | Constant angular velocity along the shortest arc. |
+| `quatNlerp(a, b, t)` | Cheaper, same path, eased velocity. |
+
+> **`q` and `-q` are the same rotation.** That is not a redundancy to tidy away:
+> it is why `quatSlerp` has to pick a hemisphere (negating one input when the
+> dot product is negative), and why comparing two quaternions componentwise is
+> usually the wrong test. Without the hemisphere fix, half of all
+> interpolations take the 300° path instead of the 60° one — the single most
+> common slerp bug. `approxSameRotation` is the test that ignores the sign.
+
+> **`quatLookAt` is the inverse of `mat4LookAt`.** `quatLookAt` returns an
+> orientation (object-to-world: it takes −z to `forward`), which is what a
+> camera or a turret *is*. `mat4LookAt` returns a view matrix, which moves the
+> world into camera space. So
+> `quatLookAt(dir, up).toMat4().transposed() == mat4LookAt(origin, dir, up)`.
+> Feeding the orientation to a renderer as a view matrix mirrors the camera,
+> which looks like a handedness bug and gets debugged as one.
+
+> **`slerp` vs `nlerp`.** They trace the same path and differ only in velocity:
+> `nlerp` eases in and out by up to a few degrees at the midpoint of a wide
+> rotation. Right for blending animation poses, where the cost is paid per bone
+> and the difference is invisible. Wrong for a camera sweeping a known arc,
+> where the velocity change is exactly what would be seen.
+
+---
+
 ## `vyto/geom/path`
 
 A backend-neutral 2D vector path. Record `move`/`line`/`quad`/`cubic`/`close`
@@ -198,19 +261,22 @@ none.
 
 ## Deliberately out of scope
 
-`Mat3`, quaternions and Euler-angle conversions · camera controllers, frustum
-culling and scene graphs · 2D affine transforms (`vyto/gfx` has its own via the
-blend2d shim) · polygon boolean operations, convex hull and triangulation ·
-spline fitting and path stroking-to-outline · anything geographic — that is
-`vyto/geo`, which builds on `Vec3` here.
+`Mat3` · camera controllers, frustum culling and scene graphs · 2D affine
+transforms (`vyto/gfx` has its own via the blend2d shim) · polygon boolean
+operations, convex hull and triangulation · spline fitting and path
+stroking-to-outline · anything geographic — that is `vyto/geo`, which builds on
+`Vec3` here.
 
 These are renderer or engine concerns rather than primitives, and nothing needs
 them until something is drawing in 3D.
 
 ## Tests
 
-`tests/fixtures/geom_vec.vt` and `tests/fixtures/geom_mat.vt` — pure
-computation, so they run on every host.
+`tests/fixtures/geom_vec.vt`, `tests/fixtures/geom_mat.vt` and
+`tests/fixtures/geom_quat.vt` — pure computation, so they run on every host.
+The quaternion fixture checks itself against `Mat4` throughout, which is
+evidence rather than a tautology because `geom_mat.vt` tests `Mat4`
+independently.
 
 Golden files print **ints and bools only, never a bare float**: the runtime
 prints `%g` at six significant digits and the freestanding path uses a

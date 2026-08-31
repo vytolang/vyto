@@ -78,12 +78,34 @@ not D3D). A full model-view-projection pipeline is `Vec4` in, perspective
 divide, `Vec3` out — the math for it is complete. What consumes that math
 (§6) is the open question.
 
-**Deliberately out of scope** (`geom/README.md`): `Mat3`, quaternions,
-Euler-angle conversions, camera controllers, frustum culling, scene graphs,
-2D affine transforms (`vyto/gfx` has its own), polygon boolean ops/convex
-hull/triangulation, spline fitting, path-stroking-to-outline. Stated reason:
-these are renderer/engine concerns, and nothing needs them "until something
-is drawing in 3D."
+**Deliberately out of scope** (`geom/README.md`): `Mat3`, camera controllers,
+frustum culling, scene graphs, 2D affine transforms (`vyto/gfx` has its own),
+polygon boolean ops/convex hull/triangulation, spline fitting,
+path-stroking-to-outline. Stated reason: these are renderer/engine concerns,
+and nothing needs them "until something is drawing in 3D."
+
+### `Quat` — orientation
+
+```js
+import { Quat, quatFromAxisAngle, quatSlerp } from "vyto/geom/quat";
+```
+
+A `struct` of four floats, scalar last, matching `Vec4`'s field order. Methods:
+`mul` (composition, same order as `Mat4.mul`) `conjugate` `inverse`
+`rotate(v)` `toMat4` `axis` `angle` `normalized` `approxEquals`
+`approxSameRotation`, plus the `Vec4` linear-space set.
+
+Constructors: `quatIdentity` `quatFromAxisAngle(axis, rad)`
+`quatFromEuler(yaw, pitch, roll)` `quatFromMat4(m)` `quatLookAt(forward, up)`
+`quatSlerp(a, b, t)` `quatNlerp(a, b, t)`.
+
+A rotation is representable as a `Mat4` already, so this is for the two things
+a matrix is bad at: composing rotations without gimbal lock, and interpolating
+between them. Componentwise interpolation of two rotation matrices does not
+produce a rotation at all. Two traps, both documented in `geom/README.md`:
+`q` and `-q` are the same rotation (which is why slerp must pick a hemisphere),
+and `quatLookAt` returns an **orientation**, the inverse of `mat4LookAt`'s
+view matrix.
 
 ### `Path` — backend-neutral vector path
 

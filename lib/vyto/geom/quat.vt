@@ -1,0 +1,327 @@
+// vyto/geom/quat — orientation as a unit quaternion.
+//
+//     let q = quatFromAxisAngle(Vec3(0.0, 1.0, 0.0), PI * 0.5);
+//     q.rotate(Vec3(1.0, 0.0, 0.0));       // no matrix built
+//     q.toMat4();                          // when one is wanted
+//     quatSlerp(a, b, 0.5);                // the reason this module exists
+//
+// A rotation is representable as a Mat4 already, so this exists for the two
+// things a matrix is bad at. Composing Euler angles gimbal-locks: at 90 degrees
+// of pitch two of the three axes become the same axis and a degree of freedom
+// is silently gone. And interpolating two rotation matrices componentwise does
+// not produce a rotation at all — the result is a skewed matrix that has to be
+// re-orthonormalized, and the path it traces is not constant-angular-velocity.
+// Slerp on unit quaternions is both, exactly.
+//
+// Four floats, so it is a struct like Vec4 and Mat4 — stack-allocated, copied
+// rather than referenced, invisible to the reference counter. Animating a
+// thousand orientations per frame allocates nothing.
+//
+// A separate module from vyto/geom rather than more of geom.vt, matching the
+// way vyto/geom/path is separate: a caller doing 2D layout with Vec2 has no use
+// for quaternions and should not read past them.
+//
+// CONVENTIONS, which are the whole story with rotation types:
+//
+//   * (x, y, z, w) with the scalar LAST, matching Vec4's field order. Half the
+//     world puts w first; converting between the two is silent and disastrous.
+//   * Unit quaternions represent rotations. Nothing here normalizes on your
+//     behalf except where noted, because normalizing in every operation costs a
+//     sqrt that composition does not need.
+//   * a.mul(b) applies b FIRST, then a — identical to Mat4.mul, so
+//     a.mul(b).toMat4() and a.toMat4().mul(b.toMat4()) agree.
+//   * Right-handed, positive angles turning counter-clockwise looking down the
+//     axis towards the origin. Same as mat4RotationAxis.
+//   * q and -q are the SAME rotation. That is not a redundancy to be tidied
+//     away: it is why slerp has to pick a hemisphere, and why comparing two
+//     quaternions componentwise is the wrong test.
+
+import { Vec3, Mat4, mat4Identity } from "vyto/geom";
+import { sqrt, sin, cos, acos, atan2, fabs, fmin, fmax } from "vyto/math";
+
+export struct Quat {
+    x: float;
+    y: float;
+    z: float;
+    w: float;
+
+    // ---- linear-space operations ------------------------------------------
+    // These treat the quaternion as a 4-vector. They are what slerp and nlerp
+    // are built from; they are not rotations and do not compose like them.
+
+    fn add(o: Quat): Quat {
+        return Quat(this.x + o.x, this.y + o.y, this.z + o.z, this.w + o.w);
+    }
+    fn sub(o: Quat): Quat {
+        return Quat(this.x - o.x, this.y - o.y, this.z - o.z, this.w - o.w);
+    }
+    fn scale(s: float): Quat {
+        return Quat(this.x * s, this.y * s, this.z * s, this.w * s);
+    }
+    // The other representation of the same rotation, not the inverse rotation.
+    fn neg(): Quat { return Quat(-this.x, -this.y, -this.z, -this.w); }
+    fn dot(o: Quat): float {
+        return this.x * o.x + this.y * o.y + this.z * o.z + this.w * o.w;
+    }
+    fn len2(): float {
+        return this.x * this.x + this.y * this.y + this.z * this.z + this.w * this.w;
+    }
+    fn len(): float { return sqrt(this.len2()); }
+    fn normalized(): Quat {
+        let l = this.len();
+        // Identity rather than a zero quaternion: a zero quaternion is not a
+        // rotation at all, and returning one propagates NaN into every later
+        // rotate() and toMat4(). Vec4.normalized() can return zero because a
+        // zero vector is a meaningful direction-less vector; this cannot.
+        if (l == 0.0) { return quatIdentity(); }
+        return Quat(this.x / l, this.y / l, this.z / l, this.w / l);
+    }
+
+    // ---- rotation operations ----------------------------------------------
+
+    // The Hamilton product: the rotation "o first, then this". Same order as
+    // Mat4.mul, so a chain reads the same either way round.
+    fn mul(o: Quat): Quat {
+        return Quat(
+            this.w * o.x + this.x * o.w + this.y * o.z - this.z * o.y,
+            this.w * o.y - this.x * o.z + this.y * o.w + this.z * o.x,
+            this.w * o.z + this.x * o.y - this.y * o.x + this.z * o.w,
+            this.w * o.w - this.x * o.x - this.y * o.y - this.z * o.z);
+    }
+
+    // Negate the vector part. For a UNIT quaternion this is the inverse, and
+    // it is the cheap one — no division, no length. Use inverse() when the
+    // quaternion may not be unit.
+    fn conjugate(): Quat { return Quat(-this.x, -this.y, -this.z, this.w); }
+
+    // conjugate / |q|^2. Identity on a zero quaternion rather than a NaN, the
+    // same policy Mat4.inverted() applies to a singular matrix.
+    fn inverse(): Quat {
+        let n = this.len2();
+        if (n == 0.0) { return quatIdentity(); }
+        return Quat(-this.x / n, -this.y / n, -this.z / n, this.w / n);
+    }
+
+    // Rotate a vector. This is q*v*q^-1 with the algebra folded out, which
+    // costs about half what building a Mat4 and multiplying would — worth it
+    // when a handful of vectors are rotated by one orientation. Past that,
+    // build the matrix once.
+    //
+    // Assumes a unit quaternion. A non-unit one scales the result by |q|^2.
+    fn rotate(v: Vec3): Vec3 {
+        let u = Vec3(this.x, this.y, this.z);
+        let uv = u.cross(v);
+        let uuv = u.cross(uv);
+        return v.add(uv.scale(this.w).add(uuv).scale(2.0));
+    }
+
+    // The equivalent rotation matrix. Assumes a unit quaternion; a non-unit one
+    // produces a matrix that also scales.
+    fn toMat4(): Mat4 {
+        let xx = this.x * this.x;
+        let yy = this.y * this.y;
+        let zz = this.z * this.z;
+        let xy = this.x * this.y;
+        let xz = this.x * this.z;
+        let yz = this.y * this.z;
+        let wx = this.w * this.x;
+        let wy = this.w * this.y;
+        let wz = this.w * this.z;
+        return Mat4(
+            1.0 - 2.0 * (yy + zz), 2.0 * (xy - wz),       2.0 * (xz + wy),       0.0,
+            2.0 * (xy + wz),       1.0 - 2.0 * (xx + zz), 2.0 * (yz - wx),       0.0,
+            2.0 * (xz - wy),       2.0 * (yz + wx),       1.0 - 2.0 * (xx + yy), 0.0,
+            0.0,                   0.0,                   0.0,                   1.0);
+    }
+
+    // The axis this rotates about. Undefined for the identity — there is no
+    // distinguished axis for a zero rotation — so that case returns +x, which
+    // pairs with angle() == 0 to reconstruct the identity through
+    // quatFromAxisAngle.
+    fn axis(): Vec3 {
+        let s2 = this.x * this.x + this.y * this.y + this.z * this.z;
+        if (s2 == 0.0) { return Vec3(1.0, 0.0, 0.0); }
+        let s = sqrt(s2);
+        return Vec3(this.x / s, this.y / s, this.z / s);
+    }
+
+    // The rotation angle in radians, in [0, PI].
+    //
+    // atan2(|xyz|, w) rather than 2*acos(w): acos loses precision badly near
+    // w == 1, which is exactly the small-angle case an animation spends most of
+    // its time in. It also needs no clamping, because atan2 has no domain
+    // limit. The abs on w is what folds q and -q onto the same answer.
+    fn angle(): float {
+        let s = sqrt(this.x * this.x + this.y * this.y + this.z * this.z);
+        return 2.0 * atan2(s, fabs(this.w));
+    }
+
+    // Componentwise, so it is a test on the REPRESENTATION. q and -q are the
+    // same rotation and fail this — use approxSameRotation for the other test.
+    fn approxEquals(o: Quat, eps: float): bool {
+        return fabs(this.x - o.x) < eps && fabs(this.y - o.y) < eps
+            && fabs(this.z - o.z) < eps && fabs(this.w - o.w) < eps;
+    }
+
+    // Whether the two describe the same orientation, hemisphere included. The
+    // dot product of two unit quaternions is cos(half the angle between the
+    // rotations), so |dot| == 1 means the same rotation either way signed.
+    fn approxSameRotation(o: Quat, eps: float): bool {
+        return fabs(fabs(this.dot(o)) - 1.0) < eps;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Quat constructors
+//
+// Free functions in the same style as the mat4* set, and named to match: a
+// caller who knows mat4RotationAxis can guess quatFromAxisAngle.
+// ---------------------------------------------------------------------------
+
+export fn quatIdentity(): Quat { return Quat(0.0, 0.0, 0.0, 1.0); }
+
+// Rotation of `rad` about `axis`. The axis is normalized here so a caller need
+// not; a zero axis yields the identity rather than a NaN, exactly as
+// mat4RotationAxis does.
+export fn quatFromAxisAngle(axis: Vec3, rad: float): Quat {
+    let a = axis.normalized();
+    if (a.len2() == 0.0) { return quatIdentity(); }
+    let h = rad * 0.5;
+    let s = sin(h);
+    return Quat(a.x * s, a.y * s, a.z * s, cos(h));
+}
+
+// Intrinsic Tait-Bryan angles applied Z (yaw) then Y (pitch) then X (roll),
+// which is the aviation convention and matches
+// mat4RotationZ(yaw).mul(mat4RotationY(pitch)).mul(mat4RotationX(roll)).
+//
+// Provided for callers whose input is Euler angles — a config file, a UI with
+// three sliders. Do not store orientation this way: that is what gimbal lock
+// is, and this function cannot avoid it, it can only decline to make it worse.
+export fn quatFromEuler(yaw: float, pitch: float, roll: float): Quat {
+    let cy = cos(yaw * 0.5);
+    let sy = sin(yaw * 0.5);
+    let cp = cos(pitch * 0.5);
+    let sp = sin(pitch * 0.5);
+    let cr = cos(roll * 0.5);
+    let sr = sin(roll * 0.5);
+    return Quat(cy * cp * sr - sy * sp * cr,
+                cy * sp * cr + sy * cp * sr,
+                sy * cp * cr - cy * sp * sr,
+                cy * cp * cr + sy * sp * sr);
+}
+
+// Extract the rotation from a matrix. Only the upper-left 3x3 is read, and it
+// is assumed to be a pure rotation — a matrix carrying scale or shear produces
+// a quaternion that is not unit and not meaningful.
+//
+// The four branches are Shepperd's method and they are not optional. The
+// textbook single formula divides by sqrt(1 + trace), which goes to zero for a
+// 180-degree rotation — the one case that then produces infinities. Each branch
+// divides by a quantity the branch condition has just proved is largest, so the
+// divisor is always at least 1.
+export fn quatFromMat4(m: Mat4): Quat {
+    let trace = m.m00 + m.m11 + m.m22;
+    if (trace > 0.0) {
+        let s = sqrt(trace + 1.0) * 2.0;
+        return Quat((m.m21 - m.m12) / s,
+                    (m.m02 - m.m20) / s,
+                    (m.m10 - m.m01) / s,
+                    0.25 * s);
+    }
+    if (m.m00 > m.m11 && m.m00 > m.m22) {
+        let s = sqrt(1.0 + m.m00 - m.m11 - m.m22) * 2.0;
+        return Quat(0.25 * s,
+                    (m.m01 + m.m10) / s,
+                    (m.m02 + m.m20) / s,
+                    (m.m21 - m.m12) / s);
+    }
+    if (m.m11 > m.m22) {
+        let s = sqrt(1.0 + m.m11 - m.m00 - m.m22) * 2.0;
+        return Quat((m.m01 + m.m10) / s,
+                    0.25 * s,
+                    (m.m12 + m.m21) / s,
+                    (m.m02 - m.m20) / s);
+    }
+    let s = sqrt(1.0 + m.m22 - m.m00 - m.m11) * 2.0;
+    return Quat((m.m02 + m.m20) / s,
+                (m.m12 + m.m21) / s,
+                0.25 * s,
+                (m.m10 - m.m01) / s);
+}
+
+// The ORIENTATION of something looking along `forward` with `up` roughly up.
+// Right-handed and looking down -z, matching mat4LookAt's conventions and its
+// degenerate cases (identity rather than NaN).
+//
+// This is object-to-world: it takes -z to `forward`, so it is what a camera or
+// a turret IS, and it is the inverse of what mat4LookAt returns. mat4LookAt
+// builds a VIEW matrix, which moves the world into camera space, so
+//
+//     quatLookAt(dir, up).toMat4().transposed() == mat4LookAt(origin, dir, up)
+//
+// with the transpose standing in for the inverse because both are rotations.
+// Feeding this straight to a renderer as a view matrix puts the camera in
+// mirror image, which looks like a handedness bug and gets debugged as one —
+// use .inverse() (or .conjugate(), it is unit) to get the view rotation.
+export fn quatLookAt(forward: Vec3, up: Vec3): Quat {
+    let f = forward.normalized();
+    if (f.len2() == 0.0) { return quatIdentity(); }
+    let sVec = f.cross(up);
+    if (sVec.len2() == 0.0) { return quatIdentity(); }
+    let r = sVec.normalized();
+    let u = r.cross(f);
+    // The basis as a rotation matrix, then read the quaternion off it. Columns
+    // are right/up/backward because the camera looks down -z.
+    return quatFromMat4(Mat4(r.x, u.x, -f.x, 0.0,
+                             r.y, u.y, -f.y, 0.0,
+                             r.z, u.z, -f.z, 0.0,
+                             0.0, 0.0,  0.0, 1.0));
+}
+
+// Spherical linear interpolation: constant angular velocity along the shortest
+// arc. This is the operation the module exists for.
+//
+// Two things it must do that a naive version does not:
+//
+//   * Pick the hemisphere. q and -q are the same rotation, so without negating
+//     one input when the dot product is negative, half of all interpolations
+//     take the 300-degree path instead of the 60-degree one. This is the single
+//     most common slerp bug.
+//   * Fall back to a lerp when the two are nearly parallel, where sin(omega)
+//     approaches zero and the division blows up. The 1e-12 threshold matches
+//     vyto/geo's vector slerp, and over that range the straight line and the
+//     arc differ by less than float precision anyway.
+export fn quatSlerp(a: Quat, b: Quat, t: float): Quat {
+    let p = a.normalized();
+    let q = b.normalized();
+    let d = p.dot(q);
+    if (d < 0.0) {
+        q = q.neg();
+        d = -d;
+    }
+    // Clamp before acos: a dot product of two unit quaternions can land just
+    // past 1.0 in floating point, and acos(1.0000000000000002) is NaN.
+    d = fmax(-1.0, fmin(1.0, d));
+    let omega = acos(d);
+    let s = sin(omega);
+    if (fabs(s) < 1e-12) {
+        return p.add(q.sub(p).scale(t)).normalized();
+    }
+    return p.scale(sin((1.0 - t) * omega) / s)
+            .add(q.scale(sin(t * omega) / s));
+}
+
+// Normalized linear interpolation. Cheaper than slerp — no acos, no sin — and
+// it traces the same PATH, but not at constant angular velocity: it eases in
+// and out slightly, by up to a few degrees at the midpoint of a wide rotation.
+//
+// Right for blending animation poses every frame, where the difference is
+// invisible and the cost is paid per bone. Wrong for a camera sweeping a known
+// arc over time, where the velocity change is exactly what would be seen.
+export fn quatNlerp(a: Quat, b: Quat, t: float): Quat {
+    let q = b;
+    // Same hemisphere fix as slerp, and needed for the same reason.
+    if (a.dot(b) < 0.0) { q = q.neg(); }
+    return a.add(q.sub(a).scale(t)).normalized();
+}
