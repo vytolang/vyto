@@ -24,7 +24,7 @@ make test-win         # cross-build the windows-x64 slice into tests/tmp/win-x64
 make clean-cache      # remove every .vyto-cache in the tree
 ```
 
-`make test` runs all 87 examples and is slow. While iterating, build and run
+`make test` runs all 108 examples and is slow. While iterating, build and run
 the single example you care about directly:
 
 ```sh
@@ -227,6 +227,14 @@ and never re-arm one from `render()`.
 
 blend2d (`vyto/gfx`) and ICU (`vyto/intl`) binaries are **not in git** — they
 are built by `lib/vyto/*/native/build-*.sh`. On a fresh clone the gfx tests
-silently skip rather than fail. `vyto/regex` (pcre2) and `vyto/crypto/ecc`
-(micro-ecc) *are* vendored and need nothing.
+silently skip rather than fail. `vyto/regex` (pcre2), `vyto/crypto/ecc`
+(micro-ecc) and `vyto/media/image` (stb_image_write) *are* vendored and need
+nothing; each carries a `native/refresh-*.sh --verify` that checks the committed
+tree against its sha256 manifest.
+
+That silent skip is exactly why those three are vendored — a must-have module
+whose tests quietly do not run on a fresh clone is worse than one that is
+missing. It is also why `vyto/media/image` splits encode from decode: encode is
+vendored and always works, and `vyto/media/image/decode` is a separate module
+because it reaches blend2d.
 

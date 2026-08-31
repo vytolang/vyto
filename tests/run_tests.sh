@@ -156,6 +156,18 @@ else
     echo "FAIL freestanding_openssl_stub (vyto/crypto/openssl's VT_NO_LIBC arm does not build)"
     fail=1
 fi
+# And for vyto/media/image, whose shim instantiates stb_image_write — a header
+# that needs malloc, stdio and sprintf, so an unguarded include would break the
+# freestanding build of anything importing the package. The fixture imports only
+# the encoder, never vyto/media/image/decode, which reaches blend2d (C++) and
+# could never build here; that module split is what makes this test possible.
+if ./vytoc build tests/fixtures/image_freestanding.vt --freestanding --cc gcc \
+        -o examples/.vyto-cache/libimg_fs.a >/dev/null 2>&1; then
+    echo "PASS freestanding_image_stub"
+else
+    echo "FAIL freestanding_image_stub (vyto/media/image's VT_NO_LIBC arm does not build)"
+    fail=1
+fi
 # vyto/db is pure Vyto and must stay freestanding-safe; its SQLite subpackage is
 # the one part that is not, so db_shim.c carries a VT_NO_LIBC arm that drops the
 # whole library and returns failure sentinels. Both halves are checked because
@@ -1239,8 +1251,23 @@ voltphone closed"
         echo "FAIL gfx_load_bytes (got: $got)"
         fail=1
     fi
+    # vyto/media/image/decode: encode with stb, decode with blend2d, compare
+    # every pixel. Gated here because decoding is the half that needs blend2d;
+    # the encoder is covered by examples/111_image.vt, which runs everywhere.
+    # This is also the only check on gfx_image_copy_pixels, which un-premultiplies
+    # blend2d's PRGB32 — get that wrong and every translucent pixel darkens.
+    got=$(./vytoc run tests/fixtures/image_decode.vt 2>&1)
+    if [ "$got" = "$(cat tests/fixtures/image_decode.expected)" ]; then
+        echo "PASS image_decode"
+    else
+        echo "FAIL image_decode"
+        echo "--- expected ---"; cat tests/fixtures/image_decode.expected
+        echo "--- got ---"; printf '%s\n' "$got"
+        fail=1
+    fi
 else
     echo "SKIP gfx_canvas_blit (no libblend2d — run lib/vyto/gfx/native/build-blend2d.sh)"
+    echo "SKIP image_decode (no libblend2d — the encoder half runs in 111_image)"
 fi
 
 # --- readfile/readlines on a growable /proc file (size 0 by stat) ---

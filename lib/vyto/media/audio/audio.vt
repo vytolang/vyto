@@ -1,0 +1,207 @@
+// vyto/media/audio — playback, capture and device enumeration.
+//
+//     let devs = audio_devices();                   // what is plugged in
+//     let p = audio_open_playback(48000, 2);        // 48 kHz stereo
+//     p.start();
+//     p.write(samples);                             // f32 interleaved, -1..1
+//
+// STATUS: STUB. Every entry point below panics. The signatures are real and
+// settled so they can be reviewed and imported against; see this package's
+// README for what is planned and what is deliberately excluded.
+//
+// The intended backend is miniaudio — one public-domain C header covering
+// WASAPI/CoreAudio/ALSA/PulseAudio/AAudio, which vendors the way
+// stb_image_write does for vyto/media/image and needs no build system.
+//
+// ---- THE CONSTRAINT THAT SHAPES THIS API ------------------------------------
+//
+// An audio callback runs on a thread the OS owns, at real-time priority, with a
+// hard deadline of a few milliseconds. Vyto's memory model is single-address-
+// space reference counting with no atomics on the refcount, so a foreign thread
+// may touch C memory ONLY — it must never retain or release a Vyto object.
+// That rules out the API every audio library reaches for first: a Vyto closure
+// invoked from the callback.
+//
+// So the sample path is a lock-free ring buffer owned by C. The callback fills
+// or drains it and touches nothing else; the Vyto side reads and writes it from
+// its own thread whenever it likes. write() and read() below are that ring, and
+// they are why this module has no `onAudio(cb)` and will not grow one.
+//
+// The second consequence: an underrun is normal, not exceptional. If the Vyto
+// side is late the callback emits silence rather than blocking — blocking a
+// real-time thread is how an audio glitch becomes a system-wide stutter. The
+// underruns() counter is how that becomes visible instead of mysterious.
+
+// Sample format: 32-bit float, interleaved, nominally -1.0 to 1.0. One format
+// rather than an enum because the conversion belongs in the shim, where it is
+// written once, rather than in every caller.
+export const AUDIO_F32: int = 0;
+
+// Device kinds for audio_devices().
+export const AUDIO_PLAYBACK: int = 0;
+export const AUDIO_CAPTURE: int = 1;
+
+fn todo(what: string) {
+    panic("vyto/media/audio: " + what + " is not implemented yet — this module is"
+        + " a stub with settled signatures; see its README");
+}
+
+// ---- devices ----------------------------------------------------------------
+
+// One enumerated device. `id` is the backend's opaque identifier and is what
+// audio_open_* takes; the empty string means "the system default", which is
+// what a caller should use unless a human has picked something else.
+export class AudioDevice {
+    id: string;
+    name: string;
+    kind: int;          // AUDIO_PLAYBACK or AUDIO_CAPTURE
+    channels: int;
+    defaultRate: int;
+
+    fn init() {
+        todo("AudioDevice");
+    }
+}
+
+// Every device the backend can see, both directions. An empty array means no
+// audio backend initialised, which is normal on a headless box and must not be
+// treated as an error.
+export fn audio_devices(): AudioDevice[] {
+    todo("audio_devices");
+    return [];
+}
+
+// ---- playback ---------------------------------------------------------------
+
+// An open output stream. The C side owns the device and the ring buffer; this
+// object owns the C side, and deinit stops the stream and frees it — so a
+// stream that goes out of scope stops making noise, deterministically.
+export class AudioPlayback {
+    handle: rawptr;
+    rate: int;
+    channels: int;
+
+    fn init() {
+        todo("AudioPlayback");
+    }
+
+    // Begin pulling from the ring. Idempotent.
+    fn start(): bool {
+        todo("AudioPlayback.start");
+        return false;
+    }
+
+    // Stop pulling. The ring keeps its contents, so start() resumes rather than
+    // restarts.
+    fn stop(): bool {
+        todo("AudioPlayback.stop");
+        return false;
+    }
+
+    // Queue interleaved f32 samples. Returns how many were accepted — fewer
+    // than offered when the ring is full, which is backpressure and not an
+    // error. A caller that ignores the return value will drop audio.
+    fn write(samples: f32[]): int {
+        todo("AudioPlayback.write");
+        return 0;
+    }
+
+    // Room left in the ring, in samples. Write this many and the call cannot
+    // partially succeed.
+    fn writable(): int {
+        todo("AudioPlayback.writable");
+        return 0;
+    }
+
+    // How many times the callback found the ring empty and emitted silence.
+    // Monotonic. A rising count means the producer is too slow or the ring is
+    // too small; it is the only symptom of either that is visible in software.
+    fn underruns(): int {
+        todo("AudioPlayback.underruns");
+        return 0;
+    }
+
+    // Frames the device has actually played. The clock to synchronise against —
+    // wall time drifts against an audio device, which is what makes video sync
+    // to audio rather than the other way round.
+    fn framesPlayed(): int {
+        todo("AudioPlayback.framesPlayed");
+        return 0;
+    }
+}
+
+// Open the default output, or a device id from audio_devices(). `rate` is in
+// Hz, `channels` is 1 or 2. Returns null if no device could be opened, which is
+// the ordinary case on a machine with no sound card.
+export fn audio_open_playback(rate: int, channels: int): AudioPlayback {
+    todo("audio_open_playback");
+    return null;
+}
+
+export fn audio_open_playback_device(id: string, rate: int, channels: int): AudioPlayback {
+    todo("audio_open_playback_device");
+    return null;
+}
+
+// ---- capture ----------------------------------------------------------------
+
+// An open input stream. Same ownership and same ring, in the other direction.
+export class AudioCapture {
+    handle: rawptr;
+    rate: int;
+    channels: int;
+
+    fn init() {
+        todo("AudioCapture");
+    }
+
+    fn start(): bool {
+        todo("AudioCapture.start");
+        return false;
+    }
+
+    fn stop(): bool {
+        todo("AudioCapture.stop");
+        return false;
+    }
+
+    // Drain up to `max` interleaved samples. Returns what was available, which
+    // may be an empty array — that is a normal poll, not a failure.
+    fn read(max: int): f32[] {
+        todo("AudioCapture.read");
+        return [];
+    }
+
+    // Samples waiting to be read.
+    fn readable(): int {
+        todo("AudioCapture.readable");
+        return 0;
+    }
+
+    // How many times the callback found the ring full and discarded input.
+    // The capture-side counterpart of underruns().
+    fn overruns(): int {
+        todo("AudioCapture.overruns");
+        return 0;
+    }
+}
+
+export fn audio_open_capture(rate: int, channels: int): AudioCapture {
+    todo("audio_open_capture");
+    return null;
+}
+
+export fn audio_open_capture_device(id: string, rate: int, channels: int): AudioCapture {
+    todo("audio_open_capture_device");
+    return null;
+}
+
+// ---- library ----------------------------------------------------------------
+
+// Whether an audio backend initialised. False on a headless machine, in a
+// container without a sound device, and on a freestanding build. Check this
+// rather than treating a null stream as an error.
+export fn audio_available(): bool {
+    todo("audio_available");
+    return false;
+}

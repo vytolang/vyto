@@ -1,0 +1,102 @@
+// vyto/media/image/decode — reading an image file into a readable Image.
+//
+//     import { decodeFile } from "vyto/media/image/decode";
+//
+//     let img = decodeFile("photo.jpg");
+//     if (img == null) { print("could not decode"); return; }
+//     img.get(0, 0);                      // 0xAARRGGBB
+//
+// A SEPARATE MODULE from vyto/media/image, and the split is a link-cost
+// decision rather than tidiness. Decoding goes through vyto/gfx and therefore
+// blend2d — a 2.5 MB C++ library that is not in git and has to be built by
+// lib/vyto/gfx/native/build-blend2d.sh. If the encoder imported this, every
+// program that merely writes a PNG would link blend2d, and on a fresh clone
+// where blend2d was never provisioned it would not build at all.
+//
+// So: encoding costs one vendored header and always works. Decoding costs
+// blend2d and you ask for it by name.
+//
+// ---- WHY THERE IS NO SECOND DECODER ----------------------------------------
+//
+// stb ships stb_image.h, which decodes, and vendoring it beside
+// stb_image_write.h would drop this dependency entirely. That was rejected: it
+// would put two PNG decoders in one tree that have to agree forever, and
+// blend2d's is already here, already used by every Image widget in vyto/ui, and
+// already exercised by the gfx tests. A disagreement between them would surface
+// as an image that renders differently depending on which module opened it.
+//
+// ---- WHAT decodeAvailable() ACTUALLY REPORTS -------------------------------
+//
+// Whether blend2d is linked into THIS BINARY, not whether it exists on the
+// machine. It is answered by decoding a four-byte image held in this file, so
+// it exercises the real path rather than checking a flag someone has to
+// remember to set.
+
+import { loadImage, loadImageBytes, freeImage, imageWidth, imageHeight,
+         imagePixels } from "vyto/gfx";
+import { Image, imageFromARGB } from "vyto/media/image";
+
+// Decode PNG/JPEG/BMP/QOI from a file. Null when the file is absent, is not a
+// format blend2d knows, or this build has no blend2d.
+//
+// Honours the --with-assets VFS through vyto/gfx's loadImage, so an app that
+// names its images by relative path works bundled or from disk unchanged.
+//
+// Caveat inherited from vyto/gfx: some PNGs fail to decode on the vendored
+// blend2d build and return null — see the comment above loadImage in gfx.vt for
+// what is confirmed and a regeneration recipe.
+export fn decodeFile(path: string): Image {
+    return adopt(loadImage(path));
+}
+
+// The same decode from bytes already in memory — an HTTP body, a database blob,
+// an embedded asset.
+export fn decodeBytes(data: byte[]): Image {
+    if (data.len == 0) { return null; }
+    return adopt(loadImageBytes(data as rawptr, data.len));
+}
+
+// Turn a blend2d image handle into an Image and free the handle. The handle is
+// C-owned and this is the only place it is released, so every path out of here
+// frees exactly once.
+fn adopt(h: rawptr): Image {
+    if (h == null) { return null; }
+    let w = imageWidth(h);
+    let hgt = imageHeight(h);
+    if (w <= 0 || hgt <= 0) {
+        freeImage(h);
+        return null;
+    }
+    let px: i32[] = [];
+    px.reserve(w * hgt);
+    let i = 0;
+    while (i < w * hgt) { px.push(0 as i32); i += 1; }
+
+    let n = imagePixels(h, px);
+    freeImage(h);
+    if (n != w * hgt) { return null; }
+    return imageFromARGB(px, w, hgt);
+}
+
+// Whether decoding works in this build. False on a clone where blend2d has not
+// been built; there, decodeFile and decodeBytes return null for every input.
+//
+// Proved by decoding rather than asserted: this is a 1x1 white PNG, the
+// smallest input that exercises the whole path.
+export fn decodeAvailable(): bool {
+    let src = [
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A,
+        0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,
+        0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+        0x08, 0x02, 0x00, 0x00, 0x00, 0x90, 0x77, 0x53,
+        0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41,
+        0x54, 0x78, 0x9C, 0x63, 0xF8, 0xFF, 0xFF, 0x3F,
+        0x00, 0x05, 0xFE, 0x02, 0xFE, 0x0D, 0xEF, 0x46,
+        0xB8, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E,
+        0x44, 0xAE, 0x42, 0x60, 0x82
+    ];
+    let png = bytes(src.len);
+    let i = 0;
+    while (i < src.len) { png[i] = src[i] as byte; i += 1; }
+    return decodeBytes(png) != null;
+}

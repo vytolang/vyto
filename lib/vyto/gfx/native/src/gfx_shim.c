@@ -1269,6 +1269,71 @@ int gfx_image_height(void *img) {
     return d.size.h;
 }
 
+/* Copy a decoded image's pixels into a caller-owned w*h*4 buffer as tightly
+   packed, NON-premultiplied 0xAARRGGBB.
+
+   Two conversions happen here, and both are the kind that is invisible until
+   something outside this tree reads the result:
+
+   1. STRIDE. blend2d's stride is whatever its allocator chose and is not w*4,
+      so handing out pixel_data would oblige every caller to carry it and to get
+      the arithmetic right. Getting it wrong skews the image, which reads as a
+      decode bug. A negative stride is also legal and means the buffer starts at
+      the BOTTOM row (core/image.h:59), so the row pointer is stepped rather
+      than indexed — base + y * stride would read before the allocation.
+
+   2. PREMULTIPLIED ALPHA. BL_FORMAT_PRGB32 stores colour already multiplied by
+      alpha, so a half-transparent pure red is 0x80800000 and not 0x80FF0000.
+      Copying that out unchanged silently darkens every translucent pixel toward
+      black, and a round trip through encode/decode would keep darkening it. PNG
+      is not premultiplied, so this has to be undone here. The +alpha/2 is
+      round-to-nearest rather than truncation, which keeps a value that survived
+      one multiply from drifting on the way back.
+
+   Returns the number of pixels written, 0 on failure or if cap is too small. */
+int gfx_image_copy_pixels(void *img, void *dst, int cap) {
+    if (!img || !dst) return 0;
+    BLImageData d;
+    bl_image_get_data(&((GfxImage *)img)->img, &d);
+    if (!d.pixel_data || d.size.w <= 0 || d.size.h <= 0) return 0;
+
+    int w = d.size.w, h = d.size.h;
+    if ((long long)w * (long long)h > (long long)cap) return 0;
+
+    unsigned char *row = (unsigned char *)d.pixel_data;
+    unsigned int *out = (unsigned int *)dst;
+    int premul = (d.format == BL_FORMAT_PRGB32);
+
+    for (int y = 0; y < h; y++) {
+        memcpy(out + (size_t)y * w, row, (size_t)w * 4);
+        row += d.stride;
+    }
+
+    if (premul) {
+        long long n = (long long)w * (long long)h, i;
+        for (i = 0; i < n; i++) {
+            unsigned int v = out[i];
+            unsigned int a = v >> 24;
+            /* Opaque needs no division, and it is the overwhelmingly common
+               case; fully transparent carries no recoverable colour at all. */
+            if (a == 255 || a == 0) continue;
+            {
+                unsigned int r = (v >> 16) & 0xFF;
+                unsigned int g = (v >>  8) & 0xFF;
+                unsigned int b =  v        & 0xFF;
+                r = (r * 255 + a / 2) / a;
+                g = (g * 255 + a / 2) / a;
+                b = (b * 255 + a / 2) / a;
+                if (r > 255) r = 255;
+                if (g > 255) g = 255;
+                if (b > 255) b = 255;
+                out[i] = (a << 24) | (r << 16) | (g << 8) | b;
+            }
+        }
+    }
+    return w * h;
+}
+
 void gfx_draw_image(GfxCanvas *c, void *img, double x, double y, double w, double h) {
     if (!img) return;
     BLRect r = { x, y, w, h };

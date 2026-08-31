@@ -1,0 +1,114 @@
+// vyto/media/image/decode — reading an encoded image back into a readable
+// Image. Gated on blend2d in run_tests.sh, because that is what decoding goes
+// through and it is not in git; the encoder half is covered by
+// examples/111_image.vt, which runs everywhere.
+//
+// The round trip is the point. Encoding alone can be self-consistently wrong —
+// a channel swap that both halves agree on is invisible until something else
+// opens the file — so this checks against blend2d's decoder, which is a
+// different implementation by different people.
+import { Image, encodePNGBytes, encodeBMPBytes, encodePNG } from "vyto/media/image";
+import { decodeFile, decodeBytes, decodeAvailable } from "vyto/media/image/decode";
+import { file_remove } from "vyto/io/file";
+
+fn check(name: string, got: string, want: string) {
+    if (got == want) {
+        print("ok    " + name);
+    } else {
+        print("FAIL  " + name);
+        print("        got  " + got);
+        print("        want " + want);
+    }
+}
+
+fn main() {
+    check("decode available", str(decodeAvailable()), "true");
+
+    // A gradient, so a row- or column-order bug cannot survive: every pixel
+    // differs from its neighbours in both directions.
+    let img = new Image(8, 5);
+    let y = 0;
+    while (y < 5) {
+        let x = 0;
+        while (x < 8) {
+            img.set(x, y, 0xFF000000 | (x * 30) | ((y * 50) << 8) | ((x + y) << 16));
+            x += 1;
+        }
+        y += 1;
+    }
+
+    let back = decodeBytes(encodePNGBytes(img));
+    if (back == null) {
+        print("FAIL  png decode returned null");
+        return;
+    }
+    check("png dimensions", str(back.width) + "x" + str(back.height), "8x5");
+
+    // Every pixel, not a sample: a stride bug shows up only on some rows, and
+    // one that shows up on row 3 of 5 would survive a spot check of the corners.
+    let same = true;
+    let bad = "";
+    y = 0;
+    while (y < 5) {
+        let x = 0;
+        while (x < 8) {
+            if (img.get(x, y) != back.get(x, y)) {
+                if (same) { bad = "(" + str(x) + "," + str(y) + ")"; }
+                same = false;
+            }
+            x += 1;
+        }
+        y += 1;
+    }
+    check("png round trip", str(same) + bad, "true");
+
+    // The corners explicitly, so a failure says WHICH corner rather than only
+    // that the images differ — a transposed image passes a count-based check.
+    check("top-left", str(back.get(0, 0)), str(img.get(0, 0)));
+    check("top-right", str(back.get(7, 0)), str(img.get(7, 0)));
+    check("bottom-left", str(back.get(0, 4)), str(img.get(0, 4)));
+    check("bottom-right", str(back.get(7, 4)), str(img.get(7, 4)));
+
+    // BMP is a second container over the same pixels. It also happens to be
+    // stored bottom-up on disk, so agreeing with the PNG proves the row order
+    // is handled by the decoder rather than by luck.
+    let bmpBack = decodeBytes(encodeBMPBytes(img));
+    if (bmpBack == null) {
+        print("ok    bmp not decodable by this build");
+    } else {
+        check("bmp round trip", str(bmpBack.get(1, 3)), str(img.get(1, 3)));
+        check("bmp row order", str(bmpBack.get(0, 0)), str(img.get(0, 0)));
+    }
+
+    // Through a file, which is a different blend2d entry point than the
+    // in-memory one and has its own failure mode.
+    let path = "tests/tmp_image_decode.png";
+    check("write", str(encodePNG(img, path)), "true");
+    let fileBack = decodeFile(path);
+    if (fileBack == null) {
+        print("FAIL  file decode returned null");
+    } else {
+        check("file dimensions", str(fileBack.width) + "x" + str(fileBack.height), "8x5");
+        check("file pixel", str(fileBack.get(5, 2)), str(img.get(5, 2)));
+    }
+    file_remove(path);
+
+    // Failures are null, not panics or empty images.
+    check("missing file", str(decodeFile("tests/definitely_not_here.png") == null), "true");
+    check("garbage bytes", str(decodeBytes(bytes(16)) == null), "true");
+    check("empty bytes", str(decodeBytes(bytes(0)) == null), "true");
+
+    // Alpha survives. blend2d stores premultiplied internally, so a
+    // half-transparent pixel is where a premultiply that is never undone would
+    // show up — as a colour that has been darkened toward black.
+    let a = new Image(2, 1);
+    a.set(0, 0, 0x80FF0000);
+    a.set(1, 0, 0xFF00FF00);
+    let aBack = decodeBytes(encodePNGBytes(a));
+    if (aBack == null) {
+        print("FAIL  alpha decode returned null");
+    } else {
+        check("opaque pixel", str(aBack.get(1, 0)), str(0xFF00FF00));
+        check("translucent pixel", str(aBack.get(0, 0)), str(0x80FF0000));
+    }
+}

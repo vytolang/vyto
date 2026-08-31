@@ -1,0 +1,199 @@
+// vyto/media/codec — containers: what is inside a media file, and how to get
+// the compressed packets out of it without decoding them.
+//
+//     let d = demux_open("clip.mp4");
+//     for (let i in 0..d.streamCount()) { print(d.stream(i).codec); }
+//     let pkt = d.readPacket();          // still compressed
+//
+// STATUS: STUB. Every entry point below panics. The signatures are real and
+// settled so they can be reviewed and imported against; see this package's
+// README for what is planned and what is deliberately excluded.
+//
+// ---- WHY THIS IS SEPARATE FROM vyto/media/video ----------------------------
+//
+// A media file is two independent problems. The CONTAINER (mp4, mkv, webm, ogg)
+// says what streams exist, how they are timed, and where each compressed packet
+// starts. The CODEC (h264, vp9, aac, opus) turns one such packet into pixels or
+// samples. FFmpeg splits these as libavformat and libavcodec, and the split is
+// not an implementation detail — it is the difference between reading a file
+// and decoding one.
+//
+// Keeping them apart buys three things that matter here:
+//
+//   * Remuxing without decoding. Changing an mkv into an mp4, trimming a clip
+//     on keyframe boundaries, or extracting an audio track is a copy of packets
+//     from one container to another. Decoding to do that would cost orders of
+//     magnitude more time and lose quality on the re-encode.
+//   * Inspection without linking a decoder. Duration, resolution, track list
+//     and metadata come from the container alone. A media library scanner wants
+//     exactly this and nothing else.
+//   * A smaller dependency for the common case. native/src compiles per package
+//     directory, so a program that only reads container metadata does not link
+//     the decoders.
+//
+// So: vyto/media/video decodes and will be built ON this, taking packets from
+// here and producing Image frames. If that layering ever collapses — if video
+// stops going through this module — then this module has no reason to exist
+// separately and should be folded into it rather than maintained alongside.
+
+// Stream kinds.
+export const STREAM_VIDEO: int = 0;
+export const STREAM_AUDIO: int = 1;
+export const STREAM_SUBTITLE: int = 2;
+export const STREAM_OTHER: int = 3;
+
+fn todo(what: string) {
+    panic("vyto/media/codec: " + what + " is not implemented yet — this module is"
+        + " a stub with settled signatures; see its README");
+}
+
+// ---- streams ----------------------------------------------------------------
+
+// One track inside a container. Everything here comes from the container's
+// headers, so it is available without decoding a single frame.
+//
+// `timeBase` is the unit of every timestamp on this stream, in seconds — a
+// packet's `pts` is `pts * timeBase` seconds. Containers do not agree on one,
+// and assuming milliseconds is how audio drifts out of sync over a long file.
+export class MediaStream {
+    index: int;
+    kind: int;              // STREAM_*
+    codec: string;          // "h264", "aac", "opus", …
+    timeBase: float;
+    durationTicks: int;     // in timeBase units; 0 when the container omits it
+
+    // video only, 0 for other kinds
+    width: int;
+    height: int;
+    frameRate: float;
+
+    // audio only, 0 for other kinds
+    sampleRate: int;
+    channels: int;
+
+    fn init() {
+        todo("MediaStream");
+    }
+}
+
+// One compressed packet. `data` is codec-specific bytes — this module never
+// interprets them, which is exactly what makes remuxing possible.
+//
+// `pts` is the presentation timestamp and `dts` the decode timestamp, both in
+// the stream's timeBase. They differ whenever a codec reorders frames (B-frames
+// in h264), and a caller that assumes they are the same will present frames out
+// of order on exactly the files where it matters.
+export class Packet {
+    streamIndex: int;
+    data: byte[];
+    pts: int;
+    dts: int;
+    keyframe: bool;
+
+    fn init() {
+        todo("Packet");
+    }
+}
+
+// ---- demuxing ---------------------------------------------------------------
+
+// An open container being read. Owns the C object; deinit closes it.
+export class Demuxer {
+    handle: rawptr;
+
+    fn init() {
+        todo("Demuxer");
+    }
+
+    fn streamCount(): int {
+        todo("Demuxer.streamCount");
+        return 0;
+    }
+
+    fn stream(index: int): MediaStream {
+        todo("Demuxer.stream");
+        return null;
+    }
+
+    // Whole-file duration in seconds, or 0.0 when the container does not say —
+    // which a live stream never does.
+    fn duration(): float {
+        todo("Demuxer.duration");
+        return 0.0;
+    }
+
+    // Container-level metadata: "title", "artist", "encoder". Returns "" for a
+    // key the file does not carry.
+    fn metadata(key: string): string {
+        todo("Demuxer.metadata");
+        return "";
+    }
+
+    // The next packet from any stream, in file order. Null at end of file —
+    // which is the normal loop termination, not an error.
+    fn readPacket(): Packet {
+        todo("Demuxer.readPacket");
+        return null;
+    }
+
+    // Seek to roughly `seconds`, landing on the keyframe at or before it. Not
+    // exact by design: a non-keyframe cannot be decoded without the frames
+    // before it, so exact seeking means decoding forward from here, and that is
+    // the caller's decision to make rather than a hidden cost.
+    fn seek(seconds: float): bool {
+        todo("Demuxer.seek");
+        return false;
+    }
+}
+
+export fn demux_open(path: string): Demuxer {
+    todo("demux_open");
+    return null;
+}
+
+// ---- muxing -----------------------------------------------------------------
+
+// A container being written. Streams must all be declared before the first
+// packet — the header records them, and it is written once at the start.
+export class Muxer {
+    handle: rawptr;
+
+    fn init() {
+        todo("Muxer");
+    }
+
+    // Declare a stream, returning its index. Copy the MediaStream from a
+    // Demuxer to remux, which is what preserves the codec parameters exactly.
+    fn addStream(s: MediaStream): int {
+        todo("Muxer.addStream");
+        return -1;
+    }
+
+    // Write a packet through unchanged. The stream index refers to this muxer's
+    // streams, not the source's, so remuxing has to translate.
+    fn writePacket(p: Packet): bool {
+        todo("Muxer.writePacket");
+        return false;
+    }
+
+    // Finish the file: write the trailer and the index. A container closed
+    // without this is unplayable in most players even though every packet
+    // reached the disk, which is a failure mode worth naming.
+    fn finish(): bool {
+        todo("Muxer.finish");
+        return false;
+    }
+}
+
+// The container format is taken from the path's extension.
+export fn mux_create(path: string): Muxer {
+    todo("mux_create");
+    return null;
+}
+
+// ---- library ----------------------------------------------------------------
+
+export fn codec_available(): bool {
+    todo("codec_available");
+    return false;
+}

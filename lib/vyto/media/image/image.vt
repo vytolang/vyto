@@ -1,0 +1,263 @@
+// vyto/media/image — writing image files, and reading one back into an array.
+//
+//     let img = new Image(2, 2);
+//     img.set(0, 0, 0xFFFF0000);          // opaque red
+//     encodePNG(img, "out.png");
+//
+//     let bytes = encodePNGBytes(img);    // or straight to memory
+//     let back = decodeFile("photo.jpg"); // needs vyto/gfx — see below
+//
+// Before this module no Vyto program could write an image file at all.
+// vyto/gfx decodes (blend2d has PNG/JPEG/BMP/QOI codecs built in) but has no
+// encoder and, until now, no way to read a decoded image's pixels either — the
+// only route to a readable buffer was drawing onto a Canvas and walking its
+// stride-padded rawptr.
+//
+// ---- THE PIXEL FORMAT, WHICH IS THE POINT ----------------------------------
+//
+// `Image.pixels` is `i32[]` of 0xAARRGGBB, row-major, width*height, NO stride
+// padding. Every module here that produces pixels produces one of these.
+//
+// It is written down because the tree already had three layouts that disagree:
+//
+//   * vyto/raster3d Framebuffer.color — i32[] 0xRRGGBB, no alpha
+//   * vyto/raster3d Texture.pixels    — i32[]
+//   * vyto/gfx Canvas.pixels()        — rawptr 0xAARRGGBB, stride-padded,
+//                                       stride measured in BYTES
+//
+// Image is a superset of the first (alpha 0xFF) and drops the stride trap of
+// the last. Conversion is explicit — imageFromFramebuffer, imageFromRGB — since
+// Vyto has no overloading and a silently guessed format is how a red image
+// comes out blue.
+//
+// A word on 0xAARRGGBB: it is a NUMBER, not a byte layout. What those bytes
+// look like in memory depends on the host, which is why the shim repacks by
+// shifting rather than casting a pointer. Nothing here is endian-dependent.
+//
+// ---- TWO HALVES WITH DIFFERENT DEPENDENCIES --------------------------------
+//
+// ENCODE is always available. It is backed by stb_image_write, one public
+// domain header vendored into native/src/stb — see native/refresh-stb.sh for
+// why it is in git rather than fetched. No provisioning, no build script, and
+// it cross-compiles unchanged.
+//
+// DECODE lives in a SEPARATE MODULE, `vyto/media/image/decode`, and is not
+// reachable from here. That is deliberate and it is a link-cost decision:
+// decoding goes through vyto/gfx and therefore blend2d, a 2.5 MB C++ library
+// that is not in git and has to be built. If this module imported it, every
+// program that merely writes a PNG would link blend2d — or fail to build on a
+// clone where it was never provisioned.
+//
+//     import { decodeFile } from "vyto/media/image/decode";   // opt in
+//
+// So encoding always works and costs one vendored header; decoding costs
+// blend2d and you ask for it by name. Vendoring a second decoder to avoid that
+// was considered and rejected: two PNG decoders in one tree have to agree
+// forever, and blend2d's is already here and already tested.
+
+extern "C" {
+    fn vimg_write_png(path: cstring, px: rawptr, w: i32, h: i32): i32;
+    fn vimg_write_bmp(path: cstring, px: rawptr, w: i32, h: i32): i32;
+    fn vimg_write_tga(path: cstring, px: rawptr, w: i32, h: i32): i32;
+    fn vimg_write_jpg(path: cstring, px: rawptr, w: i32, h: i32, quality: i32): i32;
+
+    fn vimg_encode_png(px: rawptr, w: i32, h: i32): rawptr;
+    fn vimg_encode_bmp(px: rawptr, w: i32, h: i32): rawptr;
+    fn vimg_encode_tga(px: rawptr, w: i32, h: i32): rawptr;
+    fn vimg_encode_jpg(px: rawptr, w: i32, h: i32, quality: i32): rawptr;
+
+    fn vimg_buf_data(h: rawptr): rawptr;
+    fn vimg_buf_len(h: rawptr): i32;
+    fn vimg_buf_free(h: rawptr);
+    fn vimg_buf_take(h: rawptr, dst: rawptr, cap: i32): i32;
+
+    fn vimg_set_png_compression(level: i32);
+    fn vimg_available(): i32;
+}
+
+// ---- Image ------------------------------------------------------------------
+
+// A decoded picture. Holds an array, so it is a class rather than a value
+// struct — the vyto/geom/path rule.
+export class Image {
+    pixels: i32[];      // 0xAARRGGBB, row-major, width * height
+    width: int;
+    height: int;
+
+    // A transparent image of the given size. bytes-equivalent zeroed storage,
+    // so an all-zero pixel is fully transparent black.
+    fn init(width: int, height: int) {
+        if (width < 0 || height < 0) {
+            panic("Image: negative dimensions");
+        }
+        this.width = width;
+        this.height = height;
+        let n = width * height;
+        this.pixels = [];
+        this.pixels.reserve(n);
+        let i = 0;
+        while (i < n) { this.pixels.push(0 as i32); i += 1; }
+    }
+
+    fn isEmpty(): bool { return this.width == 0 || this.height == 0; }
+
+    // Out of bounds reads 0 (transparent) rather than panicking, so sampling
+    // past an edge — which every filter kernel does — needs no guard at the
+    // call site. Writes out of bounds are silently dropped for the same reason.
+    fn get(x: int, y: int): int {
+        if (x < 0 || y < 0 || x >= this.width || y >= this.height) { return 0; }
+        return (this.pixels[y * this.width + x] as int) & 0xFFFFFFFF;
+    }
+
+    fn set(x: int, y: int, argb: int) {
+        if (x < 0 || y < 0 || x >= this.width || y >= this.height) { return; }
+        this.pixels[y * this.width + x] = argb as i32;
+    }
+
+    fn fill(argb: int) {
+        let v = argb as i32;
+        let i = 0;
+        while (i < this.pixels.len) { this.pixels[i] = v; i += 1; }
+    }
+
+    // An independent copy. The pixels array is shared by reference otherwise,
+    // which is usually what you want and occasionally very much not.
+    fn clone(): Image {
+        let out = new Image(this.width, this.height);
+        let i = 0;
+        while (i < this.pixels.len) { out.pixels[i] = this.pixels[i]; i += 1; }
+        return out;
+    }
+}
+
+// ---- constructing from what the rest of the tree already has ---------------
+
+// From a raw i32[] that is already 0xAARRGGBB. The array is adopted, not
+// copied, so a later write through the caller's reference is visible here.
+export fn imageFromARGB(px: i32[], w: int, h: int): Image {
+    if (w < 0 || h < 0 || px.len < w * h) {
+        panic("vyto/media/image: imageFromARGB needs at least w*h pixels");
+    }
+    let img = new Image(0, 0);
+    img.pixels = px;
+    img.width = w;
+    img.height = h;
+    return img;
+}
+
+// From 0xRRGGBB with no alpha channel — vyto/raster3d's Framebuffer.color and
+// Texture.pixels are this shape. Every pixel becomes fully opaque.
+//
+// Copies, because it has to change every value; that is also why it cannot be
+// the same function as imageFromARGB despite the identical signature.
+export fn imageFromRGB(px: i32[], w: int, h: int): Image {
+    if (w < 0 || h < 0 || px.len < w * h) {
+        panic("vyto/media/image: imageFromRGB needs at least w*h pixels");
+    }
+    let img = new Image(w, h);
+    let n = w * h;
+    let i = 0;
+    while (i < n) {
+        img.pixels[i] = (((px[i] as int) & 0xFFFFFF) | 0xFF000000) as i32;
+        i += 1;
+    }
+    return img;
+}
+
+// ---- encoding to a file -----------------------------------------------------
+
+// All four return false rather than panicking: a failed write is a disk being
+// full or a directory not existing, which is a runtime condition a caller
+// handles, not a bug.
+
+export fn encodePNG(img: Image, path: string): bool {
+    if (img == null || img.isEmpty()) { return false; }
+    return vimg_write_png(path.cstr(), img.pixels as rawptr,
+                          img.width as i32, img.height as i32) != 0;
+}
+
+export fn encodeBMP(img: Image, path: string): bool {
+    if (img == null || img.isEmpty()) { return false; }
+    return vimg_write_bmp(path.cstr(), img.pixels as rawptr,
+                          img.width as i32, img.height as i32) != 0;
+}
+
+export fn encodeTGA(img: Image, path: string): bool {
+    if (img == null || img.isEmpty()) { return false; }
+    return vimg_write_tga(path.cstr(), img.pixels as rawptr,
+                          img.width as i32, img.height as i32) != 0;
+}
+
+// JPEG is lossy and has NO ALPHA — the alpha channel is dropped, not composited
+// against a background, because there is no background colour to pick. An image
+// with transparency will not survive a round trip through this; use PNG.
+//
+// `quality` is 1..100. Above about 95 the file grows fast for no visible gain.
+export fn encodeJPEG(img: Image, path: string, quality: int): bool {
+    if (img == null || img.isEmpty()) { return false; }
+    return vimg_write_jpg(path.cstr(), img.pixels as rawptr,
+                          img.width as i32, img.height as i32, quality as i32) != 0;
+}
+
+// ---- encoding to memory -----------------------------------------------------
+
+// For an HTTP response, a database blob, or a hash. Returns an empty byte[] on
+// failure, which for an image format is unambiguous — no encoder produces zero
+// bytes on success.
+
+export fn encodePNGBytes(img: Image): byte[] {
+    if (img == null || img.isEmpty()) { return bytes(0); }
+    return take(vimg_encode_png(img.pixels as rawptr,
+                                img.width as i32, img.height as i32));
+}
+
+export fn encodeBMPBytes(img: Image): byte[] {
+    if (img == null || img.isEmpty()) { return bytes(0); }
+    return take(vimg_encode_bmp(img.pixels as rawptr,
+                                img.width as i32, img.height as i32));
+}
+
+export fn encodeTGABytes(img: Image): byte[] {
+    if (img == null || img.isEmpty()) { return bytes(0); }
+    return take(vimg_encode_tga(img.pixels as rawptr,
+                                img.width as i32, img.height as i32));
+}
+
+export fn encodeJPEGBytes(img: Image, quality: int): byte[] {
+    if (img == null || img.isEmpty()) { return bytes(0); }
+    return take(vimg_encode_jpg(img.pixels as rawptr, img.width as i32,
+                                img.height as i32, quality as i32));
+}
+
+// Copy a C-owned encode buffer into a Vyto byte[] and free it. The pointer is
+// borrowed and dies with the handle, so the copy is not optional — this is the
+// vyto/net fetch convention (net.vt:26-32) with the free hidden, because unlike
+// a fetch there is no reason for a caller to hold the handle.
+//
+// The buffer is allocated here and passed down as a cstring rather than the
+// shim returning an array, because the shim has no -I to runtime/ and cannot
+// build a VtArray. vimg_buf_take frees the handle even when the copy is short,
+// so there is no path through this function that leaks.
+fn take(h: rawptr): byte[] {
+    if (h == null) { return bytes(0); }
+    let n = vimg_buf_len(h) as int;
+    if (n <= 0) {
+        vimg_buf_free(h);
+        return bytes(0);
+    }
+    let out = bytes(n);
+    vimg_buf_take(h, out as rawptr, n as i32);
+    return out;
+}
+
+// ---- knobs ------------------------------------------------------------------
+
+// Deflate level for PNG, 0..9, default 8. Lower is faster and larger; 0 stores
+// uncompressed. Global to the process, because it is a global in stb.
+export fn setPNGCompression(level: int) {
+    vimg_set_png_compression(level as i32);
+}
+
+// Whether encoding works. False only on a --freestanding build, where the shim
+// compiles to stubs because stb needs a libc.
+export fn encodeAvailable(): bool { return (vimg_available() as int) == 1; }

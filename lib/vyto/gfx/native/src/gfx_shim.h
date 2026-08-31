@@ -188,6 +188,11 @@ void *gfx_image_load_bytes(const void *data, int len);
 void gfx_image_free(void *img);
 int gfx_image_width(void *img);
 int gfx_image_height(void *img);
+/* Copy a decoded image into a caller-owned buffer of `cap` PIXELS as tightly
+   packed 0xAARRGGBB, discarding blend2d's row padding. Returns pixels written,
+   or 0 if cap is smaller than width*height. A copy rather than a borrowed
+   pointer so callers never handle a stride — see the .c for why. */
+int gfx_image_copy_pixels(void *img, void *dst, int cap);
 void gfx_draw_image(GfxCanvas *c, void *img, double x, double y, double w, double h); /* scaled into x,y,w,h */
 
 #endif

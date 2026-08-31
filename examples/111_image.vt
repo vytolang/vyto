@@ -1,0 +1,170 @@
+// vyto/media/image — writing image files.
+//
+// Before this module no Vyto program could write an image at all: vyto/gfx
+// decodes (blend2d has the codecs) but has never had an encoder. So a program
+// could render, and could put pixels on a screen, and could not save one.
+//
+// This example is a golden test as much as a demonstration. It asserts on the
+// STRUCTURE of the encoded bytes — magic numbers, IHDR contents, the round trip
+// through the checksum — rather than on a hash of the whole file, because a
+// whole-file hash would also be a hash of stb's deflate implementation and
+// would move on any upstream refresh for reasons that say nothing about whether
+// this code is correct.
+//
+// Deliberately does NOT import vyto/media/image/decode, which needs blend2d and
+// is not in git — this example must run on a fresh clone.
+
+import { Image, imageFromRGB, imageFromARGB,
+         encodePNG, encodePNGBytes, encodeBMPBytes, encodeTGABytes,
+         encodeJPEGBytes, encodeAvailable, setPNGCompression } from "vyto/media/image";
+import { crc32 } from "vyto/hash";
+import { chr } from "vyto/util/text";
+import { file_remove } from "vyto/io/file";
+
+fn check(name: string, got: string, want: string) {
+    if (got == want) {
+        print("ok    " + name);
+    } else {
+        print("FAIL  " + name);
+        print("        got  " + got);
+        print("        want " + want);
+    }
+}
+
+fn checkBool(name: string, got: bool, want: bool) {
+    if (got == want) {
+        print("ok    " + name);
+    } else {
+        print("FAIL  " + name + " (got " + str(got) + ", want " + str(want) + ")");
+    }
+}
+
+// A big-endian u32 out of a byte[] — PNG is big-endian throughout.
+fn be32(b: byte[], off: int): int {
+    return ((b[off] as int) << 24) | ((b[off + 1] as int) << 16)
+         | ((b[off + 2] as int) << 8) | (b[off + 3] as int);
+}
+
+fn tag(b: byte[], off: int): string {
+    let s = "";
+    let i = 0;
+    while (i < 4) { s = s + chr(b[off + i] as int); i += 1; }
+    return s;
+}
+
+fn main() {
+    print("---- the Image type ----");
+    let img = new Image(4, 3);
+    checkBool("encoder linked", encodeAvailable(), true);
+    check("dims", str(img.width) + "x" + str(img.height), "4x3");
+    check("pixel count", str(img.pixels.len), "12");
+    // A fresh image is transparent, not black: every pixel is zero, and zero
+    // has an alpha of zero.
+    check("starts transparent", str(img.get(0, 0)), "0");
+
+    img.fill(0xFF102030);
+    img.set(0, 0, 0xFFFF0000);
+    img.set(3, 2, 0xFF0000FF);
+    check("filled", str(img.get(1, 1)), str(0xFF102030));
+    check("set corner", str(img.get(0, 0)), str(0xFFFF0000));
+    check("set far corner", str(img.get(3, 2)), str(0xFF0000FF));
+    // Out of bounds reads transparent instead of panicking, so a filter kernel
+    // that samples past an edge needs no guard at the call site.
+    check("out of bounds reads 0", str(img.get(99, 99)), "0");
+    // And a write out of bounds is dropped rather than corrupting a neighbour.
+    img.set(-1, -1, 0xFFFFFFFF);
+    check("out of bounds write dropped", str(img.get(0, 0)), str(0xFFFF0000));
+
+    let cl = img.clone();
+    cl.set(1, 1, 0xFF00FF00);
+    check("clone is independent", str(img.get(1, 1)), str(0xFF102030));
+
+    print("---- converting from the other pixel layouts ----");
+    // vyto/raster3d hands out 0xRRGGBB with no alpha channel; every pixel must
+    // come back fully opaque rather than fully transparent, which is what a
+    // plain reinterpret would produce.
+    let rgb = [0x00FF0000 as i32, 0x0000FF00 as i32, 0x000000FF as i32, 0x00FFFFFF as i32];
+    let fromRgb = imageFromRGB(rgb, 2, 2);
+    check("rgb gains alpha", str(fromRgb.get(0, 0)), str(0xFFFF0000));
+    check("rgb keeps colour", str(fromRgb.get(1, 1)), str(0xFFFFFFFF));
+    // ARGB is adopted as-is, alpha included.
+    let argb = [0x80FF0000 as i32, 0xFF00FF00 as i32, 0x000000FF as i32, 0xFFFFFFFF as i32];
+    let fromArgb = imageFromARGB(argb, 2, 2);
+    check("argb keeps alpha", str(fromArgb.get(0, 0)), str(0x80FF0000));
+
+    print("---- PNG ----");
+    let png = encodePNGBytes(img);
+    checkBool("non-empty", png.len > 0, true);
+    // The 8-byte signature, and every byte of it is load-bearing: 0x89 has the
+    // high bit set to catch a 7-bit transport, "PNG" names the format, the
+    // CR-LF and the lone LF catch a text-mode transfer converting line endings
+    // either way, and 0x1A stops MS-DOS `type` from printing the whole file.
+    // Note "PNG" is three bytes here, not a four-byte chunk tag.
+    check("signature", str(png[0] as int) + ","
+          + chr(png[1] as int) + chr(png[2] as int) + chr(png[3] as int) + ","
+          + str(png[4] as int) + "," + str(png[5] as int) + ","
+          + str(png[6] as int) + "," + str(png[7] as int),
+          "137,PNG,13,10,26,10");
+    // First chunk is always IHDR, and it carries the dimensions we asked for.
+    check("first chunk", tag(png, 12), "IHDR");
+    check("IHDR width", str(be32(png, 16)), "4");
+    check("IHDR height", str(be32(png, 20)), "3");
+    check("bit depth", str(png[24] as int), "8");
+    // Colour type 6 is truecolour WITH alpha. Anything else means the alpha
+    // channel was silently dropped on the way out.
+    check("colour type (6 = RGBA)", str(png[25] as int), "6");
+    // Last 12 bytes are the IEND chunk: length 0, the tag, and its CRC.
+    check("ends with IEND", tag(png, png.len - 8), "IEND");
+
+    // Encoding is deterministic — the same pixels give the same bytes, which is
+    // what makes an image hash usable as a cache key.
+    check("deterministic", str(crc32(encodePNGBytes(img)) == crc32(png)), "true");
+    // Different pixels give different bytes. Without this the line above would
+    // pass just as well for an encoder that always emitted the same buffer.
+    check("content-sensitive", str(crc32(encodePNGBytes(cl)) != crc32(png)), "true");
+
+    // The compression level is a real knob, but it is a knob on the DEFLATE
+    // stream and not on the picture — a decoder cannot tell which level wrote a
+    // file. On an image this small it does not even change the size: measured,
+    // a 4x3 comes out at the same length at level 0 and level 8, because 48
+    // bytes of pixel data is below the point where a Huffman table pays for
+    // itself. So the property worth asserting is that the level is honoured and
+    // the file stays valid, not that the byte count moves.
+    setPNGCompression(0);
+    let stored = encodePNGBytes(img);
+    setPNGCompression(8);
+    check("level 0 still a PNG", tag(stored, 12), "IHDR");
+    check("level 0 same dimensions", str(be32(stored, 16)) + "x" + str(be32(stored, 20)), "4x3");
+    check("restored level reproduces", str(crc32(encodePNGBytes(img)) == crc32(png)), "true");
+
+    print("---- other formats ----");
+    // JPEG: SOI marker, and no alpha channel by construction.
+    let jpg = encodeJPEGBytes(img, 90);
+    checkBool("jpeg non-empty", jpg.len > 0, true);
+    check("jpeg SOI", str(jpg[0] as int) + "," + str(jpg[1] as int), "255,216");
+    // Quality changes the size. A higher quality keeps more coefficients, so on
+    // any image with detail it cannot be smaller.
+    checkBool("higher quality is not smaller",
+              encodeJPEGBytes(img, 95).len >= encodeJPEGBytes(img, 20).len, true);
+
+    let bmp = encodeBMPBytes(img);
+    check("bmp magic", tag2(bmp), "BM");
+    let tga = encodeTGABytes(img);
+    checkBool("tga non-empty", tga.len > 0, true);
+
+    print("---- writing to a file ----");
+    let path = "111_image_out.png";
+    checkBool("write succeeds", encodePNG(img, path), true);
+    // A path that cannot exist fails rather than panicking: a full disk or a
+    // missing directory is a runtime condition, not a bug in the caller.
+    checkBool("bad path fails cleanly", encodePNG(img, "/no/such/dir/x.png"), false);
+    // An empty image is refused rather than producing a zero-byte file that
+    // every viewer would reject.
+    checkBool("empty image refused", encodePNG(new Image(0, 0), path), false);
+    check("empty image encodes to nothing", str(encodePNGBytes(new Image(0, 0)).len), "0");
+    file_remove(path);
+}
+
+fn tag2(b: byte[]): string {
+    return chr(b[0] as int) + chr(b[1] as int);
+}
