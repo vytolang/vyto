@@ -27,9 +27,13 @@ characters.**
 
 That is a deliberate trade: byte operations are fast and allocation-free, and
 most text handling (parsing, delimiters, protocol work) is genuinely byte
-work. When you need characters, use `vyto/intl/unicode` (§7) — `charCount`,
-`graphemes`, `toUpper(s, locale)` — or `vyto/regex`, which is Unicode-aware by
-default (§6).
+work.
+
+**To count characters rather than bytes, `charCount(s)` from `vyto/util/text`
+(§5) is the cheap answer** — one pass, no allocation, no dependency. For
+anything more — normalizing, case-folding correctly, splitting into graphemes —
+use `vyto/intl/unicode` (§7), or `vyto/regex`, which is Unicode-aware by default
+(§6).
 
 ## 2. Built-in methods
 
@@ -276,8 +280,17 @@ Pure Vyto over the builtins, plus the native `StringBuilder`.
 | `is_blank(s)` | Empty or whitespace-only. |
 | `equals_ignore_case(a, b)` | ASCII case-insensitive equality. |
 | `index_of_from(s, sub, at)` | First index at or after `at`, or `-1`. (`from` is a keyword.) **Copies the tail** — it is `s.slice(at, s.len).index_of(sub)`, so on a large `s` this allocates the remainder of the string on every call. Scan bytes yourself over big buffers. |
+| `charCount(s)` | **Unicode code points**, where `s.len` is bytes — `charCount("José")` is 4, `"José".len` is 5. One pass over the continuation bytes: no ICU, no allocation. Code points are not graphemes: precomposed `é` counts as 1 but `e` + U+0301 counts as 2, and a ZWJ emoji counts as several, so unnormalized text can count differently than it looks. `graphemes()` in §7 is the exact answer, at the cost of ICU. |
 | `chr(code)` / `ord(s, i)` | See §4. |
 | `stringBuilder(cap)` | See §3. |
+
+> **`charCount` used to live in `vyto/validator`**, where `minChars`/`maxChars`
+> are built on it. That import still resolves — validator re-exports it — but
+> reaching for a validation package to count characters also compiled its
+> neighbours: **0.75 s vs 0.30 s** for a program that does nothing else,
+> measured, because `vyto/validator/pattern` sits in the same package directory
+> and pulls in PCRE2. Binary size is identical either way, since Vyto links only
+> what you import.
 
 ## 6. Regular expressions — `vyto/regex`
 
@@ -498,7 +511,7 @@ needs a one-time setup; see **Native dependencies** in the
 | Function | What it does |
 |---|---|
 | `decode(s)` / `encode(cps)` | `string` ⟷ `int[]` of code points. |
-| `charCount(s)` | Code points, not bytes. |
+| `charCount(s)` | Code points, not bytes. Same answer as `vyto/util/text`'s (§5), which needs no ICU — prefer that one unless you are already importing this module. |
 | `graphemes(s)` | User-perceived characters — the right unit for cursors and truncation. |
 | `words(s)` / `wordsIn(s, loc)` | Locale-aware word segmentation. |
 | `lineBreaks(s)` | Legal break offsets for wrapping. |
