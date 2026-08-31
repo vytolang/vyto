@@ -1,0 +1,97 @@
+// Content hashing for a fetched package tree.
+//
+// The hash is over the extracted TREE, not over a tarball.
+// A tarball digest changes with compression level, member order, mtimes and
+// uid/gid — none of which are the package — so it would report a difference
+// where there is none, and two projects pinning the same revision would not
+// share a cache entry. Hashing the tree makes the digest stable across a
+// clone, a tarball download, and a git repack.
+//
+// The digest is over a canonical rendering:
+//
+//     <relative path> LF <"x" | "-"> LF <sha256 hex of contents> LF
+//
+// for every regular file, sorted by path, concatenated and hashed once. Three
+// properties that matter and are easy to lose:
+//
+//   * SORTED, so directory iteration order (which is filesystem-dependent)
+//     cannot change the digest.
+//   * The PATH is inside the digest, so renaming a file changes it. Hashing
+//     only contents would let files be swapped around silently.
+//   * The EXECUTABLE BIT is inside the digest, because a package's build
+//     scripts are files whose executability is behaviour.
+//
+// .git is skipped: it is the transport's bookkeeping, not the package, and it
+// differs between a clone and a tarball of the same commit.
+
+import { sha256, hex_encode, strBytes } from "vyto/crypto";
+import { file_open, path_join } from "vyto/io/file";
+import { stringBuilder } from "vyto/util/text";
+import { capture } from "vyto/os";
+
+// One file's contribution. Returns "" when the file cannot be read, which the
+// caller must treat as a failure rather than as an empty file — an unreadable
+// file inside a package is not a package we should be verifying.
+fn fileDigest(abs: string): string {
+    let f = file_open(abs, "rb");
+    if (f == null) { return ""; }
+    let b = f.readBytes();
+    f.close();
+    return hex_encode(sha256(b));
+}
+
+// Collect every regular file under `root`, as paths relative to it, sorted.
+//
+// Uses `find` rather than a recursive listdir walk for one reason: listdir
+// panics on a path it cannot open (docs/builtins.md), and a package tree can
+// contain a dangling symlink or a directory with no read permission. A panic
+// there would abort an install with no diagnostic. `find -type f` skips what
+// it cannot follow and keeps going.
+//
+// `root` is a path WE built (cache dir + verified package name), never raw
+// user input, and it is quoted here as well.
+export fn listFiles(root: string): string[] {
+    let r = capture("find '" + root + "' -type f -not -path '*/.git/*' 2>/dev/null");
+    if (r == null) { return []; }
+    let out: string[] = [];
+    let lines = r.out().split("\n");
+    let prefix = root + "/";
+    for (let i in 0..lines.len) {
+        let ln = lines[i];
+        if (ln.is_empty()) { continue; }
+        if (!ln.starts_with(prefix)) { continue; }
+        out.push(ln.slice(prefix.len, ln.len));
+    }
+    out.sort((a, b) => byte_comp(a, 0, a.len, b, 0, b.len));
+    return out;
+}
+
+// True when the file at `abs` has any execute bit set. Shells out to `test -x`
+// rather than stat(2) because vyto/io/file exposes no mode accessor.
+fn isExec(abs: string): bool {
+    let r = capture("test -x '" + abs + "' && echo y");
+    if (r == null) { return false; }
+    return r.out().starts_with("y");
+}
+
+// The tree digest, as "sha256-<hex>". Empty string on any failure, so a caller
+// can distinguish "could not hash" from a real digest — never silently treat a
+// broken tree as a valid empty one.
+export fn treeHash(root: string): string {
+    let files = listFiles(root);
+    if (files.len == 0) { return ""; }      // an empty package is not a package
+    let sb = stringBuilder(4096);
+    for (let i in 0..files.len) {
+        let rel = files[i];
+        let abs = path_join(root, rel);
+        let d = fileDigest(abs);
+        if (d.is_empty()) { return ""; }    // unreadable file: fail closed
+        sb.append(rel);
+        sb.append("\n");
+        if (isExec(abs)) { sb.append("x"); } else { sb.append("-"); }
+        sb.append("\n");
+        sb.append(d);
+        sb.append("\n");
+    }
+    return "sha256-" + hex_encode(sha256(strBytes(sb.toString())));
+}

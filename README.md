@@ -166,6 +166,14 @@ it then depends only on base system libraries (libc, libX11):
   with an `$ORIGIN` rpath and shipped next to the executable).
 - **vytobind**: generates the `extern` binding from a C header —
   `vytobind zlib.h --lib z --filter 'compress*' > zlib.vt`.
+- **vytopack**: fetches a third-party package into `vyto_modules/` and pins it
+  in `vyto.lock` — `vytopack install --url=<git url> --rev=v0.3.1`. Imports
+  then resolve with no flag. Fetching shells out to `git`; see
+  `src/vytopack/README.md`.
+- **Module search path**: an import resolves against the importing file's own
+  directory, then any package root (`--modpath`, `$VYTO_PATH`, a
+  `vyto_modules/` found by walking up), then the stdlib. A file under a root is
+  named by its root-relative path, so two packages may each ship a `config.vt`.
 - **C callbacks**: `cthunk(closure)` turns a Vyto closure into a C function
   pointer (userdata-first or `cthunk_last` for userdata-last APIs).
 - **Cross-compilation**: `vytoc build app.vt --target linux-arm64` (also

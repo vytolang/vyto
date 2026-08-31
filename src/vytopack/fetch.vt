@@ -1,0 +1,132 @@
+// Fetching a package tree.
+//
+// Git URL, no registry: resolving git + rev + hash needs no server, no
+// accounts and nobody operating infrastructure.
+//
+// Every string that reaches a shell here has been through vytopack/safety
+// first — vyto/os's capture() is popen(3), so an unvalidated URL would be
+// executed rather than fetched. The single-quoting below is defence in depth,
+// not the defence: the allow-list is.
+//
+// The rule this file exists to keep: fetching a package NEVER executes code
+// from that package. There is no hook, no postinstall, no script. `git clone`
+// runs git, and nothing in the fetched tree runs at all.
+
+import { capture, run } from "vyto/os";
+import { file_exists, file_mkdirs } from "vyto/io/file";
+import { urlProblem, revProblem } from "vytopack/safety";
+
+// True when git is on PATH. Checked before use so the failure is a sentence
+// rather than a shell error on stderr.
+export fn haveGit(): bool {
+    let r = capture("command -v git 2>/dev/null");
+    if (r == null) { return false; }
+    return !r.out().is_empty();
+}
+
+// Resolve a rev (tag, branch or partial sha) to a full commit sha WITHOUT
+// cloning. This is what makes the lockfile pin exact: `git ls-remote` answers
+// for tags and branches, and a full sha passed in is returned unchanged.
+//
+// Empty string on any failure.
+export fn resolveRev(url: string, rev: string): string {
+    if (!urlProblem(url).is_empty()) { return ""; }
+    if (!revProblem(rev).is_empty()) { return ""; }
+    // Already a full sha? Nothing to resolve.
+    if (rev.len == 40 && isHex(rev)) { return rev; }
+    let r = capture("git ls-remote '" + url + "' '" + rev + "' 2>/dev/null");
+    if (r == null || !r.ok()) { return ""; }
+    let out = r.out();
+    if (out.is_empty()) { return ""; }
+    // "sha<TAB>refs/tags/v1". An annotated tag also lists "refs/tags/v1^{}",
+    // which is the COMMIT the tag points at — prefer it when present, since
+    // that is what a clone checks out.
+    let lines = out.split("\n");
+    let plain = "";
+    for (let i in 0..lines.len) {
+        let ln = lines[i];
+        if (ln.is_empty()) { continue; }
+        let tab = ln.index_of("\t");
+        if (tab < 0) { continue; }
+        let sha = ln.slice(0, tab);
+        if (sha.len != 40 || !isHex(sha)) { continue; }
+        if (ln.ends_with("^{}")) { return sha; }
+        if (plain.is_empty()) { plain = sha; }
+    }
+    return plain;
+}
+
+fn isHex(s: string): bool {
+    for (let i in 0..s.len) {
+        let c = s[i];
+        let ok = (c >= 48 && c <= 57) || (c >= 97 && c <= 102) || (c >= 65 && c <= 70);
+        if (!ok) { return false; }
+    }
+    return !s.is_empty();
+}
+
+// Clone `url` at `rev` into `dest`, which must not already exist.
+//
+// --depth 1 because a package is a tree, not a history. The .git directory is
+// removed afterwards: it is the transport's bookkeeping, differs between a
+// clone and a tarball of the same commit, and would otherwise land inside the
+// hashed tree.
+//
+// Returns "" on success, a reason on failure.
+export fn gitFetch(url: string, rev: string, dest: string): string {
+    let up = urlProblem(url);
+    if (!up.is_empty()) { return up; }
+    let rp = revProblem(rev);
+    if (!rp.is_empty()) { return rp; }
+    if (file_exists(dest)) { return "destination already exists: " + dest; }
+    if (!haveGit()) { return "git is not on PATH"; }
+
+    // Clone at the ref, then detach onto the exact sha. Two steps because
+    // --branch does not accept a raw commit sha on a shallow clone.
+    let cmd = "git clone --quiet --depth 1 --branch '" + rev + "' '" + url
+            + "' '" + dest + "' 2>&1";
+    let r = capture(cmd);
+    if (r == null) { return "could not run git"; }
+    if (!r.ok()) {
+        // Retry without --branch: rev may be a sha, which --branch rejects.
+        let r2 = capture("git clone --quiet '" + url + "' '" + dest + "' 2>&1");
+        if (r2 == null || !r2.ok()) {
+            return "git clone failed: " + firstLine(r.out());
+        }
+        let co = capture("git -C '" + dest + "' checkout --quiet '" + rev + "' 2>&1");
+        if (co == null) { return "could not run git checkout"; }
+        if (!co.ok()) {
+            return "git checkout " + rev + " failed: " + firstLine(co.out());
+        }
+    }
+    // Drop the transport's bookkeeping so the tree is just the package.
+    run("rm -rf '" + dest + "/.git'");
+    return "";
+}
+
+fn firstLine(s: string): string {
+    let nl = s.index_of("\n");
+    if (nl < 0) { return s; }
+    return s.slice(0, nl);
+}
+
+// Copy a tree. Used to publish a fetched tree into the content-addressed cache
+// and to materialize it into the project. `cp -a` preserves the executable
+// bit, which is part of the tree digest.
+export fn copyTree(src: string, dest: string): string {
+    if (!file_exists(src)) { return "source does not exist: " + src; }
+    let parent = parentOf(dest);
+    if (!parent.is_empty() && !file_mkdirs(parent)) {
+        return "could not create " + parent;
+    }
+    let r = capture("cp -a '" + src + "/.' '" + dest + "' 2>&1");
+    if (r == null) { return "could not run cp"; }
+    if (!r.ok()) { return "copy failed: " + firstLine(r.out()); }
+    return "";
+}
+
+fn parentOf(p: string): string {
+    let cut = p.last_index_of("/");
+    if (cut <= 0) { return ""; }
+    return p.slice(0, cut);
+}

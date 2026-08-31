@@ -1,0 +1,160 @@
+// The package cache and the lockfile.
+//
+// The cache is CONTENT-ADDRESSED — pkg/sha256/<hex>/ — not name-addressed. Three things fall out of that and none of them are
+// incidental:
+//
+//   * two projects pinning the same revision share one copy;
+//   * a cache entry can never be stale, because its path IS its content;
+//   * `prune` is a mark-and-sweep against lockfiles rather than a heuristic.
+//
+// Location mirrors find_obj_cache_dir in src/main.c rather than inventing a
+// third scheme: $VYTO_PKG_CACHE (or "off"), then $XDG_CACHE_HOME/vyto/pkg,
+// then ~/.cache/vyto/pkg. NOT ~/.config/vyto — this is regenerable data, and a
+// tool that silently fills a config directory with hundreds of MB of clones is
+// a bad citizen on every desktop.
+
+import { getenv, homeDir } from "vyto/os";
+import { file_exists, file_mkdirs, path_join } from "vyto/io/file";
+import { JsonValue, json_parse, json_encode_pretty, jstr,
+         JS_OBJ } from "vyto/util/json";
+
+// Root of the package cache, or "" when caching is disabled or unusable.
+// Never fatal: a build that cannot cache should still be able to fetch.
+export fn cacheDir(): string {
+    let env = getenv("VYTO_PKG_CACHE");
+    if (env == "off") { return ""; }
+    if (!env.is_empty()) {
+        if (!file_mkdirs(env)) { return ""; }
+        return env;
+    }
+    let xdg = getenv("XDG_CACHE_HOME");
+    if (!xdg.is_empty()) {
+        let p = path_join(xdg, "vyto/pkg");
+        if (file_mkdirs(p)) { return p; }
+        return "";
+    }
+    let home = homeDir();
+    if (home.is_empty()) { return ""; }
+    let p = path_join(home, ".cache/vyto/pkg");
+    if (file_mkdirs(p)) { return p; }
+    return "";
+}
+
+// Where a tree with digest `hash` ("sha256-<hex>") lives. Two levels so one
+// directory does not accumulate thousands of entries. Empty when there is no
+// cache or the digest is not one we wrote.
+export fn cachePath(hash: string): string {
+    let root = cacheDir();
+    if (root.is_empty()) { return ""; }
+    if (!hash.starts_with("sha256-")) { return ""; }
+    let hex = hash.slice(7, hash.len);
+    if (hex.len < 4) { return ""; }
+    return path_join(root, path_join("sha256", path_join(hex.slice(0, 2), hex)));
+}
+
+export fn cacheHas(hash: string): bool {
+    let p = cachePath(hash);
+    if (p.is_empty()) { return false; }
+    return file_exists(p);
+}
+
+// --- the lockfile ----------------------------------------------------------
+//
+// One entry per package, carrying BOTH halves of what was asked and what was
+// built:
+//
+//   version — what the user typed: "v0.1.1", "main", or a raw sha. Human
+//             readable, and the only thing that answers "which version is
+//             installed?". A first draft dropped it and kept only the sha,
+//             which made every installed package unidentifiable at a glance:
+//             `list` could print fc02a7329820 and nothing else.
+//   rev     — what that resolved to, ALWAYS a full commit sha. A tag moves; a
+//             commit does not, so this is what gets built and re-fetched.
+//
+// Both are needed and neither substitutes for the other. The package's own
+// vyto.json deliberately does NOT carry a version: that would be a second
+// source of truth needing manual sync with the tag, and it drifted on the very
+// first release that had one.
+export class Locked {
+    name: string;
+    url: string;
+    version: string;    // the requested ref, as typed
+    rev: string;        // resolved full sha
+    hash: string;       // sha256-<hex> of the extracted tree
+    dir: string;        // project-relative install path
+
+    fn init(name: string, url: string, version: string, rev: string,
+            hash: string, dir: string) {
+        this.name = name;
+        this.url = url;
+        this.version = version;
+        this.rev = rev;
+        this.hash = hash;
+        this.dir = dir;
+    }
+}
+
+export const LOCK_FILE: string = "vyto.lock";
+
+// Read the lockfile. Missing file and unparseable file both yield an empty
+// list — the caller is installing either way, and a corrupt lock should not
+// wedge the tool. A caller that must distinguish them can check file_exists.
+export fn lockRead(path: string): Locked[] {
+    let out: Locked[] = [];
+    if (!file_exists(path)) { return out; }
+    let root = json_parse(readfile(path));
+    if (!root.parseError().is_empty()) { return out; }
+    let pkgs = root.get("packages");
+    if (!pkgs.isObj()) { return out; }
+    let names = pkgs.objKeys();
+    for (let i in 0..names.len) {
+        let n = names[i];
+        let e = pkgs.get(n);
+        // A lock written before `version` existed simply has none; the entry
+        // stays usable and `list` falls back to the short sha.
+        out.push(new Locked(n, e.get("url").asString(), e.get("version").asString(),
+                            e.get("rev").asString(), e.get("hash").asString(),
+                            e.get("dir").asString()));
+    }
+    return out;
+}
+
+// Write the lockfile. Entries are emitted in the order given; callers sort by
+// name so the file is stable under version control rather than reordering on
+// every install.
+export fn lockWrite(path: string, entries: Locked[]): bool {
+    let pkgs = new JsonValue(JS_OBJ);
+    for (let i in 0..entries.len) {
+        let e = entries[i];
+        let o = new JsonValue(JS_OBJ);
+        o.set("url", jstr(e.url));
+        o.set("version", jstr(e.version));
+        o.set("rev", jstr(e.rev));
+        o.set("hash", jstr(e.hash));
+        o.set("dir", jstr(e.dir));
+        pkgs.set(e.name, o);
+    }
+    let root = new JsonValue(JS_OBJ);
+    root.set("lockfile", jstr("1"));
+    root.set("packages", pkgs);
+    return writefile(path, json_encode_pretty(root) + "\n");
+}
+
+// Replace `entry` in `entries` by name, or append it. Returns a fresh list,
+// sorted by name.
+export fn lockUpsert(entries: Locked[], entry: Locked): Locked[] {
+    let out: Locked[] = [];
+    for (let i in 0..entries.len) {
+        if (entries[i].name != entry.name) { out.push(entries[i]); }
+    }
+    out.push(entry);
+    out.sort((a, b) => byte_comp(a.name, 0, a.name.len, b.name, 0, b.name.len));
+    return out;
+}
+
+export fn lockFind(entries: Locked[], name: string): Locked {
+    for (let i in 0..entries.len) {
+        if (entries[i].name == name) { return entries[i]; }
+    }
+    return null;
+}

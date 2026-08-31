@@ -1,0 +1,84 @@
+// vyto.json — a package describing itself.
+//
+// **Only `name` is read today**, deliberately: a field the tool ignores is a
+// field that drifts from reality without anyone noticing, so the rest of the
+// format (dependencies, requires, native.targets) arrives with the code that
+// consumes it.
+//
+// `name` earns its place early because without it a package cannot state its
+// own identity. The name is otherwise the URL's last path component, so a fork
+// at github.com/them/semver-lib installs as `semver-lib` and every
+// `import "vyto-semver/semver"` inside it breaks. The manifest is what makes a
+// package's import path a property of the package rather than of where it
+// happens to be hosted.
+//
+// A package with no vyto.json stays perfectly valid — the URL basename is a
+// fine default, and requiring a manifest would make "point it at any git repo
+// of .vt files" false.
+
+import { file_exists, path_join } from "vyto/io/file";
+import { json_parse } from "vyto/util/json";
+import { nameProblem } from "vytopack/safety";
+
+export const MANIFEST_FILE: string = "vyto.json";
+
+// Deliberately NO `version` field.
+//
+// The version is the git ref the install requested, recorded in vyto.lock —
+// one source of truth, accurate for a tag, a branch or a raw sha alike. A
+// manifest that also declared one would have to be bumped in the same commit
+// as every tag, with nothing enforcing it. That is not hypothetical: the first
+// package to ship one had `"version": "0.1.0"` sitting in a `v0.1.1` release,
+// so install reported the wrong number on the very first release that had the
+// field at all.
+export class Manifest {
+    name: string;       // "" when absent or unusable
+    found: bool;
+    err: string;        // non-empty when the file exists but is unusable
+
+    fn init(name: string, found: bool, err: string) {
+        this.name = name;
+        this.found = found;
+        this.err = err;
+    }
+}
+
+fn none(): Manifest { return new Manifest("", false, ""); }
+
+// Read <dir>/vyto.json. A missing file is not an error — it yields found=false
+// and the caller falls back to the URL basename.
+//
+// A file that exists but is malformed IS an error, reported through `err`
+// rather than ignored: a package that ships a broken manifest has made a
+// mistake worth surfacing, and silently falling back would hide it until the
+// import paths came out wrong.
+export fn readManifest(dir: string): Manifest {
+    let path = path_join(dir, MANIFEST_FILE);
+    if (!file_exists(path)) { return none(); }
+
+    let root = json_parse(readfile(path));
+    if (!root.parseError().is_empty()) {
+        return new Manifest("", true, MANIFEST_FILE + " is not valid JSON: "
+                                      + root.parseError());
+    }
+    if (!root.isObj()) {
+        return new Manifest("", true, MANIFEST_FILE + " must be a JSON object");
+    }
+
+    let name = "";
+    if (root.has("name")) {
+        let n = root.get("name");
+        if (!n.isStr()) {
+            return new Manifest("", true, MANIFEST_FILE + ": \"name\" must be a string");
+        }
+        name = n.asString();
+        // The name becomes a directory and part of every module name in the
+        // package, so it goes through the same check as a --name.
+        let np = nameProblem(name);
+        if (!np.is_empty()) {
+            return new Manifest("", true, MANIFEST_FILE + ": " + np);
+        }
+    }
+
+    return new Manifest(name, true, "");
+}

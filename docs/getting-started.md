@@ -204,6 +204,28 @@ ship a `config.vt` and both still load. A file outside every root keeps its bare
 stem, and two of those sharing a stem is an error: a module name prefixes every
 emitted C symbol, so the collision is unbuildable.
 
+### Getting a package
+
+A package root is just a directory, so **unzipping a download into
+`vyto_modules/<name>/` is all it takes** — no manifest and no tool:
+
+```
+myapp/
+  main.vt                        import { kv_get } from "vyto-kv/store";
+  vyto_modules/vyto-kv/store/store.vt
+```
+
+`vytopack` automates the bookkeeping when you want it — resolving a tag to an
+exact commit, recording it in `vyto.lock`, hashing what landed, and sharing a
+cache across projects:
+
+```sh
+vytopack install --url=https://github.com/vytolang/vyto-kv --rev=v0.3.1
+```
+
+Both routes produce the same tree and the same module names. See
+`src/vytopack/README.md`.
+
 Each `.vt` file is one compilation unit, content-hash cached, with automatic
 dead-code stripping at link time — an unused import costs essentially nothing in
 the shipped binary. See the **Standard library** table in the

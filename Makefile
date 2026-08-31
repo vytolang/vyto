@@ -3,7 +3,7 @@ CFLAGS  ?= -std=c99 -O2 -Wall -Wextra -g
 SRC     := src/main.c src/util.c src/lex.c src/parse.c src/check.c src/emit.c
 HDR     := src/util.h src/lex.h src/ast.h src/parse.h src/check.h src/emit.h
 
-all: vytoc vytobind
+all: vytoc vytobind vytopack
 
 vytoc: $(SRC) $(HDR)
 	$(CC) $(CFLAGS) -o $@ $(SRC)
@@ -11,7 +11,18 @@ vytoc: $(SRC) $(HDR)
 vytobind: src/vytobind.c src/util.c src/util.h
 	$(CC) $(CFLAGS) -o $@ src/vytobind.c src/util.c
 
-.PHONY: all test test-charts test-mobile test-win clean clean-cache
+# The one payload binary written in Vyto rather than C, so this stage needs
+# vytoc to exist first. It still adds no build dependency: fetching is `git`
+# through a subprocess, not libcurl, so `ldd vytopack` is libc and libm and the
+# prerequisites stay a C99 compiler, make and git.
+#
+# --modpath src makes src/ a package root, which is what lets vytopack.vt
+# import its siblings as "vytopack/safety" rather than by bare stem — the tool
+# is the first customer of the resolver it feeds.
+vytopack: vytoc $(wildcard src/vytopack/*.vt)
+	./vytoc build src/vytopack/vytopack.vt -o $@ --modpath src --release
+
+.PHONY: all test test-charts test-mobile test-win test-pack clean clean-cache
 
 test: vytoc vytobind
 	./tests/run_tests.sh
@@ -25,6 +36,12 @@ test-charts: vytoc
 
 test-mobile: vytoc
 	./tests/run_tests_mobile.sh
+
+# Split out of `make test` only to keep that target's runtime down: this one
+# shells out to git repeatedly. Needs git — already a prerequisite — but no
+# network, since it clones a throwaway repo it creates in tests/tmp.
+test-pack: vytoc
+	./tests/run_tests_pack.sh
 
 # Cross-build the Windows-portable slice for windows-x64 and stage it, with its
 # goldens and a self-checking run.ps1, into tests/tmp/win-x64/. Runs nothing —
@@ -42,5 +59,5 @@ clean-cache:
 	rm -rf tests/tmp
 
 clean: clean-cache
-	rm -f vytoc vytobind
+	rm -f vytoc vytobind vytopack
 	rm -rf examples/greeter/native examples/greeter/greeter.vt

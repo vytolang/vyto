@@ -1,0 +1,167 @@
+// Input validation for vytopack.
+//
+// Every string here reaches either a SHELL or the FILESYSTEM, and both of
+// those came from a URL somebody typed. vyto/os's `run`/`capture` go through
+// popen/system (os/native/src, popen at :200), so a URL carrying `;` or a
+// backtick would be executed, not fetched. Fetching a package must never
+// execute code from it; that promise is worth nothing if fetching the URL
+// executes code before the package is even on disk.
+//
+// So the rule is allow-listing, not escaping. Escaping is a blocklist wearing
+// a disguise: it has to anticipate every metacharacter of a shell we do not
+// control. An allow-list of the characters a git URL legitimately needs is
+// short, checkable by reading, and fails closed on anything novel.
+
+import { path_dirname } from "vyto/io/file";
+
+// Characters a git remote URL legitimately needs. Deliberately excludes
+// everything the shell reads: ; & | $ ` ( ) < > * ? [ ] { } ! # ' " \ and
+// whitespace. A URL that needs one of those is refused rather than escaped.
+fn urlByteOk(c: int): bool {
+    if (c >= 97 && c <= 122) { return true; }   // a-z
+    if (c >= 65 && c <= 90) { return true; }    // A-Z
+    if (c >= 48 && c <= 57) { return true; }    // 0-9
+    // - . _ ~ : / @ + %  — enough for https, ssh and percent-escapes
+    if (c == 45 || c == 46 || c == 95 || c == 126) { return true; }
+    if (c == 58 || c == 47 || c == 64 || c == 43 || c == 37) { return true; }
+    return false;
+}
+
+// True when `u` is safe to place on a shell command line AND looks like a
+// remote we support. Returns the reason on failure so the caller can say what
+// was wrong rather than "invalid".
+export fn urlProblem(u: string): string {
+    if (u.is_empty()) { return "empty URL"; }
+    if (u.len > 512) { return "URL is longer than 512 bytes"; }
+    for (let i in 0..u.len) {
+        if (!urlByteOk(u[i])) {
+            return "URL contains a character that is not allowed: '"
+                 + u.slice(i, i + 1) + "' at byte " + str(i)
+                 + " (a git URL needs only letters, digits and -._~:/@+%)";
+        }
+    }
+    // A leading '-' would be read by git as an option, not a URL.
+    if (u.starts_with("-")) { return "URL starts with '-', which git reads as an option"; }
+    // file:// is a real git transport and fetches nothing over a network. It
+    // is allowed because it is what makes vytopack testable with no network at
+    // all — tests/ builds a throwaway repo and clones it. It reads a path the
+    // user named, which is no more privilege than they already have.
+    if (!u.starts_with("https://") && !u.starts_with("http://")
+        && !u.starts_with("git@") && !u.starts_with("ssh://")
+        && !u.starts_with("file://")) {
+        return "URL must start with https://, http://, ssh://, file:// or git@";
+    }
+    return "";
+}
+
+// A git revision: a tag, branch or sha. Same allow-list minus the URL
+// punctuation, so a rev can never introduce a path or an option either.
+export fn revProblem(r: string): string {
+    if (r.is_empty()) { return "empty revision"; }
+    if (r.len > 256) { return "revision is longer than 256 bytes"; }
+    if (r.starts_with("-")) { return "revision starts with '-', which git reads as an option"; }
+    for (let i in 0..r.len) {
+        let c = r[i];
+        let ok = (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (c >= 48 && c <= 57)
+              || c == 45 || c == 46 || c == 95 || c == 47;
+        if (!ok) {
+            return "revision contains a character that is not allowed: '"
+                 + r.slice(i, i + 1) + "' at byte " + str(i);
+        }
+    }
+    // ".." in a ref is both a git range operator and a path escape.
+    if (r.contains("..")) { return "revision contains '..'"; }
+    return "";
+}
+
+// A package name becomes a DIRECTORY name and, through the resolver, part of
+// every module name in that package. Keep it to what a path component and a C
+// identifier can both survive; vytoc's sanitize() maps the rest to '_', which
+// would silently merge two distinct packages into one module namespace.
+export fn nameProblem(n: string): string {
+    if (n.is_empty()) { return "empty package name"; }
+    if (n.len > 128) { return "package name is longer than 128 bytes"; }
+    if (n == "." || n == "..") { return "package name is '" + n + "'"; }
+    if (n.starts_with("-")) { return "package name starts with '-'"; }
+    for (let i in 0..n.len) {
+        let c = n[i];
+        let ok = (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (c >= 48 && c <= 57)
+              || c == 45 || c == 46 || c == 95;
+        if (!ok) {
+            return "package name contains a character that is not allowed: '"
+                 + n.slice(i, i + 1) + "' (use letters, digits, - . _)";
+        }
+    }
+    return "";
+}
+
+// Derive a package name from a git URL: the last path component, minus a
+// trailing ".git". Empty when nothing usable is left, so the caller can demand
+// an explicit --name rather than inventing one.
+export fn nameFromUrl(u: string): string {
+    let s = u;
+    while (s.ends_with("/")) { s = s.slice(0, s.len - 1); }
+    let cut = s.last_index_of("/");
+    if (cut >= 0) { s = s.slice(cut + 1, s.len); }
+    // scp-style "git@host:owner/repo" has no slash after the colon
+    let colon = s.last_index_of(":");
+    if (colon >= 0) { s = s.slice(colon + 1, s.len); }
+    if (s.ends_with(".git")) { s = s.slice(0, s.len - 4); }
+    if (nameProblem(s) != "") { return ""; }
+    return s;
+}
+
+// --- path containment ------------------------------------------------------
+//
+// An install must write beneath the project, never outside it. `--dir` is attacker-adjacent (it is often derived from the URL), so this
+// is a containment check, not a tidiness one.
+
+// Normalize a relative path by resolving "." and ".." textually, WITHOUT
+// touching the filesystem. Returns "" when the path climbs above its own root,
+// which is exactly the case we refuse. Textual is the right call here: the
+// destination does not exist yet, so there is nothing for realpath to resolve.
+export fn normalizeRel(p: string): string {
+    if (p.starts_with("/")) { return ""; }        // absolute: not beneath cwd
+    let parts = p.split("/");
+    let out: string[] = [];
+    for (let i in 0..parts.len) {
+        let seg = parts[i];
+        if (seg == "" || seg == ".") { continue; }
+        if (seg == "..") {
+            if (out.len == 0) { return ""; }      // climbs out of the project
+            out.pop();
+            continue;
+        }
+        out.push(seg);
+    }
+    if (out.len == 0) { return ""; }
+    return out.join("/");
+}
+
+// Where an install may write. Returns "" with `problem` set when it may not.
+export fn destProblem(dir: string): string {
+    if (dir.is_empty()) { return "empty --dir"; }
+    if (dir.starts_with("/")) {
+        return "--dir must be relative to the project, not an absolute path";
+    }
+    if (dir.starts_with("~")) {
+        return "--dir must be relative to the project ('~' is not expanded)";
+    }
+    if (normalizeRel(dir) == "") {
+        return "--dir resolves outside the project directory";
+    }
+    // The path is also going to be handed to mkdir and to a shell.
+    for (let i in 0..dir.len) {
+        if (!urlByteOk(dir[i])) {
+            return "--dir contains a character that is not allowed: '"
+                 + dir.slice(i, i + 1) + "'";
+        }
+    }
+    return "";
+}
+
+// The parent directory a package tree will be created under, so callers can
+// mkdir -p it without re-deriving the split.
+export fn destParent(dir: string): string {
+    return path_dirname(normalizeRel(dir));
+}

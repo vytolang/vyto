@@ -1,0 +1,279 @@
+// vytopack — fetch Vyto packages into a project.
+//
+// Scope: `install --url` + cache + lock, plus the `name` field of vyto.json.
+// Transitive dependencies, the rest of the manifest format and
+// add/update/remove are deliberately absent — a working install with an exact
+// pin and a verified hash is independently useful, and it is what proves the
+// resolver.
+//
+// Three rules this tool exists to keep:
+//
+//   * It NEVER executes code from a package. Fetching runs git; nothing in the
+//     fetched tree runs at all. No hooks, no postinstall.
+//   * It NEVER writes outside the project. --dir is containment-checked.
+//   * `vytoc` never fetches. This binary is the only thing that touches a
+//     network, which is what makes a build hermetic by construction rather
+//     than by promise.
+
+import { Cli } from "vyto/cli";
+import { exit, run } from "vyto/os";
+import { file_exists, file_mkdirs, path_join } from "vyto/io/file";
+import { urlProblem, revProblem, nameProblem, nameFromUrl,
+         destProblem, normalizeRel } from "vytopack/safety";
+import { treeHash } from "vytopack/tree";
+import { cacheDir, cachePath, cacheHas, Locked, LOCK_FILE,
+         lockRead, lockWrite, lockUpsert, lockFind } from "vytopack/store";
+import { haveGit, resolveRev, gitFetch, copyTree } from "vytopack/fetch";
+import { Manifest, readManifest } from "vytopack/manifest";
+
+const VERSION: string = "0.1.0";
+
+fn die(msg: string) {
+    print("vytopack: error: " + msg);
+    exit(1);
+}
+
+// A scratch directory for a fetch in progress, inside the cache so the final
+// publish is a rename on the same filesystem rather than a cross-device copy.
+fn scratchPath(): string {
+    let c = cacheDir();
+    if (c.is_empty()) { return ""; }
+    return path_join(c, "tmp-fetch");
+}
+
+fn rmTree(p: string) {
+    if (!p.is_empty() && file_exists(p)) { run("rm -rf '" + p + "'"); }
+}
+
+fn cmdInstall(app: Cli): int {
+    let url = app.get("url");
+    if (url.is_empty()) {
+        die("install needs --url (installing from a manifest's dependency list "
+            + "is not supported yet)");
+    }
+    let up = urlProblem(url);
+    if (!up.is_empty()) { die(up); }
+
+    let rev = app.get("rev");
+    let rp = revProblem(rev);
+    if (!rp.is_empty()) { die(rp); }
+
+    // A PROVISIONAL name, used only to look up a prior lock entry and hence a
+    // cache hit. The authoritative name comes from the package's own
+    // vyto.json once we have the tree; see below.
+    let name = app.get("name");
+    let explicit = !name.is_empty();
+    if (!explicit) {
+        name = nameFromUrl(url);
+        if (name.is_empty()) {
+            die("could not derive a package name from " + url + " — pass --name");
+        }
+    }
+    let np = nameProblem(name);
+    if (!np.is_empty()) { die(np); }
+
+    if (!haveGit()) { die("git is not on PATH"); }
+
+    // Resolve to an exact commit BEFORE fetching. The lockfile must record
+    // what was built, and a tag can move between now and the next install.
+    print("resolving " + url + " at " + rev);
+    let sha = resolveRev(url, rev);
+    if (sha.is_empty()) {
+        die("could not resolve '" + rev + "' in " + url
+            + " (is the tag/branch spelled right, and the repo reachable?)");
+    }
+
+    let entries = lockRead(LOCK_FILE);
+    let prior = lockFind(entries, name);
+
+    // A cached tree is keyed by CONTENT, so it can only be reused when a
+    // previous lock told us which content this revision produced. Without that
+    // we have to fetch to find out — the digest is of the tree, not the sha.
+    let cached = "";
+    if (prior != null && prior.rev == sha && cacheHas(prior.hash)) {
+        cached = cachePath(prior.hash);
+        print("using cached " + prior.hash);
+    }
+
+    // Get the tree somewhere readable first. `src` is either the cache entry
+    // (untouched) or a scratch clone we own; either way the destination is not
+    // chosen until the package has had a chance to name itself.
+    let hash = "";
+    let src = "";
+    let scratch = "";
+    if (!cached.is_empty()) {
+        hash = prior.hash;
+        src = cached;
+    } else {
+        if (app.on("offline")) {
+            die("not in the cache and --offline was given");
+        }
+        scratch = scratchPath();
+        if (scratch.is_empty()) {
+            die("no usable cache directory (set VYTO_PKG_CACHE, or unset it to use ~/.cache)");
+        }
+        rmTree(scratch);
+        print("fetching " + sha.slice(0, 12));
+        let ferr = gitFetch(url, sha, scratch);
+        if (!ferr.is_empty()) { rmTree(scratch); die(ferr); }
+
+        hash = treeHash(scratch);
+        if (hash.is_empty()) { rmTree(scratch); die("could not hash the fetched tree"); }
+
+        // Publish into the content-addressed cache before materializing, so a
+        // second project gets a hit even if the copy into this one fails.
+        let cpath = cachePath(hash);
+        if (!cpath.is_empty() && !file_exists(cpath)) {
+            let perr = copyTree(scratch, cpath);
+            if (!perr.is_empty()) { print("vytopack: warning: could not cache: " + perr); }
+        }
+        src = scratch;
+    }
+
+    // The package names itself. Precedence: --name (the human in front of the
+    // terminal), then vyto.json, then the URL's last component. Reading it here
+    // rather than from the URL is what makes a fork installable: clone this to
+    // github.com/them/semver-lib and it still installs as `vyto-semver`, so
+    // every `import "vyto-semver/..."` inside it keeps resolving.
+    let mf = readManifest(src);
+    if (!mf.err.is_empty()) { rmTree(scratch); die(mf.err); }
+    if (!explicit && !mf.name.is_empty() && mf.name != name) {
+        print("package declares the name '" + mf.name + "' (the URL suggested '"
+              + name + "')");
+        name = mf.name;
+        // The cache lookup above used the provisional name, so a prior entry
+        // under the real one may exist and simply was not consulted. Harmless:
+        // the worst case is a fetch we could have skipped.
+        prior = lockFind(entries, name);
+    }
+
+    // Destination: --dir, else vyto_modules/<name>. Containment-checked either
+    // way — --dir is often derived from a URL, and an install that can write
+    // outside the project is a package manager that can overwrite a shell
+    // profile.
+    let dir = app.get("dir");
+    if (dir.is_empty()) { dir = path_join("vyto_modules", name); }
+    let dp = destProblem(dir);
+    if (!dp.is_empty()) { rmTree(scratch); die(dp); }
+    let dest = normalizeRel(dir);
+    if (file_exists(dest)) {
+        rmTree(scratch);
+        die(dest + " already exists — remove it first (there is no `update` yet)");
+    }
+
+    let derr = copyTree(src, dest);
+    rmTree(scratch);
+    if (!derr.is_empty()) { die(derr); }
+
+    // Verify what actually landed, not what we think we copied. This is the
+    // check that makes the lockfile mean something on the NEXT install.
+    let got = treeHash(dest);
+    if (got != hash) {
+        rmTree(dest);
+        die("hash mismatch after install: expected " + hash + ", got " + got);
+    }
+    if (prior != null && !prior.hash.is_empty() && prior.hash != hash) {
+        print("vytopack: warning: " + name + " changed content for the same revision");
+    }
+
+    entries = lockUpsert(entries, new Locked(name, url, rev, sha, hash, dest));
+    if (!lockWrite(LOCK_FILE, entries)) { die("could not write " + LOCK_FILE); }
+
+    print("installed " + name + " " + rev + " -> " + dest);
+    print("  rev  " + sha);
+    print("  hash " + hash);
+    print("");
+    print("import it as \"" + name + "/<module>\" — vytoc searches vyto_modules/");
+    if (!dest.starts_with("vyto_modules/")) {
+        print("note: " + dest + " is not under vyto_modules/, so build with");
+        print("      vytoc build <file> --modpath " + parentOf(dest));
+    }
+    return 0;
+}
+
+fn parentOf(p: string): string {
+    let cut = p.last_index_of("/");
+    if (cut <= 0) { return "."; }
+    return p.slice(0, cut);
+}
+
+fn cmdList(app: Cli): int {
+    let entries = lockRead(LOCK_FILE);
+    if (entries.len == 0) {
+        print("no packages installed (no " + LOCK_FILE + " here)");
+        return 0;
+    }
+    for (let i in 0..entries.len) {
+        let e = entries[i];
+        let mark = "  ";
+        if (!file_exists(e.dir)) { mark = "! "; }
+        // The requested ref is what a person recognises; the short sha is the
+        // detail that disambiguates it. A lock written before `version`
+        // existed has none, so fall back rather than print an empty column.
+        let ver = e.version;
+        if (ver.is_empty()) { ver = "-"; }
+        print(mark + e.name.pad_end(22, " ") + " " + ver.pad_end(14, " ")
+              + " " + e.rev.slice(0, 12) + "  " + e.dir);
+    }
+    return 0;
+}
+
+fn cmdVerify(app: Cli): int {
+    let entries = lockRead(LOCK_FILE);
+    if (entries.len == 0) { print("nothing to verify"); return 0; }
+    let bad = 0;
+    for (let i in 0..entries.len) {
+        let e = entries[i];
+        if (!file_exists(e.dir)) {
+            print("MISSING  " + e.name + " (" + e.dir + ")");
+            bad += 1;
+            continue;
+        }
+        let got = treeHash(e.dir);
+        if (got == e.hash) {
+            print("ok       " + e.name);
+        } else {
+            print("MODIFIED " + e.name + "\n  locked " + e.hash + "\n  actual " + got);
+            bad += 1;
+        }
+    }
+    if (bad > 0) { return 1; }
+    return 0;
+}
+
+fn cmdCache(app: Cli): int {
+    let c = cacheDir();
+    if (c.is_empty()) { print("cache is disabled or unusable"); return 0; }
+    print(c);
+    return 0;
+}
+
+fn main() {
+    let app = new Cli("vytopack", "fetch Vyto packages into a project");
+
+    let ins = app.command("install", "fetch a package into this project");
+    ins.option("url", "git URL of the package").meta("URL");
+    ins.option("rev", "tag, branch or commit to pin").meta("REV").dflt("HEAD");
+    ins.option("dir", "where to put it (default vyto_modules/<name>)").meta("PATH");
+    ins.option("name", "override the package name derived from the URL").meta("NAME");
+    ins.flag("offline", "fail instead of fetching when it is not cached");
+
+    app.command("list", "show what " + LOCK_FILE + " records");
+    app.command("verify", "re-hash installed packages against " + LOCK_FILE);
+    app.command("cache", "print the package cache directory");
+    app.flag("version", "print the version and exit");
+
+    if (!app.parse(args())) {
+        print(app.report());
+        exit(app.exitCode());
+    }
+    if (app.on("version")) { print("vytopack " + VERSION); return; }
+
+    let cmd = app.chosen();
+    if (cmd == "install") { exit(cmdInstall(ins)); }
+    if (cmd == "list") { exit(cmdList(app)); }
+    if (cmd == "verify") { exit(cmdVerify(app)); }
+    if (cmd == "cache") { exit(cmdCache(app)); }
+
+    print(app.usage());
+}
