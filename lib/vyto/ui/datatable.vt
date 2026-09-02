@@ -150,6 +150,21 @@ export class DataTable extends Widget {
     // only while cell_focus is on, and only when both coordinates are real —
     // a value viewer has nothing to show for "no row selected".
     onCell: fn(int, int);
+    // A cell edit was accepted: (visible row, rendered column position, the
+    // typed text). Fires BEFORE the frame is touched, and the return decides
+    // whether the frame is touched at all — true writes the value in, false
+    // leaves the cell as it was.
+    //
+    // That return is the whole point. A grid over a database cannot write the
+    // new value in when the user presses Enter: the server has not been asked
+    // yet, may refuse, and may be reached through a confirmation the user is
+    // still looking at. Answering false and updating the frame later — once the
+    // server has agreed — is what keeps the grid showing what the database
+    // holds rather than what somebody typed.
+    //
+    // Null means "no opinion": the frame is written, which is the local
+    // spreadsheet behaviour a grid over in-memory data wants.
+    onCellEdit: fn(int, int, string): bool;
     // Right-click on a header: (rendered column position, absolute x, y).
     onHeaderContext: fn(int, int, int);
     // Right-click on a body cell: (visible row, rendered column position, x, y).
@@ -175,6 +190,16 @@ export class DataTable extends Widget {
     // presentation toggles
     zebra: bool;        // alternating row background
     grid: bool;         // vertical column dividers
+    row_lines: bool;    // horizontal rules between data rows
+    // Draw the rounded, bordered card the table sits on. On by default, which
+    // is the look every existing caller already gets.
+    //
+    // Off is for a table that IS its panel: an app whose page already draws the
+    // section boundary gets two edges around the data otherwise, and the inner
+    // one is the one that has to go. This governs the *outer* card only —
+    // `grid` and `row_lines` are independent, so a borderless table keeps its
+    // cell dividers.
+    card: bool;
     na_text: string;    // placeholder drawn for an empty cell
     loading: bool;      // show a loading state instead of rows
     empty_text: string; // shown when there are no rows at all
@@ -212,6 +237,15 @@ export class DataTable extends Widget {
     // cell cursor + inline cell editing
     cell_focus: bool;   // enable a focused-cell cursor (Left/Right move it)
     cur_col: int;       // focused rendered column position, -1
+    // Whether typing over the focused cell may CHANGE it. Off by default, and
+    // separate from cell_focus on purpose: a cursor is for reading — it drives
+    // the value viewer and Ctrl+C — and every grid that shows data from
+    // somewhere else wants one without wanting the data rewritten.
+    //
+    // With this off, a printable key falls through to type-ahead as it would
+    // with no cursor at all. See the note above commit_edit for what went
+    // wrong when the two were one flag.
+    editable: bool;
     editing: bool;      // the focused cell is being edited
     edit_buf: string;   // in-progress edit text
     // type-ahead-to-select
@@ -258,6 +292,8 @@ export class DataTable extends Widget {
         this.col_sel = [];
         this.zebra = true;
         this.grid = true;
+        this.row_lines = false;
+        this.card = true;
         this.na_text = "–";
         this.loading = false;
         this.empty_text = "No rows";
@@ -281,6 +317,7 @@ export class DataTable extends Widget {
         this.totals_row = false;
         this.cell_focus = false;
         this.cur_col = -1;
+        this.editable = false;
         this.editing = false;
         this.edit_buf = "";
         this.ta_buf = "";
@@ -926,6 +963,18 @@ export class DataTable extends Widget {
         this.invalidate();
     }
 
+    // Allow typing over the focused cell. Needs the cell cursor, so this turns
+    // that on too — an editable grid with no cursor has nothing to edit.
+    //
+    // Off by default. A grid showing data that lives somewhere else should
+    // either leave it off or set onCellEdit and answer false, so the value
+    // reaches the frame only once its real home has accepted it.
+    fn setEditable(b: bool) {
+        this.editable = b;
+        if (b) { this.showCellCursor(true); }
+        this.invalidate();
+    }
+
     fn first_vis_pos(): int {
         for (let i in 0..this.cols.len) { if (this.cols[i].visible) { return i; } }
         return -1;
@@ -983,7 +1032,29 @@ export class DataTable extends Widget {
     // Write the edited buffer back into the cell via the engine's random-access
     // setters. Numeric columns parse the buffer (invalid = discarded); text
     // columns take it verbatim. The view is left as-is.
+    //
+    // ── THE FRAME IS NOT ALWAYS THE PLACE THE VALUE GOES ────────────────────
+    //
+    // onCellEdit gets the typed text first and its answer decides whether the
+    // frame is written. A grid over a DataFrame is the only case where writing
+    // it here is right; a grid over a *database* must not, because the server
+    // has not agreed yet.
+    //
+    // That was a real bug, not a hypothetical: this method used to write the
+    // frame unconditionally and there was no hook and no gate, so every grid in
+    // VytoDBA — the browser, query results, history — accepted a typed value,
+    // redrew the cell with it, and sent nothing anywhere. The grid showed a
+    // value the database did not have, and said nothing about it.
     fn commit_edit() {
+        if (this.onCellEdit != null
+            && !this.onCellEdit(this.selected, this.cur_col, this.edit_buf)) {
+            // The owner is writing the value somewhere else and will update the
+            // frame if and when that succeeds. The editor closes either way:
+            // leaving it open would trap the keyboard behind a dialog.
+            this.editing = false;
+            this.invalidate();
+            return;
+        }
         let c = this.cols[this.cur_col];
         let dfcol = c.col;
         let k = this.df.colKind(dfcol);
@@ -1930,8 +2001,15 @@ export class DataTable extends Widget {
 
     override fn render(s: Painter, th: Theme) {
         let b = this.bounds;
-        s.fill_round(b, th.radius_md, th.surface_raised);
-        s.stroke_round(b, th.radius_md, 1, th.border);
+        // The body plane is painted either way — the rows, the header and the
+        // footer all assume an opaque ground under them. Only the rounding and
+        // the border are the card.
+        if (this.card) {
+            s.fill_round(b, th.radius_md, th.surface_raised);
+            s.stroke_round(b, th.radius_md, 1, th.border);
+        } else {
+            s.fill(b, th.surface_raised);
+        }
 
         // rebuild the visual model with the live painter (real text metrics for
         // wrap), then re-clamp against the resulting content height.
@@ -2028,6 +2106,10 @@ export class DataTable extends Widget {
                     }
                     if (this.checkboxes) { this.draw_checkbox(s, th, vy + this.row_h / 2, this.is_selected(rowi)); }
                     this.draw_row_cells(s, th, rowi, vy, vh, base, sl, right, fc);
+                    // The rule goes under the cells, not over them: a cell's
+                    // own clip stops at its column, so drawing it first would
+                    // leave the line broken at every column edge.
+                    if (this.row_lines) { s.line(b.x, vy + vh, right, vy + vh, th.divider); }
                 } else if (kind == VR_GROUP) {
                     this.draw_group_header(s, th, iv, vy, vh);
                 } else {
@@ -2080,6 +2162,17 @@ export class DataTable extends Widget {
                     for (let j in 0..fc) { this.draw_body_cell(s, th, vrow, j, base + this.colx[j], ry, this.row_h); }
                 }
                 s.clip_pop();
+            }
+            // pass 4: the horizontal rules, after every cell in every pane —
+            // a cell clips to its own column, so a rule drawn earlier would be
+            // overpainted at each column and read as a dashed line.
+            if (this.row_lines) {
+                for (let i in 0..vis) {
+                    let vrow = firstRow + i;
+                    if (vrow >= vlen) { break; }
+                    let ry = by - off + (i as float) * this.row_h;
+                    s.line(b.x, ry + this.row_h, right, ry + this.row_h, th.divider);
+                }
             }
         }
         s.clip_pop();
@@ -2381,7 +2474,13 @@ export class DataTable extends Widget {
         }
         // a printable key edits the focused cell (cursor mode) or type-ahead jumps
         if (ch.len > 0 && (this.mods() & MOD_CTRL) == 0) {
-            if (this.cell_focus && this.selected >= 0 && this.cur_col >= 0) { this.begin_edit_with(ch); return true; }
+            // `editable`, not `cell_focus`: a cursor is for reading. Without
+            // this gate every grid with a cell cursor silently accepted a typed
+            // value into the frame — see the note above commit_edit.
+            if (this.editable && this.cell_focus && this.selected >= 0 && this.cur_col >= 0) {
+                this.begin_edit_with(ch);
+                return true;
+            }
             return this.typeahead(ch);
         }
         // Left/Right: move the cell cursor when enabled, else scroll columns
@@ -2404,7 +2503,12 @@ export class DataTable extends Widget {
         if (k == KEY_HOME) { return this.move_sel(-vlen); }
         if (k == KEY_END) { return this.move_sel(vlen); }
         if (k == KEY_ENTER) {
-            if (this.cell_focus && this.selected >= 0 && this.cur_col >= 0) { this.begin_edit(); return true; }
+            if (this.editable && this.cell_focus && this.selected >= 0 && this.cur_col >= 0) {
+                this.begin_edit();
+                return true;
+            }
+            // Not editable: Enter is the row activation it is everywhere else,
+            // which is what the value viewer hangs off in VytoDBA.
             if (this.selected >= 0 && this.onActivate != null) { this.onActivate(this.selected); }
             return true;
         }
@@ -2471,6 +2575,7 @@ export class DataTable extends Widget {
         this.onSelect = null;
         this.onActivate = null;
         this.onCell = null;
+        this.onCellEdit = null;
         this.onSort = null;
         this.onHeaderContext = null;
         this.onCellContext = null;

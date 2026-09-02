@@ -1,0 +1,76 @@
+// DataTable cell editing: opt-in, and the owner decides where the value goes.
+//
+// Editing used to be reachable from `showCellCursor` alone and `commit_edit`
+// always wrote the DataFrame. That is right for a grid whose frame IS the data
+// (apps/datagrid) and wrong for one showing data that lives somewhere else — a
+// database grid took the typed value, redrew the cell with it, and sent nothing
+// anywhere. Two things settle it and both are checked here:
+//
+//   * `editable`, separate from `cell_focus` and OFF by default, so a cursor
+//     stays a reading tool;
+//   * `onCellEdit`, fired before the frame is touched, whose return decides
+//     whether it is touched at all.
+//
+// No Window: this drives the widget's own methods, which is what on_key calls.
+import { DataTable } from "vyto/ui/datatable";
+import { DataFrame, CK_I64, CK_STR } from "vyto/data/frame";
+
+fn build(): DataFrame {
+    let df = new DataFrame(8);
+    let id = df.addColumn("id", CK_I64);
+    let note = df.addColumn("note", CK_STR);
+    df.reserve(3);
+    for (let i in 0..3) {
+        df.beginRow().setInt(id, i + 1).setStr(note, "n" + str(i)).endRow();
+    }
+    return df;
+}
+
+fn main() {
+    // ---- the default is not editable ---------------------------------------
+    let df = build();
+    let dt = new DataTable(df);
+    print("default editable=" + str(dt.editable));
+
+    // A cursor alone must NOT make it editable — that was the bug.
+    dt.showCellCursor(true);
+    print("cursor  editable=" + str(dt.editable));
+
+    // ---- a hook answering false leaves the frame alone ---------------------
+    let df2 = build();
+    let dt2 = new DataTable(df2);
+    dt2.setEditable(true);
+    print("setEditable cursor=" + str(dt2.cell_focus) + " editable=" + str(dt2.editable));
+
+    dt2.onCellEdit = (vrow, cpos, text) => {
+        print("hook row=" + str(vrow) + " col=" + str(cpos) + " text=" + text);
+        return false;                   // the owner is writing it elsewhere
+    };
+    dt2.selected = 0;
+    dt2.cur_col = 1;
+    dt2.begin_edit_with("Z");
+    dt2.commit_edit();
+    print("refused frame=" + df2.cellStr(0, 1) + " editing=" + str(dt2.editing));
+
+    // ---- a hook answering true writes it in --------------------------------
+    dt2.onCellEdit = (vrow, cpos, text) => { return true; };
+    dt2.begin_edit_with("Y");
+    dt2.commit_edit();
+    print("accepted frame=" + df2.cellStr(0, 1));
+
+    // ---- no hook at all is the local-spreadsheet default -------------------
+    let df3 = build();
+    let dt3 = new DataTable(df3);
+    dt3.setEditable(true);
+    dt3.selected = 0;
+    dt3.cur_col = 1;
+    dt3.begin_edit_with("W");
+    dt3.commit_edit();
+    print("nohook  frame=" + df3.cellStr(0, 1));
+
+    // ---- a numeric column still parses -------------------------------------
+    dt3.cur_col = 0;
+    dt3.begin_edit_with("9");
+    dt3.commit_edit();
+    print("numeric frame=" + df3.cellStr(0, 0));
+}
