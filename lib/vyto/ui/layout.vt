@@ -4,7 +4,7 @@
 
 import { Widget, Painter, Theme, Size, BoxConstraints, bcLoose, bcTight } from "vyto/ui/core";
 import { Scrollbar, SIDE_RIGHT } from "vyto/ui/scrollbar";
-import { Rect, contains,
+import { Rect, contains, mix,
          KEY_UP, KEY_DOWN, KEY_HOME, KEY_END, KEY_PAGEUP, KEY_PAGEDOWN } from "vyto/surface";
 
 // main-axis distribution (CSS justify-content). Only bites when no child has a
@@ -782,6 +782,100 @@ export class Divider extends Widget {
             let my = this.bounds.cy();
             s.line(this.bounds.x, my, this.bounds.right(), my, th.muted);
         }
+    }
+}
+
+// ------------------------------------------------------- Splitter
+
+// A draggable divider that resizes the SizedBox beside it.
+//
+//     let dock = new SizedBox(280, 0, sidebar).fill(th.surface_sunken);
+//     new Row([dock, new Splitter(true, dock, 160, 560), new Expanded(content)])
+//
+// It needs no new machinery: Widget already routes press capture to
+// on_drag_start / on_drag / on_drag_end, which is what DataTable's column
+// resize is built on. The drag writes the target's `w` (vertical splitter) or
+// `h` (horizontal), clamps, and relayouts.
+//
+// WHY A SizedBox AND NOT A GENERIC WIDGET: the panel being resized has to be
+// the one holding the fixed dimension, and SizedBox is the toolkit's box that
+// both sizes and fills. An Expanded on the other side then takes the rest, so
+// only ONE number is ever authoritative — resizing by moving two widths in
+// opposite directions is how a splitter ends up drifting.
+//
+// The visible line is 1px; the widget measures `grab` (7px by default) so the
+// hit target is a band. That gap is deliberate — a 1px target is unusable, and
+// a 7px line is ugly.
+//
+// NOTE: there is no cursor API in vyto/surface, so this cannot show a resize
+// cursor on hover. It signals with colour instead: the hairline warms toward
+// the primary under the cursor and goes full primary while dragging.
+export class Splitter extends Widget {
+    vertical: bool;     // true = a vertical bar splitting left | right
+    target: SizedBox;   // the panel whose w/h this drag changes
+    minimum: float;
+    maximum: float;
+    grab: float;        // hit-band thickness; the drawn line stays 1px
+    dragging: bool;
+
+    fn init(vertical: bool, target: SizedBox, minimum: float, maximum: float) {
+        super.init();
+        this.vertical = vertical;
+        this.target = target;
+        this.minimum = minimum;
+        this.maximum = maximum;
+        this.grab = 7.0;
+        this.dragging = false;
+    }
+
+    override fn measure(s: Painter, th: Theme): Size {
+        if (this.vertical) { return Size(this.grab, 40); }
+        return Size(40, this.grab);
+    }
+
+    override fn render(s: Painter, th: Theme) {
+        let c = th.divider;
+        if (this.dragging) { c = th.primary; }
+        else if (this.hovered) { c = mix(th.divider, th.primary, 0.55); }
+
+        if (this.vertical) {
+            let mx = this.bounds.cx() - 0.5;
+            s.fill(Rect(mx, this.bounds.y, 1.0, this.bounds.h), c);
+        } else {
+            let my = this.bounds.cy() - 0.5;
+            s.fill(Rect(this.bounds.x, my, this.bounds.w, 1.0), c);
+        }
+    }
+
+    override fn on_drag_start(x: int, y: int): bool {
+        if (this.target == null) { return false; }
+        this.dragging = true;
+        let w = this.win;
+        if (w != null) { w.redraw(); }
+        return true;
+    }
+
+    // dx/dy are deltas since the last move, so this accumulates onto the
+    // target's current size rather than tracking an anchor.
+    override fn on_drag(dx: int, dy: int): bool {
+        if (this.target == null) { return false; }
+        let n = this.target.h;
+        let d = dy as float;
+        if (this.vertical) { n = this.target.w; d = dx as float; }
+        n += d;
+        if (n < this.minimum) { n = this.minimum; }
+        if (n > this.maximum) { n = this.maximum; }
+        if (this.vertical) { this.target.w = n; } else { this.target.h = n; }
+        let w = this.win;
+        if (w != null) { w.layout(); w.redraw(); }
+        return true;
+    }
+
+    override fn on_drag_end(x: int, y: int): bool {
+        this.dragging = false;
+        let w = this.win;
+        if (w != null) { w.redraw(); }
+        return true;
     }
 }
 
