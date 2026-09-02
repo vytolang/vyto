@@ -1356,9 +1356,30 @@ export class TextArea extends Widget {
         let sel_on = !this.sel.empty();
         let sel_lo = this.sel.lo();
         let sel_hi = this.sel.hi();
+        // Rows outside the WINDOW are skipped, not just rows outside the
+        // buffer.
+        //
+        // `view_rows` is derived from this widget's own bounds, and TextArea's
+        // measure() asks for one row per line with no cap — so in a plain
+        // Column a 5,000-line area is laid out 5,000 rows tall and this loop
+        // drew every one of them, all but a screenful of it off-window. That is
+        // ~40ms a frame against 0.4ms for the same buffer in a bounded parent,
+        // and it made typing in a long unbounded TextArea feel like the
+        // machine had stalled.
+        //
+        // Clipping already stopped those rows appearing; it does not stop them
+        // being shaped and rasterised, which is where the time goes. A widget
+        // inside a fixed-height box (VytoDBA's value viewer, any SizedBox) was
+        // never affected — its bounds were small to begin with.
+        let win_h = s.height();
         for (let i in 0..this.view_rows) {
             let vrow = this.top + i;
             if (vrow >= this.wrap_count) { break; }
+            let row_y = this.bounds.y + TA_PAD + (i as float) * this.line_h;
+            // Below the window: everything after is further down, so stop.
+            if (row_y > win_h) { break; }
+            // Above it: skip, but keep going — later rows come back on screen.
+            if (row_y + this.line_h < 0.0) { continue; }
             let li = this.wrap_map[vrow];
             let col = this.wrap_col[vrow];
             let line = this.lines[li];

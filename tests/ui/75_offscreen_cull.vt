@@ -1,0 +1,113 @@
+// A widget laid out taller than the window must not draw the rows nobody can
+// see — and must draw the visible ones identically.
+//
+// TextArea.measure asks for one row per line with no cap, so in a plain Column
+// a long one is laid out at its full height and its draw loop ran over every
+// row. Clipping hid them; it did not stop them being shaped and rasterised.
+// Measured before the fix: ~34 ms per frame for a 5,000-line area against
+// ~0.4 ms for the same text in a fixed-height box. Text had the same shape.
+//
+// Both now skip rows outside the window. This test pins the OUTPUT — a cull
+// that changed a pixel would be a rendering bug wearing a performance fix, and
+// the selection cases matter most: a skipped line still has to advance the
+// running display offset, or a selection that starts below the fold lands on
+// the wrong characters.
+import { Window, Column, TextArea, SizedBox } from "vyto/ui";
+import { Rect } from "vyto/surface";
+import { Text, ALIGN_CENTER } from "vyto/ui/display";
+import { Snapshot } from "vyto/gfx/snapshot";
+
+fn lines(n: int): string {
+    let s = "";
+    for (let i in 0..n) {
+        if (i > 0) { s += "\n"; }
+        s += "line " + str(i) + " some text";
+    }
+    return s;
+}
+
+fn words(n: int): string {
+    let t = "";
+    for (let i in 0..n) { t += "word" + str(i) + " "; }
+    return t;
+}
+
+fn main() {
+    // ---- TextArea, laid out far taller than the window ---------------------
+    let w = new Window("ta", 500, 300);
+    let snap = new Snapshot(w, 15.0);
+    let ta = new TextArea();
+    ta.set_text(lines(400));
+    w.root = new Column([ta]);
+    w.layout();
+    snap.capture("ta-top");
+
+    // Scrolled: follow_caret pulls `top` back to the caret on the next render,
+    // so the caret has to move too — setting `top` alone reproduces the frame
+    // above and asserts nothing.
+    ta.caret_row = 25;
+    ta.caret_col = 0;
+    snap.capture("ta-scrolled");
+
+    // A selection running past the bottom of the window: the rows below the
+    // fold are skipped, and their display offsets still have to be counted.
+    ta.sel.set(40, 3000);
+    snap.capture("ta-selected");
+
+    // ---- TextArea in a bounded parent: the case that was always fine -------
+    let w2 = new Window("ta2", 500, 300);
+    let snap2 = new Snapshot(w2, 15.0);
+    let ta2 = new TextArea();
+    ta2.set_text(lines(400));
+    w2.root = new Column([new SizedBox(0, 150, ta2)]);
+    w2.layout();
+    snap2.capture("ta-bounded");
+
+    // ---- Text, same shape --------------------------------------------------
+    let w3 = new Window("tx", 520, 320);
+    let snap3 = new Snapshot(w3, 15.0);
+    let tx = new Text(words(400));
+    tx.selectable = true;
+    w3.root = new Column([tx]);
+    w3.layout();
+    snap3.capture("tx-plain");
+
+    tx.sel.set(30, 2400);
+    snap3.capture("tx-selected");
+
+    // Centred: alignment needs each drawn line's width, so a culled line must
+    // not shift the ones that survive.
+    let w4 = new Window("tx2", 520, 320);
+    let snap4 = new Snapshot(w4, 15.0);
+    let tx2 = new Text(words(400));
+    tx2.align = ALIGN_CENTER;
+    w4.root = new Column([tx2]);
+    w4.layout();
+    snap4.capture("tx-center");
+
+    // ---- SCROLLED PAST THE TOP --------------------------------------------
+    //
+    // The cases above all start at y=0, so no line is ever ABOVE the window and
+    // the skip-and-keep-counting branch never runs — fault injection confirmed
+    // they pass with that branch's offset bookkeeping deliberately broken.
+    //
+    // Reaching it needs a Text whose bounds start above the window AND are tall
+    // enough to contain many wrapped lines. A ScrollView will not do it:
+    // Text.measure returns a one-LINE estimate (real wrapping needs the final
+    // width), so the ScrollView sizes it to ~17px and scrolling moves a
+    // single-line widget rather than scrolling within a tall one.
+    //
+    // So the bounds are set directly, which is a supported placement — a plain
+    // Widget parent arranges children at their manually set .bounds (vyto/ui's
+    // documented escape hatch).
+    let w5 = new Window("tx3", 520, 320);
+    let snap5 = new Snapshot(w5, 15.0);
+    let tx3 = new Text(words(400));
+    tx3.selectable = true;
+    tx3.sel.set(30, 2400);
+    w5.root = new Column([tx3]);
+    w5.layout();
+    // Lift it so the first ~35 wrapped lines sit above the top edge.
+    tx3.bounds = Rect(tx3.bounds.x, -600.0, tx3.bounds.w, 1400.0);
+    snap5.capture("tx-scrolled-past-top");
+}
