@@ -82,19 +82,43 @@ fn is_ws(b: int): bool { return b == 32 || b == 9 || b == 10 || b == 13; }
 
 // Map an x-offset within a single rendered line (px from the line's left edge)
 // to a byte offset into `line`. Walks whole UTF-8 sequences accumulating
-// measured prefix widths and snaps to the nearer glyph boundary. Takes the
-// Surface (not a Painter) so it is callable from event handlers, which have no
-// Painter but can reach metrics via win.surf.
-export fn col_at_x(surf: Surface, line: string, target: int): int {
+// measured prefix widths and snaps to the nearer glyph boundary.
+//
+// **Takes the PAINTER, and it must be the same one that drew the line.**
+//
+// This used to take the Surface, on the reasoning that an event handler has no
+// Painter. It has one — `win.painter` — and the Surface is the wrong ruler
+// whenever the two disagree, which is exactly the case an app using vyto/gfx
+// is in:
+//
+//   Surface.text_width  the lean X11 tier's bitmap font: a flat 9px per
+//                       character, because it is monospace
+//   GfxPainter          blend2d measuring the real proportional face
+//
+// Measured on DejaVu Sans at 15px, "SELECT id, customer, email FROM orders …":
+//
+//   col     4     8    16    24    32    40    48    56
+//   drift   0    7px  19px  19px  29px  34px  39px  47px
+//
+// So the caret landed further from the cursor the further along the line you
+// clicked — about four characters in by mid-line, which is how this was
+// reported. The error is per-character and accumulates, so it cannot be fixed
+// with an offset; the measurement itself has to come from whatever drew.
+//
+// A Window always has a Painter (Window.init installs a SurfacePainter, which
+// wraps this same Surface), so the lean tier is byte-identical to before and
+// only the rich tier changes — which is the tier that was wrong.
+export fn col_at_x(s: Painter, line: string, target: int): int {
     if (target <= 0) { return 0; }
     let i = 0;
-    let prev_w = 0;
+    let prev_w = 0.0;
+    let t = target as float;
     while (i < line.len) {
         let n = utf8_next(line, i);
-        let w = surf.text_width(line.slice(0, n));
-        if (w >= target) {
-            let mid = (prev_w + w) / 2;
-            if (target <= mid) { return i; }
+        let w = s.text_width(line.slice(0, n));
+        if (w >= t) {
+            let mid = (prev_w + w) / 2.0;
+            if (t <= mid) { return i; }
             return n;
         }
         prev_w = w;

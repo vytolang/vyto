@@ -189,10 +189,11 @@ export class TextField extends Widget {
         this.sel.clear();
     }
 
-    // Map an absolute x to a byte offset in text (metrics via win.surf).
+    // Map an absolute x to a byte offset in text, measured with the painter
+    // that draws it (col_at_x's note explains why the Surface is the wrong ruler).
     fn offset_at(x: int): int {
         if (this.win == null) { return this.caret; }
-        return col_at_x(this.win.surf, this.text,
+        return col_at_x(this.win.painter, this.text,
                         (x as float - this.bounds.x - this.pad_l + this.scroll_x) as int);
     }
 
@@ -366,7 +367,7 @@ export class TextField extends Widget {
 
     override fn on_click(x: int, y: int): bool {
         this.blink.wake();
-        // precise caret placement: metrics via win.surf (see offset_at)
+        // precise caret placement: painter metrics (see offset_at)
         let off = this.offset_at(x);
         this.caret = off;
         this.sel.set(off, off);
@@ -883,7 +884,11 @@ export class TextArea extends Widget {
 
     fn offset_at(x: int, y: int): int {
         if (this.win == null || this.wrap_count == 0) { return this.caret_offset(); }
-        let surf = this.win.surf;
+        // The PAINTER, not the Surface: the row math below already uses
+        // `line_h`, which render() caches from the painter, so the vertical
+        // axis was right and only the horizontal one was measured with the
+        // wrong font. See col_at_x's note.
+        let p = this.win.painter;
         let vrow = this.top + ((y as float - this.bounds.y - TA_PAD) / this.line_h) as int;
         if (vrow < 0) { vrow = 0; }
         if (vrow >= this.wrap_count) { vrow = this.wrap_count - 1; }
@@ -895,7 +900,7 @@ export class TextArea extends Widget {
         let nv = vrow + 1;
         if (nv < this.wrap_count && this.wrap_map[nv] == li) { end = this.wrap_col[nv]; }
         let piece = line.slice(cstart, end);
-        let local = col_at_x(surf, piece, (x as float - (this.bounds.x + TA_PAD)) as int);
+        let local = col_at_x(p, piece, (x as float - (this.bounds.x + TA_PAD)) as int);
         return this.ta_offset(li, cstart + local);
     }
 
@@ -1266,7 +1271,7 @@ export class TextArea extends Widget {
     override fn on_blur(): bool { this.blink.stop(); return false; }
 
     override fn on_click(x: int, y: int): bool {
-        // precise caret placement (x->col via win.surf metrics), collapse sel
+        // precise caret placement (x->col via painter metrics), collapse sel
         this.blink.wake();
         this.follow_caret = true;
         let off = this.offset_at(x, y);

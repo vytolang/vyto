@@ -126,23 +126,31 @@ export class Text extends Widget {
     }
 
     // Map an absolute pointer (x,y) to a display-text byte offset, replicating
-    // draw()'s per-line geometry. Uses win.surf for metrics (event handlers
-    // have no Painter). Assumes the lean tier's surf metrics match the painter.
+    // draw()'s per-line geometry — and measuring with the same painter draw()
+    // used, since "the surf metrics match the painter" is true only on the
+    // lean tier and false for any app using vyto/gfx.
     fn offset_at(x: int, y: int): int {
         if (this.cached_count == 0 || this.win == null) { return 0; }
-        let surf = this.win.surf;
-        let lh = surf.font_height() as float;   // raw Surface metric is int
+        // The painter that DREW this text, not the Surface — on the rich tier
+        // the two measure different fonts and the hit test lands in the wrong
+        // place, further off the further along the line. See col_at_x.
+        //
+        // Both axes here, unlike TextArea: this one took its line height from
+        // the Surface too, so a tall proportional face mis-picked the line as
+        // well as the column.
+        let p = this.win.painter;
+        let lh = p.font_height();
         let adv = lh + 2.0;
         let li = 0;
         if (adv > 0.0) { li = ((y as float - this.bounds.y) / adv) as int; }
         if (li < 0) { li = 0; }
         if (li >= this.cached_count) { li = this.cached_count - 1; }
         let ln = this.cached_lines[li];
-        let tw = surf.text_width(ln) as float;
+        let tw = p.text_width(ln);
         let ox = this.bounds.x;
         if (this.align == ALIGN_CENTER) { ox = this.bounds.center_x(tw); }
         else if (this.align == ALIGN_RIGHT) { ox = this.bounds.right() - tw; }
-        let col = col_at_x(surf, ln, (x as float - ox) as int);
+        let col = col_at_x(p, ln, (x as float - ox) as int);
         let base = 0;
         for (let i in 0..li) { base += this.cached_lines[i].len + 1; }
         return base + col;
@@ -151,7 +159,9 @@ export class Text extends Widget {
     fn show_toolbar(px: float) {
         if (this.win == null || this.sel.empty()) { return; }
         let li = this.line_of_offset(this.sel.lo());
-        let lh = this.win.surf.font_height() as float;
+        // Same painter metric as offset_at and draw, so the toolbar is anchored
+        // to the line the selection is actually on.
+        let lh = this.win.painter.font_height();
         let ytop = this.bounds.y + (li as float) * (lh + 2.0);
         open_selection_toolbar(this, this.sel, px, ytop, this.selectionActions);
     }

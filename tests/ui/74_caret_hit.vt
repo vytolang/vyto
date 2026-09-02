@@ -1,0 +1,83 @@
+// Click-to-caret must be measured with the painter that DREW the text.
+//
+// The bug this pins: TextField/TextArea/Text mapped a click x to a column with
+// `Surface.text_width` while drawing with the Window's Painter. On the lean
+// tier those agree (the Painter *is* a SurfacePainter over the same Surface),
+// so nothing here failed. Under vyto/gfx they do not: the lean tier's bitmap
+// font is a flat 9px per character and blend2d measures a real proportional
+// face, so the caret landed further from the cursor the further along the line
+// the click was — ~4 characters by mid-line, growing after that.
+//
+// The assertion is written against the PAINTER's own metrics rather than
+// against hardcoded pixel numbers, so it holds for whatever face the tier
+// provides and fails the moment the hit test starts consulting a different
+// ruler than the renderer.
+import { Window, Column, TextField, TextArea } from "vyto/ui";
+import { GfxPainter } from "vyto/gfx/painter";
+import { SNAP_FONT } from "vyto/gfx/snapshot";
+import { file_exists } from "vyto/io/file";
+import { exit } from "vyto/os";
+
+// Where the caret should land for a click at the x that is one pixel past the
+// midpoint of the glyph at `col` — i.e. the click that should select `col`.
+fn probe(win: Window, f: TextField, text: string, col: int) {
+    let p = win.painter;
+    // x of the left edge of the glyph AT col, plus a bit into it, in widget
+    // coordinates: bounds.x + pad_l is where the text starts.
+    let left = p.text_width(text.slice(0, col));
+    let x = (f.bounds.x + f.pad_l + left + 2.0) as int;
+    f.on_click(x, (f.bounds.y + f.bounds.h / 2.0) as int);
+    print("field col " + str(col) + " -> caret " + str(f.caret));
+}
+
+fn probeArea(win: Window, t: TextArea, line: string, col: int) {
+    let p = win.painter;
+    let left = p.text_width(line.slice(0, col));
+    // TA_PAD is 6 in form.vt; the first visual row sits at bounds.y + TA_PAD.
+    let x = (t.bounds.x + 6.0 + left + 2.0) as int;
+    let y = (t.bounds.y + 6.0 + 4.0) as int;
+    t.on_click(x, y);
+    print("area  col " + str(col) + " -> caret " + str(t.caret_col));
+}
+
+fn main() {
+    let win = new Window("Caret", 900, 300);
+
+    // The RICH tier deliberately: on the lean tier the Surface and the Painter
+    // are the same ruler, so this test cannot fail there. A GfxPainter measures
+    // a real proportional face, which is the tier the bug lived on.
+    //
+    // A missing font is a hard stop rather than a fallback: dropping to the
+    // lean tier would make every assertion below pass while testing nothing,
+    // which is the failure mode this file exists to prevent.
+    if (!file_exists(SNAP_FONT)) {
+        print("74_caret_hit: pinned font missing: " + SNAP_FONT);
+        exit(1);
+        return;
+    }
+    win.use_painter(new GfxPainter(win.surface(), SNAP_FONT, 15.0));
+
+    let line = "SELECT id, customer, email FROM orders WHERE total > 100";
+
+    let f = new TextField("");
+    f.text = line;
+
+    let t = new TextArea();
+    t.set_text(line);
+
+    win.root = new Column([f, t]);
+    win.layout();
+    // A redraw, not a capture: this test asserts on caret columns, and a frame
+    // hash in the golden would make it fail for every unrelated style change.
+    win.redraw();
+
+    // Early, middle and late in the line. The late ones are the point: a
+    // per-character measurement error is invisible at column 4 and obvious at
+    // column 48.
+    for (let c in [0, 4, 12, 24, 36, 48]) {
+        probe(win, f, line, c);
+    }
+    for (let c in [0, 4, 12, 24, 36, 48]) {
+        probeArea(win, t, line, c);
+    }
+}
