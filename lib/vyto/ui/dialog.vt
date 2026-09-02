@@ -111,6 +111,13 @@ fn draw_file_glyph(s: Painter, r: Rect, is_dir: bool, color: int, bg: int) {
 // A modal file picker: a breadcrumb header, a scrollable file/folder list
 // (icon + name + modified date + size, folders first), a filename field, and
 // Cancel/OK. Full keyboard navigation. onAccept(path) fires with the full path.
+//
+// Three modes, and the third is why `dir_mode` exists rather than a second
+// class: everything about the widget is the same except what OK means.
+//
+//     new FilePicker(dir, false)   Open   — onAccept gets a FILE
+//     new FilePicker(dir, true)    Save   — onAccept gets a FILE, name editable
+//     dirPicker(dir)               Choose — onAccept gets a DIRECTORY
 export class FilePicker extends Dialog {
     dir: string;
     entries: FileEntry[];
@@ -119,6 +126,11 @@ export class FilePicker extends Dialog {
     hover_row: int;
     show_hidden: bool;
     save_mode: bool;
+    // Pick a DIRECTORY rather than a file. The list still shows files — you
+    // navigate by what you can see — but they are not selectable and OK
+    // returns the directory currently open. Set through dirPicker(); the
+    // two-arg constructor is unchanged for every existing caller.
+    dir_mode: bool;
     focus_field: int;
     pathfield: TextField;
     ok: Button;
@@ -139,9 +151,20 @@ export class FilePicker extends Dialog {
     last_click_ms: int;
     last_click_row: int;
 
+    // Retitle for a mode set after construction. dirPicker calls this; nothing
+    // else needs to, because the other two modes are known at init.
+    fn set_dir_mode(on: bool) {
+        this.dir_mode = on;
+        if (!on) { return; }
+        this.title = "Choose folder";
+        this.ok.label = "Choose";
+        this.pathfield.placeholder = "Folder name (or leave empty for this one)";
+    }
+
     fn init(dir: string, save_mode: bool) {
         if (save_mode) { super.init("Save As"); } else { super.init("Open"); }
         this.save_mode = save_mode;
+        this.dir_mode = false;
         this.dir = this.norm_dir(dir);
         this.entries = [];
         this.selected = -1;
@@ -249,7 +272,11 @@ export class FilePicker extends Dialog {
         this.dir = nd;
         this.selected = 0;
         this.scroll = 0;
-        this.pathfield.set_text("");
+        // In SAVE mode the name is what the user is CREATING, so it survives
+        // the walk to wherever they want to put it — clearing it made "browse
+        // to a folder, then save" impossible without retyping. In OPEN mode the
+        // name refers to a file in the directory being left, so it goes.
+        if (!this.save_mode) { this.pathfield.set_text(""); }
         this.load_entries();
     }
 
@@ -286,7 +313,45 @@ export class FilePicker extends Dialog {
 
     // OK button / Enter in the name field
     fn accept() {
-        let name = this.pathfield.text;
+        // Picking a DIRECTORY: OK means "this one" — the directory currently
+        // open. Without this branch there is no way to choose a directory at
+        // all, because the rule below navigates into every directory name
+        // instead of returning it. A typed name still navigates, so the field
+        // remains a way to jump somewhere before accepting it.
+        if (this.dir_mode) {
+            let typed = this.pathfield.text;
+            if (typed.len > 0) {
+                let t = typed;
+                if (typed[0] != 47) { t = path_join(this.dir, typed); }
+                if (isdir(t)) { this.navigate_to(t); return; }
+            }
+            this.accept_path(this.dir);
+            return;
+        }
+        let name = this.pathfield.text.trim();
+
+        // ── SAVE: THE NAME NEED NOT EXIST ───────────────────────────────────
+        //
+        // Save is about a file being CREATED, so the only thing OK can mean is
+        // "this directory, that name". Falling through to enter_selected()
+        // required an existing file to be highlighted first, which made the
+        // dialog demand a file on disk before it would let you save a new one.
+        //
+        // An empty name still accepts — the caller prefilled a suggestion and
+        // the user cleared it, so the directory is the answer and the caller
+        // supplies the name. That is what makes "browse to a folder, press
+        // Save" work.
+        if (this.save_mode) {
+            if (name.len == 0) { this.accept_path(this.dir); return; }
+            let f = name;
+            if (name[0] != 47) { f = path_join(this.dir, name); }
+            // A name that IS an existing directory still navigates: it cannot
+            // be a file, so it can only have meant "go there".
+            if (isdir(f)) { this.navigate_to(f); return; }
+            this.accept_path(f);
+            return;
+        }
+
         if (name.len == 0) {
             this.enter_selected();
             return;
@@ -624,6 +689,14 @@ export class FilePicker extends Dialog {
     override fn drop_handlers() {
         this.onAccept = null;
     }
+}
+
+// A FilePicker that returns a DIRECTORY. Same widget, same navigation; OK
+// accepts the folder currently open instead of navigating into it.
+export fn dirPicker(dir: string): FilePicker {
+    let fp = new FilePicker(dir, false);
+    fp.set_dir_mode(true);
+    return fp;
 }
 
 // A minimal modal notice with an OK button (used for About).
