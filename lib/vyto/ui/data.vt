@@ -4,7 +4,8 @@
 // the model is string cells (rows: string[][]); a Table owns its data so it can
 // filter/sort/paginate it directly.
 
-import { Widget, Painter, Theme, Size, BoxConstraints } from "vyto/ui/core";
+import { Widget, Painter, Theme, Size, BoxConstraints,
+         WEIGHT_REG, WEIGHT_MED, WEIGHT_BOLD } from "vyto/ui/core";
 import { SearchField, Button } from "vyto/ui/form";
 import { SIDE_BOTTOM } from "vyto/ui/scrollbar";
 import { Rect, contains, mix, KEY_UP, KEY_DOWN, KEY_LEFT, KEY_RIGHT,
@@ -48,19 +49,42 @@ fn str_cmp(a: string, b: string): int {
 
 // ------------------------------------------------------- TreeNode / TreeView
 
+// Emphasis for a tree row, read only when TreeView.typed_levels is on. It is
+// the node's IMPORTANCE, not its depth: a tree can hold a connection nested
+// under a folder and still want the connection to read as the strong thing.
+export const TN_NORMAL: int = 0;  // body weight, on_surface
+export const TN_STRONG: int = 1;  // bold — a root, a connection
+export const TN_MEDIUM: int = 2;  // medium — a container one level in
+export const TN_MUTED: int  = 3;  // muted ink — a leaf among many
+export const TN_GROUP: int  = 4;  // small caption — a "TABLES (5)" divider row
+
 // A tree node the app builds and hands to a TreeView. `data` is a free app key.
 export class TreeNode {
     label: string;
     children: TreeNode[];
     expanded: bool;
     data: int;
+    // TN_* — how this row is weighted when the view has typed_levels on.
+    // TN_NORMAL (the default) reproduces the old uniform look exactly.
+    emphasis: int;
+    // A status dot drawn at the row's right edge, 0 = none. An ARGB colour
+    // rather than a state enum: what a dot means is the app's business, and a
+    // tree in a DB client, a file browser and a device list would each want a
+    // different vocabulary.
+    dot: int;
 
     fn init(label: string) {
         this.label = label;
         this.children = [];
         this.expanded = false;
         this.data = 0;
+        this.emphasis = TN_NORMAL;
+        this.dot = 0;
     }
+
+    // new TreeNode("local").weight(TN_STRONG).status(th.success)
+    builder fn weight(e: int) { this.emphasis = e; return this; }
+    builder fn status(color: int) { this.dot = color; return this; }
 
     fn add(child: TreeNode): TreeNode {
         this.children.push(child);
@@ -92,6 +116,32 @@ export class TreeView extends Widget {
     // cursor is selected first, because a context menu that acts on something
     // other than what it is pointing at is how people delete the wrong thing.
     onContext: fn(TreeNode, int, int);
+    // ---- presentation ------------------------------------------------------
+    //
+    // All four default to the look this widget has always had, so an existing
+    // caller sees no change. Turning them on together gives the flat sidebar
+    // an editor uses — the difference is structural, not chromatic, which is
+    // why none of it was reachable from a Theme or a Skin.
+    //
+    // `card` off: no rounded fill and no border. The tree becomes the panel it
+    // sits in rather than a box floating inside it.
+    card: bool;
+    // `bleed_selection` on: the selection and hover bands span the full widget
+    // width with no radius and no inset, so a selected row reads as a row
+    // rather than as a button someone left switched on.
+    bleed_selection: bool;
+    // `typed_levels` on: each row is drawn at the weight and colour its
+    // TreeNode.emphasis asks for, so depth is scannable without reading.
+    typed_levels: bool;
+    // `quiet_chevrons` on: a filled triangle at on_surface_subtle instead of
+    // two full-strength strokes. At a schema's row count the loud version is a
+    // column of black arrows down the left edge.
+    quiet_chevrons: bool;
+    // Row height and per-level indent. Defaults are the historical 24/16; an
+    // editor-style sidebar is tighter.
+    row_h: float;
+    indent_w: float;
+
     view_w: float;
     view_h: float;
     // Widest row drawn, in content pixels (indent + label). Measured during
@@ -108,6 +158,12 @@ export class TreeView extends Widget {
         this.hover = -1;
         this.scroll = 0;
         this.focusable = true;
+        this.card = true;
+        this.bleed_selection = false;
+        this.typed_levels = false;
+        this.quiet_chevrons = false;
+        this.row_h = TREE_ROW_H;
+        this.indent_w = 16.0;
         this.view_w = 240;
         this.view_h = 240;
         this.content_w = 0;
@@ -153,11 +209,31 @@ export class TreeView extends Widget {
     }
 
     fn clamp_scroll() {
-        let content = TREE_ROW_H * this.flat.len as float + 4;
+        let content = this.row_h * this.flat.len as float + 4;
         let maxs = content - this.bounds.h;
         if (maxs < 0) { maxs = 0; }
         if (this.scroll > maxs) { this.scroll = maxs; }
         if (this.scroll < 0) { this.scroll = 0; }
+    }
+
+    // Ink and weight for one row. Split out because the emphasis table is
+    // worth reading as a table, and because render() is long enough already.
+    fn row_ink(th: Theme, n: TreeNode, selected: bool): int {
+        if (!this.typed_levels) { return th.on_surface; }
+        // A selected row always takes full ink: it is the thing being looked
+        // at, and a muted leaf that stays muted under the selection band reads
+        // as disabled rather than as chosen.
+        if (selected) { return th.on_surface; }
+        if (n.emphasis == TN_MUTED) { return th.on_surface_muted; }
+        if (n.emphasis == TN_GROUP) { return th.on_surface_subtle; }
+        return th.on_surface;
+    }
+
+    fn row_weight(n: TreeNode): int {
+        if (!this.typed_levels) { return WEIGHT_REG; }
+        if (n.emphasis == TN_STRONG) { return WEIGHT_BOLD; }
+        if (n.emphasis == TN_MEDIUM || n.emphasis == TN_GROUP) { return WEIGHT_MED; }
+        return WEIGHT_REG;
     }
 
     override fn render(s: Painter, th: Theme) {
@@ -165,46 +241,99 @@ export class TreeView extends Widget {
         if (win == null) { return; }
         this.rebuild();
         this.clamp_scroll();
-        s.fill_round(this.bounds, th.radius_md, th.surface_raised);
-        s.stroke_round(this.bounds, th.radius_md, 1, th.border);
-        if (this.focused) { win.skin.focus.paint(s, th, this.bounds, th.radius_md); }
-        s.clip_push(this.bounds, th.radius_md);
-        let on = th.on_surface;
+
+        // The card. Off means this widget paints no ground of its own and the
+        // panel behind it shows through — which is the whole point: the tree
+        // becomes the sidebar instead of a box inside it.
+        let radius = 0.0;
+        if (this.card) {
+            radius = th.radius_md;
+            s.fill_round(this.bounds, radius, th.surface_raised);
+            s.stroke_round(this.bounds, radius, 1, th.border);
+        }
+        if (this.focused) { win.skin.focus.paint(s, th, this.bounds, radius); }
+        s.clip_push(this.bounds, radius);
+
+        let rh = this.row_h;
+        // A bled row starts at the widget's top edge; a carded one is inset by
+        // 2px so its rounded band clears the border.
+        let y0 = this.bounds.y;
+        if (!this.bleed_selection) { y0 += 2.0; }
+
         let widest = 0.0;
         for (let i in 0..this.flat.len) {
-            let ry = this.bounds.y + 2.0 - this.scroll + (i as float) * TREE_ROW_H;
-            if (ry + TREE_ROW_H < this.bounds.y || ry > this.bounds.bottom()) { continue; }
+            let ry = y0 - this.scroll + (i as float) * rh;
+            if (ry + rh < this.bounds.y || ry > this.bounds.bottom()) { continue; }
             let n = this.flat[i];
             let d = this.depth[i];
-            if (i == this.selected) {
-                s.fill_round(Rect(this.bounds.x + 2, ry, this.bounds.w - 4, TREE_ROW_H - 2),
-                             th.radius_sm, th.selection);
-            } else if (i == this.hover) {
+            let selected = i == this.selected;
+
+            // Selection / hover band.
+            let band = 0;
+            if (selected) { band = th.selection; }
+            else if (i == this.hover) {
                 // Same weight as DataTable's hover row, so a tree and a grid
-                // side by side track the cursor identically.
-                s.fill_round(Rect(this.bounds.x + 2, ry, this.bounds.w - 4, TREE_ROW_H - 2),
-                             th.radius_sm, mix(th.surface_raised, th.on_surface, 0.04));
+                // side by side track the cursor identically. Against a
+                // borderless tree the ground is the panel, not surface_raised.
+                let under = th.surface_raised;
+                if (!this.card) { under = th.surface_sunken; }
+                band = mix(under, th.on_surface, 0.04);
             }
-            let ind = 10.0 + (d as float) * 16.0;
-            let cx = this.bounds.x + ind - this.scroll_off_x;
-            let cy = ry + TREE_ROW_H / 2.0;
-            if (!n.leaf()) {
-                if (n.expanded) {
-                    s.line_w(cx - 4, cy - 2, cx, cy + 2, 2, on);
-                    s.line_w(cx, cy + 2, cx + 4, cy - 2, 2, on);
+            if (band != 0) {
+                if (this.bleed_selection) {
+                    s.fill(Rect(this.bounds.x, ry, this.bounds.w, rh), band);
                 } else {
-                    s.line_w(cx - 2, cy - 4, cx + 2, cy, 2, on);
-                    s.line_w(cx + 2, cy, cx - 2, cy + 4, 2, on);
+                    s.fill_round(Rect(this.bounds.x + 2, ry, this.bounds.w - 4, rh - 2),
+                                 th.radius_sm, band);
                 }
             }
+
+            let ind = 10.0 + (d as float) * this.indent_w;
+            let cx = this.bounds.x + ind - this.scroll_off_x;
+            let cy = ry + rh / 2.0;
+            if (!n.leaf()) {
+                if (this.quiet_chevrons) {
+                    // A filled triangle in the subtle ink. Quiet enough to
+                    // ignore while reading names, present when looked for.
+                    let cc = th.on_surface_subtle;
+                    if (n.expanded) {
+                        s.polygon([cx - 4.0, cx + 4.0, cx], [cy - 2.0, cy - 2.0, cy + 3.0], cc);
+                    } else {
+                        s.polygon([cx - 2.0, cx + 3.0, cx - 2.0], [cy - 4.0, cy, cy + 4.0], cc);
+                    }
+                } else {
+                    let on = th.on_surface;
+                    if (n.expanded) {
+                        s.line_w(cx - 4, cy - 2, cx, cy + 2, 2, on);
+                        s.line_w(cx, cy + 2, cx + 4, cy - 2, 2, on);
+                    } else {
+                        s.line_w(cx - 2, cy - 4, cx + 2, cy, 2, on);
+                        s.line_w(cx + 2, cy, cx - 2, cy + 4, 2, on);
+                    }
+                }
+            }
+
             let tx = this.bounds.x + ind + 14 - this.scroll_off_x;
+            let ink = this.row_ink(th, n, selected);
+            let weight = this.row_weight(n);
+
+            // A group row is a caption, so it is set smaller as well as lighter.
+            let small = this.typed_levels && n.emphasis == TN_GROUP;
+            if (small) { s.push_font(th.text_xs, weight); }
+            s.set_weight(weight);
+
             let tw = s.text_width(n.label);
             if (ind + 14 + tw + 8 > widest) { widest = ind + 14 + tw + 8; }
             // The rect is the row's own width from the text's left edge, not
             // the widget's: with a horizontal offset the text may start left of
             // the widget and text_in would otherwise clip it away.
-            let tr = Rect(tx, ry, tw + 4, TREE_ROW_H);
-            s.text_in(tr, 0, n.label, on);
+            s.text_in(Rect(tx, ry, tw + 4, rh), 0, n.label, ink);
+
+            s.set_weight(WEIGHT_REG);
+            if (small) { s.pop_font(); }
+
+            // Status dot at the right edge, inside any vertical scrollbar.
+            if (n.dot != 0) { s.circle(this.bounds.right() - 12.0, cy, 3.5, n.dot); }
         }
         s.clip_pop();
         this.content_w = widest;
@@ -213,8 +342,12 @@ export class TreeView extends Widget {
     }
 
     fn row_at(py: int): int {
+        // Must mirror render()'s y0 exactly — a bled row starts at the top
+        // edge, a carded one 2px in — or a click lands on the wrong row.
+        let y0 = this.bounds.y;
+        if (!this.bleed_selection) { y0 += 2.0; }
         // back into row-index space, so the divide truncates here
-        let r = ((py as float - this.bounds.y - 2.0 + this.scroll) / TREE_ROW_H) as int;
+        let r = ((py as float - y0 + this.scroll) / this.row_h) as int;
         if (r < 0 || r >= this.flat.len) { return -1; }
         return r;
     }
@@ -254,7 +387,7 @@ export class TreeView extends Widget {
         this.selected = i;
         let n = this.flat[i];
         let d = this.depth[i];
-        let chev = this.bounds.x + 10.0 + (d as float) * 16.0 - this.scroll_off_x;
+        let chev = this.bounds.x + 10.0 + (d as float) * this.indent_w - this.scroll_off_x;
         if (!n.leaf() && x as float < chev + 12.0) {
             n.expanded = !n.expanded;
             if (n.expanded && this.onExpand != null) { this.onExpand(n); }
@@ -301,7 +434,7 @@ export class TreeView extends Widget {
             this.scroll_clamp();
             return true;
         }
-        this.scroll += (delta as float) * TREE_ROW_H;
+        this.scroll += (delta as float) * this.row_h;
         this.clamp_scroll();
         return true;
     }
