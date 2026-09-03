@@ -38,9 +38,13 @@ const DT_CB_W: float = 28.0;     // width of the checkbox selection gutter
 const DT_FILT_H: float = 28.0;   // height of the optional inline filter row
 
 // Visual-row kinds for the materialized model (grouping / detail / wrapping).
-const VR_DATA: int = 0;      // a data row (vr_row = view index)
-const VR_GROUP: int = 1;     // a group header (vr_row = first view index, vr_gend = end)
-const VR_DETAIL: int = 2;    // a row's expanded detail panel (vr_row = view index)
+// The tag only says which kind a row is; the payload it selects among lives in
+// the parallel vr_* arrays, which an enum does not police — see vr_row.
+enum VR {
+    DATA,        // a data row (vr_row = view index)
+    GROUP,       // a group header (vr_row = first view index, vr_gend = end)
+    DETAIL,      // a row's expanded detail panel (vr_row = view index)
+}
 
 // The leading bytes of a cell, for width measurement only.
 //
@@ -261,9 +265,9 @@ export class DataTable extends Widget {
     wrap: bool;         // wrap cell text (rows grow to fit)
     // materialized visual-row model (parallel arrays), built lazily when any of
     // grouping / detail / wrap is active; the flat uniform path is used otherwise.
-    vr_kind: int[];
-    vr_row: int[];      // VR_DATA/VR_DETAIL: view index; VR_GROUP: first view index
-    vr_gend: int[];     // VR_GROUP: end view index (exclusive); else -1
+    vr_kind: VR[];
+    vr_row: int[];      // VR.DATA/VR.DETAIL: view index; VR.GROUP: first view index
+    vr_gend: int[];     // VR.GROUP: end view index (exclusive); else -1
     vr_y: float[];      // cumulative top (content coords)
     vr_h: float[];      // height
     vis_total_h: float; // total content height of the visual model
@@ -1205,7 +1209,7 @@ export class DataTable extends Widget {
         return this.row_h * lines as float;
     }
 
-    fn push_vr(kind: int, row: int, gend: int, y: float, h: float) {
+    fn push_vr(kind: VR, row: int, gend: int, y: float, h: float) {
         this.vr_kind.push(kind); this.vr_row.push(row); this.vr_gend.push(gend);
         this.vr_y.push(y); this.vr_h.push(h);
     }
@@ -1223,12 +1227,12 @@ export class DataTable extends Widget {
                 let gval = this.df.cellStr(i, this.group_col);
                 let j = i + 1;
                 while (j < vlen && this.df.cellStr(j, this.group_col) == gval) { j += 1; }
-                this.push_vr(VR_GROUP, i, j, y, this.row_h); y += this.row_h;
+                this.push_vr(VR.GROUP, i, j, y, this.row_h); y += this.row_h;
                 if (!this.is_collapsed(gval)) {
                     for (let r in i..j) {
                         let rh = this.row_height(s, r);
-                        this.push_vr(VR_DATA, r, -1, y, rh); y += rh;
-                        if (this.is_expanded(r)) { this.push_vr(VR_DETAIL, r, -1, y, this.detail_h); y += this.detail_h; }
+                        this.push_vr(VR.DATA, r, -1, y, rh); y += rh;
+                        if (this.is_expanded(r)) { this.push_vr(VR.DETAIL, r, -1, y, this.detail_h); y += this.detail_h; }
                     }
                 }
                 i = j;
@@ -1236,8 +1240,8 @@ export class DataTable extends Widget {
         } else {
             for (let r in 0..vlen) {
                 let rh = this.row_height(s, r);
-                this.push_vr(VR_DATA, r, -1, y, rh); y += rh;
-                if (this.is_expanded(r)) { this.push_vr(VR_DETAIL, r, -1, y, this.detail_h); y += this.detail_h; }
+                this.push_vr(VR.DATA, r, -1, y, rh); y += rh;
+                if (this.is_expanded(r)) { this.push_vr(VR.DETAIL, r, -1, y, this.detail_h); y += this.detail_h; }
             }
         }
         this.vis_total_h = y;
@@ -2096,7 +2100,8 @@ export class DataTable extends Widget {
                 let vh = this.vr_h[iv];
                 let kind = this.vr_kind[iv];
                 let rowi = this.vr_row[iv];
-                if (kind == VR_DATA) {
+                switch (kind) {
+                case VR.DATA: {
                     if (this.is_selected(rowi)) {
                         s.fill(Rect(b.x, vy, b.w, vh), th.selection);
                     } else if (rowi == this.hover_row) {
@@ -2110,10 +2115,9 @@ export class DataTable extends Widget {
                     // own clip stops at its column, so drawing it first would
                     // leave the line broken at every column edge.
                     if (this.row_lines) { s.line(b.x, vy + vh, right, vy + vh, th.divider); }
-                } else if (kind == VR_GROUP) {
-                    this.draw_group_header(s, th, iv, vy, vh);
-                } else {
-                    this.draw_detail_panel(s, th, rowi, vy, vh);
+                }
+                case VR.GROUP: { this.draw_group_header(s, th, iv, vy, vh); }
+                case VR.DETAIL: { this.draw_detail_panel(s, th, rowi, vy, vh); }
                 }
                 iv += 1;
             }
@@ -2264,7 +2268,7 @@ export class DataTable extends Widget {
             let iv = this.visual_at_y(cy);
             if (iv < 0 || iv >= this.vr_kind.len) { return -1; }
             if (cy >= this.vr_y[iv] + this.vr_h[iv]) { return -1; }   // in the trailing gap
-            if (this.vr_kind[iv] == VR_DATA) { return this.vr_row[iv]; }
+            if (this.vr_kind[iv] == VR.DATA) { return this.vr_row[iv]; }
             return -1;
         }
         let vrow = ((fy - by + this.scroll_off_y) / this.row_h) as int;
@@ -2339,11 +2343,11 @@ export class DataTable extends Widget {
         // group header → toggle collapse; detail panel → swallow
         if (this.has_visual()) {
             let iv = this.visual_row_at(y);
-            if (iv >= 0 && this.vr_kind[iv] == VR_GROUP) {
+            if (iv >= 0 && this.vr_kind[iv] == VR.GROUP) {
                 this.toggle_group(this.df.cellStr(this.vr_row[iv], this.group_col));
                 return true;
             }
-            if (iv >= 0 && this.vr_kind[iv] == VR_DETAIL) { return true; }
+            if (iv >= 0 && this.vr_kind[iv] == VR.DETAIL) { return true; }
         }
         let vrow = this.row_at(y);
         if (vrow >= 0) {
@@ -2537,7 +2541,7 @@ export class DataTable extends Widget {
             // find the DATA visual row for vrow
             let found = -1;
             for (let i in 0..this.vr_kind.len) {
-                if (this.vr_kind[i] == VR_DATA && this.vr_row[i] == vrow) { found = i; break; }
+                if (this.vr_kind[i] == VR.DATA && this.vr_row[i] == vrow) { found = i; break; }
             }
             if (found < 0) { return; }
             top = this.vr_y[found];
