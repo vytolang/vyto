@@ -1405,6 +1405,11 @@ static char *ex(Em *em, Expr *e, bool *fresh) {
         }
         if (src->kind == TY_ARRAY) /* byte[] as cstring/rawptr: borrowed buffer view */
             return arena_printf(&g_arena, "((%s)vt_arr_data(%s))", c_type(dst), ex_b(em, e->lhs));
+        /* value struct as rawptr: the address of the struct itself, so a shim
+           can read or fill it in place. The checker restricted this to an
+           addressable operand, so &-ing it is well-formed C. */
+        if (src->kind == TY_STRUCT && dst->kind == TY_RAWPTR)
+            return arena_printf(&g_arena, "((%s)&(%s))", c_type(dst), ex_b(em, e->lhs));
         /* int -> enum: the value may have come from C or a file, so a debug
            build checks it really names a variant. The comparison chain is
            emitted inline rather than calling a runtime helper, so a sparse or

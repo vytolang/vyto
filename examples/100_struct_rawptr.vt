@@ -1,0 +1,47 @@
+// Passing a Vyto struct to C by address.
+//
+// 06_ffi.vt shows the other direction: `extern "C" { struct div_t {...} }`
+// describes a struct C already defines, and div() returns one by value. Here
+// the struct is declared in Vyto and C fills it in place through a pointer —
+// the shape every ioctl and most syscalls want.
+//
+// A struct emits as a plain C struct in field order with exact-width types, so
+// one whose fields are all C-shaped values already has the target's layout.
+// `s as rawptr` hands out its address; the cast borrows, it transfers nothing,
+// so C must not keep the pointer past the call.
+//
+// Two rules keep it honest, both compile errors:
+//   - every field must be a C-compatible value type, checked recursively
+//     (tests/errors/struct_rawptr_field.vt)
+//   - the operand must be a named location, never a temporary
+//     (tests/errors/struct_rawptr_temp.vt)
+
+struct Timespec {
+    sec: clong;
+    nsec: clong;
+}
+
+struct Pair {
+    a: Timespec;
+    b: Timespec;
+}
+
+extern "C" {
+    fn clock_gettime(clk: i32, tp: rawptr): i32;
+}
+
+const CLOCK_REALTIME: int = 0;
+
+fn main() {
+    // C writes into a local we declared in Vyto.
+    let ts = Timespec(0 as clong, 0 as clong);
+    let rc = clock_gettime(CLOCK_REALTIME as i32, ts as rawptr);
+    print("clock_gettime rc = " + rc as int);
+    print("filled = " + str(ts.sec > 0 as clong));
+
+    // A field path works too: the address lands inside the outer struct.
+    let p = Pair(Timespec(0 as clong, 0 as clong), Timespec(0 as clong, 0 as clong));
+    clock_gettime(CLOCK_REALTIME as i32, p.b as rawptr);
+    print("outer untouched = " + str(p.a.sec == 0 as clong));
+    print("inner filled = " + str(p.b.sec > 0 as clong));
+}

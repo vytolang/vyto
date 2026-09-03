@@ -300,6 +300,41 @@ static bool valid_extern_field(const Type *t) {
     }
 }
 
+/* Is this struct safe to hand to C as a raw pointer? Every field must be a
+   fixed-width value with a C counterpart, checked recursively, so nothing
+   refcounted (string, array, class, closure) can reach a shim through the
+   cast. A struct emits as a plain C struct in declaration order
+   (src/emit.c:2468), so one that passes this test already has the target's
+   ABI layout -- the cast hands out a pointer to memory C can read. */
+static bool struct_is_abi_safe(const StructDecl *sd) {
+    for (int f = 0; f < sd->nfields; f++) {
+        const Type *ft = sd->fields[f].type;
+        if (ft->kind == TY_STRUCT) {
+            if (!ft->sdecl->is_extern && !struct_is_abi_safe(ft->sdecl)) return false;
+            continue;
+        }
+        if (!valid_extern_field(ft)) return false;
+    }
+    return true;
+}
+
+/* Can we take this expression's address? Only a named storage location has a
+   lifetime the cast can borrow -- the address of a temporary would dangle the
+   moment the enclosing statement ended. A field path is addressable when its
+   base is, since a value struct's fields live inside it. */
+static bool is_addressable(const Expr *e) {
+    switch (e->kind) {
+    case EX_IDENT:
+        return e->ref == REF_LOCAL || e->ref == REF_PARAM;
+    case EX_MEMBER:
+        /* v.x on a value struct, or this.x on a class instance */
+        return e->ref == REF_FIELD &&
+               (e->lhs->type->kind == TY_CLASS || is_addressable(e->lhs));
+    default:
+        return false;
+    }
+}
+
 static void resolve_enum(EnumDecl *ed, Module *m);
 
 static void resolve_module_sigs(Module *m) {
@@ -2836,6 +2871,35 @@ static Type *check_expr(Ctx *c, Expr *e, Type *expected) {
                                      shim or the runtime retain it as an owner
                                      (vt_arr_view). Borrowed — the cast itself
                                      transfers nothing. */
+        /* A value struct as a pointer to itself, for a syscall or an ioctl that
+           reads or fills a kernel ABI struct. Two guards: every field must be a
+           C-shaped value (so nothing refcounted is exposed to C), and the
+           operand must be a named location (so the pointer cannot outlive a
+           temporary). Borrowed and non-owning, like the array and class cases
+           above — C must not hold it past the call. */
+        if (src->kind == TY_STRUCT && dst->kind == TY_RAWPTR) {
+            if (!struct_is_abi_safe(src->sdecl))
+                fatal_at(e->loc,
+                         "cannot cast %s to rawptr: every field must be a "
+                         "C-compatible value type",
+                         type_str(src));
+            if (!is_addressable(e->lhs)) {
+                /* A captured struct lives in the closure's heap environment,
+                   not the frame, so it is addressable C but not a lifetime the
+                   cast should hand out. Name it separately -- "temporary" would
+                   send the reader looking for one that is not there. */
+                if (e->lhs->kind == EX_IDENT && e->lhs->ref == REF_CAPTURE)
+                    fatal_at(e->loc,
+                             "cannot cast the captured %s to rawptr: copy it to "
+                             "a local inside the closure and cast that",
+                             type_str(src));
+                fatal_at(e->loc,
+                         "cannot cast a temporary %s to rawptr: bind it to a "
+                         "local first, so the pointer has something to point at",
+                         type_str(src));
+            }
+            return e->type = dst;
+        }
         fatal_at(e->loc, "cannot cast %s to %s", type_str(src), type_str(dst));
     }
     case EX_STRCONV:

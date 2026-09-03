@@ -170,6 +170,7 @@ Every crossing is still an explicit conversion, the checker requires it:
 | `string` → `cstring` | `s.cstr()` |
 | `cstring` → `string` | `str(p)` — a builtin, not an import |
 | `T[]` → `rawptr` | `xs as rawptr`, **plus** `xs.len as i32` as a separate argument |
+| `struct` → `rawptr` | `s as rawptr` — the struct's own address; see below |
 
 ```js
 fn fillPolygon(xs: float[], ys: float[], rgb: int) {
@@ -177,6 +178,40 @@ fn fillPolygon(xs: float[], ys: float[], rgb: int) {
                      xs.len as i32, rgb as i32);   // gfx/gfx.vt:156
 }
 ```
+
+### Structs by address
+
+An `extern "C"` block can *describe* a struct C already defines, and pass it by
+value — that is `div_t` in [`examples/06_ffi.vt`](../examples/06_ffi.vt). The
+other direction is a struct declared in **Vyto** that C fills in place through a
+pointer, which is the shape every `ioctl` and most syscalls want:
+
+```js
+struct Timespec { sec: clong; nsec: clong; }
+
+extern "C" { fn clock_gettime(clk: i32, tp: rawptr): i32; }
+
+let ts = Timespec(0 as clong, 0 as clong);
+clock_gettime(0 as i32, ts as rawptr);      // C writes into ts
+```
+
+This works because a struct emits as a plain C struct in field order with
+exact-width types, so one whose fields are all C-shaped values already has the
+target's ABI layout. Use the fixed-width family (`i32`, `u16`, `clong`, `f64`)
+and not `int`, so the width is the one the kernel header says.
+
+The cast **borrows** — it transfers nothing, and C must not keep the pointer
+past the call. Two rules keep that honest, both compile errors:
+
+- **Every field must be a C-compatible value type**, checked recursively, so a
+  nested struct cannot smuggle in something refcounted or layout-unspecified.
+  An enum is rejected: it is a value type, but has no guaranteed C counterpart.
+- **The operand must be a named location** — a local, a parameter, or a field
+  path — never a temporary. `f(Timespec(...) as rawptr)` would hand C the
+  address of storage that dies when the statement ends, so it does not compile.
+  Bind it to a local first.
+
+Worked example: [`examples/100_struct_rawptr.vt`](../examples/100_struct_rawptr.vt).
 
 See [`docs/types.md`](types.md) for the full type reference — value vs.
 reference types, the fixed-width FFI family (§2), and `rawptr`/`cstring`
