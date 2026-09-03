@@ -3,71 +3,82 @@
 // Plus Align, Stack/Positioned, Wrap, Grid, Flexible, Divider.
 
 import { Widget, Painter, Theme, Size, BoxConstraints, bcLoose, bcTight } from "vyto/ui/core";
-import { Scrollbar, SIDE_RIGHT } from "vyto/ui/scrollbar";
+import { Scrollbar, SIDE } from "vyto/ui/scrollbar";
 import { Rect, contains, mix,
          KEY_UP, KEY_DOWN, KEY_HOME, KEY_END, KEY_PAGEUP, KEY_PAGEDOWN } from "vyto/surface";
 
 // main-axis distribution (CSS justify-content). Only bites when no child has a
 // grow factor — a growing child eats the free space first, leaving none to
 // distribute.
-export const JUSTIFY_START: int = 0;    // pack at the start (default)
-export const JUSTIFY_CENTER: int = 1;   // pack the block centered
-export const JUSTIFY_END: int = 2;      // pack at the end
-export const JUSTIFY_BETWEEN: int = 3;  // first/last flush to edges, gaps equal
-export const JUSTIFY_AROUND: int = 4;   // equal gaps, half-gaps at the edges
-export const JUSTIFY_EVENLY: int = 5;   // equal gaps including both edges
+export enum JUSTIFY {
+    START,      // pack at the start (default)
+    CENTER,     // pack the block centered
+    END,        // pack at the end
+    BETWEEN,    // first/last flush to edges, gaps equal
+    AROUND,     // equal gaps, half-gaps at the edges
+    EVENLY,     // equal gaps including both edges
+}
 
 // cross-axis alignment (CSS align-items / align-self, see Widget.selfAlign).
-export const CROSS_STRETCH: int = 0;    // fill the cross axis (default)
-export const CROSS_START: int = 1;      // hug the leading edge, natural size
-export const CROSS_CENTER: int = 2;     // center on the cross axis
-export const CROSS_END: int = 3;        // hug the trailing edge
+export enum CROSS {
+    STRETCH,    // fill the cross axis (default)
+    START,      // hug the leading edge, natural size
+    CENTER,     // center on the cross axis
+    END,        // hug the trailing edge
+}
 
 // [startOffset, extraGap] added to a Column/Row's main-axis packing to realize
-// a JUSTIFY_* mode across `free` leftover pixels among `n` children.
-fn dist_offsets(mode: int, free: float, n: int): float[] {
+// a JUSTIFY mode across `free` leftover pixels among `n` children.
+fn dist_offsets(mode: JUSTIFY, free: float, n: int): float[] {
     if (free <= 0.0 || n <= 0) { return [0.0, 0.0]; }
-    if (mode == JUSTIFY_CENTER) { return [free / 2.0, 0.0]; }
-    if (mode == JUSTIFY_END) { return [free, 0.0]; }
-    if (mode == JUSTIFY_BETWEEN) {
+    switch (mode) {
+    case JUSTIFY.START:  { return [0.0, 0.0]; }
+    case JUSTIFY.CENTER: { return [free / 2.0, 0.0]; }
+    case JUSTIFY.END:    { return [free, 0.0]; }
+    case JUSTIFY.BETWEEN: {
         if (n == 1) { return [free / 2.0, 0.0]; }   // one child: center it
         return [0.0, free / (n - 1) as float];
     }
-    if (mode == JUSTIFY_AROUND) {
+    case JUSTIFY.AROUND: {
         let g = free / n as float;
         return [g / 2.0, g];
     }
-    if (mode == JUSTIFY_EVENLY) {
+    case JUSTIFY.EVENLY: {
         let g = free / (n + 1) as float;
         return [g, g];
     }
-    return [0.0, 0.0];  // JUSTIFY_START
+    }
 }
 
 // [offset, size] for one child on the cross axis: how to place a `natural`-sized
-// child within `avail` cross pixels under a CROSS_* mode.
-fn cross_place(mode: int, avail: float, natural: float): float[] {
-    if (mode == CROSS_STRETCH) { return [0.0, avail]; }
+// child within `avail` cross pixels under a CROSS mode.
+fn cross_place(mode: CROSS, avail: float, natural: float): float[] {
+    // STRETCH is the one mode that ignores the natural size, so it answers
+    // before the clamp below rather than as a switch arm.
+    if (mode == CROSS.STRETCH) { return [0.0, avail]; }
     let sz = natural;
     if (sz > avail) { sz = avail; }
-    if (mode == CROSS_CENTER) { return [(avail - sz) / 2.0, sz]; }
-    if (mode == CROSS_END) { return [avail - sz, sz]; }
-    return [0.0, sz];  // CROSS_START
+    switch (mode) {
+    case CROSS.CENTER:  { return [(avail - sz) / 2.0, sz]; }
+    case CROSS.END:     { return [avail - sz, sz]; }
+    case CROSS.START:   { return [0.0, sz]; }
+    case CROSS.STRETCH: { return [0.0, avail]; }   // unreachable; see above
+    }
 }
 
 // vertical stack; children stretched to the inner width
 export class Column extends Widget {
     padding: float;    // -1 = theme default
     spacing: float;    // -1 = theme default
-    mainAlign: int;  // JUSTIFY_* — vertical distribution of free space
-    crossAlign: int; // CROSS_* — horizontal alignment of children
+    mainAlign: JUSTIFY;  // vertical distribution of free space
+    crossAlign: CROSS; // horizontal alignment of children
 
     fn init(kids: Widget[]) {
         super.init();
         this.padding = -1;
         this.spacing = -1;
-        this.mainAlign = JUSTIFY_START;
-        this.crossAlign = CROSS_STRETCH;
+        this.mainAlign = JUSTIFY.START;
+        this.crossAlign = CROSS.STRETCH;
         for (let k in kids) {
             this.add(k);
         }
@@ -84,8 +95,8 @@ export class Column extends Widget {
 
     builder fn gap(n: float) { this.spacing = n; return this; }
     builder fn pad(n: float) { this.padding = n; return this; }
-    builder fn justify(n: int) { this.mainAlign = n; return this; }
-    builder fn align(n: int) { this.crossAlign = n; return this; }
+    builder fn justify(n: JUSTIFY) { this.mainAlign = n; return this; }
+    builder fn align(n: CROSS) { this.crossAlign = n; return this; }
 
     override fn measure(s: Painter, th: Theme): Size {
         let pad = this.pad_of(th);
@@ -150,8 +161,11 @@ export class Column extends Widget {
                 given += share;
                 ch += share;
             }
-            let ca = c.alignSelf;
-            if (ca < 0) { ca = this.crossAlign; }
+            // alignSelf stays a plain int because -1 means "inherit", which is
+            // outside the CROSS set; an INHERIT variant would force a dead arm
+            // into every switch over it.
+            let ca = this.crossAlign;
+            if (c.alignSelf >= 0) { ca = c.alignSelf as CROSS; }
             let cp = cross_place(ca, inner.w, widths[i]);
             c.arrange(s, th, Rect(inner.x + cp[0], y, cp[1], ch));
             y += ch + gap + od[1];
@@ -163,15 +177,15 @@ export class Column extends Widget {
 export class Row extends Widget {
     padding: float;
     spacing: float;
-    mainAlign: int;  // JUSTIFY_* — horizontal distribution of free space
-    crossAlign: int; // CROSS_* — vertical alignment of children
+    mainAlign: JUSTIFY;  // horizontal distribution of free space
+    crossAlign: CROSS; // vertical alignment of children
 
     fn init(kids: Widget[]) {
         super.init();
         this.padding = -1;
         this.spacing = -1;
-        this.mainAlign = JUSTIFY_START;
-        this.crossAlign = CROSS_STRETCH;
+        this.mainAlign = JUSTIFY.START;
+        this.crossAlign = CROSS.STRETCH;
         for (let k in kids) {
             this.add(k);
         }
@@ -188,8 +202,8 @@ export class Row extends Widget {
 
     builder fn gap(n: float) { this.spacing = n; return this; }
     builder fn pad(n: float) { this.padding = n; return this; }
-    builder fn justify(n: int) { this.mainAlign = n; return this; }
-    builder fn align(n: int) { this.crossAlign = n; return this; }
+    builder fn justify(n: JUSTIFY) { this.mainAlign = n; return this; }
+    builder fn align(n: CROSS) { this.crossAlign = n; return this; }
 
     override fn measure(s: Painter, th: Theme): Size {
         let pad = this.pad_of(th);
@@ -249,8 +263,11 @@ export class Row extends Widget {
                 given += share;
                 cw += share;
             }
-            let ca = c.alignSelf;
-            if (ca < 0) { ca = this.crossAlign; }
+            // alignSelf stays a plain int because -1 means "inherit", which is
+            // outside the CROSS set; an INHERIT variant would force a dead arm
+            // into every switch over it.
+            let ca = this.crossAlign;
+            if (c.alignSelf >= 0) { ca = c.alignSelf as CROSS; }
             let cp = cross_place(ca, inner.h, heights[i]);
             c.arrange(s, th, Rect(x, inner.y + cp[0], cw, cp[1]));
             x += cw + gap + od[1];
@@ -1067,7 +1084,7 @@ export class ScrollView extends Box {
         this.scroll_y = 0;
         this.content_h = 0;
         this.focusable = true;
-        this.add_scrollbar(SIDE_RIGHT);   // reusable base-Widget scrollbar
+        this.add_scrollbar(SIDE.RIGHT);   // reusable base-Widget scrollbar
         if (child != null) { this.add(child); }
     }
 
@@ -1301,7 +1318,7 @@ export class ListView extends Widget {
         this.build = build;
         this.scroll = 0.0;
         this.focusable = true;
-        this.add_scrollbar(SIDE_RIGHT);   // reusable base-Widget scrollbar
+        this.add_scrollbar(SIDE.RIGHT);   // reusable base-Widget scrollbar
     }
 
     fn content_h(): float { return (this.count() as float) * this.row_h; }
