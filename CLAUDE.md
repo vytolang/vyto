@@ -19,11 +19,30 @@ Every piece of builtin library code must adhere to this goal.
 ## Build and test
 
 ```sh
-make                  # builds vytoc + vytobind
+make                  # builds vytoc + vytobind + vytopack
 make test             # full suite: every examples/NN_*.vt vs its .expected
+make test-pack        # vytopack: install, manifest, audit, shell-injection
+make test-charts      # lib/vyto/ui/chart.vt
+make test-mobile      # lib/vyto/mobile/android/ui.vt
 make test-win         # cross-build the windows-x64 slice into tests/tmp/win-x64
 make clean-cache      # remove every .vyto-cache in the tree
 ```
+
+**`make test` is not the whole suite.** Four targets are split out of it, so a
+green `make test` says nothing about what they cover — run the matching one
+after touching its area, and all of them before a release:
+
+| Target | Covers | Split out because |
+|---|---|---|
+| `test-pack` | 36 checks over `src/vytopack` — install, manifest parsing, `audit`, and the URL/rev/dir rejection cases | shells out to `git` repeatedly. No network: it clones a throwaway repo it creates under `tests/tmp` |
+| `test-charts` | 21 golden cases over `lib/vyto/ui/chart.vt` | leaf package; every entry file compiles its own copy of the ui stack |
+| `test-mobile` | 18 golden cases over `lib/vyto/mobile/android/ui.vt` | same, and the widgets need the headless surface |
+| `test-win` | the windows-x64 portable slice | only *stages* into `tests/tmp/win-x64`; runs nothing. Copy it to a Windows box to execute |
+
+`test-pack`'s rejection cases are the ones worth knowing about: they assert the
+refusal *reason*, not merely that the command failed, because fault injection
+showed an exit-status-only check passed with validation stubbed out entirely.
+Anything touching `safety.vt` needs this target, not `make test`.
 
 `make test` runs all 108 examples and is slow. While iterating, build and run
 the single example you care about directly:
