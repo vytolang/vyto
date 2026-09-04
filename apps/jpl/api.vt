@@ -32,6 +32,9 @@
 
 import { http_get } from "vyto/net/http";
 import { file_exists, file_size, file_mkdirs, path_dirname } from "vyto/io/file";
+import { is_digit, CHAR_BACKSLASH, CHAR_COLON, CHAR_COMMA, CHAR_CR, CHAR_DQUOTE,
+         CHAR_LBRACKET, CHAR_LF, CHAR_LOWER_N, CHAR_RBRACKET, CHAR_SPACE,
+         CHAR_TAB, CHAR_UPPER_Y } from "vyto/util/ascii";
 
 const SBDB: string = "https://ssd-api.jpl.nasa.gov/sbdb_query.api";
 
@@ -132,7 +135,11 @@ export class Belt {
 
 // ── scanning ─────────────────────────────────────────────────────────────────
 
-fn is_space(c: int): bool { return c == 32 || c == 9 || c == 10 || c == 13; }
+// Spelled out rather than vyto/util/ascii's is_space(): that also matches
+// form feed, which JSON does not count as whitespace.
+fn is_space(c: int): bool {
+    return c == CHAR_SPACE || c == CHAR_TAB || c == CHAR_LF || c == CHAR_CR;
+}
 
 // Find a byte from an offset. Deliberately NOT vyto/util/text's index_of_from,
 // which is `s.slice(start, s.len).index_of(sub)` — that copies the whole tail of
@@ -158,19 +165,19 @@ fn skip_ws(s: string, i: int): int {
 fn read_fields(s: string, names: string[]): int {
     let key = s.index_of("\"fields\"");
     if (key < 0) { return -1; }
-    let p = find_ch(s, key, 91);              // '['
+    let p = find_ch(s, key, CHAR_LBRACKET);
     if (p < 0) { return -1; }
     p += 1;
     while (p < s.len) {
         p = skip_ws(s, p);
         if (p >= s.len) { return -1; }
         let c = s[p];
-        if (c == 93) { return p + 1; }        // ']'
-        if (c == 44) { p += 1; continue; }    // ','
-        if (c != 34) { return -1; }           // '"'
+        if (c == CHAR_RBRACKET) { return p + 1; }
+        if (c == CHAR_COMMA) { p += 1; continue; }
+        if (c != CHAR_DQUOTE) { return -1; }
         let lo = p + 1;
         let q = lo;
-        while (q < s.len && s[q] != 34) { q += 1; }
+        while (q < s.len && s[q] != CHAR_DQUOTE) { q += 1; }
         names.push(s.slice(lo, q));
         p = q + 1;
     }
@@ -207,7 +214,7 @@ export fn load_belt(text: string): Belt {
 
     let dkey = text.index_of("\"data\"");
     if (dkey < 0) { b.err = "no data array in the response"; return b; }
-    let p = find_ch(text, dkey, 91);         // '['
+    let p = find_ch(text, dkey, CHAR_LBRACKET);
     if (p < 0) { b.err = "malformed data array"; return b; }
     p += 1;
 
@@ -216,9 +223,9 @@ export fn load_belt(text: string): Belt {
         p = skip_ws(text, p);
         if (p >= text.len) { break; }
         let c = text[p];
-        if (c == 93) { break; }                // ']' — end of data
-        if (c == 44) { p += 1; continue; }     // ',' between rows
-        if (c != 91) { break; }                // expected '[' to open a row
+        if (c == CHAR_RBRACKET) { break; }              // end of data
+        if (c == CHAR_COMMA) { p += 1; continue; }      // between rows
+        if (c != CHAR_LBRACKET) { break; }              // expected a row to open
         p += 1;
 
         // One row. Columns absent from this response simply never get written,
@@ -238,18 +245,18 @@ export fn load_belt(text: string): Belt {
             p = skip_ws(text, p);
             if (p >= text.len) { break; }
             let ch = text[p];
-            if (ch == 93) { break; }           // ']' ends the row early
-            if (ch == 44) { p += 1; continue; }
+            if (ch == CHAR_RBRACKET) { break; }         // ends the row early
+            if (ch == CHAR_COMMA) { p += 1; continue; }
 
             let lo = -1;
             let hi = -1;
-            if (ch == 34) {                    // '"' — a quoted value
+            if (ch == CHAR_DQUOTE) {                    // a quoted value
                 lo = p + 1;
                 let q = lo;
                 while (q < text.len) {
                     let qc = text[q];
-                    if (qc == 92) { q += 2; continue; }   // '\' escape
-                    if (qc == 34) { break; }
+                    if (qc == CHAR_BACKSLASH) { q += 2; continue; }
+                    if (qc == CHAR_DQUOTE) { break; }
                     q += 1;
                 }
                 hi = q;
@@ -257,10 +264,11 @@ export fn load_belt(text: string): Belt {
             } else {                            // null, or a bare number
                 lo = p;
                 let q = p;
-                while (q < text.len && text[q] != 44 && text[q] != 93) { q += 1; }
+                while (q < text.len && text[q] != CHAR_COMMA
+                                    && text[q] != CHAR_RBRACKET) { q += 1; }
                 hi = q;
                 p = q;
-                if (hi > lo && text[lo] == 110) { lo = -1; }   // 'n' of null
+                if (hi > lo && text[lo] == CHAR_LOWER_N) { lo = -1; }   // "null"
             }
 
             let target = map[col];
@@ -273,16 +281,16 @@ export fn load_belt(text: string): Belt {
                 else if (target == COL_DIAM) { vd = text.to_float_at(lo, hi); }
                 else if (target == COL_CLASS) { vc = b.class_code(text.slice(lo, hi)); }
                 else if (target == COL_NEO) {
-                    if (text[lo] == 89) { vf = vf | FLAG_NEO; }        // 'Y'
+                    if (text[lo] == CHAR_UPPER_Y) { vf = vf | FLAG_NEO; }
                 } else if (target == COL_PHA) {
-                    if (text[lo] == 89) { vf = vf | FLAG_PHA; }
+                    if (text[lo] == CHAR_UPPER_Y) { vf = vf | FLAG_PHA; }
                 }
             }
             col += 1;
         }
 
         // Step past the row's closing ']'.
-        while (p < text.len && text[p] != 93) { p += 1; }
+        while (p < text.len && text[p] != CHAR_RBRACKET) { p += 1; }
         if (p < text.len) { p += 1; }
 
         b.name_off.push(nm_off);
@@ -300,9 +308,9 @@ export fn load_belt(text: string): Belt {
     let ck = text.index_of("\"count\"");
     if (ck >= 0) {
         let q = ck + 7;
-        while (q < text.len && (text[q] == 58 || is_space(text[q]))) { q += 1; }
+        while (q < text.len && (text[q] == CHAR_COLON || is_space(text[q]))) { q += 1; }
         let lo = q;
-        while (q < text.len && text[q] >= 48 && text[q] <= 57) { q += 1; }
+        while (q < text.len && is_digit(text[q])) { q += 1; }
         if (q > lo) { b.total = text.to_float_at(lo, q) as int; }
     }
     if (b.total == 0) { b.total = b.n; }
