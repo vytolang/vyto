@@ -34,9 +34,10 @@
 // so "http://a.com/p#" formats back as "http://a.com/p".
 
 import { StringBuilder } from "vyto/util/text";
-import { is_alnum, is_digit, CHAR_DOT, CHAR_LOWER_A, CHAR_LOWER_F,
-         CHAR_MINUS, CHAR_PLUS, CHAR_TILDE, CHAR_UNDERSCORE, CHAR_UPPER_A,
-         CHAR_UPPER_F, CHAR_ZERO } from "vyto/util/ascii";
+import { is_alnum, is_alpha, is_digit, CHAR_COLON, CHAR_DOT, CHAR_HASH,
+         CHAR_LOWER_A, CHAR_LOWER_F, CHAR_MINUS, CHAR_PERCENT, CHAR_PLUS,
+         CHAR_QUESTION, CHAR_SLASH, CHAR_SPACE, CHAR_TILDE,
+         CHAR_UNDERSCORE, CHAR_UPPER_A, CHAR_UPPER_F, CHAR_ZERO } from "vyto/util/ascii";
 
 // ---- percent-encoding ------------------------------------------------------
 
@@ -59,8 +60,8 @@ export fn url_decode(s: string): string { return decode_set(s, false); }
 export fn url_decode_form(s: string): string { return decode_set(s, true); }
 
 fn is_unreserved(c: int): bool {
-    return is_alnum(c) || c == CHAR_MINUS || c == CHAR_DOT ||
-           c == CHAR_UNDERSCORE || c == CHAR_TILDE;
+    return is_alnum(c) || c == CHAR_MINUS || c == CHAR_DOT ||   // - .
+           c == CHAR_UNDERSCORE || c == CHAR_TILDE;   // _ ~
 }
 
 // Unescaped bytes are appended in runs rather than one at a time — the same
@@ -71,12 +72,13 @@ fn encode_set(s: string, keepSlash: bool, plusSpace: bool): string {
     let i = 0;
     while (i < s.len) {
         let c = s[i];
-        if (is_unreserved(c) || (keepSlash && c == 47)) { i += 1; continue; }
+        if (is_unreserved(c) || (keepSlash && c == CHAR_SLASH)) { i += 1; continue; }   // /
         if (i > runStart) { sb.append(s.slice(runStart, i)); }
-        if (plusSpace && c == 32) {
-            sb.appendByte(43);
+        // form encoding writes a space as '+'; everything else percent-escapes
+        if (plusSpace && c == CHAR_SPACE) {
+            sb.appendByte(CHAR_PLUS);
         } else {
-            sb.appendByte(37);
+            sb.appendByte(CHAR_PERCENT);
             sb.append(hex2(c));
         }
         i += 1;
@@ -91,7 +93,7 @@ fn decode_set(s: string, plusSpace: bool): string {
     let i = 0;
     while (i < s.len) {
         let c = s[i];
-        if (c == 37 && i + 2 < s.len) {
+        if (c == CHAR_PERCENT && i + 2 < s.len) {   // %
             let hi = hex_val(s[i + 1]);
             let lo = hex_val(s[i + 2]);
             if (hi >= 0 && lo >= 0) {
@@ -100,7 +102,7 @@ fn decode_set(s: string, plusSpace: bool): string {
                 continue;
             }
         }
-        if (plusSpace && c == 43) { sb.appendByte(32); i += 1; continue; }
+        if (plusSpace && c == CHAR_PLUS) { sb.appendByte(CHAR_SPACE); i += 1; continue; }   // + -> space
         sb.appendByte(c);
         i += 1;
     }
@@ -115,9 +117,9 @@ fn hex2(c: int): string {
 }
 
 fn hex_val(c: int): int {
-    if (is_digit(c)) { return c - CHAR_ZERO; }
-    if (c >= CHAR_LOWER_A && c <= CHAR_LOWER_F) { return c - CHAR_LOWER_A + 10; }
-    if (c >= CHAR_UPPER_A && c <= CHAR_UPPER_F) { return c - CHAR_UPPER_A + 10; }
+    if (is_digit(c)) { return c - CHAR_ZERO; }   // 0
+    if (c >= CHAR_LOWER_A && c <= CHAR_LOWER_F) { return c - CHAR_LOWER_A + 10; }   // a f
+    if (c >= CHAR_UPPER_A && c <= CHAR_UPPER_F) { return c - CHAR_UPPER_A + 10; }   // A F
     return -1;
 }
 
@@ -364,7 +366,7 @@ export fn url_parse(s: string): Url {
         let i = 0;
         while (i < rest.len) {
             let c = rest[i];
-            if (c == 47 || c == 63 || c == 35) { end = i; break; }  // '/' '?' '#'
+            if (c == CHAR_SLASH || c == CHAR_QUESTION || c == CHAR_HASH) { end = i; break; }   // / ? #
             i += 1;
         }
         let auth = rest.slice(0, end);
@@ -396,12 +398,13 @@ export fn url_is_valid(s: string): bool { return url_parse(s).isValid(); }
 // and what a browser does; a host:port pair with no scheme is not a URL.
 fn scheme_end(s: string): int {
     let c0 = s[0];
-    if (!((c0 >= 65 && c0 <= 90) || (c0 >= 97 && c0 <= 122))) { return -1; }
+    // RFC 3986: a scheme must start with a letter.
+    if (!is_alpha(c0)) { return -1; }
     let i = 1;
     while (i < s.len) {
         let c = s[i];
-        if (c == 58) { return i; }
-        let ok = is_alnum(c) || c == CHAR_PLUS || c == CHAR_MINUS || c == CHAR_DOT;
+        if (c == CHAR_COLON) { return i; }   // :
+        let ok = is_alnum(c) || c == CHAR_PLUS || c == CHAR_MINUS || c == CHAR_DOT;   // + - .
         if (!ok) { return -1; }
         i += 1;
     }
@@ -461,7 +464,7 @@ fn parse_authority(u: Url, auth: string): bool {
         let i = 0;
         while (i < ds.len) {
             let c = ds[i];
-            if (c < 48 || c > 57) {
+            if (!is_digit(c)) {
                 u.err = "invalid port";
                 return false;
             }

@@ -29,6 +29,7 @@
 
 import { StringBuilder } from "vyto/util/text";
 import { BufReader, bufReader, BufWriter, bufWriter } from "vyto/io/file";
+import { CHAR_CR, CHAR_DQUOTE, CHAR_LF, CHAR_SPACE, CHAR_TAB } from "vyto/util/ascii";
 
 // ---- dialects --------------------------------------------------------------
 
@@ -71,11 +72,11 @@ export fn csv_sniff(sample: string): Dialect {
         let i = 0;
         while (i < sample.len && counts.len < 10) {
             let ch = sample[i];
-            if (ch == 34) { inQuote = !inQuote; }
+            if (ch == CHAR_DQUOTE) { inQuote = !inQuote; }   // "
             else {
                 if (!inQuote) {
                     if (ch == delim) { n += 1; }
-                    if (ch == 10) { counts.push(n); n = 0; }
+                    if (ch == CHAR_LF) { counts.push(n); n = 0; }   // newline
                 }
             }
             i += 1;
@@ -145,8 +146,8 @@ export class CsvReader {
                 if (c == this.d.delim) { this.pos += 1; }
                 else {
                     // Only a line break can end a record here.
-                    if (c == 13) { this.pos += 1; }
-                    if (this.pos < this.n && this.s[this.pos] == 10) { this.pos += 1; }
+                    if (c == CHAR_CR) { this.pos += 1; }   // carriage return
+                    if (this.pos < this.n && this.s[this.pos] == CHAR_LF) { this.pos += 1; }   // newline
                     this.line += 1;
                     done = true;
                 }
@@ -189,20 +190,20 @@ export class CsvReader {
         let moved = true;
         while (moved) {
             moved = false;
-            if (this.pos < this.n && this.s[this.pos] == 13 &&
-                this.pos + 1 < this.n && this.s[this.pos + 1] == 10) {
+            if (this.pos < this.n && this.s[this.pos] == CHAR_CR &&   // carriage return
+                this.pos + 1 < this.n && this.s[this.pos + 1] == CHAR_LF) {   // newline
                 this.pos += 2;
                 this.line += 1;
                 moved = true;
             } else {
-                if (this.pos < this.n && this.s[this.pos] == 10) {
+                if (this.pos < this.n && this.s[this.pos] == CHAR_LF) {   // newline
                     this.pos += 1;
                     this.line += 1;
                     moved = true;
                 }
             }
             if (this.d.comment != 0 && this.pos < this.n && this.s[this.pos] == this.d.comment) {
-                while (this.pos < this.n && this.s[this.pos] != 10) { this.pos += 1; }
+                while (this.pos < this.n && this.s[this.pos] != CHAR_LF) { this.pos += 1; }   // newline
                 moved = true;
             }
         }
@@ -212,7 +213,7 @@ export class CsvReader {
         if (this.d.trimSpace) {
             while (this.pos < this.n) {
                 let c = this.s[this.pos];
-                if (c == 32 || c == 9) {
+                if (c == CHAR_SPACE || c == CHAR_TAB) {   // space tab
                     if (c == this.d.delim) { break; }
                     this.pos += 1;
                 } else { break; }
@@ -228,7 +229,7 @@ export class CsvReader {
         let start = this.pos;
         while (this.pos < this.n) {
             let c = this.s[this.pos];
-            if (c == this.d.delim || c == 10 || c == 13) { break; }
+            if (c == this.d.delim || c == CHAR_LF || c == CHAR_CR) { break; }   // newline carriage return
             this.pos += 1;
         }
         let v = this.s.slice(start, this.pos);
@@ -246,7 +247,7 @@ export class CsvReader {
         let closed = false;
         while (this.pos < this.n) {
             let c = this.s[this.pos];
-            if (c == 10) { this.line += 1; }
+            if (c == CHAR_LF) { this.line += 1; }   // newline
             if (c != this.d.quote) { this.pos += 1; continue; }
             if (this.pos > runStart) { sb.appendSlice(this.s, runStart, this.pos); }
             this.pos += 1;
@@ -269,7 +270,7 @@ export class CsvReader {
             while (this.pos < this.n) {
                 let c = this.s[this.pos];
                 if (c == this.d.delim) { break; }
-                if (c != 32 && c != 9) { break; }
+                if (c != CHAR_SPACE && c != CHAR_TAB) { break; }   // space tab
                 this.pos += 1;
             }
         }
@@ -279,7 +280,7 @@ export class CsvReader {
         let tailStart = this.pos;
         while (this.pos < this.n) {
             let c = this.s[this.pos];
-            if (c == this.d.delim || c == 10 || c == 13) { break; }
+            if (c == this.d.delim || c == CHAR_LF || c == CHAR_CR) { break; }   // newline carriage return
             this.pos += 1;
         }
         if (this.pos > tailStart) { sb.appendSlice(this.s, tailStart, this.pos); }
@@ -306,13 +307,13 @@ export fn csv_field(v: string, d: Dialect): string {
     let i = 0;
     while (i < v.len) {
         let c = v[i];
-        if (c == d.delim || c == d.quote || c == 10 || c == 13) { needs = true; }
+        if (c == d.delim || c == d.quote || c == CHAR_LF || c == CHAR_CR) { needs = true; }   // newline carriage return
         i += 1;
     }
     if (v.len > 0 && d.trimSpace) {
         let f = v[0];
         let l = v[v.len - 1];
-        if (f == 32 || f == 9 || l == 32 || l == 9) { needs = true; }
+        if (f == CHAR_SPACE || f == CHAR_TAB || l == CHAR_SPACE || l == CHAR_TAB) { needs = true; }   // space tab
     }
     if (!needs) { return v; }
     let sb = new StringBuilder(v.len + 8);

@@ -37,10 +37,11 @@
 // worst input produces a paragraph of text.
 
 import { StringBuilder } from "vyto/util/text";
-import { is_alnum, CHAR_BACKSLASH, CHAR_BACKTICK, CHAR_BANG, CHAR_CR,
-         CHAR_DOT, CHAR_DQUOTE, CHAR_EQ, CHAR_GT, CHAR_HASH, CHAR_LBRACKET,
-         CHAR_LF, CHAR_LPAREN, CHAR_LT, CHAR_MINUS, CHAR_PLUS,
-         CHAR_RBRACKET, CHAR_RPAREN, CHAR_SPACE, CHAR_SQUOTE, CHAR_STAR,
+import { is_alnum, is_high, CHAR_AT, CHAR_BACKSLASH, CHAR_BACKTICK,
+         CHAR_BANG, CHAR_COLON, CHAR_CR, CHAR_DOT, CHAR_DQUOTE, CHAR_EQ,
+         CHAR_GT, CHAR_HASH, CHAR_LBRACE, CHAR_LBRACKET, CHAR_LF,
+         CHAR_LPAREN, CHAR_LT, CHAR_MINUS, CHAR_PLUS, CHAR_RBRACKET,
+         CHAR_RPAREN, CHAR_SLASH, CHAR_SPACE, CHAR_SQUOTE, CHAR_STAR,
          CHAR_TAB, CHAR_TILDE, CHAR_UNDERSCORE } from "vyto/util/ascii";
 import { html_escape, html_escape_attr } from "vyto/util/html";
 
@@ -159,9 +160,9 @@ fn split_lines(text: string): string[] {
     let start = 0;
     let i = 0;
     while (i < text.len) {
-        if (text[i] == CHAR_LF) {
+        if (text[i] == CHAR_LF) {   // newline
             let end = i;
-            if (end > start && text[end - 1] == CHAR_CR) { end -= 1; }
+            if (end > start && text[end - 1] == CHAR_CR) { end -= 1; }   // carriage return
             out.push(text.slice(start, end));
             start = i + 1;
         }
@@ -169,7 +170,7 @@ fn split_lines(text: string): string[] {
     }
     if (start < text.len) {
         let end = text.len;
-        if (end > start && text[end - 1] == CHAR_CR) { end -= 1; }
+        if (end > start && text[end - 1] == CHAR_CR) { end -= 1; }   // carriage return
         out.push(text.slice(start, end));
     }
     return out;
@@ -183,9 +184,9 @@ fn indent_of(line: string): int {
     let i = 0;
     while (i < line.len) {
         let c = line[i];
-        if (c == CHAR_SPACE) { n += 1; }
+        if (c == CHAR_SPACE) { n += 1; }   // space
         else {
-            if (c == CHAR_TAB) { n = n + 4 - (n % 4); }
+            if (c == CHAR_TAB) { n = n + 4 - (n % 4); }   // tab
             else { break; }
         }
         i += 1;
@@ -199,9 +200,9 @@ fn strip_indent(line: string, n: int): string {
     let i = 0;
     while (i < line.len && col < n) {
         let c = line[i];
-        if (c == CHAR_SPACE) { col += 1; }
+        if (c == CHAR_SPACE) { col += 1; }   // space
         else {
-            if (c == CHAR_TAB) { col = col + 4 - (col % 4); }
+            if (c == CHAR_TAB) { col = col + 4 - (col % 4); }   // tab
             else { break; }
         }
         i += 1;
@@ -215,9 +216,9 @@ fn atx_level(line: string): int {
     let t = line.trim_start();
     if (indent_of(line) >= 4) { return 0; }
     let n = 0;
-    while (n < t.len && t[n] == CHAR_HASH) { n += 1; }
+    while (n < t.len && t[n] == CHAR_HASH) { n += 1; }   // #
     if (n == 0 || n > 6) { return 0; }
-    if (n < t.len && t[n] != CHAR_SPACE && t[n] != CHAR_TAB) { return 0; }
+    if (n < t.len && t[n] != CHAR_SPACE && t[n] != CHAR_TAB) { return 0; }   // space tab
     return n;
 }
 
@@ -225,8 +226,8 @@ fn atx_text(line: string, level: int): string {
     let t = line.trim_start().slice(level, line.trim_start().len).trim();
     // A closing run of hashes is decoration and is dropped.
     let end = t.len;
-    while (end > 0 && t[end - 1] == CHAR_HASH) { end -= 1; }
-    if (end < t.len && (end == 0 || t[end - 1] == CHAR_SPACE || t[end - 1] == CHAR_TAB)) {
+    while (end > 0 && t[end - 1] == CHAR_HASH) { end -= 1; }   // #
+    if (end < t.len && (end == 0 || t[end - 1] == CHAR_SPACE || t[end - 1] == CHAR_TAB)) {   // space tab
         t = t.slice(0, end).trim_end();
     }
     return t;
@@ -238,14 +239,14 @@ fn is_hrule(line: string): bool {
     let t = line.trim();
     if (t.len < 3) { return false; }
     let c0 = t[0];
-    if (c0 != CHAR_STAR && c0 != CHAR_MINUS && c0 != CHAR_UNDERSCORE) { return false; }
+    if (c0 != CHAR_STAR && c0 != CHAR_MINUS && c0 != CHAR_UNDERSCORE) { return false; }   // * - _
     let n = 0;
     let i = 0;
     while (i < t.len) {
         let c = t[i];
         if (c == c0) { n += 1; }
         else {
-            if (c != CHAR_SPACE && c != CHAR_TAB) { return false; }
+            if (c != CHAR_SPACE && c != CHAR_TAB) { return false; }   // space tab
         }
         i += 1;
     }
@@ -258,13 +259,13 @@ fn setext_level(line: string): int {
     let t = line.trim();
     if (t.len == 0) { return 0; }
     let c0 = t[0];
-    if (c0 != CHAR_EQ && c0 != CHAR_MINUS) { return 0; }
+    if (c0 != CHAR_EQ && c0 != CHAR_MINUS) { return 0; }   // = -
     let i = 0;
     while (i < t.len) {
         if (t[i] != c0) { return 0; }
         i += 1;
     }
-    if (c0 == CHAR_EQ) { return 1; }
+    if (c0 == CHAR_EQ) { return 1; }   // =
     return 2;
 }
 
@@ -282,7 +283,7 @@ fn fence_run(line: string, out: int[]): int {
     if (n < 3) { return 0; }
     // A backtick fence's info string may not contain a backtick.
     let info = t.slice(n, t.len);
-    if (c0 == CHAR_BACKTICK && info.index_of("`") >= 0) { return 0; }
+    if (c0 == CHAR_BACKTICK && info.index_of("`") >= 0) { return 0; }   // `
     out[0] = c0;
     out[1] = ind;
     return n;
@@ -315,10 +316,10 @@ fn list_marker(line: string, out: int[]): bool {
             out[4] = line.len;
             return true;
         }
-        if (t[1] != CHAR_SPACE && t[1] != CHAR_TAB) { return false; }
+        if (t[1] != CHAR_SPACE && t[1] != CHAR_TAB) { return false; }   // space tab
         let after = 1;
         let spaces = 0;
-        while (after < t.len && (t[after] == CHAR_SPACE || t[after] == CHAR_TAB) && spaces < 4) {
+        while (after < t.len && (t[after] == CHAR_SPACE || t[after] == CHAR_TAB) && spaces < 4) {   // space tab
             after += 1;
             spaces += 1;
         }
@@ -345,10 +346,10 @@ fn list_marker(line: string, out: int[]): bool {
         out[4] = line.len;
         return true;
     }
-    if (t[d + 1] != CHAR_SPACE && t[d + 1] != CHAR_TAB) { return false; }
+    if (t[d + 1] != CHAR_SPACE && t[d + 1] != CHAR_TAB) { return false; }   // space tab
     let after = d + 1;
     let spaces = 0;
-    while (after < t.len && (t[after] == CHAR_SPACE || t[after] == CHAR_TAB) && spaces < 4) {
+    while (after < t.len && (t[after] == CHAR_SPACE || t[after] == CHAR_TAB) && spaces < 4) {   // space tab
         after += 1;
         spaces += 1;
     }
@@ -506,7 +507,7 @@ class Blocks {
             let t = strip_indent(line, ind);
             if (ind < 4 && t.starts_with(">")) {
                 let rest = t.slice(1, t.len);
-                if (rest.len > 0 && rest[0] == CHAR_SPACE) { rest = rest.slice(1, rest.len); }
+                if (rest.len > 0 && rest[0] == CHAR_SPACE) { rest = rest.slice(1, rest.len); }   // space
                 inner.push(rest);
                 this.pos += 1;
                 continue;
@@ -666,7 +667,7 @@ fn inline_spans(s: string, depth: int): MdNode[] {
         let c = s[i];
 
         // Backslash escape: only before punctuation, else the backslash is text.
-        if (c == CHAR_BACKSLASH && i + 1 < s.len) {
+        if (c == CHAR_BACKSLASH && i + 1 < s.len) {   // backslash
             let nx = s[i + 1];
             if (nx == 10) {                                    // hard break
                 flush(sb, out);
@@ -685,26 +686,26 @@ fn inline_spans(s: string, depth: int): MdNode[] {
         }
 
         // Line break: two trailing spaces make it hard, otherwise it is soft.
-        if (c == CHAR_LF) {
+        if (c == CHAR_LF) {   // newline
             let hard = ends_with_two_spaces(s, i);
             flush_trim(sb, out);
             if (hard) { out.push(node(MD_BREAK)); } else { out.push(node(MD_SOFTBREAK)); }
             i += 1;
             // Leading whitespace on the next line is not content.
-            while (i < s.len && (s[i] == CHAR_SPACE || s[i] == CHAR_TAB)) { i += 1; }
+            while (i < s.len && (s[i] == CHAR_SPACE || s[i] == CHAR_TAB)) { i += 1; }   // space tab
             continue;
         }
 
         // Code span: a run of N backticks closed by another run of exactly N.
-        if (c == CHAR_BACKTICK) {
+        if (c == CHAR_BACKTICK) {   // `
             let run = 0;
-            while (i + run < s.len && s[i + run] == CHAR_BACKTICK) { run += 1; }
+            while (i + run < s.len && s[i + run] == CHAR_BACKTICK) { run += 1; }   // `
             let close = find_backtick_run(s, i + run, run);
             if (close >= 0) {
                 flush(sb, out);
                 let code = s.slice(i + run, close);
                 // One leading and trailing space is stripped, so `` ` `` works.
-                if (code.len >= 2 && code[0] == CHAR_SPACE && code[code.len - 1] == CHAR_SPACE &&
+                if (code.len >= 2 && code[0] == CHAR_SPACE && code[code.len - 1] == CHAR_SPACE &&   // space
                     code.trim() != "") {
                     code = code.slice(1, code.len - 1);
                 }
@@ -720,7 +721,7 @@ fn inline_spans(s: string, depth: int): MdNode[] {
         }
 
         // Autolink: <https://…> or <a@b.c>.
-        if (c == CHAR_LT) {
+        if (c == CHAR_LT) {   // <
             let close = index_at(s, ">", i + 1);
             if (close > i + 1) {
                 let body = s.slice(i + 1, close);
@@ -743,7 +744,7 @@ fn inline_spans(s: string, depth: int): MdNode[] {
         }
 
         // Image: ![alt](url "title")
-        if (c == CHAR_BANG && i + 1 < s.len && s[i + 1] == CHAR_LBRACKET) {
+        if (c == CHAR_BANG && i + 1 < s.len && s[i + 1] == CHAR_LBRACKET) {   // ! [
             let endOut = [0];
             let img = try_link(s, i + 1, true, depth, endOut);
             if (img != null) {
@@ -758,7 +759,7 @@ fn inline_spans(s: string, depth: int): MdNode[] {
         }
 
         // Link: [text](url "title")
-        if (c == CHAR_LBRACKET) {
+        if (c == CHAR_LBRACKET) {   // [
             let endOut = [0];
             let a = try_link(s, i, false, depth, endOut);
             if (a != null) {
@@ -773,7 +774,7 @@ fn inline_spans(s: string, depth: int): MdNode[] {
         }
 
         // Emphasis and strong emphasis.
-        if (c == CHAR_STAR || c == CHAR_UNDERSCORE) {
+        if (c == CHAR_STAR || c == CHAR_UNDERSCORE) {   // * _
             let run = 0;
             while (i + run < s.len && s[i + run] == c) { run += 1; }
             // One delimiter is emphasis, two is strong, and three is both
@@ -834,11 +835,11 @@ fn try_link(s: string, at: int, isImage: bool, depth: int, endOut: int[]): MdNod
     let title = "";
     // A title is a quoted run at the end, separated from the destination by
     // whitespace — which is what tells "a b" apart from a URL containing one.
-    if (inner.len > 0 && (inner[inner.len - 1] == CHAR_DQUOTE || inner[inner.len - 1] == CHAR_SQUOTE)) {
+    if (inner.len > 0 && (inner[inner.len - 1] == CHAR_DQUOTE || inner[inner.len - 1] == CHAR_SQUOTE)) {   // " '
         let q = inner[inner.len - 1];
         let k = inner.len - 2;
         while (k > 0) {
-            if (inner[k] == q && (inner[k - 1] == CHAR_SPACE || inner[k - 1] == CHAR_TAB)) { break; }
+            if (inner[k] == q && (inner[k - 1] == CHAR_SPACE || inner[k - 1] == CHAR_TAB)) { break; }   // space tab
             k -= 1;
         }
         if (k > 0) {
@@ -848,7 +849,7 @@ fn try_link(s: string, at: int, isImage: bool, depth: int, endOut: int[]): MdNod
     }
     // <angle-bracketed destinations> are allowed and the brackets are not part
     // of the URL.
-    if (dest.len >= 2 && dest[0] == CHAR_LT && dest[dest.len - 1] == CHAR_GT) {
+    if (dest.len >= 2 && dest[0] == CHAR_LT && dest[dest.len - 1] == CHAR_GT) {   // < >
         dest = dest.slice(1, dest.len - 1);
     }
 
@@ -876,10 +877,10 @@ fn matching_bracket(s: string, at: int): int {
     let i = at;
     while (i < s.len) {
         let c = s[i];
-        if (c == CHAR_BACKSLASH) { i += 2; continue; }
-        if (c == CHAR_LBRACKET) { depth += 1; }
+        if (c == CHAR_BACKSLASH) { i += 2; continue; }   // backslash
+        if (c == CHAR_LBRACKET) { depth += 1; }   // [
         else {
-            if (c == CHAR_RBRACKET) {
+            if (c == CHAR_RBRACKET) {   // ]
                 depth -= 1;
                 if (depth == 0) { return i; }
             }
@@ -894,10 +895,10 @@ fn matching_paren(s: string, at: int): int {
     let i = at;
     while (i < s.len) {
         let c = s[i];
-        if (c == CHAR_BACKSLASH) { i += 2; continue; }
-        if (c == CHAR_LPAREN) { depth += 1; }
+        if (c == CHAR_BACKSLASH) { i += 2; continue; }   // backslash
+        if (c == CHAR_LPAREN) { depth += 1; }   // (
         else {
-            if (c == CHAR_RPAREN) {
+            if (c == CHAR_RPAREN) {   // )
                 depth -= 1;
                 if (depth == 0) { return i; }
             }
@@ -913,7 +914,7 @@ fn matching_paren(s: string, at: int): int {
 // into emphasis, which is the single most common false positive in markdown.
 // `*` is allowed intraword, as CommonMark specifies.
 fn find_delim(s: string, at: int, c: int, want: int, openAt: int): int {
-    if (c == CHAR_UNDERSCORE && openAt > 0 && is_word_byte(s[openAt - 1])) { return -1; }
+    if (c == CHAR_UNDERSCORE && openAt > 0 && is_word_byte(s[openAt - 1])) { return -1; }   // _
     // Two passes. The first accepts only a run of exactly `want`, so that in
     // "*a **b** c*" the single `*` pairs with the final one rather than with
     // the `**` that opens the strong span inside it. The second pass relaxes
@@ -929,11 +930,11 @@ fn scan_delim(s: string, at: int, c: int, want: int, exact: bool): int {
     let i = at;
     while (i < s.len) {
         let ch = s[i];
-        if (ch == CHAR_BACKSLASH) { i += 2; continue; }
-        if (ch == CHAR_BACKTICK) {
+        if (ch == CHAR_BACKSLASH) { i += 2; continue; }   // backslash
+        if (ch == CHAR_BACKTICK) {   // `
             // Skip a code span: a delimiter inside one is literal.
             let run = 0;
-            while (i + run < s.len && s[i + run] == CHAR_BACKTICK) { run += 1; }
+            while (i + run < s.len && s[i + run] == CHAR_BACKTICK) { run += 1; }   // `
             let end = find_backtick_run(s, i + run, run);
             if (end >= 0) { i = end + run; continue; }
             i += 1;
@@ -946,8 +947,8 @@ fn scan_delim(s: string, at: int, c: int, want: int, exact: bool): int {
         if (exact && run != want) { i += run; continue; }
         // The closer may not be preceded by whitespace, and for `_` may not be
         // followed by a word byte.
-        if (i > 0 && (s[i - 1] == CHAR_SPACE || s[i - 1] == CHAR_TAB)) { i += run; continue; }
-        if (c == CHAR_UNDERSCORE && i + run < s.len && is_word_byte(s[i + run])) { i += run; continue; }
+        if (i > 0 && (s[i - 1] == CHAR_SPACE || s[i - 1] == CHAR_TAB)) { i += run; continue; }   // space tab
+        if (c == CHAR_UNDERSCORE && i + run < s.len && is_word_byte(s[i + run])) { i += run; continue; }   // _
         return i;
     }
     return -1;
@@ -957,9 +958,9 @@ fn scan_delim(s: string, at: int, c: int, want: int, exact: bool): int {
 fn find_backtick_run(s: string, at: int, n: int): int {
     let i = at;
     while (i < s.len) {
-        if (s[i] != CHAR_BACKTICK) { i += 1; continue; }
+        if (s[i] != CHAR_BACKTICK) { i += 1; continue; }   // `
         let run = 0;
-        while (i + run < s.len && s[i + run] == CHAR_BACKTICK) { run += 1; }
+        while (i + run < s.len && s[i + run] == CHAR_BACKTICK) { run += 1; }   // `
         if (run == n) { return i; }
         i += run;
     }
@@ -982,18 +983,22 @@ fn is_autolink(body: string): bool {
 fn is_word_byte(c: int): bool {
     // >= 128 keeps any UTF-8 continuation byte on the "word" side, so an
     // accented letter does not read as a delimiter boundary.
-    return is_alnum(c) || c >= 128;
+    return is_alnum(c) || is_high(c);
 }
 
-// The characters a backslash may escape, per CommonMark.
+// The characters a backslash may escape, per CommonMark: every ASCII
+// punctuation byte, which is the four blocks between the digits, the
+// uppercase letters and the lowercase ones.
 fn is_punct(c: int): bool {
-    return (c >= 33 && c <= 47) || (c >= 58 && c <= 64) ||
-           (c >= 91 && c <= 96) || (c >= 123 && c <= 126);
+    return (c >= CHAR_BANG && c <= CHAR_SLASH) ||        // ! through /
+           (c >= CHAR_COLON && c <= CHAR_AT) ||          // : through @
+           (c >= CHAR_LBRACKET && c <= CHAR_BACKTICK) || // [ through `
+           (c >= CHAR_LBRACE && c <= CHAR_TILDE);        // { through ~
 }
 
 fn ends_with_two_spaces(s: string, nl: int): bool {
     if (nl < 2) { return false; }
-    return s[nl - 1] == CHAR_SPACE && s[nl - 2] == CHAR_SPACE;
+    return s[nl - 1] == CHAR_SPACE && s[nl - 2] == CHAR_SPACE;   // space
 }
 
 fn text_node(s: string): MdNode {

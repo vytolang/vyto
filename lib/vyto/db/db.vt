@@ -53,6 +53,8 @@ import { ColumnInfo, IndexColumn, IndexInfo, ForeignKey, TriggerInfo,
          OBJ_TABLE, OBJ_VIEW, OBJ_VIRTUAL, OBJ_SHADOW, OBJ_INDEX, OBJ_TRIGGER,
          OBJ_UNKNOWN, IDX_APPDEF, IDX_UNIQUE, IDX_PK,
          HID_NONE, HID_HIDDEN, HID_VIRTUAL, HID_STORED } from "vyto/db/introspect";
+import { is_lower, CHAR_CASE_SHIFT, CHAR_CR, CHAR_LF, CHAR_MINUS, CHAR_SLASH,
+         CHAR_SPACE, CHAR_STAR, CHAR_TAB } from "vyto/util/ascii";
 
 // A materialized result set. Rows own their cells, so a Result outlives the
 // statement it came from, the connection, and the Db itself.
@@ -279,8 +281,10 @@ fn changesShape(sql: string): bool {
     let w = "";
     while (i < sql.len) {
         let c = sql[i];
-        if (c == 32 || c == 9 || c == 10 || c == 13) { break; }
-        if (c >= 97 && c <= 122) { w = w + str_of_byte(c - 32); }
+        // Spelled out rather than is_space(): that also matches form feed,
+        // which does not end a SQL token here.
+        if (c == CHAR_SPACE || c == CHAR_TAB || c == CHAR_LF || c == CHAR_CR) { break; }
+        if (is_lower(c)) { w = w + str_of_byte(c - CHAR_CASE_SHIFT); }   // fold to upper
         else { w = w + str_of_byte(c); }
         if (w.len > 8) { return false; }
         i += 1;
@@ -302,14 +306,14 @@ fn skipSqlLeading(s: string): int {
     let i = 0;
     while (i < s.len) {
         let c = s[i];
-        if (c == 32 || c == 9 || c == 10 || c == 13) { i += 1; continue; }
-        if (c == 45 && i + 1 < s.len && s[i + 1] == 45) {
-            while (i < s.len && s[i] != 10) { i += 1; }
+        if (c == CHAR_SPACE || c == CHAR_TAB || c == CHAR_LF || c == CHAR_CR) { i += 1; continue; }
+        if (c == CHAR_MINUS && i + 1 < s.len && s[i + 1] == CHAR_MINUS) {      // "--"
+            while (i < s.len && s[i] != CHAR_LF) { i += 1; }
             continue;
         }
-        if (c == 47 && i + 1 < s.len && s[i + 1] == 42) {
+        if (c == CHAR_SLASH && i + 1 < s.len && s[i + 1] == CHAR_STAR) {       // "/*"
             i += 2;
-            while (i + 1 < s.len && !(s[i] == 42 && s[i + 1] == 47)) { i += 1; }
+            while (i + 1 < s.len && !(s[i] == CHAR_STAR && s[i + 1] == CHAR_SLASH)) { i += 1; }   // "*/"
             i += 2;
             continue;
         }

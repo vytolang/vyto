@@ -43,9 +43,12 @@ import { StringBuilder } from "vyto/util/text";
 import { is_alnum, is_digit, CHAR_BACKSLASH, CHAR_BS, CHAR_COLON,
          CHAR_COMMA, CHAR_CR, CHAR_DOT, CHAR_DQUOTE, CHAR_EQ, CHAR_ESC,
          CHAR_FF, CHAR_HASH, CHAR_LBRACE, CHAR_LBRACKET, CHAR_LF,
-         CHAR_LOWER_A, CHAR_LOWER_F, CHAR_MINUS, CHAR_NUL, CHAR_PLUS,
+         CHAR_LOWER_A, CHAR_LOWER_B, CHAR_LOWER_E, CHAR_LOWER_F,
+         CHAR_LOWER_N, CHAR_LOWER_O, CHAR_LOWER_R, CHAR_LOWER_T,
+         CHAR_LOWER_U, CHAR_LOWER_X, CHAR_MINUS, CHAR_NUL, CHAR_PLUS,
          CHAR_RBRACE, CHAR_RBRACKET, CHAR_SPACE, CHAR_SQUOTE, CHAR_TAB,
-         CHAR_UNDERSCORE, CHAR_UPPER_A, CHAR_UPPER_F, CHAR_ZERO } from "vyto/util/ascii";
+         CHAR_UNDERSCORE, CHAR_UPPER_A, CHAR_UPPER_B, CHAR_UPPER_E,
+         CHAR_UPPER_F, CHAR_UPPER_O, CHAR_UPPER_U, CHAR_UPPER_X, CHAR_ZERO } from "vyto/util/ascii";
 
 // Nesting bound, as in json.vt: arrays and inline tables recurse, so hostile
 // input has to soft-fail rather than overflow the C stack.
@@ -102,23 +105,23 @@ class TomlParser {
     fn sp() {
         while (this.pos < this.n) {
             let c = this.s[this.pos];
-            if (c == CHAR_SPACE || c == CHAR_TAB) { this.pos += 1; } else { break; }
+            if (c == CHAR_SPACE || c == CHAR_TAB) { this.pos += 1; } else { break; }   // space tab
         }
     }
     // Skip a comment if one starts here.
     fn skipComment() {
-        if (this.peek() != CHAR_HASH) { return; }
-        while (this.pos < this.n && this.s[this.pos] != CHAR_LF) { this.pos += 1; }
+        if (this.peek() != CHAR_HASH) { return; }   // #
+        while (this.pos < this.n && this.s[this.pos] != CHAR_LF) { this.pos += 1; }   // newline
     }
     // Whitespace, comments and newlines — everything between statements.
     fn blank() {
         while (this.pos < this.n) {
             let c = this.s[this.pos];
-            if (c == CHAR_SPACE || c == CHAR_TAB || c == CHAR_CR) { this.pos += 1; }
+            if (c == CHAR_SPACE || c == CHAR_TAB || c == CHAR_CR) { this.pos += 1; }   // space tab carriage return
             else {
-                if (c == CHAR_LF) { this.pos += 1; this.line += 1; }
+                if (c == CHAR_LF) { this.pos += 1; this.line += 1; }   // newline
                 else {
-                    if (c == CHAR_HASH) { this.skipComment(); }
+                    if (c == CHAR_HASH) { this.skipComment(); }   // #
                     else { break; }
                 }
             }
@@ -129,9 +132,9 @@ class TomlParser {
         this.sp();
         this.skipComment();
         if (this.atEnd()) { return true; }
-        if (this.s[this.pos] == CHAR_CR) { this.pos += 1; }
+        if (this.s[this.pos] == CHAR_CR) { this.pos += 1; }   // carriage return
         if (this.atEnd()) { return true; }
-        if (this.s[this.pos] != CHAR_LF) {
+        if (this.s[this.pos] != CHAR_LF) {   // newline
             this.fail("unexpected text after " + what);
             return false;
         }
@@ -146,7 +149,7 @@ class TomlParser {
         while (true) {
             this.blank();
             if (this.atEnd()) { break; }
-            if (this.s[this.pos] == CHAR_LBRACKET) {
+            if (this.s[this.pos] == CHAR_LBRACKET) {   // [
                 if (!this.header()) { return this.errValue(); }
             } else {
                 if (!this.keyval(this.cur, this.curPath)) { return this.errValue(); }
@@ -166,7 +169,7 @@ class TomlParser {
     fn header(): bool {
         let arrayOfTables = false;
         this.pos += 1;                                        // '['
-        if (this.peek() == CHAR_LBRACKET) {
+        if (this.peek() == CHAR_LBRACKET) {   // [
             arrayOfTables = true;
             this.pos += 1;
         }
@@ -178,13 +181,13 @@ class TomlParser {
             return false;
         }
         this.sp();
-        if (this.peek() != CHAR_RBRACKET) {
+        if (this.peek() != CHAR_RBRACKET) {   // ]
             this.fail("expected ']' after table name");
             return false;
         }
         this.pos += 1;
         if (arrayOfTables) {
-            if (this.peek() != CHAR_RBRACKET) {
+            if (this.peek() != CHAR_RBRACKET) {   // ]
                 this.fail("expected ']]' after array-of-tables name");
                 return false;
             }
@@ -235,7 +238,7 @@ class TomlParser {
                     }
                     // Walking *through* an array of tables addresses its last
                     // element, which is how [[a]] then [a.b] nests.
-                    if (nxt.len() == CHAR_NUL) {
+                    if (nxt.len() == CHAR_NUL) {   // NUL
                         this.fail("cannot index empty array '" + k + "'");
                         return node;
                     }
@@ -275,7 +278,7 @@ class TomlParser {
             return false;
         }
         this.sp();
-        if (this.peek() != CHAR_EQ) {
+        if (this.peek() != CHAR_EQ) {   // =
             this.fail("expected '=' after key '" + dotted(parts) + "'");
             return false;
         }
@@ -331,7 +334,7 @@ class TomlParser {
             if (this.failed()) { return out; }
             out.push(k);
             this.sp();
-            if (this.peek() != CHAR_DOT) { break; }
+            if (this.peek() != CHAR_DOT) { break; }   // .
             this.pos += 1;
         }
         return out;
@@ -339,12 +342,12 @@ class TomlParser {
 
     fn keySegment(): string {
         let c = this.peek();
-        if (c == CHAR_DQUOTE) { return this.basicString(false); }
-        if (c == CHAR_SQUOTE) { return this.literalString(false); }
+        if (c == CHAR_DQUOTE) { return this.basicString(false); }   // "
+        if (c == CHAR_SQUOTE) { return this.literalString(false); }   // '
         let start = this.pos;
         while (this.pos < this.n) {
             let b = this.s[this.pos];
-            let bare = is_alnum(b) || b == CHAR_UNDERSCORE || b == CHAR_MINUS;
+            let bare = is_alnum(b) || b == CHAR_UNDERSCORE || b == CHAR_MINUS;   // _ -
             if (!bare) { break; }
             this.pos += 1;
         }
@@ -371,16 +374,16 @@ class TomlParser {
     fn valueInner(): JsonValue {
         let c = this.peek();
         if (c < 0) { return this.fail("expected a value"); }
-        if (c == CHAR_DQUOTE) {
+        if (c == CHAR_DQUOTE) {   // "
             if (this.startsWith("\"\"\"")) { return jstr(this.mlString(true)); }
             return jstr(this.basicString(false));
         }
-        if (c == CHAR_SQUOTE) {
+        if (c == CHAR_SQUOTE) {   // '
             if (this.startsWith("'''")) { return jstr(this.mlString(false)); }
             return jstr(this.literalString(false));
         }
-        if (c == CHAR_LBRACKET) { return this.array(); }
-        if (c == CHAR_LBRACE) { return this.inlineTable(); }
+        if (c == CHAR_LBRACKET) { return this.array(); }   // [
+        if (c == CHAR_LBRACE) { return this.inlineTable(); }   // {
         return this.scalar();
     }
 
@@ -397,16 +400,16 @@ class TomlParser {
         let runStart = this.pos;
         while (this.pos < this.n) {
             let c = this.s[this.pos];
-            if (c == CHAR_LF) {
+            if (c == CHAR_LF) {   // newline
                 this.fail("unterminated string");
                 return sb.toString();
             }
-            if (c == CHAR_DQUOTE) {
+            if (c == CHAR_DQUOTE) {   // "
                 if (this.pos > runStart) { sb.append(this.s.slice(runStart, this.pos)); }
                 this.pos += 1;
                 return sb.toString();
             }
-            if (c != CHAR_BACKSLASH) { this.pos += 1; continue; }
+            if (c != CHAR_BACKSLASH) { this.pos += 1; continue; }   // backslash
             if (this.pos > runStart) { sb.append(this.s.slice(runStart, this.pos)); }
             this.pos += 1;
             this.escape(sb);
@@ -423,8 +426,8 @@ class TomlParser {
         let start = this.pos;
         while (this.pos < this.n) {
             let c = this.s[this.pos];
-            if (c == CHAR_LF) { break; }
-            if (c == CHAR_SQUOTE) {
+            if (c == CHAR_LF) { break; }   // newline
+            if (c == CHAR_SQUOTE) {   // '
                 let v = this.s.slice(start, this.pos);
                 this.pos += 1;
                 return v;
@@ -442,8 +445,8 @@ class TomlParser {
         let delim = "'''";
         if (basic) { delim = "\"\"\""; }
         this.pos += 3;
-        if (this.pos < this.n && this.s[this.pos] == CHAR_CR) { this.pos += 1; }
-        if (this.pos < this.n && this.s[this.pos] == CHAR_LF) {
+        if (this.pos < this.n && this.s[this.pos] == CHAR_CR) { this.pos += 1; }   // carriage return
+        if (this.pos < this.n && this.s[this.pos] == CHAR_LF) {   // newline
             this.pos += 1;
             this.line += 1;
         }
@@ -455,8 +458,10 @@ class TomlParser {
                 this.pos += 3;
                 // Up to two extra quotes belong to the content, per the spec.
                 let extra = 0;
-                let q = 39;
-                if (basic) { q = 34; }
+                // The delimiter's own quote: """ for a basic string, ''' for
+                // a literal one.
+                let q = CHAR_SQUOTE;
+                if (basic) { q = CHAR_DQUOTE; }
                 while (extra < 2 && this.pos < this.n && this.s[this.pos] == q) {
                     sb.appendByte(q);
                     this.pos += 1;
@@ -465,23 +470,23 @@ class TomlParser {
                 return sb.toString();
             }
             let c = this.s[this.pos];
-            if (c == CHAR_LF) { this.line += 1; }
-            if (basic && c == CHAR_BACKSLASH) {
+            if (c == CHAR_LF) { this.line += 1; }   // newline
+            if (basic && c == CHAR_BACKSLASH) {   // backslash
                 if (this.pos > runStart) { sb.append(this.s.slice(runStart, this.pos)); }
                 this.pos += 1;
                 // Line-ending backslash: swallow the break and the following
                 // whitespace, which is how a long string is wrapped in source.
                 let save = this.pos;
                 this.sp();
-                if (this.pos < this.n && this.s[this.pos] == CHAR_CR) { this.pos += 1; }
-                if (this.pos < this.n && this.s[this.pos] == CHAR_LF) {
+                if (this.pos < this.n && this.s[this.pos] == CHAR_CR) { this.pos += 1; }   // carriage return
+                if (this.pos < this.n && this.s[this.pos] == CHAR_LF) {   // newline
                     this.pos += 1;
                     this.line += 1;
                     while (this.pos < this.n) {
                         let w = this.s[this.pos];
-                        if (w == CHAR_SPACE || w == CHAR_TAB || w == CHAR_CR) { this.pos += 1; }
+                        if (w == CHAR_SPACE || w == CHAR_TAB || w == CHAR_CR) { this.pos += 1; }   // space tab carriage return
                         else {
-                            if (w == CHAR_LF) { this.pos += 1; this.line += 1; }
+                            if (w == CHAR_LF) { this.pos += 1; this.line += 1; }   // newline
                             else { break; }
                         }
                     }
@@ -510,16 +515,16 @@ class TomlParser {
         this.pos += 1;
         // The `c ==` side is the escape's *letter*, which vyto/util/ascii
         // deliberately does not name; the byte it produces is named.
-        if (c == CHAR_DQUOTE) { sb.appendByte(CHAR_DQUOTE); return; }
-        if (c == CHAR_BACKSLASH) { sb.appendByte(CHAR_BACKSLASH); return; }
-        if (c == 98) { sb.appendByte(CHAR_BS); return; }       // \b
-        if (c == 116) { sb.appendByte(CHAR_TAB); return; }     // \t
-        if (c == 110) { sb.appendByte(CHAR_LF); return; }      // \n
-        if (c == 102) { sb.appendByte(CHAR_FF); return; }      // \f
-        if (c == 114) { sb.appendByte(CHAR_CR); return; }      // \r
-        if (c == 101) { sb.appendByte(CHAR_ESC); return; }     // \e (TOML 1.1, harmless)
-        if (c == 117) { this.unicodeEscape(sb, 4); return; }  // \uXXXX
-        if (c == 85) { this.unicodeEscape(sb, 8); return; }   // \UXXXXXXXX
+        if (c == CHAR_DQUOTE) { sb.appendByte(CHAR_DQUOTE); return; }   // "
+        if (c == CHAR_BACKSLASH) { sb.appendByte(CHAR_BACKSLASH); return; }   // backslash
+        if (c == CHAR_LOWER_B) { sb.appendByte(CHAR_BS); return; }       // \b
+        if (c == CHAR_LOWER_T) { sb.appendByte(CHAR_TAB); return; }     // \t
+        if (c == CHAR_LOWER_N) { sb.appendByte(CHAR_LF); return; }      // \n
+        if (c == CHAR_LOWER_F) { sb.appendByte(CHAR_FF); return; }      // \f
+        if (c == CHAR_LOWER_R) { sb.appendByte(CHAR_CR); return; }      // \r
+        if (c == CHAR_LOWER_E) { sb.appendByte(CHAR_ESC); return; }     // \e (TOML 1.1, harmless)
+        if (c == CHAR_LOWER_U) { this.unicodeEscape(sb, 4); return; }  // \uXXXX
+        if (c == CHAR_UPPER_U) { this.unicodeEscape(sb, 8); return; }   // \UXXXXXXXX
         this.fail("unknown escape '\\" + chr_of(c) + "'");
     }
 
@@ -554,7 +559,7 @@ class TomlParser {
         while (true) {
             this.blank();
             if (this.atEnd()) { return this.fail("unterminated array"); }
-            if (this.s[this.pos] == CHAR_RBRACKET) {
+            if (this.s[this.pos] == CHAR_RBRACKET) {   // ]
                 this.pos += 1;
                 return a;
             }
@@ -564,8 +569,8 @@ class TomlParser {
             this.blank();
             if (this.atEnd()) { return this.fail("unterminated array"); }
             let c = this.s[this.pos];
-            if (c == CHAR_COMMA) { this.pos += 1; continue; }
-            if (c == CHAR_RBRACKET) { this.pos += 1; return a; }
+            if (c == CHAR_COMMA) { this.pos += 1; continue; }   // ,
+            if (c == CHAR_RBRACKET) { this.pos += 1; return a; }   // ]
             return this.fail("expected ',' or ']' in array");
         }
         return a;
@@ -576,7 +581,7 @@ class TomlParser {
         this.pos += 1;                                        // '{'
         let t = jobj();
         this.sp();
-        if (this.peek() == CHAR_RBRACE) {
+        if (this.peek() == CHAR_RBRACE) {   // }
             this.pos += 1;
             return t;
         }
@@ -586,7 +591,7 @@ class TomlParser {
             if (this.failed()) { return this.errValue(); }
             if (parts.len == 0) { return this.fail("expected a key in inline table"); }
             this.sp();
-            if (this.peek() != CHAR_EQ) { return this.fail("expected '=' in inline table"); }
+            if (this.peek() != CHAR_EQ) { return this.fail("expected '=' in inline table"); }   // =
             this.pos += 1;
             this.sp();
             let v = this.value();
@@ -609,8 +614,8 @@ class TomlParser {
             node.set(leaf, v);
             this.sp();
             let c = this.peek();
-            if (c == CHAR_COMMA) { this.pos += 1; continue; }
-            if (c == CHAR_RBRACE) { this.pos += 1; return t; }
+            if (c == CHAR_COMMA) { this.pos += 1; continue; }   // ,
+            if (c == CHAR_RBRACE) { this.pos += 1; return t; }   // }
             return this.fail("expected ',' or '}' in inline table");
         }
         return t;
@@ -621,10 +626,10 @@ class TomlParser {
         let start = this.pos;
         while (this.pos < this.n) {
             let c = this.s[this.pos];
-            if (c == CHAR_COMMA || c == CHAR_RBRACKET || c == CHAR_RBRACE || c == CHAR_HASH || c == CHAR_LF || c == CHAR_CR) { break; }
+            if (c == CHAR_COMMA || c == CHAR_RBRACKET || c == CHAR_RBRACE || c == CHAR_HASH || c == CHAR_LF || c == CHAR_CR) { break; }   // , ] } # newline carriage return
             // A space ends the token, unless it is the one separating a TOML
             // date from its time ("1979-05-27 07:32:00").
-            if (c == CHAR_SPACE || c == CHAR_TAB) {
+            if (c == CHAR_SPACE || c == CHAR_TAB) {   // space tab
                 if (!this.dateSpace(start)) { break; }
             }
             this.pos += 1;
@@ -646,7 +651,7 @@ class TomlParser {
         if (this.pos + 3 >= this.n) { return false; }
         let a = this.s[this.pos + 1];
         let b = this.s[this.pos + 2];
-        return is_digit(a) && is_digit(b) && this.s[this.pos + 3] == CHAR_COLON;
+        return is_digit(a) && is_digit(b) && this.s[this.pos + 3] == CHAR_COLON;   // :
     }
 }
 
@@ -662,11 +667,11 @@ fn classify(tok: string): JsonValue {
     if (tok == "nan" || tok == "+nan" || tok == "-nan") { return jnum(nan_value()); }
 
     // Radix-prefixed integers, which never carry a sign in TOML.
-    if (tok.len > 2 && tok[0] == 48) {
+    if (tok.len > 2 && tok[0] == CHAR_ZERO) {   // 0
         let p = tok[1];
-        if (p == 120 || p == 88) { return radix(tok.slice(2, tok.len), 16); }   // 0x
-        if (p == 111 || p == 79) { return radix(tok.slice(2, tok.len), 8); }    // 0o
-        if (p == 98 || p == 66) { return radix(tok.slice(2, tok.len), 2); }     // 0b
+        if (p == CHAR_LOWER_X || p == CHAR_UPPER_X) { return radix(tok.slice(2, tok.len), 16); }   // 0x
+        if (p == CHAR_LOWER_O || p == CHAR_UPPER_O) { return radix(tok.slice(2, tok.len), 8); }    // 0o
+        if (p == CHAR_LOWER_B || p == CHAR_UPPER_B) { return radix(tok.slice(2, tok.len), 2); }     // 0b
     }
 
     if (looks_like_datetime(tok)) { return jstr(tok); }
@@ -687,7 +692,7 @@ fn strip_underscores(tok: string): string {
     let i = 0;
     while (i < tok.len) {
         let c = tok[i];
-        if (c == CHAR_UNDERSCORE) {
+        if (c == CHAR_UNDERSCORE) {   // _
             if (i == 0 || i + 1 >= tok.len) { return ""; }
             if (!is_digit(tok[i - 1]) || !is_digit(tok[i + 1])) { return ""; }
         } else {
@@ -704,7 +709,7 @@ fn strip_radix_underscores(tok: string, base: int): string {
     let i = 0;
     while (i < tok.len) {
         let c = tok[i];
-        if (c == CHAR_UNDERSCORE) {
+        if (c == CHAR_UNDERSCORE) {   // _
             if (i == 0 || i + 1 >= tok.len) { return ""; }
             if (!is_base_digit(tok[i - 1], base) || !is_base_digit(tok[i + 1], base)) { return ""; }
         } else {
@@ -724,21 +729,21 @@ fn is_base_digit(c: int, base: int): bool {
 // TOML also forbids leading zeros, which this enforces.
 fn valid_number(s: string): bool {
     let i = 0;
-    if (i < s.len && (s[i] == CHAR_PLUS || s[i] == CHAR_MINUS)) { i += 1; }
+    if (i < s.len && (s[i] == CHAR_PLUS || s[i] == CHAR_MINUS)) { i += 1; }   // + -
     let intStart = i;
     while (i < s.len && is_digit(s[i])) { i += 1; }
     let intLen = i - intStart;
     if (intLen == 0) { return false; }
-    if (intLen > 1 && s[intStart] == 48) { return false; }
-    if (i < s.len && s[i] == CHAR_DOT) {
+    if (intLen > 1 && s[intStart] == CHAR_ZERO) { return false; }   // 0
+    if (i < s.len && s[i] == CHAR_DOT) {   // .
         i += 1;
         let fs = i;
         while (i < s.len && is_digit(s[i])) { i += 1; }
         if (i == fs) { return false; }
     }
-    if (i < s.len && (s[i] == 101 || s[i] == 69)) {
+    if (i < s.len && (s[i] == CHAR_LOWER_E || s[i] == CHAR_UPPER_E)) {   // e E
         i += 1;
-        if (i < s.len && (s[i] == CHAR_PLUS || s[i] == CHAR_MINUS)) { i += 1; }
+        if (i < s.len && (s[i] == CHAR_PLUS || s[i] == CHAR_MINUS)) { i += 1; }   // + -
         let es = i;
         while (i < s.len && is_digit(s[i])) { i += 1; }
         if (i == es) { return false; }
@@ -765,11 +770,11 @@ fn radix(body: string, base: int): JsonValue {
 // A TOML date, time, or datetime, which this module keeps as text. The shapes
 // are YYYY-MM-DD…, and HH:MM:SS…; nothing else starts that way.
 fn looks_like_datetime(tok: string): bool {
-    if (tok.len >= 10 && tok[4] == CHAR_MINUS && tok[7] == CHAR_MINUS &&
+    if (tok.len >= 10 && tok[4] == CHAR_MINUS && tok[7] == CHAR_MINUS &&   // -
         is_digit(tok[0]) && is_digit(tok[1]) && is_digit(tok[2]) && is_digit(tok[3])) {
         return true;
     }
-    if (tok.len >= 8 && tok[2] == CHAR_COLON && tok[5] == CHAR_COLON &&
+    if (tok.len >= 8 && tok[2] == CHAR_COLON && tok[5] == CHAR_COLON &&   // :
         is_digit(tok[0]) && is_digit(tok[1])) {
         return true;
     }
@@ -778,9 +783,9 @@ fn looks_like_datetime(tok: string): bool {
 
 
 fn hex_val(c: int): int {
-    if (is_digit(c)) { return c - CHAR_ZERO; }
-    if (c >= CHAR_LOWER_A && c <= CHAR_LOWER_F) { return c - CHAR_LOWER_A + 10; }
-    if (c >= CHAR_UPPER_A && c <= CHAR_UPPER_F) { return c - CHAR_UPPER_A + 10; }
+    if (is_digit(c)) { return c - CHAR_ZERO; }   // 0
+    if (c >= CHAR_LOWER_A && c <= CHAR_LOWER_F) { return c - CHAR_LOWER_A + 10; }   // a f
+    if (c >= CHAR_UPPER_A && c <= CHAR_UPPER_F) { return c - CHAR_UPPER_A + 10; }   // A F
     return -1;
 }
 
@@ -824,7 +829,7 @@ fn utf8_encode(cp: int): string {
 }
 
 fn chr_of(code: int): string {
-    if (code == CHAR_NUL) { return ""; }
+    if (code == CHAR_NUL) { return ""; }   // NUL
     let b = bytes(2);
     b[0] = code as byte;
     return str(b as cstring);
@@ -923,7 +928,7 @@ fn is_table(v: JsonValue): bool { return v.kind == JSON.OBJ; }
 // An array of tables only if it is non-empty and *every* element is a table:
 // an empty array is written inline, and a mixed one is an error at write time.
 fn is_table_array(v: JsonValue): bool {
-    if (v.kind != JSON.ARR || v.len() == CHAR_NUL) { return false; }
+    if (v.kind != JSON.ARR || v.len() == CHAR_NUL) { return false; }   // NUL
     let i = 0;
     while (i < v.len()) {
         if (v.at(i).kind != JSON.OBJ) { return false; }
@@ -960,7 +965,7 @@ fn encode_key(k: string): string {
     let i = 0;
     while (i < k.len) {
         let c = k[i];
-        let ok = is_alnum(c) || c == CHAR_UNDERSCORE || c == CHAR_MINUS;
+        let ok = is_alnum(c) || c == CHAR_UNDERSCORE || c == CHAR_MINUS;   // _ -
         if (!ok) { bare = false; }
         i += 1;
     }
@@ -1024,13 +1029,13 @@ fn quote_basic(s: string): string {
     while (i < s.len) {
         let c = s[i];
         let esc = "";
-        if (c == CHAR_DQUOTE) { esc = "\\\""; }
-        else { if (c == CHAR_BACKSLASH) { esc = "\\\\"; }
-        else { if (c == CHAR_LF) { esc = "\\n"; }
-        else { if (c == CHAR_CR) { esc = "\\r"; }
-        else { if (c == CHAR_TAB) { esc = "\\t"; }
-        else { if (c == CHAR_BS) { esc = "\\b"; }
-        else { if (c == CHAR_FF) { esc = "\\f"; }
+        if (c == CHAR_DQUOTE) { esc = "\\\""; }   // "
+        else { if (c == CHAR_BACKSLASH) { esc = "\\\\"; }   // backslash
+        else { if (c == CHAR_LF) { esc = "\\n"; }   // newline
+        else { if (c == CHAR_CR) { esc = "\\r"; }   // carriage return
+        else { if (c == CHAR_TAB) { esc = "\\t"; }   // tab
+        else { if (c == CHAR_BS) { esc = "\\b"; }   // backspace
+        else { if (c == CHAR_FF) { esc = "\\f"; }   // form feed
         else { if (c < 0x20) { esc = "\\u" + hex4(c); } } } } } } } }
         if (esc != "") {
             if (i > runStart) { sb.append(s.slice(runStart, i)); }

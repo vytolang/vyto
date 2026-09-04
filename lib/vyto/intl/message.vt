@@ -23,8 +23,9 @@ import { Locale, PLURAL_CARDINAL, PLURAL_ORDINAL } from "vyto/intl";
 import { formatNumber } from "vyto/intl/number";
 import { json_parse, JsonValue } from "vyto/util/json";
 import { file_open } from "vyto/io/file";
-import { CHAR_COMMA, CHAR_CR, CHAR_EQ, CHAR_HASH, CHAR_LBRACE, CHAR_LF,
-         CHAR_RBRACE, CHAR_SPACE, CHAR_SQUOTE, CHAR_TAB } from "vyto/util/ascii";
+import { is_alpha, is_digit, CHAR_COMMA, CHAR_CR, CHAR_EQ, CHAR_HASH,
+         CHAR_LBRACE, CHAR_LF, CHAR_RBRACE, CHAR_SPACE, CHAR_SQUOTE,
+         CHAR_TAB } from "vyto/util/ascii";
 
 extern "C" {
     fn intl_plural_open(locale: cstring, kind: i32): rawptr;
@@ -89,10 +90,8 @@ export fn argSet(): Args { return new Args(); }
 // Deliberately NOT vyto/util/ascii's is_space, which also counts form
 // feed. This is the four bytes the spec calls whitespace.
 fn is_space(c: int): bool {
-    return c == CHAR_SPACE || c == CHAR_TAB || c == CHAR_LF || c == CHAR_CR;
+    return c == CHAR_SPACE || c == CHAR_TAB || c == CHAR_LF || c == CHAR_CR;   // space tab newline carriage return
 }
-fn is_digit(c: int): bool { return c >= 48 && c <= 57; }
-fn is_alpha(c: int): bool { return (c >= 97 && c <= 122) || (c >= 65 && c <= 90); }
 
 class MsgFormatter {
     p: string;
@@ -111,7 +110,7 @@ class MsgFormatter {
     // Read up to the next ',' or '}' (an argument name), trimmed.
     fn readName(): string {
         let start = this.pos;
-        while (this.pos < this.p.len && this.p[this.pos] != CHAR_COMMA && this.p[this.pos] != CHAR_RBRACE) {
+        while (this.pos < this.p.len && this.p[this.pos] != CHAR_COMMA && this.p[this.pos] != CHAR_RBRACE) {   // , }
             this.pos += 1;
         }
         return this.p.slice(start, this.pos).trim();
@@ -142,8 +141,8 @@ class MsgFormatter {
         let depth = 0;
         while (this.pos < this.p.len) {
             let c = this.p[this.pos];
-            if (c == CHAR_LBRACE) { depth += 1; }
-            else if (c == CHAR_RBRACE) {
+            if (c == CHAR_LBRACE) { depth += 1; }   // {
+            else if (c == CHAR_RBRACE) {   // }
                 if (depth == 0) { this.pos += 1; return; }
                 depth -= 1;
             }
@@ -176,12 +175,12 @@ class MsgFormatter {
             if (c == CHAR_RBRACE) { break; }                                   // '}'
             if (c == CHAR_LBRACE) { out = out + this.argument(hash); continue; } // '{'
             if (c == CHAR_HASH) { out = out + hash; this.pos += 1; continue; }  // '#'
-            if (c == CHAR_SQUOTE) {                                              // '\''  quoting
+            if (c == CHAR_SQUOTE) {   // '
                 this.pos += 1;
-                if (this.pos < this.p.len && this.p[this.pos] == CHAR_SQUOTE) {  // '' -> '
+                if (this.pos < this.p.len && this.p[this.pos] == CHAR_SQUOTE) {   // '
                     out = out + "'"; this.pos += 1; continue;
                 }
-                while (this.pos < this.p.len && this.p[this.pos] != CHAR_SQUOTE) {
+                while (this.pos < this.p.len && this.p[this.pos] != CHAR_SQUOTE) {   // '
                     out = out + this.p.slice(this.pos, this.pos + 1);
                     this.pos += 1;
                 }
@@ -212,11 +211,11 @@ class MsgFormatter {
             return formatNumber(this.argNum(name), this.loc);
         }
         if (type == "plural" || type == "selectordinal") {
-            if (this.pos < this.p.len && this.p[this.pos] == CHAR_COMMA) { this.pos += 1; }
+            if (this.pos < this.p.len && this.p[this.pos] == CHAR_COMMA) { this.pos += 1; }   // ,
             return this.plural(name, type == "selectordinal");
         }
         if (type == "select") {
-            if (this.pos < this.p.len && this.p[this.pos] == CHAR_COMMA) { this.pos += 1; }
+            if (this.pos < this.p.len && this.p[this.pos] == CHAR_COMMA) { this.pos += 1; }   // ,
             return this.select(name);
         }
         // unknown/absent type: treat as a simple substitution
@@ -237,10 +236,10 @@ class MsgFormatter {
         let otherMsg = "";
         while (true) {
             this.skipWs();
-            if (this.pos >= this.p.len || this.p[this.pos] == CHAR_RBRACE) { break; }
+            if (this.pos >= this.p.len || this.p[this.pos] == CHAR_RBRACE) { break; }   // }
             let sel = this.readSelector();
             this.skipWs();
-            if (this.pos >= this.p.len || this.p[this.pos] != CHAR_LBRACE) { break; }
+            if (this.pos >= this.p.len || this.p[this.pos] != CHAR_LBRACE) { break; }   // {
             this.pos += 1; // '{'
             let sub = this.message(hash);
             if (this.pos < this.p.len && this.p[this.pos] == CHAR_RBRACE) { this.pos += 1; } // submessage '}'
@@ -265,17 +264,17 @@ class MsgFormatter {
         let otherMsg = "";
         while (true) {
             this.skipWs();
-            if (this.pos >= this.p.len || this.p[this.pos] == CHAR_RBRACE) { break; }
+            if (this.pos >= this.p.len || this.p[this.pos] == CHAR_RBRACE) { break; }   // }
             let sel = this.readToken();
             this.skipWs();
-            if (this.pos >= this.p.len || this.p[this.pos] != CHAR_LBRACE) { break; }
+            if (this.pos >= this.p.len || this.p[this.pos] != CHAR_LBRACE) { break; }   // {
             this.pos += 1; // '{'
             let sub = this.message("");
-            if (this.pos < this.p.len && this.p[this.pos] == CHAR_RBRACE) { this.pos += 1; }
+            if (this.pos < this.p.len && this.p[this.pos] == CHAR_RBRACE) { this.pos += 1; }   // }
             if (sel == "other") { otherMsg = sub; }
             if (!haveChosen && sel == key) { chosen = sub; haveChosen = true; }
         }
-        if (this.pos < this.p.len && this.p[this.pos] == CHAR_RBRACE) { this.pos += 1; }
+        if (this.pos < this.p.len && this.p[this.pos] == CHAR_RBRACE) { this.pos += 1; }   // }
         if (haveChosen) { return chosen; }
         return otherMsg;
     }

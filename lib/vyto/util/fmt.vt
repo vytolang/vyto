@@ -19,6 +19,11 @@
 // per the library-wide "panic hard, sentinel soft" rule.
 
 import { StringBuilder } from "vyto/util/text";
+import { is_digit, CHAR_DOT, CHAR_HASH, CHAR_LOWER_B, CHAR_LOWER_C,
+         CHAR_LOWER_D, CHAR_LOWER_E, CHAR_LOWER_F, CHAR_LOWER_G,
+         CHAR_LOWER_I, CHAR_LOWER_O, CHAR_LOWER_S, CHAR_LOWER_U,
+         CHAR_LOWER_X, CHAR_MINUS, CHAR_PERCENT, CHAR_PLUS, CHAR_SPACE,
+         CHAR_UPPER_E, CHAR_UPPER_F, CHAR_UPPER_G, CHAR_UPPER_X, CHAR_ZERO } from "vyto/util/ascii";
 
 extern "C" {
     fn fmt_i64(spec: cstring, v: i64, out: cstring, cap: i32): i32;
@@ -48,9 +53,10 @@ export fn ff(x: float): FmtArg  { let a = new FmtArg(FA_FLOAT); a.f = x;        
 export fn fs(x: string): FmtArg { let a = new FmtArg(FA_STR);   a.s = x;        return a; }
 export fn fb(x: bool): FmtArg   { let a = new FmtArg(FA_BOOL);  a.b = x;        return a; }
 
-fn is_digit(c: int): bool { return c >= 48 && c <= 57; }
 fn is_flag(c: int): bool {
-    return c == 45 || c == 43 || c == 32 || c == 48 || c == 35; // - + space 0 #
+    // CHAR_ZERO is the '0' flag character here (zero-padding), not a count.
+    return c == CHAR_MINUS || c == CHAR_PLUS || c == CHAR_SPACE ||   // - + space
+           c == CHAR_ZERO || c == CHAR_HASH;   // 0 #
 }
 
 // One-byte string from a byte value (used by %c). Byte 0 would truncate the
@@ -92,7 +98,7 @@ fn render_bin(v: i64, width: int, zero: bool, left: bool): string {
     while (k < nbits) {
         let shift = nbits - 1 - k;
         let bit = ((v >> (shift as i64)) & 1) as int;
-        buf[k] = (48 + bit) as byte;
+        buf[k] = (CHAR_ZERO + bit) as byte;   // 0
         k += 1;
     }
     return pad_field(str(buf as cstring), width, zero, left);
@@ -117,23 +123,23 @@ export fn fmt(f: string, args: FmtArg[]): string {
     let n = f.len;
     while (i < n) {
         let c = f[i];
-        if (c != 37) {                                  // not '%'
+        if (c != CHAR_PERCENT) {   // %
             let runStart = i;
-            while (i < n && f[i] != 37) { i += 1; }
+            while (i < n && f[i] != CHAR_PERCENT) { i += 1; }   // %
             sb.appendSlice(f, runStart, i);
             continue;
         }
 
         let j = i + 1;
-        if (j < n && f[j] == 37) { sb.appendByte(37); i = j + 1; continue; } // "%%"
+        if (j < n && f[j] == CHAR_PERCENT) { sb.appendByte(CHAR_PERCENT); i = j + 1; continue; } // "%%"
 
         // ---- parse the spec: flags, width, .precision, conversion ----
         let flagsStart = j;
         let hasMinus = false;
         let hasZero = false;
         while (j < n && is_flag(f[j])) {
-            if (f[j] == 45) { hasMinus = true; }
-            if (f[j] == 48) { hasZero = true; }
+            if (f[j] == CHAR_MINUS) { hasMinus = true; }   // -
+            if (f[j] == CHAR_ZERO) { hasZero = true; }   // 0
             j += 1;
         }
         let wStart = j;
@@ -142,7 +148,7 @@ export fn fmt(f: string, args: FmtArg[]): string {
         if (j > wStart) { width = f.slice(wStart, j).to_int(); }
         let prec = 0;
         let hasPrec = false;
-        if (j < n && f[j] == 46) {
+        if (j < n && f[j] == CHAR_DOT) {   // .
             j += 1;
             hasPrec = true;
             let pStart = j;
@@ -162,13 +168,13 @@ export fn fmt(f: string, args: FmtArg[]): string {
         // building "%lld", or allocating a scratch buffer: the builder appends
         // the digits (or the bytes) straight into its own storage.
         let plain = (j == i + 1);
-        if (plain && (conv == 100 || conv == 105)) {  // %d %i
+        if (plain && (conv == CHAR_LOWER_D || conv == CHAR_LOWER_I)) {  // %d %i
             if (a.kind != FA_INT) { panic("fmt: %d expects an int argument"); }
             sb.appendInt(a.i as int);
             i = j + 1;
             continue;
         }
-        if (plain && conv == 115 && a.kind == FA_STR) { // %s of a string
+        if (plain && conv == CHAR_LOWER_S && a.kind == FA_STR) { // %s of a string
             sb.append(a.s);
             i = j + 1;
             continue;
@@ -177,33 +183,34 @@ export fn fmt(f: string, args: FmtArg[]): string {
         let specNoConv = f.slice(i, j); // "%<flags><width>.<prec>", conversion excluded
         let convStr = f.slice(j, j + 1);
 
-        if (conv == 100 || conv == 105) {            // d i
+        if (conv == CHAR_LOWER_D || conv == CHAR_LOWER_I) {            // d i
             if (a.kind != FA_INT) { panic("fmt: %d expects an int argument"); }
             sb.append(run_num(specNoConv + "lld", false, false, a.i, 0.0, width, prec));
-        } else if (conv == 117) {                    // u
+        } else if (conv == CHAR_LOWER_U) {                    // u
             if (a.kind != FA_INT) { panic("fmt: %u expects an int argument"); }
             sb.append(run_num(specNoConv + "llu", false, true, a.i, 0.0, width, prec));
-        } else if (conv == 120 || conv == 88) {      // x X
+        } else if (conv == CHAR_LOWER_X || conv == CHAR_UPPER_X) {      // x X
             if (a.kind != FA_INT) { panic("fmt: %x expects an int argument"); }
             sb.append(run_num(specNoConv + "ll" + convStr, false, true, a.i, 0.0, width, prec));
-        } else if (conv == 111) {                    // o
+        } else if (conv == CHAR_LOWER_O) {   // o
             if (a.kind != FA_INT) { panic("fmt: %o expects an int argument"); }
             sb.append(run_num(specNoConv + "llo", false, true, a.i, 0.0, width, prec));
-        } else if (conv == 98) {                     // b (non-standard, handled here)
+        } else if (conv == CHAR_LOWER_B) {                     // b (non-standard, handled here)
             if (a.kind != FA_INT) { panic("fmt: %b expects an int argument"); }
             sb.append(render_bin(a.i, width, hasZero, hasMinus));
-        } else if (conv == 102 || conv == 70 || conv == 101 || conv == 69 ||
-                   conv == 103 || conv == 71) {      // f F e E g G
+        } else if (conv == CHAR_LOWER_F || conv == CHAR_UPPER_F ||   // f F
+                   conv == CHAR_LOWER_E || conv == CHAR_UPPER_E ||   // e E
+                   conv == CHAR_LOWER_G || conv == CHAR_UPPER_G) {   // g G
             if (a.kind != FA_FLOAT) { panic("fmt: floating conversion expects a float argument"); }
             sb.append(run_num(specNoConv + convStr, true, false, 0, a.f, width, prec));
-        } else if (conv == 115) {                    // s
+        } else if (conv == CHAR_LOWER_S) {                    // s
             let sv = "";
             if (a.kind == FA_STR) { sv = a.s; }
             else if (a.kind == FA_BOOL) { if (a.b) { sv = "true"; } else { sv = "false"; } }
             else { panic("fmt: %s expects a string (or bool) argument"); }
             if (hasPrec && prec < sv.len) { sv = sv.slice(0, prec); }
             sb.append(pad_field(sv, width, false, hasMinus));
-        } else if (conv == 99) {                     // c
+        } else if (conv == CHAR_LOWER_C) {   // c
             if (a.kind != FA_INT) { panic("fmt: %c expects an int argument"); }
             sb.append(pad_field(chr(a.i as int), width, false, hasMinus));
         } else {
@@ -236,7 +243,7 @@ export fn commas(v: int): string {
     // take the digits from str(v) rather than negating: -INT64_MIN overflows
     // (a checked-arithmetic panic in debug builds)
     let s = str(v);
-    let neg = s.len > 0 && s[0] == 45; // '-'
+    let neg = s.len > 0 && s[0] == CHAR_MINUS;   // -
     if (neg) { s = s.slice(1, s.len); }
     let out = "";
     let cnt = 0;

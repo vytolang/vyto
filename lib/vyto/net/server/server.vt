@@ -40,11 +40,12 @@
 
 import { Socket, PollSet, POLL_READ, POLL_WRITE,
          socket_listen_on, socket_listen_reuseport } from "vyto/net/socket";
-import { is_alnum, is_upper, CHAR_AMP, CHAR_BACKTICK, CHAR_BANG,
-         CHAR_CARET, CHAR_COLON, CHAR_CR, CHAR_DEL, CHAR_DOLLAR, CHAR_DOT,
-         CHAR_HASH, CHAR_LF, CHAR_MINUS, CHAR_PERCENT, CHAR_PIPE, CHAR_PLUS,
-         CHAR_QUESTION, CHAR_SLASH, CHAR_SPACE, CHAR_SQUOTE, CHAR_STAR,
-         CHAR_TAB, CHAR_TILDE, CHAR_UNDERSCORE } from "vyto/util/ascii";
+import { is_alnum, is_digit, is_upper, CHAR_AMP, CHAR_BACKTICK, CHAR_BANG,
+         CHAR_CARET, CHAR_CASE_SHIFT, CHAR_COLON, CHAR_CR, CHAR_DEL,
+         CHAR_DOLLAR, CHAR_DOT, CHAR_HASH, CHAR_LF, CHAR_MINUS, CHAR_PERCENT,
+         CHAR_PIPE, CHAR_PLUS, CHAR_QUESTION, CHAR_SLASH, CHAR_SPACE,
+         CHAR_SQUOTE, CHAR_STAR, CHAR_TAB, CHAR_TILDE, CHAR_UNDERSCORE,
+         CHAR_ZERO } from "vyto/util/ascii";
 import { StringBuilder } from "vyto/util/text";
 import { monoMs, monoUs, unixSec, sleepMs } from "vyto/util/time";
 import { date_from_unix, date_format } from "vyto/util/date";
@@ -268,7 +269,7 @@ fn hdr_name_is(a: string, b: string): bool {
 }
 
 fn lower_b(c: int): int {
-    if (is_upper(c)) { return c + 32; }
+    if (is_upper(c)) { return c + CHAR_CASE_SHIFT; }
     return c;
 }
 
@@ -291,9 +292,9 @@ fn hdr_eq(raw: byte[], off: int, len: int, name: string): bool {
 fn is_tchar(c: int): bool {
     if (is_alnum(c)) { return true; }
     // ! # $ % & ' * + - . ^ _ ` | ~
-    if (c == CHAR_BANG || c == CHAR_HASH || c == CHAR_DOLLAR || c == CHAR_PERCENT || c == CHAR_AMP) { return true; }
-    if (c == CHAR_SQUOTE || c == CHAR_STAR || c == CHAR_PLUS || c == CHAR_MINUS || c == CHAR_DOT) { return true; }
-    if (c == CHAR_CARET || c == CHAR_UNDERSCORE || c == CHAR_BACKTICK || c == CHAR_PIPE || c == CHAR_TILDE) { return true; }
+    if (c == CHAR_BANG || c == CHAR_HASH || c == CHAR_DOLLAR || c == CHAR_PERCENT || c == CHAR_AMP) { return true; }   // ! # $ % &
+    if (c == CHAR_SQUOTE || c == CHAR_STAR || c == CHAR_PLUS || c == CHAR_MINUS || c == CHAR_DOT) { return true; }   // ' * + - .
+    if (c == CHAR_CARET || c == CHAR_UNDERSCORE || c == CHAR_BACKTICK || c == CHAR_PIPE || c == CHAR_TILDE) { return true; }   // ^ _ ` | ~
     return false;
 }
 
@@ -310,7 +311,7 @@ fn is_hval_byte(c: int): bool {
 fn find_lf(raw: byte[], at: int, end: int): int {
     let i = at;
     while (i < end) {
-        if (raw[i] == CHAR_LF) { return i; }
+        if (raw[i] == CHAR_LF) { return i; }   // newline
         i += 1;
     }
     return -1;
@@ -338,7 +339,7 @@ fn has_nul_escape(raw: byte[], off: int, len: int): bool {
     for (let i in 0..len) {
         if (raw[off + i] != CHAR_PERCENT) { continue; }             // '%'
         if (i + 2 >= len) { continue; }
-        if (raw[off + i + 1] == 48 && raw[off + i + 2] == 48) { return true; }
+        if (raw[off + i + 1] == CHAR_ZERO && raw[off + i + 2] == CHAR_ZERO) { return true; }   // "%00"
     }
     return false;
 }
@@ -350,7 +351,7 @@ fn needs_normalising(raw: byte[], off: int, len: int): bool {
     for (let i in 0..len) {
         let c = raw[off + i];
         if (c == CHAR_PERCENT) { return true; }                     // '%'
-        if (c == CHAR_DOT && (i == 0 || raw[off + i - 1] == CHAR_SLASH)) { return true; }
+        if (c == CHAR_DOT && (i == 0 || raw[off + i - 1] == CHAR_SLASH)) { return true; }   // . /
         if (c == CHAR_SLASH && i > 0 && raw[off + i - 1] == CHAR_SLASH) { return true; }  // "//"
     }
     return false;
@@ -368,8 +369,8 @@ fn parse_uint(raw: byte[], off: int, len: int, cap: int): int {
     let v = 0;
     for (let i in 0..len) {
         let c = raw[off + i];
-        if (c < 48 || c > 57) { return -1; }
-        v = v * 10 + (c - 48);
+        if (!is_digit(c)) { return -1; }
+        v = v * 10 + (c - CHAR_ZERO);
         // Bound inside the loop, not after: a 40-digit Content-Length must not
         // be allowed to overflow before the check happens.
         if (v > cap) { return -1; }
@@ -382,9 +383,9 @@ fn parse_uint(raw: byte[], off: int, len: int, cap: int): int {
 fn find_head_end(raw: byte[], used: int): int {
     let i = 0;
     while (i + 1 < used) {
-        if (raw[i] == CHAR_LF && raw[i + 1] == CHAR_LF) { return i + 2; }
-        if (i + 3 < used && raw[i] == CHAR_CR && raw[i + 1] == CHAR_LF
-            && raw[i + 2] == CHAR_CR && raw[i + 3] == CHAR_LF) { return i + 4; }
+        if (raw[i] == CHAR_LF && raw[i + 1] == CHAR_LF) { return i + 2; }   // newline
+        if (i + 3 < used && raw[i] == CHAR_CR && raw[i + 1] == CHAR_LF   // carriage return newline
+            && raw[i + 2] == CHAR_CR && raw[i + 3] == CHAR_LF) { return i + 4; }   // carriage return newline
         i += 1;
     }
     return -1;
@@ -428,8 +429,8 @@ fn parse_int_or(s: string, dflt: int): int {
     let v = 0;
     for (let i in 0..s.len) {
         let c = s[i];
-        if (c < 48 || c > 57) { return dflt; }
-        v = v * 10 + (c - 48);
+        if (!is_digit(c)) { return dflt; }
+        v = v * 10 + (c - CHAR_ZERO);
     }
     return v;
 }
@@ -973,7 +974,7 @@ export class ServerResponse {
     // cannot be written by accident.
     fn header(name: string, value: string): ServerResponse {
         for (let i in 0..value.len) {
-            if (value[i] == CHAR_CR || value[i] == CHAR_LF) { return this; }
+            if (value[i] == CHAR_CR || value[i] == CHAR_LF) { return this; }   // carriage return newline
         }
         // RFC 7231 makes Date mandatory and the server emits it from a cache.
         // Noting an explicit one here keeps a handler that sets its own from
@@ -1234,7 +1235,7 @@ export class Server {
     // configured default, and never a scan of the handler's headers.
     fn withHeader(name: string, value: string): Server {
         for (let i in 0..value.len) {
-            if (value[i] == CHAR_CR || value[i] == CHAR_LF) { return this; }
+            if (value[i] == CHAR_CR || value[i] == CHAR_LF) { return this; }   // carriage return newline
         }
         this.dflt_names.push(name);
         this.dflt_values.push(value);
@@ -1292,11 +1293,11 @@ export class Server {
         // METHOD SP TARGET SP HTTP/1.x
         let sp1 = -1;
         let i = 0;
-        while (i < eol) { if (raw[i] == CHAR_SPACE) { sp1 = i; break; } i += 1; }
+        while (i < eol) { if (raw[i] == CHAR_SPACE) { sp1 = i; break; } i += 1; }   // space
         if (sp1 < 0) { return 400; }
         let sp2 = -1;
         i = sp1 + 1;
-        while (i < eol) { if (raw[i] == CHAR_SPACE) { sp2 = i; break; } i += 1; }
+        while (i < eol) { if (raw[i] == CHAR_SPACE) { sp2 = i; break; } i += 1; }   // space
         if (sp2 < 0) { return 400; }
 
         req.method_off = 0;
@@ -1322,20 +1323,20 @@ export class Server {
         let p_off = t_off;
         let p_len = t_len;
 
-        if (t_len == 1 && raw[t_off] == CHAR_STAR) {
+        if (t_len == 1 && raw[t_off] == CHAR_STAR) {   // *
             // asterisk-form: `OPTIONS * HTTP/1.1`. Legal, and not a path.
             req.path_off = t_off; req.path_len = 1;
             req.query_off = -1;   req.query_len = 0;
             p_len = 0;                       // nothing to normalise
-        } else if (raw[t_off] != CHAR_SLASH) {
+        } else if (raw[t_off] != CHAR_SLASH) {   // /
             // Not origin-form. Absolute-form is what a proxy sends and what we
             // used to 404 on, because the whole URI was matched against the
             // route table.
             let sch = -1;
             if (t_len >= 3) {
                 for (let k in 0..t_len - 2) {
-                    if (raw[t_off + k] == CHAR_COLON && raw[t_off + k + 1] == CHAR_SLASH
-                        && raw[t_off + k + 2] == CHAR_SLASH) { sch = k; break; }
+                    if (raw[t_off + k] == CHAR_COLON && raw[t_off + k + 1] == CHAR_SLASH   // : /
+                        && raw[t_off + k + 2] == CHAR_SLASH) { sch = k; break; }   // /
                 }
             }
             // No `://` and it does not start with `/`: authority-form, which is
@@ -1349,7 +1350,7 @@ export class Server {
             let slash = -1;
             let k2 = a;
             while (k2 < t_off + t_len) {
-                if (raw[k2] == CHAR_SLASH) { slash = k2; break; }
+                if (raw[k2] == CHAR_SLASH) { slash = k2; break; }   // /
                 k2 += 1;
             }
             if (slash < 0) {
@@ -1369,7 +1370,7 @@ export class Server {
         if (p_len > 0) {
             let qm = -1;
             for (let k in 0..p_len) {
-                if (raw[p_off + k] == CHAR_QUESTION) { qm = k; break; }
+                if (raw[p_off + k] == CHAR_QUESTION) { qm = k; break; }   // ?
             }
             if (qm < 0) {
                 req.path_off = p_off; req.path_len = p_len;
@@ -1385,7 +1386,7 @@ export class Server {
         let v_len = eol - v_off;
         if (v_len < 8) { return 400; }
         if (!hdr_eq(raw, v_off, 7, "HTTP/1.")) { return 505; }
-        let minor = raw[v_off + 7] - 48;
+        let minor = raw[v_off + 7] - CHAR_ZERO;   // ASCII digit -> value
         if (minor != 0 && minor != 1) { return 505; }
         req.version_minor = minor;
         req.keep_alive = minor == 1;      // 1.0 defaults to close
@@ -1397,7 +1398,7 @@ export class Server {
             let e = find_lf(raw, pos, used);
             if (e < 0) { return 400; }
             let line_end = e;
-            if (line_end > pos && raw[line_end - 1] == CHAR_CR) { line_end -= 1; }
+            if (line_end > pos && raw[line_end - 1] == CHAR_CR) { line_end -= 1; }   // carriage return
             if (line_end == pos) { pos = e + 1; break; }   // blank line: done
 
             hdr_bytes += (e - pos) + 1;
@@ -1409,11 +1410,11 @@ export class Server {
             // message/http. Accepting it is a smuggling vector, because whether
             // the fold joins to the previous header is exactly the thing two
             // implementations disagree about.
-            if (raw[pos] == CHAR_SPACE || raw[pos] == CHAR_TAB) { return 400; }
+            if (raw[pos] == CHAR_SPACE || raw[pos] == CHAR_TAB) { return 400; }   // space tab
 
             let colon = -1;
             let j = pos;
-            while (j < line_end) { if (raw[j] == CHAR_COLON) { colon = j; break; } j += 1; }
+            while (j < line_end) { if (raw[j] == CHAR_COLON) { colon = j; break; } j += 1; }   // :
             if (colon < 0) { return 400; }
 
             let nlen = colon - pos;
@@ -1428,9 +1429,9 @@ export class Server {
 
             // trim OWS around the value
             let vs = colon + 1;
-            while (vs < line_end && (raw[vs] == CHAR_SPACE || raw[vs] == CHAR_TAB)) { vs += 1; }
+            while (vs < line_end && (raw[vs] == CHAR_SPACE || raw[vs] == CHAR_TAB)) { vs += 1; }   // space tab
             let ve = line_end;
-            while (ve > vs && (raw[ve - 1] == CHAR_SPACE || raw[ve - 1] == CHAR_TAB)) { ve -= 1; }
+            while (ve > vs && (raw[ve - 1] == CHAR_SPACE || raw[ve - 1] == CHAR_TAB)) { ve -= 1; }   // space tab
 
             for (let k in vs..ve) {
                 if (!is_hval_byte(raw[k])) { return 400; }
@@ -1527,7 +1528,7 @@ export class Server {
                 let digits = req.hval_len[cl_first] > 0;
                 for (let k in 0..req.hval_len[cl_first]) {
                     let c = raw[req.hval_off[cl_first] + k];
-                    if (c < 48 || c > 57) { digits = false; break; }
+                    if (!is_digit(c)) { digits = false; break; }
                 }
                 if (digits) { return 413; }
                 return 400;
@@ -1550,7 +1551,7 @@ export class Server {
             // structural — there is no escaping path for a later check to catch.
             // The guard below is belt-and-braces against that behaviour changing.
             let norm = remove_dot_segments(dec);
-            if (norm.len >= 3 && norm[0] == CHAR_DOT && norm[1] == CHAR_DOT && norm[2] == CHAR_SLASH) { return 400; }
+            if (norm.len >= 3 && norm[0] == CHAR_DOT && norm[1] == CHAR_DOT && norm[2] == CHAR_SLASH) { return 400; }   // . /
             if (norm == "..") { return 400; }
             if (norm.len == 0) { norm = "/"; }
             req.norm_path = norm;
@@ -1727,9 +1728,9 @@ export class Server {
                 let scan = 0;
                 let seen = -1;
                 while (scan + 1 < used) {
-                    if (raw[scan] == CHAR_LF && raw[scan + 1] == CHAR_LF) { seen = scan + 2; break; }
-                    if (scan + 3 < used && raw[scan] == CHAR_CR && raw[scan + 1] == CHAR_LF
-                        && raw[scan + 2] == CHAR_CR && raw[scan + 3] == CHAR_LF) { seen = scan + 4; break; }
+                    if (raw[scan] == CHAR_LF && raw[scan + 1] == CHAR_LF) { seen = scan + 2; break; }   // newline
+                    if (scan + 3 < used && raw[scan] == CHAR_CR && raw[scan + 1] == CHAR_LF   // carriage return newline
+                        && raw[scan + 2] == CHAR_CR && raw[scan + 3] == CHAR_LF) { seen = scan + 4; break; }   // carriage return newline
                     scan += 1;
                 }
                 if (seen >= 0) { hdr_end = seen; break; }

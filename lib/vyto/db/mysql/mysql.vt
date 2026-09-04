@@ -85,6 +85,9 @@ import { MySession, MyRowBuffer, MyPrepared } from "vyto/db/mysql/session";
 import { MyColumn, MyParam, MyReader, decodeBinaryRow, decodeError, decodeOk,
          decodeColumnDef } from "vyto/db/mysql/proto";
 import { decodeBinary, encodeParam } from "vyto/db/mysql/mytype";
+import { is_lower, CHAR_BACKTICK, CHAR_CASE_SHIFT, CHAR_CR, CHAR_LF,
+         CHAR_MINUS, CHAR_SLASH, CHAR_SPACE, CHAR_STAR, CHAR_TAB,
+         CHAR_UPPER_E, CHAR_UPPER_S, CHAR_UPPER_U } from "vyto/util/ascii";
 
 const DEFAULT_PORT: int = 3306;
 
@@ -678,11 +681,12 @@ fn changesSchema(sql: string): bool {
     let c0 = upperByte(sql[i]);
     let c1 = upperByte(sql[i + 1]);
     let c2 = upperByte(sql[i + 2]);
-    if (c0 != 85 || c1 != 83 || c2 != 69) { return false; }        // U S E
+    if (c0 != CHAR_UPPER_U || c1 != CHAR_UPPER_S || c2 != CHAR_UPPER_E) { return false; }
     // Must be the whole keyword: "USER" and "USE_X" are not this.
     if (i + 3 >= sql.len) { return true; }
     let n = sql[i + 3];
-    return n == 32 || n == 9 || n == 10 || n == 13 || n == 96;     // space/tab/nl/cr/backtick
+    return n == CHAR_SPACE || n == CHAR_TAB || n == CHAR_LF || n == CHAR_CR
+        || n == CHAR_BACKTICK;
 }
 
 // Past leading whitespace, `-- ...` line comments and `/* ... */ block comments.
@@ -690,14 +694,14 @@ fn skipLeading(s: string): int {
     let i = 0;
     while (i < s.len) {
         let c = s[i];
-        if (c == 32 || c == 9 || c == 10 || c == 13) { i += 1; continue; }
-        if (c == 45 && i + 1 < s.len && s[i + 1] == 45) {          // "--"
-            while (i < s.len && s[i] != 10) { i += 1; }
+        if (c == CHAR_SPACE || c == CHAR_TAB || c == CHAR_LF || c == CHAR_CR) { i += 1; continue; }
+        if (c == CHAR_MINUS && i + 1 < s.len && s[i + 1] == CHAR_MINUS) {      // "--"
+            while (i < s.len && s[i] != CHAR_LF) { i += 1; }
             continue;
         }
-        if (c == 47 && i + 1 < s.len && s[i + 1] == 42) {          // "/*"
+        if (c == CHAR_SLASH && i + 1 < s.len && s[i + 1] == CHAR_STAR) {       // "/*"
             i += 2;
-            while (i + 1 < s.len && !(s[i] == 42 && s[i + 1] == 47)) { i += 1; }
+            while (i + 1 < s.len && !(s[i] == CHAR_STAR && s[i + 1] == CHAR_SLASH)) { i += 1; }   // "*/"
             i += 2;
             continue;
         }
@@ -707,7 +711,7 @@ fn skipLeading(s: string): int {
 }
 
 fn upperByte(c: int): int {
-    if (c >= 97 && c <= 122) { return c - 32; }
+    if (is_lower(c)) { return c - CHAR_CASE_SHIFT; }   // fold to upper
     return c;
 }
 
