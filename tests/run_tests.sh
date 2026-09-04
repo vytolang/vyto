@@ -714,6 +714,20 @@ else
     fail=1
 fi
 
+# --- float semantics: literals, comparison, rounding, transcendentals, the
+#     inf/nan edges and str() round-tripping. 90 assertions, pure Vyto, and it
+#     lives in apps/ only because that is where it was written — it is a
+#     language test, not an app, so it runs here rather than with the app
+#     builds. Sub-second, unlike the large apps make test deliberately skips. ---
+got=$(./vytoc run apps/float_paranoia.vt 2>&1)
+if [ "$got" = "$(cat apps/float_paranoia.expected)" ]; then
+    echo "PASS float_paranoia"
+else
+    echo "FAIL float_paranoia"
+    printf '%s\n' "$got" | grep '^FAIL' | head -20
+    fail=1
+fi
+
 # --- vyto/math/stats: descriptive statistics over float[]/int[] (pure Vyto) ---
 got=$(./vytoc run tests/fixtures/math_stats.vt 2>&1)
 if [ "$got" = "$(cat tests/fixtures/math_stats.expected)" ]; then
