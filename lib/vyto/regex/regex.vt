@@ -31,7 +31,12 @@
 //     a truncated result would be indistinguishable from a real one).
 //
 // Replacement strings use PCRE2's syntax: $1, ${name}, $$ for a literal
-// dollar. Not \1.
+// dollar. Not \1. A malformed one — a trailing "$", or "$9"/"${nope}" naming a
+// group the pattern does not have — PANICS, for the reason above: replace
+// returns a plain string, so there is nowhere to report it and a silently
+// wrong substitution is worse than a loud stop. The message quotes the
+// REPLACEMENT rather than the pattern, which is the string actually at fault.
+// Pass RX_SUB_UNSET_EMPTY to make an unset group substitute as "" instead.
 //
 // Ownership: a Regex owns a compiled pattern, its match data and its match
 // context; deinit frees all three. Because the match data is allocated once
@@ -68,6 +73,7 @@ export const RX_NO_MATCH:      int = 1;
 export const RX_ERR_LIMIT:     int = 2;   // backtracking budget exhausted
 export const RX_ERR_UTF:       int = 3;   // subject is not valid UTF-8
 export const RX_ERR_INTERNAL:  int = 4;
+export const RX_ERR_BADREPL:   int = 5;   // replacement template, not the pattern
 
 // ---- default limits, as set on every new Regex ---------------------------
 export const RX_DEFAULT_MATCH_LIMIT: int = 1000000;
@@ -148,6 +154,7 @@ fn code_of(rc: int): int {
     if (rc == -1) { return RX_NO_MATCH; }
     if (rc == -2) { return RX_ERR_LIMIT; }
     if (rc == -3) { return RX_ERR_UTF; }
+    if (rc == -5) { return RX_ERR_BADREPL; }
     return RX_ERR_INTERNAL;
 }
 
@@ -156,6 +163,12 @@ fn code_text(code: int): string {
     if (code == RX_NO_MATCH)  { return "no match"; }
     if (code == RX_ERR_LIMIT) { return "match limit exceeded"; }
     if (code == RX_ERR_UTF)   { return "subject is not valid UTF-8"; }
+    if (code == RX_ERR_BADREPL) {
+        return "the replacement names a group the match does not have: a '$' "
+             + "must be followed by a digit, {name}, or another '$', and the "
+             + "group must exist and have participated (for an optional group "
+             + "that did not match, pass RX_SUB_UNSET_EMPTY)";
+    }
     return "internal regex error";
 }
 
@@ -469,7 +482,11 @@ export class Regex {
                                buf as cstring, cap as i64) as int;
         }
         if (n < 0) {
-            panic("vyto/regex: replace failed: " + code_text(code_of(n)));
+            // The replacement is quoted, not the pattern: every failure this
+            // can report is a property of `repl`, and naming the pattern sent
+            // readers to the wrong string.
+            panic("vyto/regex: replace failed for replacement '" + repl + "': "
+                + code_text(code_of(n)));
         }
         return strbytes(buf, n);
     }
@@ -921,7 +938,12 @@ fn cached_subst(pattern: string, s: string, repl: string,
                                   buf as cstring, cap as i64) as int;
     }
     if (n < 0) {
-        panic("vyto/regex: replace failed for '" + pattern + "'");
+        if (code_of(n) == RX_ERR_BADREPL) {
+            panic("vyto/regex: replace failed for replacement '" + repl + "': "
+                + code_text(RX_ERR_BADREPL));
+        }
+        panic("vyto/regex: replace failed for '" + pattern + "': "
+            + code_text(code_of(n)));
     }
     return strbytes(buf, n);
 }

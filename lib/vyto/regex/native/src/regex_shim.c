@@ -57,6 +57,13 @@
 #define VRE_LIMIT     (-2)
 #define VRE_BADUTF    (-3)
 #define VRE_INTERNAL  (-4)
+/* Substitution only: the template and the subject disagree. Either the
+   replacement is malformed ("$" at the end), or it references a group that
+   does not exist ("$9") or that did not participate in this match (an unset
+   "(x)?"). Separate from VRE_INTERNAL so the Vyto side can name the template
+   instead of blaming the engine; the last case is fixable by the caller with
+   RX_SUB_UNSET_EMPTY. */
+#define VRE_BADREPL   (-5)
 
 /* Runtime limits applied to every context we create. Deliberately far below
    PCRE2's compile-time ceilings in config.h: those are "don't hang forever"
@@ -500,6 +507,13 @@ long vre_substitute(void *vh, const char *subj, long slen,
     /* With OVERFLOW_LENGTH, a too-small buffer still reports the length needed
        (including the terminating NUL, which the caller's retry allows for). */
     if (rc == PCRE2_ERROR_NOMEMORY) return (long)outlen;
+    /* A bad replacement is the caller's data, not an engine fault. PCRE2 spells
+       it three ways: BADREPLACEMENT for a malformed template, BADREPESCAPE for
+       a bad escape in one, NOSUBSTRING for a group reference that does not
+       resolve. classify() would fold all three into VRE_INTERNAL. */
+    if (rc == PCRE2_ERROR_BADREPLACEMENT || rc == PCRE2_ERROR_BADREPESCAPE ||
+        rc == PCRE2_ERROR_NOSUBSTRING    || rc == PCRE2_ERROR_UNSET)
+        return VRE_BADREPL;
     if (rc < 0) return classify(rc);   /* -2 limit, -3 bad utf, -4 internal */
     return (long)outlen;
 }
