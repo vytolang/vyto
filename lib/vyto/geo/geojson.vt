@@ -17,8 +17,7 @@
 
 import { LatLon, BBox, Geometry, GEOM_POINT, GEOM_LINE, GEOM_POLYGON,
          bboxEmpty } from "vyto/geo";
-import { JsonValue, json_parse, JS_ARR, JS_OBJ, JS_STR, JS_NUM,
-         JS_BOOL } from "vyto/util/json";
+import { JsonValue, json_parse, JSON } from "vyto/util/json";
 
 // A geometry with its properties.
 //
@@ -63,7 +62,7 @@ export class GeoFeature {
 // A GeoJSON position is [lon, lat] or [lon, lat, alt]. Anything shorter is
 // skipped rather than read past the end.
 fn readPosition(v: JsonValue, lons: float[], lats: float[], alts: float[]): bool {
-    if (v.kind != JS_ARR || v.len() < 2) { return false; }
+    if (v.kind != JSON.ARR || v.len() < 2) { return false; }
     lons.push(v.at(0).asFloat());
     lats.push(v.at(1).asFloat());
     // The third element is altitude. Dropping it is the easy mistake: terrain,
@@ -74,7 +73,7 @@ fn readPosition(v: JsonValue, lons: float[], lats: float[], alts: float[]): bool
 
 // An array of positions — one LineString, or one ring of a Polygon.
 fn readPositions(v: JsonValue, g: Geometry, outer: bool) {
-    if (v.kind != JS_ARR) { return; }
+    if (v.kind != JSON.ARR) { return; }
     let lons: float[] = [];
     let lats: float[] = [];
     let alts: float[] = [];
@@ -90,7 +89,7 @@ fn readPositions(v: JsonValue, g: Geometry, outer: bool) {
 // what partOuter is for, and it is why a MultiPolygon's second polygon does
 // not get mistaken for a hole in the first.
 fn readRings(v: JsonValue, g: Geometry) {
-    if (v.kind != JS_ARR) { return; }
+    if (v.kind != JSON.ARR) { return; }
     let i = 0;
     while (i < v.len()) {
         readPositions(v.at(i), g, i == 0);
@@ -106,12 +105,12 @@ fn readRings(v: JsonValue, g: Geometry) {
 // malformed one. GeometryCollection is not handled here — it has no single
 // kind, so parseGeoJsonValue flattens it into separate features instead.
 export fn geometryFromJson(v: JsonValue): Geometry {
-    if (v.kind != JS_OBJ) { return null; }
+    if (v.kind != JSON.OBJ) { return null; }
     let t = v.get("type");
-    if (t.kind != JS_STR) { return null; }
+    if (t.kind != JSON.STR) { return null; }
     let kind = t.asString();
     let coords = v.get("coordinates");
-    if (coords.kind != JS_ARR) { return null; }
+    if (coords.kind != JSON.ARR) { return null; }
 
     if (kind == "Point") {
         let g = new Geometry(GEOM_POINT);
@@ -173,9 +172,9 @@ export fn geometryFromJson(v: JsonValue): Geometry {
 // ---------------------------------------------------------------------------
 
 fn scalarToString(v: JsonValue): string {
-    if (v.kind == JS_STR) { return v.asString(); }
-    if (v.kind == JS_BOOL) { if (v.asBool()) { return "true"; } return "false"; }
-    if (v.kind == JS_NUM) {
+    if (v.kind == JSON.STR) { return v.asString(); }
+    if (v.kind == JSON.BOOL) { if (v.asBool()) { return "true"; } return "false"; }
+    if (v.kind == JSON.NUM) {
         let f = v.asFloat();
         let i = f as int;
         // Integral values print as integers: "3", not "3.000000". Zoom
@@ -188,14 +187,14 @@ fn scalarToString(v: JsonValue): string {
 }
 
 fn readProps(v: JsonValue, f: GeoFeature) {
-    if (v.kind != JS_OBJ) { return; }
+    if (v.kind != JSON.OBJ) { return; }
     let keys = v.objKeys();
     let i = 0;
     while (i < keys.len) {
         let val = v.get(keys[i]);
         // Objects and arrays have no useful flat form, so they are skipped
         // rather than stringified into something no caller can use.
-        if (val.kind != JS_OBJ && val.kind != JS_ARR) {
+        if (val.kind != JSON.OBJ && val.kind != JSON.ARR) {
             f.props.set(keys[i], scalarToString(val));
         }
         i = i + 1;
@@ -212,11 +211,11 @@ fn addFeature(out: GeoFeature[], v: JsonValue) {
     // A GeometryCollection has no single kind, so it becomes one feature per
     // member, each carrying a copy of the parent's properties. That keeps
     // Geometry's invariant that a shape has one kind.
-    if (geomV.kind == JS_OBJ) {
+    if (geomV.kind == JSON.OBJ) {
         let t = geomV.get("type");
-        if (t.kind == JS_STR && t.asString() == "GeometryCollection") {
+        if (t.kind == JSON.STR && t.asString() == "GeometryCollection") {
             let members = geomV.get("geometries");
-            if (members.kind != JS_ARR) { return; }
+            if (members.kind != JSON.ARR) { return; }
             let i = 0;
             while (i < members.len()) {
                 let g = geometryFromJson(members.at(i));
@@ -249,18 +248,18 @@ fn addFeature(out: GeoFeature[], v: JsonValue) {
 // caller writing the same three-way branch.
 export fn parseGeoJsonValue(root: JsonValue): GeoFeature[] {
     let out: GeoFeature[] = [];
-    if (root == null || root.kind != JS_OBJ) { return out; }
+    if (root == null || root.kind != JSON.OBJ) { return out; }
     let t = root.get("type");
-    if (t.kind != JS_STR) { return out; }
+    if (t.kind != JSON.STR) { return out; }
     let kind = t.asString();
 
     if (kind == "FeatureCollection") {
         let feats = root.get("features");
-        if (feats.kind != JS_ARR) { return out; }
+        if (feats.kind != JSON.ARR) { return out; }
         let i = 0;
         while (i < feats.len()) {
             let f = feats.at(i);
-            if (f.kind == JS_OBJ) { addFeature(out, f); }
+            if (f.kind == JSON.OBJ) { addFeature(out, f); }
             i = i + 1;
         }
         return out;

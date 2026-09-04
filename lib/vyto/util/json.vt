@@ -22,21 +22,18 @@
 import { fmt, fs, fi } from "vyto/util/fmt";
 import { StringBuilder } from "vyto/util/text";
 
-export const JS_NULL:  int = 0;
-export const JS_BOOL:  int = 1;
-export const JS_NUM:   int = 2;
-export const JS_STR:   int = 3;
-export const JS_ARR:   int = 4;
-export const JS_OBJ:   int = 5;
+// What a JsonValue is. The payload it selects among lives in the flattened
+// num/bstr/bval/arr/keys/vals fields below, which the tag does not police.
+export enum JSON { NULL, BOOL, NUM, STR, ARR, OBJ }
 
 export class JsonValue {
-    kind: int;
+    kind: JSON;
     num: float;
-    bstr: string;               // string payload (kind == JS_STR)
-    bval: bool;                 // bool payload (kind == JS_BOOL)
-    arr: JsonValue[];           // array elements (kind == JS_ARR only)
-    keys: string[];             // object key insertion order (kind == JS_OBJ)
-    vals: JsonValue[];          // object member values, parallel to keys (JS_OBJ)
+    bstr: string;               // string payload (kind == JSON.STR)
+    bval: bool;                 // bool payload (kind == JSON.BOOL)
+    arr: JsonValue[];           // array elements (kind == JSON.ARR only)
+    keys: string[];             // object key insertion order (kind == JSON.OBJ)
+    vals: JsonValue[];          // object member values, parallel to keys (JSON.OBJ)
     err: string;                // non-empty only on a parse-failure root
 
     // Sub-containers are allocated per kind, not up front: a leaf (null / bool /
@@ -44,23 +41,23 @@ export class JsonValue {
     // arrays (linear scan) rather than a hash Map, so a small object costs two
     // tiny arrays instead of a 64-bucket table — the difference between ~2.7 GB
     // and ~0.3 GB when parsing a million-object document.
-    fn init(k: int) {
+    fn init(k: JSON) {
         this.kind = k;
         this.err = "";
-        if (k == JS_ARR) { this.arr = []; }
-        if (k == JS_OBJ) { this.keys = []; this.vals = []; }
+        if (k == JSON.ARR) { this.arr = []; }
+        if (k == JSON.OBJ) { this.keys = []; this.vals = []; }
     }
 
-    fn isNull(): bool { return this.kind == JS_NULL; }
-    fn isObj(): bool  { return this.kind == JS_OBJ; }
-    fn isArr(): bool  { return this.kind == JS_ARR; }
-    fn isNum(): bool  { return this.kind == JS_NUM; }
-    fn isStr(): bool  { return this.kind == JS_STR; }
-    fn isBool(): bool { return this.kind == JS_BOOL; }
+    fn isNull(): bool { return this.kind == JSON.NULL; }
+    fn isObj(): bool  { return this.kind == JSON.OBJ; }
+    fn isArr(): bool  { return this.kind == JSON.ARR; }
+    fn isNum(): bool  { return this.kind == JSON.NUM; }
+    fn isStr(): bool  { return this.kind == JSON.STR; }
+    fn isBool(): bool { return this.kind == JSON.BOOL; }
 
     // Index of member `k` in an object's key list, or -1 (linear scan).
     fn keyIndex(k: string): int {
-        if (this.kind != JS_OBJ) { return -1; }
+        if (this.kind != JSON.OBJ) { return -1; }
         let i = 0;
         while (i < this.keys.len) {
             if (this.keys[i] == k) { return i; }
@@ -73,42 +70,42 @@ export class JsonValue {
     fn get(k: string): JsonValue {
         let idx = this.keyIndex(k);
         if (idx >= 0) { return this.vals[idx]; }
-        return new JsonValue(JS_NULL);
+        return new JsonValue(JSON.NULL);
     }
     fn has(k: string): bool { return this.keyIndex(k) >= 0; }
 
     // Array element, or a Null value if not an array / index out of range.
     fn at(i: int): JsonValue {
-        if (this.kind == JS_ARR && i >= 0 && i < this.arr.len) { return this.arr[i]; }
-        return new JsonValue(JS_NULL);
+        if (this.kind == JSON.ARR && i >= 0 && i < this.arr.len) { return this.arr[i]; }
+        return new JsonValue(JSON.NULL);
     }
 
     // Element count for arrays and objects; 0 otherwise.
     fn len(): int {
-        if (this.kind == JS_ARR) { return this.arr.len; }
-        if (this.kind == JS_OBJ) { return this.keys.len; }
+        if (this.kind == JSON.ARR) { return this.arr.len; }
+        if (this.kind == JSON.OBJ) { return this.keys.len; }
         return 0;
     }
 
     fn asFloat(): float {
-        if (this.kind == JS_NUM) { return this.num; }
-        if (this.kind == JS_BOOL) { if (this.bval) { return 1.0; } return 0.0; }
+        if (this.kind == JSON.NUM) { return this.num; }
+        if (this.kind == JSON.BOOL) { if (this.bval) { return 1.0; } return 0.0; }
         return 0.0;
     }
     fn asInt(): int { return this.asFloat() as int; }
     fn asBool(): bool {
-        if (this.kind == JS_BOOL) { return this.bval; }
-        if (this.kind == JS_NUM) { return this.num != 0.0; }
+        if (this.kind == JSON.BOOL) { return this.bval; }
+        if (this.kind == JSON.NUM) { return this.num != 0.0; }
         return false;
     }
     fn asString(): string {
-        if (this.kind == JS_STR) { return this.bstr; }
+        if (this.kind == JSON.STR) { return this.bstr; }
         return "";
     }
 
     // Object keys in insertion order (empty for non-objects).
     fn objKeys(): string[] {
-        if (this.kind == JS_OBJ) { return this.keys; }
+        if (this.kind == JSON.OBJ) { return this.keys; }
         return [];
     }
 
@@ -116,13 +113,13 @@ export class JsonValue {
 
     // Add/replace a member (only meaningful on an object).
     fn set(k: string, v: JsonValue) {
-        if (this.kind != JS_OBJ) { return; }
+        if (this.kind != JSON.OBJ) { return; }
         let idx = this.keyIndex(k);
         if (idx >= 0) { this.vals[idx] = v; }
         else { this.keys.push(k); this.vals.push(v); }
     }
     fn append(v: JsonValue) {
-        if (this.kind != JS_ARR) { return; }
+        if (this.kind != JSON.ARR) { return; }
         this.arr.push(v);
     }
 
@@ -140,13 +137,13 @@ export class JsonValue {
 
 // ---- constructors --------------------------------------------------------
 
-export fn jnull(): JsonValue { return new JsonValue(JS_NULL); }
-export fn jbool(b: bool): JsonValue { let v = new JsonValue(JS_BOOL); v.bval = b; return v; }
-export fn jnum(n: float): JsonValue { let v = new JsonValue(JS_NUM); v.num = n; return v; }
-export fn jint(n: int): JsonValue { let v = new JsonValue(JS_NUM); v.num = n as float; return v; }
-export fn jstr(s: string): JsonValue { let v = new JsonValue(JS_STR); v.bstr = s; return v; }
-export fn jarr(): JsonValue { return new JsonValue(JS_ARR); }
-export fn jobj(): JsonValue { return new JsonValue(JS_OBJ); }
+export fn jnull(): JsonValue { return new JsonValue(JSON.NULL); }
+export fn jbool(b: bool): JsonValue { let v = new JsonValue(JSON.BOOL); v.bval = b; return v; }
+export fn jnum(n: float): JsonValue { let v = new JsonValue(JSON.NUM); v.num = n; return v; }
+export fn jint(n: int): JsonValue { let v = new JsonValue(JSON.NUM); v.num = n as float; return v; }
+export fn jstr(s: string): JsonValue { let v = new JsonValue(JSON.STR); v.bstr = s; return v; }
+export fn jarr(): JsonValue { return new JsonValue(JSON.ARR); }
+export fn jobj(): JsonValue { return new JsonValue(JSON.OBJ); }
 
 // ---- parser --------------------------------------------------------------
 
@@ -166,7 +163,7 @@ class Parser {
 
     fn fail(msg: string): JsonValue {
         if (this.err == "") { this.err = fmt("%s at byte %d", [fs(msg), fi(this.pos)]); }
-        let v = new JsonValue(JS_NULL);
+        let v = new JsonValue(JSON.NULL);
         v.err = this.err;
         return v;
     }
@@ -677,11 +674,13 @@ fn append_num(sb: StringBuilder, x: float) {
 // trips this — a programmer error, so panic (not sentinel).
 fn write_sb(v: JsonValue, sb: StringBuilder, pretty: bool, depth: int) {
     if (depth > JSON_MAX_DEPTH) { panic("json: stringify nesting deeper than 1024 levels"); }
-    if (v.kind == JS_NULL) { sb.append("null"); return; }
-    if (v.kind == JS_BOOL) { if (v.bval) { sb.append("true"); } else { sb.append("false"); } return; }
-    if (v.kind == JS_NUM) { append_num(sb, v.num); return; }
-    if (v.kind == JS_STR) { quote_into(sb, v.bstr); return; }
-    if (v.kind == JS_ARR) {
+    switch (v.kind) {
+    case JSON.NULL: { sb.append("null"); return; }
+    case JSON.BOOL: { if (v.bval) { sb.append("true"); } else { sb.append("false"); } return; }
+    case JSON.NUM:  { append_num(sb, v.num); return; }
+    case JSON.STR:  { quote_into(sb, v.bstr); return; }
+    case JSON.OBJ:  { }   // falls through to the object writer below
+    case JSON.ARR: {
         sb.append("[");
         let i = 0;
         while (i < v.arr.len) {
@@ -693,6 +692,7 @@ fn write_sb(v: JsonValue, sb: StringBuilder, pretty: bool, depth: int) {
         if (pretty && v.arr.len > 0) { sb.append("\n"); sb.append(indent(depth)); }
         sb.append("]");
         return;
+    }
     }
     // object
     sb.append("{");

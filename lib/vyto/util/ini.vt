@@ -23,13 +23,13 @@
 //   * **Every value is a string.** INI has no types — `port = 8080` and
 //     `port = "8080"` are the same file. Use asString() then to_int(), or
 //     vyto/cli's non-panicking parse_int, rather than asInt(), which reads a
-//     JS_STR as 0.
+//     JSON.STR as 0.
 //   * Sections are flat by default: `[a.b]` is one section whose name contains
 //     a dot. Pass `true` to ini_parse_nested when the dots mean nesting.
 //   * A repeated key replaces the earlier one, and a repeated `[section]`
 //     reopens it. Both are what the Python and Git readers do.
 
-import { JsonValue, jnull, jstr, jobj, JS_NULL, JS_STR, JS_OBJ, JS_ARR }
+import { JsonValue, jnull, jstr, jobj, JSON }
     from "vyto/util/json";
 import { StringBuilder } from "vyto/util/text";
 
@@ -62,7 +62,7 @@ fn parse(text: string, nested: bool): JsonValue {
             let name = line.slice(1, close).trim();
             if (name.len == 0) { return failure(root, "empty section name", lineNo); }
             cur = section(root, name, nested);
-            if (cur.kind != JS_OBJ) {
+            if (cur.kind != JSON.OBJ) {
                 return failure(root, "section '" + name + "' collides with a key", lineNo);
             }
             continue;
@@ -102,7 +102,7 @@ fn section(root: JsonValue, name: string, nested: bool): JsonValue {
         let k = parts[i].trim();
         if (k.len > 0) {
             node = child(node, k);
-            if (node.kind != JS_OBJ) { return node; }
+            if (node.kind != JSON.OBJ) { return node; }
         }
         i += 1;
     }
@@ -154,14 +154,14 @@ fn unquote(v: string): string {
 // library-wide "panic hard, sentinel soft" rule. Flatten first, or use
 // vyto/util/toml, which has a format for it.
 export fn ini_encode(v: JsonValue): string {
-    if (v.kind != JS_OBJ) { panic("vyto/util/ini: ini_encode needs an object at the root"); }
+    if (v.kind != JSON.OBJ) { panic("vyto/util/ini: ini_encode needs an object at the root"); }
     let sb = new StringBuilder(256);
     let keys = v.objKeys();
 
     let i = 0;
     while (i < keys.len) {
         let val = v.get(keys[i]);
-        if (val.kind != JS_OBJ) {
+        if (val.kind != JSON.OBJ) {
             sb.append(keys[i]).append(" = ").append(scalar_text(val)).append("\n");
         }
         i += 1;
@@ -170,14 +170,14 @@ export fn ini_encode(v: JsonValue): string {
     i = 0;
     while (i < keys.len) {
         let val = v.get(keys[i]);
-        if (val.kind == JS_OBJ) {
+        if (val.kind == JSON.OBJ) {
             if (sb.len() > 0) { sb.append("\n"); }
             sb.append("[").append(keys[i]).append("]\n");
             let sub = val.objKeys();
             let j = 0;
             while (j < sub.len) {
                 let sv = val.get(sub[j]);
-                if (sv.kind == JS_OBJ) {
+                if (sv.kind == JSON.OBJ) {
                     panic("vyto/util/ini: INI has no nested sections ('" + keys[i] + "." + sub[j] + "')");
                 }
                 sb.append(sub[j]).append(" = ").append(scalar_text(sv)).append("\n");
@@ -190,10 +190,10 @@ export fn ini_encode(v: JsonValue): string {
 }
 
 fn scalar_text(v: JsonValue): string {
-    if (v.kind == JS_ARR) { panic("vyto/util/ini: INI has no arrays"); }
-    if (v.kind == JS_NULL) { panic("vyto/util/ini: INI has no null; remove the key instead"); }
+    if (v.kind == JSON.ARR) { panic("vyto/util/ini: INI has no arrays"); }
+    if (v.kind == JSON.NULL) { panic("vyto/util/ini: INI has no null; remove the key instead"); }
     let s = "";
-    if (v.kind == JS_STR) { s = v.asString(); }
+    if (v.kind == JSON.STR) { s = v.asString(); }
     else { s = v.stringify(); }
     if (s.len == 0) { return s; }
     let f = s[0];

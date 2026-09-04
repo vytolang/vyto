@@ -38,7 +38,7 @@
 // which no JSON parser accepts. toml_encode round-trips them correctly.
 
 import { JsonValue, jnull, jbool, jnum, jstr, jarr, jobj,
-         JS_NULL, JS_BOOL, JS_NUM, JS_STR, JS_ARR, JS_OBJ } from "vyto/util/json";
+         JSON } from "vyto/util/json";
 import { StringBuilder } from "vyto/util/text";
 
 // Nesting bound, as in json.vt: arrays and inline tables recurse, so hostile
@@ -209,7 +209,7 @@ class TomlParser {
             let last = i == parts.len - 1;
             let k = parts[i];
             let nxt = node.get(k);
-            if (nxt.kind == JS_NULL && !node.has(k)) {
+            if (nxt.kind == JSON.NULL && !node.has(k)) {
                 if (last && arrayOfTables) {
                     let a = jarr();
                     node.set(k, a);
@@ -221,7 +221,7 @@ class TomlParser {
                 node.set(k, t);
                 node = t;
             } else {
-                if (nxt.kind == JS_ARR) {
+                if (nxt.kind == JSON.ARR) {
                     if (last && arrayOfTables) {
                         let t = jobj();
                         nxt.append(t);
@@ -235,7 +235,7 @@ class TomlParser {
                     }
                     node = nxt.at(nxt.len() - 1);
                 } else {
-                    if (nxt.kind != JS_OBJ) {
+                    if (nxt.kind != JSON.OBJ) {
                         this.fail("key '" + k + "' is not a table");
                         return node;
                     }
@@ -289,7 +289,7 @@ class TomlParser {
                 node = t;
             } else {
                 let nxt = node.get(k);
-                if (nxt.kind != JS_OBJ) {
+                if (nxt.kind != JSON.OBJ) {
                     this.fail("key '" + k + "' is not a table");
                     return false;
                 }
@@ -627,7 +627,7 @@ class TomlParser {
         this.pos = start + tok.len;
         if (tok.len == 0) { return this.fail("expected a value"); }
         let v = classify(tok);
-        if (v.kind == JS_NULL) { return this.fail("invalid value '" + tok + "'"); }
+        if (v.kind == JSON.NULL) { return this.fail("invalid value '" + tok + "'"); }
         return v;
     }
 
@@ -859,7 +859,7 @@ export fn toml_failed(v: JsonValue): bool { return v.parseError() != ""; }
 // scalars) — an encoder failure is a programmer error, which is the
 // library-wide "panic hard, sentinel soft" rule.
 export fn toml_encode(v: JsonValue): string {
-    if (v.kind != JS_OBJ) { panic("vyto/util/toml: toml_encode needs an object at the root"); }
+    if (v.kind != JSON.OBJ) { panic("vyto/util/toml: toml_encode needs an object at the root"); }
     let sb = new StringBuilder(256);
     write_table(v, [], sb);
     return sb.toString();
@@ -912,15 +912,15 @@ fn write_table(t: JsonValue, path: string[], sb: StringBuilder) {
     }
 }
 
-fn is_table(v: JsonValue): bool { return v.kind == JS_OBJ; }
+fn is_table(v: JsonValue): bool { return v.kind == JSON.OBJ; }
 
 // An array of tables only if it is non-empty and *every* element is a table:
 // an empty array is written inline, and a mixed one is an error at write time.
 fn is_table_array(v: JsonValue): bool {
-    if (v.kind != JS_ARR || v.len() == 0) { return false; }
+    if (v.kind != JSON.ARR || v.len() == 0) { return false; }
     let i = 0;
     while (i < v.len()) {
-        if (v.at(i).kind != JS_OBJ) { return false; }
+        if (v.at(i).kind != JSON.OBJ) { return false; }
         i += 1;
     }
     return true;
@@ -964,13 +964,13 @@ fn encode_key(k: string): string {
 }
 
 fn write_value(v: JsonValue, sb: StringBuilder) {
-    if (v.kind == JS_STR) { sb.append(quote_basic(v.asString())); return; }
-    if (v.kind == JS_BOOL) {
+    if (v.kind == JSON.STR) { sb.append(quote_basic(v.asString())); return; }
+    if (v.kind == JSON.BOOL) {
         if (v.asBool()) { sb.append("true"); } else { sb.append("false"); }
         return;
     }
-    if (v.kind == JS_NUM) { sb.append(format_number(v.asFloat())); return; }
-    if (v.kind == JS_ARR) {
+    if (v.kind == JSON.NUM) { sb.append(format_number(v.asFloat())); return; }
+    if (v.kind == JSON.ARR) {
         sb.append("[");
         let i = 0;
         while (i < v.len()) {
@@ -981,7 +981,7 @@ fn write_value(v: JsonValue, sb: StringBuilder) {
         sb.append("]");
         return;
     }
-    if (v.kind == JS_OBJ) {
+    if (v.kind == JSON.OBJ) {
         // Reached only for an object nested inside an array, which has no
         // header form and must go inline.
         sb.append("{");
