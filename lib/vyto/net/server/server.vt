@@ -40,6 +40,11 @@
 
 import { Socket, PollSet, POLL_READ, POLL_WRITE,
          socket_listen_on, socket_listen_reuseport } from "vyto/net/socket";
+import { is_alnum, is_upper, CHAR_AMP, CHAR_BACKTICK, CHAR_BANG,
+         CHAR_CARET, CHAR_COLON, CHAR_CR, CHAR_DEL, CHAR_DOLLAR, CHAR_DOT,
+         CHAR_HASH, CHAR_LF, CHAR_MINUS, CHAR_PERCENT, CHAR_PIPE, CHAR_PLUS,
+         CHAR_QUESTION, CHAR_SLASH, CHAR_SPACE, CHAR_SQUOTE, CHAR_STAR,
+         CHAR_TAB, CHAR_TILDE, CHAR_UNDERSCORE } from "vyto/util/ascii";
 import { StringBuilder } from "vyto/util/text";
 import { monoMs, monoUs, unixSec, sleepMs } from "vyto/util/time";
 import { date_from_unix, date_format } from "vyto/util/date";
@@ -263,7 +268,7 @@ fn hdr_name_is(a: string, b: string): bool {
 }
 
 fn lower_b(c: int): int {
-    if (c >= 65 && c <= 90) { return c + 32; }
+    if (is_upper(c)) { return c + 32; }
     return c;
 }
 
@@ -284,22 +289,20 @@ fn hdr_eq(raw: byte[], off: int, len: int, name: string): bool {
 // header see two different requests. Refusing the whole request is the only
 // answer that cannot desync.
 fn is_tchar(c: int): bool {
-    if (c >= 48 && c <= 57)  { return true; }    // 0-9
-    if (c >= 65 && c <= 90)  { return true; }    // A-Z
-    if (c >= 97 && c <= 122) { return true; }    // a-z
+    if (is_alnum(c)) { return true; }
     // ! # $ % & ' * + - . ^ _ ` | ~
-    if (c == 33 || c == 35 || c == 36 || c == 37 || c == 38) { return true; }
-    if (c == 39 || c == 42 || c == 43 || c == 45 || c == 46) { return true; }
-    if (c == 94 || c == 95 || c == 96 || c == 124 || c == 126) { return true; }
+    if (c == CHAR_BANG || c == CHAR_HASH || c == CHAR_DOLLAR || c == CHAR_PERCENT || c == CHAR_AMP) { return true; }
+    if (c == CHAR_SQUOTE || c == CHAR_STAR || c == CHAR_PLUS || c == CHAR_MINUS || c == CHAR_DOT) { return true; }
+    if (c == CHAR_CARET || c == CHAR_UNDERSCORE || c == CHAR_BACKTICK || c == CHAR_PIPE || c == CHAR_TILDE) { return true; }
     return false;
 }
 
 // A header value may hold any visible byte plus SP and HTAB. Control characters
 // are how a CR or LF gets smuggled into the header block.
 fn is_hval_byte(c: int): bool {
-    if (c == 9) { return true; }                 // HTAB
-    if (c < 32) { return false; }                // CTL, including CR and LF
-    if (c == 127) { return false; }              // DEL
+    if (c == CHAR_TAB) { return true; }                 // HTAB
+    if (c < CHAR_SPACE) { return false; }        // CTL, including CR and LF
+    if (c == CHAR_DEL) { return false; }              // DEL
     return true;
 }
 
@@ -307,7 +310,7 @@ fn is_hval_byte(c: int): bool {
 fn find_lf(raw: byte[], at: int, end: int): int {
     let i = at;
     while (i < end) {
-        if (raw[i] == 10) { return i; }
+        if (raw[i] == CHAR_LF) { return i; }
         i += 1;
     }
     return -1;
@@ -333,7 +336,7 @@ fn hval_same(raw: byte[], a_off: int, a_len: int, b_off: int, b_len: int): bool 
 // the property this whole block exists to deny.
 fn has_nul_escape(raw: byte[], off: int, len: int): bool {
     for (let i in 0..len) {
-        if (raw[off + i] != 37) { continue; }             // '%'
+        if (raw[off + i] != CHAR_PERCENT) { continue; }             // '%'
         if (i + 2 >= len) { continue; }
         if (raw[off + i + 1] == 48 && raw[off + i + 2] == 48) { return true; }
     }
@@ -346,9 +349,9 @@ fn has_nul_escape(raw: byte[], off: int, len: int): bool {
 fn needs_normalising(raw: byte[], off: int, len: int): bool {
     for (let i in 0..len) {
         let c = raw[off + i];
-        if (c == 37) { return true; }                     // '%'
-        if (c == 46 && (i == 0 || raw[off + i - 1] == 47)) { return true; }
-        if (c == 47 && i > 0 && raw[off + i - 1] == 47) { return true; }  // "//"
+        if (c == CHAR_PERCENT) { return true; }                     // '%'
+        if (c == CHAR_DOT && (i == 0 || raw[off + i - 1] == CHAR_SLASH)) { return true; }
+        if (c == CHAR_SLASH && i > 0 && raw[off + i - 1] == CHAR_SLASH) { return true; }  // "//"
     }
     return false;
 }
@@ -379,9 +382,9 @@ fn parse_uint(raw: byte[], off: int, len: int, cap: int): int {
 fn find_head_end(raw: byte[], used: int): int {
     let i = 0;
     while (i + 1 < used) {
-        if (raw[i] == 10 && raw[i + 1] == 10) { return i + 2; }
-        if (i + 3 < used && raw[i] == 13 && raw[i + 1] == 10
-            && raw[i + 2] == 13 && raw[i + 3] == 10) { return i + 4; }
+        if (raw[i] == CHAR_LF && raw[i + 1] == CHAR_LF) { return i + 2; }
+        if (i + 3 < used && raw[i] == CHAR_CR && raw[i + 1] == CHAR_LF
+            && raw[i + 2] == CHAR_CR && raw[i + 3] == CHAR_LF) { return i + 4; }
         i += 1;
     }
     return -1;
@@ -970,7 +973,7 @@ export class ServerResponse {
     // cannot be written by accident.
     fn header(name: string, value: string): ServerResponse {
         for (let i in 0..value.len) {
-            if (value[i] == 13 || value[i] == 10) { return this; }
+            if (value[i] == CHAR_CR || value[i] == CHAR_LF) { return this; }
         }
         // RFC 7231 makes Date mandatory and the server emits it from a cache.
         // Noting an explicit one here keeps a handler that sets its own from
@@ -1054,7 +1057,7 @@ class Route {
         if (ps.len != this.segs.len) { return false; }
         for (let i in 0..this.segs.len) {
             let s = this.segs[i];
-            if (s.len > 0 && s[0] == 58) {          // ':' — a param
+            if (s.len > 0 && s[0] == CHAR_COLON) {          // ':' — a param
                 req.param_names.push(s.slice(1, s.len));
                 req.param_vals.push(ps[i]);
                 continue;
@@ -1231,7 +1234,7 @@ export class Server {
     // configured default, and never a scan of the handler's headers.
     fn withHeader(name: string, value: string): Server {
         for (let i in 0..value.len) {
-            if (value[i] == 13 || value[i] == 10) { return this; }
+            if (value[i] == CHAR_CR || value[i] == CHAR_LF) { return this; }
         }
         this.dflt_names.push(name);
         this.dflt_values.push(value);
@@ -1284,16 +1287,16 @@ export class Server {
         if (lf < 0) { return 400; }
         if (lf > L.max_request_line) { return 414; }
         let eol = lf;
-        if (eol > 0 && raw[eol - 1] == 13) { eol -= 1; }   // strip CR
+        if (eol > 0 && raw[eol - 1] == CHAR_CR) { eol -= 1; }   // strip CR
 
         // METHOD SP TARGET SP HTTP/1.x
         let sp1 = -1;
         let i = 0;
-        while (i < eol) { if (raw[i] == 32) { sp1 = i; break; } i += 1; }
+        while (i < eol) { if (raw[i] == CHAR_SPACE) { sp1 = i; break; } i += 1; }
         if (sp1 < 0) { return 400; }
         let sp2 = -1;
         i = sp1 + 1;
-        while (i < eol) { if (raw[i] == 32) { sp2 = i; break; } i += 1; }
+        while (i < eol) { if (raw[i] == CHAR_SPACE) { sp2 = i; break; } i += 1; }
         if (sp2 < 0) { return 400; }
 
         req.method_off = 0;
@@ -1319,20 +1322,20 @@ export class Server {
         let p_off = t_off;
         let p_len = t_len;
 
-        if (t_len == 1 && raw[t_off] == 42) {
+        if (t_len == 1 && raw[t_off] == CHAR_STAR) {
             // asterisk-form: `OPTIONS * HTTP/1.1`. Legal, and not a path.
             req.path_off = t_off; req.path_len = 1;
             req.query_off = -1;   req.query_len = 0;
             p_len = 0;                       // nothing to normalise
-        } else if (raw[t_off] != 47) {
+        } else if (raw[t_off] != CHAR_SLASH) {
             // Not origin-form. Absolute-form is what a proxy sends and what we
             // used to 404 on, because the whole URI was matched against the
             // route table.
             let sch = -1;
             if (t_len >= 3) {
                 for (let k in 0..t_len - 2) {
-                    if (raw[t_off + k] == 58 && raw[t_off + k + 1] == 47
-                        && raw[t_off + k + 2] == 47) { sch = k; break; }
+                    if (raw[t_off + k] == CHAR_COLON && raw[t_off + k + 1] == CHAR_SLASH
+                        && raw[t_off + k + 2] == CHAR_SLASH) { sch = k; break; }
                 }
             }
             // No `://` and it does not start with `/`: authority-form, which is
@@ -1346,7 +1349,7 @@ export class Server {
             let slash = -1;
             let k2 = a;
             while (k2 < t_off + t_len) {
-                if (raw[k2] == 47) { slash = k2; break; }
+                if (raw[k2] == CHAR_SLASH) { slash = k2; break; }
                 k2 += 1;
             }
             if (slash < 0) {
@@ -1366,7 +1369,7 @@ export class Server {
         if (p_len > 0) {
             let qm = -1;
             for (let k in 0..p_len) {
-                if (raw[p_off + k] == 63) { qm = k; break; }
+                if (raw[p_off + k] == CHAR_QUESTION) { qm = k; break; }
             }
             if (qm < 0) {
                 req.path_off = p_off; req.path_len = p_len;
@@ -1394,7 +1397,7 @@ export class Server {
             let e = find_lf(raw, pos, used);
             if (e < 0) { return 400; }
             let line_end = e;
-            if (line_end > pos && raw[line_end - 1] == 13) { line_end -= 1; }
+            if (line_end > pos && raw[line_end - 1] == CHAR_CR) { line_end -= 1; }
             if (line_end == pos) { pos = e + 1; break; }   // blank line: done
 
             hdr_bytes += (e - pos) + 1;
@@ -1406,11 +1409,11 @@ export class Server {
             // message/http. Accepting it is a smuggling vector, because whether
             // the fold joins to the previous header is exactly the thing two
             // implementations disagree about.
-            if (raw[pos] == 32 || raw[pos] == 9) { return 400; }
+            if (raw[pos] == CHAR_SPACE || raw[pos] == CHAR_TAB) { return 400; }
 
             let colon = -1;
             let j = pos;
-            while (j < line_end) { if (raw[j] == 58) { colon = j; break; } j += 1; }
+            while (j < line_end) { if (raw[j] == CHAR_COLON) { colon = j; break; } j += 1; }
             if (colon < 0) { return 400; }
 
             let nlen = colon - pos;
@@ -1425,9 +1428,9 @@ export class Server {
 
             // trim OWS around the value
             let vs = colon + 1;
-            while (vs < line_end && (raw[vs] == 32 || raw[vs] == 9)) { vs += 1; }
+            while (vs < line_end && (raw[vs] == CHAR_SPACE || raw[vs] == CHAR_TAB)) { vs += 1; }
             let ve = line_end;
-            while (ve > vs && (raw[ve - 1] == 32 || raw[ve - 1] == 9)) { ve -= 1; }
+            while (ve > vs && (raw[ve - 1] == CHAR_SPACE || raw[ve - 1] == CHAR_TAB)) { ve -= 1; }
 
             for (let k in vs..ve) {
                 if (!is_hval_byte(raw[k])) { return 400; }
@@ -1547,7 +1550,7 @@ export class Server {
             // structural — there is no escaping path for a later check to catch.
             // The guard below is belt-and-braces against that behaviour changing.
             let norm = remove_dot_segments(dec);
-            if (norm.len >= 3 && norm[0] == 46 && norm[1] == 46 && norm[2] == 47) { return 400; }
+            if (norm.len >= 3 && norm[0] == CHAR_DOT && norm[1] == CHAR_DOT && norm[2] == CHAR_SLASH) { return 400; }
             if (norm == "..") { return 400; }
             if (norm.len == 0) { norm = "/"; }
             req.norm_path = norm;
@@ -1724,9 +1727,9 @@ export class Server {
                 let scan = 0;
                 let seen = -1;
                 while (scan + 1 < used) {
-                    if (raw[scan] == 10 && raw[scan + 1] == 10) { seen = scan + 2; break; }
-                    if (scan + 3 < used && raw[scan] == 13 && raw[scan + 1] == 10
-                        && raw[scan + 2] == 13 && raw[scan + 3] == 10) { seen = scan + 4; break; }
+                    if (raw[scan] == CHAR_LF && raw[scan + 1] == CHAR_LF) { seen = scan + 2; break; }
+                    if (scan + 3 < used && raw[scan] == CHAR_CR && raw[scan + 1] == CHAR_LF
+                        && raw[scan + 2] == CHAR_CR && raw[scan + 3] == CHAR_LF) { seen = scan + 4; break; }
                     scan += 1;
                 }
                 if (seen >= 0) { hdr_end = seen; break; }
