@@ -27,6 +27,7 @@ import { DataFrame, CK_STR, CK_CAT, CK_BOOL, CK_F64, CK_F32,
          OP_EQ, OP_LT, OP_LE, OP_GT, OP_GE, OP_CONTAINS,
          AGG_SUM, AGG_MIN, AGG_MAX, AGG_AVG, AGG_COUNT } from "vyto/data/frame";
 import { SIDE } from "vyto/ui/scrollbar";
+import { ALIGN } from "vyto/ui/display";
 import { csvWriter } from "vyto/util/csv";
 import { StringBuilder } from "vyto/util/text";
 
@@ -61,12 +62,12 @@ fn measure_head(s: string): string {
     return s.slice(0, n);
 }
 
-// One rendered column: a fixed pixel `width`, text `align` (0/1/2 = L/C/R), and
+// One rendered column: a fixed pixel `width`, text `align`, and
 // the source `col` index into the DataFrame.
 export class DtColumn {
     title: string;
     width: float;
-    align: int;
+    align: ALIGN;
     col: int;
     sortable: bool;
     visible: bool;      // hidden columns take zero width and are skipped
@@ -88,7 +89,7 @@ export class DtColumn {
     fn init(title: string, width: float, col: int) {
         this.title = title;
         this.width = width;
-        this.align = 0;
+        this.align = ALIGN.LEFT;
         this.col = col;
         this.sortable = true;
         this.visible = true;
@@ -362,7 +363,7 @@ export class DataTable extends Widget {
             if (text) { w = 160; }
             else if (k == CK_BOOL) { w = 70; }
             let c = new DtColumn(this.df.colName(i), w, i);
-            if (!text && k != CK_BOOL) { c.align = 2; } // numerics right-aligned
+            if (!text && k != CK_BOOL) { c.align = ALIGN.RIGHT; } // numerics right-aligned
             this.cols.push(c);
         }
         this.rebuild_colx();
@@ -547,7 +548,7 @@ export class DataTable extends Widget {
     fn addDerivedColumn(name: string, op: int, a: int, b: int): int {
         let c = this.df.derive(name, op, a, b);
         let col = new DtColumn(name, 90, c);
-        col.align = 2;   // derived columns are numeric
+        col.align = ALIGN.RIGHT;   // derived columns are numeric
         this.cols.push(col);
         this.rebuild_colx();
         this.clamp();
@@ -1765,8 +1766,8 @@ export class DataTable extends Widget {
     // about what is in it.
     fn draw_cell(s: Painter, c: DtColumn, cx: float, y: float, h: float, text: string, color: int) {
         let pad = 8.0;
-        if (c.align == 1) { pad = (c.width - s.text_width(text)) / 2; }
-        else if (c.align == 2) { pad = c.width - s.text_width(text) - 8; }
+        if (c.align == ALIGN.CENTER) { pad = (c.width - s.text_width(text)) / 2; }
+        else if (c.align == ALIGN.RIGHT) { pad = c.width - s.text_width(text) - 8; }
         if (pad < 4) { pad = 4; }
         // 1px short of the divider, so a full-width cell cannot paint over it.
         s.clip_push(Rect(cx, y, c.width - 1, h), 0.0);
@@ -1795,13 +1796,13 @@ export class DataTable extends Widget {
         // Both widths are measured at the weight each is drawn in: a bold title
         // is ~8% wider, which is enough to make a tag that fits by arithmetic
         // collide on screen.
-        if (c.type_tag != "" && c.align != 1) {
+        if (c.type_tag != "" && c.align != ALIGN.CENTER) {
             let titlew = s.text_width(c.title);
             s.set_weight(WEIGHT.REG);
             let tw = s.text_width(c.type_tag);
             let tx = c.width - 18.0 - tw;               // left title: tag on the right
             let clear = tx - (8.0 + titlew) >= 6.0;
-            if (c.align == 2) {
+            if (c.align == ALIGN.RIGHT) {
                 tx = 8.0;                               // right title: tag on the left
                 clear = (c.width - 8.0 - titlew) - (tx + tw) >= 6.0;
             }
@@ -1902,7 +1903,7 @@ export class DataTable extends Widget {
                 ly += this.row_h;
             }
         } else {
-            if (this.highlight_search && this.query != "" && txt != "" && c.align == 0) {
+            if (this.highlight_search && this.query != "" && txt != "" && c.align == ALIGN.LEFT) {
                 let hi = this.find_ci(txt, this.query);
                 if (hi >= 0) {
                     let px = 8 + s.text_width(txt.slice(0, hi));
