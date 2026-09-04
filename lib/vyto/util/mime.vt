@@ -31,6 +31,9 @@ import { StringBuilder } from "vyto/util/text";
 // ---- base64 ----------------------------------------------------------------
 
 const B64_STD: string = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+import { CHAR_BACKSLASH, CHAR_BANG, CHAR_CR, CHAR_DOT, CHAR_DQUOTE,
+         CHAR_EQ, CHAR_LF, CHAR_MINUS, CHAR_PLUS, CHAR_SEMI, CHAR_SLASH,
+         CHAR_SPACE, CHAR_TAB, CHAR_TILDE, CHAR_UNDERSCORE } from "vyto/util/ascii";
 const B64_URL: string = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
 // Standard base64 with `=` padding (RFC 4648 §4).
@@ -101,8 +104,8 @@ fn b64_val(c: int): int {
     if (c >= 65 && c <= 90) { return c - 65; }
     if (c >= 97 && c <= 122) { return c - 71; }
     if (c >= 48 && c <= 57) { return c + 4; }
-    if (c == 43 || c == 45) { return 62; }
-    if (c == 47 || c == 95) { return 63; }
+    if (c == CHAR_PLUS || c == CHAR_MINUS) { return 62; }
+    if (c == CHAR_SLASH || c == CHAR_UNDERSCORE) { return 63; }
     return -1;
 }
 
@@ -129,15 +132,15 @@ export fn qp_encode(s: string): string {
     while (i < s.len) {
         let c = s[i];
         // A literal CRLF is a hard break and resets the column.
-        if (c == 13 && i + 1 < s.len && s[i + 1] == 10) {
+        if (c == CHAR_CR && i + 1 < s.len && s[i + 1] == CHAR_LF) {
             sb.append("\r\n");
             col = 0;
             i += 2;
             continue;
         }
-        let atEnd = (i + 1 >= s.len) || (s[i + 1] == 13 && i + 2 < s.len && s[i + 2] == 10);
-        let space = c == 32 || c == 9;
-        let literal = (c >= 33 && c <= 126 && c != 61) || (space && !atEnd);
+        let atEnd = (i + 1 >= s.len) || (s[i + 1] == CHAR_CR && i + 2 < s.len && s[i + 2] == CHAR_LF);
+        let space = c == CHAR_SPACE || c == CHAR_TAB;
+        let literal = (c >= 33 && c <= 126 && c != CHAR_EQ) || (space && !atEnd);
         let width = 1;
         if (!literal) { width = 3; }
         if (col + width > 75) {
@@ -163,13 +166,13 @@ export fn qp_decode(s: string): string {
     let i = 0;
     while (i < s.len) {
         let c = s[i];
-        if (c != 61) {
+        if (c != CHAR_EQ) {
             sb.appendByte(c);
             i += 1;
             continue;
         }
-        if (i + 2 < s.len && s[i + 1] == 13 && s[i + 2] == 10) { i += 3; continue; }
-        if (i + 1 < s.len && s[i + 1] == 10) { i += 2; continue; }
+        if (i + 2 < s.len && s[i + 1] == CHAR_CR && s[i + 2] == CHAR_LF) { i += 3; continue; }
+        if (i + 1 < s.len && s[i + 1] == CHAR_LF) { i += 2; continue; }
         if (i + 2 < s.len) {
             let hi = hex_val(s[i + 1]);
             let lo = hex_val(s[i + 2]);
@@ -310,24 +313,24 @@ export fn mime_parse(s: string): MediaType {
 fn scan_params(s: string, start: int, keys: string[], vals: string[]) {
     let i = start;
     while (i < s.len) {
-        if (s[i] != 59) { i += 1; continue; }    // find the next ';'
+        if (s[i] != CHAR_SEMI) { i += 1; continue; }    // find the next ';'
         i += 1;
-        while (i < s.len && (s[i] == 32 || s[i] == 9)) { i += 1; }
+        while (i < s.len && (s[i] == CHAR_SPACE || s[i] == CHAR_TAB)) { i += 1; }
         let nameStart = i;
-        while (i < s.len && s[i] != 61 && s[i] != 59) { i += 1; }
+        while (i < s.len && s[i] != CHAR_EQ && s[i] != CHAR_SEMI) { i += 1; }
         let name = s.slice(nameStart, i).trim().to_lower();
-        if (i >= s.len || s[i] == 59) {
+        if (i >= s.len || s[i] == CHAR_SEMI) {
             if (name.len > 0) { keys.push(name); vals.push(""); }
             continue;
         }
         i += 1;                                   // skip '='
-        while (i < s.len && (s[i] == 32 || s[i] == 9)) { i += 1; }
+        while (i < s.len && (s[i] == CHAR_SPACE || s[i] == CHAR_TAB)) { i += 1; }
         let v = "";
-        if (i < s.len && s[i] == 34) {            // quoted-string
+        if (i < s.len && s[i] == CHAR_DQUOTE) {            // quoted-string
             i += 1;
             let sb = new StringBuilder(16);
-            while (i < s.len && s[i] != 34) {
-                if (s[i] == 92 && i + 1 < s.len) { i += 1; }   // '\' escapes the next byte
+            while (i < s.len && s[i] != CHAR_DQUOTE) {
+                if (s[i] == CHAR_BACKSLASH && i + 1 < s.len) { i += 1; }   // '\' escapes the next byte
                 sb.appendByte(s[i]);
                 i += 1;
             }
@@ -335,7 +338,7 @@ fn scan_params(s: string, start: int, keys: string[], vals: string[]) {
             v = sb.toString();
         } else {
             let vs = i;
-            while (i < s.len && s[i] != 59) { i += 1; }
+            while (i < s.len && s[i] != CHAR_SEMI) { i += 1; }
             v = s.slice(vs, i).trim();
         }
         if (name.len > 0) { keys.push(name); vals.push(v); }
@@ -349,7 +352,7 @@ fn quote_param(v: string): string {
     while (i < v.len) {
         let c = v[i];
         let tok = (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) ||
-                  c == 45 || c == 46 || c == 95 || c == 126 || c == 43 || c == 33 ||
+                  c == CHAR_MINUS || c == CHAR_DOT || c == CHAR_UNDERSCORE || c == CHAR_TILDE || c == CHAR_PLUS || c == CHAR_BANG ||
                   c == 35 || c == 36 || c == 38 || c == 94 || c == 96 || c == 124;
         if (!tok) { needs = true; }
         i += 1;
@@ -360,7 +363,7 @@ fn quote_param(v: string): string {
     let j = 0;
     while (j < v.len) {
         let c = v[j];
-        if (c == 34 || c == 92) { sb.appendByte(92); }
+        if (c == CHAR_DQUOTE || c == CHAR_BACKSLASH) { sb.appendByte(92); }
         sb.appendByte(c);
         j += 1;
     }
@@ -436,8 +439,8 @@ fn path_ext_of(p: string): string {
     let i = p.len - 1;
     while (i >= 0) {
         let c = p[i];
-        if (c == 47 || c == 92) { return ""; }         // '/' or '\': no dot in the last segment
-        if (c == 46) {
+        if (c == CHAR_SLASH || c == CHAR_BACKSLASH) { return ""; }         // '/' or '\': no dot in the last segment
+        if (c == CHAR_DOT) {
             if (i == 0) { return ""; }
             let prev = p[i - 1];
             if (prev == 47 || prev == 92) { return ""; }   // a dotfile, not an extension
@@ -571,10 +574,10 @@ export fn multipart_parse(body: string, boundary: string): Part[] {
     if (pos < 0) { return out; }
     while (pos >= 0) {
         let after = pos + delim.len;
-        if (after + 1 < body.len && body[after] == 45 && body[after + 1] == 45) { break; }  // "--" closer
+        if (after + 1 < body.len && body[after] == CHAR_MINUS && body[after + 1] == CHAR_MINUS) { break; }  // "--" closer
         // Skip the CRLF (or bare LF) that ends the delimiter line.
-        if (after < body.len && body[after] == 13) { after += 1; }
-        if (after < body.len && body[after] == 10) { after += 1; }
+        if (after < body.len && body[after] == CHAR_CR) { after += 1; }
+        if (after < body.len && body[after] == CHAR_LF) { after += 1; }
         let next = index_at(body, delim, after);
         let end = body.len;
         if (next >= 0) { end = next; }
