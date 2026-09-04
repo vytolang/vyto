@@ -32,6 +32,10 @@
 // separate module.
 
 import { StringBuilder } from "vyto/util/text";
+import { CHAR_AMP, CHAR_COLON, CHAR_CR, CHAR_DOT, CHAR_DQUOTE, CHAR_EQ,
+         CHAR_GT, CHAR_HASH, CHAR_LBRACKET, CHAR_LF, CHAR_LT, CHAR_MINUS,
+         CHAR_RBRACKET, CHAR_SLASH, CHAR_SPACE, CHAR_SQUOTE, CHAR_TAB,
+         CHAR_UNDERSCORE } from "vyto/util/ascii";
 
 // ---- token kinds -----------------------------------------------------------
 
@@ -67,11 +71,11 @@ fn escape_into(s: string, attr: bool): string {
     while (i < s.len) {
         let c = s[i];
         let rep = "";
-        if (c == 38) { rep = "&amp;"; }
-        else { if (c == 60) { rep = "&lt;"; }
-        else { if (c == 62) { rep = "&gt;"; }
-        else { if (attr && c == 34) { rep = "&quot;"; }
-        else { if (attr && c == 39) { rep = "&apos;"; } } } } }
+        if (c == CHAR_AMP) { rep = "&amp;"; }
+        else { if (c == CHAR_LT) { rep = "&lt;"; }
+        else { if (c == CHAR_GT) { rep = "&gt;"; }
+        else { if (attr && c == CHAR_DQUOTE) { rep = "&quot;"; }
+        else { if (attr && c == CHAR_SQUOTE) { rep = "&apos;"; } } } } }
         if (rep == "") { i += 1; continue; }
         if (i > runStart) { sb.append(s.slice(runStart, i)); }
         sb.append(rep);
@@ -92,7 +96,7 @@ export fn xml_unescape(s: string): string {
     let runStart = 0;
     let i = 0;
     while (i < s.len) {
-        if (s[i] != 38) { i += 1; continue; }
+        if (s[i] != CHAR_AMP) { i += 1; continue; }
         let semi = index_at(s, ";", i + 1);
         if (semi < 0 || semi - i > 12) { i += 1; continue; }
         let body = s.slice(i + 1, semi);
@@ -115,7 +119,7 @@ fn entity_value(body: string): string {
     if (body == "gt") { return ">"; }
     if (body == "quot") { return "\""; }
     if (body == "apos") { return "'"; }
-    if (body.len < 2 || body[0] != 35) { return ""; }        // '#'
+    if (body.len < 2 || body[0] != CHAR_HASH) { return ""; }        // '#'
     let cp = 0;
     if (body[1] == 120 || body[1] == 88) {                    // 'x' or 'X'
         if (body.len < 3) { return ""; }
@@ -340,7 +344,7 @@ export class XmlReader {
             return this.tok;
         }
 
-        if (this.s[this.pos] != 60) { return this.textToken(); }   // '<'
+        if (this.s[this.pos] != CHAR_LT) { return this.textToken(); }   // '<'
 
         // '<' — decide which construct.
         if (this.startsWith("<!--")) { return this.comment(); }
@@ -361,14 +365,14 @@ export class XmlReader {
     fn countLines(lo: int, hi: int) {
         let i = lo;
         while (i < hi) {
-            if (this.s[i] == 10) { this.line += 1; }
+            if (this.s[i] == CHAR_LF) { this.line += 1; }
             i += 1;
         }
     }
 
     fn textToken(): int {
         let start = this.pos;
-        while (this.pos < this.n && this.s[this.pos] != 60) { this.pos += 1; }
+        while (this.pos < this.n && this.s[this.pos] != CHAR_LT) { this.pos += 1; }
         let raw = this.s.slice(start, this.pos);
         this.countLines(start, this.pos);
         if (this.skipSpace && raw.trim() == "") { return this.next(); }
@@ -429,9 +433,9 @@ export class XmlReader {
         let done = false;
         while (i < this.n && !done) {
             let c = this.s[i];
-            if (c == 91) { depth += 1; }                      // '['
-            else { if (c == 93) { depth -= 1; }                // ']'
-            else { if (c == 62 && depth <= 0) { done = true; } } }
+            if (c == CHAR_LBRACKET) { depth += 1; }                      // '['
+            else { if (c == CHAR_RBRACKET) { depth -= 1; }                // ']'
+            else { if (c == CHAR_GT && depth <= 0) { done = true; } } }
             i += 1;
         }
         if (!done) { return this.fail("unterminated DOCTYPE"); }
@@ -448,7 +452,7 @@ export class XmlReader {
         while (i < this.n && is_name_byte(this.s[i])) { i += 1; }
         let nm = this.s.slice(start, i);
         while (i < this.n && is_space(this.s[i])) { i += 1; }
-        if (i >= this.n || this.s[i] != 62) { return this.fail("malformed closing tag"); }
+        if (i >= this.n || this.s[i] != CHAR_GT) { return this.fail("malformed closing tag"); }
         this.countLines(this.pos, i + 1);
         this.pos = i + 1;
         if (nm.len == 0) { return this.fail("empty closing tag name"); }
@@ -473,14 +477,14 @@ export class XmlReader {
         let empty = false;
         while (i < this.n && !closed) {
             while (i < this.n && is_space(this.s[i])) {
-                if (this.s[i] == 10) { this.line += 1; }
+                if (this.s[i] == CHAR_LF) { this.line += 1; }
                 i += 1;
             }
             if (i >= this.n) { break; }
             let c = this.s[i];
-            if (c == 62) { i += 1; closed = true; break; }                       // '>'
-            if (c == 47) {                                                        // '/'
-                if (i + 1 < this.n && this.s[i + 1] == 62) {
+            if (c == CHAR_GT) { i += 1; closed = true; break; }                       // '>'
+            if (c == CHAR_SLASH) {                                                        // '/'
+                if (i + 1 < this.n && this.s[i + 1] == CHAR_GT) {
                     i += 2;
                     closed = true;
                     empty = true;
@@ -497,7 +501,7 @@ export class XmlReader {
             }
             let key = this.s.slice(ks, i);
             while (i < this.n && is_space(this.s[i])) { i += 1; }
-            if (i >= this.n || this.s[i] != 61) {
+            if (i >= this.n || this.s[i] != CHAR_EQ) {
                 this.pos = i;
                 return this.fail("attribute '" + key + "' has no value");
             }
@@ -515,7 +519,7 @@ export class XmlReader {
             i += 1;
             let vs = i;
             while (i < this.n && this.s[i] != q) {
-                if (this.s[i] == 10) { this.line += 1; }
+                if (this.s[i] == CHAR_LF) { this.line += 1; }
                 i += 1;
             }
             if (i >= this.n) {
@@ -581,14 +585,18 @@ export class XmlReader {
 
 export fn xmlReader(text: string): XmlReader { return new XmlReader(text); }
 
-fn is_space(c: int): bool { return c == 32 || c == 9 || c == 10 || c == 13; }
+// Deliberately NOT vyto/util/ascii's is_space, which also counts form
+// feed. This is the four bytes the spec calls whitespace.
+fn is_space(c: int): bool {
+    return c == CHAR_SPACE || c == CHAR_TAB || c == CHAR_LF || c == CHAR_CR;
+}
 
 // XML name characters, approximated: ASCII letters and digits, `_ - . :`, and
 // every byte >= 0x80 so UTF-8 names pass through. Precise NameStartChar rules
 // would need codepoint decoding for no practical gain here.
 fn is_name_byte(c: int): bool {
     return (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) ||
-           c == 95 || c == 45 || c == 46 || c == 58 || c >= 128;
+           c == CHAR_UNDERSCORE || c == CHAR_MINUS || c == CHAR_DOT || c == CHAR_COLON || c >= 128;
 }
 
 fn prefix_of(name: string): string {

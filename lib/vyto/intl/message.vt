@@ -23,6 +23,8 @@ import { Locale, PLURAL_CARDINAL, PLURAL_ORDINAL } from "vyto/intl";
 import { formatNumber } from "vyto/intl/number";
 import { json_parse, JsonValue } from "vyto/util/json";
 import { file_open } from "vyto/io/file";
+import { CHAR_COMMA, CHAR_CR, CHAR_EQ, CHAR_HASH, CHAR_LBRACE, CHAR_LF,
+         CHAR_RBRACE, CHAR_SPACE, CHAR_SQUOTE, CHAR_TAB } from "vyto/util/ascii";
 
 extern "C" {
     fn intl_plural_open(locale: cstring, kind: i32): rawptr;
@@ -84,7 +86,11 @@ export fn argSet(): Args { return new Args(); }
 
 // ---- the MessageFormat-subset engine ------------------------------------
 
-fn is_space(c: int): bool { return c == 32 || c == 9 || c == 10 || c == 13; }
+// Deliberately NOT vyto/util/ascii's is_space, which also counts form
+// feed. This is the four bytes the spec calls whitespace.
+fn is_space(c: int): bool {
+    return c == CHAR_SPACE || c == CHAR_TAB || c == CHAR_LF || c == CHAR_CR;
+}
 fn is_digit(c: int): bool { return c >= 48 && c <= 57; }
 fn is_alpha(c: int): bool { return (c >= 97 && c <= 122) || (c >= 65 && c <= 90); }
 
@@ -105,7 +111,7 @@ class MsgFormatter {
     // Read up to the next ',' or '}' (an argument name), trimmed.
     fn readName(): string {
         let start = this.pos;
-        while (this.pos < this.p.len && this.p[this.pos] != 44 && this.p[this.pos] != 125) {
+        while (this.pos < this.p.len && this.p[this.pos] != CHAR_COMMA && this.p[this.pos] != CHAR_RBRACE) {
             this.pos += 1;
         }
         return this.p.slice(start, this.pos).trim();
@@ -122,7 +128,7 @@ class MsgFormatter {
     // A plural selector: "=N" exact or a keyword.
     fn readSelector(): string {
         this.skipWs();
-        if (this.pos < this.p.len && this.p[this.pos] == 61) { // '='
+        if (this.pos < this.p.len && this.p[this.pos] == CHAR_EQ) { // '='
             let start = this.pos;
             this.pos += 1;
             while (this.pos < this.p.len && is_digit(this.p[this.pos])) { this.pos += 1; }
@@ -136,8 +142,8 @@ class MsgFormatter {
         let depth = 0;
         while (this.pos < this.p.len) {
             let c = this.p[this.pos];
-            if (c == 123) { depth += 1; }
-            else if (c == 125) {
+            if (c == CHAR_LBRACE) { depth += 1; }
+            else if (c == CHAR_RBRACE) {
                 if (depth == 0) { this.pos += 1; return; }
                 depth -= 1;
             }
@@ -167,15 +173,15 @@ class MsgFormatter {
         let out = "";
         while (this.pos < this.p.len) {
             let c = this.p[this.pos];
-            if (c == 125) { break; }                                   // '}'
-            if (c == 123) { out = out + this.argument(hash); continue; } // '{'
-            if (c == 35) { out = out + hash; this.pos += 1; continue; }  // '#'
-            if (c == 39) {                                              // '\''  quoting
+            if (c == CHAR_RBRACE) { break; }                                   // '}'
+            if (c == CHAR_LBRACE) { out = out + this.argument(hash); continue; } // '{'
+            if (c == CHAR_HASH) { out = out + hash; this.pos += 1; continue; }  // '#'
+            if (c == CHAR_SQUOTE) {                                              // '\''  quoting
                 this.pos += 1;
-                if (this.pos < this.p.len && this.p[this.pos] == 39) {  // '' -> '
+                if (this.pos < this.p.len && this.p[this.pos] == CHAR_SQUOTE) {  // '' -> '
                     out = out + "'"; this.pos += 1; continue;
                 }
-                while (this.pos < this.p.len && this.p[this.pos] != 39) {
+                while (this.pos < this.p.len && this.p[this.pos] != CHAR_SQUOTE) {
                     out = out + this.p.slice(this.pos, this.pos + 1);
                     this.pos += 1;
                 }
@@ -194,11 +200,11 @@ class MsgFormatter {
         this.skipWs();
         let name = this.readName();
         this.skipWs();
-        if (this.pos < this.p.len && this.p[this.pos] == 125) {          // {name}
+        if (this.pos < this.p.len && this.p[this.pos] == CHAR_RBRACE) {          // {name}
             this.pos += 1;
             return this.argStr(name);
         }
-        if (this.pos < this.p.len && this.p[this.pos] == 44) { this.pos += 1; } // ','
+        if (this.pos < this.p.len && this.p[this.pos] == CHAR_COMMA) { this.pos += 1; } // ','
         let type = this.readToken();
         this.skipWs();
         if (type == "number") {
@@ -206,11 +212,11 @@ class MsgFormatter {
             return formatNumber(this.argNum(name), this.loc);
         }
         if (type == "plural" || type == "selectordinal") {
-            if (this.pos < this.p.len && this.p[this.pos] == 44) { this.pos += 1; }
+            if (this.pos < this.p.len && this.p[this.pos] == CHAR_COMMA) { this.pos += 1; }
             return this.plural(name, type == "selectordinal");
         }
         if (type == "select") {
-            if (this.pos < this.p.len && this.p[this.pos] == 44) { this.pos += 1; }
+            if (this.pos < this.p.len && this.p[this.pos] == CHAR_COMMA) { this.pos += 1; }
             return this.select(name);
         }
         // unknown/absent type: treat as a simple substitution
@@ -231,13 +237,13 @@ class MsgFormatter {
         let otherMsg = "";
         while (true) {
             this.skipWs();
-            if (this.pos >= this.p.len || this.p[this.pos] == 125) { break; }
+            if (this.pos >= this.p.len || this.p[this.pos] == CHAR_RBRACE) { break; }
             let sel = this.readSelector();
             this.skipWs();
-            if (this.pos >= this.p.len || this.p[this.pos] != 123) { break; }
+            if (this.pos >= this.p.len || this.p[this.pos] != CHAR_LBRACE) { break; }
             this.pos += 1; // '{'
             let sub = this.message(hash);
-            if (this.pos < this.p.len && this.p[this.pos] == 125) { this.pos += 1; } // submessage '}'
+            if (this.pos < this.p.len && this.p[this.pos] == CHAR_RBRACE) { this.pos += 1; } // submessage '}'
             if (sel.starts_with("=")) {
                 if (!haveExact && count == (sel.slice(1, sel.len).to_int() as float)) {
                     exactMsg = sub; haveExact = true;
@@ -247,7 +253,7 @@ class MsgFormatter {
                 if (!haveChosen && sel == kw) { chosen = sub; haveChosen = true; }
             }
         }
-        if (this.pos < this.p.len && this.p[this.pos] == 125) { this.pos += 1; } // argument '}'
+        if (this.pos < this.p.len && this.p[this.pos] == CHAR_RBRACE) { this.pos += 1; } // argument '}'
         if (haveExact) { return exactMsg; }
         if (haveChosen) { return chosen; }
         return otherMsg;
@@ -259,17 +265,17 @@ class MsgFormatter {
         let otherMsg = "";
         while (true) {
             this.skipWs();
-            if (this.pos >= this.p.len || this.p[this.pos] == 125) { break; }
+            if (this.pos >= this.p.len || this.p[this.pos] == CHAR_RBRACE) { break; }
             let sel = this.readToken();
             this.skipWs();
-            if (this.pos >= this.p.len || this.p[this.pos] != 123) { break; }
+            if (this.pos >= this.p.len || this.p[this.pos] != CHAR_LBRACE) { break; }
             this.pos += 1; // '{'
             let sub = this.message("");
-            if (this.pos < this.p.len && this.p[this.pos] == 125) { this.pos += 1; }
+            if (this.pos < this.p.len && this.p[this.pos] == CHAR_RBRACE) { this.pos += 1; }
             if (sel == "other") { otherMsg = sub; }
             if (!haveChosen && sel == key) { chosen = sub; haveChosen = true; }
         }
-        if (this.pos < this.p.len && this.p[this.pos] == 125) { this.pos += 1; }
+        if (this.pos < this.p.len && this.p[this.pos] == CHAR_RBRACE) { this.pos += 1; }
         if (haveChosen) { return chosen; }
         return otherMsg;
     }
