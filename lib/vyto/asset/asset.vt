@@ -8,7 +8,7 @@
 //
 // Keys are logical paths relative to the app root, e.g. "assets/logo.png".
 // When embedded, the lookup hits the in-binary registry; otherwise it reads
-// `appDir() + "/" + key` from disk. `loadImage` and `readfile` already consult
+// `{appDir()}/{key}` from disk. `loadImage` and `readfile` already consult
 // the same registry, so much existing relative-path code needs no change — this
 // module is for explicit access and for getting a real path (assetPath).
 
@@ -32,7 +32,7 @@ export fn assetBytes(logical: string): byte[] {
         if (n > 0 as i64) { vt_vfs_read(logical.cstr(), buf as cstring, n); }
         return buf;
     }
-    let f = file_open(appDir() + "/" + logical, "rb");
+    let f = file_open(`{appDir()}/{logical}`, "rb");
     let d = f.readBytes();
     f.close();
     return d;
@@ -41,7 +41,7 @@ export fn assetBytes(logical: string): byte[] {
 // True if the asset is embedded or exists on disk.
 export fn assetExists(logical: string): bool {
     if (vt_vfs_size(logical.cstr()) >= 0 as i64) { return true; }
-    return file_exists(appDir() + "/" + logical);
+    return file_exists(`{appDir()}/{logical}`);
 }
 
 // Replace '/' with '_' so a logical path becomes a flat temp filename.
@@ -55,16 +55,16 @@ fn flatten(s: string): string {
     return out;
 }
 
-// A real filesystem path for the asset. On disk that's appDir()+"/"+key; when
+// A real filesystem path for the asset. On disk that's `{appDir()}/{key}`; when
 // embedded, the blob is materialized to a temp file once and that path returned
 // — for consumers that must have a path (e.g. a db opener, a media player).
 export fn assetPath(logical: string): string {
     if (vt_vfs_size(logical.cstr()) < 0 as i64) {
-        return appDir() + "/" + logical;
+        return `{appDir()}/{logical}`;
     }
-    let dir = getenvOr("TMPDIR", "/tmp") + "/vyto-assets";
+    let dir = `{getenvOr("TMPDIR", "/tmp")}/vyto-assets`;
     file_mkdirs(dir);
-    let out = dir + "/" + flatten(logical);
+    let out = `{dir}/{flatten(logical)}`;
     if (!file_exists(out)) {
         let f = file_open(out, "wb");
         f.writeBytes(assetBytes(logical));
@@ -76,7 +76,7 @@ export fn assetPath(logical: string): string {
 // List logical keys directly under `dir` (a logical prefix like "assets"): the
 // embedded registry when bundled, else the disk directory under appDir().
 export fn assetList(dir: string): string[] {
-    let prefix = dir + "/";
+    let prefix = `{dir}/`;
     let out: string[] = [];
     let n = vt_vfs_count() as int;
     if (n > 0) {
@@ -91,7 +91,7 @@ export fn assetList(dir: string): string[] {
         return out;
     }
     // not embedded: read the directory from disk
-    for (let name in listdir(appDir() + "/" + dir)) {
+    for (let name in listdir(`{appDir()}/{dir}`)) {
         out.push(prefix + name);
     }
     return out;
