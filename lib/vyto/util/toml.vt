@@ -40,7 +40,7 @@
 import { JsonValue, jnull, jbool, jnum, jstr, jarr, jobj,
          JSON } from "vyto/util/json";
 import { StringBuilder } from "vyto/util/text";
-import { CHAR_BACKSLASH, CHAR_BS, CHAR_COLON, CHAR_COMMA, CHAR_CR,
+import { is_alnum, is_digit, CHAR_BACKSLASH, CHAR_BS, CHAR_COLON, CHAR_COMMA, CHAR_CR,
          CHAR_DOT, CHAR_DQUOTE, CHAR_EQ, CHAR_ESC, CHAR_FF, CHAR_HASH,
          CHAR_LBRACE, CHAR_LBRACKET, CHAR_LF, CHAR_MINUS, CHAR_NUL,
          CHAR_PLUS, CHAR_RBRACE, CHAR_RBRACKET, CHAR_SPACE, CHAR_SQUOTE,
@@ -172,7 +172,7 @@ class TomlParser {
         this.sp();
         let parts = this.keyPath();
         if (this.failed()) { return false; }
-        if (parts.len == CHAR_NUL) {
+        if (parts.len == 0) {
             this.fail("empty table name");
             return false;
         }
@@ -269,7 +269,7 @@ class TomlParser {
     fn keyval(table: JsonValue, prefix: string): bool {
         let parts = this.keyPath();
         if (this.failed()) { return false; }
-        if (parts.len == CHAR_NUL) {
+        if (parts.len == 0) {
             this.fail("expected a key");
             return false;
         }
@@ -343,8 +343,7 @@ class TomlParser {
         let start = this.pos;
         while (this.pos < this.n) {
             let b = this.s[this.pos];
-            let bare = (b >= 65 && b <= 90) || (b >= 97 && b <= 122) ||
-                       (b >= 48 && b <= 57) || b == CHAR_UNDERSCORE || b == CHAR_MINUS;
+            let bare = is_alnum(b) || b == CHAR_UNDERSCORE || b == CHAR_MINUS;
             if (!bare) { break; }
             this.pos += 1;
         }
@@ -584,7 +583,7 @@ class TomlParser {
             this.sp();
             let parts = this.keyPath();
             if (this.failed()) { return this.errValue(); }
-            if (parts.len == CHAR_NUL) { return this.fail("expected a key in inline table"); }
+            if (parts.len == 0) { return this.fail("expected a key in inline table"); }
             this.sp();
             if (this.peek() != CHAR_EQ) { return this.fail("expected '=' in inline table"); }
             this.pos += 1;
@@ -632,7 +631,7 @@ class TomlParser {
         let tokRaw = this.s.slice(start, this.pos);
         let tok = tokRaw.trim_end();
         this.pos = start + tok.len;
-        if (tok.len == CHAR_NUL) { return this.fail("expected a value"); }
+        if (tok.len == 0) { return this.fail("expected a value"); }
         let v = classify(tok);
         if (v.kind == JSON.NULL) { return this.fail("invalid value '" + tok + "'"); }
         return v;
@@ -641,12 +640,12 @@ class TomlParser {
     // True when the space at this.pos joins a date to a time.
     fn dateSpace(start: int): bool {
         let sofar = this.s.slice(start, this.pos);
-        if (sofar.len != CHAR_LF) { return false; }
+        if (sofar.len != 10) { return false; }   // YYYY-MM-DD
         if (sofar[4] != CHAR_MINUS || sofar[7] != CHAR_MINUS) { return false; }         // 'YYYY-MM-DD'
         if (this.pos + 3 >= this.n) { return false; }
         let a = this.s[this.pos + 1];
         let b = this.s[this.pos + 2];
-        return a >= 48 && a <= 57 && b >= 48 && b <= 57 && this.s[this.pos + 3] == CHAR_COLON;
+        return is_digit(a) && is_digit(b) && this.s[this.pos + 3] == CHAR_COLON;
     }
 }
 
@@ -688,7 +687,7 @@ fn strip_underscores(tok: string): string {
     while (i < tok.len) {
         let c = tok[i];
         if (c == CHAR_UNDERSCORE) {
-            if (i == CHAR_NUL || i + 1 >= tok.len) { return ""; }
+            if (i == 0 || i + 1 >= tok.len) { return ""; }
             if (!is_digit(tok[i - 1]) || !is_digit(tok[i + 1])) { return ""; }
         } else {
             sb.appendByte(c);
@@ -705,7 +704,7 @@ fn strip_radix_underscores(tok: string, base: int): string {
     while (i < tok.len) {
         let c = tok[i];
         if (c == CHAR_UNDERSCORE) {
-            if (i == CHAR_NUL || i + 1 >= tok.len) { return ""; }
+            if (i == 0 || i + 1 >= tok.len) { return ""; }
             if (!is_base_digit(tok[i - 1], base) || !is_base_digit(tok[i + 1], base)) { return ""; }
         } else {
             sb.appendByte(c);
@@ -728,7 +727,7 @@ fn valid_number(s: string): bool {
     let intStart = i;
     while (i < s.len && is_digit(s[i])) { i += 1; }
     let intLen = i - intStart;
-    if (intLen == CHAR_NUL) { return false; }
+    if (intLen == 0) { return false; }
     if (intLen > 1 && s[intStart] == 48) { return false; }
     if (i < s.len && s[i] == CHAR_DOT) {
         i += 1;
@@ -750,7 +749,7 @@ fn radix(body: string, base: int): JsonValue {
     // Underscores separate digits here too, but the neighbours must be digits
     // *of this base* — the decimal 0-9 test would reject 0xdead_beef.
     let clean = strip_radix_underscores(body, base);
-    if (clean.len == CHAR_NUL) { return jnull(); }
+    if (clean.len == 0) { return jnull(); }
     let v = 0;
     let i = 0;
     while (i < clean.len) {
@@ -776,7 +775,6 @@ fn looks_like_datetime(tok: string): bool {
     return false;
 }
 
-fn is_digit(c: int): bool { return c >= 48 && c <= 57; }
 
 fn hex_val(c: int): int {
     if (c >= 48 && c <= 57) { return c - 48; }
@@ -961,8 +959,7 @@ fn encode_key(k: string): string {
     let i = 0;
     while (i < k.len) {
         let c = k[i];
-        let ok = (c >= 65 && c <= 90) || (c >= 97 && c <= 122) ||
-                 (c >= 48 && c <= 57) || c == CHAR_UNDERSCORE || c == CHAR_MINUS;
+        let ok = is_alnum(c) || c == CHAR_UNDERSCORE || c == CHAR_MINUS;
         if (!ok) { bare = false; }
         i += 1;
     }
