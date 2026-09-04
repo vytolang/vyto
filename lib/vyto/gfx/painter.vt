@@ -8,7 +8,7 @@
 //
 // It lives in its own module so plain Canvas users (import "vyto/gfx") don't
 // pull in vyto/ui, and vyto/ui apps don't pull in blend2d unless they use this.
-import { Painter, WEIGHT_REG, WEIGHT_MED, WEIGHT_BOLD } from "vyto/ui";
+import { Painter, WEIGHT } from "vyto/ui";
 import { Canvas, loadImage, freeImage } from "vyto/gfx";
 import { Surface, Rect, rgb } from "vyto/surface";
 import { Path } from "vyto/geom/path";
@@ -36,11 +36,11 @@ fn derive_variant_path(regular: string, tag: string): string {
 export class GfxPainter extends Painter {
     surf: Surface;
     canvas: Canvas;
-    weight: int;      // current active weight (WEIGHT_REG/MED/BOLD)
+    weight: WEIGHT;   // current active weight
     font_path: string; // kept for canvas re-creation on resize
     base_font_size: float;   // size the faces were loaded at (the scale's 1.0)
     size_stack: float[];     // push_font/pop_font, saved (size, weight) pairs
-    weight_stack: int[];
+    weight_stack: WEIGHT[];
     // Optional per-weight in-memory TTF buffers (e.g. a font embedded via
     // --with-assets). Empty for the disk-path case; when set, a weight loads
     // from its buffer instead of font_path. Kept for canvas re-creation.
@@ -55,7 +55,7 @@ export class GfxPainter extends Painter {
         this.weight_stack = [];
         this.font_bytes = [];
         this.font_bytes_len = [];
-        this.weight = WEIGHT_REG;
+        this.weight = WEIGHT.REG;
         this.make_canvas(surf.width(), surf.height());
     }
 
@@ -70,16 +70,19 @@ export class GfxPainter extends Painter {
     }
 
     // Load one weight slot: prefer this weight's embedded buffer, else the
-    // regular buffer (bytes mode), else the disk path.
+    // regular buffer (bytes mode), else the disk path. `w` is a slot *index*
+    // into the parallel font_bytes arrays and goes on to the Canvas FFI edge,
+    // so it stays an int rather than a WEIGHT.
     fn load_weight(w: int, path: string): bool {
         if (this.font_bytes.len > w && this.font_bytes_len[w] > 0) {
             return this.canvas.loadFontBytes(this.font_bytes[w], this.font_bytes_len[w],
                                              this.base_font_size, w);
         }
-        if (this.font_bytes.len > WEIGHT_REG && this.font_bytes_len[WEIGHT_REG] > 0) {
+        let reg = WEIGHT.REG as int;
+        if (this.font_bytes.len > reg && this.font_bytes_len[reg] > 0) {
             // bytes mode, this weight not supplied: reuse regular so it renders
-            return this.canvas.loadFontBytes(this.font_bytes[WEIGHT_REG],
-                                             this.font_bytes_len[WEIGHT_REG],
+            return this.canvas.loadFontBytes(this.font_bytes[reg],
+                                             this.font_bytes_len[reg],
                                              this.base_font_size, w);
         }
         // embedded asset (--with-assets): a font referenced by its relative path
@@ -97,15 +100,15 @@ export class GfxPainter extends Painter {
         // regular weight always loads; medium/bold are best-effort — widgets
         // fall back to regular if a variant TTF isn't on disk (or not supplied
         // as bytes). load_weight handles the bytes-vs-path choice per weight.
-        this.load_weight(WEIGHT_REG, this.font_path);
-        if (!this.load_weight(WEIGHT_MED, derive_variant_path(this.font_path, "-Medium"))) {
+        this.load_weight(WEIGHT.REG, this.font_path);
+        if (!this.load_weight(WEIGHT.MED, derive_variant_path(this.font_path, "-Medium"))) {
             // reuse regular for medium so set_weight(med) never blanks text
-            this.load_weight(WEIGHT_MED, this.font_path);
+            this.load_weight(WEIGHT.MED, this.font_path);
         }
-        if (!this.load_weight(WEIGHT_BOLD, derive_variant_path(this.font_path, "-Bold"))) {
-            this.load_weight(WEIGHT_BOLD, derive_variant_path(this.font_path, "Bold"));
+        if (!this.load_weight(WEIGHT.BOLD, derive_variant_path(this.font_path, "-Bold"))) {
+            this.load_weight(WEIGHT.BOLD, derive_variant_path(this.font_path, "Bold"));
         }
-        this.canvas.setWeight(this.weight);
+        this.canvas.setWeight(this.weight as int);
     }
 
     // window resized: the canvas is fixed-size, so rebuild it (and its font
@@ -255,16 +258,17 @@ export class GfxPainter extends Painter {
     override fn free_image(handle: rawptr) { freeImage(handle); }
 
     // -- typography (WS3) --------------------------------------------------------
-    override fn set_weight(w: int) {
+    override fn set_weight(w: WEIGHT) {
         this.weight = w;
-        this.canvas.setWeight(w);
+        // Canvas is the FFI edge and keeps the C-shaped int; the enum widens.
+        this.canvas.setWeight(w as int);
     }
 
     // Type scale. The canvas caches faces by path and sized fonts by
     // (face, size), so pushing a size drawn earlier in the frame is a lookup
     // rather than a font build — which is what makes it affordable to bracket
     // every label with a push/pop.
-    override fn push_font(size: float, weight: int) {
+    override fn push_font(size: float, weight: WEIGHT) {
         this.size_stack.push(this.canvas.fontSize());
         this.weight_stack.push(this.weight);
         this.canvas.setFontSize(size);
