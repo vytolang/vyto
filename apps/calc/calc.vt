@@ -12,6 +12,9 @@ import { Window, Column, Row, Spacer, Label, Button, TextField,
          Container } from "vyto/ui";
 import { sqrt, pow, sin, cos, tan, asin, acos, atan, log, log10, exp, floor, ceil, fabs, PI, E } from "vyto/math";
 import { rgb } from "vyto/surface";
+import { is_alpha, is_digit, CHAR_DOT, CHAR_LOWER_A, CHAR_LOWER_F,
+         CHAR_LPAREN, CHAR_RPAREN, CHAR_SPACE, CHAR_TAB, CHAR_UPPER_A,
+         CHAR_UPPER_F, CHAR_ZERO } from "vyto/util/ascii";
 
 extern "C" {
     fn atof(s: cstring): float;
@@ -82,11 +85,11 @@ fn tokenize(expr: string): Token[] {
     while (i < n) {
         let ch = expr[i];
         // skip whitespace
-        if (ch == 32 || ch == 9) { i += 1; continue; } // space or tab
+        if (ch == CHAR_SPACE || ch == CHAR_TAB) { i += 1; continue; }
         // number (including decimal point)
-        if ((ch >= 48 && ch <= 57) || ch == 46) { // '0'-'9' or '.'
+        if (is_digit(ch) || ch == CHAR_DOT) {
             let start = i;
-            while (i < n && ((expr[i] >= 48 && expr[i] <= 57) || expr[i] == 46)) { i += 1; }
+            while (i < n && (is_digit(expr[i]) || expr[i] == CHAR_DOT)) { i += 1; }
             let s = expr.slice(start, i);
             let t = new Token();
             t.init_num(str2float(s));
@@ -94,9 +97,9 @@ fn tokenize(expr: string): Token[] {
             continue;
         }
         // letters (functions, constants, 'E' in scientific notation handled above)
-        if ((ch >= 65 && ch <= 90) || (ch >= 97 && ch <= 122)) { // A-Z a-z
+        if (is_alpha(ch)) {
             let start = i;
-            while (i < n && ((expr[i] >= 65 && expr[i] <= 90) || (expr[i] >= 97 && expr[i] <= 122))) { i += 1; }
+            while (i < n && is_alpha(expr[i])) { i += 1; }
             let s = expr.slice(start, i);
             let t = new Token();
             if (s == "pi" || s == "PI") {
@@ -120,14 +123,14 @@ fn tokenize(expr: string): Token[] {
             continue;
         }
         // parentheses
-        if (ch == 40) { // '('
+        if (ch == CHAR_LPAREN) {
             let t = new Token();
             t.init_lparen();
             tokens.push(t);
             i += 1;
             continue;
         }
-        if (ch == 41) { // ')'
+        if (ch == CHAR_RPAREN) {
             let t = new Token();
             t.init_rparen();
             tokens.push(t);
@@ -547,7 +550,7 @@ class Calc {
         }
         if (token == ".") {
             // only add if last token isn't already a dot
-            if (this.expr.len > 0 && this.expr[this.expr.len - 1] == 46) { return; }
+            if (this.expr.len > 0 && this.expr[this.expr.len - 1] == CHAR_DOT) { return; }
         }
         this.expr = this.expr + token;
         this.update_basic_display();
@@ -688,12 +691,13 @@ class Calc {
         // validate digit for current base
         if (token.len == 1) {
             let ch = token[0];
-            if ((ch >= 48 && ch <= 57) || (ch >= 65 && ch <= 70) || (ch >= 97 && ch <= 102)) {
+            if (is_digit(ch) || (ch >= CHAR_UPPER_A && ch <= CHAR_UPPER_F)
+                              || (ch >= CHAR_LOWER_A && ch <= CHAR_LOWER_F)) {
                 // check valid for base
                 let val: int = 0;
-                if (ch >= 48 && ch <= 57) { val = ch - 48; }
-                else if (ch >= 65 && ch <= 70) { val = ch - 55; }
-                else if (ch >= 97 && ch <= 102) { val = ch - 87; }
+                if (is_digit(ch)) { val = ch - CHAR_ZERO; }
+                else if (ch <= CHAR_UPPER_F) { val = ch - CHAR_UPPER_A + 10; }
+                else { val = ch - CHAR_LOWER_A + 10; }
                 let max_digit: int = 0;
                 if (this.base_idx == 0) { max_digit = 16; }       // HEX
                 else if (this.base_idx == 1) { max_digit = 10; }  // DEC
