@@ -654,7 +654,8 @@ int vs_events_pending(void *s) {
     return n;
 }
 
-int vs_scale_pct(void) {
+int vs_scale_pct(void *s) {
+    (void)s;   /* one surface, one display: nothing to look up */
     /* $VYTO_SCALE first, matching every other backend (vsurf.c:50-57), so a
      * device can be forced to a known scale for screenshot comparison. */
     const char *env = getenv("VYTO_SCALE");

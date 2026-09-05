@@ -83,14 +83,56 @@ long long vs_now_ms(void) {
 
 static int g_scale_pct; /* cached DPI scale (percent), set at vs_open */
 
-/* $VYTO_SCALE (e.g. "1.5" or "150") overrides platform DPI detection */
-static int scale_from_env(void) {
-    const char *e = getenv("VYTO_SCALE");
+/* One $VYTO_SCALE entry as a percent, or 0 when it is not usable. Accepts a
+   factor ("1.5") or a percent ("150"); the 8.0 split is what tells them apart. */
+static int scale_parse_one(const char *e) {
     if (!e || !*e) return 0;
     double f = atof(e);
     if (f > 8.0) return (int)(f + 0.5); /* given as percent already */
     if (f >= 0.5) return (int)(f * 100.0 + 0.5);
     return 0;
+}
+
+/* $VYTO_SCALE overrides platform DPI detection. One value applies everywhere;
+   a comma list names each monitor in order ("100,200"), which is how mixed-DPI
+   behaviour is exercised on a machine with a single screen. `index` picks an
+   entry; past the end of a list, the LAST entry stands, so "150" and "150,150"
+   mean the same thing for any monitor count. */
+static int scale_from_env_at(int index) {
+    const char *e = getenv("VYTO_SCALE");
+    if (!e || !*e) return 0;
+    if (index < 0) index = 0;
+    const char *p = e;
+    int got = 0;
+    for (int i = 0; ; i++) {
+        int v = scale_parse_one(p);
+        if (v > 0) got = v;         /* remember the last usable entry */
+        if (i >= index) break;
+        const char *c = strchr(p, ',');
+        if (!c) break;              /* list ran out: keep the last one */
+        p = c + 1;
+    }
+    return got;
+}
+
+/* The scale with no monitor in mind — the first entry, and the whole value for
+   the ordinary scalar form. */
+static int scale_from_env(void) { return scale_from_env_at(0); }
+
+/* Index of the monitor containing (x, y), or 0 when nothing does. Used to give
+   a window the scale of the screen it is actually on. Declared here because
+   both desktop arms need it; vs_monitors is defined per arm below. */
+static int monitor_index_at(int x, int y) {
+    VsMonitor mons[16];
+    int n = vs_monitors(mons, 16);
+    if (n > 16) n = 16;
+    for (int i = 0; i < n; i++) {
+        if (x >= mons[i].x && x < mons[i].x + mons[i].w &&
+            y >= mons[i].y && y < mons[i].y + mons[i].h) {
+            return i;
+        }
+    }
+    return 0;   /* off every screen (or none reported): the first one */
 }
 
 
@@ -657,6 +699,33 @@ int vs_set_fullscreen(void *vs, int on) {
     return 1;
 }
 
+/* Per-monitor DPI, resolved at runtime rather than linked.
+ *
+ * GetDpiForMonitor is Windows 8.1, and this toolchain's headers gate it behind
+ * NTDDI_WINBLUE while mingw defaults NTDDI_VERSION to Server 2003 — so the
+ * declaration is preprocessed away entirely and a direct call would not even
+ * compile. Raising the gate would raise the floor for every other Win32 call in
+ * this file, and adding Shcore to the link line would drop support for the
+ * older Windows this backend was verified on. GetProcAddress avoids both, and
+ * matches the dlopen/dlsym idiom the X11 arm already uses for XRandR.
+ *
+ * Returns 0 when the API is unavailable, which is the pre-8.1 answer. */
+static int win_monitor_scale(HMONITOR mon) {
+    typedef HRESULT (WINAPI *getdpi_t)(HMONITOR, int, UINT *, UINT *);
+    static getdpi_t getdpi;
+    static int tried;
+    if (!tried) {
+        tried = 1;
+        HMODULE h = LoadLibraryA("shcore.dll");
+        if (h) getdpi = (getdpi_t)(void *)GetProcAddress(h, "GetDpiForMonitor");
+    }
+    if (!getdpi || !mon) return 0;
+    UINT dx = 0, dy = 0;
+    if (getdpi(mon, 0 /* MDT_EFFECTIVE_DPI */, &dx, &dy) != 0) return 0;
+    if (dx < 48) return 0;
+    return (int)((dx * 100 + 48) / 96);
+}
+
 /* EnumDisplayMonitors hands each monitor to a callback, so collect through a
    small context rather than returning from inside it. */
 typedef struct { VsMonitor *out; int max; int n; } VsMonEnum;
@@ -673,7 +742,12 @@ static BOOL CALLBACK vs_mon_cb(HMONITOR mon, HDC dc, LPRECT rc, LPARAM lp) {
             e->out[e->n].w = mi.rcMonitor.right - mi.rcMonitor.left;
             e->out[e->n].h = mi.rcMonitor.bottom - mi.rcMonitor.top;
             e->out[e->n].primary = (mi.dwFlags & MONITORINFOF_PRIMARY) ? 1 : 0;
-            e->out[e->n].scale_pct = g_scale_pct > 0 ? g_scale_pct : 100;
+            /* $VYTO_SCALE for this monitor first, then what Windows says, then
+               the process-wide value. */
+            int sc = scale_from_env_at(e->n);
+            if (!sc) sc = win_monitor_scale(mon);
+            if (!sc) sc = g_scale_pct;
+            e->out[e->n].scale_pct = sc > 0 ? sc : 100;
         }
         e->n++;
     }
@@ -740,7 +814,9 @@ int vs_monitors(VsMonitor *out, int max) {
             out[0].w = GetSystemMetrics(SM_CXSCREEN);
             out[0].h = GetSystemMetrics(SM_CYSCREEN);
             out[0].primary = 1;
-            out[0].scale_pct = g_scale_pct > 0 ? g_scale_pct : 100;
+            int sc = scale_from_env_at(0);
+            if (!sc) sc = g_scale_pct;
+            out[0].scale_pct = sc > 0 ? sc : 100;
         }
     }
     return e.n;
@@ -894,7 +970,20 @@ void vs_present_rect(void *vs, int x, int y, int w, int h) {
     ReleaseDC(s->hwnd, dc);
 }
 
-int vs_scale_pct(void) {
+int vs_scale_pct(void *vs) {
+    VSurf *s = vs;
+    if (s && s->hwnd) {
+        int x = 0, y = 0;
+        vs_get_position(s, &x, &y);
+        int idx = monitor_index_at(x, y);
+        int env = scale_from_env_at(idx);
+        if (env) return env;
+        /* Ask the monitor itself. win_monitor_dpi falls back to the global when
+           the platform cannot say, which is every pre-8.1 Windows. */
+        VsMonitor mons[16];
+        int n = vs_monitors(mons, 16);
+        if (idx < n && idx < 16 && mons[idx].scale_pct > 0) return mons[idx].scale_pct;
+    }
     int env = scale_from_env();
     if (env) return env;
     return g_scale_pct ? g_scale_pct : 100;
@@ -1171,7 +1260,19 @@ static unsigned long pixel_of(Display *dpy, int rgb) {
 
 /* Xft.dpi from the X resource database, else the physical screen DPI;
    returned as a percent of the 96dpi baseline. */
-static int x11_detect_scale(Display *dpy) {
+/* Scale from a monitor's pixel width and physical width in mm, or 0 when the
+   monitor did not report a usable physical size (projectors, KVMs and virtual
+   outputs often report 0). */
+static int dpi_scale_pct(int px, int mm) {
+    if (px < 1 || mm < 1) return 0;
+    double dpi = (double)px * 25.4 / (double)mm;
+    if (dpi < 48.0 || dpi > 480.0) return 0;
+    return (int)(dpi * 100.0 / 96.0 + 0.5);
+}
+
+/* The desktop's declared scale, from the one global Xft.dpi resource. X has no
+   per-output equivalent, so this is the same answer for every monitor. */
+static int x11_xft_scale(Display *dpy) {
     const char *rms = XResourceManagerString(dpy);
     if (rms) {
         const char *p = strstr(rms, "Xft.dpi:");
@@ -1180,13 +1281,15 @@ static int x11_detect_scale(Display *dpy) {
             if (dpi >= 48.0) return (int)(dpi * 100.0 / 96.0 + 0.5);
         }
     }
+    return 0;
+}
+
+static int x11_detect_scale(Display *dpy) {
+    int xft = x11_xft_scale(dpy);
+    if (xft) return xft;
     int scr = DefaultScreen(dpy);
-    int mm = DisplayWidthMM(dpy, scr);
-    if (mm > 0) {
-        double dpi = (double)DisplayWidth(dpy, scr) * 25.4 / (double)mm;
-        if (dpi >= 48.0 && dpi <= 480.0) return (int)(dpi * 100.0 / 96.0 + 0.5);
-    }
-    return 100;
+    int sc = dpi_scale_pct(DisplayWidth(dpy, scr), DisplayWidthMM(dpy, scr));
+    return sc > 0 ? sc : 100;
 }
 
 /* =================================================== fbdev sub-backend
@@ -2149,13 +2252,22 @@ int vs_monitors(VsMonitor *out, int max) {
             VsRRMonitor *m = get_monitors(dpy, DefaultRootWindow(dpy), 1, &n);
             if (m && n > 0) {
                 count = n;
+                int xft = x11_xft_scale(dpy);   /* one global resource */
                 for (int i = 0; out && i < n && i < max; i++) {
                     out[i].x = m[i].x;
                     out[i].y = m[i].y;
                     out[i].w = m[i].width;
                     out[i].h = m[i].height;
                     out[i].primary = m[i].primary ? 1 : 0;
-                    out[i].scale_pct = g_scale_pct > 0 ? g_scale_pct : 100;
+                    /* $VYTO_SCALE per monitor first, then the desktop's own
+                       declaration, then this monitor's physical DPI. Xft.dpi
+                       outranks physics deliberately: a 142dpi laptop panel is
+                       routinely run at 96, and preferring the physical number
+                       would oversize every window by ~48%. */
+                    int sc = scale_from_env_at(i);
+                    if (!sc) sc = xft;
+                    if (!sc) sc = dpi_scale_pct(m[i].width, m[i].mwidth);
+                    out[i].scale_pct = sc > 0 ? sc : 100;
                 }
                 if (free_monitors) free_monitors(m);
                 XCloseDisplay(dpy);
@@ -2173,7 +2285,9 @@ int vs_monitors(VsMonitor *out, int max) {
         out[0].w = DisplayWidth(dpy, scr);
         out[0].h = DisplayHeight(dpy, scr);
         out[0].primary = 1;
-        out[0].scale_pct = g_scale_pct > 0 ? g_scale_pct : 100;
+        int sc = scale_from_env_at(0);
+        if (!sc) sc = x11_detect_scale(dpy);
+        out[0].scale_pct = sc > 0 ? sc : 100;
     }
     XCloseDisplay(dpy);
     return count;
@@ -2954,7 +3068,18 @@ int vs_can_wait_fds(void *vs) {
     return (s && !s->fb_on && s->dpy) ? 1 : 0;
 }
 
-int vs_scale_pct(void) {
+int vs_scale_pct(void *vs) {
+    VSurf *s = vs;
+    if (s && s->dpy) {
+        int x = 0, y = 0;
+        vs_get_position(s, &x, &y);
+        int idx = monitor_index_at(x, y);
+        int env = scale_from_env_at(idx);
+        if (env) return env;
+        VsMonitor mons[16];
+        int n = vs_monitors(mons, 16);
+        if (idx < n && idx < 16 && mons[idx].scale_pct > 0) return mons[idx].scale_pct;
+    }
     int env = scale_from_env();
     if (env) return env;
     return g_scale_pct ? g_scale_pct : 100;

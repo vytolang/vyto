@@ -247,9 +247,28 @@ int vs_mods(void *s);        /* VS_MOD_* bitmask at the last delivered event */
 /* monotonic milliseconds — the animation/game clock (not wall time) */
 long long vs_now_ms(void);
 
-/* UI scale factor ×100 (100 = 96dpi baseline, 200 = HiDPI 2x). From
-   $VYTO_SCALE when set, else Xft.dpi / the Windows DPI, else 100. */
-int vs_scale_pct(void);
+/* UI scale factor ×100 (100 = 96dpi baseline, 200 = HiDPI 2x) for the monitor
+   this window is on. From $VYTO_SCALE when set, else the platform's answer,
+   else 100. Passing NULL asks for the desktop's overall scale, which is what a
+   caller with no window yet gets.
+ *
+ * How much "per monitor" really means depends on the platform, and the honest
+ * answer differs:
+ *   - Win32 knows genuinely per-monitor DPI, so a window on a 2x screen reports
+ *     200 while one on a 1x screen reports 100.
+ *   - X11 does NOT. There is one global Xft.dpi resource and no per-output
+ *     equivalent; per-monitor scaling on Linux desktops is done by the
+ *     compositor, outside X. So every window reports the desktop's scale.
+ *     Physical DPI from XRandR is deliberately NOT used as a substitute: a
+ *     laptop panel measuring 142dpi is routinely run at 96, and treating the
+ *     physical number as the UI scale makes every window ~48% too large. It is
+ *     used only as a fallback when Xft.dpi is absent entirely.
+ *
+ * $VYTO_SCALE overrides all of it, and takes either one value for everything
+ * ("1.5" or "150") or a comma list naming each monitor in order
+ * ("100,200" = first screen 1x, second 2x). The list form exists to make
+ * mixed-DPI behaviour testable on a single-monitor machine. */
+int vs_scale_pct(void *s);
 int vs_x(void *s);
 int vs_y(void *s);
 int vs_wheel(void *s);       /* last VS_EV_MOUSE_WHEEL delta (positive = down) */
