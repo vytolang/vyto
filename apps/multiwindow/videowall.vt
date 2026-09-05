@@ -183,13 +183,28 @@ fn main() {
             ea = ctl.poll();
         }
 
+        // A screen closing removes THAT screen, not the app. Setting the
+        // loop's exit flag here instead is the easy mistake: EV_CLOSE names one
+        // window, and treating it as "quit" takes every other window down with
+        // it. Only the controller closing ends the program.
+        let keep: Screen[] = [];
         for (let s in screens) {
+            let alive = true;
             let e = s.surf.poll();
             while (e != EV_NONE) {
-                if (e == EV_CLOSE) { live = false; }
+                if (e == EV_CLOSE) { alive = false; }
                 else if (e == EV_EXPOSE || e == EV_RESIZE) { s.present_full(); }
                 e = s.surf.poll();
             }
+            if (alive) { keep.push(s); }
+            else { print(s.name + " closed"); }
+        }
+        if (keep.len != screens.len) {
+            screens = keep;              // dropping the Screen closes its window
+            if (sel >= screens.len) { sel = screens.len - 1; }
+            if (sel < 0) { sel = 0; }
+            redraw_ctl = true;
+            if (screens.len == 0) { live = false; }   // nothing left to control
         }
 
         if (redraw_ctl) { draw_controller(ctl, screens, sel); }

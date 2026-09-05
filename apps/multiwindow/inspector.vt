@@ -44,6 +44,7 @@ fn main() {
 
     let live = true;
     let dirty = true;
+    let detail_open = true;   // the detail pane can be closed on its own
     while (live) {
         if (dirty) {
             // --- list window ---
@@ -63,6 +64,7 @@ fn main() {
             list.present();
 
             // --- detail window, drawn from the SAME variable ---
+            if (detail_open) {
             let dw = detail.width() as float;
             let dh = detail.height() as float;
             let p = people[sel];
@@ -75,11 +77,15 @@ fn main() {
             detail.text(16, dh as int - 14,
                         "row " + (sel + 1) + " of " + people.len, rgb(102, 110, 126));
             detail.present();
+            }
             dirty = false;
         }
 
-        let ea = list.waitTimeoutFds(40, [detail.eventFd()]);
+        let wfds: int[] = [];
+        if (detail_open) { wfds.push(detail.eventFd()); }
+        let ea = list.waitTimeoutFds(40, wfds);
         while (ea != EV_NONE) {
+            // The list is the app: closing it quits.
             if (ea == EV_CLOSE) { live = false; }
             else if (ea == EV_EXPOSE || ea == EV_RESIZE) { dirty = true; }
             else if (ea == EV_MOUSE_DOWN) {
@@ -93,9 +99,12 @@ fn main() {
             ea = list.poll();
         }
 
-        let eb = detail.poll();
+        // Closing the DETAIL pane leaves the list running. EV_CLOSE names one
+        // window; treating it as "quit" is what takes the other one down too.
+        let eb = EV_NONE;
+        if (detail_open) { eb = detail.poll(); }
         while (eb != EV_NONE) {
-            if (eb == EV_CLOSE) { live = false; }
+            if (eb == EV_CLOSE) { detail_open = false; break; }
             else if (eb == EV_EXPOSE || eb == EV_RESIZE) { dirty = true; }
             eb = detail.poll();
         }

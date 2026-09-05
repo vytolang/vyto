@@ -105,6 +105,40 @@ Assign the return value and handle it, as in the loop above.
 The other window's fd is only *watched for readability*, so B's events do stay
 queued for its own `poll()`. Only the window you call the method on is drained.
 
+### The other trap: EV_CLOSE names ONE window
+
+`EV_CLOSE` says *this* window was closed. It does not mean "quit". The obvious
+loop is wrong:
+
+```vyto
+if (eb == EV_CLOSE) { live = false; }      // ← closes EVERY window
+```
+
+Because dropping out of the loop drops every `Surface`, closing one child takes
+the whole app down with it — which looks like a library bug and is not. Decide
+per window what its closing means:
+
+```vyto
+// a secondary window: it goes, the app stays
+if (eb == EV_CLOSE) { b_open = false; }
+
+// the primary window: closing it is closing the app
+if (ea == EV_CLOSE) { live = false; }
+```
+
+Once a window is gone, stop polling it and stop passing its `eventFd()` to
+`waitTimeoutFds` — the descriptor is dead:
+
+```vyto
+let wfds: int[] = [];
+if (b_open) { wfds.push(b.eventFd()); }
+let ea = a.waitTimeoutFds(40, wfds);
+```
+
+For a variable number of windows, filter the list instead of tracking flags —
+`apps/multiwindow/spawn.vt` and `videowall.vt` both keep an array and rebuild
+it, which also releases the closed window's `Surface`.
+
 ### Scaling to N windows
 
 Collect the descriptors:

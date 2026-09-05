@@ -131,14 +131,18 @@ fn main() {
     disp.draw(q);
 
     let live = true;
+    let disp_open = true;   // the waiting-room screen can be closed on its own
     while (live) {
         // Block on the console's events OR the display's connection: two
         // windows are two X connections, so the display's fd is what makes an
         // idle pair cost nothing. Note this RETURNS the console's event.
-        let ea = con.surf.waitTimeoutFds(40, [disp.surf.eventFd()]);
+        let wfds: int[] = [];
+        if (disp_open) { wfds.push(disp.surf.eventFd()); }
+        let ea = con.surf.waitTimeoutFds(40, wfds);
         let changed = false;
 
         while (ea != EV_NONE) {
+            // The console is the app: closing it quits.
             if (ea == EV_CLOSE) { live = false; }
             else if (ea == EV_EXPOSE || ea == EV_RESIZE) { con.draw(q); }
             else if (ea == EV_MOUSE_DOWN) {
@@ -155,9 +159,15 @@ fn main() {
             ea = con.surf.poll();
         }
 
-        let eb = disp.surf.poll();
+        let eb = EV_NONE;
+        if (disp_open) { eb = disp.surf.poll(); }
         while (eb != EV_NONE) {
-            if (eb == EV_CLOSE) { live = false; }
+            // Closing the WAITING-ROOM display does not quit — the queue keeps
+            // running on the console, which is what a receptionist would
+            // expect if the second screen were unplugged. EV_CLOSE names one
+            // window; treating it as "quit the app" is what takes every other
+            // window down with it.
+            if (eb == EV_CLOSE) { disp_open = false; break; }
             else if (eb == EV_EXPOSE || eb == EV_RESIZE) { disp.draw(q); }
             eb = disp.surf.poll();
         }
@@ -167,7 +177,7 @@ fn main() {
         if (changed) {
             print("now serving " + q.now_serving);
             con.draw(q);
-            disp.draw(q);
+            if (disp_open) { disp.draw(q); }
         }
     }
     print("closed at " + q.now_serving);

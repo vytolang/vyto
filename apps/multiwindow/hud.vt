@@ -51,11 +51,15 @@ fn main() {
     draw_hud(hud, value);
 
     let live = true;
+    let hud_open = true;   // the HUD can be dismissed without quitting
     while (live) {
-        let ea = main_w.waitTimeoutFds(40, [hud.eventFd()]);
+        let wfds: int[] = [];
+        if (hud_open) { wfds.push(hud.eventFd()); }
+        let ea = main_w.waitTimeoutFds(40, wfds);
         let changed = false;
 
         while (ea != EV_NONE) {
+            // The main window is the app: closing it quits.
             if (ea == EV_CLOSE) { live = false; }
             else if (ea == EV_EXPOSE || ea == EV_RESIZE) { draw_main(main_w, value); }
             else if (ea == EV_MOUSE_DOWN) {
@@ -68,16 +72,20 @@ fn main() {
             ea = main_w.poll();
         }
 
-        let eb = hud.poll();
+        // Dismissing the HUD leaves the main window running — a panel is not
+        // the app. EV_CLOSE names one window; treating it as "quit" is what
+        // takes the other one down with it.
+        let eb = EV_NONE;
+        if (hud_open) { eb = hud.poll(); }
         while (eb != EV_NONE) {
-            if (eb == EV_CLOSE) { live = false; }
+            if (eb == EV_CLOSE) { hud_open = false; break; }
             // Without this the HUD goes see-through wherever it is damaged.
             else if (eb == EV_EXPOSE || eb == EV_RESIZE) { draw_hud(hud, value); }
             else if (eb == EV_MOUSE_DOWN) {
                 let x = hud.mouse_x();
                 let y = hud.mouse_y();
                 if (y < BAR && x > hud.width() - 24) {
-                    live = false;                 // our own close box
+                    hud_open = false;             // our own close box
                 } else if (y < BAR) {
                     hud.drag_start(EDGE.MOVE, x, y);
                 }
@@ -87,10 +95,14 @@ fn main() {
 
         if (changed) {
             draw_main(main_w, value);
-            draw_hud(hud, value);
+            if (hud_open) { draw_hud(hud, value); }
             print("value " + value);
         }
     }
-    let p = hud.position();
-    print("hud ended at " + p[0] + "," + p[1]);
+    if (hud_open) {
+        let p = hud.position();
+        print("hud ended at " + p[0] + "," + p[1]);
+    } else {
+        print("hud was dismissed; main window ran on");
+    }
 }
