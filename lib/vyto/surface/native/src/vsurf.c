@@ -42,6 +42,27 @@
 static int headless_on(void);
 static long long headless_ms; /* synthetic clock: +16 per scripted event */
 
+/* Per-surface input state. Each arm's VSurf embeds one of these, so the shared
+   headless reader can fill a surface's slot without knowing that arm's struct
+   layout — the platform structs are defined below the #ifdef split, but this is
+   not. Was a set of file-scope statics, which two windows would have shared.
+   `text` is the storage vs_text() hands back a pointer to, so it lives exactly
+   as long as its surface. */
+typedef struct VsInput {
+    int key, x, y, wheel, mods;
+    char text[32];
+    int pending_up;  /* headless: a click's MOUSE_UP still owed to this surface */
+    int hl_index;    /* headless: this surface's open order, what `win N` names */
+} VsInput;
+
+/* Headless multi-window routing. The event script is one process-global reader,
+   but vs_wait/vs_poll are called PER SURFACE — so a scripted event has to say
+   which window it is for, and a surface whose turn it is not must not consume
+   it. `win N` sets the target; surfaces are numbered in vs_open order, and the
+   default of 0 is what keeps every existing script working unchanged. */
+static int hl_target;    /* window index the script is currently addressing */
+static int hl_next_index; /* open-order counter handed out by vs_open */
+
 #ifdef _WIN32
 #include <windows.h>
 long long vs_now_ms(void) {
@@ -72,8 +93,6 @@ static int scale_from_env(void) {
     return 0;
 }
 
-static int last_key, last_x, last_y, last_wheel, last_mods;
-static char last_text[32];
 
 /* process-local clipboard buffer: the whole story for headless and fbdev,
    and the "we own the selection" copy on X11 */
@@ -146,13 +165,21 @@ static void headless_open_script(void) {
  *                    "none" (e.g. "mods ctrl+shift"). Emits no event itself.
  *   clip <text>      seed the process-local clipboard (what vs_clipboard_get
  *                    returns) — the paste-test hook. Emits no event itself.
+ *   win <n>          address window <n> (open order, 0-based) with everything
+ *                    that follows. Emits no event itself. Absent means 0, so a
+ *                    single-window script needs no `win` line — which is why
+ *                    every pre-existing script still behaves identically.
+ *                    Indices are open order, so closing and reopening a surface
+ *                    renumbers: fine for a scripted test, not a general API.
  *   close
  * '#' starts a comment; EOF acts as close. */
-static int headless_wait(int *w, int *h) {
-    static int pending_up; /* deliver MOUSE_UP after each click's MOUSE_DOWN */
+static int headless_wait(VsInput *in, int *w, int *h) {
     headless_ms += 16;     /* one synthetic frame per delivered event */
-    if (pending_up) {
-        pending_up = 0;
+    /* Not this window's turn: report "nothing for me" rather than draining an
+       event addressed to another surface. The caller polls both. */
+    if (in->hl_index != hl_target) return VS_EV_NONE;
+    if (in->pending_up) {
+        in->pending_up = 0;
         return VS_EV_MOUSE_UP;
     }
     for (;;) {
@@ -164,10 +191,10 @@ static int headless_wait(int *w, int *h) {
             if ((lead & 0xE0) == 0xC0) len = 2;
             else if ((lead & 0xF0) == 0xE0) len = 3;
             else if ((lead & 0xF8) == 0xF0) len = 4;
-            last_key = len == 1 ? (int)lead : 0;
+            in->key = len == 1 ? (int)lead : 0;
             int i = 0;
-            while (i < len && type_p[i]) { last_text[i] = type_p[i]; i++; }
-            last_text[i] = 0;
+            while (i < len && type_p[i]) { in->text[i] = type_p[i]; i++; }
+            in->text[i] = 0;
             type_p += i;
             return VS_EV_KEY;
         }
@@ -183,12 +210,25 @@ static int headless_wait(int *w, int *h) {
         if (strncmp(script_line, "key ", 4) == 0 || strncmp(script_line, "keyup ", 6) == 0) {
             int up = script_line[3] == 'u';
             const char *k = script_line + (up ? 6 : 4);
-            last_text[0] = 0;
+            in->text[0] = 0;
             int code = key_by_name(k);
             if (!code) continue;
-            last_key = code;
-            if (code == VS_KEY_SPACE) { last_text[0] = ' '; last_text[1] = 0; }
+            in->key = code;
+            if (code == VS_KEY_SPACE) { in->text[0] = ' '; in->text[1] = 0; }
             return up ? VS_EV_KEY_UP : VS_EV_KEY;
+        }
+        {
+            int wn;
+            if (sscanf(script_line, "win %d", &wn) == 1) {
+                hl_target = wn;
+                /* Stop reading HERE rather than continuing the loop: everything
+                   after this line belongs to another window, and this surface
+                   would otherwise consume the very events it just handed over.
+                   The caller polls each surface, so the new target picks up on
+                   its own next call. */
+                if (in->hl_index != hl_target) return VS_EV_NONE;
+                continue;
+            }
         }
         if (strncmp(script_line, "clip ", 5) == 0) {
             clip_store(&clip_local, script_line + 5);
@@ -205,20 +245,20 @@ static int headless_wait(int *w, int *h) {
                 else if (strncmp(p, "none", 4) == 0) { m = 0; p += 4; }
                 else p++;
             }
-            last_mods = m;
+            in->mods = m;
             continue;
         }
-        if (sscanf(script_line, "click %d %d", &last_x, &last_y) == 2) {
-            pending_up = 1;
+        if (sscanf(script_line, "click %d %d", &in->x, &in->y) == 2) {
+            in->pending_up = 1;
             return VS_EV_MOUSE_DOWN;
         }
-        if (sscanf(script_line, "rclick %d %d", &last_x, &last_y) == 2) {
+        if (sscanf(script_line, "rclick %d %d", &in->x, &in->y) == 2) {
             return VS_EV_MOUSE_RDOWN;
         }
-        if (sscanf(script_line, "down %d %d", &last_x, &last_y) == 2) {
+        if (sscanf(script_line, "down %d %d", &in->x, &in->y) == 2) {
             return VS_EV_MOUSE_DOWN;
         }
-        if (sscanf(script_line, "up %d %d", &last_x, &last_y) == 2) {
+        if (sscanf(script_line, "up %d %d", &in->x, &in->y) == 2) {
             return VS_EV_MOUSE_UP;
         }
         {
@@ -235,21 +275,21 @@ static int headless_wait(int *w, int *h) {
         {
             int mx, my;
             if (sscanf(script_line, "move %d %d", &mx, &my) == 2) {
-                last_x = mx;
-                last_y = my;
+                in->x = mx;
+                in->y = my;
                 return VS_EV_MOUSE_MOVE;
             }
         }
         {
             int sc, sx, sy;
             if (sscanf(script_line, "scroll %d %d %d", &sc, &sx, &sy) == 3) {
-                last_wheel = sc;
-                last_x = sx;
-                last_y = sy;
+                in->wheel = sc;
+                in->x = sx;
+                in->y = sy;
                 return VS_EV_MOUSE_WHEEL;
             }
             if (sscanf(script_line, "scroll %d", &sc) == 1) {
-                last_wheel = sc;
+                in->wheel = sc;
                 return VS_EV_MOUSE_WHEEL;
             }
         }
@@ -257,17 +297,20 @@ static int headless_wait(int *w, int *h) {
     }
 }
 
-int vs_key(void) { return last_key; }
-const char *vs_text(void) { return last_text; }
-int vs_x(void) { return last_x; }
-int vs_y(void) { return last_y; }
-int vs_wheel(void) { return last_wheel; }
-int vs_mods(void) { return last_mods; }
+/* The six input accessors used to live here, reading file-scope statics. They
+   now read per-surface fields, and VSurf is defined separately in each arm
+   below — so the definitions moved down into the Win32 and X11 arms. See
+   vs_input_accessors in each. */
 
 #ifdef _WIN32
 /* ================================================================ Win32 */
 
 #include <windows.h>
+
+typedef struct QEv {
+    int type, key, x, y, mods;
+    char text[2];
+} QEv;
 
 typedef struct VSurf {
     HWND hwnd; /* NULL in headless mode */
@@ -277,15 +320,14 @@ typedef struct VSurf {
     HFONT font;
     int w, h;
     int min_w, min_h; /* client-area floor from vs_set_min_size; 0 = none */
+
+    VsInput in;   /* this window's input state; see VsInput above */
+    QEv evq[64];  /* this window's pending events */
+    int evq_head, evq_len;
 } VSurf;
 
-/* WndProc -> vs_wait event queue (single window; small ring buffer) */
-typedef struct QEv {
-    int type, key, x, y, mods;
-    char text[2];
-} QEv;
-static QEv evq[64];
-static int evq_head, evq_len;
+/* WndProc -> vs_wait event queue. One ring PER SURFACE: a shared ring let
+   whichever window called vs_wait pop another window's events. */
 
 /* async modifier state at event time */
 static int win_mods(void) {
@@ -297,10 +339,14 @@ static int win_mods(void) {
     return m;
 }
 
-static void q_push(int type, int key, int x, int y, int ch) {
+static void q_push(VSurf *s, int type, int key, int x, int y, int ch) {
+    /* Messages arrive before vs_open's SetWindowLongPtr runs (WM_NCCREATE,
+       WM_CREATE), so GWLP_USERDATA is still null then. Dropping those is
+       correct: there is no surface yet for them to belong to. */
+    if (!s) return;
     /* coalesce mouse-move bursts: overwrite a trailing queued move */
-    if (type == VS_EV_MOUSE_MOVE && evq_len > 0) {
-        QEv *tail = &evq[(evq_head + evq_len - 1) % 64];
+    if (type == VS_EV_MOUSE_MOVE && s->evq_len > 0) {
+        QEv *tail = &s->evq[(s->evq_head + s->evq_len - 1) % 64];
         if (tail->type == VS_EV_MOUSE_MOVE) {
             tail->x = x;
             tail->y = y;
@@ -308,12 +354,12 @@ static void q_push(int type, int key, int x, int y, int ch) {
             return;
         }
     }
-    if (evq_len == 64) {
+    if (s->evq_len == 64) {
         /* drop when full — except CLOSE, which must never be lost */
         if (type != VS_EV_CLOSE) return;
-        evq_len--; /* sacrifice the newest queued event for the CLOSE */
+        s->evq_len--; /* sacrifice the newest queued event for the CLOSE */
     }
-    QEv *e = &evq[(evq_head + evq_len) % 64];
+    QEv *e = &s->evq[(s->evq_head + s->evq_len) % 64];
     e->type = type;
     e->key = key;
     e->x = x;
@@ -321,7 +367,7 @@ static void q_push(int type, int key, int x, int y, int ch) {
     e->mods = win_mods();
     e->text[0] = (char)ch;
     e->text[1] = 0;
-    evq_len++;
+    s->evq_len++;
 }
 
 /* shared VK -> VS_KEY_* mapping for WM_KEYDOWN/WM_KEYUP (and SYS variants) */
@@ -382,7 +428,7 @@ static LRESULT CALLBACK vs_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         HDC dc = BeginPaint(hwnd, &ps);
         if (s && s->memdc) BitBlt(dc, 0, 0, s->w, s->h, s->memdc, 0, 0, SRCCOPY);
         EndPaint(hwnd, &ps);
-        q_push(VS_EV_EXPOSE, 0, 0, 0, 0);
+        q_push(s, VS_EV_EXPOSE, 0, 0, 0, 0);
         return 0;
     }
     case WM_SIZE: {
@@ -391,7 +437,7 @@ static LRESULT CALLBACK vs_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             s->w = w;
             s->h = h;
             make_backbuffer(s);
-            q_push(VS_EV_RESIZE, 0, 0, 0, 0);
+            q_push(s, VS_EV_RESIZE, 0, 0, 0, 0);
         }
         return 0;
     }
@@ -413,19 +459,19 @@ static LRESULT CALLBACK vs_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
            setting one later cannot reintroduce a flash on resize. */
         return 1;
     case WM_CLOSE:
-        q_push(VS_EV_CLOSE, 0, 0, 0, 0);
+        q_push(s, VS_EV_CLOSE, 0, 0, 0, 0);
         return 0; /* the Vyto loop decides; vs_close destroys the window */
     case WM_LBUTTONDOWN:
-        q_push(VS_EV_MOUSE_DOWN, 0, (short)LOWORD(lp), (short)HIWORD(lp), 0);
+        q_push(s, VS_EV_MOUSE_DOWN, 0, (short)LOWORD(lp), (short)HIWORD(lp), 0);
         return 0;
     case WM_LBUTTONUP:
-        q_push(VS_EV_MOUSE_UP, 0, (short)LOWORD(lp), (short)HIWORD(lp), 0);
+        q_push(s, VS_EV_MOUSE_UP, 0, (short)LOWORD(lp), (short)HIWORD(lp), 0);
         return 0;
     case WM_RBUTTONDOWN:
-        q_push(VS_EV_MOUSE_RDOWN, 0, (short)LOWORD(lp), (short)HIWORD(lp), 0);
+        q_push(s, VS_EV_MOUSE_RDOWN, 0, (short)LOWORD(lp), (short)HIWORD(lp), 0);
         return 0;
     case WM_MOUSEMOVE:
-        q_push(VS_EV_MOUSE_MOVE, 0, (short)LOWORD(lp), (short)HIWORD(lp), 0);
+        q_push(s, VS_EV_MOUSE_MOVE, 0, (short)LOWORD(lp), (short)HIWORD(lp), 0);
         return 0;
     case WM_MOUSEWHEEL: {
         POINT pt;
@@ -435,7 +481,7 @@ static LRESULT CALLBACK vs_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         int delta = GET_WHEEL_DELTA_WPARAM(wp);
         /* normalize: one wheel notch = WHEEL_DELTA (120); map to +/-3 lines */
         int lines = (delta * 3) / 120;
-        q_push(VS_EV_MOUSE_WHEEL, lines, pt.x, pt.y, 0);
+        q_push(s, VS_EV_MOUSE_WHEEL, lines, pt.x, pt.y, 0);
         return 0;
     }
     case WM_KEYDOWN:
@@ -448,7 +494,7 @@ static LRESULT CALLBACK vs_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             else if (wp >= '0' && wp <= '9') k = (int)wp;
             else if (wp == VK_SPACE) k = VS_KEY_SPACE;
         }
-        if (k) q_push(VS_EV_KEY, k, 0, 0, 0);
+        if (k) q_push(s, VS_EV_KEY, k, 0, 0, 0);
         /* unhandled keys fall to DefWindowProc (TranslateMessage yields
            WM_CHAR); SYS messages always fall through so Alt+F4 etc. work */
         if (k && msg == WM_KEYDOWN) return 0;
@@ -463,12 +509,12 @@ static LRESULT CALLBACK vs_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             else if (wp >= '0' && wp <= '9') k = (int)wp;
             else if (wp == VK_SPACE) k = VS_KEY_SPACE;
         }
-        if (k) q_push(VS_EV_KEY_UP, k, 0, 0, 0);
+        if (k) q_push(s, VS_EV_KEY_UP, k, 0, 0, 0);
         if (msg == WM_KEYUP) return 0;
         break;
     }
     case WM_CHAR:
-        if (wp >= 32 && wp < 127) q_push(VS_EV_KEY, (int)wp, 0, 0, (int)wp);
+        if (wp >= 32 && wp < 127) q_push(s, VS_EV_KEY, (int)wp, 0, 0, (int)wp);
         return 0;
     default:
         break;
@@ -482,6 +528,7 @@ void *vs_open(const char *title, int w, int h) {
     s->w = w;
     s->h = h;
     if (headless_on()) {
+        s->in.hl_index = hl_next_index++;
         headless_open_script();
         g_scale_pct = 100;
         return s;
@@ -699,48 +746,57 @@ int vs_font_height(void *vs) {
     return (int)tm.tmHeight;
 }
 
-static int q_pop(void) {
-    QEv e = evq[evq_head];
-    evq_head = (evq_head + 1) % 64;
-    evq_len--;
-    last_key = e.key;
-    last_x = e.x;
-    last_y = e.y;
-    last_mods = e.mods;
-    last_wheel = (e.type == VS_EV_MOUSE_WHEEL) ? e.key : 0;
-    last_text[0] = e.text[0];
-    last_text[1] = 0;
+static int q_pop(VSurf *s) {
+    QEv e = s->evq[s->evq_head];
+    s->evq_head = (s->evq_head + 1) % 64;
+    s->evq_len--;
+    s->in.key = e.key;
+    s->in.x = e.x;
+    s->in.y = e.y;
+    s->in.mods = e.mods;
+    s->in.wheel = (e.type == VS_EV_MOUSE_WHEEL) ? e.key : 0;
+    s->in.text[0] = e.text[0];
+    s->in.text[1] = 0;
     return e.type;
 }
 
+/* The six input accessors, Win32 arm. NULL-guarded because raw_handle() is
+   public, so a caller can hand us anything. */
+int vs_key(void *vs)   { VSurf *s = vs; return s ? s->in.key : 0; }
+const char *vs_text(void *vs) { VSurf *s = vs; return s ? s->in.text : ""; }
+int vs_x(void *vs)     { VSurf *s = vs; return s ? s->in.x : 0; }
+int vs_y(void *vs)     { VSurf *s = vs; return s ? s->in.y : 0; }
+int vs_wheel(void *vs) { VSurf *s = vs; return s ? s->in.wheel : 0; }
+int vs_mods(void *vs)  { VSurf *s = vs; return s ? s->in.mods : 0; }
+
 int vs_wait(void *vs) {
     VSurf *s = vs;
-    if (!s->hwnd) return headless_wait(&s->w, &s->h);
-    while (evq_len == 0) {
+    if (!s->hwnd) return headless_wait(&s->in, &s->w, &s->h);
+    while (s->evq_len == 0) {
         MSG msg;
         if (GetMessageA(&msg, NULL, 0, 0) <= 0) return VS_EV_CLOSE;
         TranslateMessage(&msg);
         DispatchMessageA(&msg);
     }
-    return q_pop();
+    return q_pop(s);
 }
 
 int vs_poll(void *vs) {
     VSurf *s = vs;
-    if (!s->hwnd) return headless_wait(&s->w, &s->h);
+    if (!s->hwnd) return headless_wait(&s->in, &s->w, &s->h);
     MSG msg;
-    while (evq_len == 0 && PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
+    while (s->evq_len == 0 && PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
         TranslateMessage(&msg);
         DispatchMessageA(&msg);
     }
-    return evq_len ? q_pop() : VS_EV_NONE;
+    return s->evq_len ? q_pop(s) : VS_EV_NONE;
 }
 
 int vs_wait_timeout(void *vs, int ms) {
     VSurf *s = vs;
-    if (!s->hwnd) return headless_wait(&s->w, &s->h);
+    if (!s->hwnd) return headless_wait(&s->in, &s->w, &s->h);
     for (;;) {
-        if (evq_len) return q_pop();
+        if (s->evq_len) return q_pop(s);
         /* MWMO_INPUTAVAILABLE: also wake for input already in the queue that
            a previous PeekMessage saw — plain MsgWaitForMultipleObjects only
            signals NEW input and can stall on already-queued messages */
@@ -791,7 +847,7 @@ int vs_damage(void *vs, VsRect *out) {
 }
 
 /* Messages already decoded into the queue by a previous PeekMessage. */
-int vs_events_pending(void *vs) { (void)vs; return evq_len; }
+int vs_events_pending(void *vs) { VSurf *s = vs; return s ? s->evq_len : 0; }
 
 int vs_can_wait_fds(void *vs) { (void)vs; return 0; }
 
@@ -903,6 +959,8 @@ typedef struct VSurf {
     uint32_t *bb;      /* software backbuffer, w*h of 0x00RRGGBB */
     int fb_clip_on, fb_cx0, fb_cy0, fb_cx1, fb_cy1;
     int fb_expose;     /* deliver one EV_EXPOSE on the first wait */
+
+    VsInput in;   /* this window's input state; see VsInput above */
 } VSurf;
 
 static XFontStruct *font;       /* one bitmap UI font, shared, never freed */
@@ -1113,16 +1171,16 @@ static void fbq_push(int type, int key, int wheel, const char *text) {
     fbq_len++;
 }
 
-static int fbq_pop(void) {
+static int fbq_pop(VSurf *s) {
     FbEv e = fbq[fbq_head];
     fbq_head = (fbq_head + 1) % 64;
     fbq_len--;
-    last_key = e.key;
-    last_x = e.x;
-    last_y = e.y;
-    last_wheel = e.wheel;
-    last_mods = e.mods;
-    snprintf(last_text, sizeof last_text, "%s", e.text);
+    s->in.key = e.key;
+    s->in.x = e.x;
+    s->in.y = e.y;
+    s->in.wheel = e.wheel;
+    s->in.mods = e.mods;
+    snprintf(s->in.text, sizeof s->in.text, "%s", e.text);
     return e.type;
 }
 
@@ -1228,7 +1286,7 @@ static int fb_next(VSurf *s, int block, int ms) {
     }
     for (;;) {
         if (fb_close_req) return VS_EV_CLOSE;
-        if (fbq_len) return fbq_pop();
+        if (fbq_len) return fbq_pop(s);
         fd_set rf;
         FD_ZERO(&rf);
         int maxfd = -1;
@@ -1579,6 +1637,7 @@ void *vs_open(const char *title, int w, int h) {
     s->w = w;
     s->h = h;
     if (headless_on()) {
+        s->in.hl_index = hl_next_index++;
         headless_open_script();
         g_scale_pct = 100;
         return s;
@@ -2072,7 +2131,7 @@ const char *vs_clipboard_get(void *vs) {
     return "";
 }
 
-/* decode an X key event into last_key/last_text; 1 if a key we deliver, else 0 */
+/* decode an X key event into s->in.key/s->in.text; 1 if a key we deliver, else 0 */
 static int x11_decode_key(VSurf *s, XKeyEvent *ke) {
     char buf[16];
     KeySym ks = 0;
@@ -2087,30 +2146,30 @@ static int x11_decode_key(VSurf *s, XKeyEvent *ke) {
         n = XLookupString(ke, buf, sizeof buf - 1, &ks, NULL);
     }
     buf[n < 0 ? 0 : n] = 0;
-    last_text[0] = 0;
+    s->in.text[0] = 0;
     switch (ks) {
-    case XK_Return: case XK_KP_Enter: last_key = VS_KEY_ENTER; return 1;
-    case XK_BackSpace: last_key = VS_KEY_BACKSPACE; return 1;
-    case XK_Escape: last_key = VS_KEY_ESC; return 1;
-    case XK_Up: case XK_KP_Up: last_key = VS_KEY_UP; return 1;
-    case XK_Down: case XK_KP_Down: last_key = VS_KEY_DOWN; return 1;
-    case XK_Left: case XK_KP_Left: last_key = VS_KEY_LEFT; return 1;
-    case XK_Right: case XK_KP_Right: last_key = VS_KEY_RIGHT; return 1;
-    case XK_Delete: case XK_KP_Delete: last_key = VS_KEY_DELETE; return 1;
-    case XK_Tab: case XK_ISO_Left_Tab: last_key = VS_KEY_TAB; return 1;
-    case XK_Home: case XK_KP_Home: last_key = VS_KEY_HOME; return 1;
-    case XK_End: case XK_KP_End: last_key = VS_KEY_END; return 1;
-    case XK_Page_Up: case XK_KP_Page_Up: last_key = VS_KEY_PAGEUP; return 1;
-    case XK_Page_Down: case XK_KP_Page_Down: last_key = VS_KEY_PAGEDOWN; return 1;
-    case XK_Insert: case XK_KP_Insert: last_key = VS_KEY_INSERT; return 1;
-    case XK_Shift_L: case XK_Shift_R: last_key = VS_KEY_SHIFT; return 1;
-    case XK_Control_L: case XK_Control_R: last_key = VS_KEY_CTRL; return 1;
+    case XK_Return: case XK_KP_Enter: s->in.key = VS_KEY_ENTER; return 1;
+    case XK_BackSpace: s->in.key = VS_KEY_BACKSPACE; return 1;
+    case XK_Escape: s->in.key = VS_KEY_ESC; return 1;
+    case XK_Up: case XK_KP_Up: s->in.key = VS_KEY_UP; return 1;
+    case XK_Down: case XK_KP_Down: s->in.key = VS_KEY_DOWN; return 1;
+    case XK_Left: case XK_KP_Left: s->in.key = VS_KEY_LEFT; return 1;
+    case XK_Right: case XK_KP_Right: s->in.key = VS_KEY_RIGHT; return 1;
+    case XK_Delete: case XK_KP_Delete: s->in.key = VS_KEY_DELETE; return 1;
+    case XK_Tab: case XK_ISO_Left_Tab: s->in.key = VS_KEY_TAB; return 1;
+    case XK_Home: case XK_KP_Home: s->in.key = VS_KEY_HOME; return 1;
+    case XK_End: case XK_KP_End: s->in.key = VS_KEY_END; return 1;
+    case XK_Page_Up: case XK_KP_Page_Up: s->in.key = VS_KEY_PAGEUP; return 1;
+    case XK_Page_Down: case XK_KP_Page_Down: s->in.key = VS_KEY_PAGEDOWN; return 1;
+    case XK_Insert: case XK_KP_Insert: s->in.key = VS_KEY_INSERT; return 1;
+    case XK_Shift_L: case XK_Shift_R: s->in.key = VS_KEY_SHIFT; return 1;
+    case XK_Control_L: case XK_Control_R: s->in.key = VS_KEY_CTRL; return 1;
     case XK_Alt_L: case XK_Alt_R: case XK_Meta_L: case XK_Meta_R:
-        last_key = VS_KEY_ALT; return 1;
-    case XK_Super_L: case XK_Super_R: last_key = VS_KEY_SUPER; return 1;
+        s->in.key = VS_KEY_ALT; return 1;
+    case XK_Super_L: case XK_Super_R: s->in.key = VS_KEY_SUPER; return 1;
     default:
         if (ks >= XK_F1 && ks <= XK_F12) { /* contiguous keysym block */
-            last_key = VS_KEY_F1 + (int)(ks - XK_F1);
+            s->in.key = VS_KEY_F1 + (int)(ks - XK_F1);
             return 1;
         }
         /* Printable key: prefer the (shift-aware) keysym so Ctrl+A still
@@ -2119,17 +2178,17 @@ static int x11_decode_key(VSurf *s, XKeyEvent *ke) {
            only from a printable lookup, so Ctrl-chorded keys deliver a key
            code but no insertable text. */
         if (ks == XK_space || (ks >= 0x21 && ks <= 0x7e)) {
-            last_key = (int)ks;
+            s->in.key = (int)ks;
             if (n >= 1 && (unsigned char)buf[0] >= 32 && buf[0] != 127) {
-                if ((size_t)n < sizeof last_text) memcpy(last_text, buf, (size_t)n + 1);
+                if ((size_t)n < sizeof s->in.text) memcpy(s->in.text, buf, (size_t)n + 1);
             }
             return 1;
         }
         /* keypad digits, and any UTF-8 text the input method composed:
            no ASCII key code (key = 0 for multibyte), only insertable text */
         if (n >= 1 && (unsigned char)buf[0] >= 32 && buf[0] != 127) {
-            last_key = (n == 1 && (unsigned char)buf[0] < 127) ? buf[0] : 0;
-            if ((size_t)n < sizeof last_text) memcpy(last_text, buf, (size_t)n + 1);
+            s->in.key = (n == 1 && (unsigned char)buf[0] < 127) ? buf[0] : 0;
+            if ((size_t)n < sizeof s->in.text) memcpy(s->in.text, buf, (size_t)n + 1);
             return 1;
         }
     }
@@ -2201,51 +2260,51 @@ static int x11_translate(VSurf *s, XEvent *e) {
         return -1;
     }
     case KeyPress:
-        last_mods = x11_mods_of(e->xkey.state);
+        s->in.mods = x11_mods_of(e->xkey.state);
         return x11_decode_key(s, &e->xkey) ? VS_EV_KEY : -1;
     case KeyRelease:
-        last_mods = x11_mods_of(e->xkey.state);
+        s->in.mods = x11_mods_of(e->xkey.state);
         return x11_decode_key(s, &e->xkey) ? VS_EV_KEY_UP : -1;
     case ButtonPress:
-        last_mods = x11_mods_of(e->xbutton.state);
+        s->in.mods = x11_mods_of(e->xbutton.state);
         if (e->xbutton.button == Button1) {
-            last_x = e->xbutton.x;
-            last_y = e->xbutton.y;
+            s->in.x = e->xbutton.x;
+            s->in.y = e->xbutton.y;
             return VS_EV_MOUSE_DOWN;
         }
         if (e->xbutton.button == Button3) {
-            last_x = e->xbutton.x;
-            last_y = e->xbutton.y;
+            s->in.x = e->xbutton.x;
+            s->in.y = e->xbutton.y;
             return VS_EV_MOUSE_RDOWN;
         }
         if (e->xbutton.button == Button4) {
-            last_x = e->xbutton.x;
-            last_y = e->xbutton.y;
-            last_wheel = -3; /* up = negative (content moves down) */
+            s->in.x = e->xbutton.x;
+            s->in.y = e->xbutton.y;
+            s->in.wheel = -3; /* up = negative (content moves down) */
             return VS_EV_MOUSE_WHEEL;
         }
         if (e->xbutton.button == Button5) {
-            last_x = e->xbutton.x;
-            last_y = e->xbutton.y;
-            last_wheel = 3; /* down = positive (content moves up) */
+            s->in.x = e->xbutton.x;
+            s->in.y = e->xbutton.y;
+            s->in.wheel = 3; /* down = positive (content moves up) */
             return VS_EV_MOUSE_WHEEL;
         }
         return -1;
     case ButtonRelease:
-        last_mods = x11_mods_of(e->xbutton.state);
+        s->in.mods = x11_mods_of(e->xbutton.state);
         if (e->xbutton.button == Button1) {
-            last_x = e->xbutton.x;
-            last_y = e->xbutton.y;
+            s->in.x = e->xbutton.x;
+            s->in.y = e->xbutton.y;
             return VS_EV_MOUSE_UP;
         }
         return -1;
     case MotionNotify:
-        last_mods = x11_mods_of(e->xmotion.state);
+        s->in.mods = x11_mods_of(e->xmotion.state);
         /* hover source — coalesce: only deliver if the cursor actually moved.
            X11 often fires many MotionNotify per pixel; throttle by storing the
            latest and letting vs_wait dedupe via the change check in Window. */
-        last_x = e->xmotion.x;
-        last_y = e->xmotion.y;
+        s->in.x = e->xmotion.x;
+        s->in.y = e->xmotion.y;
         return VS_EV_MOUSE_MOVE;
     case ClientMessage:
         if ((Atom)e->xclient.data.l[0] == s->wm_delete) return VS_EV_CLOSE;
@@ -2269,11 +2328,20 @@ static void x11_coalesce_motion(VSurf *s) {
         XPeekEvent(s->dpy, &e);
         if (e.type != MotionNotify) return;
         XNextEvent(s->dpy, &e);
-        last_x = e.xmotion.x;
-        last_y = e.xmotion.y;
-        last_mods = x11_mods_of(e.xmotion.state);
+        s->in.x = e.xmotion.x;
+        s->in.y = e.xmotion.y;
+        s->in.mods = x11_mods_of(e.xmotion.state);
     }
 }
+
+/* The six input accessors, X11/fbdev/headless arm. NULL-guarded because
+   raw_handle() is public, so a caller can hand us anything. */
+int vs_key(void *vs)   { VSurf *s = vs; return s ? s->in.key : 0; }
+const char *vs_text(void *vs) { VSurf *s = vs; return s ? s->in.text : ""; }
+int vs_x(void *vs)     { VSurf *s = vs; return s ? s->in.x : 0; }
+int vs_y(void *vs)     { VSurf *s = vs; return s ? s->in.y : 0; }
+int vs_wheel(void *vs) { VSurf *s = vs; return s ? s->in.wheel : 0; }
+int vs_mods(void *vs)  { VSurf *s = vs; return s ? s->in.mods : 0; }
 
 /* translate + IME filter + motion coalescing for one raw event */
 static int x11_deliver(VSurf *s, XEvent *e) {
@@ -2286,7 +2354,7 @@ static int x11_deliver(VSurf *s, XEvent *e) {
 int vs_wait(void *vs) {
     VSurf *s = vs;
     if (s->fb_on) return fb_next(s, 1, -1);
-    if (!s->dpy) return headless_wait(&s->w, &s->h);
+    if (!s->dpy) return headless_wait(&s->in, &s->w, &s->h);
     for (;;) {
         XEvent e;
         XNextEvent(s->dpy, &e);
@@ -2300,7 +2368,7 @@ int vs_wait(void *vs) {
 int vs_poll(void *vs) {
     VSurf *s = vs;
     if (s->fb_on) return fb_next(s, 0, -1);
-    if (!s->dpy) return headless_wait(&s->w, &s->h);
+    if (!s->dpy) return headless_wait(&s->in, &s->w, &s->h);
     XFlush(s->dpy);
     while (XPending(s->dpy)) {
         XEvent e;
@@ -2316,7 +2384,7 @@ int vs_poll(void *vs) {
 int vs_wait_timeout(void *vs, int ms) {
     VSurf *s = vs;
     if (s->fb_on) return fb_next(s, 1, ms >= 0 ? ms : 0);
-    if (!s->dpy) return headless_wait(&s->w, &s->h);
+    if (!s->dpy) return headless_wait(&s->in, &s->w, &s->h);
     int fd = ConnectionNumber(s->dpy);
     for (;;) {
         XFlush(s->dpy);
@@ -2357,7 +2425,7 @@ int vs_wait_timeout(void *vs, int ms) {
 int vs_wait_timeout_fds(void *vs, int ms, const int *fds, int n) {
     VSurf *s = vs;
     if (s->fb_on) return fb_next(s, 1, ms >= 0 ? ms : 0);
-    if (!s->dpy) return headless_wait(&s->w, &s->h);
+    if (!s->dpy) return headless_wait(&s->in, &s->w, &s->h);
     int xfd = ConnectionNumber(s->dpy);
     for (;;) {
         XFlush(s->dpy);

@@ -81,7 +81,13 @@ static struct {
 
 /* Per-event state, matching vsurf's model: the accessors describe whatever
  * event was last *delivered*, not what is queued. Only the Vyto thread reads
- * these, and only from inside a deliver, so they need no lock. */
+ * these, and only from inside a deliver, so they need no lock.
+ *
+ * These stay file-scope rather than moving into a per-surface struct the way
+ * the desktop arms did: Android is single-window by construction — the whole
+ * platform binding is one static `S`, and vs_open attaches to it rather than
+ * allocating. The accessors still take a surface handle so the ABI matches the
+ * other arms; they just have nothing to look it up in. */
 static int   last_key, last_x, last_y, last_wheel, last_mods;
 
 /* Deliberately heap, not the 32-byte fixed buffer vsurf.c uses (vsurf.c:60).
@@ -533,13 +539,13 @@ int vs_wait_timeout(void *s, int ms) {
     }
 }
 
-int vs_key(void)   { return last_key; }
-int vs_mods(void)  { return last_mods; }
-int vs_x(void)     { return last_x; }
-int vs_y(void)     { return last_y; }
-int vs_wheel(void) { return last_wheel; }
+int vs_key(void *s)   { (void)s; return last_key; }
+int vs_mods(void *s)  { (void)s; return last_mods; }
+int vs_x(void *s)     { (void)s; return last_x; }
+int vs_y(void *s)     { (void)s; return last_y; }
+int vs_wheel(void *s) { (void)s; return last_wheel; }
 
-const char *vs_text(void) { return last_text_buf ? last_text_buf : ""; }
+const char *vs_text(void *s) { (void)s; return last_text_buf ? last_text_buf : ""; }
 
 /* --------------------------------------------------------- vsurf: metrics */
 

@@ -137,9 +137,9 @@ int vs_set_vsync(void *s, int on);
 typedef struct VsRect { int x, y, w, h; } VsRect;
 int vs_damage(void *s, VsRect *out);
 
-int vs_key(void);         /* last VS_EV_KEY code */
-const char *vs_text(void);/* UTF-8 text of last key ("" if none) */
-int vs_mods(void);        /* VS_MOD_* bitmask at the last delivered event */
+int vs_key(void *s);         /* last VS_EV_KEY code */
+const char *vs_text(void *s);/* UTF-8 text of last key ("" if none) */
+int vs_mods(void *s);        /* VS_MOD_* bitmask at the last delivered event */
 
 /* monotonic milliseconds — the animation/game clock (not wall time) */
 long long vs_now_ms(void);
@@ -147,9 +147,9 @@ long long vs_now_ms(void);
 /* UI scale factor ×100 (100 = 96dpi baseline, 200 = HiDPI 2x). From
    $VYTO_SCALE when set, else Xft.dpi / the Windows DPI, else 100. */
 int vs_scale_pct(void);
-int vs_x(void);
-int vs_y(void);
-int vs_wheel(void);       /* last VS_EV_MOUSE_WHEEL delta (positive = down) */
+int vs_x(void *s);
+int vs_y(void *s);
+int vs_wheel(void *s);       /* last VS_EV_MOUSE_WHEEL delta (positive = down) */
 
 /* Clipboard, UTF-8 text. set copies the text out; get returns "" when the
    clipboard is empty or unavailable, and the returned pointer stays valid

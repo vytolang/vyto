@@ -1,0 +1,80 @@
+// Two real windows in one process.
+//
+// This is what the per-surface input refactor bought: before it, the six input
+// getters read file-scope statics, so both windows shared one input state and
+// there was no way to tell which window a click belonged to.
+//
+// Run it on a desktop (needs a display):
+//     ./vytoc run examples/113_multiwindow.vt
+// Click in either window; each reports its own clicks and nothing else. Close
+// either one to quit.
+//
+// There is deliberately no .expected file: the harness runs examples without a
+// display, so this one is SKIPped there. The deterministic version of the same
+// check is tests/ui/96_multiwindow, which runs headless.
+//
+// Note the wait: two surfaces means two X connections, hence two descriptors.
+// waitTimeoutFds blocks on THIS window's events OR the other's fd, so an idle
+// pair costs no CPU. Polling both in a bare loop would spin a core instead.
+import { Surface, Rect, rgb,
+         EV_NONE, EV_CLOSE, EV_EXPOSE, EV_RESIZE,
+         EV_MOUSE_DOWN, EV_KEY } from "vyto/surface";
+
+fn paint(s: Surface, label: string, color: int, hits: int) {
+    s.fill(Rect(0.0, 0.0, s.width() as float, s.height() as float), color);
+    s.text(16, 34, label, rgb(255, 255, 255));
+    s.text(16, 60, "clicks: " + hits, rgb(235, 235, 235));
+    s.text(16, 84, "click me — I only see my own", rgb(200, 200, 200));
+    s.present();
+}
+
+fn main() {
+    let a = new Surface("Window A", 340, 200);
+    let b = new Surface("Window B", 340, 200);
+    a.set_min_size(200, 120);
+    b.set_min_size(200, 120);
+
+    let ca = 0;
+    let cb = 0;
+    paint(a, "A", rgb(150, 40, 40), ca);
+    paint(b, "B", rgb(30, 70, 160), cb);
+
+    let live = true;
+    while (live) {
+        // Block on A's window or B's connection, whichever speaks first.
+        // NOTE: this RETURNS A's event when A is the one that woke us — it does
+        // not leave it queued — so the return value has to be handled, not
+        // discarded, or A's input vanishes. B's fd is only watched for
+        // readability, so B's events stay queued for its own poll() below.
+        let ea = a.waitTimeoutFds(50, [b.eventFd()]);
+        while (ea != EV_NONE) {
+            if (ea == EV_CLOSE) { live = false; }
+            else if (ea == EV_MOUSE_DOWN) {
+                ca += 1;
+                print("A click " + a.mouse_x() + "," + a.mouse_y());
+                paint(a, "A", rgb(150, 40, 40), ca);
+            } else if (ea == EV_KEY) {
+                print("A key " + a.key());
+            } else if (ea == EV_EXPOSE || ea == EV_RESIZE) {
+                paint(a, "A", rgb(150, 40, 40), ca);
+            }
+            ea = a.poll();
+        }
+
+        let eb = b.poll();
+        while (eb != EV_NONE) {
+            if (eb == EV_CLOSE) { live = false; }
+            else if (eb == EV_MOUSE_DOWN) {
+                cb += 1;
+                print("B click " + b.mouse_x() + "," + b.mouse_y());
+                paint(b, "B", rgb(30, 70, 160), cb);
+            } else if (eb == EV_KEY) {
+                print("B key " + b.key());
+            } else if (eb == EV_EXPOSE || eb == EV_RESIZE) {
+                paint(b, "B", rgb(30, 70, 160), cb);
+            }
+            eb = b.poll();
+        }
+    }
+    print("closed after A=" + ca + " B=" + cb + " clicks");
+}
