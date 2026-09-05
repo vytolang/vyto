@@ -149,6 +149,38 @@ typedef struct VsMonitor {
 } VsMonitor;
 int vs_monitors(VsMonitor *out, int max);
 
+/* Read a window's pixels back, as 0x00RRGGBB rows of `*w` pixels.
+ *
+ * `win` is a NATIVE window handle — vs_native_window() for one of ours, or an
+ * XID / HWND obtained elsewhere for somebody else's. It is not a VSurf: the
+ * interesting case is a window this process did not create, and a surface
+ * handle cannot name one.
+ *
+ * Writes at most `cap` pixels into `out` and reports the window's size through
+ * `*w`/`*h`. Returns the number of pixels the window HAS, so a caller can pass
+ * cap 0 to size a buffer and call again — a return larger than `cap` means the
+ * capture was truncated, not that it failed. 0 means it could not be read.
+ *
+ * Only the platforms whose window systems allow a client to read another
+ * window: X11 (XGetImage) and Win32 (BitBlt from the window DC). It returns 0
+ * everywhere else, and that includes **Wayland**, where capture is deliberately
+ * behind a portal with user consent rather than a function call — treat 0 as
+ * the normal answer on Linux desktops rather than an error, because it will be
+ * once Wayland is the common case.
+ *
+ * Two limits that are properties of X11, not of this call:
+ *   - Without a compositing manager the server keeps no offscreen storage for
+ *     an obscured window, so a covered region reads back as whatever is drawn
+ *     on top of it. With a compositor (the usual desktop) the content is
+ *     preserved and the capture is correct. There is no way to tell from here
+ *     which you got.
+ *   - An unmapped or iconified window has no content to read at all.
+ *
+ * For previewing a window this process renders, do not use this: blit the
+ * canvas you already have (see apps/multiwindow/videowall.vt). Capture exists
+ * for windows you did not draw. */
+int vs_capture(unsigned long win, int *out, int cap, int *w, int *h);
+
 /* The `edge` values for vs_drag_start, matching _NET_WM_MOVERESIZE. */
 enum {
     VS_EDGE_TOPLEFT = 0,

@@ -97,9 +97,26 @@ packed; 1366 pads to a stride of 1368 and the preview would shear. Use
 Each preview is a scaled full-frame CPU copy, so redraw them when content
 changes rather than every frame. A monitoring thumbnail does not need 60fps.
 
-This only works for windows **this process renders**. Previewing a foreign
-window — a browser, another app — needs X11 `XGetImage` or a compositor
-capture protocol, neither of which is in `vsurf.h`.
+This only works for windows **this process renders** — and it is the right way
+to do it, because the canvas is already there.
+
+For a window you did **not** draw, `capture_window(native_xid)` reads its pixels
+back into a `Capture` whose `pixels` array blits like any other:
+
+```vyto
+let c = capture_window(xid as culong);
+if (c != null) { ctl.blit(c.pixels, c.w, c.h, panel); }
+```
+
+It returns null when the window cannot be read, and **that is the ordinary
+answer, not an error** — it is what Wayland gives (capture there is behind a
+portal with user consent), what Android gives, and what any unmapped window
+gives. Code the null path first. X11 and Win32 are the platforms where it
+works.
+
+One X11 caveat it cannot detect for you: without a compositing manager, an
+obscured region reads back as whatever is drawn over it, because the server
+keeps no offscreen copy. Most desktops composite, so it is usually right.
 
 ## Not covered
 

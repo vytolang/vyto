@@ -491,6 +491,16 @@ int vs_set_fullscreen(void *s, int on) {
     return 0;
 }
 
+int vs_capture(unsigned long win, int *out, int cap, int *w, int *h) {
+    (void)win; (void)out; (void)cap;
+    if (w) *w = 0;
+    if (h) *h = 0;
+    /* Android has no notion of reading another app's window, and screen capture
+     * is a MediaProjection permission flow on the Java side rather than
+     * anything this shim can reach. 0 is the honest answer. */
+    return 0;
+}
+
 int vs_monitors(VsMonitor *out, int max) {
     /* One display, and it is the surface we already have. */
     if (max > 0) {

@@ -7,7 +7,7 @@
 
 import { vs_open, vs_close, vs_width, vs_height, vs_set_title, vs_set_min_size,
           vs_set_decorated, vs_get_position, vs_move, vs_drag_start,
-          vs_set_size, vs_set_fullscreen, vs_monitors,
+          vs_set_size, vs_set_fullscreen, vs_monitors, vs_capture,
           vs_fill_rect, vs_draw_rect, vs_draw_line, vs_draw_text, vs_blit, vs_present,
           vs_text_width, vs_font_ascent, vs_font_height,
           vs_wait, vs_poll, vs_wait_timeout, vs_key, vs_text, vs_x, vs_y, vs_wheel,
@@ -71,6 +71,47 @@ export fn surface_monitors(): Monitor[] {
                              m.primary as int != 0, sc));
     }
     return out;
+}
+
+// A window's pixels, read back with capture_window(). `pixels` is
+// 0x00RRGGBB, row-major, w*h — the layout Surface.blit and blitPtr expect, so a
+// capture can be scaled straight into a preview panel.
+export class Capture {
+    w: int; h: int;
+    pixels: i32[];
+    fn init(w: int, h: int, pixels: i32[]) {
+        this.w = w; this.h = h; this.pixels = pixels;
+    }
+}
+
+// Read back the pixels of the window named by a NATIVE handle — an XID on X11,
+// an HWND on Windows. Get one for your own window from Surface.native_window();
+// the interesting case is a window this process did not create, whose handle
+// comes from elsewhere.
+//
+// Returns null when the window cannot be read. **Treat that as ordinary, not as
+// an error**: it is the answer on Wayland (capture is behind a portal with user
+// consent, not a function call), on Android, and for any window that is not
+// currently mapped.
+//
+// Not the way to preview a window you render yourself — blit the canvas you
+// already have instead, as apps/multiwindow/videowall.vt does. This exists for
+// windows you did not draw.
+//
+// On X11 without a compositing manager an obscured region reads back as
+// whatever is drawn over it, because the server keeps no offscreen copy. Most
+// desktops composite, so this is usually correct — but it cannot be detected
+// from here.
+export fn capture_window(native_win: culong): Capture {
+    let cw: i32 = 0;
+    let ch: i32 = 0;
+    let need = vs_capture(native_win, null, 0 as i32, &cw, &ch) as int;
+    if (need < 1 || cw < 1 || ch < 1) { return null; }
+    let buf: i32[] = [];
+    for (let i in 0..need) { buf.push(0 as i32); }
+    let got = vs_capture(native_win, buf as rawptr, need as i32, &cw, &ch) as int;
+    if (got < 1) { return null; }
+    return new Capture(cw as int, ch as int, buf);
 }
 
 // Which part of a chromeless window a drag grabs. Values mirror VS_EDGE_* in

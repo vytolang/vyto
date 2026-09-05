@@ -680,6 +680,52 @@ static BOOL CALLBACK vs_mon_cb(HMONITOR mon, HDC dc, LPRECT rc, LPARAM lp) {
     return TRUE;
 }
 
+int vs_capture(unsigned long win, int *out, int cap, int *w, int *h) {
+    if (w) *w = 0;
+    if (h) *h = 0;
+    HWND hwnd = (HWND)(UINT_PTR)win;
+    if (!hwnd || !IsWindow(hwnd) || !IsWindowVisible(hwnd)) return 0;
+    RECT r;
+    if (!GetClientRect(hwnd, &r)) return 0;
+    int cw = r.right - r.left, ch = r.bottom - r.top;
+    if (cw < 1 || ch < 1) return 0;
+    if (w) *w = cw;
+    if (h) *h = ch;
+    int total = cw * ch;
+    if (!out || cap <= 0) return total;
+
+    HDC src = GetDC(hwnd);
+    if (!src) return 0;
+    HDC mem = CreateCompatibleDC(src);
+    HBITMAP bmp = CreateCompatibleBitmap(src, cw, ch);
+    HGDIOBJ old = SelectObject(mem, bmp);
+    int ok = BitBlt(mem, 0, 0, cw, ch, src, 0, 0, SRCCOPY);
+
+    int got = 0;
+    if (ok) {
+        BITMAPINFO bi;
+        memset(&bi, 0, sizeof bi);
+        bi.bmiHeader.biSize = sizeof bi.bmiHeader;
+        bi.bmiHeader.biWidth = cw;
+        bi.bmiHeader.biHeight = -ch;   /* negative: top-down rows */
+        bi.bmiHeader.biPlanes = 1;
+        bi.bmiHeader.biBitCount = 32;
+        bi.bmiHeader.biCompression = BI_RGB;
+        int n = total < cap ? total : cap;
+        /* GetDIBits writes 0x00RRGGBB into the caller's buffer directly when the
+           request is a full-width run; a partial cap just truncates the tail. */
+        if (GetDIBits(mem, bmp, 0, (UINT)ch, out, &bi, DIB_RGB_COLORS)) {
+            for (int i = 0; i < n; i++) out[i] &= 0xFFFFFF;
+            got = total;
+        }
+    }
+    SelectObject(mem, old);
+    DeleteObject(bmp);
+    DeleteDC(mem);
+    ReleaseDC(hwnd, src);
+    return got;
+}
+
 int vs_monitors(VsMonitor *out, int max) {
     VsMonEnum e;
     e.out = out;
@@ -1996,6 +2042,83 @@ typedef struct {
     int mwidth, mheight;
     void *outputs;
 } VsRRMonitor;
+
+/* Xlib's default error handler PRINTS and EXITS, so a stale or foreign XID —
+   exactly what a capture API gets handed — would take the process down. Swallow
+   errors for the duration of the call instead and report failure the documented
+   way, with a 0 return. */
+static int vs_cap_failed;
+static int vs_cap_err(Display *d, XErrorEvent *e) {
+    (void)d; (void)e;
+    vs_cap_failed = 1;
+    return 0;
+}
+
+int vs_capture(unsigned long win, int *out, int cap, int *w, int *h) {
+    if (w) *w = 0;
+    if (h) *h = 0;
+    if (!win) return 0;
+    /* Own connection: the caller may be naming a window from another process,
+       and this is a query rather than anything tied to one of our surfaces. */
+    Display *dpy = XOpenDisplay(NULL);
+    if (!dpy) return 0;
+    vs_cap_failed = 0;
+    XErrorHandler prev = XSetErrorHandler(vs_cap_err);
+
+    XWindowAttributes a;
+    if (!XGetWindowAttributes(dpy, (Window)win, &a) || vs_cap_failed ||
+        a.map_state != IsViewable || a.width < 1 || a.height < 1) {
+        /* An unmapped or iconified window has no content to read. */
+        XSetErrorHandler(prev);
+        XCloseDisplay(dpy);
+        return 0;
+    }
+    if (w) *w = a.width;
+    if (h) *h = a.height;
+    int total = a.width * a.height;
+    if (!out || cap <= 0) {
+        XSetErrorHandler(prev);
+        XCloseDisplay(dpy);
+        return total;
+    }
+
+    XImage *im = XGetImage(dpy, (Window)win, 0, 0,
+                           (unsigned)a.width, (unsigned)a.height,
+                           AllPlanes, ZPixmap);
+    if (!im || vs_cap_failed) {
+        if (im) XDestroyImage(im);
+        XSetErrorHandler(prev);
+        XCloseDisplay(dpy);
+        return 0;
+    }
+
+    int n = total < cap ? total : cap;
+    /* Fast path for the ordinary 24/32-bit little-endian visual; XGetPixel
+       otherwise, which is correct everywhere but goes through Xlib per pixel. */
+    if (im->bits_per_pixel == 32 && im->byte_order == LSBFirst &&
+        im->red_mask == 0xFF0000 && im->green_mask == 0x00FF00 &&
+        im->blue_mask == 0x0000FF) {
+        for (int y = 0; y < a.height; y++) {
+            const uint32_t *row = (const uint32_t *)(im->data + (long)y * im->bytes_per_line);
+            for (int x = 0; x < a.width; x++) {
+                int i = y * a.width + x;
+                if (i >= n) break;
+                out[i] = (int)(row[x] & 0xFFFFFF);
+            }
+        }
+    } else {
+        for (int y = 0; y < a.height; y++)
+            for (int x = 0; x < a.width; x++) {
+                int i = y * a.width + x;
+                if (i >= n) break;
+                out[i] = (int)(XGetPixel(im, x, y) & 0xFFFFFF);
+            }
+    }
+    XDestroyImage(im);
+    XSetErrorHandler(prev);
+    XCloseDisplay(dpy);
+    return vs_cap_failed ? 0 : total;
+}
 
 int vs_monitors(VsMonitor *out, int max) {
     if (!out) max = 0;   /* counting call: fill nothing, just report how many */
