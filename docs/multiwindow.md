@@ -17,7 +17,7 @@ behaviour isn't visible from `.vt` source. Working code for every pattern is in
 There is no special call. `new Surface(...)` works anywhere — at startup, or
 inside an event handler:
 
-```vyto
+```js
 import { Surface, Rect, rgb } from "vyto/surface";
 
 let a = new Surface("Main", 400, 300);
@@ -40,7 +40,7 @@ other. Dropping the last reference to a `Surface` closes its window
 This is the part people expect to be hard. It isn't: the windows are objects on
 one thread in one process, so shared state is a variable.
 
-```vyto
+```js
 class Model {
     count: int;
     fn init() { this.count = 0; }
@@ -69,7 +69,7 @@ The fix uses descriptors. Every X11 surface exposes the socket its events
 arrive on, and `waitTimeoutFds` blocks on **this window's events or readability
 on any other descriptor you name**:
 
-```vyto
+```js
 while (live) {
     // blocks until A has an event, B's connection is readable, or 40ms passes
     let ea = a.waitTimeoutFds(40, [b.eventFd()]);
@@ -93,7 +93,7 @@ while (live) {
 **`waitTimeoutFds` and `wait_timeout` RETURN the woken window's event. They do
 not leave it queued.**
 
-```vyto
+```js
 a.waitTimeoutFds(40, [b.eventFd()]);   // ← A's event consumed HERE
 let ea = a.poll();                     // ← ...so this finds nothing
 ```
@@ -110,7 +110,7 @@ queued for its own `poll()`. Only the window you call the method on is drained.
 `EV_CLOSE` says *this* window was closed. It does not mean "quit". The obvious
 loop is wrong:
 
-```vyto
+```js
 if (eb == EV_CLOSE) { live = false; }      // ← closes EVERY window
 ```
 
@@ -118,7 +118,7 @@ Because dropping out of the loop drops every `Surface`, closing one child takes
 the whole app down with it — which looks like a library bug and is not. Decide
 per window what its closing means:
 
-```vyto
+```js
 // a secondary window: it goes, the app stays
 if (eb == EV_CLOSE) { b_open = false; }
 
@@ -129,7 +129,7 @@ if (ea == EV_CLOSE) { live = false; }
 Once a window is gone, stop polling it and stop passing its `eventFd()` to
 `waitTimeoutFds` — the descriptor is dead:
 
-```vyto
+```js
 let wfds: int[] = [];
 if (b_open) { wfds.push(b.eventFd()); }
 let ea = a.waitTimeoutFds(40, wfds);
@@ -143,7 +143,7 @@ it, which also releases the closed window's `Surface`.
 
 Collect the descriptors:
 
-```vyto
+```js
 let fds: int[] = [];
 for (let w in others) { fds.push(w.eventFd()); }
 let ev = main.waitTimeoutFds(40, fds);
@@ -162,7 +162,7 @@ A window's descriptor is an ordinary fd, so it composes with everything else
 that has one. `Reactor` (`vyto/os/reactor`) can own the loop and treat windows,
 sockets, timers and forked workers uniformly:
 
-```vyto
+```js
 rx.watch(a.eventFd(), POLL_READ, (fd, ev) => { /* drain a.poll() */ return true; });
 rx.watch(b.eventFd(), POLL_READ, (fd, ev) => { /* drain b.poll() */ return true; });
 for (let wfd in pool.workerFds()) { rx.watch(wfd, POLL_READ, ...); }
@@ -180,7 +180,7 @@ socket/timer/worker half.
 
 ## 4. Windows and monitors
 
-```vyto
+```js
 let ms = surface_monitors();          // never empty; exactly one is primary
 for (let m in ms) {
     print(m.w + "x" + m.h + " at " + m.x + "," + m.y + " scale " + m.scale);
@@ -190,7 +190,7 @@ for (let m in ms) {
 Monitors are reported in the **same coordinate space `move_to` uses**, so
 placing a window on a particular screen is geometry rather than a screen index:
 
-```vyto
+```js
 let m = ms[ms.len - 1];               // the last screen
 s.set_size(m.w, m.h);
 s.move_to(m.x, m.y);
@@ -234,7 +234,7 @@ mixed-DPI behaviour on a single-screen machine.
 Drop the system titlebar and border for a kiosk, a custom-chrome app, or a
 floating panel:
 
-```vyto
+```js
 s.set_decorated(false);
 ```
 
@@ -244,7 +244,7 @@ manager's. Three consequences, and forgetting any one of them is the usual bug:
 
 **Dragging.** Hand the drag back to the window manager from your own title area:
 
-```vyto
+```js
 if (ev == EV_MOUSE_DOWN && s.mouse_y() < BAR_H) {
     s.drag_start(EDGE.MOVE, s.mouse_x(), s.mouse_y());
 }
@@ -261,7 +261,7 @@ background, so an unhandled `EV_EXPOSE` leaves the damaged area showing whatever
 was behind the window — it looks *semi-transparent*, which reads as a rendering
 bug rather than a missing handler:
 
-```vyto
+```js
 else if (e == EV_EXPOSE || e == EV_RESIZE) { draw(s); }
 ```
 
@@ -274,7 +274,7 @@ For a control room or a video wall — thumbnails of each display inside the
 controller — do **not** capture the screen. If your process renders the window,
 you already have its pixels: render once into a `Canvas` and blit it twice.
 
-```vyto
+```js
 // full size, into its own window
 disp.blitPtr(canvas.pixels(), w, h, Rect(0.0, 0.0, w as float, h as float));
 // and scaled into a panel on the controller
@@ -295,7 +295,7 @@ changes rather than every frame. A monitoring thumbnail does not need 60fps.
 
 ### Capturing a window you did *not* render
 
-```vyto
+```js
 let c = capture_window(xid as culong);      // XID on X11, HWND on Windows
 if (c != null) { ctl.blit(c.pixels, c.w, c.h, panel); }
 ```

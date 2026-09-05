@@ -39,7 +39,7 @@ sync. Every example here is built that way.
 **Wait on all of them at once, or the app burns a core.** Two windows are two X
 connections, hence two descriptors:
 
-```vyto
+```js
 let ev = a.waitTimeoutFds(40, [b.eventFd()]);
 ```
 
@@ -51,7 +51,7 @@ while the other keeps working.
 **`EV_CLOSE` names ONE window — it does not mean "quit".** The obvious loop is
 wrong, and wrong in a way that looks like a library bug:
 
-```vyto
+```js
 if (eb == EV_CLOSE) { live = false; }      // ← closes EVERY window
 ```
 
@@ -73,7 +73,7 @@ since the titlebar it gave up is where those lived.
 `surface_monitors()` reports every attached display in the same coordinate
 space `move_to` uses, so placement is geometry rather than a screen index:
 
-```vyto
+```js
 let ms = surface_monitors();          // never empty; one entry is primary
 let m = ms[ms.len - 1];               // the last screen, say
 s.set_decorated(false);
@@ -95,7 +95,7 @@ kiosk and the only exit is killing the process.
 screen capture and not an IPC channel — each screen renders into a blend2d
 `Canvas` this process owns, and that one buffer is blitted twice:
 
-```vyto
+```js
 // full size, into its own window
 dst.blitPtr(canvas.pixels(), w, h, Rect(0.0, 0.0, w as float, h as float));
 // and scaled into a panel on the controller
@@ -119,7 +119,7 @@ to do it, because the canvas is already there.
 For a window you did **not** draw, `capture_window(native_xid)` reads its pixels
 back into a `Capture` whose `pixels` array blits like any other:
 
-```vyto
+```js
 let c = capture_window(xid as culong);
 if (c != null) { ctl.blit(c.pixels, c.w, c.h, panel); }
 ```
