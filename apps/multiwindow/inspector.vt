@@ -1,0 +1,104 @@
+// Master–detail across two windows: pick a row on the left, its detail follows
+// on the right. The pattern behind an inspector, a properties panel, or a
+// preview pane that the user can park on a second monitor.
+//
+//     ./vytoc run apps/multiwindow/inspector.vt
+//
+// The point being demonstrated: selection lives in one plain variable. "Sending
+// data between the windows" is reading that variable when drawing — same
+// process, same thread, so there is no message to pass and nothing to keep in
+// sync.
+import { Surface, Rect, rgb,
+         EV_NONE, EV_CLOSE, EV_EXPOSE, EV_RESIZE, EV_MOUSE_DOWN, EV_KEY,
+         KEY_UP, KEY_DOWN } from "vyto/surface";
+
+const ROW_H: int = 34;
+
+class Patient {
+    name: string;
+    ward: string;
+    notes: string;
+    fn init(name: string, ward: string, notes: string) {
+        this.name = name; this.ward = ward; this.notes = notes;
+    }
+}
+
+fn roster(): Patient[] {
+    return [
+        new Patient("A. Mwangi",  "Cardiology", "review ECG at 14:00"),
+        new Patient("B. Otieno",  "Orthopedic", "post-op day 2, mobile"),
+        new Patient("C. Wanjiru", "Maternity",  "routine observation"),
+        new Patient("D. Kamau",   "ICU",        "vitals hourly"),
+        new Patient("E. Achieng", "Pediatric",  "discharge pending"),
+    ];
+}
+
+fn main() {
+    let people = roster();
+    let sel = 0;                       // the only shared state
+
+    let list = new Surface("Patients", 320, 260);
+    let detail = new Surface("Patient detail", 380, 260);
+    list.set_min_size(240, 160);
+    detail.set_min_size(260, 160);
+
+    let live = true;
+    let dirty = true;
+    while (live) {
+        if (dirty) {
+            // --- list window ---
+            let w = list.width() as float;
+            let h = list.height() as float;
+            list.fill(Rect(0.0, 0.0, w, h), rgb(28, 31, 38));
+            list.text(14, 26, "PATIENTS", rgb(138, 148, 166));
+            for (let i in 0..people.len) {
+                let y = 44 + i * ROW_H;
+                if (i == sel) {
+                    list.fill(Rect(8.0, y as float, w - 16.0, ROW_H as float),
+                              rgb(45, 90, 72));
+                }
+                list.text(20, y + 22, people[i].name, rgb(232, 236, 244));
+            }
+            list.text(14, h as int - 14, "click or up/down", rgb(102, 110, 126));
+            list.present();
+
+            // --- detail window, drawn from the SAME variable ---
+            let dw = detail.width() as float;
+            let dh = detail.height() as float;
+            let p = people[sel];
+            detail.fill(Rect(0.0, 0.0, dw, dh), rgb(20, 23, 29));
+            detail.text(16, 30, "DETAIL", rgb(138, 148, 166));
+            detail.fill(Rect(16.0, 46.0, dw - 32.0, 3.0), rgb(61, 220, 151));
+            detail.text(16, 82, p.name, rgb(240, 243, 250));
+            detail.text(16, 112, "ward:  " + p.ward, rgb(180, 188, 202));
+            detail.text(16, 138, "notes: " + p.notes, rgb(180, 188, 202));
+            detail.text(16, dh as int - 14,
+                        "row " + (sel + 1) + " of " + people.len, rgb(102, 110, 126));
+            detail.present();
+            dirty = false;
+        }
+
+        let ea = list.waitTimeoutFds(40, [detail.eventFd()]);
+        while (ea != EV_NONE) {
+            if (ea == EV_CLOSE) { live = false; }
+            else if (ea == EV_EXPOSE || ea == EV_RESIZE) { dirty = true; }
+            else if (ea == EV_MOUSE_DOWN) {
+                let row = (list.mouse_y() - 44) / ROW_H;
+                if (row >= 0 && row < people.len) { sel = row; dirty = true; }
+            } else if (ea == EV_KEY) {
+                let k = list.key();
+                if (k == KEY_DOWN && sel < people.len - 1) { sel += 1; dirty = true; }
+                if (k == KEY_UP && sel > 0) { sel -= 1; dirty = true; }
+            }
+            ea = list.poll();
+        }
+
+        let eb = detail.poll();
+        while (eb != EV_NONE) {
+            if (eb == EV_CLOSE) { live = false; }
+            else if (eb == EV_EXPOSE || eb == EV_RESIZE) { dirty = true; }
+            eb = detail.poll();
+        }
+    }
+    print("closed on " + people[sel].name);
+}

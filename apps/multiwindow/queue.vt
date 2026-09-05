@@ -1,0 +1,174 @@
+// Hospital queue display — the two-screen shape.
+//
+// A receptionist's console on one screen advances the queue; a waiting-room
+// display on another shows the number being served, large enough to read from
+// across the room. One process, two windows, no IPC: the counter is a plain
+// variable that both windows draw from.
+//
+// The waiting-room window uses the rich tier (vyto/gfx), because the lean
+// surface has one fixed bitmap font it cannot scale — see lib/vyto/ui/core.vt
+// on that. The console stays lean: it only needs small text.
+//
+//     ./vytoc run apps/multiwindow/queue.vt
+//
+// Put the display window on the second monitor by dragging it there; window
+// placement by monitor is not in vyto/surface yet.
+import { Surface, Rect, rgb, EDGE,
+         EV_NONE, EV_CLOSE, EV_EXPOSE, EV_RESIZE, EV_MOUSE_DOWN, EV_KEY,
+         KEY_SPACE, KEY_ENTER } from "vyto/surface";
+import { Canvas } from "vyto/gfx";
+
+// ---- palette ---------------------------------------------------------------
+const INK: int = 0xFF12141A;      // display background
+const ACCENT: int = 0xFF3DDC97;   // the number
+const LABEL: int = 0xFF8A94A6;
+const CARD: int = 0xFF1B1F28;
+
+// ---- the shared state both windows read ------------------------------------
+class Queue {
+    now_serving: int;
+    counter: int;      // which desk called it
+    fn init() { this.now_serving = 0; this.counter = 1; }
+}
+
+// ---- window A: the receptionist's console (lean tier) ----------------------
+class Console {
+    surf: Surface;
+    next_btn: Rect;
+    reset_btn: Rect;
+
+    fn init() {
+        this.surf = new Surface("Reception — console", 380, 220);
+        this.surf.set_min_size(320, 180);
+        this.next_btn = Rect(24.0, 96.0, 150.0, 46.0);
+        this.reset_btn = Rect(196.0, 96.0, 150.0, 46.0);
+    }
+
+    fn draw(q: Queue) {
+        let s = this.surf;
+        let w = s.width() as float;
+        let h = s.height() as float;
+        s.fill(Rect(0.0, 0.0, w, h), rgb(28, 31, 38));
+        s.text(24, 34, "RECEPTION", rgb(138, 148, 166));
+        s.text(24, 68, "now serving: " + q.now_serving, rgb(240, 242, 248));
+
+        s.fill(this.next_btn, rgb(61, 220, 151));
+        s.text(this.next_btn.x as int + 34, this.next_btn.y as int + 28,
+               "CALL NEXT", rgb(12, 20, 16));
+
+        s.fill(this.reset_btn, rgb(52, 58, 70));
+        s.text(this.reset_btn.x as int + 52, this.reset_btn.y as int + 28,
+               "RESET", rgb(226, 230, 238));
+
+        s.text(24, h as int - 22, "space / click — esc or close to quit",
+               rgb(102, 110, 126));
+        s.present();
+    }
+
+    // returns true when the queue changed
+    fn on_click(x: int, y: int, q: Queue): bool {
+        let p = Rect(x as float, y as float, 1.0, 1.0);
+        if (this.next_btn.overlaps(p)) { q.now_serving += 1; return true; }
+        if (this.reset_btn.overlaps(p)) { q.now_serving = 0; return true; }
+        return false;
+    }
+}
+
+// ---- window B: the waiting-room display (rich tier, big type) --------------
+class Display {
+    surf: Surface;
+    canvas: Canvas;
+
+    fn init() {
+        this.surf = new Surface("Waiting room — now serving", 640, 400);
+        this.surf.set_min_size(320, 220);
+        this.canvas = new Canvas(this.surf.width(), this.surf.height());
+        // Bold, because this is read from across a room. loadFontWeight's size
+        // is the size the face is loaded AT; setFontSize scales per draw.
+        this.canvas.loadFont("lib/vyto/gfx/assets/Inter-Bold.ttf", 200.0);
+    }
+
+    fn draw(q: Queue) {
+        let w = this.surf.width();
+        let h = this.surf.height();
+        if (w != this.canvas.width() || h != this.canvas.height()) {
+            this.canvas.resize(w, h);
+        }
+        let c = this.canvas;
+        c.clear(INK);
+
+        // a card behind the number, so the display reads as a panel
+        c.fillRoundRect(24.0, 24.0, (w - 48) as float, (h - 48) as float, 18.0, CARD);
+
+        c.setFontSize(26.0);
+        let label = "NOW SERVING";
+        c.text(((w as float) - c.textWidth(label)) / 2.0, 92.0, label, LABEL);
+
+        // The number, scaled to the window: big is the whole point of this
+        // screen, so size it from the height rather than fixing it.
+        let big = (h as float) * 0.44;
+        c.setFontSize(big);
+        let n = "" + q.now_serving;
+        let nx = ((w as float) - c.textWidth(n)) / 2.0;
+        c.text(nx, (h as float) * 0.72, n, ACCENT);
+
+        c.setFontSize(22.0);
+        let desk = "desk " + q.counter;
+        c.text(((w as float) - c.textWidth(desk)) / 2.0, (h as float) - 46.0,
+               desk, LABEL);
+
+        c.flush();
+        this.surf.blitRect(c.pixels(), c.stride() / 4, 0, 0, w, h, 0, 0);
+        this.surf.present();
+    }
+}
+
+fn main() {
+    let q = new Queue();
+    let con = new Console();
+    let disp = new Display();
+    con.draw(q);
+    disp.draw(q);
+
+    let live = true;
+    while (live) {
+        // Block on the console's events OR the display's connection: two
+        // windows are two X connections, so the display's fd is what makes an
+        // idle pair cost nothing. Note this RETURNS the console's event.
+        let ea = con.surf.waitTimeoutFds(40, [disp.surf.eventFd()]);
+        let changed = false;
+
+        while (ea != EV_NONE) {
+            if (ea == EV_CLOSE) { live = false; }
+            else if (ea == EV_EXPOSE || ea == EV_RESIZE) { con.draw(q); }
+            else if (ea == EV_MOUSE_DOWN) {
+                if (con.on_click(con.surf.mouse_x(), con.surf.mouse_y(), q)) {
+                    changed = true;
+                }
+            } else if (ea == EV_KEY) {
+                let k = con.surf.key();
+                if (k == KEY_SPACE || k == KEY_ENTER) {
+                    q.now_serving += 1;
+                    changed = true;
+                }
+            }
+            ea = con.surf.poll();
+        }
+
+        let eb = disp.surf.poll();
+        while (eb != EV_NONE) {
+            if (eb == EV_CLOSE) { live = false; }
+            else if (eb == EV_EXPOSE || eb == EV_RESIZE) { disp.draw(q); }
+            eb = disp.surf.poll();
+        }
+
+        // one change, both windows: the state is shared, so this is just two
+        // draws rather than any kind of message passing
+        if (changed) {
+            print("now serving " + q.now_serving);
+            con.draw(q);
+            disp.draw(q);
+        }
+    }
+    print("closed at " + q.now_serving);
+}

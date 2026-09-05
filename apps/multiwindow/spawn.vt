@@ -1,0 +1,104 @@
+// Windows opened on demand, and closed independently — the dialog / document
+// shape. A window is not special: `new Surface(...)` works inside an event
+// handler as well as at startup, and dropping the reference closes it.
+//
+//     ./vytoc run apps/multiwindow/spawn.vt
+//
+// Each child is a peer, not a child in any OS sense: it has its own connection
+// and its own input, so a click in one is never reported by another. That is
+// the property the per-surface input refactor bought.
+import { Surface, Rect, rgb,
+         EV_NONE, EV_CLOSE, EV_EXPOSE, EV_RESIZE, EV_MOUSE_DOWN } from "vyto/surface";
+
+class Note {
+    surf: Surface;
+    n: int;
+    hits: int;
+    fn init(n: int) {
+        this.n = n;
+        this.hits = 0;
+        this.surf = new Surface("Note " + n, 240, 150);
+        this.surf.set_min_size(180, 110);
+    }
+    fn draw() {
+        let s = this.surf;
+        let w = s.width() as float;
+        let h = s.height() as float;
+        s.fill(Rect(0.0, 0.0, w, h), rgb(30 + this.n * 17 % 90, 44, 70));
+        s.text(14, 30, "note " + this.n, rgb(240, 243, 250));
+        s.text(14, 58, "clicks here: " + this.hits, rgb(190, 200, 215));
+        s.text(14, h as int - 16, "close me on my own", rgb(120, 132, 150));
+        s.present();
+    }
+}
+
+fn draw_main(main_w: Surface, open_count: int) {
+    let w = main_w.width() as float;
+    let h = main_w.height() as float;
+    main_w.fill(Rect(0.0, 0.0, w, h), rgb(24, 27, 34));
+    main_w.text(16, 30, "SPAWNER", rgb(138, 148, 166));
+    main_w.fill(Rect(16.0, 52.0, w - 32.0, 44.0), rgb(61, 220, 151));
+    main_w.text(60, 80, "NEW NOTE", rgb(12, 20, 16));
+    main_w.text(16, 122, "open: " + open_count, rgb(226, 230, 238));
+    main_w.text(16, h as int - 14, "each note has its own input",
+                rgb(102, 110, 126));
+    main_w.present();
+}
+
+fn main() {
+    let main_w = new Surface("Spawner", 300, 170);
+    main_w.set_min_size(240, 140);
+    let notes: Note[] = [];
+    let made = 0;
+
+    draw_main(main_w, notes.len);
+
+    let live = true;
+    while (live) {
+        // Watch every open window: the main one blocks, the notes contribute
+        // their descriptors, so nothing polls and nothing is missed.
+        let fds: int[] = [];
+        for (let nt in notes) { fds.push(nt.surf.eventFd()); }
+        let ea = main_w.waitTimeoutFds(40, fds);
+
+        while (ea != EV_NONE) {
+            if (ea == EV_CLOSE) { live = false; }
+            else if (ea == EV_EXPOSE || ea == EV_RESIZE) { draw_main(main_w, notes.len); }
+            else if (ea == EV_MOUSE_DOWN) {
+                let y = main_w.mouse_y();
+                if (y >= 52 && y <= 96) {
+                    made += 1;
+                    let nt = new Note(made);
+                    nt.draw();
+                    notes.push(nt);
+                    print("opened note " + made);
+                    draw_main(main_w, notes.len);
+                }
+            }
+            ea = main_w.poll();
+        }
+
+        // Each note answers for itself; a closed one is dropped from the list,
+        // and releasing the last reference is what closes its window.
+        let keep: Note[] = [];
+        for (let nt in notes) {
+            let alive = true;
+            let e = nt.surf.poll();
+            while (e != EV_NONE) {
+                if (e == EV_CLOSE) { alive = false; }
+                else if (e == EV_EXPOSE || e == EV_RESIZE) { nt.draw(); }
+                else if (e == EV_MOUSE_DOWN) {
+                    nt.hits += 1;
+                    print("note " + nt.n + " clicked at "
+                          + nt.surf.mouse_x() + "," + nt.surf.mouse_y());
+                    nt.draw();
+                }
+                e = nt.surf.poll();
+            }
+            if (alive) { keep.push(nt); }
+            else { print("note " + nt.n + " closed"); }
+        }
+        if (keep.len != notes.len) { notes = keep; draw_main(main_w, notes.len); }
+    }
+    print("done, " + notes.len + " still open");
+}

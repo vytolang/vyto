@@ -1,0 +1,96 @@
+// A chromeless always-there panel beside a normal window — the floating HUD,
+// palette, or toolbar shape.
+//
+//     ./vytoc run apps/multiwindow/hud.vt
+//
+// The HUD has no system titlebar, so it draws and drives its own: pressing its
+// bar hands the drag to the window manager (drag_start), which keeps snapping
+// and multi-monitor behaviour that a hand-rolled drag would lose.
+//
+// Two things an undecorated window must do itself, both easy to forget:
+//   * handle EV_EXPOSE — the server paints no background, so a damaged area
+//     that is never repainted shows whatever was behind the window
+//   * offer a way to close, since there is no [x]
+import { Surface, Rect, rgb, EDGE,
+         EV_NONE, EV_CLOSE, EV_EXPOSE, EV_RESIZE, EV_MOUSE_DOWN } from "vyto/surface";
+
+const BAR: int = 26;
+
+fn draw_hud(s: Surface, value: int) {
+    let w = s.width() as float;
+    let h = s.height() as float;
+    s.fill(Rect(0.0, 0.0, w, h), rgb(18, 20, 26));
+    s.fill(Rect(0.0, 0.0, w, BAR as float), rgb(44, 48, 60));
+    s.text(10, 18, "HUD", rgb(232, 236, 244));
+    s.fill(Rect(w - 20.0, 7.0, 12.0, 12.0), rgb(190, 70, 70));   // close box
+    s.text(12, 52, "value: " + value, rgb(61, 220, 151));
+    s.text(12, 74, "drag my bar", rgb(130, 140, 158));
+    s.present();
+}
+
+fn draw_main(s: Surface, value: int) {
+    let w = s.width() as float;
+    let h = s.height() as float;
+    s.fill(Rect(0.0, 0.0, w, h), rgb(26, 29, 36));
+    s.text(16, 30, "MAIN WINDOW", rgb(138, 148, 166));
+    s.fill(Rect(16.0, 50.0, 150.0, 40.0), rgb(61, 220, 151));
+    s.text(46, 75, "BUMP +1", rgb(12, 20, 16));
+    s.text(16, 118, "value: " + value, rgb(232, 236, 244));
+    s.text(16, h as int - 14, "the HUD tracks this", rgb(102, 110, 126));
+    s.present();
+}
+
+fn main() {
+    let main_w = new Surface("Main", 320, 180);
+    let hud = new Surface("HUD", 190, 100);
+    hud.set_decorated(false);
+    main_w.set_min_size(260, 150);
+
+    let value = 0;
+    draw_main(main_w, value);
+    draw_hud(hud, value);
+
+    let live = true;
+    while (live) {
+        let ea = main_w.waitTimeoutFds(40, [hud.eventFd()]);
+        let changed = false;
+
+        while (ea != EV_NONE) {
+            if (ea == EV_CLOSE) { live = false; }
+            else if (ea == EV_EXPOSE || ea == EV_RESIZE) { draw_main(main_w, value); }
+            else if (ea == EV_MOUSE_DOWN) {
+                let y = main_w.mouse_y();
+                if (y >= 50 && y <= 90 && main_w.mouse_x() <= 166) {
+                    value += 1;
+                    changed = true;
+                }
+            }
+            ea = main_w.poll();
+        }
+
+        let eb = hud.poll();
+        while (eb != EV_NONE) {
+            if (eb == EV_CLOSE) { live = false; }
+            // Without this the HUD goes see-through wherever it is damaged.
+            else if (eb == EV_EXPOSE || eb == EV_RESIZE) { draw_hud(hud, value); }
+            else if (eb == EV_MOUSE_DOWN) {
+                let x = hud.mouse_x();
+                let y = hud.mouse_y();
+                if (y < BAR && x > hud.width() - 24) {
+                    live = false;                 // our own close box
+                } else if (y < BAR) {
+                    hud.drag_start(EDGE.MOVE, x, y);
+                }
+            }
+            eb = hud.poll();
+        }
+
+        if (changed) {
+            draw_main(main_w, value);
+            draw_hud(hud, value);
+            print("value " + value);
+        }
+    }
+    let p = hud.position();
+    print("hud ended at " + p[0] + "," + p[1]);
+}
