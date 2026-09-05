@@ -447,6 +447,9 @@ as `examples/45_os.vt`) is handled.
 - **[Graphics](graphics.md)** — the drawing stack top to bottom: `vyto/geom`
   math, the `vyto/surface` and `vyto/gfx` rendering tiers, and what Vyto can
   and can't currently draw.
+- **[Multiple windows](multiwindow.md)** — driving several OS windows from one
+  process: the event loop that covers them all, monitors and placement,
+  chromeless windows, and previewing one window inside another.
 - **[Hardware & peripherals](hardware.md)** — cameras, sensors, GPIO, serial,
   USB and GPS through `vyto/hw/*`.
 - **[README](../README.md)** — language highlights, why it's fast, the standard
