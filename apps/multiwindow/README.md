@@ -9,6 +9,7 @@ runs on its own:
 ./vytoc run apps/multiwindow/spawn.vt        # windows opened and closed on demand
 ./vytoc run apps/multiwindow/hud.vt          # chromeless floating panel
 ./vytoc run apps/multiwindow/kiosk.vt        # fullscreen signage + control window
+./vytoc run apps/multiwindow/videowall.vt    # control room with live preview panels
 ```
 
 They need a display (X11 today). There are no `.expected` files: these are
@@ -24,6 +25,7 @@ demos, and the deterministic checks live in `tests/ui/96_multiwindow` and
 | `spawn.vt` | `new Surface(...)` inside an event handler. Each note is a peer with its own input, closable on its own. |
 | `hud.vt` | An undecorated always-there panel that draws its own titlebar and hands dragging back to the window manager. |
 | `kiosk.vt` | Fullscreen signage on one screen, a control window on another. Picks its monitor from `surface_monitors()`. |
+| `videowall.vt` | Three signage screens, each shown live as a thumbnail inside the controller. |
 
 ## The three things worth knowing
 
@@ -70,6 +72,34 @@ headless or embedded target degrades honestly instead of pretending.
 **A fullscreen chromeless window must offer its own way out.** There is no [x]
 and no titlebar; `kiosk.vt` quits on ESC from either window. Skip that on a real
 kiosk and the only exit is killing the process.
+
+## Previewing a screen inside the controller
+
+`videowall.vt` shows each display live inside the control window. It is not a
+screen capture and not an IPC channel — each screen renders into a blend2d
+`Canvas` this process owns, and that one buffer is blitted twice:
+
+```vyto
+// full size, into its own window
+dst.blitPtr(canvas.pixels(), w, h, Rect(0.0, 0.0, w as float, h as float));
+// and scaled into a panel on the controller
+ctl.blitPtr(canvas.pixels(), w, h, Rect(16.0, 62.0, 200.0, 120.0));
+```
+
+`blitPtr` scales to whatever destination rect it is given, so a thumbnail costs
+one extra blit and no extra rendering. Render once, present to both.
+
+**Pick canvas widths that are a multiple of 4.** blend2d row-aligns its buffer,
+and `blitPtr` requires it tightly packed (stride == w*4). 1920 and 1280 are
+packed; 1366 pads to a stride of 1368 and the preview would shear. Use
+`blitRect` where a stride must be respected — but note it does not scale.
+
+Each preview is a scaled full-frame CPU copy, so redraw them when content
+changes rather than every frame. A monitoring thumbnail does not need 60fps.
+
+This only works for windows **this process renders**. Previewing a foreign
+window — a browser, another app — needs X11 `XGetImage` or a compositor
+capture protocol, neither of which is in `vsurf.h`.
 
 ## Not covered
 

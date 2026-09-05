@@ -1,0 +1,198 @@
+// A control room: several signage screens, each previewed live inside the
+// controller window.
+//
+//     ./vytoc run apps/multiwindow/videowall.vt
+//
+// The preview is not a screen capture and not an IPC channel. Each display
+// renders into a blend2d Canvas this process owns, and that one buffer is
+// blitted twice — full size to its own window, and scaled into a small rect on
+// the controller. Surface.blitPtr scales to whatever destination rect you hand
+// it, so a thumbnail costs one extra blit and no extra rendering.
+//
+//     Canvas (per screen)
+//        |-- blitPtr 1:1     -> that screen's window
+//        +-- blitPtr -> rect -> a preview panel on the controller
+//
+// Click a preview panel to select that screen; SPACE changes what the selected
+// screen shows. Close the controller to quit.
+import { Surface, Rect, rgb, surface_monitors,
+         EV_NONE, EV_CLOSE, EV_EXPOSE, EV_RESIZE, EV_MOUSE_DOWN, EV_KEY,
+         KEY_SPACE, KEY_ESC } from "vyto/surface";
+import { Canvas } from "vyto/gfx";
+
+const INK: int = 0xFF0B0E13;
+const CARD: int = 0xFF161C26;
+const MINT: int = 0xFF3DDC97;
+const AMBER: int = 0xFFE8B93D;
+const MUTED: int = 0xFF8A94A6;
+
+// Each screen renders once, into its own canvas, and that canvas feeds both the
+// real window and the controller's thumbnail.
+class Screen {
+    surf: Surface;
+    canvas: Canvas;
+    name: string;
+    msg: int;
+    w: int;
+    h: int;
+
+    fn init(name: string, w: int, h: int, x: int, y: int) {
+        this.name = name;
+        this.msg = 0;
+        // Width matters: blend2d row-aligns, and blitPtr wants a tightly packed
+        // buffer (stride == w*4). An odd width such as 1366 pads to 1368 and
+        // the preview would shear. Even multiples of 4 are safe, so the sizes
+        // here are chosen rather than arbitrary.
+        this.w = w;
+        this.h = h;
+        this.surf = new Surface(name, w, h);
+        this.surf.move_to(x, y);
+        this.canvas = new Canvas(w, h);
+        this.canvas.loadFont("lib/vyto/gfx/assets/Inter-Bold.ttf", 160.0);
+    }
+
+    fn text_for(): string {
+        if (this.msg == 0) { return "OPEN"; }
+        if (this.msg == 1) { return "NOW SERVING"; }
+        if (this.msg == 2) { return "PLEASE WAIT"; }
+        return "CLOSED";
+    }
+
+    fn accent(): int {
+        if (this.msg == 3) { return AMBER; }
+        return MINT;
+    }
+
+    // Render the frame ONCE. Both destinations read this buffer afterwards.
+    fn render() {
+        let c = this.canvas;
+        let w = this.w as float;
+        let h = this.h as float;
+        c.clear(INK);
+        c.fillRoundRect(10.0, 10.0, w - 20.0, h - 20.0, 12.0, CARD);
+        c.setFontSize(h * 0.075);
+        c.text(28.0, h * 0.20, this.name, MUTED);
+        let t = this.text_for();
+        c.setFontSize(h * 0.19);
+        c.text((w - c.textWidth(t)) / 2.0, h * 0.62, t, this.accent());
+        c.flush();
+    }
+
+    // 1:1 into its own window
+    fn present_full() {
+        this.surf.blitPtr(this.canvas.pixels(), this.w, this.h,
+                          Rect(0.0, 0.0, this.w as float, this.h as float));
+        this.surf.present();
+    }
+
+    // scaled into a panel on some other surface — the whole trick
+    fn present_into(dst: Surface, r: Rect) {
+        dst.blitPtr(this.canvas.pixels(), this.w, this.h, r);
+    }
+}
+
+fn panel_rect(i: int, ctl_w: int): Rect {
+    let pw = 200.0;
+    let ph = 120.0;
+    let gap = 16.0;
+    let x = gap + (i as float) * (pw + gap);
+    return Rect(x, 62.0, pw, ph);
+}
+
+fn draw_controller(ctl: Surface, screens: Screen[], sel: int) {
+    let w = ctl.width() as float;
+    let h = ctl.height() as float;
+    ctl.fill(Rect(0.0, 0.0, w, h), rgb(22, 25, 32));
+    ctl.text(16, 30, "CONTROL ROOM — live previews", rgb(138, 148, 166));
+
+    for (let i in 0..screens.len) {
+        let r = panel_rect(i, ctl.width());
+        // the live feed: the screen's own frame, scaled down
+        screens[i].present_into(ctl, r);
+        // selection ring
+        if (i == sel) {
+            ctl.frame(r, rgb(61, 220, 151));
+            ctl.frame(Rect(r.x - 1.0, r.y - 1.0, r.w + 2.0, r.h + 2.0),
+                      rgb(61, 220, 151));
+        } else {
+            ctl.frame(r, rgb(70, 78, 92));
+        }
+        ctl.text(r.x as int, r.bottom() as int + 18, screens[i].name,
+                 rgb(150, 158, 174));
+    }
+
+    ctl.text(16, h as int - 34, "click a preview to select it", rgb(120, 128, 145));
+    ctl.text(16, h as int - 14, "space = change that screen   esc = quit",
+             rgb(120, 128, 145));
+    ctl.present();
+}
+
+fn main() {
+    let ms = surface_monitors();
+    let m = ms[0];
+
+    // Three signage screens. On a single-monitor rig they are ordinary windows
+    // laid out side by side; on a real wall each would be sized to its own
+    // monitor and fullscreened, exactly as kiosk.vt does.
+    let screens = [
+        new Screen("GATE A", 480, 280, m.x + 40,  m.y + 420),
+        new Screen("GATE B", 480, 280, m.x + 540, m.y + 420),
+        new Screen("GATE C", 480, 280, m.x + 1040, m.y + 420),
+    ];
+    for (let s in screens) { s.render(); s.present_full(); }
+
+    let ctl = new Surface("Control room", 680, 260);
+    ctl.move_to(m.x + 40, m.y + 80);
+    ctl.set_min_size(560, 230);
+    let sel = 0;
+    draw_controller(ctl, screens, sel);
+
+    let live = true;
+    while (live) {
+        // one blocking wait covering the controller and every screen
+        let fds: int[] = [];
+        for (let s in screens) { fds.push(s.surf.eventFd()); }
+        let ea = ctl.waitTimeoutFds(60, fds);
+
+        let redraw_ctl = false;
+        while (ea != EV_NONE) {
+            if (ea == EV_CLOSE) { live = false; }
+            else if (ea == EV_EXPOSE || ea == EV_RESIZE) { redraw_ctl = true; }
+            else if (ea == EV_MOUSE_DOWN) {
+                let mx = ctl.mouse_x();
+                let my = ctl.mouse_y();
+                for (let i in 0..screens.len) {
+                    let r = panel_rect(i, ctl.width());
+                    if (r.overlaps(Rect(mx as float, my as float, 1.0, 1.0))) {
+                        sel = i;
+                        redraw_ctl = true;
+                    }
+                }
+            } else if (ea == EV_KEY) {
+                let k = ctl.key();
+                if (k == KEY_ESC) { live = false; }
+                else if (k == KEY_SPACE) {
+                    let s = screens[sel];
+                    s.msg = (s.msg + 1) % 4;
+                    s.render();          // render once...
+                    s.present_full();    // ...to its own screen...
+                    redraw_ctl = true;   // ...and into the preview
+                    print(s.name + " -> " + s.text_for());
+                }
+            }
+            ea = ctl.poll();
+        }
+
+        for (let s in screens) {
+            let e = s.surf.poll();
+            while (e != EV_NONE) {
+                if (e == EV_CLOSE) { live = false; }
+                else if (e == EV_EXPOSE || e == EV_RESIZE) { s.present_full(); }
+                e = s.surf.poll();
+            }
+        }
+
+        if (redraw_ctl) { draw_controller(ctl, screens, sel); }
+    }
+    print("closed");
+}
