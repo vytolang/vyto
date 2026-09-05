@@ -1386,9 +1386,20 @@ voltphone closed"
         echo "--- got ---"; printf '%s\n' "$got"
         fail=1
     fi
+    # Canvas.resize must REUSE the parsed typefaces. Rebuilding the canvas
+    # instead re-parses every TTF on every step of a drag-resize, which no
+    # geometry golden can see — they assert what was drawn, never what it cost.
+    got=$(./vytoc run tests/fixtures/gfx_resize_fonts.vt 2>&1)
+    if [ "$got" = "ok" ]; then
+        echo "PASS gfx_resize_fonts"
+    else
+        echo "FAIL gfx_resize_fonts (got: $got)"
+        fail=1
+    fi
 else
     echo "SKIP gfx_canvas_blit (no libblend2d — run lib/vyto/gfx/native/build-blend2d.sh)"
     echo "SKIP image_decode (no libblend2d — the encoder half runs in 111_image)"
+    echo "SKIP gfx_resize_fonts (no libblend2d)"
 fi
 
 # --- readfile/readlines on a growable /proc file (size 0 by stat) ---

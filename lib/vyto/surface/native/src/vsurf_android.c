@@ -455,6 +455,12 @@ void vs_set_title(void *s, const char *t) {
      * from the manifest, so this is meaningfully a no-op rather than a gap. */
 }
 
+void vs_set_min_size(void *s, int w, int h) {
+    (void)s; (void)w; (void)h;
+    /* The surface is the size the system gives it — there is no user-draggable
+     * frame to clamp. A no-op by nature, not an unimplemented arm. */
+}
+
 /* ---------------------------------------------------------- vsurf: events */
 
 static void timespec_in(struct timespec *ts, int ms) {
@@ -550,6 +556,14 @@ long long vs_now_ms(void) {
  * paused-app battery behaviour intact (vs_wait_timeout swallows the timeout
  * while backgrounded; an fd-driven loop outside would not know to). */
 int vs_event_fd(void *s) { (void)s; return -1; }
+
+/* No damage region. Android drives repaints through AndroidPainter and the
+ * command buffer, not Expose, so there is nothing to report: 0 means "repaint
+ * everything", which is what this path already did. */
+int vs_damage(void *s, VsRect *out) {
+    (void)s; (void)out;
+    return 0;
+}
 
 /* Cannot fold caller fds into a condvar wait, so this degrades to the bounded
  * wait — the same 16ms polling the caller would otherwise do by hand.

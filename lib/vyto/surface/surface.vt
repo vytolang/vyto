@@ -5,14 +5,23 @@
 // This is a supported public layer: consume it directly for games, custom
 // renderers, or visualization tools, or let vyto/ui sit on top of it.
 
-import { vs_open, vs_close, vs_width, vs_height, vs_set_title,
+import { vs_open, vs_close, vs_width, vs_height, vs_set_title, vs_set_min_size,
           vs_fill_rect, vs_draw_rect, vs_draw_line, vs_draw_text, vs_blit, vs_present,
           vs_text_width, vs_font_ascent, vs_font_height,
           vs_wait, vs_poll, vs_wait_timeout, vs_key, vs_text, vs_x, vs_y, vs_wheel,
           vs_mods, vs_now_ms, vs_scale_pct, vs_set_vsync, vs_blit_rect, vs_present_rect,
           vs_clip_set, vs_clip_clear, vs_clipboard_get, vs_clipboard_set,
           vs_event_fd, vs_events_pending, vs_wait_timeout_fds, vs_can_wait_fds,
+          vs_damage,
           vs_native_display, vs_native_window, vs_native_gc } from "vsurf";
+
+// Mirrors VsRect in vsurf.h — the out-param of vs_damage. Declared here rather
+// than in the generated vsurf.vt because the binding filter is vs_*.
+extern "C" {
+    struct VsRect {
+        x: i32; y: i32; w: i32; h: i32;
+    }
+}
 
 // Event classes returned by Surface.wait(). Values mirror VS_EV_* in
 // vsurf.h (const initializers must be literals, so they are restated here).
@@ -356,6 +365,14 @@ export class Surface {
     fn height(): int { return vs_height(this.h); }
     fn set_title(t: string) { vs_set_title(this.h, t.cstr()); }
 
+    // Stop the window manager sizing this window below w x h. Worth setting on
+    // any resizable window: a WM will otherwise drag one to near-zero, and a
+    // layout narrower than its fixed children has nothing sensible to compute.
+    // Ignored where the size is not user-driven (Android, fbdev, headless).
+    fn set_min_size(w: int, h: int) {
+        vs_set_min_size(this.h, w as i32, h as i32);
+    }
+
     // The X11 backend is integer-only, so every Rect snaps here rather than at
     // the ~560 call sites above. round_out (not truncation) so a fill still
     // covers every pixel the float rect touched.
@@ -475,6 +492,17 @@ export class Surface {
     // headless. A caller that wants to block indefinitely when idle must check
     // this first — where it is false, it still needs a timer ceiling.
     fn canWaitFds(): bool { return vs_can_wait_fds(this.h) as int != 0; }
+
+    // The region the last EV_EXPOSE actually lost. Returns a zero-sized Rect
+    // when the backend reports none, which means "repaint everything" — X11
+    // reports a real region, every other backend returns nothing.
+    //
+    // **Reading consumes it**, so call once per expose and act on what you get.
+    fn damage(): Rect {
+        let r = VsRect();
+        if (vs_damage(this.h, &r) as int == 0) { return Rect(0.0, 0.0, 0.0, 0.0); }
+        return Rect(r.x as float, r.y as float, r.w as float, r.h as float);
+    }
     // Ask the backend for an EV_VSYNC once per display refresh while `on`.
     //
     // Returns whether the backend really drives a vsync clock. **A caller that

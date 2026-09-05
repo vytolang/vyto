@@ -18,6 +18,16 @@ typedef struct GfxCanvas GfxCanvas;
 
 GfxCanvas *gfx_canvas_new(int w, int h); /* NULL on failure */
 void gfx_canvas_free(GfxCanvas *c);
+/* Resize the pixel buffer in place, keeping the loaded font faces and the
+   (face, size) cache — recreating the canvas instead re-parses every TTF, which
+   on a drag-resize is the dominant per-step cost. 1 ok, 0 fail (canvas
+   unchanged). Contents are undefined afterwards: repaint before presenting. */
+int gfx_canvas_resize(GfxCanvas *c, int w, int h);
+/* How many distinct typefaces are parsed and cached on this canvas. Exposed so
+   a test can assert that a resize REUSES them: the cost of rebuilding a canvas
+   is invisible to any golden that only checks geometry, and re-parsing fonts on
+   every step of a drag-resize is exactly the regression worth catching. */
+int gfx_face_count(GfxCanvas *c);
 int gfx_width(GfxCanvas *c);
 int gfx_height(GfxCanvas *c);
 

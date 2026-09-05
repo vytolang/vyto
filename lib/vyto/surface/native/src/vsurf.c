@@ -276,6 +276,7 @@ typedef struct VSurf {
     HBITMAP bmp0; /* original 1x1 bitmap of memdc, restored before delete */
     HFONT font;
     int w, h;
+    int min_w, min_h; /* client-area floor from vs_set_min_size; 0 = none */
 } VSurf;
 
 /* WndProc -> vs_wait event queue (single window; small ring buffer) */
@@ -394,6 +395,23 @@ static LRESULT CALLBACK vs_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         return 0;
     }
+    case WM_GETMINMAXINFO:
+        if (s && s->min_w > 0 && s->min_h > 0) {
+            /* min_w/min_h are client-area, but this message wants the whole
+               window, so grow them by the frame the current style adds. */
+            RECT r = { 0, 0, s->min_w, s->min_h };
+            AdjustWindowRect(&r, (DWORD)GetWindowLongPtr(hwnd, GWL_STYLE), FALSE);
+            MINMAXINFO *mmi = (MINMAXINFO *)lp;
+            mmi->ptMinTrackSize.x = r.right - r.left;
+            mmi->ptMinTrackSize.y = r.bottom - r.top;
+            return 0;
+        }
+        break;
+    case WM_ERASEBKGND:
+        /* Claim the erase so GDI never paints a background under us. The class
+           brush is null today, so this changes nothing — it is here so that
+           setting one later cannot reintroduce a flash on resize. */
+        return 1;
     case WM_CLOSE:
         q_push(VS_EV_CLOSE, 0, 0, 0, 0);
         return 0; /* the Vyto loop decides; vs_close destroys the window */
@@ -517,6 +535,16 @@ int vs_height(void *vs) { return ((VSurf *)vs)->h; }
 void vs_set_title(void *vs, const char *t) {
     VSurf *s = vs;
     if (s->hwnd) SetWindowTextA(s->hwnd, t);
+}
+
+void vs_set_min_size(void *vs, int w, int h) {
+    VSurf *s = vs;
+    if (!s || w < 1 || h < 1) return;
+    /* Stored, not applied: Win32 asks via WM_GETMINMAXINFO rather than being
+       told. The values are the client area the caller wants, and the WndProc
+       adjusts them to a window size there. */
+    s->min_w = w;
+    s->min_h = h;
 }
 
 void vs_fill_rect(void *vs, int x, int y, int w, int h, int rgb) {
@@ -754,6 +782,14 @@ int vs_wait_timeout_fds(void *vs, int ms, const int *fds, int n) {
    not an fd, which is precisely why this returns -1.) */
 int vs_event_fd(void *vs) { (void)vs; return -1; }
 
+/* No damage region: WM_PAINT's update rect is not plumbed through the event
+   ring, so a repaint here is always full. Returning 0 is the documented
+   "repaint everything" answer, not a stub with a wrong value. */
+int vs_damage(void *vs, VsRect *out) {
+    (void)vs; (void)out;
+    return 0;
+}
+
 /* Messages already decoded into the queue by a previous PeekMessage. */
 int vs_events_pending(void *vs) { (void)vs; return evq_len; }
 
@@ -849,6 +885,10 @@ typedef struct VSurf {
     XIC ic;
     XImage *img;   /* cached blit staging image, resized on demand */
     int img_w, img_h;
+    /* union of the damage rects of the Expose run just delivered, so a caller
+       can repaint only what the server actually lost. dmg_w == 0 means "no
+       region reported" — repaint everything. */
+    int dmg_x, dmg_y, dmg_w, dmg_h;
     /* clipboard (CLIPBOARD selection) */
     Atom a_clipboard, a_utf8, a_targets, a_incr, a_clip_prop;
     char *clip_got; /* last text fetched from another owner */
@@ -1562,11 +1602,31 @@ void *vs_open(const char *title, int w, int h) {
                 vis->blue_mask == 0x0000FF;
     g_scale_pct = x11_detect_scale(dpy);
     s->dpy = dpy;
-    s->win = XCreateSimpleWindow(dpy, DefaultRootWindow(dpy), 0, 0, (unsigned)w, (unsigned)h, 1,
-                                 BlackPixel(dpy, scr), WhitePixel(dpy, scr));
+    /* Two attributes here are what keep a resize from flashing white, and both
+       are about the *server's* behaviour before our repaint gets a chance to
+       run — not about anything we draw.
+
+       background_pixmap None: with a background pixel set (XCreateSimpleWindow
+       forces one, and White is the conventional pick) the server paints it into
+       any newly exposed area before delivering Expose. Asking for None means it
+       paints nothing and the old pixels simply stay until we present.
+
+       bit_gravity NorthWestGravity: the default is ForgetGravity, under which a
+       resize discards the window's whole contents and tiles it with the
+       background — the entire window, not just the new strip. NorthWest keeps
+       the top-left content anchored, so a grow shows the previous frame in the
+       old region while only the new edge is undefined. */
+    XSetWindowAttributes swa;
+    swa.background_pixmap = None;
+    swa.border_pixel = BlackPixel(dpy, scr);
+    swa.bit_gravity = NorthWestGravity;
+    swa.event_mask = ExposureMask | KeyPressMask | KeyReleaseMask | ButtonPressMask |
+                     ButtonReleaseMask | PointerMotionMask | StructureNotifyMask;
+    s->win = XCreateWindow(dpy, DefaultRootWindow(dpy), 0, 0, (unsigned)w, (unsigned)h, 1,
+                           depth, InputOutput, vis,
+                           CWBackPixmap | CWBorderPixel | CWBitGravity | CWEventMask, &swa);
     XStoreName(dpy, s->win, title);
-    XSelectInput(dpy, s->win, ExposureMask | KeyPressMask | KeyReleaseMask | ButtonPressMask |
-                                  ButtonReleaseMask | PointerMotionMask | StructureNotifyMask);
+    /* the event mask went in through CWEventMask above; no XSelectInput needed */
     /* only emit KeyRelease on real release, not auto-repeat — matters for
        held-key game input (EV_KEY / EV_KEY_UP pairing) */
     XkbSetDetectableAutoRepeat(dpy, True, NULL);
@@ -1658,6 +1718,20 @@ int vs_height(void *vs) { return ((VSurf *)vs)->h; }
 void vs_set_title(void *vs, const char *t) {
     VSurf *s = vs;
     if (s->dpy) XStoreName(s->dpy, s->win, t);
+}
+
+void vs_set_min_size(void *vs, int w, int h) {
+    VSurf *s = vs;
+    if (!s || !s->dpy || w < 1 || h < 1) return;
+    /* XAllocSizeHints rather than a stack struct: the hints carry fields we do
+       not set, and the WM reads all of them. */
+    XSizeHints *sh = XAllocSizeHints();
+    if (!sh) return;
+    sh->flags = PMinSize;
+    sh->min_width = w;
+    sh->min_height = h;
+    XSetWMNormalHints(s->dpy, s->win, sh);
+    XFree(sh);
 }
 
 void vs_fill_rect(void *vs, int x, int y, int w, int h, int rgb) {
@@ -2062,20 +2136,66 @@ static int x11_decode_key(VSurf *s, XKeyEvent *ke) {
     return 0; /* dead key or unmapped */
 }
 
+/* Drain a run of pending ConfigureNotify, keeping only the last size. Called
+   with the size of the configure being translated; leaves the newest in *w/*h.
+   Peeks before consuming, so an event of any other type stops the drain and
+   stays queued. */
+static void x11_coalesce_configure(VSurf *s, int *w, int *h) {
+    while (XPending(s->dpy)) {
+        XEvent e;
+        XPeekEvent(s->dpy, &e);
+        if (e.type != ConfigureNotify) return;
+        XNextEvent(s->dpy, &e);
+        *w = e.xconfigure.width;
+        *h = e.xconfigure.height;
+    }
+}
+
 /* translate one XEvent into a VS_EV_* code, or -1 to ignore and keep waiting */
 static int x11_translate(VSurf *s, XEvent *e) {
     switch (e->type) {
-    case Expose:
+    case Expose: {
+        /* The server splits damage into several Expose events and sets count to
+           how many remain, so union them and deliver on the last. Repainting
+           only that union is much cheaper than a full redraw when a small strip
+           was uncovered. */
+        int ex = e->xexpose.x, ey = e->xexpose.y;
+        int ew = e->xexpose.width, eh = e->xexpose.height;
+        if (s->dmg_w <= 0 || s->dmg_h <= 0) {
+            s->dmg_x = ex; s->dmg_y = ey; s->dmg_w = ew; s->dmg_h = eh;
+        } else {
+            int x0 = s->dmg_x < ex ? s->dmg_x : ex;
+            int y0 = s->dmg_y < ey ? s->dmg_y : ey;
+            int x1 = s->dmg_x + s->dmg_w > ex + ew ? s->dmg_x + s->dmg_w : ex + ew;
+            int y1 = s->dmg_y + s->dmg_h > ey + eh ? s->dmg_y + s->dmg_h : ey + eh;
+            s->dmg_x = x0; s->dmg_y = y0; s->dmg_w = x1 - x0; s->dmg_h = y1 - y0;
+        }
         if (e->xexpose.count == 0) return VS_EV_EXPOSE;
         return -1;
+    }
     case ConfigureNotify: {
         int w = e->xconfigure.width, h = e->xconfigure.height;
+        /* A drag-resize delivers configures at pointer rate, and each one that
+           reaches the caller costs a full canvas rebuild, relayout and repaint.
+           Only the final size matters, so swallow the run first — the same
+           trick x11_coalesce_motion plays on MotionNotify. */
+        x11_coalesce_configure(s, &w, &h);
         if (w != s->w || h != s->h) {
             s->w = w;
             s->h = h;
             XFreePixmap(s->dpy, s->back);
             s->back = XCreatePixmap(s->dpy, s->win, (unsigned)w, (unsigned)h,
                                     (unsigned)DefaultDepth(s->dpy, DefaultScreen(s->dpy)));
+            /* XCreatePixmap does not clear: the new pixmap holds whatever that
+               server memory last contained. A present racing the repaint would
+               show that garbage, so start it from a known colour. */
+            XSetForeground(s->dpy, s->pgc, BlackPixel(s->dpy, DefaultScreen(s->dpy)));
+            XFillRectangle(s->dpy, s->back, s->pgc, 0, 0, (unsigned)w, (unsigned)h);
+            /* the whole buffer is undefined now, so any damage accumulated
+               against the old geometry is meaningless — a resize repaints in
+               full regardless */
+            s->dmg_w = 0;
+            s->dmg_h = 0;
             return VS_EV_RESIZE;
         }
         return -1;
@@ -2300,6 +2420,21 @@ int vs_event_fd(void *vs) {
     if (s->fb_on) return -1;   /* fbdev: reads /dev/input, not a single fd */
     if (!s->dpy) return -1;    /* headless */
     return ConnectionNumber(s->dpy);
+}
+
+/* Consumes the region, so a second call before the next Expose reports none —
+   the caller either repaints it now or loses it, which is the same contract the
+   input getters have. fbdev and headless report no region and repaint fully. */
+int vs_damage(void *vs, VsRect *out) {
+    VSurf *s = vs;
+    if (!s || !out || s->dmg_w <= 0 || s->dmg_h <= 0) return 0;
+    out->x = s->dmg_x;
+    out->y = s->dmg_y;
+    out->w = s->dmg_w;
+    out->h = s->dmg_h;
+    s->dmg_w = 0;
+    s->dmg_h = 0;
+    return 1;
 }
 
 /* Events already decoded and waiting, independent of the socket. Xlib's own

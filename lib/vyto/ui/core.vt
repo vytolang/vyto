@@ -3156,7 +3156,13 @@ export class Window {
         if (y1 > h) { y1 = h; }
         this.has_dirty = false;
         if (x1 <= x0 || y1 <= y0) { return; }
-        let d = Rect(x0, y0, x1 - x0, y1 - y0);
+        // Snap to whole pixels BEFORE clipping and filling. present_rect blits
+        // round_out() of this region, so a fractional edge here would present a
+        // boundary row the clip had excluded from the fill — that row keeps the
+        // previous frame's pixels and shows as a thin stale line, most visible
+        // where it contrasts with the background. Rounding out first makes the
+        // painted area exactly the presented area (round_out is idempotent).
+        let d = Rect(x0, y0, x1 - x0, y1 - y0).round_out();
         // Clip to the region on the rich tier so translucent chrome (shadows)
         // can't re-composite over last frame's pixels outside the cleared
         // area — that's what made hovered buttons' shadows darken over time.
@@ -3668,7 +3674,18 @@ export class Window {
                 // can be; paint whatever that owed and present exactly once.
                 this.flush_frame();
             } else if (ev == EV_EXPOSE) {
-                this.redraw();
+                // Repaint only what the server actually lost, when it tells us.
+                // Uncovering a strip of a window is otherwise a full redraw,
+                // which on the rich tier is a whole-canvas rasterization.
+                // A backend that reports no region gives a zero-sized rect and
+                // we fall back to the full path.
+                let d = this.surf.damage();
+                if (d.w > 0.0 && d.h > 0.0) {
+                    this.mark_dirty(d);
+                    this.repaint();
+                } else {
+                    this.redraw();
+                }
             } else if (ev == EV_RESIZE) {
                 this.painter.on_resize(this.surf.width(), this.surf.height());
                 this.layout();

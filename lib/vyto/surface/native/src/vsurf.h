@@ -84,6 +84,12 @@ void vs_close(void *s);
 int vs_width(void *s);
 int vs_height(void *s);
 void vs_set_title(void *s, const char *t);
+/* Refuse to let the window manager size the window below w x h. Without it a
+   WM can drag a window to near-zero, and a layout pass then computes negative
+   rects from a width smaller than its fixed children. X11 sets PMinSize,
+   Win32 answers WM_GETMINMAXINFO; fbdev, headless and Android ignore it (their
+   size is not user-driven). Values < 1 are ignored. */
+void vs_set_min_size(void *s, int w, int h);
 
 /* drawing goes to a backbuffer; colors are 0xRRGGBB */
 void vs_fill_rect(void *s, int x, int y, int w, int h, int rgb);
@@ -123,6 +129,14 @@ int vs_wait_timeout(void *s, int ms); /* blocks <= ms; VS_EV_TIMER on timeout */
  * when this returns 0, or it will never present at all. Only the Android arm
  * returns 1 today (Choreographer); X11/Win32/fbdev/headless return 0. */
 int vs_set_vsync(void *s, int on);
+/* The region the last VS_EV_EXPOSE actually lost, as the union of that Expose
+   run. Returns 1 and fills *out when the backend reported one, 0 when it did
+   not — repaint the whole window in that case. Reading it CONSUMES it, so call
+   once per expose. X11 reports a real region; Win32, fbdev, headless and
+   Android always return 0. */
+typedef struct VsRect { int x, y, w, h; } VsRect;
+int vs_damage(void *s, VsRect *out);
+
 int vs_key(void);         /* last VS_EV_KEY code */
 const char *vs_text(void);/* UTF-8 text of last key ("" if none) */
 int vs_mods(void);        /* VS_MOD_* bitmask at the last delivered event */

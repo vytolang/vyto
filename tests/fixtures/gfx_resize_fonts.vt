@@ -1,0 +1,36 @@
+// Canvas.resize keeps the parsed typefaces.
+//
+// Recreating the canvas instead (what on_resize used to do) re-parses every
+// loaded TTF, and a drag-resize runs that on every step — the dominant cost of
+// resizing a rich-tier window. No golden catches it, because geometry goldens
+// assert what was drawn, never what it cost, so this asserts the face cache
+// directly.
+import { Canvas } from "vyto/gfx";
+
+fn main() {
+    let c = new Canvas(200, 150);
+    if (!c.loadFont("lib/vyto/gfx/assets/Inter-Regular.ttf", 14.0)) {
+        // No font on disk: the resize half is still worth checking.
+        print("nofont");
+    }
+    let before = c.faceCount();
+
+    if (!c.resize(400, 300)) { print("resize failed"); return; }
+    if (c.width() != 400 || c.height() != 300) {
+        print("bad size " + c.width() + "x" + c.height());
+        return;
+    }
+    // Shrinking, growing and a no-op resize must all reuse the same faces.
+    c.resize(100, 80);
+    c.resize(100, 80);
+    c.resize(640, 480);
+
+    if (c.faceCount() != before) {
+        print("faces changed: " + before + " -> " + c.faceCount());
+        return;
+    }
+    // Drawing after the swap must still work — the context is a new object.
+    c.clear(0xFF000000);
+    c.fillRect(10.0, 10.0, 50.0, 20.0, 0xFFFFFFFF);
+    print("ok");
+}

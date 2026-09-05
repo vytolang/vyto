@@ -111,6 +111,47 @@ GfxCanvas *gfx_canvas_new(int w, int h) {
     return c;
 }
 
+/* Resize in place, keeping everything that does not depend on the dimensions.
+   Only img/ctx are sized; faces, the (face,size) font cache, face_of, the
+   weight/size state and the shadow scratch layer are all size-independent, so
+   recreating the whole canvas to grow it re-parses every loaded TTF for
+   nothing. That parse ran on every step of a drag-resize and dominated it.
+   Returns 1 on success, 0 on failure (leaving the old canvas intact). */
+int gfx_canvas_resize(GfxCanvas *c, int w, int h) {
+    if (!c) return 0;
+    if (w < 1) w = 1; /* same clamp as gfx_canvas_new, same reason */
+    if (h < 1) h = 1;
+    if (w == c->w && h == c->h) return 1;
+    BLImageCore img;
+    BLContextCore ctx;
+    if (bl_image_init_as(&img, w, h, BL_FORMAT_PRGB32) != BL_SUCCESS) return 0;
+    if (bl_context_init_as(&ctx, &img, NULL) != BL_SUCCESS) {
+        bl_image_destroy(&img);
+        return 0;
+    }
+    /* only swap once both succeeded, so a failed resize is a no-op */
+    bl_context_destroy(&c->ctx);
+    bl_image_destroy(&c->img);
+    c->img = img;
+    c->ctx = ctx;
+    c->w = w;
+    c->h = h;
+    /* A clip entry holds pixels saved out of the OLD image and a box in the old
+       geometry, neither of which survives the swap. The stack is balanced
+       between frames (resize is driven from the event loop, not mid-paint), so
+       this normally has nothing to do — but dropping it is the safe direction,
+       since carrying it would restore stale corners into the new image. */
+    for (int i = 0; i < c->clip_top && i < c->clip_cap; i++) {
+        for (int k = 0; k < c->clip[i].nbox; k++) free(c->clip[i].save[k]);
+        c->clip[i].nbox = 0;
+    }
+    c->clip_top = 0;
+    /* Nothing to re-apply on the new context: fill/stroke styles are set per
+       call, and the active weight and size live in the struct (gfx_set_font_
+       weight/size only assign fields), so text keeps drawing as it did. */
+    return 1;
+}
+
 static void destroy_fonts(GfxCanvas *c) {
     for (int i = 0; i < c->nfonts; i++) bl_font_destroy(&c->fonts[i].font);
     for (int i = 0; i < c->nfaces; i++) {
@@ -148,6 +189,7 @@ void gfx_canvas_free(GfxCanvas *c) {
 
 int gfx_width(GfxCanvas *c) { return c ? c->w : 0; }
 int gfx_height(GfxCanvas *c) { return c ? c->h : 0; }
+int gfx_face_count(GfxCanvas *c) { return c ? c->nfaces : 0; }
 
 void gfx_clear(GfxCanvas *c, int color) {
     bl_context_set_fill_style_rgba32(&c->ctx, rgba32_of(color));
