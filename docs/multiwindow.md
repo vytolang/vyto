@@ -338,7 +338,144 @@ Measured on the examples in `apps/multiwindow/`, RSS shortly after launch:
 8.3 MB by itself, which is why the single-fullscreen case costs more than three
 small ones. Adding screens is cheap; raising resolution is what costs.
 
-## 9. Worked examples
+## 9. API reference
+
+Everything below is `vyto/surface`. Only the multi-window-relevant members are
+listed — drawing, text and clipboard are covered in
+[`graphics.md`](graphics.md) and [`events.md`](events.md).
+
+### Creating and closing
+
+```js
+new Surface(title: string, w: int, h: int): Surface
+```
+
+There is no `close()`. A window closes when its `Surface` is released —
+assigning `null` over the last reference is how you close one deliberately.
+
+### Geometry and placement
+
+```js
+s.width(): int
+s.height(): int
+s.position(): int[]                 // [x, y] of the top-left, in screen coords
+s.move_to(x: int, y: int)
+s.set_size(w: int, h: int)
+s.set_min_size(w: int, h: int)      // floor the WM honours while dragging
+s.set_title(t: string)
+s.set_fullscreen(on: bool): bool    // false where there is no WM to ask
+```
+
+`set_fullscreen` targets the monitor the window is **currently on**, so choose a
+screen by moving there first.
+
+### Monitors
+
+```js
+surface_monitors(): Monitor[]       // never empty; exactly one is primary
+
+class Monitor {
+    x: int; y: int; w: int; h: int;
+    primary: bool;
+    scale: float;                   // 1.0 = 96dpi
+}
+
+s.scale(): float                    // scale of the monitor this window is on
+```
+
+Monitor geometry is in the same coordinate space `move_to` uses.
+
+### Decorations and dragging
+
+```js
+s.set_decorated(on: bool)
+s.drag_start(edge: EDGE, x: int, y: int): bool
+
+enum EDGE {
+    TOPLEFT = 0, TOP = 1, TOPRIGHT = 2, RIGHT = 3,
+    BOTTOMRIGHT = 4, BOTTOM = 5, BOTTOMLEFT = 6, LEFT = 7,
+    MOVE = 8,
+}
+```
+
+`drag_start` returns `false` when no window manager took the drag; fall back to
+`move_to` on `EV_MOUSE_MOVE`. Values match `_NET_WM_MOVERESIZE`.
+
+### The event loop
+
+```js
+s.wait(): int                       // blocks until an event
+s.poll(): int                       // EV_NONE when nothing is queued
+s.wait_timeout(ms: int): int        // EV_TIMER if ms elapses
+s.waitTimeoutFds(ms: int, fds: int[]): int
+s.eventFd(): int                    // -1 where the backend has no descriptor
+s.eventsPending(): int
+s.canWaitFds(): bool                // true on X11; false elsewhere
+```
+
+`wait`, `wait_timeout` and `waitTimeoutFds` **return** the event — they do not
+leave it queued. See §3.
+
+Event constants: `EV_NONE`, `EV_EXPOSE`, `EV_KEY`, `EV_MOUSE_DOWN`,
+`EV_MOUSE_UP`, `EV_RESIZE`, `EV_CLOSE`, `EV_MOUSE_MOVE`, `EV_TIMER`,
+`EV_KEY_UP`, `EV_MOUSE_WHEEL`, `EV_MOUSE_RDOWN`, `EV_VSYNC` (0–12), and the
+`EVENT` enum with the same members for an exhaustive `switch`.
+
+### Event payload
+
+Read after the event that produced it — each names *this* window's last event:
+
+```js
+s.key(): int
+s.text_ev(): string
+s.mouse_x(): int
+s.mouse_y(): int
+s.wheel(): int
+s.mods(): int
+s.damage(): Rect        // region the last EV_EXPOSE lost; zero-sized = repaint all
+```
+
+### Presenting pixels
+
+```js
+s.blit(pixels: i32[], srcw: int, srch: int, dst: Rect)
+s.blitPtr(p: rawptr, srcw: int, srch: int, dst: Rect)
+s.blitRect(p: rawptr, stridePx: int, srcx: int, srcy: int,
+           w: int, h: int, dstx: int, dsty: int)
+s.present()
+s.present_rect(r: Rect)
+```
+
+`blit` and `blitPtr` **scale** to the destination rect — that is what makes a
+preview thumbnail one call. Both require tightly packed pixels
+(stride == `srcw*4`); `blitRect` takes an explicit stride but does **not**
+scale. Pixels are `0x00RRGGBB`, row-major.
+
+### Capturing another window
+
+```js
+capture_window(native_win: culong): Capture      // null when unreadable
+
+class Capture {
+    w: int; h: int;
+    pixels: i32[];                  // 0x00RRGGBB, row-major, w*h
+}
+
+s.native_window(): culong           // this window's XID / HWND
+```
+
+### Escape hatches
+
+```js
+s.raw_handle(): rawptr
+s.native_display(): rawptr          // X11 Display*
+s.native_gc(): rawptr
+```
+
+For reaching past the API — `set_decorated` was originally done this way, with
+`_MOTIF_WM_HINTS` set directly on `native_window()`.
+
+## 10. Worked examples
 
 All in [`apps/multiwindow/`](../apps/multiwindow/); each runs on its own and
 needs a display.
@@ -355,7 +492,7 @@ needs a display.
 Smaller, single-purpose demos: `examples/113_multiwindow.vt` (two windows, input
 routing) and `examples/114_chromeless.vt` (decorations, drag, resize edges).
 
-## 10. What is not supported
+## 11. What is not supported
 
 - **Running `vyto/ui` on more than one window** — see §7.
 - **Live re-scaling** when a window moves to a different-DPI monitor (§4).
