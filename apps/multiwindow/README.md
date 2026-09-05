@@ -1,6 +1,6 @@
 # Multi-window examples
 
-Four patterns for driving more than one OS window from one Vyto process. Each
+Six patterns for driving more than one OS window from one Vyto process. Each
 runs on its own:
 
 ```sh
@@ -13,8 +13,10 @@ runs on its own:
 ```
 
 They need a display (X11 today). There are no `.expected` files: these are
-demos, and the deterministic checks live in `tests/ui/96_multiwindow` and
-`tests/ui/97_window_controls`.
+demos, and the deterministic checks live in `tests/ui/96_multiwindow`,
+`97_window_controls`, `98_monitors`, `99_capture` and `100_dpi`.
+
+Full reference: [`docs/multiwindow.md`](../../docs/multiwindow.md).
 
 ## What each one shows
 
@@ -27,7 +29,7 @@ demos, and the deterministic checks live in `tests/ui/96_multiwindow` and
 | `kiosk.vt` | Fullscreen signage on one screen, a control window on another. Picks its monitor from `surface_monitors()`. |
 | `videowall.vt` | Three signage screens, each shown live as a thumbnail inside the controller. |
 
-## The three things worth knowing
+## The four things worth knowing
 
 **Sharing data between windows is not a thing you have to arrange.** They are
 objects on one thread in one process, so a counter is a variable and both
@@ -45,6 +47,20 @@ That blocks until *either* speaks. Polling both in a bare loop spins.
 `waitTimeoutFds` **returns** the woken window's event rather than leaving it
 queued — discard the return value and that window's input silently disappears
 while the other keeps working.
+
+**`EV_CLOSE` names ONE window — it does not mean "quit".** The obvious loop is
+wrong, and wrong in a way that looks like a library bug:
+
+```vyto
+if (eb == EV_CLOSE) { live = false; }      // ← closes EVERY window
+```
+
+Leaving the loop drops every `Surface`, so closing one child takes the app down
+with it. Decide per window: a secondary window clears its own flag, only the
+primary quits. Once a window is gone, stop polling it and stop passing its
+`eventFd()` to `waitTimeoutFds` — that descriptor is dead. `spawn.vt` and
+`videowall.vt` keep an array and filter it, which also releases the closed
+window.
 
 **A chromeless window owns every pixel.** With decorations off the server paints
 no background, so an unhandled `EV_EXPOSE` leaves the damaged area showing
@@ -118,8 +134,27 @@ One X11 caveat it cannot detect for you: without a compositing manager, an
 obscured region reads back as whatever is drawn over it, because the server
 keeps no offscreen copy. Most desktops composite, so it is usually right.
 
+## DPI
+
+`Monitor.scale` reports each screen's own scale, and `s.scale()` gives the scale
+of the monitor a window is on.
+
+**Per-monitor scale is only real on Windows.** X11 has one global `Xft.dpi` and
+no per-output equivalent — per-monitor scaling on Linux desktops is a compositor
+feature implemented outside X — so every X11 window reports the desktop's scale.
+Physical DPI from XRandR is deliberately not used as a substitute: a laptop
+panel measuring 142dpi is routinely run at 96, and treating physics as the scale
+oversizes everything by ~48%.
+
+`$VYTO_SCALE` overrides it, taking either one value (`1.5`, `150`) or a comma
+list naming monitors in order (`100,200`) — the list form is how mixed-DPI
+behaviour is testable on a single-screen machine.
+
 ## Not covered
 
-Per-monitor DPI: `Monitor.scale` currently reports the global scale rather than
-the scale of that particular screen, so a mixed-DPI multi-head setup will size
-text by the wrong factor on one of them.
+- **Live re-scaling.** Scale is read once at `Window` construction, so dragging
+  a window to a different-DPI monitor does not re-scale it.
+- **`vyto/ui` on more than one window.** `Window` binds one `Surface` and its
+  `run()` owns the thread; these examples use the raw `Surface` layer. The
+  workable split is toolkit on the control window, raw surface on the display —
+  what `kiosk.vt` does.
