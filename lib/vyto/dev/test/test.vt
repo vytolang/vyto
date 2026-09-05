@@ -1,0 +1,210 @@
+// vyto/dev/test — unit tests that assert on values, not on stdout.
+//
+//     import { suite } from "vyto/dev/test";
+//     import { exitWith } from "vyto/dev/test/exit";
+//
+//     fn main() {
+//         let t = suite("hex");
+//         t.section("known vectors");
+//         t.eqInt("digit_0", hex_val(48), 0);
+//         t.eqInt("upper_A", hex_val(65), 10);
+//         exitWith(t.done());
+//     }
+//
+// The examples/ suite diffs a program's stdout against a golden, which is a
+// fine way to test deterministic output and a bad way to test three things the
+// stdlib now needs: a refusal (does this fail for the RIGHT reason), a
+// non-deterministic result (a fresh keypair differs every run), and a property
+// over generated input (do these two implementations agree on all 256 bytes).
+// This package covers those. It does not replace examples/ — those are
+// documentation that happens to be executable, and they should stay that way.
+//
+// ---- why an assertion prints and continues instead of aborting ----
+//
+// `panic()` cannot be caught. It writes to stderr and calls vt_host_abort(),
+// which is exit(101) (runtime/vyto_rt.c:140, :553) — there is no handler, no
+// recover, no unwind. So an assertion that panicked on mismatch would report
+// exactly ONE failure per run and you would re-run to find the second.
+//
+// Instead every assertion prints its verdict, counts it, and returns. A run
+// reports every failure it found. The assertion also RETURNS a bool, for the
+// case where continuing is not merely noisy but fatal:
+//
+//     if (!t.ok("parsed", r != null)) { return; }   // next line would deref null
+//     t.eqInt("rows", r.rows.len, 3);
+//
+// Use the return value only for that. Wrapping every assertion in an `if` buys
+// nothing and reads worse.
+//
+// ---- why there is no global registry ----
+//
+// The top level of a Vyto file holds only import/const/fn/struct/enum/class/
+// extern (src/parse.c:1040-1100) — there is no module-level `let`, and classes
+// have static methods but not static fields (src/parse.c:932). There is also no
+// reflection, so nothing can enumerate functions by name. Both facts point the
+// same way: the suite is an ordinary object created in main() and threaded
+// through explicitly, and test discovery is the runner globbing tests/unit/*.vt.
+//
+// ---- why four typed eq* methods instead of one generic ----
+//
+// Generics are monomorphized with no bounds, so a single `eq<A>` would emit one
+// copy per type and still could not format `got`/`want` into the failure block —
+// there is no printable bound to call through. Four explicit methods is the
+// version that reads as it behaves.
+
+// One test suite: its name, its tallies, and its output format. Created by
+// `suite()`, never with `new` directly, so the constructor stays free to change.
+export class T {
+    name: string;
+    passed: int;
+    failed: int;
+    skipped: int;
+
+    fn init(name: string) {
+        this.name = name;
+        this.passed = 0;
+        this.failed = 0;
+        this.skipped = 0;
+        print("# " + name);
+    }
+
+    // ---- the reporting core; every assertion below ends up here ----
+
+    // Record a pass. Split out so the tally is incremented in exactly one place.
+    fn pass(label: string): bool {
+        this.passed = this.passed + 1;
+        print("ok " + label);
+        return true;
+    }
+
+    // Record a failure with no detail lines.
+    fn fail(label: string, why: string): bool {
+        this.failed = this.failed + 1;
+        print("not ok " + label);
+        if (why != "") { print("  " + why); }
+        return false;
+    }
+
+    // Record a failure with the got/want block. Indented two spaces so
+    // `grep '^not ok'` gives a one-line-per-failure digest and the detail is
+    // still there for a human reading the log.
+    fn failed_cmp(label: string, got: string, want: string): bool {
+        this.failed = this.failed + 1;
+        print("not ok " + label);
+        print("  got:  " + got);
+        print("  want: " + want);
+        return false;
+    }
+
+    // ---- assertions ----
+
+    // The general one: assert a condition the caller has already evaluated.
+    // Carries no got/want block, because a bool has nothing useful to show.
+    fn ok(label: string, cond: bool): bool {
+        if (cond) { return this.pass(label); }
+        return this.fail(label, "");
+    }
+
+    fn eq(label: string, got: string, want: string): bool {
+        if (got == want) { return this.pass(label); }
+        return this.failed_cmp(label, got, want);
+    }
+
+    fn eqInt(label: string, got: int, want: int): bool {
+        if (got == want) { return this.pass(label); }
+        return this.failed_cmp(label, str(got), str(want));
+    }
+
+    fn eqBool(label: string, got: bool, want: bool): bool {
+        if (got == want) { return this.pass(label); }
+        return this.failed_cmp(label, str(got), str(want));
+    }
+
+    // Float equality is a tolerance, never `==`. The default eps is the one
+    // apps/float_paranoia.vt settled on; pass your own when the computation's
+    // error budget is known. Note NaN fails against everything including
+    // itself, which is the intended behaviour — assert it with `is_nan()`.
+    fn eqFloat(label: string, got: float, want: float, eps: float = 0.000000001): bool {
+        let d = got - want;
+        if (d.abs() <= eps) { return this.pass(label); }
+        return this.failed_cmp(label, str(got), str(want));
+    }
+
+    // Substring, for messages and rendered output where pinning the whole
+    // string would make the test fragile for no gain.
+    fn contains(label: string, hay: string, needle: string): bool {
+        if (hay.contains(needle)) { return this.pass(label); }
+        return this.failed_cmp(label, hay, "(containing) " + needle);
+    }
+
+    fn eqIntArr(label: string, got: int[], want: int[]): bool {
+        if (got.len != want.len) {
+            return this.failed_cmp(label, "len " + str(got.len), "len " + str(want.len));
+        }
+        for (let i in 0..got.len) {
+            if (got[i] != want[i]) {
+                return this.failed_cmp(label,
+                    "[" + str(i) + "]=" + str(got[i]), "[" + str(i) + "]=" + str(want[i]));
+            }
+        }
+        return this.pass(label);
+    }
+
+    fn eqStrArr(label: string, got: string[], want: string[]): bool {
+        if (got.len != want.len) {
+            return this.failed_cmp(label, "len " + str(got.len), "len " + str(want.len));
+        }
+        for (let i in 0..got.len) {
+            if (got[i] != want[i]) {
+                return this.failed_cmp(label,
+                    "[" + str(i) + "]=" + got[i], "[" + str(i) + "]=" + want[i]);
+            }
+        }
+        return this.pass(label);
+    }
+
+    // ---- structure ----
+
+    // A divider. Carries no verdict, so it never affects the tallies — it is
+    // there to make a long log readable and to group related assertions.
+    fn section(name: string) {
+        print("-- " + name);
+    }
+
+    // A test that could not run. Counted separately from a pass so a suite that
+    // skips everything cannot read as green, and the reason is required.
+    fn skip(label: string, why: string) {
+        this.skipped = this.skipped + 1;
+        print("skip " + label + " (" + why + ")");
+    }
+
+    // ---- termination ----
+
+    // Print the summary and RETURN the intended exit code (0 green, 1 red).
+    //
+    // It returns rather than exiting for two reasons. It keeps this module free
+    // of `vyto/os` — see vyto/dev/test/exit. And it makes done() itself
+    // testable: the selftest calls it and inspects what came back, which it
+    // could not do if the call terminated the process.
+    //
+    // The line ends in a bare `ok` or `FAILED` token, and the runner greps for
+    // it. That is not decoration — it is how an ABORTED suite is distinguished
+    // from a failing one. With no catch, code under test that panics kills the
+    // process after some `ok` lines and never reaches here, so "the summary is
+    // present" is the only evidence the suite ran to the end.
+    fn done(): int {
+        let verdict = "ok";
+        if (this.failed > 0) { verdict = "FAILED"; }
+        print("# " + this.name + ": " + str(this.passed) + " passed, "
+              + str(this.failed) + " failed, " + str(this.skipped) + " skipped "
+              + verdict);
+        if (this.failed > 0) { return 1; }
+        return 0;
+    }
+}
+
+// Start a suite. Prints the `# <name>` header immediately, so a suite that
+// dies before its first assertion still says which suite it was.
+export fn suite(name: string): T {
+    return new T(name);
+}

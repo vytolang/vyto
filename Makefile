@@ -22,7 +22,7 @@ vytobind: src/vytobind.c src/util.c src/util.h
 vytopack: vytoc $(wildcard src/vytopack/*.vt)
 	./vytoc build src/vytopack/vytopack.vt -o $@ --modpath src --release
 
-.PHONY: all test test-charts test-mobile test-win test-pack clean clean-cache
+.PHONY: all test test-charts test-mobile test-win test-pack test-dev clean clean-cache
 
 test: vytoc vytobind
 	./tests/run_tests.sh
@@ -42,6 +42,14 @@ test-mobile: vytoc
 # network, since it clones a throwaway repo it creates in tests/tmp.
 test-pack: vytoc
 	./tests/run_tests_pack.sh
+
+# Unit tests written against lib/vyto/dev/test: assertions on values rather
+# than a stdout diff, so a refusal, a non-deterministic result or a property
+# over generated input can actually be tested. Split out of `make test` for the
+# same reason test-pack is. Run it after touching lib/vyto/dev/test or anything
+# under tests/unit.
+test-dev: vytoc
+	./tests/run_tests_dev.sh
 
 # Cross-build the Windows-portable slice for windows-x64 and stage it, with its
 # goldens and a self-checking run.ps1, into tests/tmp/win-x64/. Runs nothing —

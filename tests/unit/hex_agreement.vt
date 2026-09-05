@@ -1,0 +1,144 @@
+// tests/unit/hex_agreement.vt — do the scattered hex_val copies agree?
+//
+// Nine private hex-nibble decoders live in the stdlib under three names:
+//
+//     hex_val    util/url.vt:119   util/mime.vt:210  util/html.vt:459
+//                util/xml.vt:148   util/toml.vt:785  util/uuid/uuid.vt:228
+//                crypto/crypto.vt:142
+//     hexVal     db/pgsql/pgtype.vt:223
+//     hex_digit  util/json.vt:765
+//
+// They exist separately because the one exported pair, hex_encode/hex_decode in
+// crypto.vt:105, cannot be imported without linking SHA-256, SHA-512, MD5,
+// ChaCha20 and Poly1305 — a steep price for decoding `%20` in a URL. The fix is
+// a zero-dependency vyto/util/hex leaf package that everything can import.
+//
+// This test is what has to pass BEFORE that consolidation happens. Collapsing
+// nine functions into one is only safe if they agree, and "they look the same"
+// is not evidence — a decoder that accepts what another rejects is a parser bug
+// that no golden-output test would surface, because both spellings produce
+// identical output on well-formed input. The disagreement only shows on input
+// nobody thought to write down.
+//
+// It found one. See the last section.
+//
+// The copies are private, so they cannot be imported; they are transcribed
+// below. That is deliberate, not a workaround — this test then fails the day a
+// transcription drifts from its original, which is exactly when a consolidation
+// based on it would silently change behaviour. If one of these starts failing,
+// re-read the source it names before touching anything.
+import { suite } from "vyto/dev/test";
+import { exitWith } from "vyto/dev/test/exit";
+import { is_digit } from "vyto/util/ascii";
+
+const CHAR_ZERO: int = 48;
+const CHAR_UPPER_A: int = 65;
+const CHAR_UPPER_F: int = 70;
+const CHAR_LOWER_A: int = 97;
+const CHAR_LOWER_F: int = 102;
+
+// The seven byte-identical copies, transcribed once. url, mime, html, xml,
+// toml, uuid and crypto differ only in whitespace and comment style.
+fn hex_val_common(c: int): int {
+    if (is_digit(c)) { return c - CHAR_ZERO; }
+    if (c >= CHAR_LOWER_A && c <= CHAR_LOWER_F) { return c - CHAR_LOWER_A + 10; }
+    if (c >= CHAR_UPPER_A && c <= CHAR_UPPER_F) { return c - CHAR_UPPER_A + 10; }
+    return -1;
+}
+
+// db/pgsql/pgtype.vt:223 — same body, different name.
+fn hexVal_pgsql(c: int): int {
+    if (is_digit(c)) { return c - CHAR_ZERO; }
+    if (c >= CHAR_LOWER_A && c <= CHAR_LOWER_F) { return c - CHAR_LOWER_A + 10; }
+    if (c >= CHAR_UPPER_A && c <= CHAR_UPPER_F) { return c - CHAR_UPPER_A + 10; }
+    return -1;
+}
+
+// util/json.vt:765 — note the last line. This one returns 0, not -1.
+fn hex_digit_json(c: int): int {
+    if (is_digit(c)) { return c - CHAR_ZERO; }
+    if (c >= CHAR_LOWER_A && c <= CHAR_LOWER_F) { return c - CHAR_LOWER_A + 10; }
+    if (c >= CHAR_UPPER_A && c <= CHAR_UPPER_F) { return c - CHAR_UPPER_A + 10; }
+    return 0;
+}
+
+fn main() {
+    let t = suite("hex_agreement");
+
+    t.section("known vectors");
+    t.eqInt("digit_0", hex_val_common(48), 0);
+    t.eqInt("digit_9", hex_val_common(57), 9);
+    t.eqInt("lower_a", hex_val_common(97), 10);
+    t.eqInt("lower_f", hex_val_common(102), 15);
+    t.eqInt("upper_A", hex_val_common(65), 10);
+    t.eqInt("upper_F", hex_val_common(70), 15);
+
+    // The boundaries either side of every accepted range — where an off-by-one
+    // lives, and the cases a hand-written vector table habitually omits.
+    t.section("boundaries");
+    t.eqInt("before_0", hex_val_common(47), -1);
+    t.eqInt("after_9", hex_val_common(58), -1);
+    t.eqInt("before_A", hex_val_common(64), -1);
+    t.eqInt("after_F", hex_val_common(71), -1);
+    t.eqInt("before_a", hex_val_common(96), -1);
+    t.eqInt("after_f", hex_val_common(103), -1);
+    // 'g' and 'G' sit just past the ranges and are the letters most likely to
+    // be fed in by a typo in real hex input.
+    t.eqInt("lower_g", hex_val_common(103), -1);
+    t.eqInt("upper_G", hex_val_common(71), -1);
+
+    // The whole input domain, not a sample. This is the assertion the examples
+    // suite cannot express, and it is why this package exists.
+    t.section("pgsql agrees over all 256 byte values");
+    let pg_diffs = 0;
+    for (let c in 0..256) {
+        if (hexVal_pgsql(c) != hex_val_common(c)) { pg_diffs = pg_diffs + 1; }
+    }
+    t.eqInt("hexVal_pgsql identical on every byte", pg_diffs, 0);
+
+    t.section("round trip over every nibble");
+    for (let v in 0..16) {
+        let lower = v + CHAR_ZERO;
+        if (v >= 10) { lower = v - 10 + CHAR_LOWER_A; }
+        let upper = v + CHAR_ZERO;
+        if (v >= 10) { upper = v - 10 + CHAR_UPPER_A; }
+        t.eqInt(`roundtrip_lower_{v}`, hex_val_common(lower), v);
+        t.eqInt(`roundtrip_upper_{v}`, hex_val_common(upper), v);
+    }
+
+    // ---- the disagreement -------------------------------------------------
+    //
+    // json.vt's hex_digit returns 0 for a non-hex byte where every other copy
+    // returns -1. So `\u00zz` decodes as U+0000 rather than being rejected —
+    // the sentinel and a legitimate value for the digit zero are the same
+    // number, and the caller cannot tell them apart.
+    //
+    // This is pinned, not fixed. Changing it is a behaviour change to JSON
+    // parsing that belongs in its own commit with its own test, and the point
+    // of this file is to know about it BEFORE a consolidation quietly picks one
+    // convention for all nine. When json.vt is fixed, this section is what
+    // says so.
+    t.section("json disagrees, deliberately pinned");
+    t.eqInt("json returns 0 on non-hex", hex_digit_json(122), 0);
+    t.eqInt("every other copy returns -1", hex_val_common(122), -1);
+    t.ok("and so they disagree", hex_digit_json(122) != hex_val_common(122));
+
+    // On valid hex they must still agree, or json is wrong twice over.
+    let json_diffs = 0;
+    for (let c in 0..256) {
+        if (hex_val_common(c) >= 0 && hex_digit_json(c) != hex_val_common(c)) {
+            json_diffs = json_diffs + 1;
+        }
+    }
+    t.eqInt("json agrees on every VALID hex byte", json_diffs, 0);
+
+    // And the disagreement is confined to exactly the rejected bytes — 256
+    // minus the 22 that are valid hex.
+    let disagree = 0;
+    for (let c in 0..256) {
+        if (hex_digit_json(c) != hex_val_common(c)) { disagree = disagree + 1; }
+    }
+    t.eqInt("disagreement is exactly the non-hex bytes", disagree, 234);
+
+    exitWith(t.done());
+}

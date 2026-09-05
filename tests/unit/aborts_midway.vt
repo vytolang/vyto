@@ -1,0 +1,39 @@
+// tests/unit/aborts_midway.vt — a suite that dies before it finishes.
+//
+// This is a NEGATIVE test of the runner, not of the framework: it must be
+// reported FAIL, and tests/run_tests_dev.sh special-cases it by name so that
+// "reported FAIL" is the passing outcome.
+//
+// It exists because of the one thing the language does not give us. `panic()`
+// cannot be caught, so when code under test panics the process is gone at
+// exit(101) — after some `ok` lines have already been printed, and before the
+// summary line is ever reached. A runner that judged only on exit status, or
+// only on "did some assertions pass", would score that identically to a clean
+// failure and would never notice that most of the suite did not run.
+//
+// Requiring the summary line is what closes that hole, and this file is what
+// proves the requirement is actually enforced. Delete the grep in the runner
+// and this test starts passing — which is exactly what the fault-injection
+// matrix in the README checks for.
+import { suite } from "vyto/dev/test";
+import { exitWith } from "vyto/dev/test/exit";
+
+fn main() {
+    let t = suite("aborts_midway");
+
+    t.section("assertions that do run");
+    t.eqInt("first", 1, 1);
+    t.eqInt("second", 2, 2);
+    t.eqInt("third", 3, 3);
+
+    // A real runtime panic from the code under test, not a deliberate panic()
+    // call — an out-of-bounds index is the most ordinary way a test dies for
+    // reasons that have nothing to do with its assertions.
+    t.section("and then the code under test dies");
+    let xs: int[] = [1, 2, 3];
+    let boom = xs[99];
+    print("unreachable: " + str(boom));
+
+    // Never reached. No summary line is ever printed, which is the whole point.
+    exitWith(t.done());
+}

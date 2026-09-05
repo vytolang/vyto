@@ -1,0 +1,112 @@
+// tests/unit/selftest.vt — the framework asserting on itself.
+//
+// Every assertion appears TWICE: once passing, once deliberately failing. The
+// failing half is the load-bearing half. A framework whose eqInt() returned
+// true unconditionally would sail through a suite made only of true
+// assertions, and that is the exact shape of check that passes trivially once
+// it stops finding anything.
+//
+// Because the deliberate failures make this suite's own verdict red, it is NOT
+// run through the usual pass/fail path. It is diffed byte for byte against
+// selftest.expected and its non-zero exit is expected; tests/run_tests_dev.sh
+// special-cases it by name. That golden is validated by `diff`, a tool with no
+// relationship to this code — which is the point. The framework cannot be the
+// only witness to its own correctness.
+//
+// Regenerating the golden: `make clean-cache` FIRST (CLAUDE.md §"stale
+// objects"), or it records the previous build of the framework rather than the
+// one you just changed.
+import { suite } from "vyto/dev/test";
+import { exitWith } from "vyto/dev/test/exit";
+
+fn main() {
+    let t = suite("selftest");
+
+    // ---- each assertion, both directions ----
+
+    t.section("ok");
+    t.ok("ok_pass", true);
+    t.ok("ok_fail", false);
+
+    t.section("eq");
+    t.eq("eq_pass", "abc", "abc");
+    t.eq("eq_fail", "abc", "abd");
+    t.eq("eq_empty_vs_set", "", "x");
+
+    t.section("eqInt");
+    t.eqInt("eqInt_pass", 2 + 2, 4);
+    t.eqInt("eqInt_fail", 2 + 2, 5);
+    t.eqInt("eqInt_negative", -7, -7);
+
+    t.section("eqBool");
+    t.eqBool("eqBool_pass", true, true);
+    t.eqBool("eqBool_fail", true, false);
+
+    t.section("eqFloat");
+    t.eqFloat("eqFloat_pass", 0.1 + 0.2, 0.3);
+    t.eqFloat("eqFloat_fail", 1.0, 2.0);
+    // Tolerance is a real comparison, not a rounding of the printed form: this
+    // difference is far above the default eps and must fail.
+    t.eqFloat("eqFloat_just_outside", 1.0, 1.001);
+    // And an explicit eps must widen it.
+    t.eqFloat("eqFloat_wide_eps", 1.0, 1.001, 0.01);
+
+    t.section("contains");
+    t.contains("contains_pass", "hello world", "lo wo");
+    t.contains("contains_fail", "hello world", "goodbye");
+
+    t.section("eqIntArr");
+    let a1: int[] = [1, 2, 3];
+    let a2: int[] = [1, 2, 3];
+    let a3: int[] = [1, 9, 3];
+    let a4: int[] = [1, 2];
+    t.eqIntArr("eqIntArr_pass", a1, a2);
+    t.eqIntArr("eqIntArr_fail_elem", a1, a3);
+    t.eqIntArr("eqIntArr_fail_len", a1, a4);
+
+    t.section("eqStrArr");
+    let s1: string[] = ["a", "b"];
+    let s2: string[] = ["a", "b"];
+    let s3: string[] = ["a", "c"];
+    t.eqStrArr("eqStrArr_pass", s1, s2);
+    t.eqStrArr("eqStrArr_fail", s1, s3);
+
+    t.section("fail and skip");
+    t.fail("fail_is_always_red", "stated reason");
+    t.skip("skip_is_neither", "nothing to run against");
+
+    // ---- the return values ----
+    //
+    // An assertion returns its own verdict so a caller can bail before a line
+    // that would panic. If those returns were wrong, the guard idiom in the
+    // header comment would silently stop guarding, so they are asserted here.
+    // Note each inner call also prints and counts — that is expected, and the
+    // golden pins it.
+
+    t.section("return values");
+    t.ok("ok_returns_true", t.ok("inner_pass", true) == true);
+    t.ok("ok_returns_false", t.ok("inner_fail", false) == false);
+    t.ok("eqInt_returns_true", t.eqInt("inner_eq_pass", 1, 1) == true);
+    t.ok("eqInt_returns_false", t.eqInt("inner_eq_fail", 1, 2) == false);
+    t.ok("fail_returns_false", t.fail("inner_fail_call", "expected") == false);
+
+    // ---- counting ----
+    //
+    // The tallies are asserted from inside, which is circular on its own — a
+    // framework that miscounted could also mis-assert the count. It is not
+    // circular once the golden pins the SUMMARY line too: the count printed at
+    // the end and the count observed here have to agree with each other AND
+    // with a number checked by diff. Getting all three consistent while broken
+    // is not a plausible accident.
+    t.section("counting");
+    t.ok("skipped_counted", t.skipped == 1);
+    t.ok("some_passed", t.passed > 0);
+    t.ok("some_failed", t.failed > 0);
+
+    // done() returns 1 here, because this suite has deliberate failures.
+    // Asserting that IS the test — a done() that returned 0 unconditionally
+    // would green-wash every failing suite in the tree.
+    let code = t.done();
+    print("# done() returned " + str(code));
+    exitWith(code);
+}
