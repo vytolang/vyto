@@ -584,6 +584,59 @@ void vs_set_title(void *vs, const char *t) {
     if (s->hwnd) SetWindowTextA(s->hwnd, t);
 }
 
+
+void vs_set_decorated(void *vs, int on) {
+    VSurf *s = vs;
+    if (!s || !s->hwnd) return;
+    /* WS_POPUP is the undecorated counterpart of WS_OVERLAPPEDWINDOW. The
+       SetWindowPos with SWP_FRAMECHANGED is required — without it the frame is
+       not recalculated and the titlebar stays until something else resizes. */
+    LONG_PTR style = on ? (WS_OVERLAPPEDWINDOW | WS_VISIBLE)
+                        : (WS_POPUP | WS_VISIBLE);
+    SetWindowLongPtr(s->hwnd, GWL_STYLE, style);
+    SetWindowPos(s->hwnd, NULL, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
+}
+
+void vs_get_position(void *vs, int *x, int *y) {
+    VSurf *s = vs;
+    if (x) *x = 0;
+    if (y) *y = 0;
+    if (!s || !s->hwnd) return;
+    RECT r;
+    if (GetWindowRect(s->hwnd, &r)) {
+        if (x) *x = r.left;
+        if (y) *y = r.top;
+    }
+}
+
+void vs_move(void *vs, int x, int y) {
+    VSurf *s = vs;
+    if (!s || !s->hwnd) return;
+    SetWindowPos(s->hwnd, NULL, x, y, 0, 0,
+                 SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+}
+
+/* Win32's equivalent of _NET_WM_MOVERESIZE: tell DefWindowProc the click landed
+   on the caption (or a border), and it runs its own modal move/resize loop with
+   the system's snapping. HTCAPTION is the move case; the rest map to the eight
+   edges in the same order as VS_EDGE_*. */
+int vs_drag_start(void *vs, int edge, int x_root, int y_root) {
+    VSurf *s = vs;
+    (void)x_root; (void)y_root;
+    if (!s || !s->hwnd) return 0;
+    if (edge < 0 || edge > 8) return 0;
+    static const int ht[9] = {
+        HTTOPLEFT, HTTOP, HTTOPRIGHT, HTRIGHT,
+        HTBOTTOMRIGHT, HTBOTTOM, HTBOTTOMLEFT, HTLEFT, HTCAPTION
+    };
+    /* Release the implicit capture from the press, then re-issue the click as a
+       non-client one so DefWindowProc starts its drag loop. */
+    ReleaseCapture();
+    SendMessage(s->hwnd, WM_NCLBUTTONDOWN, (WPARAM)ht[edge], 0);
+    return 1;
+}
+
 void vs_set_min_size(void *vs, int w, int h) {
     VSurf *s = vs;
     if (!s || w < 1 || h < 1) return;
@@ -1777,6 +1830,75 @@ int vs_height(void *vs) { return ((VSurf *)vs)->h; }
 void vs_set_title(void *vs, const char *t) {
     VSurf *s = vs;
     if (s->dpy) XStoreName(s->dpy, s->win, t);
+}
+
+
+/* _MOTIF_WM_HINTS is the de-facto way to ask for an undecorated window: every
+   major WM honours it, and unlike override-redirect the window stays managed,
+   so it still gets focus, taskbar presence and _NET_WM_MOVERESIZE. */
+void vs_set_decorated(void *vs, int on) {
+    VSurf *s = vs;
+    if (!s || !s->dpy) return;
+    Atom a = XInternAtom(s->dpy, "_MOTIF_WM_HINTS", False);
+    /* MotifWmHints: flags, functions, decorations, input_mode, status.
+       flags = MWM_HINTS_DECORATIONS (1<<1). */
+    long hints[5] = { 2, 0, 0, 0, 0 };
+    hints[2] = on ? 1 : 0;
+    XChangeProperty(s->dpy, s->win, a, a, 32, PropModeReplace,
+                    (unsigned char *)hints, 5);
+    XFlush(s->dpy);
+}
+
+void vs_get_position(void *vs, int *x, int *y) {
+    VSurf *s = vs;
+    if (x) *x = 0;
+    if (y) *y = 0;
+    if (!s || !s->dpy) return;
+    /* The window's own x/y are relative to its parent, which for a managed
+       window is the WM's frame — so translate to the root instead. */
+    Window child;
+    int rx = 0, ry = 0;
+    if (XTranslateCoordinates(s->dpy, s->win, DefaultRootWindow(s->dpy),
+                              0, 0, &rx, &ry, &child)) {
+        if (x) *x = rx;
+        if (y) *y = ry;
+    }
+}
+
+void vs_move(void *vs, int x, int y) {
+    VSurf *s = vs;
+    if (!s || !s->dpy) return;
+    XMoveWindow(s->dpy, s->win, x, y);
+    XFlush(s->dpy);
+}
+
+int vs_drag_start(void *vs, int edge, int x_root, int y_root) {
+    VSurf *s = vs;
+    if (!s || !s->dpy) return 0;
+    if (edge < 0 || edge > 8) return 0;
+    Atom mr = XInternAtom(s->dpy, "_NET_WM_MOVERESIZE", True);
+    if (mr == None) return 0;   /* WM does not advertise it */
+
+    /* The button must be released first: the WM takes a fresh grab, and the
+       one this client already holds from the press would fight it. */
+    XUngrabPointer(s->dpy, CurrentTime);
+    XFlush(s->dpy);
+
+    XClientMessageEvent e;
+    memset(&e, 0, sizeof e);
+    e.type = ClientMessage;
+    e.window = s->win;
+    e.message_type = mr;
+    e.format = 32;
+    e.data.l[0] = x_root;
+    e.data.l[1] = y_root;
+    e.data.l[2] = edge;
+    e.data.l[3] = 1;    /* button 1 */
+    e.data.l[4] = 1;    /* source: normal application */
+    XSendEvent(s->dpy, DefaultRootWindow(s->dpy), False,
+               SubstructureRedirectMask | SubstructureNotifyMask, (XEvent *)&e);
+    XFlush(s->dpy);
+    return 1;
 }
 
 void vs_set_min_size(void *vs, int w, int h) {

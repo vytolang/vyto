@@ -1,0 +1,86 @@
+// A window with no system titlebar, drawing and driving its own chrome.
+//
+// Dropping the decorations means dropping what they provided: there is no
+// titlebar to grab and no border to pull, so the app has to offer both. It does
+// that by deciding which region a press landed in and handing the drag back to
+// the window manager with drag_start — which is better than moving the window
+// yourself on every motion event, because the WM applies its own snapping and
+// multi-monitor rules.
+//
+// Run it on a desktop (needs a display):
+//     ./vytoc run examples/114_chromeless.vt
+// Drag the bar to move, pull any edge to resize, click the red box to quit.
+//
+// No .expected on purpose: the harness runs examples without a display, so this
+// one SKIPs there. The headless contract check is tests/ui/97_window_controls.
+import { Surface, Rect, rgb, EDGE,
+         EV_CLOSE, EV_EXPOSE, EV_RESIZE, EV_MOUSE_DOWN } from "vyto/surface";
+
+const BAR: int = 32;   // our own titlebar
+const RIM: int = 6;    // grab margin for the resize edges
+
+fn draw(s: Surface) {
+    let w = s.width() as float;
+    let h = s.height() as float;
+    s.fill(Rect(0.0, 0.0, w, h), rgb(24, 24, 30));
+    s.fill(Rect(0.0, 0.0, w, BAR as float), rgb(50, 50, 64));
+    s.text(12, 21, "chromeless — drag me", rgb(238, 238, 244));
+    s.fill(Rect(w - 24.0, 9.0, 15.0, 15.0), rgb(190, 70, 70));   // close box
+    s.text(12, 56, s.width() + " x " + s.height(), rgb(168, 168, 182));
+    s.text(12, 78, "pull an edge to resize", rgb(140, 140, 155));
+    s.present();
+}
+
+// Which drag the point starts: a resize edge, a move, or nothing.
+// Corners win over sides, and the rim wins over the bar.
+fn grab_at(s: Surface, x: int, y: int): int {
+    let l = x < RIM;
+    let r = x > s.width() - RIM;
+    let t = y < RIM;
+    let b = y > s.height() - RIM;
+    if (t && l) { return EDGE.TOPLEFT as int; }
+    if (t && r) { return EDGE.TOPRIGHT as int; }
+    if (b && l) { return EDGE.BOTTOMLEFT as int; }
+    if (b && r) { return EDGE.BOTTOMRIGHT as int; }
+    if (l) { return EDGE.LEFT as int; }
+    if (r) { return EDGE.RIGHT as int; }
+    if (t) { return EDGE.TOP as int; }
+    if (b) { return EDGE.BOTTOM as int; }
+    if (y < BAR) { return EDGE.MOVE as int; }
+    return -1;
+}
+
+fn main() {
+    let s = new Surface("Chromeless", 360, 210);
+    s.set_decorated(false);
+    s.set_min_size(200, 120);   // the WM still honours this while resizing
+    draw(s);
+
+    let live = true;
+    while (live) {
+        let e = s.wait_timeout(30);
+        if (e == EV_CLOSE) { live = false; }
+        // An undecorated window owns every pixel: the server paints no
+        // background, so an unhandled expose leaves the damaged area showing
+        // whatever was behind the window.
+        else if (e == EV_EXPOSE || e == EV_RESIZE) { draw(s); }
+        else if (e == EV_MOUSE_DOWN) {
+            let x = s.mouse_x();
+            let y = s.mouse_y();
+            if (y < BAR && x > s.width() - 28) {
+                live = false;                       // close box
+                continue;
+            }
+            let g = grab_at(s, x, y);
+            if (g >= 0) {
+                // false means no window manager took it — then a fallback would
+                // move the window by hand on each EV_MOUSE_MOVE instead.
+                if (!s.drag_start(g as EDGE, x, y)) {
+                    print("no WM drag available; would fall back to move_to");
+                }
+            }
+        }
+    }
+    let p = s.position();
+    print("closed at " + p[0] + "," + p[1] + " size " + s.width() + "x" + s.height());
+}

@@ -461,6 +461,29 @@ void vs_set_title(void *s, const char *t) {
      * from the manifest, so this is meaningfully a no-op rather than a gap. */
 }
 
+void vs_set_decorated(void *s, int on) {
+    (void)s; (void)on;
+    /* No window manager: an Android surface fills what the system gives it and
+     * has no frame to drop. A no-op by nature, not an unimplemented arm. */
+}
+
+void vs_get_position(void *s, int *x, int *y) {
+    (void)s;
+    /* The surface is always at the origin of its own window. */
+    if (x) *x = 0;
+    if (y) *y = 0;
+}
+
+void vs_move(void *s, int x, int y) {
+    (void)s; (void)x; (void)y;
+    /* Nothing to move: the system owns placement. */
+}
+
+int vs_drag_start(void *s, int edge, int x_root, int y_root) {
+    (void)s; (void)edge; (void)x_root; (void)y_root;
+    return 0;   /* no WM to hand the drag to */
+}
+
 void vs_set_min_size(void *s, int w, int h) {
     (void)s; (void)w; (void)h;
     /* The surface is the size the system gives it — there is no user-draggable

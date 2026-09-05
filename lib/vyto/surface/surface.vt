@@ -6,6 +6,7 @@
 // renderers, or visualization tools, or let vyto/ui sit on top of it.
 
 import { vs_open, vs_close, vs_width, vs_height, vs_set_title, vs_set_min_size,
+          vs_set_decorated, vs_get_position, vs_move, vs_drag_start,
           vs_fill_rect, vs_draw_rect, vs_draw_line, vs_draw_text, vs_blit, vs_present,
           vs_text_width, vs_font_ascent, vs_font_height,
           vs_wait, vs_poll, vs_wait_timeout, vs_key, vs_text, vs_x, vs_y, vs_wheel,
@@ -21,6 +22,24 @@ extern "C" {
     struct VsRect {
         x: i32; y: i32; w: i32; h: i32;
     }
+}
+
+// Which part of a chromeless window a drag grabs. Values mirror VS_EDGE_* in
+// vsurf.h, which in turn are the _NET_WM_MOVERESIZE numbers.
+//
+// MOVE is the common one: an app that draws its own titlebar calls
+// s.drag_start(EDGE.MOVE, ...) from the mouse-down handler and the window
+// manager takes the drag from there, snapping included.
+export enum EDGE {
+    TOPLEFT = 0,
+    TOP = 1,
+    TOPRIGHT = 2,
+    RIGHT = 3,
+    BOTTOMRIGHT = 4,
+    BOTTOM = 5,
+    BOTTOMLEFT = 6,
+    LEFT = 7,
+    MOVE = 8,
 }
 
 // Event classes returned by Surface.wait(). Values mirror VS_EV_* in
@@ -371,6 +390,55 @@ export class Surface {
     // Ignored where the size is not user-driven (Android, fbdev, headless).
     fn set_min_size(w: int, h: int) {
         vs_set_min_size(this.h, w as i32, h as i32);
+    }
+
+    // Drop the window manager's titlebar and border, for an app that draws its
+    // own chrome. Call it before the first present.
+    //
+    // **An undecorated window has to provide what the decorations did**: with
+    // no titlebar there is nothing to grab, so dragging, resizing and closing
+    // become the app's job — see drag_start below. It also owns every pixel,
+    // since the server paints no background: handle EV_EXPOSE or damaged areas
+    // show whatever was behind the window.
+    //
+    // Ignored where there is no window manager (Android, fbdev, headless).
+    fn set_decorated(on: bool) {
+        let flag = 0;
+        if (on) { flag = 1; }
+        vs_set_decorated(this.h, flag as i32);
+    }
+
+    // Top-left corner in screen coordinates.
+    fn position(): int[] {
+        let px: i32 = 0;
+        let py: i32 = 0;
+        vs_get_position(this.h, &px, &py);
+        return [px as int, py as int];
+    }
+
+    // Move the window's top-left corner to (x, y) on screen.
+    fn move_to(x: int, y: int) { vs_move(this.h, x as i32, y as i32); }
+
+    // Hand an in-progress drag to the window manager: call it from a
+    // mouse-down in your own title area, and the WM moves (or resizes) the
+    // window until the button is released.
+    //
+    //     if (ev == EV_MOUSE_DOWN && s.mouse_y() < 30) {
+    //         s.drag_start(EDGE.MOVE, s.mouse_x(), s.mouse_y());
+    //     }
+    //
+    // Prefer this over moving the window yourself on each motion event: the WM
+    // applies its own snapping, edge-tiling and multi-monitor rules, which a
+    // hand-rolled drag does not get. Returns false when the WM will not take it
+    // (no _NET_WM_MOVERESIZE, or a backend without one) — then fall back to
+    // move_to() on EV_MOUSE_MOVE.
+    //
+    // Coordinates are the pointer position; window-relative is fine, since the
+    // backend translates to root where it needs to.
+    fn drag_start(edge: EDGE, x: int, y: int): bool {
+        let p = this.position();
+        return vs_drag_start(this.h, edge as i32,
+                             (p[0] + x) as i32, (p[1] + y) as i32) as int != 0;
     }
 
     // The X11 backend is integer-only, so every Rect snaps here rather than at

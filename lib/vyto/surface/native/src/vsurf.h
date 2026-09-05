@@ -91,6 +91,48 @@ void vs_set_title(void *s, const char *t);
    size is not user-driven). Values < 1 are ignored. */
 void vs_set_min_size(void *s, int w, int h);
 
+/* Drop the window manager's titlebar and border. A chromeless window is the
+   point of a custom-chrome app — but the WM's move, resize, snap and close all
+   live in the decorations it just gave up, so an undecorated window must
+   provide them itself — that is what vs_drag_start below is for.
+   X11 asks via _MOTIF_WM_HINTS, Win32 swaps WS_OVERLAPPEDWINDOW for WS_POPUP.
+   fbdev, headless and Android have no window manager and ignore it. Call it
+   before the first present. */
+void vs_set_decorated(void *s, int on);
+
+/* Where the window's top-left corner sits on screen, and how to move it.
+   Meaningful for a chromeless window doing its own dragging; also how a future
+   multi-monitor placement API positions a window. */
+void vs_get_position(void *s, int *x, int *y);
+void vs_move(void *s, int x, int y);
+
+/* Hand an in-progress drag to the window manager: the app sees a mouse-down in
+   its own title area and calls this, and the WM takes over until the button is
+   released.
+ *
+ * Preferred over moving the window yourself on every motion event, because the
+ * WM applies its own snapping, edge-tiling and multi-monitor behaviour — a
+ * hand-rolled drag gets none of that and fights the compositor for pacing.
+ * Returns 1 when the WM took it, 0 when it did not (no _NET_WM_MOVERESIZE, or
+ * a backend without one), in which case fall back to vs_move on motion.
+ *
+ * `edge` selects the operation, matching the _NET_WM_MOVERESIZE values:
+ * 0..7 are the eight resize edges (see VS_EDGE_*), 8 is a move. */
+int vs_drag_start(void *s, int edge, int x_root, int y_root);
+
+/* The `edge` values for vs_drag_start, matching _NET_WM_MOVERESIZE. */
+enum {
+    VS_EDGE_TOPLEFT = 0,
+    VS_EDGE_TOP = 1,
+    VS_EDGE_TOPRIGHT = 2,
+    VS_EDGE_RIGHT = 3,
+    VS_EDGE_BOTTOMRIGHT = 4,
+    VS_EDGE_BOTTOM = 5,
+    VS_EDGE_BOTTOMLEFT = 6,
+    VS_EDGE_LEFT = 7,
+    VS_EDGE_MOVE = 8
+};
+
 /* drawing goes to a backbuffer; colors are 0xRRGGBB */
 void vs_fill_rect(void *s, int x, int y, int w, int h, int rgb);
 void vs_draw_rect(void *s, int x, int y, int w, int h, int rgb);
