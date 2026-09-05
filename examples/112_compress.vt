@@ -1,0 +1,101 @@
+// vyto/compress — DEFLATE, zlib and gzip.
+//
+// Three framings of the same compressed stream. They are not interchangeable:
+// a decoder has to be told which one it is reading, and reading gzip data as
+// zlib fails rather than producing nonsense.
+import { gzip_compress, gunzip, zlib_compress, zlib_decompress,
+         deflate_raw, inflate_raw, Deflater, Inflater,
+         FMT_GZIP, zlibVersion } from "vyto/compress";
+import { str_bytes } from "vyto/hash";
+
+fn text_of(b: byte[]): string {
+    return strbytes(b, b.len);
+}
+
+fn main() {
+    print("zlib " + zlibVersion());
+    print("");
+
+    // Something with enough repetition to be worth compressing.
+    let msg = "the quick brown fox jumps over the lazy dog. "
+            + "the quick brown fox jumps over the lazy dog. "
+            + "the quick brown fox jumps over the lazy dog.";
+    let src = str_bytes(msg);
+    print("original: " + str(src.len) + " bytes");
+
+    // ---- the three framings ----
+    //
+    // Raw is smallest because it carries no header and no checksum; gzip is
+    // largest because it carries both plus a length. The difference is fixed
+    // overhead, not compression quality — the deflate stream inside is the same.
+    print("raw deflate:  " + str(deflate_raw(src).len) + " bytes");
+    print("zlib wrapper: " + str(zlib_compress(src).len) + " bytes");
+    print("gzip wrapper: " + str(gzip_compress(src).len) + " bytes");
+    print("");
+
+    // ---- round trip ----
+    let packed = gzip_compress(src);
+    let r = gunzip(packed);
+    if (!r.ok) {
+        print("decompress failed: " + r.err);
+        return;
+    }
+    print("round trip: " + str(r.data.len) + " bytes back");
+    print("identical:  " + str(text_of(r.data) == msg));
+    print("");
+
+    // ---- levels ----
+    //
+    // 0 stores (and so grows, by the framing overhead), 9 works hardest.
+    print("level 0: " + str(gzip_compress(src, 0).len) + " bytes (stored)");
+    print("level 6: " + str(gzip_compress(src, 6).len) + " bytes (default)");
+    print("level 9: " + str(gzip_compress(src, 9).len) + " bytes (smallest)");
+    print("");
+
+    // ---- decompression is checked, compression is not ----
+    //
+    // Compressing cannot fail on valid input, so it returns bytes. Decompressing
+    // is given bytes someone else produced, so it returns a result you check.
+    let junk = str_bytes("this is not a gzip stream");
+    let bad = gunzip(junk);
+    print("garbage refused: " + str(!bad.ok));
+    print("  reason: " + bad.err);
+
+    // Right data, wrong framing — also refused.
+    let mismatched = zlib_decompress(packed);
+    print("wrong framing refused: " + str(!mismatched.ok));
+    print("");
+
+    // ---- a bomb is capped ----
+    //
+    // A megabyte of zeroes compresses to almost nothing. Without a limit that
+    // is a way to make a server allocate far more than it received.
+    let big = bytes(1048576);
+    let bomb = gzip_compress(big);
+    print("1 MiB of zeroes -> " + str(bomb.len) + " bytes");
+    print("refused at limit 1000: " + str(!gunzip(bomb, 1000).ok));
+    print("allowed with no limit: " + str(gunzip(bomb, 0).ok));
+    print("");
+
+    // ---- streaming ----
+    //
+    // For data too big to hold twice. finish() is not a formality: for
+    // decompression it is where the trailer is verified, so a truncated stream
+    // is only caught there.
+    let df = new Deflater(FMT_GZIP, 6);
+    let head = df.push(src);
+    let tail = df.finish();
+    print("streamed: " + str(head.len) + " + " + str(tail.len) + " bytes");
+
+    let inf = new Inflater(FMT_GZIP);
+    let out = inf.push(packed);
+    let rest = inf.finish();
+    print("unstreamed: " + str(out.len + rest.len) + " bytes, ok=" + str(inf.ok()));
+
+    let truncated = bytes(packed.len / 2);
+    for (let i in 0..truncated.len) { truncated[i] = packed[i]; }
+    let inf2 = new Inflater(FMT_GZIP);
+    inf2.push(truncated);
+    inf2.finish();
+    print("truncated stream caught by finish(): " + str(!inf2.ok()));
+}

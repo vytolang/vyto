@@ -122,6 +122,17 @@ else
     echo "FAIL freestanding_image_stub (vyto/media/image's VT_NO_LIBC arm does not build)"
     fail=1
 fi
+# And for vyto/compress, whose vendored zlib is built on an allocator — there is
+# nothing to degrade to, so the wrapper TUs compile to nothing under VT_NO_LIBC
+# and zlib_shim.c's stub arm answers instead. Without that guard, merely
+# importing vyto/compress would break any freestanding build.
+if ./vytoc build tests/fixtures/compress_freestanding.vt --freestanding --cc gcc \
+        -o examples/.vyto-cache/libcompress_fs.a >/dev/null 2>&1; then
+    echo "PASS freestanding_compress_stub"
+else
+    echo "FAIL freestanding_compress_stub (vyto/compress's VT_NO_LIBC arm does not build)"
+    fail=1
+fi
 # vyto/db is pure Vyto and must stay freestanding-safe; its SQLite subpackage is
 # the one part that is not, so db_shim.c carries a VT_NO_LIBC arm that drops the
 # whole library and returns failure sentinels. Both halves are checked because
@@ -260,6 +271,67 @@ if sh lib/vyto/db/sqlite/native/refresh-sqlite.sh --verify >/dev/null 2>&1; then
 else
     echo "FAIL db_vendored_sqlite_unmodified (native/src/sqlite3/ has been edited)"
     fail=1
+fi
+
+# --- vyto/compress: the vendored zlib tree is byte-identical to upstream ---
+# Same reasoning as the SQLite check above. Local changes belong in zlib_shim.c
+# or zlib_config.h, both of which survive a refresh.
+if sh lib/vyto/compress/native/refresh-zlib.sh --verify >/dev/null 2>&1; then
+    echo "PASS compress_vendored_zlib_unmodified"
+else
+    echo "FAIL compress_vendored_zlib_unmodified (native/src/zlib/ has been edited)"
+    fail=1
+fi
+
+# --- vyto/compress: does our gzip interoperate with the system gzip? ---
+#
+# tests/unit/compress_roundtrip.vt proves decompress(compress(x)) == x across
+# 69 assertions, and that is NOT this check. Those compare our encoder against
+# our decoder, which share an implementation — a codec that got the format
+# consistently wrong in both directions would pass every one of them.
+#
+# So this runs both halves against the system gzip, a witness that shares no
+# code with anything in the tree. Writing something gunzip can read proves the
+# encoder; reading what gzip wrote proves the decoder. A codec can fail either
+# one alone, so both directions are checked.
+#
+# Deliberately NOT gated on anything. zlib is vendored (see the check above),
+# so unlike the gfx block below this can never legitimately skip.
+if command -v gzip >/dev/null 2>&1 && command -v gunzip >/dev/null 2>&1; then
+    cref=tests/tmp/compress_ref.bin
+    ./vytoc run tests/fixtures/compress_conformance.vt -- sample "$cref" >/dev/null 2>&1
+    if [ ! -s "$cref" ]; then
+        echo "FAIL compress_conformance (fixture produced no sample)"
+        fail=1
+    else
+        # ours -> theirs
+        ./vytoc run tests/fixtures/compress_conformance.vt -- write tests/tmp/compress_ours.gz >/dev/null 2>&1
+        if gunzip -c tests/tmp/compress_ours.gz > tests/tmp/compress_a.bin 2>/dev/null &&
+           cmp -s "$cref" tests/tmp/compress_a.bin; then
+            echo "PASS compress_conformance_ours_to_gunzip"
+        else
+            echo "FAIL compress_conformance_ours_to_gunzip (system gunzip cannot read our gzip)"
+            fail=1
+        fi
+        # theirs -> ours, at three levels, since the encoder settings differ
+        cfail=0
+        for lv in 1 6 9; do
+            gzip -$lv -c < "$cref" > tests/tmp/compress_theirs.gz 2>/dev/null
+            ./vytoc run tests/fixtures/compress_conformance.vt -- read \
+                tests/tmp/compress_theirs.gz tests/tmp/compress_b.bin >/dev/null 2>&1
+            cmp -s "$cref" tests/tmp/compress_b.bin || cfail=1
+        done
+        if [ "$cfail" -eq 0 ]; then
+            echo "PASS compress_conformance_gzip_to_ours"
+        else
+            echo "FAIL compress_conformance_gzip_to_ours (cannot read what system gzip wrote)"
+            fail=1
+        fi
+    fi
+    rm -f tests/tmp/compress_ref.bin tests/tmp/compress_ours.gz tests/tmp/compress_theirs.gz \
+          tests/tmp/compress_a.bin tests/tmp/compress_b.bin
+else
+    echo "SKIP compress_conformance (no system gzip)"
 fi
 
 # --- stdlib search path: VYTO_HOME lib, stem-collision naming, local shadowing ---

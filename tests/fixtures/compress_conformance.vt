@@ -1,0 +1,83 @@
+// tests/fixtures/compress_conformance.vt — does our gzip interoperate?
+//
+// The round-trip tests in tests/unit/compress_roundtrip.vt prove that
+// decompress(compress(x)) == x. They CANNOT prove that what we call gzip is
+// gzip: they compare our encoder against our decoder, which share an
+// implementation, so a codec that consistently got the format wrong in both
+// directions would pass all 69 of them.
+//
+// So this fixture is driven by the shell (tests/run_tests.sh, the
+// compress_conformance section), which checks it against the SYSTEM gzip —
+// a witness that shares no code with anything here. The same reasoning that
+// makes tests/unit/selftest.vt answerable only by `diff`.
+//
+// Two directions, and both are needed. Writing something gunzip can read
+// proves our encoder; reading what gzip wrote proves our decoder. A codec can
+// fail either half on its own.
+//
+//   argv[0] = "write" <out>      compress stdin-ish sample to <out>
+//   argv[0] = "read"  <in> <out> decompress <in> to <out>
+//
+// The shell does the comparing, because it is the only participant that is not
+// under test.
+import { gzip_compress, gunzip } from "vyto/compress";
+import { file_open } from "vyto/io/file";
+
+// A sample with structure worth compressing plus bytes that are not text, so
+// the check covers more than the ASCII path. Deterministic: the shell compares
+// it byte for byte against what comes back.
+fn sample(): byte[] {
+    let n = 30000;
+    let b = bytes(n);
+    for (let i in 0..n) {
+        if (i % 7 == 0) { b[i] = (i % 256) as byte; }
+        else { b[i] = (97 + (i % 26)) as byte; }
+    }
+    return b;
+}
+
+fn readAll(path: string): byte[] {
+    let f = file_open(path, "rb");
+    if (f == null) { panic("cannot open " + path); }
+    let b = f.readBytes();
+    f.close();
+    return b;
+}
+
+fn writeAll(path: string, b: byte[]) {
+    let f = file_open(path, "wb");
+    if (f == null) { panic("cannot create " + path); }
+    f.writeBytes(b);
+    f.close();
+}
+
+fn main() {
+    let a = args();
+    if (a.len < 2) { panic("usage: compress_conformance write|read <paths>"); }
+
+    if (a[0] == "write") {
+        // Our encoder's output, for the system gunzip to read.
+        writeAll(a[1], gzip_compress(sample()));
+        print("wrote " + a[1]);
+        return;
+    }
+
+    if (a[0] == "read") {
+        if (a.len < 3) { panic("read needs <in> <out>"); }
+        // The system gzip's output, through our decoder.
+        let r = gunzip(readAll(a[1]));
+        if (!r.ok) { panic("gunzip failed: " + r.err); }
+        writeAll(a[2], r.data);
+        print("read " + a[1] + " -> " + str(r.data.len) + " bytes");
+        return;
+    }
+
+    // Emit the reference sample so the shell can compare against it.
+    if (a[0] == "sample") {
+        writeAll(a[1], sample());
+        print("sample " + a[1]);
+        return;
+    }
+
+    panic("unknown mode: " + a[0]);
+}

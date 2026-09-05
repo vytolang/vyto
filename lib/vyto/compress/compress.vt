@@ -1,0 +1,281 @@
+// vyto/compress — DEFLATE, zlib and gzip.
+//
+//     import { gzip_compress, gunzip } from "vyto/compress";
+//
+//     let packed = gzip_compress(data);
+//     let r = gunzip(packed);
+//     if (!r.ok) { print(r.err); return; }
+//     use(r.data);
+//
+// Three framings of the same DEFLATE stream, and they are not interchangeable —
+// a decoder must be told which one it is reading:
+//
+//   RAW    bare DEFLATE, no header, no checksum          RFC 1951
+//   ZLIB   2-byte header, Adler-32 trailer               RFC 1950
+//   GZIP   10-byte header, CRC-32 + length trailer       RFC 1952
+//
+// Backed by zlib 1.3.1, vendored under native/src/zlib/ and compiled from
+// source on every build — see README.md, "Why zlib is vendored". There is no
+// #link, no provisioning step and no per-triple directory, so this package
+// cross-compiles unchanged and its tests can never silently skip.
+//
+// ---- why compressing returns byte[] but decompressing returns a result ----
+//
+// Compression cannot fail on valid input: any byte sequence has a valid
+// encoding, so the only failures are out-of-memory and a bad level, both of
+// which are bugs in the caller rather than facts about the data. Decompression
+// can fail on *every* input, because the bytes are usually untrusted — they
+// came off a socket or out of a file someone else wrote. Making that the
+// caller's problem at the type level is deliberate.
+//
+// Same split as vyto/crypto's AeadResult and vyto/crypto/ecc's EccResult:
+// sealing returns bytes, opening returns a result you have to check.
+//
+// ---- decompression bombs ----
+//
+// A few hundred bytes of gzip can expand to gigabytes. Every decompress entry
+// point therefore takes a `limit` on the output size and refuses to exceed it,
+// checked as the output grows rather than after the fact, so the limit caps
+// what is actually allocated. The default is 256 MiB, which is generous for a
+// document and still bounded. Pass 0 only when the input is trusted.
+
+
+extern "C" {
+    fn vzl_deflate(src: rawptr, n: i32, format: i32, level: i32): rawptr;
+    fn vzl_inflate(src: rawptr, n: i32, format: i32, limit: i32): rawptr;
+    fn vzl_stream_new(compressing: i32, format: i32, level: i32): rawptr;
+    fn vzl_stream_push(s: rawptr, src: rawptr, n: i32): i32;
+    fn vzl_stream_finish(s: rawptr): i32;
+    fn vzl_stream_pending(s: rawptr): i32;
+    fn vzl_stream_take(s: rawptr, dst: rawptr, cap: i32): i32;
+    fn vzl_stream_free(s: rawptr);
+    fn vzl_buf_len(h: rawptr): i32;
+    fn vzl_buf_take(h: rawptr, dst: rawptr, cap: i32): i32;
+    fn vzl_buf_free(h: rawptr);
+    fn vzl_last_error(): cstring;
+    fn vzl_available(): i32;
+    fn vzl_version(): cstring;
+}
+
+// Stream framings. These mirror the VZL_* values in native/src/zlib_shim.h —
+// the shim header owns the numbering and this restates it, the same
+// arrangement vyto/crypto/openssl uses for its OSSL_WANT_* sentinels.
+export const FMT_RAW:  int = 0;
+export const FMT_ZLIB: int = 1;
+export const FMT_GZIP: int = 2;
+
+// Default cap on decompressed output. Generous for a document, bounded enough
+// that a malicious stream cannot exhaust memory before it is noticed.
+//
+// Note the decompress entry points below spell this out as a literal rather
+// than referring to this constant: a default argument must be a literal
+// (src/check.c:868-871). Keep the two in step.
+export const DEFAULT_LIMIT: int = 268435456;   // 256 MiB
+
+// The outcome of a decompression: bytes, or a reason there are none.
+export class CompressResult {
+    ok: bool;
+    data: byte[];
+    err: string;
+
+    fn init(ok: bool, data: byte[], err: string) {
+        this.ok = ok;
+        this.data = data;
+        this.err = err;
+    }
+}
+
+fn failure(err: string): CompressResult {
+    return new CompressResult(false, bytes(0), err);
+}
+
+// Copy a C-owned output buffer into a byte[] and free the handle.
+//
+// The buffer is allocated here and passed down, rather than the shim returning
+// an array, because the shim has no -I to runtime/ and cannot build a VtArray
+// (the constraint lib/vyto/media/image/image.vt:237-239 documents). vzl_buf_take
+// frees the handle even when the copy is short, so no path through this
+// function leaks.
+fn take(h: rawptr): byte[] {
+    if (h == null) { return bytes(0); }
+    let n = vzl_buf_len(h) as int;
+    if (n <= 0) {
+        vzl_buf_free(h);
+        return bytes(0);
+    }
+    let out = bytes(n);
+    vzl_buf_take(h, out as rawptr, n as i32);
+    return out;
+}
+
+fn last_error(): string { return str(vzl_last_error()); }
+
+// ---- one-shot ----------------------------------------------------------
+//
+// The common case. Everything here holds both the input and the output in
+// memory at once; reach for Deflater/Inflater when that is too much.
+
+// Compress with the given framing. `level` is 0 (store) to 9 (smallest);
+// 6 is zlib's default and the usual right answer.
+export fn compress(src: byte[], format: int, level: int = 6): byte[] {
+    if (src == null) { return bytes(0); }
+    let h = vzl_deflate(src as rawptr, src.len as i32, format as i32, level as i32);
+    return take(h);
+}
+
+// Decompress with the given framing. `limit` caps the output in bytes;
+// 0 disables the cap, which is only safe on trusted input.
+export fn decompress(src: byte[], format: int, limit: int = 268435456): CompressResult {
+    if (src == null) { return failure("compress: null input"); }
+    if (src.len == 0) { return failure("compress: empty input"); }
+    let h = vzl_inflate(src as rawptr, src.len as i32, format as i32, limit as i32);
+    if (h == null) { return failure(last_error()); }
+    return new CompressResult(true, take(h), "");
+}
+
+export fn gzip_compress(src: byte[], level: int = 6): byte[] {
+    return compress(src, FMT_GZIP, level);
+}
+
+export fn gunzip(src: byte[], limit: int = 268435456): CompressResult {
+    return decompress(src, FMT_GZIP, limit);
+}
+
+export fn zlib_compress(src: byte[], level: int = 6): byte[] {
+    return compress(src, FMT_ZLIB, level);
+}
+
+export fn zlib_decompress(src: byte[], limit: int = 268435456): CompressResult {
+    return decompress(src, FMT_ZLIB, limit);
+}
+
+export fn deflate_raw(src: byte[], level: int = 6): byte[] {
+    return compress(src, FMT_RAW, level);
+}
+
+export fn inflate_raw(src: byte[], limit: int = 268435456): CompressResult {
+    return decompress(src, FMT_RAW, limit);
+}
+
+// ---- streaming ---------------------------------------------------------
+//
+// For data too large to hold twice, or arriving a chunk at a time. Push as much
+// as you have, collect whatever came out, and finish() when the input ends.
+//
+// finish() is not optional and not a formality: for decompression it is where
+// the trailer is verified, so a truncated stream is only detected there. A
+// caller that stops pushing and never finishes has checked nothing.
+
+fn drain(h: rawptr): byte[] {
+    let n = vzl_stream_pending(h) as int;
+    if (n <= 0) { return bytes(0); }
+    let out = bytes(n);
+    let got = vzl_stream_take(h, out as rawptr, n as i32) as int;
+    if (got == n) { return out; }
+    // Short take: hand back exactly what was copied.
+    let trimmed = bytes(got);
+    for (let i in 0..got) { trimmed[i] = out[i]; }
+    return trimmed;
+}
+
+// Compresses a stream. Construct, push() repeatedly, then finish().
+export class Deflater {
+    handle: rawptr;
+    err: string;
+
+    fn init(format: int, level: int = 6) {
+        this.handle = vzl_stream_new(1, format as i32, level as i32);
+        this.err = "";
+        if (this.handle == null) { this.err = last_error(); }
+    }
+
+    fn ok(): bool { return this.handle != null && this.err == ""; }
+
+    // Feed a chunk. Returns whatever compressed bytes are ready, which is
+    // routinely empty — a deflater buffers until it has enough to emit.
+    fn push(chunk: byte[]): byte[] {
+        if (!this.ok()) { return bytes(0); }
+        if (chunk == null || chunk.len == 0) { return bytes(0); }
+        if (vzl_stream_push(this.handle, chunk as rawptr, chunk.len as i32) as int != 0) {
+            this.err = last_error();
+            return bytes(0);
+        }
+        return drain(this.handle);
+    }
+
+    // Flush and close the stream, returning the last bytes. Check ok()
+    // afterwards: a failure here means the output is incomplete.
+    fn finish(): byte[] {
+        if (!this.ok()) { return bytes(0); }
+        if (vzl_stream_finish(this.handle) as int != 0) {
+            this.err = last_error();
+            return bytes(0);
+        }
+        return drain(this.handle);
+    }
+
+    // Idempotent, and safe to call on a stream that never opened.
+    fn close() {
+        if (this.handle != null) {
+            vzl_stream_free(this.handle);
+            this.handle = null;
+        }
+    }
+
+    deinit { this.close(); }
+}
+
+// Decompresses a stream. Same shape as Deflater, with one difference that
+// matters: finish() verifies the trailer, so it is what catches a truncated
+// or corrupt stream. Not calling it means not checking.
+export class Inflater {
+    handle: rawptr;
+    err: string;
+
+    fn init(format: int) {
+        this.handle = vzl_stream_new(0, format as i32, 0);
+        this.err = "";
+        if (this.handle == null) { this.err = last_error(); }
+    }
+
+    fn ok(): bool { return this.handle != null && this.err == ""; }
+
+    fn push(chunk: byte[]): byte[] {
+        if (!this.ok()) { return bytes(0); }
+        if (chunk == null || chunk.len == 0) { return bytes(0); }
+        if (vzl_stream_push(this.handle, chunk as rawptr, chunk.len as i32) as int != 0) {
+            this.err = last_error();
+            return bytes(0);
+        }
+        return drain(this.handle);
+    }
+
+    fn finish(): byte[] {
+        if (!this.ok()) { return bytes(0); }
+        if (vzl_stream_finish(this.handle) as int != 0) {
+            this.err = last_error();
+            return bytes(0);
+        }
+        return drain(this.handle);
+    }
+
+    fn close() {
+        if (this.handle != null) {
+            vzl_stream_free(this.handle);
+            this.handle = null;
+        }
+    }
+
+    deinit { this.close(); }
+}
+
+// ---- capability --------------------------------------------------------
+
+// False only on a --freestanding build, where zlib is compiled out entirely
+// because it needs an allocator. Surfacing it here is what keeps the rest of
+// this file free of platform conditionals, the same way
+// vyto/media/image's encodeAvailable() does.
+export fn compressAvailable(): bool { return vzl_available() as int != 0; }
+
+// The vendored zlib's version, e.g. "1.3.1".
+export fn zlibVersion(): string { return str(vzl_version()); }

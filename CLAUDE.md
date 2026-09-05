@@ -21,6 +21,7 @@ Every piece of builtin library code must adhere to this goal.
 ```sh
 make                  # builds vytoc + vytobind + vytopack
 make test             # full suite: every examples/NN_*.vt vs its .expected
+make test-dev         # unit tests under tests/unit/ (vyto/dev/test)
 make test-pack        # vytopack: install, manifest, audit, shell-injection
 make test-charts      # lib/vyto/ui/chart.vt
 make test-mobile      # lib/vyto/mobile/android/ui.vt
@@ -28,7 +29,7 @@ make test-win         # cross-build the windows-x64 slice into tests/tmp/win-x64
 make clean-cache      # remove every .vyto-cache in the tree
 ```
 
-**`make test` is not the whole suite.** Four targets are split out of it, so a
+**`make test` is not the whole suite.** Five targets are split out of it, so a
 green `make test` says nothing about what they cover — run the matching one
 after touching its area, and all of them before a release:
 
@@ -37,6 +38,7 @@ after touching its area, and all of them before a release:
 | `test-pack` | 36 checks over `src/vytopack` — install, manifest parsing, `audit`, and the URL/rev/dir rejection cases | shells out to `git` repeatedly. No network: it clones a throwaway repo it creates under `tests/tmp` |
 | `test-charts` | 21 golden cases over `lib/vyto/ui/chart.vt` | leaf package; every entry file compiles its own copy of the ui stack |
 | `test-mobile` | 18 golden cases over `lib/vyto/mobile/android/ui.vt` | same, and the widgets need the headless surface |
+| `test-dev` | unit tests in `tests/unit/` written against `lib/vyto/dev/test` — assertions on values, not a stdout diff | the framework's own selftest is deliberately red, and four fixtures must be *reported* failing, so it needs its own verdict logic |
 | `test-win` | the windows-x64 portable slice | only *stages* into `tests/tmp/win-x64`; runs nothing. Copy it to a Windows box to execute |
 
 `test-pack`'s rejection cases are the ones worth knowing about: they assert the
@@ -276,9 +278,12 @@ and never re-arm one from `render()`.
 blend2d (`vyto/gfx`) and ICU (`vyto/intl`) binaries are **not in git** — they
 are built by `lib/vyto/*/native/build-*.sh`. On a fresh clone the gfx tests
 silently skip rather than fail. `vyto/regex` (pcre2), `vyto/crypto/ecc`
-(micro-ecc) and `vyto/media/image` (stb_image_write) *are* vendored and need
-nothing; each carries a `native/refresh-*.sh --verify` that checks the committed
-tree against its sha256 manifest.
+(micro-ecc), `vyto/media/image` (stb_image_write), `vyto/db/sqlite` (the
+amalgamation) and `vyto/compress` (zlib) *are* vendored and need nothing; each
+carries a `native/refresh-*.sh --verify` that checks the committed tree against
+its sha256 manifest. Only **sqlite's and compress's** are actually invoked by
+`make test` — the other three are documented but manual, so a local edit inside
+their vendored trees goes unnoticed until the next refresh silently reverts it.
 
 That silent skip is exactly why those three are vendored — a must-have module
 whose tests quietly do not run on a fresh clone is worse than one that is

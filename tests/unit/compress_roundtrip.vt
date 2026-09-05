@@ -1,0 +1,243 @@
+// tests/unit/compress_roundtrip.vt — properties of vyto/compress that a
+// stdout golden cannot express.
+//
+// Compressed bytes are not a stable thing to assert on: they change with the
+// zlib version, the level, and the strategy. What IS stable is the round trip —
+// decompress(compress(x)) == x for every x — and that is a property over
+// generated input rather than a fixed vector. Same for the refusals: what
+// matters is that malformed input is rejected, not the exact wording.
+//
+// This is the assertion class the examples suite cannot reach, and the reason
+// vyto/dev/test was built before this package.
+//
+// Format conformance — that our gzip really is gzip — is NOT tested here. It
+// cannot be: this file and the code it tests share an implementation, so
+// agreement between them proves nothing about the format. That check lives in
+// tests/fixtures/compress_conformance.vt, judged by the system gzip.
+import { suite } from "vyto/dev/test";
+import { exitWith } from "vyto/dev/test/exit";
+import { rng } from "vyto/math/random";
+import { compress, decompress, gzip_compress, gunzip,
+         zlib_compress, zlib_decompress, deflate_raw, inflate_raw,
+         Deflater, Inflater,
+         FMT_RAW, FMT_ZLIB, FMT_GZIP } from "vyto/compress";
+
+fn same(a: byte[], b: byte[]): bool {
+    if (a.len != b.len) { return false; }
+    for (let i in 0..a.len) {
+        if (a[i] != b[i]) { return false; }
+    }
+    return true;
+}
+
+fn fmt_name(f: int): string {
+    if (f == FMT_RAW) { return "raw"; }
+    if (f == FMT_ZLIB) { return "zlib"; }
+    return "gzip";
+}
+
+fn main() {
+    let t = suite("compress_roundtrip");
+    let formats: int[] = [FMT_RAW, FMT_ZLIB, FMT_GZIP];
+
+    // ---- the shapes of input that break buffer arithmetic ----------------
+    //
+    // Empty and one-byte inputs are where an off-by-one in the output sizing
+    // shows up. Incompressible data is the case where the output is LARGER
+    // than the input, which a naive "output fits in the input buffer"
+    // assumption gets wrong and which never occurs on text.
+    t.section("edge-case inputs, every framing");
+    for (let f in 0..formats.len) {
+        let fmt = formats[f];
+        let n = fmt_name(fmt);
+
+        let empty = bytes(0);
+        let ce = compress(empty, fmt);
+        let re = decompress(ce, fmt);
+        t.ok(n + "_empty_ok", re.ok);
+        t.eqInt(n + "_empty_len", re.data.len, 0);
+
+        let one = bytes(1);
+        one[0] = 65 as byte;
+        let c1 = compress(one, fmt);
+        let r1 = decompress(c1, fmt);
+        t.ok(n + "_onebyte_ok", r1.ok);
+        t.ok(n + "_onebyte_same", same(r1.data, one));
+
+        // All zeroes: the most compressible input there is.
+        let zeros = bytes(100000);
+        let cz = compress(zeros, fmt);
+        let rz = decompress(cz, fmt);
+        t.ok(n + "_zeros_ok", rz.ok);
+        t.ok(n + "_zeros_same", same(rz.data, zeros));
+        t.ok(n + "_zeros_shrank", cz.len < 1000);
+
+        // Data with NUL bytes throughout — this package returns byte[] rather
+        // than string precisely so these survive.
+        let nuls = bytes(1000);
+        for (let i in 0..1000) { nuls[i] = ((i % 3) * 0) as byte; }
+        nuls[500] = 7 as byte;
+        let cn = compress(nuls, fmt);
+        let rn = decompress(cn, fmt);
+        t.ok(n + "_nuls_ok", rn.ok);
+        t.ok(n + "_nuls_same", same(rn.data, nuls));
+    }
+
+    // ---- incompressible input --------------------------------------------
+    //
+    // Random bytes cannot be compressed, so the output is bigger than the
+    // input. Asserted explicitly because it is the direction buffer-sizing
+    // bugs assume is impossible.
+    t.section("incompressible input grows");
+    let r0 = rng(20260905);
+    let noise = bytes(4096);
+    for (let i in 0..4096) { noise[i] = (r0.nextBelow(256)) as byte; }
+    let cnoise = gzip_compress(noise);
+    t.ok("random_grew", cnoise.len > noise.len);
+    let rnoise = gunzip(cnoise);
+    t.ok("random_ok", rnoise.ok);
+    t.ok("random_same", same(rnoise.data, noise));
+
+    // ---- every level ------------------------------------------------------
+    t.section("levels 0-9 all round-trip");
+    let text = bytes(20000);
+    for (let i in 0..20000) { text[i] = (97 + (i % 26)) as byte; }
+    for (let lv in 0..10) {
+        let c = gzip_compress(text, lv);
+        let r = gunzip(c);
+        t.ok(`level_{lv}_ok`, r.ok);
+        t.ok(`level_{lv}_same`, same(r.data, text));
+    }
+    // Level 0 stores, so it cannot shrink; level 9 must beat level 1 here.
+    t.ok("level0_stores", gzip_compress(text, 0).len > text.len);
+    t.ok("level9_beats_level1", gzip_compress(text, 9).len <= gzip_compress(text, 1).len);
+
+    // ---- randomised round trip, replayable on failure ---------------------
+    //
+    // Seeded so a failing case can be reproduced exactly. Sizes deliberately
+    // straddle the shim's 32 KiB internal chunk so multi-chunk paths are hit.
+    t.section("randomised sizes, seeded");
+    let r = rng(987654321);
+    let failures = 0;
+    for (let trial in 0..40) {
+        let len = r.nextBelow(70000);
+        let src = bytes(len);
+        // Mixed entropy: runs of a repeated byte broken up by random ones, so
+        // neither the literal nor the match path is exercised alone.
+        for (let i in 0..len) {
+            if (r.nextBelow(4) == 0) { src[i] = (r.nextBelow(256)) as byte; }
+            else { src[i] = (65 + (i % 5)) as byte; }
+        }
+        let fmt = formats[r.nextBelow(3)];
+        let packed = compress(src, fmt, r.nextBelow(10));
+        let back = decompress(packed, fmt);
+        if (!back.ok || !same(back.data, src)) { failures = failures + 1; }
+    }
+    t.eqInt("40 random round trips", failures, 0);
+
+    // ---- malformed input is refused, never a panic ------------------------
+    //
+    // The half most likely to be wrong, because these bytes usually come off a
+    // socket. Every case must come back ok=false with a reason, and the process
+    // must survive to print the summary — a panic here would abort the suite
+    // and the runner would catch that as a missing summary line.
+    t.section("malformed input refused");
+    let good = gzip_compress(text);
+
+    let truncated = bytes(good.len / 2);
+    for (let i in 0..truncated.len) { truncated[i] = good[i]; }
+    let rt = gunzip(truncated);
+    t.ok("truncated_refused", !rt.ok);
+    t.ok("truncated_has_reason", rt.err != "");
+
+    // Corrupt the CRC-32 trailer, leaving the stream otherwise intact: the
+    // payload inflates fine and only the checksum catches it.
+    let badcrc = bytes(good.len);
+    for (let i in 0..good.len) { badcrc[i] = good[i]; }
+    badcrc[good.len - 5] = (badcrc[good.len - 5] ^ 0xFF) as byte;
+    let rc = gunzip(badcrc);
+    t.ok("bad_crc_refused", !rc.ok);
+
+    let garbage = bytes(64);
+    for (let i in 0..64) { garbage[i] = (r.nextBelow(256)) as byte; }
+    t.ok("garbage_refused", !gunzip(garbage).ok);
+
+    t.ok("empty_input_refused", !gunzip(bytes(0)).ok);
+
+    // Right bytes, wrong framing: gzip data read as zlib must not be accepted.
+    t.ok("wrong_framing_refused", !zlib_decompress(good).ok);
+
+    // ---- decompression bombs ---------------------------------------------
+    //
+    // 1 MiB of zeroes compresses to almost nothing. With a limit below the
+    // decompressed size it must refuse rather than allocate.
+    t.section("bombs are capped");
+    let big = bytes(1048576);
+    let bomb = gzip_compress(big);
+    t.ok("bomb_is_small", bomb.len < 2000);
+    let capped = gunzip(bomb, 1000);
+    t.ok("bomb_refused_under_limit", !capped.ok);
+    let uncapped = gunzip(bomb, 0);
+    t.ok("bomb_ok_without_limit", uncapped.ok);
+    t.eqInt("bomb_full_size", uncapped.data.len, 1048576);
+
+    // ---- streaming --------------------------------------------------------
+    //
+    // The streaming path must produce byte-identical output to the one-shot
+    // path for the same input, and must survive being fed in awkward chunk
+    // sizes.
+    t.section("streaming matches one-shot");
+    let payload = bytes(50000);
+    for (let i in 0..50000) { payload[i] = (32 + (i % 90)) as byte; }
+
+    let df = new Deflater(FMT_GZIP, 6);
+    let acc = bytes(0);
+    let pos = 0;
+    let chunk = 7000;
+    while (pos < payload.len) {
+        let end = pos + chunk;
+        if (end > payload.len) { end = payload.len; }
+        let piece = bytes(end - pos);
+        for (let i in 0..piece.len) { piece[i] = payload[pos + i]; }
+        let got = df.push(piece);
+        if (got.len > 0) {
+            let merged = bytes(acc.len + got.len);
+            for (let i in 0..acc.len) { merged[i] = acc[i]; }
+            for (let i in 0..got.len) { merged[acc.len + i] = got[i]; }
+            acc = merged;
+        }
+        pos = end;
+    }
+    let tail = df.finish();
+    let full = bytes(acc.len + tail.len);
+    for (let i in 0..acc.len) { full[i] = acc[i]; }
+    for (let i in 0..tail.len) { full[acc.len + i] = tail[i]; }
+    t.ok("stream_deflate_ok", df.ok());
+
+    // The streamed output must be readable by the one-shot decoder.
+    let sr = gunzip(full);
+    t.ok("streamed_output_decodes", sr.ok);
+    t.ok("streamed_output_correct", same(sr.data, payload));
+
+    // And the streaming decoder must read one-shot output.
+    let inf = new Inflater(FMT_GZIP);
+    let oneshot = gzip_compress(payload);
+    let dacc = inf.push(oneshot);
+    let dtail = inf.finish();
+    let dfull = bytes(dacc.len + dtail.len);
+    for (let i in 0..dacc.len) { dfull[i] = dacc[i]; }
+    for (let i in 0..dtail.len) { dfull[dacc.len + i] = dtail[i]; }
+    t.ok("stream_inflate_ok", inf.ok());
+    t.ok("stream_inflate_correct", same(dfull, payload));
+
+    // A truncated stream must be caught by finish(), which is where the
+    // trailer is checked — this is why finish() is not optional.
+    let inf2 = new Inflater(FMT_GZIP);
+    let half = bytes(oneshot.len / 2);
+    for (let i in 0..half.len) { half[i] = oneshot[i]; }
+    inf2.push(half);
+    inf2.finish();
+    t.ok("stream_truncated_caught_by_finish", !inf2.ok());
+
+    exitWith(t.done());
+}
