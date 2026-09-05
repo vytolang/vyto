@@ -1,0 +1,122 @@
+// Signage on one screen, control on another — the kiosk shape.
+//
+//     ./vytoc run apps/multiwindow/kiosk.vt
+//
+// The display window picks a monitor by geometry: surface_monitors() reports
+// every attached screen in the same coordinate space move_to uses, so "put this
+// on screen 2" is size it, move it there, then fullscreen it. With one monitor
+// attached it lands on the primary, which is also what a single-screen test rig
+// gets.
+//
+// Press ESC (or close the control window) to quit — a fullscreen chromeless
+// window has no [x], so it must offer its own way out. Forgetting that on a
+// kiosk means a reboot.
+import { Surface, Rect, rgb, surface_monitors, Monitor,
+         EV_NONE, EV_CLOSE, EV_EXPOSE, EV_RESIZE, EV_MOUSE_DOWN, EV_KEY,
+         KEY_ESC, KEY_SPACE } from "vyto/surface";
+import { Canvas } from "vyto/gfx";
+
+// The screen to put signage on: the last non-primary one, else the primary.
+fn display_monitor(): Monitor {
+    let ms = surface_monitors();
+    let pick = ms[0];
+    for (let m in ms) { if (!m.primary) { pick = m; } }
+    return pick;
+}
+
+fn draw_control(s: Surface, msg_i: int, total: int, mon: Monitor) {
+    let w = s.width() as float;
+    let h = s.height() as float;
+    s.fill(Rect(0.0, 0.0, w, h), rgb(26, 29, 36));
+    s.text(16, 30, "SIGNAGE CONTROL", rgb(138, 148, 166));
+    s.fill(Rect(16.0, 50.0, w - 32.0, 42.0), rgb(61, 220, 151));
+    s.text(60, 76, "NEXT MESSAGE", rgb(12, 20, 16));
+    s.text(16, 118, "showing " + (msg_i + 1) + " of " + total, rgb(232, 236, 244));
+    s.text(16, 142, "display: " + mon.w + "x" + mon.h + " at " + mon.x + "," + mon.y,
+           rgb(150, 158, 174));
+    s.text(16, h as int - 14, "esc quits both", rgb(102, 110, 126));
+    s.present();
+}
+
+fn main() {
+    let messages = [
+        "WELCOME",
+        "NOW SERVING 42",
+        "PLEASE WAIT",
+        "COUNTER 3 OPEN",
+    ];
+    let idx = 0;
+
+    let mon = display_monitor();
+    let control = new Surface("Control", 360, 190);
+    control.set_min_size(300, 170);
+
+    // the signage window: chromeless, sized to its monitor, then fullscreened
+    let show = new Surface("Signage", 640, 400);
+    show.set_decorated(false);
+    show.set_size(mon.w, mon.h);
+    show.move_to(mon.x, mon.y);
+    show.set_fullscreen(true);
+
+    let canvas = new Canvas(show.width(), show.height());
+    canvas.loadFont("lib/vyto/gfx/assets/Inter-Bold.ttf", 200.0);
+
+    draw_control(control, idx, messages.len, mon);
+
+    let live = true;
+    let dirty = true;
+    while (live) {
+        if (dirty) {
+            let w = show.width();
+            let h = show.height();
+            if (w != canvas.width() || h != canvas.height()) { canvas.resize(w, h); }
+            canvas.clear(0xFF0A0C10);
+            let text = messages[idx];
+            // size the message to the screen rather than fixing it, so the same
+            // app reads correctly on a 1080p panel and a 4K one
+            canvas.setFontSize((h as float) * 0.16);
+            let tx = ((w as float) - canvas.textWidth(text)) / 2.0;
+            canvas.text(tx, (h as float) * 0.56, text, 0xFF3DDC97);
+            canvas.flush();
+            show.blitRect(canvas.pixels(), canvas.stride() / 4, 0, 0, w, h, 0, 0);
+            show.present();
+            dirty = false;
+        }
+
+        let ea = control.waitTimeoutFds(40, [show.eventFd()]);
+        while (ea != EV_NONE) {
+            if (ea == EV_CLOSE) { live = false; }
+            else if (ea == EV_EXPOSE || ea == EV_RESIZE) {
+                draw_control(control, idx, messages.len, mon);
+            } else if (ea == EV_MOUSE_DOWN) {
+                let y = control.mouse_y();
+                if (y >= 50 && y <= 92) {
+                    idx = (idx + 1) % messages.len;
+                    dirty = true;
+                    draw_control(control, idx, messages.len, mon);
+                    print("showing: " + messages[idx]);
+                }
+            } else if (ea == EV_KEY) {
+                let k = control.key();
+                if (k == KEY_ESC) { live = false; }
+                else if (k == KEY_SPACE) {
+                    idx = (idx + 1) % messages.len;
+                    dirty = true;
+                    draw_control(control, idx, messages.len, mon);
+                }
+            }
+            ea = control.poll();
+        }
+
+        let eb = show.poll();
+        while (eb != EV_NONE) {
+            if (eb == EV_CLOSE) { live = false; }
+            else if (eb == EV_EXPOSE || eb == EV_RESIZE) { dirty = true; }
+            // the signage window is chromeless and fullscreen: it needs its own
+            // exit, or the only way off the screen is killing the process
+            else if (eb == EV_KEY && show.key() == KEY_ESC) { live = false; }
+            eb = show.poll();
+        }
+    }
+    print("closed");
+}

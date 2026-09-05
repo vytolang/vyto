@@ -621,6 +621,85 @@ void vs_move(void *vs, int x, int y) {
    on the caption (or a border), and it runs its own modal move/resize loop with
    the system's snapping. HTCAPTION is the move case; the rest map to the eight
    edges in the same order as VS_EDGE_*. */
+void vs_set_size(void *vs, int w, int h) {
+    VSurf *s = vs;
+    if (!s || !s->hwnd || w < 1 || h < 1) return;
+    /* The caller means the client area, so grow the request by whatever frame
+       the current style adds — otherwise a decorated window comes out short by
+       the titlebar. */
+    RECT r = { 0, 0, w, h };
+    AdjustWindowRect(&r, (DWORD)GetWindowLongPtr(s->hwnd, GWL_STYLE), FALSE);
+    SetWindowPos(s->hwnd, NULL, 0, 0, r.right - r.left, r.bottom - r.top,
+                 SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+}
+
+int vs_set_fullscreen(void *vs, int on) {
+    VSurf *s = vs;
+    if (!s || !s->hwnd) return 0;
+    if (on) {
+        /* Borderless at the rect of the monitor the window is currently on —
+           the same "which monitor" rule as the X11 arm. */
+        HMONITOR mon = MonitorFromWindow(s->hwnd, MONITOR_DEFAULTTONEAREST);
+        MONITORINFO mi;
+        mi.cbSize = sizeof mi;
+        if (!GetMonitorInfo(mon, &mi)) return 0;
+        SetWindowLongPtr(s->hwnd, GWL_STYLE, WS_POPUP | WS_VISIBLE);
+        SetWindowPos(s->hwnd, HWND_TOP,
+                     mi.rcMonitor.left, mi.rcMonitor.top,
+                     mi.rcMonitor.right - mi.rcMonitor.left,
+                     mi.rcMonitor.bottom - mi.rcMonitor.top,
+                     SWP_FRAMECHANGED);
+    } else {
+        SetWindowLongPtr(s->hwnd, GWL_STYLE, WS_OVERLAPPEDWINDOW | WS_VISIBLE);
+        SetWindowPos(s->hwnd, NULL, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
+    }
+    return 1;
+}
+
+/* EnumDisplayMonitors hands each monitor to a callback, so collect through a
+   small context rather than returning from inside it. */
+typedef struct { VsMonitor *out; int max; int n; } VsMonEnum;
+
+static BOOL CALLBACK vs_mon_cb(HMONITOR mon, HDC dc, LPRECT rc, LPARAM lp) {
+    (void)dc; (void)rc;
+    VsMonEnum *e = (VsMonEnum *)lp;
+    MONITORINFO mi;
+    mi.cbSize = sizeof mi;
+    if (GetMonitorInfo(mon, &mi)) {
+        if (e->n < e->max) {
+            e->out[e->n].x = mi.rcMonitor.left;
+            e->out[e->n].y = mi.rcMonitor.top;
+            e->out[e->n].w = mi.rcMonitor.right - mi.rcMonitor.left;
+            e->out[e->n].h = mi.rcMonitor.bottom - mi.rcMonitor.top;
+            e->out[e->n].primary = (mi.dwFlags & MONITORINFOF_PRIMARY) ? 1 : 0;
+            e->out[e->n].scale_pct = g_scale_pct > 0 ? g_scale_pct : 100;
+        }
+        e->n++;
+    }
+    return TRUE;
+}
+
+int vs_monitors(VsMonitor *out, int max) {
+    VsMonEnum e;
+    e.out = out;
+    e.max = max;
+    e.n = 0;
+    EnumDisplayMonitors(NULL, NULL, vs_mon_cb, (LPARAM)&e);
+    if (e.n == 0) {   /* no monitor reported: describe the virtual screen */
+        e.n = 1;
+        if (max > 0) {
+            out[0].x = 0;
+            out[0].y = 0;
+            out[0].w = GetSystemMetrics(SM_CXSCREEN);
+            out[0].h = GetSystemMetrics(SM_CYSCREEN);
+            out[0].primary = 1;
+            out[0].scale_pct = g_scale_pct > 0 ? g_scale_pct : 100;
+        }
+    }
+    return e.n;
+}
+
 int vs_drag_start(void *vs, int edge, int x_root, int y_root) {
     VSurf *s = vs;
     (void)x_root; (void)y_root;
@@ -958,6 +1037,8 @@ const char *vs_clipboard_get(void *vs) {
 
 #else
 /* ================================================================== X11 */
+
+#include <dlfcn.h>   /* XRandR is dlopen'd, not linked — see vs_monitors */
 
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
@@ -1870,6 +1951,109 @@ void vs_move(void *vs, int x, int y) {
     if (!s || !s->dpy) return;
     XMoveWindow(s->dpy, s->win, x, y);
     XFlush(s->dpy);
+}
+
+void vs_set_size(void *vs, int w, int h) {
+    VSurf *s = vs;
+    if (!s || !s->dpy || w < 1 || h < 1) return;
+    XResizeWindow(s->dpy, s->win, (unsigned)w, (unsigned)h);
+    XFlush(s->dpy);
+}
+
+int vs_set_fullscreen(void *vs, int on) {
+    VSurf *s = vs;
+    if (!s || !s->dpy) return 0;
+    Atom st = XInternAtom(s->dpy, "_NET_WM_STATE", True);
+    Atom fs = XInternAtom(s->dpy, "_NET_WM_STATE_FULLSCREEN", True);
+    if (st == None || fs == None) return 0;   /* WM does not advertise it */
+
+    /* Ask through a client message rather than setting the property directly:
+       the property is the WM's to own once the window is mapped, and only the
+       message is honoured after that. */
+    XClientMessageEvent e;
+    memset(&e, 0, sizeof e);
+    e.type = ClientMessage;
+    e.window = s->win;
+    e.message_type = st;
+    e.format = 32;
+    e.data.l[0] = on ? 1 : 0;   /* _NET_WM_STATE_ADD / _REMOVE */
+    e.data.l[1] = (long)fs;
+    e.data.l[2] = 0;
+    e.data.l[3] = 1;            /* source: normal application */
+    XSendEvent(s->dpy, DefaultRootWindow(s->dpy), False,
+               SubstructureRedirectMask | SubstructureNotifyMask, (XEvent *)&e);
+    XFlush(s->dpy);
+    return 1;
+}
+
+/* XRandR's monitor record. Declared here rather than including Xrandr.h so the
+   header is not a build dependency either — only the first fields are read, and
+   they have been stable since the extension gained XRRGetMonitors in 1.5. */
+typedef struct {
+    unsigned long name;
+    int primary, automatic, noutput;
+    int x, y, width, height;
+    int mwidth, mheight;
+    void *outputs;
+} VsRRMonitor;
+
+int vs_monitors(VsMonitor *out, int max) {
+    if (!out) max = 0;   /* counting call: fill nothing, just report how many */
+    /* Open our own connection: this is a process-level query, and a caller may
+       have no surface yet — placing a window before creating it is the point. */
+    Display *dpy = XOpenDisplay(NULL);
+    if (!dpy) return 0;
+    int scr = DefaultScreen(dpy);
+    int count = 0;
+
+    /* dlopen rather than link: see the header. A machine without XRandR still
+       works, reporting the single screen X can describe without it.
+       The handle is deliberately never dlclosed: Xlib registers per-extension
+       close hooks that live in libXrandr, and XCloseDisplay calls them — unload
+       the library first and that call lands in freed text. Leaking one handle
+       for the process lifetime is the correct trade. */
+    static void *lib;
+    static int tried;
+    if (!tried) { tried = 1; lib = dlopen("libXrandr.so.2", RTLD_LAZY); }
+    if (lib) {
+        VsRRMonitor *(*get_monitors)(Display *, Window, int, int *) =
+            (VsRRMonitor *(*)(Display *, Window, int, int *))
+            dlsym(lib, "XRRGetMonitors");
+        void (*free_monitors)(VsRRMonitor *) =
+            (void (*)(VsRRMonitor *))dlsym(lib, "XRRFreeMonitors");
+        if (get_monitors) {
+            int n = 0;
+            VsRRMonitor *m = get_monitors(dpy, DefaultRootWindow(dpy), 1, &n);
+            if (m && n > 0) {
+                count = n;
+                for (int i = 0; out && i < n && i < max; i++) {
+                    out[i].x = m[i].x;
+                    out[i].y = m[i].y;
+                    out[i].w = m[i].width;
+                    out[i].h = m[i].height;
+                    out[i].primary = m[i].primary ? 1 : 0;
+                    out[i].scale_pct = g_scale_pct > 0 ? g_scale_pct : 100;
+                }
+                if (free_monitors) free_monitors(m);
+                XCloseDisplay(dpy);
+                return count;
+            }
+            if (m && free_monitors) free_monitors(m);
+        }
+    }
+
+    /* No XRandR: the display is one screen as far as we can tell. */
+    count = 1;
+    if (max > 0) {
+        out[0].x = 0;
+        out[0].y = 0;
+        out[0].w = DisplayWidth(dpy, scr);
+        out[0].h = DisplayHeight(dpy, scr);
+        out[0].primary = 1;
+        out[0].scale_pct = g_scale_pct > 0 ? g_scale_pct : 100;
+    }
+    XCloseDisplay(dpy);
+    return count;
 }
 
 int vs_drag_start(void *vs, int edge, int x_root, int y_root) {

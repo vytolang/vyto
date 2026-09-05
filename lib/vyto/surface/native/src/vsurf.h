@@ -120,6 +120,35 @@ void vs_move(void *s, int x, int y);
  * 0..7 are the eight resize edges (see VS_EDGE_*), 8 is a move. */
 int vs_drag_start(void *s, int edge, int x_root, int y_root);
 
+/* Resize the window. Pairs with vs_move for placing a kiosk or signage window:
+   create, size to the target screen, move onto it. Values < 1 are ignored. */
+void vs_set_size(void *s, int w, int h);
+
+/* Fullscreen the window on the monitor it currently occupies (X11 asks the WM
+   via _NET_WM_STATE_FULLSCREEN; Win32 goes borderless at the monitor rect).
+   To choose WHICH monitor, move the window onto it first and then fullscreen —
+   the WM fullscreens where the window is. Returns 1 when the request went out,
+   0 where there is no window manager to ask. */
+int vs_set_fullscreen(void *s, int on);
+
+/* Attached monitors, for placing a window on a chosen screen.
+ *
+ * Fills up to `max` entries and returns how many exist — call with max 0 to
+ * count first. Geometry is in the same coordinate space vs_move uses, so
+ * placing a window at a monitor's x/y puts it on that monitor.
+ *
+ * X11 reads XRandR, loaded with dlopen rather than linked: monitor enumeration
+ * should not put libXrandr on the link line of every GUI program, and a machine
+ * without it still runs — it just reports the one screen it can see. Win32 uses
+ * EnumDisplayMonitors. Backends with no window system report a single monitor
+ * the size of their surface. */
+typedef struct VsMonitor {
+    int x, y, w, h;
+    int primary;     /* 1 for the primary monitor */
+    int scale_pct;   /* UI scale x100, 100 = 96dpi; 0 when unknown */
+} VsMonitor;
+int vs_monitors(VsMonitor *out, int max);
+
 /* The `edge` values for vs_drag_start, matching _NET_WM_MOVERESIZE. */
 enum {
     VS_EDGE_TOPLEFT = 0,

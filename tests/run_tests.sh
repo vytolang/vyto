@@ -1415,7 +1415,8 @@ fi
 
 # --- vyto/surface binding: regenerate with vytobind, golden-check ---
 ./vytobind lib/vyto/surface/native/src/vsurf.h \
-    --lib X11@linux --lib X11@macos --lib gdi32@windows --lib user32@windows \
+    --lib X11@linux --lib dl@linux --lib X11@macos \
+    --lib gdi32@windows --lib user32@windows \
     --filter 'vs_*' --filter 'VS_*' > lib/vyto/surface/vsurf.vt || exit 1
 if diff -u tests/vsurf.vt.expected lib/vyto/surface/vsurf.vt >/dev/null 2>&1; then
     echo "PASS vytobind_vsurf"

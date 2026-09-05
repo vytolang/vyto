@@ -7,6 +7,7 @@
 
 import { vs_open, vs_close, vs_width, vs_height, vs_set_title, vs_set_min_size,
           vs_set_decorated, vs_get_position, vs_move, vs_drag_start,
+          vs_set_size, vs_set_fullscreen, vs_monitors,
           vs_fill_rect, vs_draw_rect, vs_draw_line, vs_draw_text, vs_blit, vs_present,
           vs_text_width, vs_font_ascent, vs_font_height,
           vs_wait, vs_poll, vs_wait_timeout, vs_key, vs_text, vs_x, vs_y, vs_wheel,
@@ -22,6 +23,54 @@ extern "C" {
     struct VsRect {
         x: i32; y: i32; w: i32; h: i32;
     }
+    // mirrors VsMonitor in vsurf.h — the element type vs_monitors fills
+    struct VsMonitor {
+        x: i32; y: i32; w: i32; h: i32;
+        primary: i32; scale_pct: i32;
+    }
+}
+
+// One attached display. Geometry is in the same coordinate space move_to uses,
+// so placing a window at a monitor's x/y puts it on that monitor.
+export class Monitor {
+    x: int; y: int; w: int; h: int;
+    primary: bool;
+    scale: float;      // 1.0 = 96dpi
+    fn init(x: int, y: int, w: int, h: int, primary: bool, scale: float) {
+        this.x = x; this.y = y; this.w = w; this.h = h;
+        this.primary = primary; this.scale = scale;
+    }
+}
+
+// Every attached display, primary included. Never empty: a backend that cannot
+// enumerate reports the one screen it can describe.
+//
+// This is how a kiosk or signage window picks its screen — there is no
+// "open on monitor 2", only geometry:
+//
+//     let ms = surface_monitors();
+//     if (ms.len > 1) {
+//         let m = ms[1];
+//         s.set_size(m.w, m.h);
+//         s.move_to(m.x, m.y);
+//         s.set_fullscreen(true);
+//     }
+export fn surface_monitors(): Monitor[] {
+    let n = vs_monitors(null, 0 as i32) as int;
+    if (n < 1) { return []; }
+    let buf: VsMonitor[] = [];
+    for (let i in 0..n) { buf.push(VsMonitor()); }
+    let got = vs_monitors(buf as rawptr, n as i32) as int;
+    if (got > n) { got = n; }
+    let out: Monitor[] = [];
+    for (let i in 0..got) {
+        let m = buf[i];
+        let sc = (m.scale_pct as float) / 100.0;
+        if (m.scale_pct == 0) { sc = 1.0; }
+        out.push(new Monitor(m.x as int, m.y as int, m.w as int, m.h as int,
+                             m.primary as int != 0, sc));
+    }
+    return out;
 }
 
 // Which part of a chromeless window a drag grabs. Values mirror VS_EDGE_* in
@@ -435,6 +484,19 @@ export class Surface {
     //
     // Coordinates are the pointer position; window-relative is fine, since the
     // backend translates to root where it needs to.
+    // Resize the window. With move_to, this is how a window is placed on a
+    // chosen monitor: size it to that screen, then move it there.
+    fn set_size(w: int, h: int) { vs_set_size(this.h, w as i32, h as i32); }
+
+    // Fullscreen on whichever monitor the window currently occupies — so to
+    // choose the screen, move_to it first. Returns false where there is no
+    // window manager to ask (Android, fbdev, headless).
+    fn set_fullscreen(on: bool): bool {
+        let flag = 0;
+        if (on) { flag = 1; }
+        return vs_set_fullscreen(this.h, flag as i32) as int != 0;
+    }
+
     fn drag_start(edge: EDGE, x: int, y: int): bool {
         let p = this.position();
         return vs_drag_start(this.h, edge as i32,

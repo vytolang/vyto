@@ -479,6 +479,31 @@ void vs_move(void *s, int x, int y) {
     /* Nothing to move: the system owns placement. */
 }
 
+void vs_set_size(void *s, int w, int h) {
+    (void)s; (void)w; (void)h;
+    /* The system sizes the surface; an app does not get to choose. */
+}
+
+int vs_set_fullscreen(void *s, int on) {
+    (void)s; (void)on;
+    /* Immersive mode is a Java-side window-flag decision, not something this
+     * shim can ask for. Report that nothing happened rather than implying it. */
+    return 0;
+}
+
+int vs_monitors(VsMonitor *out, int max) {
+    /* One display, and it is the surface we already have. */
+    if (max > 0) {
+        out[0].x = 0;
+        out[0].y = 0;
+        out[0].w = S.w;
+        out[0].h = S.h;
+        out[0].primary = 1;
+        out[0].scale_pct = (int)(S.density * 100.0f + 0.5f);
+    }
+    return 1;
+}
+
 int vs_drag_start(void *s, int edge, int x_root, int y_root) {
     (void)s; (void)edge; (void)x_root; (void)y_root;
     return 0;   /* no WM to hand the drag to */
