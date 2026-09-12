@@ -60,7 +60,7 @@ import { Logger, logger } from "vyto/util/log";
 // configuration. Both are the container asking for something sysconf and a
 // compile-time constant cannot answer.
 import { file_open, file_exists } from "vyto/io/file";
-import { getenv } from "vyto/os";
+import { getenv, hasEnv } from "vyto/os";
 
 // Plain libc — no shim, nothing to #link. fork/waitpid are the whole pre-fork
 // mechanism; sysconf answers "how many cores".
@@ -1543,17 +1543,46 @@ export class Server {
     // binary to change a port. Only variables that are SET and parse are
     // applied, so this never silently overwrites a deliberate programmatic
     // value with a default.
-    fn fromEnv(): Server {
-        let p = parse_int_or(getenv("PORT"), -1);
+    //
+    // `ov` OVERRIDES the process environment, for an app that reads its own
+    // config file -- a .env -- and wants those values to reach core. Both
+    // spellings are looked up: SERVER_PORT first, then bare PORT, so a sectioned
+    // config file ([server] port = 8080) and a plain `export PORT=8080` land in
+    // the same field. Absent from `ov`, a name falls through to getenv().
+    //
+    // A plain Map, not a config type: core must not depend on a framework's
+    // config loader, and this keeps the dependency pointing the one way.
+    //
+    // The default is null so the no-argument form keeps working unchanged.
+    fn fromEnv(ov: Map<string, string> = null): Server {
+        let p = parse_int_or(this.env_of(ov, "SERVER_PORT", "PORT"), -1);
         if (p >= 0) { this.port = p; }
-        let w = parse_int_or(getenv("WORKERS"), -1);
+        let w = parse_int_or(this.env_of(ov, "SERVER_WORKERS", "WORKERS"), -1);
         if (w > 0) { this.workers = w; }
-        let m = parse_int_or(getenv("MAX_CONNS"), -1);
+        let m = parse_int_or(this.env_of(ov, "SERVER_MAX_CONNS", "MAX_CONNS"), -1);
         if (m > 0) { this.max_conns = m; }
-        let b = parse_int_or(getenv("BACKLOG"), -1);
+        let b = parse_int_or(this.env_of(ov, "SERVER_BACKLOG", "BACKLOG"), -1);
         if (b > 0) { this.backlog = b; }
         return this;
     }
+
+    // `ov` wins over the environment, sectioned name wins over the bare one.
+    // Returns "" when neither holds the name, which parse_int_or turns into the
+    // sentinel the caller already tests for.
+    fn env_of(ov: Map<string, string>, qualified: string, bare: string): string {
+        if (ov != null) {
+            if (ov.has(qualified)) { return ov.get(qualified); }
+            if (ov.has(bare)) { return ov.get(bare); }
+        }
+        if (hasEnv(qualified)) { return getenv(qualified); }
+        return getenv(bare);
+    }
+
+    // Set the port after construction, for a caller that resolves it from
+    // somewhere fromEnv() does not look -- argv, typically. Last writer wins,
+    // so calling it AFTER fromEnv() is how an explicit flag beats the
+    // environment.
+    fn withPort(n: int): Server { this.port = n; return this; }
 
     fn bindHost(h: string): Server { this.host = h; return this; }
     fn withLimits(l: Limits): Server { this.limits = l; return this; }
