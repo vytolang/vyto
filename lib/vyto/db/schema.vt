@@ -41,6 +41,16 @@ export class Column {
     hasDefault: bool;
     refTable: string;
     refCol: string;
+    // The referential actions, verbatim SQL words -- "CASCADE", "SET NULL",
+    // "RESTRICT", "NO ACTION", "SET DEFAULT". Empty means the clause is
+    // omitted and the engine's default (NO ACTION) applies.
+    //
+    // Kept as text rather than an enum because the set is fixed by the SQL
+    // standard, all three engines spell them identically, and introspect.vt's
+    // ForeignKey already reports them as strings -- so a schema read back and
+    // re-emitted round-trips through the same representation.
+    refOnDelete: string;
+    refOnUpdate: string;
     boolDefault: bool;
     hasBoolDefault: bool;
 
@@ -55,6 +65,8 @@ export class Column {
         this.hasDefault = false;
         this.refTable = "";
         this.refCol = "";
+        this.refOnDelete = "";
+        this.refOnUpdate = "";
         this.boolDefault = false;
         this.hasBoolDefault = false;
     }
@@ -121,6 +133,25 @@ export class Column {
         return this;
     }
 
+    // ON DELETE / ON UPDATE for the reference set by references(). Spliced
+    // verbatim, so the caller supplies the SQL words: "CASCADE", "SET NULL",
+    // "RESTRICT", "NO ACTION", "SET DEFAULT". These come from your source
+    // code, exactly like defaultRaw -- do not build one from user input.
+    //
+    // Without a references() they render nothing: an action clause with no
+    // REFERENCES is a syntax error on every engine, and silently emitting one
+    // would turn a caller's mistake into a failed migration rather than a
+    // no-op.
+    builder fn onDelete(action: string) {
+        this.refOnDelete = action;
+        return this;
+    }
+
+    builder fn onUpdate(action: string) {
+        this.refOnUpdate = action;
+        return this;
+    }
+
     // The column's own line inside CREATE TABLE.
     fn definition(d: Dialect): string {
         let sb = new StringBuilder(64);
@@ -143,6 +174,14 @@ export class Column {
         if (this.refTable.len > 0) {
             sb.append(" REFERENCES ").append(d.quoteIdent(this.refTable));
             sb.append("(").append(d.quoteIdent(this.refCol)).append(")");
+            // Only inside this branch: an action clause without a REFERENCES
+            // is a syntax error everywhere.
+            if (this.refOnDelete.len > 0) {
+                sb.append(" ON DELETE ").append(this.refOnDelete);
+            }
+            if (this.refOnUpdate.len > 0) {
+                sb.append(" ON UPDATE ").append(this.refOnUpdate);
+            }
         }
         return sb.toString();
     }
@@ -208,16 +247,34 @@ export class Table {
     cols: Column[];
     indexes: Index[];
     ifNotExistsFlag: bool;
+    // A COMPOSITE primary key, as a table-level constraint. Empty for the
+    // ordinary case, where Column.pkFlag carries a single-column key.
+    pkCols: string[];
 
     fn init(name: string) {
         this.name = name;
         this.cols = [];
         this.indexes = [];
         this.ifNotExistsFlag = false;
+        this.pkCols = [];
     }
 
     builder fn ifNotExists() {
         this.ifNotExistsFlag = true;
+        return this;
+    }
+
+    // PRIMARY KEY (a, b) — the table-level form, which is the only way to
+    // spell a key over more than one column. Column.pkFlag is a bool with no
+    // ordinal, so two columns each calling primaryKey() would emit two
+    // PRIMARY KEY clauses: invalid DDL on all three engines. A join table is
+    // among the most common things a schema declares, so the constraint gets
+    // its own spelling rather than being left to raw SQL.
+    //
+    // Use this OR Column.primaryKey(), never both: the engines reject a table
+    // carrying a column-level and a table-level key at once.
+    builder fn primaryKey(cols: string[]) {
+        this.pkCols = cols;
         return this;
     }
 
@@ -284,6 +341,20 @@ export class Table {
             if (i > 0) { sb.append(", "); }
             sb.append(this.cols[i].definition(d));
             i += 1;
+        }
+        // The composite key is a table-level constraint, so it follows every
+        // column definition. Each name is quoted through quoteIdent, which
+        // panics on anything that is not an identifier -- the same refusal a
+        // column name gets.
+        if (this.pkCols.len > 0) {
+            sb.append(", PRIMARY KEY (");
+            let k = 0;
+            while (k < this.pkCols.len) {
+                if (k > 0) { sb.append(", "); }
+                sb.append(d.quoteIdent(this.pkCols[k]));
+                k += 1;
+            }
+            sb.append(")");
         }
         sb.append(")");
         return sb.toString();

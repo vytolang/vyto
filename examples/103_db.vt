@@ -127,6 +127,35 @@ fn main() {
     check("drop", dropTable("users").ifExists().sql(sqliteDialect()),
           "DROP TABLE IF EXISTS \"users\"");
 
+    // A COMPOSITE primary key is a table-level constraint: Column.pkFlag is a
+    // bool with no ordinal, so two columns each marked primaryKey() would emit
+    // two PRIMARY KEY clauses and no engine accepts that. A join table is the
+    // ordinary case for this.
+    let j = table("post_tags");
+    j.integer("post_id").notNull();
+    j.integer("tag_id").notNull();
+    j.primaryKey(["post_id", "tag_id"]);
+
+    check("composite pk/sqlite", j.statements(sqliteDialect())[0],
+          "CREATE TABLE \"post_tags\" (\"post_id\" INTEGER NOT NULL, \"tag_id\" INTEGER NOT NULL, PRIMARY KEY (\"post_id\", \"tag_id\"))");
+    check("composite pk/postgres", j.statements(pgDialect())[0],
+          "CREATE TABLE \"post_tags\" (\"post_id\" BIGINT NOT NULL, \"tag_id\" BIGINT NOT NULL, PRIMARY KEY (\"post_id\", \"tag_id\"))");
+    check("composite pk/mysql", j.statements(mysqlDialect())[0],
+          "CREATE TABLE `post_tags` (`post_id` BIGINT NOT NULL, `tag_id` BIGINT NOT NULL, PRIMARY KEY (`post_id`, `tag_id`))");
+
+    // A referential action. All three engines spell these identically, so the
+    // words are spliced verbatim -- but the clause renders ONLY when a
+    // references() set a parent, since ON DELETE with no REFERENCES is a
+    // syntax error everywhere.
+    let fk = table("contacts");
+    fk.integer("company_id").references("companies", "id").onDelete("SET NULL");
+    fk.integer("orphan").onDelete("CASCADE");
+
+    check("fk action/sqlite", fk.statements(sqliteDialect())[0],
+          "CREATE TABLE \"contacts\" (\"company_id\" INTEGER REFERENCES \"companies\"(\"id\") ON DELETE SET NULL, \"orphan\" INTEGER)");
+    check("fk action/mysql", fk.statements(mysqlDialect())[0],
+          "CREATE TABLE `contacts` (`company_id` BIGINT REFERENCES `companies`(`id`) ON DELETE SET NULL, `orphan` BIGINT)");
+
     print("");
     print("---- SQLite: values are bound, never interpolated ----");
     let db = new Db(sqliteMemory());
