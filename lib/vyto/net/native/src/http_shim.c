@@ -113,6 +113,32 @@ void http_ipresolve_set(int mode) {
     else                g_ip_resolve = CURL_IPRESOLVE_WHATEVER;
 }
 
+/* An extra CA bundle to trust, for a host whose issuer is not in the system
+   store: a private CA, a corporate root, or a local test server such as
+   Pebble.
+
+   Process-wide for the same reason as g_ip_resolve above -- which trust
+   anchors are usable is a property of the environment the process runs in, and
+   a per-request option would change http_perform's signature, which callers
+   binding these symbols directly depend on.
+
+   Note this ADDS a trust anchor; it does not disable verification. There is
+   deliberately no switch for that: a client that can be told to skip
+   verification is one config mistake away from accepting anyone's
+   certificate. libcurl reads $CURL_CA_BUNDLE only as a COMPILE-TIME default,
+   not at runtime, so an explicit CURLOPT_CAINFO is the only way to do this
+   from inside a program. */
+static char g_ca_file[4096] = {0};
+
+/* path: a PEM bundle to trust instead of the system store, or NULL/"" to go
+   back to the default. Affects requests started after the call. */
+void http_ca_file_set(const char *path) {
+    if (!path || !*path) { g_ca_file[0] = 0; return; }
+    size_t n = strlen(path);
+    if (n >= sizeof g_ca_file) { g_ca_file[0] = 0; return; }
+    memcpy(g_ca_file, path, n + 1);
+}
+
 /* Configure a fresh easy handle to write into `r`. Stashes the header slist in
    r->hl so it outlives the transfer (needed for the multi path) and is freed by
    http_free. */
@@ -128,6 +154,7 @@ static void configure_easy(CURL *curl, const char *method, const char *url,
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(curl, CURLOPT_USERAGENT, "vyto-http/0.1");
     curl_easy_setopt(curl, CURLOPT_IPRESOLVE, g_ip_resolve);
+    if (g_ca_file[0]) curl_easy_setopt(curl, CURLOPT_CAINFO, g_ca_file);
     if (timeout_ms > 0) {
         curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, timeout_ms);
     } else {
@@ -243,6 +270,7 @@ long http_stream(const char *method, const char *url, const char *header_lines,
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(curl, CURLOPT_USERAGENT, "vyto-http/0.1");
     curl_easy_setopt(curl, CURLOPT_IPRESOLVE, g_ip_resolve);
+    if (g_ca_file[0]) curl_easy_setopt(curl, CURLOPT_CAINFO, g_ca_file);
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
     if (timeout_ms > 0) curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, timeout_ms);
 
