@@ -35,6 +35,7 @@ extern "C" {
     fn vfile_remove(path: cstring): i32;
     fn vfile_rename(a: cstring, b: cstring): i32;
     fn vfile_mkdir(path: cstring): i32;
+    fn vfile_dir_readable(path: cstring): i32;
 }
 
 export const SEEK_SET: int = 0;
@@ -305,6 +306,19 @@ export fn bufReader(path: string): BufReader {
 
 export fn file_exists(path: string): bool { return vfile_exists(path.cstr()) as int != 0; }
 export fn file_is_file(path: string): bool { return vfile_is_file(path.cstr()) as int != 0; }
+// True when `path` is a directory this process can actually list.
+//
+// The `listdir` builtin PANICS (exit 101) on a directory it cannot open, and
+// neither `isdir` nor `file_exists` distinguishes that case — both answer true
+// for /root under an unprivileged user. Without this there is no way to ask
+// before calling, so anything walking user-chosen paths dies on the first
+// unreadable directory. Guard every listdir whose path came from outside:
+//
+//     if (!dir_readable(p)) { return; }   // show "permission denied" instead
+//     let entries = listdir(p);
+export fn dir_readable(path: string): bool {
+    return vfile_dir_readable(path.cstr()) as int != 0;
+}
 // Size in bytes, or -1 if the path is missing/unstatable.
 export fn file_size(path: string): int { return vfile_size(path.cstr()) as int; }
 // Modification time as a Unix timestamp (seconds), or -1.

@@ -1753,6 +1753,23 @@ if [ "$got" = "$want" ]; then
 else
     echo "FAIL listdir"; printf '%s\n' "$got"; fail=1
 fi
+# dir_readable: the guard that makes listdir safe on a user-chosen path.
+# listdir PANICS (exit 101) on a directory it cannot open, and isdir/file_exists
+# both answer true for one — so a clean exit here is the property under test,
+# not just the printed lines.
+got=$(./vytoc run tests/fixtures/dir_readable.vt 2>&1)
+code=$?
+if [ $code -ne 0 ]; then
+    echo "FAIL dir_readable (exit $code)"; printf '%s\n' "$got"; fail=1
+elif printf '%s\n' "$got" | grep -q "^tmp: true$" \
+  && printf '%s\n' "$got" | grep -q "^file: false$" \
+  && printf '%s\n' "$got" | grep -q "^missing: false$" \
+  && printf '%s\n' "$got" | grep -q "^survived$"; then
+    echo "PASS dir_readable"
+else
+    echo "FAIL dir_readable"; printf '%s\n' "$got"; fail=1
+fi
+
 got=$(VS_HEADLESS=1 VS_EVENTS=tests/ui/filepicker.events VYTO_PICK_DIR=tests/tmp/pickdir \
       ./vytoc run tests/ui/filepicker.vt 2>&1)
 if [ "$got" = "$(cat tests/ui/filepicker.expected)" ]; then

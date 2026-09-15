@@ -9,6 +9,11 @@
 #include <string.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <dirent.h>
+#endif
 
 void *vfile_open(const char *path, const char *mode) {
     return (void *)fopen(path, mode);
@@ -59,6 +64,41 @@ int vfile_is_file(const char *path) {
     if (stat(path, &st) != 0) return 0;
     return S_ISREG(st.st_mode) ? 1 : 0;
 }
+/* Can this directory actually be listed?
+
+   `isdir` and `file_exists` both answer yes for a directory the process cannot
+   open — /root for an unprivileged user is the standard case — and the
+   `listdir` builtin PANICS (exit 101) rather than returning empty. That leaves
+   no in-language way to check first, which is fatal for anything walking
+   user-chosen paths: one step into an unreadable directory kills the process.
+
+   Opening it is the only honest test. access(R_OK) would lie under ACLs and
+   would race the open that follows; this performs the same syscall the
+   listing will. */
+int vfile_dir_readable(const char *path) {
+#ifdef _WIN32
+    /* No opendir in the MSVC runtime. A directory listing needs the search
+       permission that FindFirstFile exercises, so probe with that. */
+    char pat[1024];
+    WIN32_FIND_DATAA fd;
+    HANDLE h;
+    if (!path) return 0;
+    _snprintf(pat, sizeof pat, "%s\\*", path);
+    pat[sizeof pat - 1] = '\0';
+    h = FindFirstFileA(pat, &fd);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    FindClose(h);
+    return 1;
+#else
+    DIR *d;
+    if (!path) return 0;
+    d = opendir(path);
+    if (!d) return 0;
+    closedir(d);
+    return 1;
+#endif
+}
+
 int vfile_remove(const char *path) { return remove(path); }
 int vfile_rename(const char *a, const char *b) { return rename(a, b); }
 /* The MSVC runtime's mkdir takes no mode — Windows has no POSIX permission
