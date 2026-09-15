@@ -6,6 +6,7 @@ import { Surface, Rect, rgb,
          EV_TIMER, EV_KEY, EV_CLOSE, EV_EXPOSE,
          KEY_UP, KEY_DOWN, KEY_LEFT, KEY_RIGHT, KEY_ESC,
          KEY_SPACE } from "vyto/surface";
+import { Font, interFont } from "vyto/surface/ttf";
 
 // --- constants ---
 const COLS: int = 40;
@@ -29,6 +30,9 @@ const C_OVERLAY_BG: int = 658450;
 const C_OVERLAY_TEXT: int = 15133680;
 const C_OVERLAY_HINT: int = 9213600;
 const C_BORDER: int = 3290950;
+// The score bar's fill. Named because the TTF text drawn on it blends against
+// this exact value — a drifted copy would show as a fringe around the glyphs.
+const C_BAR_BG: int = 987416;   // rgb(15, 17, 24)
 
 struct Point { x: int; y: int; }
 
@@ -135,21 +139,21 @@ class Game {
     }
 }
 
-fn drawGame(s: Surface, g: Game) {
+fn drawGame(s: Surface, g: Game, f: Font) {
     let barH = 40;
 
     // background
     s.fill(Rect((0) as float, (0) as float, (WIN_W) as float, (WIN_H) as float), C_BG);
 
     // score bar
-    s.fill(Rect((0) as float, (0) as float, (WIN_W) as float, (barH) as float), rgb(15, 17, 24));
+    s.fill(Rect((0) as float, (0) as float, (WIN_W) as float, (barH) as float), C_BAR_BG);
     s.line(0, barH, WIN_W, barH, C_BORDER);
 
     let scoreStr = "Score: " + g.score;
     let hiStr = "Best: " + g.highScore;
-    s.text(12, 26, scoreStr, C_SCORE);
-    let hiX = WIN_W - s.text_width(hiStr) - 12;
-    s.text(hiX, 26, hiStr, C_SCORE_LABEL);
+    f.drawOn(s, 12, 26, scoreStr, C_SCORE, C_BAR_BG);
+    let hiX = WIN_W - f.width(hiStr) - 12;
+    f.drawOn(s, hiX, 26, hiStr, C_SCORE_LABEL, C_BAR_BG);
 
     // grid lines (subtle)
     let gridY = barH;
@@ -198,30 +202,33 @@ fn drawGame(s: Surface, g: Game) {
         s.frame(Rect((ox) as float, (oy) as float, (ow) as float, (oh) as float), C_BORDER);
 
         let goStr = "GAME OVER";
-        let goW = s.text_width(goStr);
-        s.text(ox + (ow - goW) / 2, oy + 36, goStr, C_OVERLAY_TEXT);
+        let goW = f.width(goStr);
+        f.drawOn(s, ox + (ow - goW) / 2, oy + 36, goStr, C_OVERLAY_TEXT, C_OVERLAY_BG);
 
         let finalStr = "Score: " + g.score;
-        let finalW = s.text_width(finalStr);
-        s.text(ox + (ow - finalW) / 2, oy + 64, finalStr, C_SCORE);
+        let finalW = f.width(finalStr);
+        f.drawOn(s, ox + (ow - finalW) / 2, oy + 64, finalStr, C_SCORE, C_OVERLAY_BG);
 
         if (g.score >= g.highScore && g.score > 0) {
             let newHi = "New Best!";
-            let newHiW = s.text_width(newHi);
-            s.text(ox + (ow - newHiW) / 2, oy + 86, newHi, C_SNAKE_HEAD);
+            let newHiW = f.width(newHi);
+            f.drawOn(s, ox + (ow - newHiW) / 2, oy + 86, newHi, C_SNAKE_HEAD, C_OVERLAY_BG);
         }
 
         let hint = "Space to restart";
-        let hintW = s.text_width(hint);
-        s.text(ox + (ow - hintW) / 2, oy + 114, hint, C_OVERLAY_HINT);
+        let hintW = f.width(hint);
+        f.drawOn(s, ox + (ow - hintW) / 2, oy + 114, hint, C_OVERLAY_HINT, C_OVERLAY_BG);
     }
 }
 
 fn main() {
     let s = new Surface("Snake", WIN_W, WIN_H);
     let g = new Game();
+    // Built once: the glyph cache lives on the Font, so the 10fps full-redraw
+    // loop below rasterizes each glyph once and blits thereafter.
+    let f = interFont(15.0);
 
-    drawGame(s, g);
+    drawGame(s, g, f);
     s.present();
 
     let running = true;
@@ -230,7 +237,7 @@ fn main() {
 
         if (ev == EV_TIMER) {
             g.tick();
-            drawGame(s, g);
+            drawGame(s, g, f);
             s.present();
         } else if (ev == EV_KEY) {
             let k = s.key();
@@ -248,14 +255,14 @@ fn main() {
                 // Space — restart after game over
                 if (g.gameOver) {
                     g.reset();
-                    drawGame(s, g);
+                    drawGame(s, g, f);
                     s.present();
                 }
             }
         } else if (ev == EV_CLOSE) {
             running = false;
         } else if (ev == EV_EXPOSE) {
-            drawGame(s, g);
+            drawGame(s, g, f);
             s.present();
         }
     }
