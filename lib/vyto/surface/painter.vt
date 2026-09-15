@@ -1,0 +1,503 @@
+// vyto/surface/painter — the drawing target, and the lean-tier implementation.
+//
+// `Painter` is the rendering seam of the bundled UI stack: ~45 virtuals where
+// every rich operation degrades to a lean one on its own, so a widget written
+// against it renders on any backend. `SurfacePainter` is the lean tier — it
+// draws straight to the vyto/surface vector API, with no blend2d and no other
+// native dependency.
+//
+// This lives in vyto/surface rather than vyto/ui because nothing here needs a
+// widget, a theme or a window: it is a Surface delegate plus a virtual base.
+// Keeping it here means a consumer can render through a Painter without
+// pulling in the whole toolkit — which is what lets vyto/gfx's GfxPainter, a
+// headless RecordPainter, and an ANSI-emitting terminal backend all exist as
+// siblings rather than as debtors to vyto/ui.
+//
+// vyto/ui re-exports every name here, so `import { Painter } from "vyto/ui"`
+// keeps resolving exactly as before.
+
+import { Surface, Rect, rgb, with_alpha, mix } from "vyto/surface";
+import { Path } from "vyto/geom/path";
+import { Font, stdFontPath } from "vyto/surface/ttf";
+
+// --------------------------------------------------------------- Painter
+
+// A GfxPainter in vyto/gfx draws through a blend2d Canvas (the rich tier).
+// Widgets only ever see a Painter, so vyto/ui itself never depends on blend2d:
+// apps that want AA rendering pass a GfxPainter, everyone else pays nothing.
+//
+// Font weights the painter can select for a draw call. The lean tier ignores
+// weight (its bitmap font is a single weight); the rich tier maps it to
+// blend2d font slots. Widgets pull the weight of a `type_*` role from the
+// Theme. Values are pinned: the C side documents them as 0/1/2.
+export enum WEIGHT { REG = 0, MED = 1, BOLD = 2 }
+
+export class Painter {
+    virtual fn fill(r: Rect, color: int) { }
+    virtual fn frame(r: Rect, color: int) { }
+    virtual fn line(x0: float, y0: float, x1: float, y1: float, color: int) { }
+    virtual fn text(x: float, y: float, s: string, color: int) { }
+    virtual fn text_in(r: Rect, pad: float, s: string, color: int) { }
+    virtual fn text_width(s: string): float { return 0.0; }
+    virtual fn font_ascent(): float { return 0.0; }
+    virtual fn font_height(): float { return 0.0; }
+
+    // Horizontally-centred / right-aligned text within a rect, vertically
+    // centred. Concrete helpers over the metrics above, so a custom draw()
+    // never open-codes the centering arithmetic.
+    // The baseline y is snapped to a whole device pixel. Everything else the
+    // geometry does is sub-pixel, but a glyph run straddling a pixel row loses
+    // real crispness at body sizes — the stem hinting has nothing to grip — for
+    // no positional gain the eye can use. x stays fractional: horizontal
+    // sub-pixel placement keeps centring exact and costs no sharpness, since
+    // the AA there is along the stroke, not across it.
+    fn baseline_in(r: Rect): float {
+        return (r.center_y(this.font_height()) + this.font_ascent()).round();
+    }
+    fn text_center(r: Rect, s: string, color: int) {
+        this.text(r.center_x(this.text_width(s)), this.baseline_in(r), s, color);
+    }
+    fn text_right(r: Rect, pad: float, s: string, color: int) {
+        this.text(r.right() - pad - this.text_width(s), this.baseline_in(r), s, color);
+    }
+    virtual fn width(): float { return 0.0; }
+    virtual fn height(): float { return 0.0; }
+    virtual fn present() { }
+    // present only the given rect; fallback presents everything. The
+    // dirty-region repaint path calls this instead of present().
+    virtual fn present_rect(r: Rect) { this.present(); }
+    // the window was resized to w x h; painters with their own buffer
+    // (GfxPainter) recreate it here. Called by Window on EV_RESIZE.
+    virtual fn on_resize(w: int, h: int) { }
+    // true when clip_push/clip_pop really clip pixels (the rich tier);
+    // false means callers must clip geometrically (ClippedPainter).
+    virtual fn can_clip(): bool { return false; }
+    // a stroked line with width; the base fakes it with three offset 1px
+    // lines (the historical lean-tier "thick line"), the rich tier draws a
+    // real anti-aliased stroke.
+    virtual fn line_w(x0: float, y0: float, x1: float, y1: float, width: float, color: int) {
+        this.line(x0, y0, x1, y1, color);
+        if (width > 1.0) {
+            this.line(x0 + 1.0, y0, x1 + 1.0, y1, color);
+            this.line(x0, y0 + 1.0, x1, y1 + 1.0, color);
+        }
+    }
+
+    // -- WS3: weight selection for the next text draws -------------------
+    virtual fn set_weight(w: WEIGHT) { }
+
+    // -- type scale: size + weight for the next text draws ---------------
+    // push_font selects a size and weight together; pop_font restores the pair
+    // that was active before it. Every push must be balanced by a pop, and the
+    // pair must bracket measurement as well as drawing — text_width and
+    // font_height both answer for whatever font is active when they are asked.
+    //
+    // The lean tier has one fixed bitmap font it cannot resize, so both are
+    // no-ops there and the scale collapses to a single size. That is the same
+    // graceful degradation as a clip radius: push the role you mean, and let
+    // the tier honor what it can.
+    virtual fn push_font(size: float, weight: WEIGHT) { }
+    virtual fn pop_font() { }
+    // Size text is currently drawn at; 0 when the painter has no notion of one
+    // (the lean tier), so callers must not use it as a scale factor unguarded.
+    virtual fn font_size(): float { return 0.0; }
+
+    // -- WS2: widened paint vocabulary ----------------------------------
+    // Rounded fill/stroke; circle fill; vertical gradient (top→bottom);
+    // soft drop shadow; clip stack. The base class falls back to the plain
+    // primitives so any Painter (incl. a test RecordPainter or the lean
+    // SurfacePainter, which overrides the ones it can do) keeps rendering
+    // correctly, just plainer. Packed colors (0xAARRGGBB) are honored by the
+    // rich tier; the base/lean tiers treat alpha 0 as opaque.
+    virtual fn fill_round(r: Rect, radius: float, color: int) { this.fill(r, color); }
+    virtual fn stroke_round(r: Rect, radius: float, width: float, color: int) { this.frame(r, color); }
+    virtual fn circle(cx: float, cy: float, radius: float, color: int) {
+        this.fill(Rect(cx - radius, cy - radius, radius * 2.0, radius * 2.0), color);
+    }
+    virtual fn stroke_circle(cx: float, cy: float, radius: float, width: float, color: int) {
+        this.frame(Rect(cx - radius, cy - radius, radius * 2.0, radius * 2.0), color);
+    }
+    virtual fn gradient_v(r: Rect, radius: float, top: int, bottom: int) {
+        // base fallback: the mid color (alpha-aware mix against itself)
+        this.fill_round(r, radius, mix(top, bottom, 0.5));
+    }
+    virtual fn shadow(r: Rect, radius: float, blur: float, dy: float, color: int) { }
+    virtual fn clip_push(r: Rect, radius: float) { }
+    virtual fn clip_pop() { }
+
+    // -- materials: blur over what has already been painted ---------------
+    // `blur` softens a region in place. `backdrop` is the frosted material —
+    // it blurs what is behind the region and composites a translucent tint
+    // over it, which is the effect behind sheets, popovers and vibrant bars.
+    // Both need pixels to read back, so both are rich-tier only.
+    //
+    // The base fallback for `backdrop` is a flat fill of the tint at full
+    // opacity. That is deliberately not "the tint as given": a translucent
+    // fill over unblurred content is a smear on a tier that composites alpha
+    // and a wrong solid color on one that does not, whereas the tint's own RGB
+    // is the color the material was designed to read as. A frosted panel
+    // degrades to a plain panel of about the right hue, which is the same
+    // bargain the rest of the vocabulary makes.
+    //
+    // Ask can_blur() when the answer changes the design rather than the
+    // fidelity — a skin that would place light text over a dark blur needs to
+    // know it is getting a pale solid instead.
+    virtual fn can_blur(): bool { return false; }
+    virtual fn blur(r: Rect, radius: float) { }
+    virtual fn backdrop(r: Rect, radius: float, amount: float, tint: int) {
+        this.fill_round(r, radius, with_alpha(tint, 255));
+    }
+
+    // Multi-stop gradient (colors/positions parallel arrays, positions
+    // ascending in [0,1]) — for skins needing more than gradient_v's 2-color
+    // ramp (e.g. a glossy highlight band). Base fallback: mix of the first
+    // and last stop, ignoring intermediate ones — plain but never blank.
+    virtual fn gradient_n(r: Rect, radius: float, colors: i32[], positions: float[]) {
+        if (colors.len == 0) { return; }
+        this.fill_round(r, radius, mix(colors[0] as int, colors[colors.len - 1] as int, 0.5));
+    }
+
+    // Bevel border: a raised (light top/left, dark bottom/right) or sunken
+    // (swapped) 3D edge, for retro OS skins (Windows Luna/Aero). Base
+    // fallback: a plain single-tone stroke (no bevel on the lean tier).
+    virtual fn bevel(r: Rect, radius: float, width: float, light: int, dark: int, raised: bool) {
+        let color = dark;
+        if (raised) { color = light; }
+        this.stroke_round(r, radius, width, color);
+    }
+
+    // Arbitrary filled polygon (xs/ys parallel arrays, same point at index
+    // i) — for icon glyphs a rect/round-rect/circle can't express: stars,
+    // hearts, roofs, speech-bubble tails. Base fallback: the bounding box of
+    // the points, filled flat — a rough but honest stand-in on the lean tier.
+    virtual fn polygon(xs: float[], ys: float[], color: int) {
+        if (xs.len == 0) { return; }
+        let minx = xs[0]; let maxx = xs[0];
+        let miny = ys[0]; let maxy = ys[0];
+        for (let i in 0..xs.len) {
+            if (xs[i] < minx) { minx = xs[i]; }
+            if (xs[i] > maxx) { maxx = xs[i]; }
+            if (ys[i] < miny) { miny = ys[i]; }
+            if (ys[i] > maxy) { maxy = ys[i]; }
+        }
+        this.fill(Rect(minx, miny, maxx - minx, maxy - miny), color);
+    }
+
+    // Partial ring stroke (e.g. a wifi/signal glyph). Degrees, 0 = +x axis,
+    // clockwise. Base fallback: a full circle instead of a partial arc —
+    // plainer, still visibly the right shape family.
+    virtual fn stroke_arc(cx: float, cy: float, rx: float, ry: float,
+                          start_deg: float, sweep_deg: float, width: float, color: int) {
+        this.stroke_circle(cx, cy, (rx + ry) / 2.0, width, color);
+    }
+
+    // Affine transforms — a rich-tier capability. save()/restore() bracket a
+    // transform change; translate/scale/rotate compose onto the current one.
+    // The base/lean tier CANNOT transform its axis-aligned primitives, so it
+    // no-ops them: callers that need rotation/scale must check can_transform()
+    // (or accept that content draws untransformed on the lean tier). rotate is
+    // in degrees. This matches every other WS2 primitive's degrade contract.
+    virtual fn save() { }
+    virtual fn restore() { }
+    virtual fn translate(dx: float, dy: float) { }
+    virtual fn scale(sx: float, sy: float) { }
+    virtual fn rotate(deg: float) { }
+    virtual fn can_transform(): bool { return false; }
+
+    // Centered radial gradient filling a rect (colors/positions parallel,
+    // positions ascending in [0,1]). Base fallback: mix of first/last stop,
+    // like gradient_n — plain but never blank.
+    virtual fn radial_gradient(r: Rect, cx: float, cy: float, radius: float,
+                               colors: i32[], positions: float[]) {
+        if (colors.len == 0) { return; }
+        this.fill_round(r, 0.0, mix(colors[0] as int, colors[colors.len - 1] as int, 0.5));
+    }
+
+    // Fill/stroke an arbitrary vector Path. Base fallback: flatten the curves
+    // to a polygon (vyto/geom/path.vt) and hand it to polygon()/line_w — the
+    // lean tier gets straight-segment approximations of the curves. The rich
+    // tier overrides these to draw crisp anti-aliased paths.
+    virtual fn fill_path(p: Path, color: int) {
+        let fp = p.flatten();
+        this.polygon(fp.xs, fp.ys, color);
+    }
+    virtual fn stroke_path(p: Path, width: float, color: int) {
+        let fp = p.flatten();
+        for (let i in 1..fp.xs.len) {
+            this.line_w(fp.xs[i - 1] as float, fp.ys[i - 1] as float,
+                        fp.xs[i] as float, fp.ys[i] as float, width, color);
+        }
+    }
+
+    // Decoded-image loading is a rich-tier-only capability (needs blend2d);
+    // the base/lean tier can never decode a file, so it returns null rather
+    // than pretending. Widgets that call this must handle a null handle.
+    virtual fn load_image(path: string): rawptr {
+        return null;
+    }
+    // Base fallback: a flat neutral placeholder — visibly "there's an image
+    // here" rather than a blank hole, matching every other WS2 primitive's
+    // graceful-degrade contract. No Theme is available at this layer, so the
+    // color is a fixed neutral gray, not theme-derived.
+    virtual fn draw_image(handle: rawptr, r: Rect) {
+        this.fill(r, rgb(200, 200, 200));
+    }
+    // Release a handle from load_image. Widgets that hold an image call this
+    // from their own `deinit` via `this.win.painter.free_image(...)` — never
+    // straight to vyto/gfx, so display.vt keeps the "vyto/ui doesn't depend
+    // on blend2d" boundary painter.vt exists to enforce. Base: no-op (the
+    // base/lean tier's load_image never returns a real handle to free).
+    virtual fn free_image(handle: rawptr) { }
+
+    // URL-based loading is a rich-tier-only capability (needs vyto/net +
+    // blend2d); the base/lean tier has no network client, so it returns null
+    // — same graceful-degrade contract as load_image. Widgets must handle a
+    // null handle exactly as they already do for load_image's failures.
+    virtual fn load_image_url(url: string): rawptr {
+        return null;
+    }
+}
+
+// Default painter: forwards every call to a vyto/surface Surface. Clipping
+// is real on this tier too now (an X11 GC clip / Win32 region), so
+// clip_push/clip_pop crop pixels — the rounded radius degrades to a
+// rectangular scissor, same as the shim documents.
+// Default text size for the lean tier, in pixels.
+//
+// 14 rather than matching the core font's 15px cell exactly: it is the size the
+// toolkit's own `text_base` role assumes, and every widget sizes itself from
+// font_height()/font_ascent() through the painter, so layouts adapt rather than
+// break. Apps that want the old cell back can pass 12.0, which reproduces the
+// core font's height of 15 to the pixel.
+export const LEAN_FONT_PX: float = 14.0;
+
+export class SurfacePainter extends Painter {
+    surf: Surface;
+    clips: Rect[]; // clip stack; the top (intersected) rect is active
+
+    // --- text ---------------------------------------------------------------
+    //
+    // The lean tier renders text through vyto/surface/ttf: anti-aliased,
+    // proportional, full-Unicode, and still with no native dependency beyond
+    // what Surface already links. The X11 core font underneath Surface.text is
+    // a 1987 path — no AA, no hinting, monospaced, and BMP-only, so a filename
+    // with an emoji in it comes out as '?'.
+    //
+    // Faces are built lazily per (size, weight): a real app touches two or
+    // three combinations, and baking a face's ASCII costs about 2ms, so
+    // building all fifteen up front would be paying for pixels nobody draws.
+    //
+    // `base` is null when no font could be loaded — an installed binary with no
+    // stdlib directory beside it. Every text call then falls back to
+    // Surface.text, which is exactly the behaviour before this existed, so a
+    // missing font degrades the look and nothing else.
+    base: Font;            // the current face; null => Surface.text fallback
+    basePx: float;         // size the painter was built at
+    faces: Font[];         // lazy cache, parallel with faceKey/faceW
+    faceKey: float[];      // size of each cached face
+    faceW: int[];          // WEIGHT of each cached face
+    curW: int;             // weight selected for the next draws
+    // The last fill, remembered as colour AND rect. Glyph edges blend against
+    // bgColor only when the text actually sits inside bgRect; otherwise the
+    // draw falls back to bgBase (the last full-surface fill, i.e. the window
+    // ground). Tracking the rect matters because a widget fills its own
+    // background, then fills a child, then draws its label — without the
+    // containment test the label would blend against the child's colour.
+    bgColor: int;
+    bgRect: Rect;
+    bgBase: int;
+    sizeStack: float[];    // push_font/pop_font
+    weightStack: int[];
+
+    fn init(surf: Surface) {
+        this.initSized(surf, LEAN_FONT_PX);
+    }
+
+    // Build at an explicit size. Pass 12.0 to reproduce the old core-font cell,
+    // or a larger value for a hidpi surface.
+    fn initSized(surf: Surface, px: float) {
+        this.surf = surf;
+        this.clips = [];
+        this.basePx = px;
+        this.faces = [];
+        this.faceKey = [];
+        this.faceW = [];
+        this.curW = 0;
+        this.bgColor = 0;
+        this.bgBase = 0;
+        this.bgRect = Rect(0.0, 0.0, 0.0, 0.0);
+        this.sizeStack = [];
+        this.weightStack = [];
+        this.base = this.face(px, 0);
+    }
+
+    // The face for (px, weight), built and cached on first use. Returns null if
+    // the font could not be loaded at all.
+    fn face(px: float, w: int): Font {
+        for (let i in 0..(this.faces.len)) {
+            if (this.faceKey[i] == px && this.faceW[i] == w) { return this.faces[i]; }
+        }
+        let name = "Inter-Regular.ttf";
+        if (w == 1) { name = "Inter-Medium.ttf"; }
+        else if (w == 2) { name = "Inter-Bold.ttf"; }
+        let f = new Font(stdFontPath(name), px);
+        if (!f.valid()) {
+            // A missing weight falls back to regular rather than blanking the
+            // text — the same trade GfxPainter makes for its font slots.
+            if (w != 0) { return this.face(px, 0); }
+            return null;
+        }
+        this.faces.push(f);
+        this.faceKey.push(px);
+        this.faceW.push(w);
+        return f;
+    }
+
+    override fn can_clip(): bool { return true; }
+
+    // The active clip in surface coordinates, or the whole surface when the
+    // stack is empty. Text goes through blit, which ignores Surface.clip_set
+    // (surface.vt:605-606), so the box has to be handed to ttf explicitly.
+    fn clipBox(): Rect {
+        if (this.clips.len > 0) { return this.clips[this.clips.len - 1]; }
+        return Rect(0.0, 0.0, this.surf.width() as float, this.surf.height() as float);
+    }
+
+    override fn clip_push(r: Rect, radius: float) {
+        let top = r;
+        if (this.clips.len > 0) {
+            // intersect with the current clip so nesting only shrinks
+            let c = this.clips[this.clips.len - 1];
+            let x0 = r.x;
+            if (x0 < c.x) { x0 = c.x; }
+            let y0 = r.y;
+            if (y0 < c.y) { y0 = c.y; }
+            let x1 = r.right();
+            if (x1 > c.right()) { x1 = c.right(); }
+            let y1 = r.bottom();
+            if (y1 > c.bottom()) { y1 = c.bottom(); }
+            if (x1 < x0) { x1 = x0; }
+            if (y1 < y0) { y1 = y0; }
+            top = Rect(x0, y0, x1 - x0, y1 - y0);
+        }
+        this.clips.push(top);
+        this.surf.clip_set(top);
+    }
+
+    override fn clip_pop() {
+        if (this.clips.len == 0) { return; }
+        this.clips.pop();
+        if (this.clips.len > 0) {
+            this.surf.clip_set(this.clips[this.clips.len - 1]);
+        } else {
+            this.surf.clip_clear();
+        }
+    }
+    override fn frame(r: Rect, color: int) { this.surf.frame(r, color); }
+    // The lean tier's Surface API is integer-only; snap here so the widget
+    // code above can stay sub-pixel throughout.
+    override fn line(x0: float, y0: float, x1: float, y1: float, color: int) {
+        this.surf.line(x0 as int, y0 as int, x1 as int, y1 as int, color);
+    }
+    // Glyph edges are blended against `textBg` — ttf composites into a staging
+    // buffer and blits it, and Surface exposes no pixel readback, so the colour
+    // under the text has to be known rather than sampled.
+    //
+    // Tracking the last fill is what makes that work without an API change:
+    // a widget fills its background and then draws its label, which is the
+    // order every Chrome in the toolkit already paints in. `set_text_bg` is
+    // there for the cases that do not — text over an image or a gradient —
+    // where the caller knows better than the last rectangle does.
+    override fn fill(r: Rect, color: int) {
+        this.noteFill(r, color);
+        this.surf.fill(r, color);
+    }
+    override fn fill_round(r: Rect, radius: float, color: int) {
+        this.noteFill(r, color);
+        this.surf.fill(r, color);
+    }
+
+    fn noteFill(r: Rect, color: int) {
+        this.bgColor = color;
+        this.bgRect = r;
+        // A fill covering the whole surface is the window ground: keep it as
+        // the fallback for text drawn outside any later, smaller fill.
+        if (r.w >= this.surf.width() as float && r.h >= this.surf.height() as float) {
+            this.bgBase = color;
+        }
+    }
+
+    // Force the colour the next glyph edges blend against — for text over an
+    // image, a gradient, or anything else no fill recorded.
+    fn set_text_bg(color: int) {
+        this.bgColor = color;
+        this.bgRect = Rect(0.0, 0.0, this.surf.width() as float,
+                           this.surf.height() as float);
+    }
+
+    // Background under a baseline at (x, y).
+    fn bgAt(x: float, y: float): int {
+        let r = this.bgRect;
+        if (x >= r.x && x < r.right() && y >= r.y - this.font_height() && y < r.bottom() + 2.0) {
+            return this.bgColor;
+        }
+        return this.bgBase;
+    }
+
+    override fn text(x: float, y: float, s: string, color: int) {
+        if (this.base == null) {
+            this.surf.text(x as int, y as int, s, color);
+            return;
+        }
+        let c = this.clipBox();
+        this.base.drawOnClipped(this.surf, x as int, y as int, s, color, this.bgAt(x, y),
+                                c.x as int, c.y as int, c.w as int, c.h as int);
+    }
+    override fn text_in(r: Rect, pad: float, s: string, color: int) {
+        // Same vertical centring Surface.text_in uses, against our own ascent.
+        let baseline = r.y + (r.h + this.font_ascent()) / 2.0 - 1.0;
+        this.text(r.x + pad, baseline, s, color);
+    }
+    override fn text_width(s: string): float {
+        if (this.base == null) { return this.surf.text_width(s) as float; }
+        return this.base.width(s) as float;
+    }
+    override fn font_ascent(): float {
+        if (this.base == null) { return this.surf.font_ascent() as float; }
+        return this.base.ascent() as float;
+    }
+    override fn font_height(): float {
+        if (this.base == null) { return this.surf.font_height() as float; }
+        return this.base.height() as float;
+    }
+    override fn font_size(): float { return this.basePx; }
+
+    // --- weight and size selection ------------------------------------------
+
+    override fn set_weight(w: WEIGHT) {
+        let n = w as int;
+        this.curW = n;
+        let f = this.face(this.basePx, n);
+        if (f != null) { this.base = f; }
+    }
+
+    override fn push_font(size: float, weight: WEIGHT) {
+        this.sizeStack.push(this.basePx);
+        this.weightStack.push(this.curW);
+        this.basePx = size;
+        this.set_weight(weight);
+    }
+
+    override fn pop_font() {
+        if (this.sizeStack.len == 0) { return; }
+        this.basePx = this.sizeStack.pop();
+        let w = this.weightStack.pop();
+        this.curW = w;
+        let f = this.face(this.basePx, w);
+        if (f != null) { this.base = f; }
+    }
+    override fn width(): float { return this.surf.width() as float; }
+    override fn height(): float { return this.surf.height() as float; }
+    override fn present() { this.surf.present(); }
+    override fn present_rect(r: Rect) { this.surf.present_rect(r); }
+}

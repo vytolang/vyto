@@ -255,11 +255,25 @@ known triples are a closed table in `src/main.c` (`cross_cc_table`).
 
 ## Architectural seams worth not breaking
 
-**`vyto/ui` must not depend on `vyto/gfx`.** The invariant is stated at
-`lib/vyto/ui/core.vt:709` and currently holds — the only mentions of `vyto/gfx`
-in `lib/vyto/ui` are comments. `Painter` (`ui/core.vt:497`) is the rendering
-seam: ~45 virtuals where every rich operation degrades to a lean one on its
-own. Renderers are swapped at runtime with `win.use_painter(p)`, and no library
+**`vyto/ui` must not depend on `vyto/gfx`.** The invariant is stated in
+`lib/vyto/ui/core.vt` and currently holds — the only mentions of `vyto/gfx`
+in `lib/vyto/ui` are comments.
+
+**The rendering seam lives *below* the toolkit.** `Painter` and the lean-tier
+`SurfacePainter` are in **`lib/vyto/surface/painter.vt`**, not `ui/core.vt`:
+~45 virtuals where every rich operation degrades to a lean one on its own, and
+none of them need a widget, a theme or a window. `vyto/ui/core.vt` imports the
+three names (`Painter`, `SurfacePainter`, `WEIGHT`) and so re-exports them, so
+`import { Painter } from "vyto/ui"` still resolves — a Vyto import *is* a
+re-export, the same trick `vyto/net/http` uses for `url_encode`.
+
+That placement is load-bearing, not tidiness: it is what lets `vyto/gfx`'s
+`GfxPainter` compile with **zero `vyto/ui` modules**, and what makes an
+ANSI-emitting terminal backend (MODULES.md Tier C) possible without the widget
+tree. Adding a widget/theme dependency to `surface/painter.vt` would silently
+re-couple all of it.
+
+Renderers are swapped at runtime with `win.use_painter(p)`, and no library
 constructs one — only app code does.
 
 `Path` comes from `vyto/geom/path`, deliberately: it is the one structured type
