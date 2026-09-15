@@ -1,0 +1,1144 @@
+// vyto/surface/ttf — anti-aliased TrueType text in pure Vyto.
+//
+// Parses a .ttf and scanline-rasterizes its quadratic outlines into an 8-bit
+// coverage arena, then composites glyphs at draw time. No native code, no
+// #link, no C++ — so a `vyto/surface` app keeps its small binary and instant
+// startup while getting proportional, anti-aliased text instead of the X11
+// core font (misc-fixed, 1bpp, no AA) or the fbdev 8x8 table.
+//
+//     import { interFont } from "vyto/surface/ttf";
+//
+//     let f = interFont(15.0);                         // once, not per frame
+//     f.drawOn(s, 12, 26, "Score: 40", 0xC8C8DC, 0x0F1118);
+//     let w = f.width("Score: 40");                    // for centering
+//
+// Two draw forms, because surface apps come in two shapes:
+//
+//   drawOn(surface, ...)  blends against a flat `bg` and blits. For an app
+//                         that draws only with fill/line/text and owns no
+//                         pixel buffer of its own.
+//   draw(dst, stride, ...) composites straight into a caller-owned i32[] —
+//                         a raster3d Framebuffer.color, a chip8 screen — so
+//                         text lands over real pixels, not a flat colour.
+//
+// Conventions that match vyto/surface exactly, so a call site can be swapped
+// one line at a time:
+//
+//   - `y` is the BASELINE, not the top of the cell (the X11 convention that
+//     Surface.text and the fbdev fb_text both follow).
+//   - colours are 0xRRGGBB ints.
+//   - width() counts the same advance run that draw() will lay down.
+//
+// CLIPPING IS EXPLICIT, NOT AMBIENT. `Surface.clip_set` governs
+// fill/frame/line/text but blit ignores it (surface.vt:605-606), and every
+// text path here ends in a blit — so an active clip is invisible to this
+// module. Pass one to `drawClipped` / `drawOnClipped` instead; `draw` and
+// `drawOn` are the same calls with a clip the size of the target.
+//
+// The clip cuts mid-glyph rather than dropping a straddling glyph whole, which
+// is what makes a scroll viewport crop cleanly instead of popping a row in and
+// out. It also pays for itself: a glyph fully outside the box is rejected
+// before its coverage is touched, so a long run clipped to a narrow column
+// measured 4x faster than the same run unclipped.
+//
+// Scope: TrueType `glyf` outlines (simple and composite), cmap formats 4 and
+// 12, horizontal metrics. No hinting, no kerning, no GPOS, no CFF/OpenType
+// PostScript outlines. Inter — vendored at lib/vyto/gfx/assets — is the
+// reference font and parses fully.
+//
+// This module declares no #link of its own, but importing it still links X11
+// on Linux: `drawOn` needs Surface, and vyto/surface/vsurf declares the window
+// system libs. Only the parse+raster half is platform-free. Splitting drawOn
+// into its own file would buy a genuinely surface-free import for a headless
+// consumer (a layout pass, a server-side renderer); not worth it until one
+// exists.
+
+import { File, file_open } from "vyto/io/file";
+import { libDir } from "vyto/os";
+import { Surface, Rect } from "vyto/surface";
+
+// ---- byte reading ---------------------------------------------------------
+//
+// TrueType is big-endian throughout. `byte` is uint8_t (0-255), so these shift
+// and OR with no sign-extension trap — the reason the parser reads byte[] from
+// File.readBytes rather than a string.
+
+fn u8at(d: byte[], p: int): int { return d[p] as int; }
+
+fn u16at(d: byte[], p: int): int {
+    return ((d[p] as int) << 8) | (d[p + 1] as int);
+}
+
+// Signed 16-bit: TrueType stores coordinates and bearings as FWord.
+fn i16at(d: byte[], p: int): int {
+    let v = u16at(d, p);
+    if (v >= 32768) { return v - 65536; }
+    return v;
+}
+
+fn u32at(d: byte[], p: int): int {
+    return ((d[p] as int) << 24) | ((d[p + 1] as int) << 16)
+         | ((d[p + 2] as int) << 8) | (d[p + 3] as int);
+}
+
+// ---- glyph cache ----------------------------------------------------------
+//
+// Bulk-data rule (CLAUDE.md, coltable.c): one contiguous coverage arena with
+// doubling growth, glyphs as offsets into it. A cached glyph is six ints in
+// parallel arrays, never an object — a 95-glyph ASCII set is then 6 arrays and
+// one buffer, not 95 allocations with 95 refcount lifetimes.
+
+class GlyphCache {
+    cov: byte[];        // coverage arena, 0..255 per pixel
+    used: int;          // bytes of `cov` actually occupied
+
+    cp: int[];          // codepoint of each cached glyph
+    off: int[];         // its offset into `cov`
+    gw: int[];          // bitmap width
+    gh: int[];          // bitmap height
+    bx: int[];          // left bearing, pixels from pen to bitmap left
+    by: int[];          // top bearing, pixels from baseline UP to bitmap top
+    adv: int[];         // horizontal advance in pixels
+
+    // Direct index for ASCII 32..126, the hot path: -1 when not yet baked.
+    // Everything else falls back to a linear scan of `cp`, which stays short
+    // because a HUD draws a handful of non-ASCII glyphs at most.
+    ascii: int[];
+
+    fn init() {
+        this.cov = [];
+        this.used = 0;
+        this.cp = [];
+        this.off = [];
+        this.gw = [];
+        this.gh = [];
+        this.bx = [];
+        this.by = [];
+        this.adv = [];
+        this.ascii = [];
+        this.ascii.reserve(95);
+        for (let i in 0..95) { this.ascii.push(-1); }
+    }
+
+    fn find(codepoint: int): int {
+        if (codepoint >= 32 && codepoint < 127) {
+            return this.ascii[codepoint - 32];
+        }
+        for (let i in 0..(this.cp.len)) {
+            if (this.cp[i] == codepoint) { return i; }
+        }
+        return -1;
+    }
+
+    // Reserve `n` bytes at the arena's end, growing by doubling. Returns the
+    // offset. The arena only ever grows: a glyph baked once stays baked for
+    // the Font's life, which is what keeps a 10fps full-redraw loop free of
+    // per-frame rasterization.
+    fn alloc(n: int): int {
+        let at = this.used;
+        let need = this.used + n;
+        if (need > this.cov.len) {
+            let cap = this.cov.len;
+            if (cap < 4096) { cap = 4096; }
+            while (cap < need) { cap = cap * 2; }
+            this.cov.reserve(cap);
+            while (this.cov.len < cap) { this.cov.push(0 as byte); }
+        }
+        // Zero the slice: alloc hands out a blank bitmap the rasterizer
+        // accumulates into, and a reused arena would otherwise carry ghosts.
+        for (let i in at..need) { this.cov[i] = 0 as byte; }
+        this.used = need;
+        return at;
+    }
+
+    fn add(codepoint: int, offset: int, w: int, h: int,
+           bearingX: int, bearingY: int, advance: int): int {
+        let idx = this.cp.len;
+        this.cp.push(codepoint);
+        this.off.push(offset);
+        this.gw.push(w);
+        this.gh.push(h);
+        this.bx.push(bearingX);
+        this.by.push(bearingY);
+        this.adv.push(advance);
+        if (codepoint >= 32 && codepoint < 127) {
+            this.ascii[codepoint - 32] = idx;
+        }
+        return idx;
+    }
+}
+
+// ---- outline accumulation -------------------------------------------------
+//
+// A glyph's contours are flattened to line segments in pixel space, then
+// filled by scanline. Points live in flat parallel arrays rather than a Point
+// class for the same reason the cache does: a composite glyph can run to
+// hundreds of points and none of them outlive the rasterization.
+
+class Outline {
+    xs: float[];
+    ys: float[];
+    // Index one past the last point of each contour, so contour c spans
+    // [ends[c-1], ends[c]). Closing a contour means joining back to its start.
+    ends: int[];
+
+    fn init() {
+        this.xs = [];
+        this.ys = [];
+        this.ends = [];
+    }
+
+    fn moveTo(x: float, y: float) {
+        this.xs.push(x);
+        this.ys.push(y);
+    }
+
+    // Flatten a quadratic Bezier from the current point through control
+    // (cx, cy) to (x, y). Segment count scales with the control polygon's
+    // extent so a big glyph at a big size stays smooth without spending
+    // segments on a 10px one.
+    fn quadTo(cx: float, cy: float, x: float, y: float) {
+        let n = this.xs.len;
+        if (n == 0) { this.moveTo(x, y); return; }
+        let x0 = this.xs[n - 1];
+        let y0 = this.ys[n - 1];
+
+        let dx = absf(cx - x0) + absf(x - cx);
+        let dy = absf(cy - y0) + absf(y - cy);
+        let steps = ((dx + dy) * 0.4) as int;
+        if (steps < 3) { steps = 3; }
+        if (steps > 32) { steps = 32; }
+
+        for (let i in 1..(steps + 1)) {
+            let t = (i as float) / (steps as float);
+            let mt = 1.0 - t;
+            let a = mt * mt;
+            let b = 2.0 * mt * t;
+            let c = t * t;
+            this.xs.push(a * x0 + b * cx + c * x);
+            this.ys.push(a * y0 + b * cy + c * y);
+        }
+    }
+
+    fn lineTo(x: float, y: float) {
+        this.xs.push(x);
+        this.ys.push(y);
+    }
+
+    fn closeContour() {
+        this.ends.push(this.xs.len);
+    }
+}
+
+fn absf(v: float): float {
+    if (v < 0.0) { return 0.0 - v; }
+    return v;
+}
+
+// ---- Font -----------------------------------------------------------------
+
+export class Font {
+    data: byte[];       // the whole .ttf, kept: glyf is read lazily per glyph
+    px: float;          // requested pixel size (em size)
+    scale: float;       // font units -> pixels
+
+    // table offsets, -1 when absent
+    tGlyf: int;
+    tLoca: int;
+    tHmtx: int;
+    tCmap: int;
+
+    unitsPerEm: int;
+    longLoca: bool;     // head.indexToLocFormat: 0 = u16 halves, 1 = u32
+    numGlyphs: int;
+    numHMetrics: int;
+
+    asc: int;           // ascent in pixels, from hhea
+    desc: int;          // descent in pixels (positive)
+    lineGap: int;
+
+    cmapFmt: int;       // 4 or 12; 0 when no usable subtable was found
+    cmapOff: int;
+
+    cache: GlyphCache;
+    scratch: i32[];     // reused drawOn staging buffer (capacity kept, like
+                        // StringBuilder.clear) so a redraw loop allocates none
+
+    ok: bool;           // false when the file did not parse; draws become no-ops
+
+    fn init(path: string, pixelSize: float) {
+        this.px = pixelSize;
+        this.cache = new GlyphCache();
+        this.scratch = [];
+        this.ok = false;
+        this.tGlyf = -1;
+        this.tLoca = -1;
+        this.tHmtx = -1;
+        this.tCmap = -1;
+        this.unitsPerEm = 1000;
+        this.longLoca = false;
+        this.numGlyphs = 0;
+        this.numHMetrics = 0;
+        this.asc = 0;
+        this.desc = 0;
+        this.lineGap = 0;
+        this.cmapFmt = 0;
+        this.cmapOff = 0;
+        this.scale = 0.0;
+        this.data = [];
+
+        let f = file_open(path, "rb");
+        if (f == null) { return; }
+        this.data = f.readBytes();
+        f.close();
+        if (this.data.len < 12) { return; }
+        this.parse();
+    }
+
+    // ---- table directory --------------------------------------------------
+
+    fn parse() {
+        let d = this.data;
+        // sfnt version: 0x00010000 (TrueType) or "true". OpenType/CFF ("OTTO")
+        // has no glyf table and is out of scope — bail rather than mis-parse.
+        let tag = u32at(d, 0);
+        if (tag != 0x00010000 && tag != 0x74727565) { return; }
+
+        let numTables = u16at(d, 4);
+        let tHead = -1;
+        let tHhea = -1;
+        let tMaxp = -1;
+
+        for (let i in 0..numTables) {
+            let rec = 12 + i * 16;
+            if (rec + 16 > d.len) { return; }
+            let t = u32at(d, rec);
+            let off = u32at(d, rec + 8);
+            if (off < 0 || off >= d.len) { continue; }
+            if (t == 0x68656164) { tHead = off; }          // head
+            else if (t == 0x68686561) { tHhea = off; }     // hhea
+            else if (t == 0x6D617870) { tMaxp = off; }     // maxp
+            else if (t == 0x676C7966) { this.tGlyf = off; }// glyf
+            else if (t == 0x6C6F6361) { this.tLoca = off; }// loca
+            else if (t == 0x686D7478) { this.tHmtx = off; }// hmtx
+            else if (t == 0x636D6170) { this.tCmap = off; }// cmap
+        }
+
+        if (tHead < 0 || tHhea < 0 || tMaxp < 0) { return; }
+        if (this.tGlyf < 0 || this.tLoca < 0 || this.tCmap < 0) { return; }
+
+        this.unitsPerEm = u16at(d, tHead + 18);
+        if (this.unitsPerEm <= 0) { return; }
+        this.longLoca = u16at(d, tHead + 50) != 0;
+
+        this.numGlyphs = u16at(d, tMaxp + 4);
+        this.numHMetrics = u16at(d, tHhea + 34);
+
+        this.scale = this.px / (this.unitsPerEm as float);
+
+        // hhea ascender/descender are FWords; descender is negative in the
+        // file and stored positive here, matching Surface.font_ascent's sense.
+        this.asc = roundf((i16at(d, tHhea + 4) as float) * this.scale);
+        this.desc = roundf(0.0 - (i16at(d, tHhea + 6) as float) * this.scale);
+        this.lineGap = roundf((i16at(d, tHhea + 8) as float) * this.scale);
+
+        this.selectCmap();
+        if (this.cmapFmt == 0) { return; }
+        this.ok = true;
+    }
+
+    // Prefer a full-Unicode format 12 subtable, else BMP format 4. Windows
+    // (platform 3) encodings 1 and 10 are the ones fonts actually ship;
+    // platform 0 (Unicode) is accepted as a fallback.
+    fn selectCmap() {
+        let d = this.data;
+        let base = this.tCmap;
+        if (base + 4 > d.len) { return; }
+        let n = u16at(d, base + 2);
+
+        let best4 = -1;
+        let best12 = -1;
+        for (let i in 0..n) {
+            let rec = base + 4 + i * 8;
+            if (rec + 8 > d.len) { break; }
+            let plat = u16at(d, rec);
+            let enc = u16at(d, rec + 2);
+            let sub = base + u32at(d, rec + 4);
+            if (sub < 0 || sub + 2 > d.len) { continue; }
+            let fmt = u16at(d, sub);
+
+            let usable = (plat == 3 && (enc == 1 || enc == 10)) || plat == 0;
+            if (!usable) { continue; }
+            if (fmt == 12 && best12 < 0) { best12 = sub; }
+            else if (fmt == 4 && best4 < 0) { best4 = sub; }
+        }
+
+        if (best12 >= 0) { this.cmapFmt = 12; this.cmapOff = best12; return; }
+        if (best4 >= 0) { this.cmapFmt = 4; this.cmapOff = best4; return; }
+    }
+
+    // ---- codepoint -> glyph id --------------------------------------------
+
+    fn glyphId(cp: int): int {
+        if (this.cmapFmt == 12) { return this.cmap12(cp); }
+        if (this.cmapFmt == 4) { return this.cmap4(cp); }
+        return 0;
+    }
+
+    fn cmap12(cp: int): int {
+        let d = this.data;
+        let base = this.cmapOff;
+        let nGroups = u32at(d, base + 12);
+        // Groups are sorted by start code, so binary search.
+        let lo = 0;
+        let hi = nGroups - 1;
+        while (lo <= hi) {
+            let mid = (lo + hi) / 2;
+            let g = base + 16 + mid * 12;
+            if (g + 12 > d.len) { return 0; }
+            let start = u32at(d, g);
+            let end = u32at(d, g + 4);
+            if (cp < start) { hi = mid - 1; }
+            else if (cp > end) { lo = mid + 1; }
+            else { return u32at(d, g + 8) + (cp - start); }
+        }
+        return 0;
+    }
+
+    fn cmap4(cp: int): int {
+        if (cp > 0xFFFF) { return 0; }
+        let d = this.data;
+        let base = this.cmapOff;
+        let segX2 = u16at(d, base + 6);
+        if (segX2 <= 0) { return 0; }
+        let segs = segX2 / 2;
+
+        let endBase = base + 14;
+        let startBase = endBase + segX2 + 2;      // +2 skips reservedPad
+        let deltaBase = startBase + segX2;
+        let rangeBase = deltaBase + segX2;
+
+        // Find the first segment whose end code is >= cp. Segments are sorted
+        // and the last one always ends at 0xFFFF, so a linear scan terminates;
+        // binary search because a big font has hundreds of segments.
+        let lo = 0;
+        let hi = segs - 1;
+        let seg = -1;
+        while (lo <= hi) {
+            let mid = (lo + hi) / 2;
+            if (endBase + mid * 2 + 2 > d.len) { return 0; }
+            if (u16at(d, endBase + mid * 2) >= cp) { seg = mid; hi = mid - 1; }
+            else { lo = mid + 1; }
+        }
+        if (seg < 0) { return 0; }
+
+        let start = u16at(d, startBase + seg * 2);
+        if (cp < start) { return 0; }
+
+        let ro = u16at(d, rangeBase + seg * 2);
+        let delta = u16at(d, deltaBase + seg * 2);
+
+        if (ro == 0) { return (cp + delta) & 0xFFFF; }
+
+        // idRangeOffset is a byte offset from its own slot into glyphIdArray.
+        let gp = rangeBase + seg * 2 + ro + (cp - start) * 2;
+        if (gp + 2 > d.len) { return 0; }
+        let g = u16at(d, gp);
+        if (g == 0) { return 0; }
+        return (g + delta) & 0xFFFF;
+    }
+
+    // ---- glyf access ------------------------------------------------------
+
+    // Byte range of glyph `gid` inside glyf, or (-1, -1) when the glyph is
+    // empty (loca[gid] == loca[gid+1], as for a space).
+    fn locaRange(gid: int): int[] {
+        let d = this.data;
+        let out: int[] = [];
+        if (gid < 0 || gid >= this.numGlyphs) { out.push(-1); out.push(-1); return out; }
+        let a = 0;
+        let b = 0;
+        if (this.longLoca) {
+            let p = this.tLoca + gid * 4;
+            if (p + 8 > d.len) { out.push(-1); out.push(-1); return out; }
+            a = u32at(d, p);
+            b = u32at(d, p + 4);
+        } else {
+            let p = this.tLoca + gid * 2;
+            if (p + 4 > d.len) { out.push(-1); out.push(-1); return out; }
+            a = u16at(d, p) * 2;
+            b = u16at(d, p + 2) * 2;
+        }
+        if (b <= a) { out.push(-1); out.push(-1); return out; }
+        out.push(this.tGlyf + a);
+        out.push(this.tGlyf + b);
+        return out;
+    }
+
+    // Advance width in font units. hmtx stores numHMetrics full entries then
+    // one lsb per remaining glyph, so a monospaced tail reuses the last width.
+    fn advanceUnits(gid: int): int {
+        let d = this.data;
+        if (this.tHmtx < 0 || this.numHMetrics <= 0) { return 0; }
+        let i = gid;
+        if (i >= this.numHMetrics) { i = this.numHMetrics - 1; }
+        let p = this.tHmtx + i * 4;
+        if (p + 2 > d.len) { return 0; }
+        return u16at(d, p);
+    }
+
+    // Append glyph `gid`'s contours to `o`, offset by (dx, dy) in font units
+    // and scaled to pixels. `depth` guards against a cyclic composite.
+    fn appendGlyph(o: Outline, gid: int, dx: float, dy: float, depth: int) {
+        if (depth > 5) { return; }
+        let r = this.locaRange(gid);
+        if (r[0] < 0) { return; }
+        let d = this.data;
+        let g = r[0];
+        if (g + 10 > d.len) { return; }
+        let nContours = i16at(d, g);
+        if (nContours >= 0) { this.simpleGlyph(o, g, nContours, dx, dy); }
+        else { this.compositeGlyph(o, g, dx, dy, depth); }
+    }
+
+    fn simpleGlyph(o: Outline, g: int, nContours: int, dx: float, dy: float) {
+        let d = this.data;
+        let p = g + 10;
+        if (nContours == 0) { return; }
+
+        let endPts: int[] = [];
+        endPts.reserve(nContours);
+        for (let i in 0..nContours) {
+            if (p + 2 > d.len) { return; }
+            endPts.push(u16at(d, p));
+            p += 2;
+        }
+        let nPts = endPts[nContours - 1] + 1;
+        if (nPts <= 0) { return; }
+
+        // skip instructions
+        if (p + 2 > d.len) { return; }
+        let nIns = u16at(d, p);
+        p += 2 + nIns;
+
+        // flags, run-length encoded via the REPEAT bit
+        let flags: int[] = [];
+        flags.reserve(nPts);
+        while (flags.len < nPts) {
+            if (p >= d.len) { return; }
+            let fl = u8at(d, p);
+            p += 1;
+            flags.push(fl);
+            if ((fl & 8) != 0) {
+                if (p >= d.len) { return; }
+                let rep = u8at(d, p);
+                p += 1;
+                for (let i in 0..rep) {
+                    if (flags.len >= nPts) { break; }
+                    flags.push(fl);
+                }
+            }
+        }
+
+        // x coordinates: delta-encoded, width and sign from the flag bits
+        let xs: int[] = [];
+        xs.reserve(nPts);
+        let x = 0;
+        for (let i in 0..nPts) {
+            let fl = flags[i];
+            if ((fl & 2) != 0) {
+                if (p >= d.len) { return; }
+                let v = u8at(d, p);
+                p += 1;
+                if ((fl & 16) != 0) { x += v; } else { x -= v; }
+            } else if ((fl & 16) == 0) {
+                if (p + 2 > d.len) { return; }
+                x += i16at(d, p);
+                p += 2;
+            }
+            xs.push(x);
+        }
+
+        let ys: int[] = [];
+        ys.reserve(nPts);
+        let y = 0;
+        for (let i in 0..nPts) {
+            let fl = flags[i];
+            if ((fl & 4) != 0) {
+                if (p >= d.len) { return; }
+                let v = u8at(d, p);
+                p += 1;
+                if ((fl & 32) != 0) { y += v; } else { y -= v; }
+            } else if ((fl & 32) == 0) {
+                if (p + 2 > d.len) { return; }
+                y += i16at(d, p);
+                p += 2;
+            }
+            ys.push(y);
+        }
+
+        // Emit contours. TrueType points are on- or off-curve; two consecutive
+        // off-curve points imply an on-curve midpoint between them, which is
+        // what makes the "implied point" reconstruction below necessary.
+        let s = this.scale;
+        let beg = 0;
+        for (let c in 0..nContours) {
+            let to = endPts[c];
+            if (to < beg) { beg = to + 1; continue; }
+            let n = to - beg + 1;
+            if (n <= 0) { beg = to + 1; continue; }
+
+            // Find a starting on-curve point; if the contour is all off-curve,
+            // synthesize one midway between the last and first points.
+            let startIdx = -1;
+            for (let i in 0..n) {
+                if ((flags[beg + i] & 1) != 0) { startIdx = i; break; }
+            }
+
+            let sx = 0.0;
+            let sy = 0.0;
+            if (startIdx < 0) {
+                sx = (((xs[beg] + xs[to]) as float) * 0.5 + dx) * s;
+                sy = (((ys[beg] + ys[to]) as float) * 0.5 + dy) * s;
+                startIdx = 0;
+            } else {
+                sx = ((xs[beg + startIdx] as float) + dx) * s;
+                sy = ((ys[beg + startIdx] as float) + dy) * s;
+            }
+            o.moveTo(sx, sy);
+
+            let cx = 0.0;
+            let cy = 0.0;
+            let haveCtrl = false;
+
+            for (let k in 1..(n + 1)) {
+                let i = beg + ((startIdx + k) % n);
+                let px = ((xs[i] as float) + dx) * s;
+                let py = ((ys[i] as float) + dy) * s;
+                let on = (flags[i] & 1) != 0;
+
+                if (on) {
+                    if (haveCtrl) { o.quadTo(cx, cy, px, py); haveCtrl = false; }
+                    else { o.lineTo(px, py); }
+                } else {
+                    if (haveCtrl) {
+                        // implied on-curve midpoint between two controls
+                        let mx = (cx + px) * 0.5;
+                        let my = (cy + py) * 0.5;
+                        o.quadTo(cx, cy, mx, my);
+                    }
+                    cx = px;
+                    cy = py;
+                    haveCtrl = true;
+                }
+            }
+            // close back to the start, through a pending control if any
+            if (haveCtrl) { o.quadTo(cx, cy, sx, sy); }
+            o.closeContour();
+
+            beg = to + 1;
+        }
+    }
+
+    fn compositeGlyph(o: Outline, g: int, dx: float, dy: float, depth: int) {
+        let d = this.data;
+        let p = g + 10;
+        let more = true;
+        while (more) {
+            if (p + 4 > d.len) { return; }
+            let flags = u16at(d, p);
+            let gi = u16at(d, p + 2);
+            p += 4;
+
+            more = (flags & 0x20) != 0;              // MORE_COMPONENTS
+            let wordArgs = (flags & 1) != 0;         // ARG_1_AND_2_ARE_WORDS
+            let argsAreXY = (flags & 2) != 0;        // ARGS_ARE_XY_VALUES
+
+            let a1 = 0;
+            let a2 = 0;
+            if (wordArgs) {
+                if (p + 4 > d.len) { return; }
+                a1 = i16at(d, p);
+                a2 = i16at(d, p + 2);
+                p += 4;
+            } else {
+                if (p + 2 > d.len) { return; }
+                a1 = u8at(d, p);
+                a2 = u8at(d, p + 1);
+                if (argsAreXY) {
+                    if (a1 >= 128) { a1 -= 256; }
+                    if (a2 >= 128) { a2 -= 256; }
+                }
+                p += 2;
+            }
+
+            // Scale variants are parsed only to advance `p` correctly. A
+            // component transform would need a full 2x2 apply in appendGlyph;
+            // Inter uses plain offsets, so translation-only is honest here and
+            // a scaled component lands unscaled rather than corrupting the run.
+            if ((flags & 8) != 0) { p += 2; }                 // WE_HAVE_A_SCALE
+            else if ((flags & 0x40) != 0) { p += 4; }         // X_AND_Y_SCALE
+            else if ((flags & 0x80) != 0) { p += 8; }         // TWO_BY_TWO
+
+            let ox = dx;
+            let oy = dy;
+            if (argsAreXY) { ox = dx + (a1 as float); oy = dy + (a2 as float); }
+
+            this.appendGlyph(o, gi, ox, oy, depth + 1);
+        }
+    }
+
+    // ---- rasterization ----------------------------------------------------
+
+    // Bake `cp` into the cache and return its index, or -1 if it has no glyph.
+    fn bake(cp: int): int {
+        let hit = this.cache.find(cp);
+        if (hit >= 0) { return hit; }
+
+        let gid = this.glyphId(cp);
+        let advPx = roundf((this.advanceUnits(gid) as float) * this.scale);
+
+        let o = new Outline();
+        this.appendGlyph(o, gid, 0.0, 0.0, 0);
+
+        if (o.xs.len == 0 || o.ends.len == 0) {
+            // No outline (space, or an unmapped codepoint): advance only.
+            return this.cache.add(cp, 0, 0, 0, 0, 0, advPx);
+        }
+
+        // Bounds in pixel space. y is up in font space and down in raster
+        // space, so the top of the bitmap is the MAXIMUM y.
+        let minX = o.xs[0];
+        let maxX = o.xs[0];
+        let minY = o.ys[0];
+        let maxY = o.ys[0];
+        for (let i in 1..(o.xs.len)) {
+            if (o.xs[i] < minX) { minX = o.xs[i]; }
+            if (o.xs[i] > maxX) { maxX = o.xs[i]; }
+            if (o.ys[i] < minY) { minY = o.ys[i]; }
+            if (o.ys[i] > maxY) { maxY = o.ys[i]; }
+        }
+
+        let x0 = floorf(minX);
+        let y1 = ceilf(maxY);
+        let w = ceilf(maxX) - x0;
+        let h = y1 - floorf(minY);
+        if (w <= 0 || h <= 0) {
+            return this.cache.add(cp, 0, 0, 0, 0, 0, advPx);
+        }
+        // Guard a pathological outline rather than allocating megabytes.
+        if (w > 1024 || h > 1024) {
+            return this.cache.add(cp, 0, 0, 0, 0, 0, advPx);
+        }
+
+        let off = this.cache.alloc(w * h);
+        this.fillOutline(o, off, w, h, x0 as float, y1 as float);
+
+        // bearingY is measured from the baseline UP to the bitmap's top row.
+        return this.cache.add(cp, off, w, h, x0, y1, advPx);
+    }
+
+    // Scanline fill with 4x vertical supersampling and exact horizontal
+    // coverage. Crossings are gathered per sub-scanline and filled by the
+    // nonzero-ish even-odd rule (even-odd is correct for well-formed TrueType
+    // outlines, whose contours do not self-overlap).
+    fn fillOutline(o: Outline, off: int, w: int, h: int, ox: float, topY: float) {
+        let SS = 4;
+        let inv = 1.0 / (SS as float);
+        // Each sub-scanline contributes at most 255/SS to a pixel; accumulate
+        // in ints and clamp once at the end.
+        let add = 255 / SS;
+
+        let xsArr: float[] = [];
+
+        for (let row in 0..h) {
+            for (let sub in 0..SS) {
+                // Sample at the sub-scanline centre, in font-space y (up).
+                let sy = topY - ((row as float) + ((sub as float) + 0.5) * inv);
+
+                xsArr.clear();
+                let beg = 0;
+                for (let c in 0..(o.ends.len)) {
+                    let to = o.ends[c];
+                    let n = to - beg;
+                    if (n >= 2) {
+                        for (let i in 0..n) {
+                            let a = beg + i;
+                            let b = beg + ((i + 1) % n);
+                            let ya = o.ys[a];
+                            let yb = o.ys[b];
+                            if (ya == yb) { continue; }
+                            // Half-open span: a vertex shared by two edges is
+                            // counted once, which is what keeps the parity
+                            // correct at contour joins.
+                            let lo = ya;
+                            let hi = yb;
+                            if (lo > hi) { lo = yb; hi = ya; }
+                            if (sy < lo || sy >= hi) { continue; }
+                            let t = (sy - ya) / (yb - ya);
+                            xsArr.push(o.xs[a] + t * (o.xs[b] - o.xs[a]));
+                        }
+                    }
+                    beg = to;
+                }
+
+                if (xsArr.len < 2) { continue; }
+                sortFloats(xsArr);
+
+                let k = 0;
+                while (k + 1 < xsArr.len) {
+                    let sxa = xsArr[k] - ox;
+                    let sxb = xsArr[k + 1] - ox;
+                    k += 2;
+                    if (sxb <= sxa) { continue; }
+                    this.spanCoverage(off, w, h, row, sxa, sxb, add);
+                }
+            }
+        }
+    }
+
+    // Add `add` weight across [xa, xb) on one raster row, with fractional
+    // coverage at both ends — this is where the anti-aliasing comes from.
+    fn spanCoverage(off: int, w: int, h: int, row: int,
+                    xa: float, xb: float, add: int) {
+        let a = xa;
+        let b = xb;
+        if (a < 0.0) { a = 0.0; }
+        if (b > (w as float)) { b = w as float; }
+        if (b <= a) { return; }
+
+        let ia = a as int;
+        let ib = b as int;
+        if (ia < 0) { ia = 0; }
+        if (ib > w - 1) { ib = w - 1; }
+
+        let base = off + row * w;
+
+        if (ia == ib) {
+            let frac = b - a;
+            this.bump(base + ia, ((add as float) * frac) as int);
+            return;
+        }
+
+        // leading partial pixel
+        let lead = ((ia + 1) as float) - a;
+        this.bump(base + ia, ((add as float) * lead) as int);
+        // solid interior
+        for (let x in (ia + 1)..ib) { this.bump(base + x, add); }
+        // trailing partial pixel
+        let trail = b - (ib as float);
+        this.bump(base + ib, ((add as float) * trail) as int);
+    }
+
+    fn bump(idx: int, amount: int) {
+        if (amount <= 0) { return; }
+        if (idx < 0 || idx >= this.cache.cov.len) { return; }
+        let v = (this.cache.cov[idx] as int) + amount;
+        if (v > 255) { v = 255; }
+        this.cache.cov[idx] = v as byte;
+    }
+
+    // ---- metrics ----------------------------------------------------------
+
+    // Advance width of `s` in pixels. Matches what draw() lays down, so it is
+    // the right thing for centering and right-alignment.
+    fn width(s: string): int {
+        if (!this.ok) { return 0; }
+        let total = 0;
+        let i = 0;
+        while (i < s.len) {
+            let r = decodeUtf8(s, i);
+            let idx = this.bake(r[0]);
+            if (idx >= 0) { total += this.cache.adv[idx]; }
+            i = r[1];
+        }
+        return total;
+    }
+
+    fn ascent(): int { return this.asc; }
+    fn descent(): int { return this.desc; }
+    fn height(): int { return this.asc + this.desc; }
+    // Baseline-to-baseline distance for stacked lines.
+    fn lineHeight(): int { return this.asc + this.desc + this.lineGap; }
+    // False when the file was missing or unparseable; draws are no-ops then.
+    fn valid(): bool { return this.ok; }
+
+    // ---- drawing ----------------------------------------------------------
+
+    // Composite `s` into a caller-owned 0xRRGGBB buffer. `stride` is the
+    // buffer's row width in pixels; `y` is the baseline. Blends per-pixel
+    // against whatever is already there, so text over a 3D framebuffer or a
+    // blitted image comes out correct rather than boxed.
+    fn draw(dst: i32[], stride: int, x: int, y: int, s: string, rgb: int) {
+        if (stride <= 0) { return; }
+        // No clip: the whole buffer is writable.
+        this.drawClipped(dst, stride, x, y, s, rgb,
+                         0, 0, stride, dst.len / stride);
+    }
+
+    // As draw(), bounded to the half-open pixel box [cx, cx+cw) x [cy, cy+ch).
+    //
+    // A glyph straddling the edge is cut mid-glyph rather than dropped whole:
+    // that is the difference between a scroll view whose last row crops
+    // cleanly and one whose text pops in and out a line at a time. The test is
+    // folded into the per-pixel bounds check the blend already ran, so a
+    // clipped draw costs the same as an unclipped one.
+    fn drawClipped(dst: i32[], stride: int, x: int, y: int, s: string, rgb: int,
+                   cx: int, cy: int, cw: int, ch: int) {
+        if (!this.ok || stride <= 0) { return; }
+        let rows = dst.len / stride;
+
+        // Intersect the requested clip with the buffer itself, so the inner
+        // loop tests one pair of bounds instead of two.
+        let x0 = cx;
+        let y0 = cy;
+        let x1 = cx + cw;
+        let y1 = cy + ch;
+        if (x0 < 0) { x0 = 0; }
+        if (y0 < 0) { y0 = 0; }
+        if (x1 > stride) { x1 = stride; }
+        if (y1 > rows) { y1 = rows; }
+        if (x1 <= x0 || y1 <= y0) { return; }
+
+        let pen = x;
+        let i = 0;
+        while (i < s.len) {
+            let r = decodeUtf8(s, i);
+            i = r[1];
+            let idx = this.bake(r[0]);
+            if (idx < 0) { continue; }
+
+            let gw = this.cache.gw[idx];
+            let gh = this.cache.gh[idx];
+            if (gw > 0 && gh > 0) {
+                let off = this.cache.off[idx];
+                let gx = pen + this.cache.bx[idx];
+                let gy = y - this.cache.by[idx];
+                // Skip a glyph entirely outside the box before touching its
+                // coverage — a long run clipped to a narrow column is the
+                // common case, and most of its glyphs never need a pixel loop.
+                if (gx < x1 && gx + gw > x0 && gy < y1 && gy + gh > y0) {
+                    for (let ry in 0..gh) {
+                        let py = gy + ry;
+                        if (py < y0 || py >= y1) { continue; }
+                        for (let rx in 0..gw) {
+                            let px = gx + rx;
+                            if (px < x0 || px >= x1) { continue; }
+                            let cov = this.cache.cov[off + ry * gw + rx] as int;
+                            if (cov == 0) { continue; }
+                            let di = py * stride + px;
+                            let bg = dst[di] as int;
+                            dst[di] = blendRGB(bg, rgb, cov) as i32;
+                        }
+                    }
+                }
+            }
+            pen += this.cache.adv[idx];
+        }
+    }
+
+    // Draw onto a Surface over a known flat background. Rasterizes the whole
+    // run into one reused scratch buffer and issues a single 1:1 blit.
+    //
+    // `bg` must be the colour actually under the text — the glyph edges are
+    // blended against it, so a wrong value shows as a fringe. For text over
+    // varying pixels use draw() into the app's own buffer instead.
+    //
+    // Does NOT consult Surface.clip_set — blit ignores it. Use drawOnClipped
+    // to bound the draw explicitly.
+    fn drawOn(s: Surface, x: int, y: int, text: string, rgb: int, bg: int) {
+        // A clip the size of the surface is no clip at all.
+        this.drawOnClipped(s, x, y, text, rgb, bg,
+                           0, 0, s.width(), s.height());
+    }
+
+    // As drawOn(), bounded to the half-open box [cx, cx+cw) x [cy, cy+ch) in
+    // surface coordinates.
+    //
+    // This is the call a Painter needs: Surface.clip_set governs fill/line/text
+    // but blit ignores it (surface.vt:605-606), so a clipped painter that drew
+    // text through drawOn would spill past every scroll viewport. Passing the
+    // clip explicitly is the only way to honour one.
+    //
+    // The staging buffer is cropped before the blit rather than after, so a
+    // run mostly outside the box costs only the pixels that survive.
+    fn drawOnClipped(s: Surface, x: int, y: int, text: string, rgb: int, bg: int,
+                     clipX: int, clipY: int, clipW: int, clipH: int) {
+        if (!this.ok) { return; }
+        let w = this.width(text);
+        if (w <= 0) { return; }
+
+        // Size the cell to the ink this run actually bakes, not to the advance
+        // box. Both axes overhang in practice: hhea's ascent/descent are a
+        // typographic recommendation an accented capital meets exactly, and a
+        // glyph's bitmap can start left of the pen or end past its advance
+        // (measured in Inter: 'j' reaches 1px left, '#' '/' '\' 1px right).
+        // draw() discards anything outside the buffer, so an unmeasured cell
+        // clips those columns silently. Every glyph here was already baked by
+        // width() above, so this is a cache lookup per glyph, not a re-raster.
+        let rise = this.asc;     // pixels above the baseline
+        let drop = this.desc;    // pixels below it
+        let padL = 0;            // ink reaching left of the run's origin
+        let padR = 0;            // ink reaching past the advance width
+        let pen = 0;
+        let i = 0;
+        while (i < text.len) {
+            let r = decodeUtf8(text, i);
+            i = r[1];
+            let idx = this.bake(r[0]);
+            if (idx < 0) { continue; }
+            if (this.cache.gh[idx] > 0) {
+                let up = this.cache.by[idx];                       // top above baseline
+                let dn = this.cache.gh[idx] - this.cache.by[idx];  // bottom below it
+                if (up > rise) { rise = up; }
+                if (dn > drop) { drop = dn; }
+
+                let gl = pen + this.cache.bx[idx];                 // ink left edge
+                let gr = gl + this.cache.gw[idx];                  // ink right edge
+                if (0 - gl > padL) { padL = 0 - gl; }
+                if (gr - w > padR) { padR = gr - w; }
+            }
+            pen += this.cache.adv[idx];
+        }
+
+        let top = y - rise;
+        let h = rise + drop;
+        let cw = w + padL + padR;
+        if (h <= 0 || cw <= 0) { return; }
+
+        let need = cw * h;
+        if (this.scratch.len < need) {
+            this.scratch.reserve(need);
+            while (this.scratch.len < need) { this.scratch.push(0 as i32); }
+        }
+        // Only the live window is cleared; capacity beyond it is left alone,
+        // the StringBuilder.clear() trade — reuse the buffer, skip the free.
+        for (let k in 0..need) { this.scratch[k] = bg as i32; }
+
+        // Where the cell lands on the surface. Shifted left by padL so the
+        // caller's x still names the text origin, not the overhang.
+        let dx = x - padL;
+        let dy = top;
+
+        // Crop the cell against the clip, in cell-local coordinates.
+        let sx0 = clipX - dx;
+        let sy0 = clipY - dy;
+        let sx1 = (clipX + clipW) - dx;
+        let sy1 = (clipY + clipH) - dy;
+        if (sx0 < 0) { sx0 = 0; }
+        if (sy0 < 0) { sy0 = 0; }
+        if (sx1 > cw) { sx1 = cw; }
+        if (sy1 > h) { sy1 = h; }
+        if (sx1 <= sx0 || sy1 <= sy0) { return; }   // fully outside
+
+        // Rasterize only the surviving band. Clipping the glyph loop as well
+        // as the blit is what makes a run mostly outside the box cheap rather
+        // than merely correct.
+        this.drawClipped(this.scratch, cw, padL, rise, text, rgb,
+                         sx0, sy0, sx1 - sx0, sy1 - sy0);
+
+        if (sx0 == 0 && sy0 == 0 && sx1 == cw && sy1 == h) {
+            // Whole cell visible: src matches dst exactly, so blit's
+            // nearest-neighbor scaler is a 1:1 copy (surface.vt:574-576).
+            s.blit(this.scratch, cw, h,
+                   Rect(dx as float, dy as float, cw as float, h as float));
+        } else {
+            // Partial: blitRect is the stride-aware, unscaled sub-rect copy,
+            // and unlike blit it needs no repacking of the staging buffer.
+            s.blitRect(this.scratch as rawptr, cw, sx0, sy0,
+                       sx1 - sx0, sy1 - sy0, dx + sx0, dy + sy0);
+        }
+    }
+}
+
+// ---- helpers --------------------------------------------------------------
+
+// Decode one UTF-8 code point at byte `i`. Returns [codepoint, nextIndex].
+// A malformed byte yields U+FFFD and advances one, so a bad string degrades
+// to visible replacement characters instead of looping or panicking.
+fn decodeUtf8(s: string, i: int): int[] {
+    let out: int[] = [];
+    let b0 = s[i];
+    if (b0 < 0x80) { out.push(b0); out.push(i + 1); return out; }
+
+    if ((b0 & 0xE0) == 0xC0 && i + 1 < s.len) {
+        let cp = ((b0 & 0x1F) << 6) | (s[i + 1] & 0x3F);
+        out.push(cp); out.push(i + 2); return out;
+    }
+    if ((b0 & 0xF0) == 0xE0 && i + 2 < s.len) {
+        let cp = ((b0 & 0x0F) << 12) | ((s[i + 1] & 0x3F) << 6) | (s[i + 2] & 0x3F);
+        out.push(cp); out.push(i + 3); return out;
+    }
+    if ((b0 & 0xF8) == 0xF0 && i + 3 < s.len) {
+        let cp = ((b0 & 0x07) << 18) | ((s[i + 1] & 0x3F) << 12)
+               | ((s[i + 2] & 0x3F) << 6) | (s[i + 3] & 0x3F);
+        out.push(cp); out.push(i + 4); return out;
+    }
+    out.push(0xFFFD);
+    out.push(i + 1);
+    return out;
+}
+
+// Channel-wise blend of two 0xRRGGBB colours by an 0..255 coverage. The same
+// shape as raster3d/texture.vt's lerpRGB, in integer form because coverage
+// arrives as a byte and a float round-trip here would be pure cost.
+fn blendRGB(bg: int, fg: int, cov: int): int {
+    if (cov >= 255) { return fg; }
+    let inv = 255 - cov;
+    let r = (((fg >> 16) & 0xFF) * cov + ((bg >> 16) & 0xFF) * inv) / 255;
+    let g = (((fg >> 8) & 0xFF) * cov + ((bg >> 8) & 0xFF) * inv) / 255;
+    let b = ((fg & 0xFF) * cov + (bg & 0xFF) * inv) / 255;
+    return (r << 16) | (g << 8) | b;
+}
+
+fn roundf(v: float): int {
+    if (v < 0.0) { return (v - 0.5) as int; }
+    return (v + 0.5) as int;
+}
+
+fn floorf(v: float): int {
+    let i = v as int;
+    if (v < 0.0 && (i as float) != v) { return i - 1; }
+    return i;
+}
+
+fn ceilf(v: float): int {
+    let i = v as int;
+    if (v > 0.0 && (i as float) != v) { return i + 1; }
+    return i;
+}
+
+// Insertion sort: a scanline crosses a handful of edges even for a complex
+// glyph, and insertion sort beats a general sort at that size with no
+// comparator allocation.
+fn sortFloats(a: float[]) {
+    for (let i in 1..(a.len)) {
+        let v = a[i];
+        let j = i - 1;
+        while (j >= 0 && a[j] > v) {
+            a[j + 1] = a[j];
+            j -= 1;
+        }
+        a[j + 1] = v;
+    }
+}
+
+// ---- convenience ----------------------------------------------------------
+
+// Absolute path of a font vendored in the stdlib assets dir. Mirrors
+// vyto/gfx/fonts.vt:fontPath — same files, same resolution, so an app can
+// switch between the gfx painter and this module without moving assets.
+export fn stdFontPath(name: string): string {
+    let dir = libDir();
+    if (dir.len == 0) { return ""; }
+    return dir + "/vyto/gfx/assets/" + name;
+}
+
+// The vendored Inter regular face at `size` pixels.
+//
+// Resolved through libDir(), so it needs the stdlib directory present at
+// runtime. An app that must ship as a lone binary should bundle its own .ttf
+// with --with-assets and use `new Font(path, size)` instead.
+export fn interFont(size: float): Font {
+    return new Font(stdFontPath("Inter-Regular.ttf"), size);
+}
