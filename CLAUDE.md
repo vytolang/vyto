@@ -246,6 +246,13 @@ imports nothing, so `tests/fixtures/mmap_freestanding.vt` exists to exercise it.
 match `android-arm64`. A non-matching condition silently drops the library;
 nothing warns. Adding a triple means auditing all `#link` sites.
 
+**`--release` signed overflow is C undefined behaviour, not wrapping.** The
+debug check is dropped and the raw operator emitted; `-fwrapv` is opt-in, not
+default (it can block loop optimisations): `--cc 'cc -fwrapv' --clean`. The
+`--clean` matters — module objects are rebuilt on source change, not on a
+`--cc` change, so without it the flag silently never reaches user code. See
+`docs/types.md` "Integer overflow".
+
 **Cross-compiling needs a triple, not just `--cc`.** Object filenames encode
 release/debug but not the compiler or triple, so `--cc <other-toolchain>`
 without `--target` silently reuses host objects and produces a bad link. The

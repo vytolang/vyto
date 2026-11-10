@@ -694,7 +694,10 @@ else
     fail=1
 fi
 
-# --- integer overflow: checked (traps) in debug, wraps in --release ---
+# --- integer overflow: checked (traps) in debug; --release is plain C, where
+#     signed overflow is UB, so the wrap is only asserted under -fwrapv (the
+#     documented opt-in). It used to be asserted under bare --release, which
+#     passed only because gcc happens to lower this one expression as a wrap ---
 got=$(./vytoc run tests/fixtures/overflow_trap.vt 2>&1)
 if echo "$got" | grep -q "integer overflow in '+'"; then
     echo "PASS overflow_trap_debug"
@@ -702,11 +705,18 @@ else
     echo "FAIL overflow_trap_debug (expected a panic, got: $got)"
     fail=1
 fi
-got=$(./vytoc run tests/fixtures/overflow_trap.vt --release 2>&1)
+# Built from a private copy: -fwrapv only reaches a module object that is
+# compiled fresh (the cache does not key module objects on --cc), and --clean
+# on tests/fixtures/ would race the other fixtures this suite builds there.
+wrapv_dir=tests/tmp/wrapv
+rm -rf "$wrapv_dir"
+mkdir -p "$wrapv_dir"
+cp tests/fixtures/overflow_trap.vt "$wrapv_dir/"
+got=$(./vytoc run "$wrapv_dir/overflow_trap.vt" --release --cc "cc -fwrapv" 2>&1)
 if echo "$got" | grep -q -- "-9223372036854775808"; then
     echo "PASS overflow_wrap_release"
 else
-    echo "FAIL overflow_wrap_release (expected wrap to i64 min, got: $got)"
+    echo "FAIL overflow_wrap_release (expected -fwrapv wrap to i64 min, got: $got)"
     fail=1
 fi
 

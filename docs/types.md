@@ -34,9 +34,30 @@ See [`docs/math.md`](math.md) §0 for the full truncation-vs-floor discussion.
 ### Integer overflow
 
 Signed `+`, `-`, `*` (and unary `-`) are **checked in debug builds** — an
-overflow panics with a file:line message rather than wrapping. `--release`
-opts into fast two's-complement wrapping instead. Unsigned arithmetic always
-wraps, in both build modes, by definition:
+overflow panics with a file:line message rather than wrapping.
+
+**`--release` drops the check and emits the plain C operator, and signed
+overflow in C is undefined behaviour, not wrapping.** It often *looks* like
+wrapping, but the C compiler is entitled to assume it never happens and
+optimise on that assumption: a loop bound or an `if (x + 1 > x)` can be
+folded away. Treat a signed overflow in a release build as a bug, the same as
+in debug, where it is caught.
+
+If a program genuinely relies on signed wraparound (hashes, checksums, PRNGs),
+either do that arithmetic in an unsigned type, which wraps by definition in
+both modes, or ask the C compiler for wrapping semantics:
+
+```sh
+vytoc build app.vt --release --cc 'cc -fwrapv' --clean
+```
+
+`-fwrapv` is not the default because it can block some loop optimisations;
+it is opt-in for the programs that need it. **`--clean` is not optional the
+first time.** The cache rebuilds your modules' objects only when their source
+changes, not when `--cc` does, so without it a previously built app keeps
+objects compiled without `-fwrapv` and the flag silently does nothing.
+
+Unsigned arithmetic always wraps, in both build modes, by definition:
 
 ```js
 let u: u32 = 4294967295;
