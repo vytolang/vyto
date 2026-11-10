@@ -154,11 +154,11 @@ print(str(m.get_or("a", 0)));
 | `.has(k)` | `(string) -> bool` | |
 | `.remove(k)` | `(string) -> void` | |
 | `.get_or(k, default)` | `(string, V) -> V` | |
-| `.keys()` | `-> string[]` | bucket-ordered, not insertion-ordered |
-| `.values()` | `-> V[]` | bucket-ordered |
+| `.keys()` | `-> string[]` | insertion order |
+| `.values()` | `-> V[]` | insertion order, matching `.keys()` |
 | `.is_empty()` | `-> bool` | |
 | `.clear()` | `-> void` | |
-| `.merge(other)` | `(Map<string, V>) -> void` | `other`'s keys win on collision |
+| `.merge(other)` | `(Map<string, V>) -> void` | `other`'s values win on collision; a colliding key keeps its place, new keys append in `other`'s order |
 | `.len` | field | |
 
 `null` is a valid `Map` value.

@@ -1094,6 +1094,21 @@ else
     fail=1
 fi
 
+# --- builtin Map: contents and INSERTION ORDER against a parallel-array model,
+#     over a seeded random mix of set/remove/has/get_or/clear, plus merge and
+#     re-insert rules. Order is a documented guarantee since the compact-dict
+#     rewrite (vyto_rt.h, above VtMapEntry); fault injection confirmed this
+#     fails both on a broken backward-shift delete and on reversed keys() ---
+got=$(./vytoc run tests/fixtures/map_order.vt 2>&1)
+if [ "$got" = "$(cat tests/fixtures/map_order.expected)" ]; then
+    echo "PASS map_order"
+else
+    echo "FAIL map_order"
+    echo "--- expected ---"; cat tests/fixtures/map_order.expected
+    echo "--- got ---"; printf '%s\n' "$got"
+    fail=1
+fi
+
 # --- vyto/cli/ask under a pipe. The interactive path cannot be golden-tested
 #     (prompting exists to react to a human), but the piped one can, and it is
 #     the path scripts, cron and CI take: every helper must return its fallback

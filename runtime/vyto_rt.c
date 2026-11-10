@@ -1335,114 +1335,192 @@ void vt_arr_set(VtArray *a, int64_t i, const void *elem, const char *file, int l
     memcpy(slot, elem, (size_t)a->elem_size);
 }
 
-/* ---- maps ---- */
+/* ---- maps ---- (layout and invariants: vyto_rt.h, above VtMapEntry) */
 
 static void map_deinit(void *self) {
     VtMap *m = self;
-    for (int64_t b = 0; b < m->nbuckets; b++) {
-        VtMapEntry *e = m->buckets[b];
-        while (e) {
-            VtMapEntry *next = e->next;
-            vt_release(e->key);
-            if (m->val_ref) vt_release((void *)(uintptr_t)e->val);
-            vt_host_free(e);
-            e = next;
-        }
+    for (int64_t i = 0; i < m->nent; i++) {
+        VtMapEntry *e = &m->ents[i];
+        if (!e->key) continue;
+        vt_release(e->key);
+        if (m->val_ref) vt_release((void *)(uintptr_t)e->val);
     }
-    vt_host_free(m->buckets);
+    vt_host_free(m->ents);
+    vt_host_free(m->index);
 }
 static const VtType vt_map_type = {"map", map_deinit, NULL, NULL};
 
+/* Nothing is allocated until the first set: an empty map is just the header,
+   where the chained table used to allocate 64 buckets (512 B) up front. */
 VtMap *vt_map_new(bool val_ref) {
     VtMap *m = vt_alloc(sizeof(VtMap), &vt_map_type);
-    m->nbuckets = 64;
-    m->buckets = vt_host_alloc((size_t)m->nbuckets * sizeof(VtMapEntry *));
-    if (!m->buckets) vt_oom();
     m->val_ref = val_ref;
     return m;
 }
 
-static uint64_t map_hash(VtString *k) {
-    uint64_t h = 1469598103934665603ull;
-    for (int64_t i = 0; i < k->len; i++) { h ^= (unsigned char)k->data[i]; h *= 1099511628211ull; }
+/* Per-process seed. Iteration order no longer depends on the hash, so the
+   hash is free to differ between runs -- which is what makes a table keyed by
+   attacker-chosen strings (HTTP headers, form fields, JSON keys) hard to
+   flood with collisions. The entropy is ASLR: the address of a static. A
+   freestanding or non-ASLR target gets a fixed seed, which is no worse than
+   the unseeded FNV this replaced. */
+static const char vt_map_seed_anchor = 0;
+static uint64_t map_mix(uint64_t h) {
+    h ^= h >> 32; h *= 0xd6e8feb86659fd93ull;
+    h ^= h >> 32; h *= 0xd6e8feb86659fd93ull;
+    h ^= h >> 32;
     return h;
 }
 
-static VtMapEntry **map_slot(VtMap *m, VtString *key) {
-    VtMapEntry **pe = &m->buckets[map_hash(key) % (uint64_t)m->nbuckets];
-    while (*pe && !vt_str_eq((*pe)->key, key)) pe = &(*pe)->next;
-    return pe;
+/* Eight bytes per step instead of FNV's one. Host-endian word loads are fine:
+   the value only has to agree with itself within one process. */
+static uint64_t map_hash(VtString *k) {
+    const unsigned char *p = (const unsigned char *)k->data;
+    int64_t n = k->len;
+    uint64_t h = map_mix((uint64_t)(uintptr_t)&vt_map_seed_anchor) ^ (uint64_t)n;
+    while (n >= 8) {
+        uint64_t w;
+        memcpy(&w, p, 8);
+        h = (h ^ map_mix(w)) * 0x9e3779b97f4a7c15ull;
+        p += 8;
+        n -= 8;
+    }
+    uint64_t w = 0;
+    for (int64_t i = 0; i < n; i++) w |= (uint64_t)p[i] << (8 * i);
+    return map_mix(h ^ w ^ ((uint64_t)n << 56));
 }
 
-/* double the table once chains average 4 deep; entries are relinked in place */
-static void map_grow(VtMap *m) {
-    int64_t nb = m->nbuckets * 2;
-    VtMapEntry **nbk = vt_host_alloc((size_t)nb * sizeof *nbk);
-    if (!nbk) return; /* keep the old (correct, slower) table on OOM */
-    for (int64_t i = 0; i < m->nbuckets; i++) {
-        VtMapEntry *e = m->buckets[i];
-        while (e) {
-            VtMapEntry *next = e->next;
-            uint64_t h = map_hash(e->key) % (uint64_t)nb;
-            e->next = nbk[h];
-            nbk[h] = e;
-            e = next;
+#define MAP_SLOT_EMPTY 0u
+static inline uint64_t map_slot_make(int64_t ent, uint64_t h) {
+    return (h & 0xffffffff00000000ull) | (uint64_t)(ent + 1);
+}
+static inline int64_t map_slot_ent(uint64_t s) { return (int64_t)(uint32_t)s - 1; }
+
+/* Index slot holding `key`, or the empty slot that ends its probe. Returns the
+   entry number, or -1 if absent; *slotp gets the slot position either way. */
+static int64_t map_find(VtMap *m, VtString *key, uint64_t h, uint64_t *slotp) {
+    uint64_t pos = h & m->mask;
+    uint64_t tag = h & 0xffffffff00000000ull;
+    for (;;) {
+        uint64_t s = m->index[pos];
+        if (s == MAP_SLOT_EMPTY) { *slotp = pos; return -1; }
+        if ((s & 0xffffffff00000000ull) == tag) {
+            int64_t ei = map_slot_ent(s);
+            VtMapEntry *e = &m->ents[ei];
+            if (e->hash == h && vt_str_eq(e->key, key)) { *slotp = pos; return ei; }
         }
+        pos = (pos + 1) & m->mask;
     }
-    vt_host_free(m->buckets);
-    m->buckets = nbk;
-    m->nbuckets = nb;
+}
+
+static int64_t map_lookup(VtMap *m, VtString *key) {
+    if (!m->index || !key) return -1;
+    uint64_t pos;
+    return map_find(m, key, map_hash(key), &pos);
+}
+
+/* Rebuild for `ncap` entries: drop removed entries (keeping order) and
+   re-index from the stored hashes -- no key is rehashed, no string touched.
+   The index is kept at 2x the entry capacity, so its load never passes 1/2. */
+static void map_rebuild(VtMap *m, int64_t ncap) {
+    if (ncap > 0x3fffffff) vt_oom(); /* entry numbers are 32-bit */
+    int64_t w = 0;
+    for (int64_t r = 0; r < m->nent; r++)
+        if (m->ents[r].key) m->ents[w++] = m->ents[r];
+    m->nent = w;
+    if (ncap != m->cap) {
+        VtMapEntry *ne = vt_host_realloc(m->ents, (size_t)ncap * sizeof *ne);
+        if (!ne) vt_oom();
+        m->ents = ne;
+        m->cap = ncap;
+    }
+    uint64_t nslots = (uint64_t)ncap * 2;
+    vt_host_free(m->index);
+    m->index = vt_host_alloc((size_t)nslots * sizeof *m->index); /* zeroed = empty */
+    if (!m->index) vt_oom();
+    m->mask = nslots - 1;
+    for (int64_t i = 0; i < m->nent; i++) {
+        uint64_t pos = m->ents[i].hash & m->mask;
+        while (m->index[pos] != MAP_SLOT_EMPTY) pos = (pos + 1) & m->mask;
+        m->index[pos] = map_slot_make(i, m->ents[i].hash);
+    }
 }
 
 void vt_map_set(VtMap *m, VtString *key, uint64_t val, const char *file, int line) {
     if (!m) vt_panic_c(file, line, "set on null map");
-    VtMapEntry **pe = map_slot(m, key);
-    if (*pe) {
-        if (m->val_ref) {
-            vt_retain((void *)(uintptr_t)val);
-            vt_release((void *)(uintptr_t)(*pe)->val);
+    if (!key) vt_panic_c(file, line, "null map key");
+    uint64_t h = map_hash(key), pos = 0;
+    if (m->index) {
+        int64_t ei = map_find(m, key, h, &pos);
+        if (ei >= 0) {
+            VtMapEntry *e = &m->ents[ei];
+            if (m->val_ref) {
+                vt_retain((void *)(uintptr_t)val);
+                vt_release((void *)(uintptr_t)e->val);
+            }
+            e->val = val;
+            return;
         }
-        (*pe)->val = val;
-        return;
     }
-    VtMapEntry *e = vt_host_alloc(sizeof *e);
-    if (!e) vt_oom();
-    vt_retain(key);
-    e->key = key;
+    if (m->nent == m->cap) {
+        /* Full. Mostly removed slots: compact in place. Otherwise double. */
+        int64_t ncap = m->cap == 0 ? 8 : (m->len <= m->cap / 2 ? m->cap : m->cap * 2);
+        map_rebuild(m, ncap);
+        map_find(m, key, h, &pos); /* the slot moved with the index */
+    }
+    int64_t ei = m->nent++;
+    VtMapEntry *e = &m->ents[ei];
+    e->hash = h;
+    e->key = vt_retain(key);
     e->val = val;
-    e->next = NULL;
     if (m->val_ref) vt_retain((void *)(uintptr_t)val);
-    *pe = e;
+    m->index[pos] = map_slot_make(ei, h);
     m->len++;
-    if (m->len > m->nbuckets * 4) map_grow(m);
 }
 
 uint64_t vt_map_get(VtMap *m, VtString *key, const char *file, int line) {
     if (!m) vt_panic_c(file, line, "get on null map");
-    VtMapEntry **pe = map_slot(m, key);
-    if (!*pe) {
+    int64_t ei = map_lookup(m, key);
+    if (ei < 0) {
         char buf[160];
         vt_snprintf(buf, sizeof buf, "map key not found: %s", key ? key->data : "(null)");
         vt_panic_c(file, line, buf);
     }
-    return (*pe)->val;
+    return m->ents[ei].val;
 }
 
 bool vt_map_has(VtMap *m, VtString *key, const char *file, int line) {
     if (!m) vt_panic_c(file, line, "has on null map");
-    return *map_slot(m, key) != NULL;
+    return map_lookup(m, key) >= 0;
 }
 
 void vt_map_remove(VtMap *m, VtString *key, const char *file, int line) {
     if (!m) vt_panic_c(file, line, "remove on null map");
-    VtMapEntry **pe = map_slot(m, key);
-    if (!*pe) return;
-    VtMapEntry *e = *pe;
-    *pe = e->next;
+    if (!m->index || !key) return;
+    uint64_t h = map_hash(key), hole;
+    int64_t ei = map_find(m, key, h, &hole);
+    if (ei < 0) return;
+    VtMapEntry *e = &m->ents[ei];
     vt_release(e->key);
     if (m->val_ref) vt_release((void *)(uintptr_t)e->val);
-    vt_host_free(e);
+    e->key = NULL; /* removed: iteration skips it, the next rebuild drops it */
+    e->val = 0;
     m->len--;
+    /* Backward-shift deletion: pull each later slot of the same probe run back
+       into the hole if that does not move it before its home slot, so lookups
+       never need to step over a tombstone. */
+    uint64_t j = hole;
+    for (;;) {
+        j = (j + 1) & m->mask;
+        uint64_t s = m->index[j];
+        if (s == MAP_SLOT_EMPTY) break;
+        uint64_t home = m->ents[map_slot_ent(s)].hash & m->mask;
+        if (((j - home) & m->mask) >= ((j - hole) & m->mask)) {
+            m->index[hole] = s;
+            hole = j;
+        }
+    }
+    m->index[hole] = MAP_SLOT_EMPTY;
 }
 
 /* ---- closures ---- */

@@ -357,19 +357,41 @@ static inline int64_t vt_arr_wri(VtArray *a, int64_t i, const char *file, int li
 }
 void vt_arr_set(VtArray *a, int64_t i, const void *elem, const char *file, int line);
 
-/* ---- maps (string keys, 8-byte value slots) ---- */
+/* ---- maps (string keys, 8-byte value slots) ----
 
+   A compact ordered hash map, the same shape as CPython's dict:
+
+     ents   dense array of {hash, key, val}, in INSERTION order. A removed
+            entry keeps its slot with key == NULL until the next rebuild.
+     index  power-of-two open-addressing table (linear probe) of 8-byte
+            slots: low 32 bits = entry number + 1 (0 = empty), high 32 = the
+            hash's top bits as a tag, so a probe rejects a mismatched key
+            without touching its entry or its string.
+
+   Iteration (keys/values/merge) walks ents, so order is insertion order:
+   overwriting a key keeps its place; removing and re-adding moves it to the
+   end. Removal shifts later index slots back (no index tombstones), and a
+   rebuild compacts ents when removed slots pile up.
+
+   Replaced a chained table that grew at chains averaging 4 deep, reduced with
+   a 64-bit `%`, stored no hash and malloc'd every entry: 2.5x slower than C
+   on 1M-key set and 1.8x on get. See local/docs/RUNTIME_PERF.md.
+
+   `len` must stay the second field: vt_len reads it through VtLenHdr. */
 typedef struct VtMapEntry {
-    VtString *key;
+    uint64_t hash;
+    VtString *key; /* NULL: removed, skipped by iteration */
     uint64_t val;
-    struct VtMapEntry *next;
 } VtMapEntry;
 
 typedef struct VtMap {
     VtObj hdr;
-    int64_t len;
-    int64_t nbuckets;
-    VtMapEntry **buckets;
+    int64_t len;      /* live entries */
+    int64_t nent;     /* used ents slots, including removed ones */
+    int64_t cap;      /* ents capacity; 0 until the first set */
+    uint64_t mask;    /* index slots - 1 */
+    uint64_t *index;  /* NULL until the first set */
+    VtMapEntry *ents;
     bool val_ref;
 } VtMap;
 

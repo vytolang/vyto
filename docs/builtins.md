@@ -331,9 +331,14 @@ type. For keys that are not strings, use `vyto/coll`'s `HashMap`.
 > easiest mistake to make here. Use `get` only where the key's presence is an
 > invariant you have already checked with `has`.
 
-> **`keys()` and `values()` are bucket-ordered, not insertion-ordered**, and the
-> order is not stable across runs or versions. Sort them, or accumulate
-> order-independently, if the output is compared against a golden.
+> **`keys()` and `values()` are in insertion order**, as in Python's `dict`.
+> Overwriting a key with `set` keeps its place; `remove` then `set` moves it to
+> the end; `merge(other)` appends `other`'s new keys in `other`'s order. The
+> order is the same on every run, so a golden can print it directly.
+>
+> Before 2026-11 they were in hash-bucket order, which reshuffled as the map
+> grew. Code that kept a parallel array of keys to get a stable order still
+> works and can now drop it.
 
 ## 8. `enum` methods
 

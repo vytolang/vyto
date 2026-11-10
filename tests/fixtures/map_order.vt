@@ -1,0 +1,116 @@
+// Builtin Map vs a parallel-array model: contents AND insertion order, under a
+// seeded random mix of set / remove / has / get_or / clear, plus the merge and
+// re-insert rules and a 300k-key grow-and-remove pass. Python-dict semantics:
+// overwriting keeps a key's place, removing and re-adding moves it to the end.
+// Wired into tests/run_tests.sh; the order guarantee is what it pins.
+
+fn rnd(st: int[], n: int): int {
+    // 31-bit LCG: the product stays under 2^62, so a debug build's overflow
+    // check never fires.
+    st[0] = (st[0] * 1103515245 + 12345) % 2147483648;
+    return (st[0] >> 8) % n;
+}
+
+fn model_find(ks: string[], k: string): int {
+    let i = 0;
+    while (i < ks.len) { if (ks[i] == k) { return i; } i += 1; }
+    return -1;
+}
+
+fn check(m: Map<string, string>, ks: string[], vs: string[], step: int): bool {
+    if (m.len != ks.len) { print("len mismatch at " + step + ": " + m.len + " vs " + ks.len); return false; }
+    let mk = m.keys();
+    let mv = m.values();
+    if (mk.len != ks.len || mv.len != ks.len) { print("keys/values len mismatch at " + step); return false; }
+    let i = 0;
+    while (i < ks.len) {
+        if (mk[i] != ks[i]) { print("order mismatch at " + step + " pos " + i + ": " + mk[i] + " vs " + ks[i]); return false; }
+        if (mv[i] != vs[i]) { print("value mismatch at " + step + " key " + ks[i]); return false; }
+        if (m.get(ks[i]) != vs[i]) { print("get mismatch at " + step); return false; }
+        i += 1;
+    }
+    return true;
+}
+
+fn main() {
+    let st: int[] = [12345];
+    let m = new Map<string, string>();
+    let ks: string[] = [];
+    let vs: string[] = [];
+    let universe = 3000;
+    let steps = 60000;
+    let ok = true;
+    let s = 0;
+    while (s < steps && ok) {
+        let op = rnd(st, 100);
+        let k = "k" + rnd(st, universe);
+        if (op < 55) {
+            let v = "v" + s;
+            m.set(k, v);
+            let i = model_find(ks, k);
+            if (i >= 0) { vs[i] = v; } else { ks.push(k); vs.push(v); }
+        } else if (op < 90) {
+            m.remove(k);
+            let i = model_find(ks, k);
+            if (i >= 0) { ks.remove_at(i); vs.remove_at(i); }
+        } else if (op < 99) {
+            let i = model_find(ks, k);
+            if (m.has(k) != (i >= 0)) { print("has mismatch at " + s); ok = false; }
+            let want = "?";
+            if (i >= 0) { want = vs[i]; }
+            if (m.get_or(k, "?") != want) { print("get_or mismatch at " + s); ok = false; }
+        } else if (rnd(st, 20) == 0) {
+            m.clear();
+            ks = [];
+            vs = [];
+        }
+        if (s % 997 == 0 && ok) { ok = check(m, ks, vs, s); }
+        s += 1;
+    }
+    if (ok) { ok = check(m, ks, vs, steps); }
+
+    // merge: o's new keys append in o's order; collisions keep m's position
+    let a = new Map<string, string>();
+    a.set("x", "1"); a.set("y", "2"); a.set("z", "3");
+    let b = new Map<string, string>();
+    b.set("w", "9"); b.set("y", "8"); b.set("q", "7");
+    a.merge(b);
+    print("merge keys " + a.keys().join(",") + " vals " + a.values().join(","));
+    a.merge(a);
+    print("self-merge " + a.keys().join(",") + " len " + a.len);
+
+    // remove then re-add moves to end; overwrite keeps place
+    let c = new Map<string, int>();
+    c.set("a", 1); c.set("b", 2); c.set("c", 3);
+    c.set("a", 10);
+    c.remove("b");
+    c.set("b", 20);
+    print("order " + c.keys().join(",") + " a=" + c.get("a") + " b=" + c.get("b"));
+
+    // empty and missing
+    let e = new Map<string, int>();
+    print("empty " + e.len + " " + e.has("x") + " " + e.get_or("x", -1) + " " + e.keys().len);
+    e.remove("x");
+    e.clear();
+    print("big " + bigcheck());
+    if (ok) { print("FUZZ OK"); } else { print("FUZZ FAIL"); }
+}
+
+fn bigcheck(): bool {
+    let m = new Map<string, int>();
+    let i = 0;
+    while (i < 300000) { m.set("key" + i, i); i += 1; }
+    i = 0;
+    while (i < 300000) { if (i % 3 == 0) { m.remove("key" + i); } i += 1; }
+    i = 0;
+    let ok = m.len == 200000;
+    while (i < 300000) {
+        let want = i % 3 != 0;
+        if (m.has("key" + i) != want) { ok = false; }
+        if (want && m.get("key" + i) != i) { ok = false; }
+        i += 1;
+    }
+    let ks = m.keys();
+    ok = ok && ks.len == 200000 && ks[0] == "key1" && ks[1] == "key2" && ks[2] == "key4";
+    return ok;
+}
