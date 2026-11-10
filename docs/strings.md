@@ -138,7 +138,7 @@ For first-only, use `text.replace_first` (§5). For pattern replacement, `vyto/r
 
 Those panic because a malformed number in a literal is a bug. When the input is
 *data* — a config file, a CLI flag, a form field — use the non-panicking
-versions in `vyto/cli`, which follow the library-wide "panic hard, sentinel
+versions in `vyto/util/parse`, which follow the library-wide "panic hard, sentinel
 soft" rule:
 
 ```js
