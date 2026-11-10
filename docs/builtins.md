@@ -226,8 +226,8 @@ Note `split` and `lines` disagree about trailing separators, deliberately —
 | `cstr(): cstring` | A NUL-terminated view for C. Cannot represent an embedded NUL. |
 
 > **`to_int` aborts the process on bad text.** That is wrong for anything a user
-> typed. `vyto/cli`'s `parse_int` / `parse_float` / `parse_bool` return a
-> success flag instead, and exist for exactly this.
+> typed. `vyto/util/parse`'s `parse_int` / `parse_float` / `parse_bool` return
+> a success flag instead, and exist for exactly this.
 
 Concatenation with `+` accepts any string-convertible operand, so
 `"n=" + 42` works. But **`s = s + x` in a loop is O(n²)** — use

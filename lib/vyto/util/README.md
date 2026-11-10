@@ -53,6 +53,7 @@ uuid4()                                   // "5f2b0c18-6a3e-4d71-9c2a-1e7f3b8d4a
 | `vyto/util/log` | `Logger` — levels, structured fields, text or JSON lines |
 | `vyto/util/uuid` ⚙ | UUID v4/v7, `Uuid7` for ordered keys, `rand_bytes`/`rand_int` |
 | `vyto/util/helper` | `is_http_url`, UTF-8 caret movement |
+| `vyto/util/parse` | `parse_int` / `parse_float` / `parse_bool` — scalar parses that return false instead of panicking |
 
 ⚙ marks a module backed by a native shim.
 
@@ -70,6 +71,11 @@ soft" rule stated in `fmt.vt`.
 let cfg = toml_parse(readfile("app.toml"));
 if (cfg.parseError() != "") { print(cfg.parseError()); exit(1); }
 ```
+
+`vyto/util/parse` is the same rule at scalar scale, and the reason it exists:
+the `to_int` / `to_float` builtins **abort the process** on text they cannot
+read, which is right for a literal in your own source and wrong for anything
+that arrived from outside it. `parse_int` returns false instead.
 
 **Accessors are forgiving.** A missing key, a wrong kind, an out-of-range index
 all return an empty value rather than crashing, so walking an uncertain document

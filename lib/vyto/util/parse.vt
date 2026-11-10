@@ -1,0 +1,95 @@
+// vyto/util/parse — scalar parsing that reports failure instead of aborting.
+//
+//     let n: int[] = [0];
+//     if (parse_int(field, n)) { use(n[0]); }
+//     else                     { report("not a number: " + field); }
+//
+// The builtins `to_int` and `to_float` **panic** on text they cannot read,
+// which kills the process. That is right for a literal in your own source and
+// wrong for anything that came from outside it — a config file, a JSON field,
+// an HTTP parameter, a command line. These return false instead, so the caller
+// decides what a bad value means.
+//
+// Each leaves `out` untouched on failure. `out` is a 1-element array because
+// Vyto has no out-parameters (the vyto/ui/datatable idiom).
+//
+// ── WHY THIS IS NOT IN vyto/cli ─────────────────────────────────────────────
+// It was, until 2026-09-16, and most of the imports were wrong because of it:
+// twelve files took only the parsers while nine actually wanted `Cli`, and the
+// twelve included `vyto/validator`, which has nothing to do with command lines.
+// Parsing a number out of an INI value is a string question, not a CLI one.
+// `vyto/cli` still re-exports all three, so the old import path resolves.
+//
+// ── NO IMPORTS, DELIBERATELY ────────────────────────────────────────────────
+// Like `vyto/util/ascii`, this file imports nothing and carries no shim, so it
+// builds on a freestanding target. That matters because `vyto/validator`
+// depends on it: putting these in `vyto/util/text` instead would have pulled
+// that module's StringBuilder shim into every validator build.
+
+// Strict decimal integer: [+-]?digits. No whitespace, no hex, no separators,
+// and — unlike to_int, which panics — no overflow.
+export fn parse_int(s: string, out: int[]): bool {
+    if (s.len == 0) { return false; }
+    let i = 0;
+    let neg = false;
+    if (s[0] == 43 || s[0] == 45) { neg = s[0] == 45; i = 1; }
+    if (i >= s.len) { return false; }          // a sign and nothing else
+    let j = i;
+    while (j < s.len) {
+        if (s[j] < 48 || s[j] > 57) { return false; }
+        j += 1;
+    }
+    // Overflow, without ever handing to_int something it would abort on: count
+    // significant digits, then compare the 19-digit case against the bound.
+    let lead = i;
+    while (lead < s.len - 1 && s[lead] == 48) { lead += 1; }
+    let digits = s.len - lead;
+    if (digits > 19) { return false; }
+    if (digits == 19) {
+        let bound = "9223372036854775807";
+        if (neg) { bound = "9223372036854775808"; }
+        let k = 0;
+        while (k < 19) {
+            if (s[lead + k] > bound[k]) { return false; }
+            if (s[lead + k] < bound[k]) { k = 19; }   // definitely under; stop
+            else { k += 1; }
+        }
+    }
+    out[0] = s.to_int();
+    return true;
+}
+
+// [+-]?digits[.digits][(e|E)[+-]digits] — the grammar to_float accepts, minus
+// the surrounding whitespace it tolerates. No "inf", no "nan", no hex.
+export fn parse_float(s: string, out: float[]): bool {
+    if (s.len == 0) { return false; }
+    let i = 0;
+    if (s[0] == 43 || s[0] == 45) { i = 1; }
+    let intDigits = 0;
+    while (i < s.len && s[i] >= 48 && s[i] <= 57) { i += 1; intDigits += 1; }
+    if (intDigits == 0) { return false; }
+    if (i < s.len && s[i] == 46) {                  // '.'
+        i += 1;
+        let fracDigits = 0;
+        while (i < s.len && s[i] >= 48 && s[i] <= 57) { i += 1; fracDigits += 1; }
+        if (fracDigits == 0) { return false; }      // "1." is not a number here
+    }
+    if (i < s.len && (s[i] == 101 || s[i] == 69)) { // 'e' | 'E'
+        i += 1;
+        if (i < s.len && (s[i] == 43 || s[i] == 45)) { i += 1; }
+        let expDigits = 0;
+        while (i < s.len && s[i] >= 48 && s[i] <= 57) { i += 1; expDigits += 1; }
+        if (expDigits == 0) { return false; }
+    }
+    if (i != s.len) { return false; }               // trailing junk
+    out[0] = s.to_float();
+    return true;
+}
+
+// true|false, 1|0, yes|no, on|off — case-insensitive.
+export fn parse_bool(s: string, out: bool[]): bool {
+    let t = s.to_lower();
+    if (t == "true" || t == "1" || t == "yes" || t == "on") { out[0] = true; return true; }
+    if (t == "false" || t == "0" || t == "no" || t == "off") { out[0] = false; return true; }
+    return false;
+}

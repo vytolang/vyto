@@ -18,8 +18,9 @@
 // Two rules shape the design:
 //
 //   * User input never panics. `to_int`/`to_float` abort the process on bad
-//     text, so every value goes through parse_int/parse_float/parse_bool below
-//     and a bad one becomes an error message naming the flag.
+//     text, so every value goes through vyto/util/parse's parse_int /
+//     parse_float / parse_bool and a bad one becomes an error message naming
+//     the flag.
 //   * Your own mistakes do panic. Reading a name you never declared, or reading
 //     the wrong kind, is a source typo — the exact bug class this module exists
 //     to remove — so it fails loudly instead of returning "".
@@ -34,77 +35,18 @@ export const CLI_INT:    int = 2;
 export const CLI_FLOAT:  int = 3;
 
 // ---- non-panicking scalar parsing -----------------------------------------
-// The repo's first parses that report failure instead of aborting. Each returns
-// false and leaves `out` untouched on bad input; `out` is a 1-element array
-// because Vyto has no out-parameters (the vyto/ui/datatable idiom).
-
-// Strict decimal integer: [+-]?digits. No whitespace, no hex, no separators,
-// and — unlike to_int, which panics — no overflow.
-export fn parse_int(s: string, out: int[]): bool {
-    if (s.len == 0) { return false; }
-    let i = 0;
-    let neg = false;
-    if (s[0] == 43 || s[0] == 45) { neg = s[0] == 45; i = 1; }
-    if (i >= s.len) { return false; }          // a sign and nothing else
-    let j = i;
-    while (j < s.len) {
-        if (s[j] < 48 || s[j] > 57) { return false; }
-        j += 1;
-    }
-    // Overflow, without ever handing to_int something it would abort on: count
-    // significant digits, then compare the 19-digit case against the bound.
-    let lead = i;
-    while (lead < s.len - 1 && s[lead] == 48) { lead += 1; }
-    let digits = s.len - lead;
-    if (digits > 19) { return false; }
-    if (digits == 19) {
-        let bound = "9223372036854775807";
-        if (neg) { bound = "9223372036854775808"; }
-        let k = 0;
-        while (k < 19) {
-            if (s[lead + k] > bound[k]) { return false; }
-            if (s[lead + k] < bound[k]) { k = 19; }   // definitely under; stop
-            else { k += 1; }
-        }
-    }
-    out[0] = s.to_int();
-    return true;
-}
-
-// [+-]?digits[.digits][(e|E)[+-]digits] — the grammar to_float accepts, minus
-// the surrounding whitespace it tolerates. No "inf", no "nan", no hex.
-export fn parse_float(s: string, out: float[]): bool {
-    if (s.len == 0) { return false; }
-    let i = 0;
-    if (s[0] == 43 || s[0] == 45) { i = 1; }
-    let intDigits = 0;
-    while (i < s.len && s[i] >= 48 && s[i] <= 57) { i += 1; intDigits += 1; }
-    if (intDigits == 0) { return false; }
-    if (i < s.len && s[i] == 46) {                  // '.'
-        i += 1;
-        let fracDigits = 0;
-        while (i < s.len && s[i] >= 48 && s[i] <= 57) { i += 1; fracDigits += 1; }
-        if (fracDigits == 0) { return false; }      // "1." is not a number here
-    }
-    if (i < s.len && (s[i] == 101 || s[i] == 69)) { // 'e' | 'E'
-        i += 1;
-        if (i < s.len && (s[i] == 43 || s[i] == 45)) { i += 1; }
-        let expDigits = 0;
-        while (i < s.len && s[i] >= 48 && s[i] <= 57) { i += 1; expDigits += 1; }
-        if (expDigits == 0) { return false; }
-    }
-    if (i != s.len) { return false; }               // trailing junk
-    out[0] = s.to_float();
-    return true;
-}
-
-// true|false, 1|0, yes|no, on|off — case-insensitive.
-export fn parse_bool(s: string, out: bool[]): bool {
-    let t = s.to_lower();
-    if (t == "true" || t == "1" || t == "yes" || t == "on") { out[0] = true; return true; }
-    if (t == "false" || t == "0" || t == "no" || t == "off") { out[0] = false; return true; }
-    return false;
-}
+// These moved to vyto/util/parse on 2026-09-16: twelve of this module's
+// importers took only the parsers and never touched `Cli`, and one of them was
+// vyto/validator, which has nothing to do with command lines. Reading a number
+// out of a config file is a string question, not a CLI one.
+//
+// A Vyto import IS a re-export, so `import { parse_int } from "vyto/cli"` still
+// resolves — the same compatibility trick url_encode and base64_encode used
+// when they moved. New code should import vyto/util/parse directly.
+//
+// This is the module's only import, and vyto/util/parse is itself import-free
+// and shim-free, so vyto/cli still builds on a freestanding target.
+import { parse_int, parse_float, parse_bool } from "vyto/util/parse";
 
 // ---- Flag -----------------------------------------------------------------
 

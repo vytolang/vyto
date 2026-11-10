@@ -142,7 +142,7 @@ versions in `vyto/cli`, which follow the library-wide "panic hard, sentinel
 soft" rule:
 
 ```js
-import { parse_int, parse_float, parse_bool } from "vyto/cli";
+import { parse_int, parse_float, parse_bool } from "vyto/util/parse";
 
 let out: int[] = [0];                          // note: one element, not []
 if (parse_int(userInput, out)) { use(out[0]); } else { complain(); }
@@ -428,7 +428,7 @@ mail.replaceFn(log, redact);
 **Deliberately only two.** UUID, URL, ISO-date and numbers already have
 hand-written validators that beat a regex on accuracy and error reporting — use
 `uuid_is_valid`, `url_is_valid`, `date_parse` + `date_is_valid`, and
-`cli.parse_int` / `parse_float` instead.
+`vyto/util/parse`'s `parse_int` / `parse_float` instead.
 
 `rx_is_email_loose` accepts `first.last@sub.example.co.uk`, `user+tag@x.io` and
 internationalised domains; rejects a missing `@`, whitespace, a domain with no
@@ -561,7 +561,7 @@ Use `foldCase` or a `Collator` for case-insensitive comparison of real text;
 | Case-insensitive compare, ASCII | `text.equals_ignore_case` |
 | Case-insensitive compare, real text | `unicode.foldCase` or a `Collator` |
 | Parse a number you trust | `s.to_int()` |
-| Parse a number from a user | `cli.parse_int(s, out)` |
+| Parse a number from a user | `parse_int(s, out)` from `vyto/util/parse` |
 | Check *and* convert user input | `vyto/validator` — `v.check(s).asInt().between(1, 99)` |
 | "Is this an email / URL / date?" | `vyto/validator` — and see its notes on why `url()` and `isoDate()` are stricter than the parsers |
 | Build a string in a loop | `text.stringBuilder(cap)` |
