@@ -679,7 +679,7 @@ static char *emit_call(Em *em, Expr *e, bool *fresh) {
             return strconv_frag(em, a[0]);
         case B_PUSH: {
             Type *et = recv->type->elem;
-            const char *tv = newtemp(em, et, false); /* borrowed value; the store retains */
+            const char *tv = newtemp(em, et, false); /* not released: the array owns it */
             *fresh = false;
             /* Inline fast path: vt_arr_push_slot returns the new element's
                slot (len already bumped) and the typed store happens here, so
@@ -689,11 +689,16 @@ static char *emit_call(Em *em, Expr *e, bool *fresh) {
                value expression that reads the array sees its old length). A
                ref element is retained on store, exactly as vt_arr_push did. */
             const char *ct = c_type(et);
+            /* A ref element is taken OWNED (ex_o): a fresh value -- `new X()`,
+               a concat, a call result -- moves straight into the slot, where
+               it used to be retained by the store and then released at the
+               end of the statement, two RC operations that cancel. A borrowed
+               value is retained once by ex_o, as before. */
             if (type_is_ref(et))
                 return arena_printf(&g_arena,
-                                    "(%s = %s, (void)(*(%s*)vt_arr_push_slot(%s, sizeof(%s), \"%s\", %d) = (%s)vt_retain(%s)))",
-                                    tv, ex_v(em, a[0], et), ct, ex_b(em, recv), ct,
-                                    c_escape(e->loc.file, strlen(e->loc.file)), e->loc.line, ct, tv);
+                                    "(%s = %s, (void)(*(%s*)vt_arr_push_slot(%s, sizeof(%s), \"%s\", %d) = %s))",
+                                    tv, ex_o(em, a[0], et), ct, ex_b(em, recv), ct,
+                                    c_escape(e->loc.file, strlen(e->loc.file)), e->loc.line, tv);
             return arena_printf(&g_arena,
                                 "(%s = %s, (void)(*(%s*)vt_arr_push_slot(%s, sizeof(%s), \"%s\", %d) = %s))",
                                 tv, ex_v(em, a[0], et), ct, ex_b(em, recv), ct,
@@ -1133,10 +1138,12 @@ static char *ex(Em *em, Expr *e, bool *fresh) {
     case EX_BOOL: return arena_strdup(&g_arena, e->ival ? "true" : "false");
     case EX_NULL: return arena_strdup(&g_arena, "0");
     case EX_STR: {
+        /* A static immortal object, not a lazily built one: no branch, no
+           allocation, no first-use race (VT_STR_LIT_DECL in vyto_rt.h). */
         const char *v = arena_printf(&g_arena, "_sl%d", em->tempc++);
-        sb_printf(em->pre, "    static VtString* %s;\n", v);
-        return arena_printf(&g_arena, "(%s ? %s : (%s = vt_str_immortal(\"%s\", %d)))", v, v, v,
-                            c_escape(e->sval, e->slen), (int)e->slen);
+        sb_printf(em->pre, "    VT_STR_LIT_DECL(%s, %d, \"%s\");\n", v, (int)e->slen,
+                  c_escape(e->sval, e->slen));
+        return arena_printf(&g_arena, "VT_STR_LIT(%s)", v);
     }
     case EX_THIS: return arena_strdup(&g_arena, "self");
     case EX_IDENT:
@@ -2753,13 +2760,13 @@ void emit_module(Module *m, bool is_entry, bool checks, EntryMode mode, SBuf *h,
         case D_CONST: {
             Expr *e = d->const_init;
             if (e->kind == EX_STR) {
-                /* string consts are immortal strings, built lazily on first use; a
+                /* string consts are static immortal objects (VT_STR_LIT_DECL); a
                    static inline accessor avoids unused-variable warnings across TUs. */
                 sb_printf(h, "static inline VtString* v_%s_%s(void) {\n"
-                             "    static VtString* _s;\n"
-                             "    return _s ? _s : (_s = vt_str_immortal(\"%s\", %d));\n"
+                             "    VT_STR_LIT_DECL(_s, %d, \"%s\");\n"
+                             "    return VT_STR_LIT(_s);\n"
                              "}\n",
-                          m->name, d->name, c_escape(e->sval, e->slen), (int)e->slen);
+                          m->name, d->name, (int)e->slen, c_escape(e->sval, e->slen));
                 break;
             }
             const char *v;

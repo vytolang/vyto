@@ -181,6 +181,20 @@ typedef struct VtString {
 
 VtString *vt_str_new(const char *bytes, int64_t len);      /* fresh, rc=1 */
 VtString *vt_str_immortal(const char *bytes, int64_t len); /* interned literal */
+/* A string literal as a static immortal object, laid out exactly like a
+   VtString (header, len, then the bytes and their NUL at offset 24), so the
+   emitter can hand out `VT_STR_LIT(name)` with no allocation and no branch.
+   Each use of a literal used to be `_sl ? _sl : (_sl = vt_str_immortal(...))`:
+   a load and a branch on every evaluation, a heap allocation on the first, and
+   a data race when two threads reached the first one together.
+
+   rc is -1 (immortal), so retain/release never write to it, and nothing
+   else writes to a string's header after construction. */
+extern const VtType vt_string_type;
+#define VT_STR_LIT_DECL(name, n, text) \
+    static struct { VtObj hdr; int64_t len; char data[(n) + 1]; } name = \
+        {{-1, &vt_string_type}, (n), text}
+#define VT_STR_LIT(name) ((VtString *)&(name))
 VtString *vt_str_concat(VtString *a, VtString *b);
 VtString *vt_str_concat_int(VtString *a, int64_t v); /* fused: concat(a, from_int(v)), one alloc */
 VtString *vt_str_join(int n, VtString **parts);      /* n parts, one alloc; parts are borrowed */

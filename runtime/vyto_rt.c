@@ -52,20 +52,32 @@ static const unsigned pool_slot[] = {16, 32, 48, 64, 96, 128, 192, 256, 384, 512
 typedef struct { void *freelist; char *bump, *end; } PoolClass;
 static __thread PoolClass g_pool[VT_NCLASS];
 
-static int pool_class_of(size_t total) { /* total includes VT_HDR */
-    for (int i = 0; i < VT_NCLASS; i++)
-        if (total <= pool_slot[i]) return i;
-    return -1;
+/* Size -> class in one load: entry k serves totals in (16k, 16(k+1)]. Was a
+   linear scan over pool_slot, up to ten compares on every allocation. Must
+   agree with pool_slot above (checked by hand: each entry is the first class
+   whose slot is >= 16(k+1)). */
+static const unsigned char pool_class_tab[VT_POOL_MAX / 16] = {
+    0, 1, 2, 3, 4, 4, 5, 5,           /*  16 ..128 */
+    6, 6, 6, 6, 7, 7, 7, 7,           /* 144 ..256 */
+    8, 8, 8, 8, 8, 8, 8, 8,           /* 272 ..384 */
+    9, 9, 9, 9, 9, 9, 9, 9,           /* 400 ..512 */
+};
+static int pool_class_of(size_t total) { /* total includes VT_HDR; <= VT_POOL_MAX */
+    return pool_class_tab[(total - 1) >> 4];
 }
 
-static void *vt_host_alloc(size_t n) {
+/* `zero` = the caller relies on zeroed memory. Objects do (vt_alloc promises
+   zeroed fields); string payloads do not -- every str_alloc caller overwrites
+   all len bytes -- so they skip the memset of a reused slot, and a large one
+   takes malloc instead of calloc. */
+static void *pool_alloc(size_t n, int zero) {
     if (!n) n = 1;
     size_t total = n + VT_HDR;
     int c = (total <= VT_POOL_MAX) ? pool_class_of(total) : -1;
     if (c < 0) { /* large: calloc keeps the OS lazy-zero-page win for big
                     buffers (malloc+memset would eagerly fault every page).
                     Header carries the size for realloc/copy. */
-        uint64_t *h = (uint64_t *)calloc(1, n + VT_HDR);
+        uint64_t *h = (uint64_t *)(zero ? calloc(1, n + VT_HDR) : malloc(n + VT_HDR));
         if (!h) return NULL;
         h[0] = ((uint64_t)n << 8) | VT_LARGE_TAG;
         return (char *)h + VT_HDR;
@@ -75,7 +87,7 @@ static void *vt_host_alloc(size_t n) {
     if (pc->freelist) {
         slot = (char *)pc->freelist;
         pc->freelist = *(void **)slot;
-        memset(slot, 0, pool_slot[c]); /* reused slot is dirty */
+        if (zero) memset(slot, 0, pool_slot[c]); /* reused slot is dirty */
     } else {
         if (pc->bump + pool_slot[c] > pc->end) {
             char *chunk = (char *)calloc(1, VT_CHUNK); /* zeroed once */
@@ -89,6 +101,8 @@ static void *vt_host_alloc(size_t n) {
     *(uint64_t *)slot = (uint64_t)c;
     return slot + VT_HDR;
 }
+static void *vt_host_alloc(size_t n) { return pool_alloc(n, 1); }
+static void *vt_host_alloc_raw(size_t n) { return pool_alloc(n, 0); }
 
 static void vt_host_free(void *p) {
     if (!p) return;
@@ -131,6 +145,7 @@ static void *vt_host_realloc(void *p, size_t n) {
 }
 #else
 static void *vt_host_alloc(size_t n) { return calloc(1, n ? n : 1); }
+static void *vt_host_alloc_raw(size_t n) { return malloc(n ? n : 1); }
 static void *vt_host_realloc(void *p, size_t n) { return realloc(p, n); }
 static void vt_host_free(void *p) { free(p); }
 #endif
@@ -138,6 +153,10 @@ static void vt_host_free(void *p) { free(p); }
 static void vt_host_write(const char *buf, size_t len) { fwrite(buf, 1, len, stdout); }
 static void vt_host_write_err(const char *buf, size_t len) { fwrite(buf, 1, len, stderr); }
 VT_NORETURN static void vt_host_abort(void) { exit(101); }
+#else
+/* Freestanding: allocation is the embedder's vt_host_alloc hook (vyto_host.h),
+   which promises zeroed memory. There is no cheaper raw variant to ask for. */
+#define vt_host_alloc_raw vt_host_alloc
 #endif
 
 #ifndef VT_NO_FS
@@ -728,10 +747,13 @@ VT_NORETURN void vt_panic(const char *file, int line, VtString *msg) {
 /* ---- strings ---- */
 
 static void str_deinit(void *self) { (void)self; }
-static const VtType vt_string_type = {"string", str_deinit, NULL, NULL};
+/* Not static: VT_STR_LIT_DECL (vyto_rt.h) points emitted literals at it. */
+const VtType vt_string_type = {"string", str_deinit, NULL, NULL};
 
+/* Not zeroed: every caller fills all len bytes, and the header and the NUL are
+   written here. */
 static VtString *str_alloc(int64_t len) {
-    VtString *s = vt_host_alloc(sizeof(VtString) + (size_t)len + 1);
+    VtString *s = vt_host_alloc_raw(sizeof(VtString) + (size_t)len + 1);
     if (!s) vt_oom();
     s->hdr.rc = 1;
     s->hdr.type = &vt_string_type;
