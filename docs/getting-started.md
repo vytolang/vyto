@@ -277,6 +277,13 @@ and prebuilt `native/windows-x64/*.dll` packages.
 carry a native shim: `getrandom(2)` on Linux, `BCryptGenRandom` on Windows (so it
 `#link`s `bcrypt` there), `/dev/urandom` otherwise.
 
+`vyto/terminal` is portable on the same terms — termios on POSIX, the console
+API on Windows, and a stub arm that reports "not a terminal" under
+`--freestanding`. It needs no `#link` at all, since everything it binds is
+libc. The not-a-terminal answer is a normal state rather than a failure: under
+a pipe, a CI runner or a freestanding target, `raw_mode()` returns null and the
+ANSI helpers return empty strings, so output stays byte-stable.
+
 `vyto/regex` is portable and needs no provisioning, which is worth calling out
 because it carries by far the most in-tree C of any module: PCRE2 and its JIT
 are vendored under `lib/vyto/regex/native/src/pcre2/` and compiled from source

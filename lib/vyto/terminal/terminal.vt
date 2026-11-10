@@ -1,0 +1,173 @@
+// vyto/terminal — the controlling terminal: raw keys, size, and unbuffered output.
+//
+//     let t = raw_mode();                     // null when stdin is not a tty
+//     if (t != null) {
+//         let k = t.key(-1);                  // blocks until a keypress
+//         if (k == KEY_UP) { ... }
+//     }                                       // t drops -> terminal restored
+//
+// This is the layer *below* a widget toolkit: keys in, bytes out, nothing that
+// knows what a button is. `vyto/ui` on a Painter that emits ANSI is a separate,
+// larger thing (local/docs/MODULES.md, Tier C) and would sit on top of this.
+//
+// ── THE RESTORE IS TIED TO THE REFCOUNT, AND THAT IS DELIBERATE ─────────────
+// Raw mode turns off echo. A program that exits without restoring leaves the
+// user typing blind into a shell that shows nothing back — they have to know
+// to run `reset`, from memory, with no feedback. So there is no `close()`:
+// the saved state is released in `deinit`, which reference counting runs on
+// every normal exit path.
+//
+// `deinit` alone is not enough, and both gaps were found by measuring:
+//
+//   • `panic()` is `exit(101)` and unwinds nothing, so no destructor runs.
+//   • Ctrl+C raises SIGINT, which terminates without even running `atexit`.
+//
+// The shim therefore also registers an `atexit` restore AND handlers for
+// SIGINT/SIGTERM/SIGQUIT/SIGHUP, each of which restores, reinstates the
+// previous disposition and re-raises — so the process still dies by that
+// signal. Handlers are installed only where the application has not set its
+// own, and are removed when raw mode ends. See term_shim.c.
+//
+// To leave raw mode early, drop the reference: `t = null;`. Frees are
+// deterministic, so the terminal is restored on that line.
+//
+// **Hold the `Term` in a local or a field for as long as you want raw mode.**
+//     raw_mode().key(-1);      // DO NOT
+// The Term is unreferenced the moment that expression ends, so the terminal is
+// restored before the key is even read. It looks like a reasonable one-liner,
+// which is why it is called out here.
+//
+// ── CTRL+C STILL WORKS ──────────────────────────────────────────────────────
+// ISIG is left enabled, so Ctrl+C interrupts as usual rather than arriving as
+// a keycode. A beginner-facing tool that swallows Ctrl+C is a trap, and the
+// deinit restores the terminal on the way out regardless.
+//
+// ── NOT A TTY IS A NORMAL STATE, NOT AN ERROR ───────────────────────────────
+// Under a pipe, a CI runner, or a freestanding target, `isatty()` is false,
+// `raw_mode()` returns null and `size()` reports the 80x24 fallback. Every
+// caller must handle that path — it is the one the test suite exercises, and
+// the one that keeps piped output byte-stable.
+
+extern "C" {
+    fn vterm_raw(fd: i32): rawptr;
+    fn vterm_restore(h: rawptr);
+    fn vterm_read_key(h: rawptr, timeout_ms: i32): i32;
+    fn vterm_size(out: rawptr): i32;
+    fn vterm_isatty(fd: i32): i32;
+    fn vterm_write(fd: i32, buf: cstring, n: i64): i64;
+}
+
+// Key codes. These match VS_KEY_* in vyto/surface exactly — a key is the same
+// key whether it arrived from X11 or from a tty, and sharing the numbering is
+// what lets a future terminal backend for vyto/ui reuse both event sources
+// without a translation table.
+//
+// A printable character is its own byte value, so there is no constant for it:
+// test `k >= 32 && k < 127` and use `chr(k)`.
+export const KEY_ENTER:     int = 1000;
+export const KEY_BACKSPACE: int = 1001;
+export const KEY_ESC:       int = 1002;
+export const KEY_UP:        int = 1003;
+export const KEY_DOWN:      int = 1004;
+export const KEY_LEFT:      int = 1005;
+export const KEY_RIGHT:     int = 1006;
+export const KEY_DELETE:    int = 1007;
+export const KEY_TAB:       int = 1008;
+export const KEY_HOME:      int = 1009;
+export const KEY_END:       int = 1010;
+export const KEY_PAGEUP:    int = 1011;
+export const KEY_PAGEDOWN:  int = 1012;
+export const KEY_INSERT:    int = 1013;
+
+// Non-key results from `key()`. Negative, so nothing collides with a keycode.
+export const EOF:     int = -1;   // stdin closed; stop reading
+export const TIMEOUT: int = -2;   // nothing arrived within the timeout
+export const ERR:     int = -3;
+
+const FD_IN:  int = 0;
+const FD_OUT: int = 1;
+
+// Fallback when the size cannot be determined — a pipe, a CI log, a dumb
+// terminal. 80x24 is the conventional assumption and is what `less` and `ls`
+// fall back to, so output lines up with what the user sees elsewhere.
+const DEFAULT_COLS: int = 80;
+const DEFAULT_ROWS: int = 24;
+
+export class Term {
+    h: rawptr;
+
+    fn init(h: rawptr) { this.h = h; }
+
+    // Restores the terminal. Tied to the refcount on purpose — see the header.
+    deinit { vterm_restore(this.h); this.h = null; }
+
+    // One keypress.
+    //
+    // `timeout_ms` < 0 blocks until a key arrives. 0 polls. Otherwise waits
+    // that long and returns TIMEOUT if nothing came — which is how a caller
+    // interleaves input with its own work (an animation, a spinner) without a
+    // second thread.
+    //
+    // Returns a KEY_* constant, a printable character's byte value, or one of
+    // EOF / TIMEOUT / ERR.
+    //
+    // **Ctrl+D is not EOF here.** Raw mode clears ICANON, so the line
+    // discipline stops translating it and it arrives as the ordinary control
+    // byte 4 — verified. A program that wants Ctrl+D to mean "done" must test
+    // for 4 itself. EOF is reported when the descriptor really is finished,
+    // and a terminal that disappears (the emulator closing) arrives as SIGHUP
+    // rather than EOF, which is handled in the shim.
+    fn key(timeout_ms: int): int {
+        if (this.h == null) { return ERR; }
+        return vterm_read_key(this.h, timeout_ms as i32) as int;
+    }
+}
+
+// Enter raw mode: keys arrive one at a time, unechoed.
+//
+// Returns null when stdin is not a terminal, which is not an error — it is a
+// pipe, and the caller should fall back to reading lines or to plain output.
+export fn raw_mode(): Term {
+    let h = vterm_raw(FD_IN as i32);
+    if (h == null) { return null; }
+    return new Term(h);
+}
+
+// Is stdin a terminal? The question worth asking before offering an
+// interactive path at all.
+export fn isatty(): bool { return vterm_isatty(FD_IN as i32) as int == 1; }
+
+// Is stdout a terminal? The question worth asking before emitting colour —
+// `prog | less` has an interactive stdin and a piped stdout, and styling that
+// survives into the pipe is what puts escape bytes in a log file.
+export fn stdout_isatty(): bool { return vterm_isatty(FD_OUT as i32) as int == 1; }
+
+// Terminal size as [columns, rows]; [80, 24] when it cannot be determined.
+//
+// Read it fresh where it matters rather than caching: a terminal can be
+// resized at any moment, and this is a cheap ioctl.
+export fn size(): int[] {
+    let wh: i32[] = [0 as i32, 0 as i32];
+    if (vterm_size(wh as rawptr) as int != 0) {
+        return [DEFAULT_COLS, DEFAULT_ROWS];
+    }
+    return [wh[0] as int, wh[1] as int];
+}
+
+export fn cols(): int { return size()[0]; }
+export fn rows(): int { return size()[1]; }
+
+// Write with no trailing newline, flushing `print`'s buffer first.
+//
+// `print()` always appends a newline (runtime/vyto_rt.c:830) and reaches stdout
+// through the runtime's *buffered* fwrite, while this is an unbuffered write(2)
+// on the same descriptor. They do not share a buffer, so without the flush this
+// shim performs, a prompt written here would appear before output that was
+// printed earlier. Same hazard, same fix as local/vytodba/repl.vt:36-39.
+//
+// This is the only way to put a character on the screen without a line break,
+// which every prompt and every redraw needs.
+export fn emit(s: string) {
+    if (s.len == 0) { return; }
+    vterm_write(FD_OUT as i32, s.cstr(), s.len as i64);
+}

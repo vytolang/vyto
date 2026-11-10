@@ -1,0 +1,209 @@
+// vyto/terminal/prompt — a query field that filters as you type.
+//
+//     fn matches(q: string): string[] { return search(q); }
+//
+//     let p = prompt("how to ");
+//     p.on_filter(matches);          // a NAMED fn: see below
+//     let picked = p.run();          // "" if the user escaped out
+//
+// The filter must be a named function. An inline `fn (q: string) ... ` literal
+// is not an expression in Vyto and is a parse error at the call site, which is
+// worth knowing before writing the obvious thing.
+//
+// The interaction a lookup tool wants: type, see candidates narrow live, move
+// with the arrow keys, commit with Enter. It is the thing a CLI cannot do with
+// line input, and the reason this package exists.
+//
+// ── IT DRAWS IN PLACE, NOT FULL SCREEN ──────────────────────────────────────
+// The field and its candidate rows are redrawn where the cursor already is,
+// then erased on exit. No alternate screen buffer, so scrollback is untouched
+// and the user's earlier output stays on screen. That keeps it usable as one
+// step inside an ordinary CLI session rather than taking the terminal over.
+//
+// ── NOT A TTY IS A NORMAL STATE ─────────────────────────────────────────────
+// `run()` returns "" immediately when stdin is not a terminal. A caller must
+// have a non-interactive path anyway — an argument, a flag, a default — and
+// silently returning nothing is better than blocking a pipeline forever.
+//
+// ── ASCII INPUT ONLY ────────────────────────────────────────────────────────
+// Typed characters are accepted in the range 32..126. A multi-byte UTF-8
+// character arrives as several bytes, each outside that range, so it is
+// dropped rather than appended half-formed — the query stays valid UTF-8 and
+// nothing corrupts, but a non-ASCII character cannot be typed into the field.
+// Verified, not assumed: typing "é" leaves the query unchanged.
+//
+// Accepting it properly means assembling the continuation bytes and knowing
+// the character's display width, which is vyto/intl's job, not this module's.
+// The filter and the rows are unaffected — they are ordinary strings and may
+// hold any UTF-8 the caller likes.
+
+import { Term, raw_mode, isatty, emit, size,
+         KEY_ENTER, KEY_BACKSPACE, KEY_ESC, KEY_UP, KEY_DOWN,
+         KEY_DELETE, EOF, ERR, TIMEOUT } from "vyto/terminal";
+import { clear_line, to_col, up, down, hide_cursor, show_cursor,
+         reverse, reset, dim, bold, truncate, width } from "vyto/terminal/ansi";
+import { chr } from "vyto/util/text";
+
+// How many candidates to show at once. Beyond this the list stops being
+// scannable and starts being a second problem; the prototype settled on the
+// same number (local/how-to/how/main.vt:172).
+const MAX_ROWS: int = 6;
+
+// Ctrl+D. Raw mode clears ICANON, so this arrives as a plain control byte
+// rather than being turned into EOF by the terminal driver.
+const CTRL_D: int = 4;
+
+export class Prompt {
+    label: string;
+    q: string;
+    rows: string[];
+    sel: int;
+
+    // The filter. Takes the query, returns the rows to show, best first.
+    filter: fn(string): string[];
+
+    // Rows drawn last time, so the redraw knows how many lines to erase.
+    drawn: int;
+
+    fn init(label: string) {
+        this.label = label;
+        this.q = "";
+        this.rows = [];
+        this.sel = 0;
+        this.filter = null;
+        this.drawn = 0;
+    }
+
+    fn on_filter(f: fn(string): string[]) { this.filter = f; }
+
+    // Re-run the filter. Resets the selection to the top and reopens the list,
+    // because the rows underneath it just changed — keeping `sel` across a
+    // requery points it at a different candidate than the one the user saw.
+    fn requery() {
+        if (this.filter == null) { this.rows = []; return; }
+        this.rows = this.filter(this.q);
+        this.sel = 0;
+    }
+
+    fn visible_rows(): int {
+        let n = this.rows.len;
+        if (n > MAX_ROWS) { n = MAX_ROWS; }
+        return n;
+    }
+
+    // Erase what the last draw left, leaving the cursor on the field's line.
+    fn erase() {
+        if (this.drawn > 0) {
+            for (let i in 0..(this.drawn)) {
+                emit(down(1) + clear_line());
+            }
+            emit(up(this.drawn));
+        }
+        emit(to_col(1) + clear_line());
+        this.drawn = 0;
+    }
+
+    fn draw() {
+        this.erase();
+        let cols = size()[0];
+
+        emit(to_col(1) + clear_line() + bold() + this.label + reset() + this.q);
+
+        let n = this.visible_rows();
+        for (let i in 0..n) {
+            let row = truncate(this.rows[i], cols - 2);
+            emit(chr(10) + to_col(1) + clear_line());
+            if (i == this.sel) { emit(reverse() + " " + row + " " + reset()); }
+            else               { emit(" " + row); }
+        }
+        if (n > 0) {
+            // Back up to the field line so the cursor sits after the query,
+            // where the user is typing.
+            emit(up(n));
+        }
+        emit(to_col(1 + width(this.label) + this.q.len));
+        this.drawn = n;
+    }
+
+    // Run the loop. Returns the committed row, or "" if the user escaped out
+    // or stdin is not a terminal.
+    //
+    // The terminal is restored and the cursor re-shown on every exit path:
+    // `t` drops at the end of the function, and the explicit show_cursor()
+    // pairs the hide below. A panic is covered too — see terminal.vt.
+    fn run(): string {
+        if (!isatty()) { return ""; }
+        let t = raw_mode();
+        if (t == null) { return ""; }
+
+        this.requery();
+        emit(hide_cursor());
+        this.draw();
+
+        let out = "";
+        let running = true;
+        while (running) {
+            let k = t.key(-1);
+
+            if (k == EOF || k == ERR) { running = false; }
+            else if (k == TIMEOUT) { }
+            else if (k == KEY_ENTER) {
+                // Enter always ends the loop, even with nothing to commit.
+                //
+                // Returning "" on an empty list rather than ignoring the key
+                // is the whole point: a user who mistyped and pressed Enter
+                // otherwise gets silence from a program that looks hung, with
+                // no hint that Escape is the way out. The caller sees "" and
+                // can say "nothing matched" — which it has to handle anyway,
+                // since Escape produces the same answer.
+                if (this.rows.len > 0 && this.sel < this.rows.len) {
+                    out = this.rows[this.sel];
+                }
+                running = false;
+            }
+            else if (k == KEY_ESC) {
+                // Two-stage: clear a non-empty query first, quit only when
+                // there is nothing left to clear. Escape on a typo should not
+                // throw away the whole session.
+                if (this.q.len > 0) { this.q = ""; this.requery(); this.draw(); }
+                else { running = false; }
+            }
+            else if (k == KEY_BACKSPACE) {
+                if (this.q.len > 0) {
+                    this.q = this.q.slice(0, this.q.len - 1);
+                    this.requery();
+                    this.draw();
+                }
+            }
+            else if (k == KEY_UP) {
+                // Movement must NOT requery: the rows are unchanged, and
+                // re-running the filter would reset `sel` out from under the
+                // key that was meant to move it.
+                if (this.sel > 0) { this.sel = this.sel - 1; this.draw(); }
+            }
+            else if (k == KEY_DOWN) {
+                if (this.sel < this.visible_rows() - 1) { this.sel = this.sel + 1; this.draw(); }
+            }
+            else if (k == CTRL_D) {
+                // Raw mode clears ICANON, so Ctrl+D is not translated to EOF
+                // by the line discipline — it arrives as byte 4 and would
+                // otherwise be silently swallowed. Every shell and REPL treats
+                // it as "give up" on an empty line, so honour that; on a
+                // non-empty query it does nothing, which is also what they do.
+                if (this.q.len == 0) { running = false; }
+            }
+            else if (k == KEY_DELETE) { }
+            else if (k >= 32 && k < 127) {
+                this.q = this.q + chr(k);
+                this.requery();
+                this.draw();
+            }
+        }
+
+        this.erase();
+        emit(show_cursor());
+        return out;
+    }
+}
+
+export fn prompt(label: string): Prompt { return new Prompt(label); }

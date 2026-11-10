@@ -1,0 +1,72 @@
+// vyto/terminal — the terminal, and what happens when there isn't one.
+//
+// This example runs under the test harness with stdout redirected to a file,
+// so it exercises the NOT-a-terminal path throughout: every styling function
+// returns "", raw_mode() returns null, and size() reports the fallback.
+//
+// That is the deliberate choice. A tty cannot be golden-tested — the whole
+// point of raw mode is that it reacts to a human — but the degraded path can
+// be, and it is the one that has to stay byte-stable, because it is what ends
+// up in pipes, log files and CI output.
+
+import { isatty, stdout_isatty, size, cols, rows, raw_mode, emit,
+         KEY_ENTER, KEY_UP, EOF, TIMEOUT } from "vyto/terminal";
+import { styled, paint, painted_bold, fg, bg, bold, reset,
+         RED, GREEN, BRIGHT_CYAN,
+         width, truncate, clear_line, to_col, hide_cursor } from "vyto/terminal/ansi";
+
+fn main() {
+    print("---- is there a terminal? ----");
+    print("stdin  is a tty: " + str(isatty()));
+    print("stdout is a tty: " + str(stdout_isatty()));
+    print("styling enabled: " + str(styled()));
+
+    print("");
+    print("---- size ----");
+    let s = size();
+    print("size(): " + str(s[0]) + " x " + str(s[1]));
+    print("cols/rows agree: " + str(cols() == s[0] && rows() == s[1]));
+
+    print("");
+    print("---- raw mode ----");
+    // Null here is not a failure. It is the answer to "can I read keys?" when
+    // stdin is a pipe, and every caller needs that branch.
+    let t = raw_mode();
+    if (t == null) { print("raw_mode(): null — no terminal to put into raw mode"); }
+    else           { print("raw_mode(): a Term"); }
+
+    print("");
+    print("---- styling degrades to nothing ----");
+    // Not a terminal, so every one of these is the bare text. Printing the
+    // byte length proves there are no invisible escapes riding along.
+    let r = paint("red", RED);
+    let g = painted_bold("green", GREEN);
+    print("paint('red'):        [" + r + "] len " + str(r.len));
+    print("painted_bold:        [" + g + "] len " + str(g.len));
+    print("fg+bg+bold+reset:    [" + (fg(BRIGHT_CYAN) + bg(RED) + bold() + "x" + reset())
+          + "] len " + str((fg(BRIGHT_CYAN) + bg(RED) + bold() + "x" + reset()).len));
+    print("cursor/clear:        len " + str((clear_line() + to_col(1) + hide_cursor()).len));
+
+    print("");
+    print("---- width() ignores escapes ----");
+    // On a terminal these two differ; here they cannot, which is the point.
+    print("width('hello'):      " + str(width("hello")));
+    print("width(paint(...)):   " + str(width(r)));
+    print("truncate to 3:       [" + truncate("abcdefgh", 3) + "]");
+    print("truncate under len:  [" + truncate("ab", 8) + "]");
+    print("truncate to 0:       [" + truncate("abc", 0) + "]");
+
+    print("");
+    print("---- emit() writes without a newline ----");
+    emit("three");
+    emit(" joined");
+    emit(" writes");
+    print("");
+
+    print("");
+    print("---- key codes match vyto/surface ----");
+    print("KEY_ENTER: " + str(KEY_ENTER));
+    print("KEY_UP:    " + str(KEY_UP));
+    print("EOF:       " + str(EOF));
+    print("TIMEOUT:   " + str(TIMEOUT));
+}

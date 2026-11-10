@@ -274,6 +274,54 @@ else
     echo "FAIL freestanding_compress_stub (vyto/compress's VT_NO_LIBC arm does not build)"
     fail=1
 fi
+# And for vyto/terminal, whose shim includes <termios.h>, <sys/ioctl.h> and
+# <poll.h> on the POSIX arm — three hosted headers that would break the
+# freestanding build of anything importing the package. The stub arm reports
+# "not a terminal", which is a state the hosted arms reach too (under a pipe),
+# so terminal.vt needs no platform conditional and this degrades to the same
+# path examples/100_terminal.vt already covers.
+#
+# This one also checks the SYMBOLS, not just the exit status, and the extra
+# check is not belt-and-braces. Fault injection showed that bypassing the
+# VT_NO_LIBC guard still builds green: the output is an ARCHIVE, and `ar` never
+# resolves anything, so the POSIX arm's undefined tcgetattr/poll/ioctl sit in
+# the .a unnoticed. An exit-status-only check here proves only that the
+# compiler ran. Asserting that no hosted-libc symbol survived is what actually
+# tests the stub arm.
+if ./vytoc build tests/fixtures/terminal_freestanding.vt --freestanding --cc gcc \
+        -o examples/.vyto-cache/libterm_fs.a >/dev/null 2>&1; then
+    if nm examples/.vyto-cache/libterm_fs.a 2>/dev/null \
+            | grep -qE '^ +U (tcgetattr|tcsetattr|poll|ioctl)$'; then
+        echo "FAIL freestanding_terminal_stub (POSIX arm compiled; VT_NO_LIBC guard bypassed)"
+        fail=1
+    else
+        echo "PASS freestanding_terminal_stub"
+    fi
+else
+    echo "FAIL freestanding_terminal_stub (vyto/terminal's VT_NO_LIBC arm does not build)"
+    fail=1
+fi
+# Does vyto/terminal put the terminal back when the process is KILLED? Raw mode
+# turns off echo, so a program that dies without restoring leaves the user
+# typing blind into a shell that shows nothing back.
+#
+# Three exit paths, each of which was found broken by measurement in this order:
+# deinit misses panic() (exit(101) unwinds nothing), atexit misses Ctrl+C
+# (SIGINT runs no atexit handlers), and Ctrl+C is how people actually quit an
+# interactive program. A regression is invisible in every other test — the
+# program still works — until a user presses Ctrl+C.
+#
+# Needs a pty, since the state under test is a dead process's terminal, so it is
+# a Python helper. Skipped where python3 is absent rather than failing the suite.
+if command -v python3 >/dev/null 2>&1; then
+    if python3 tests/terminal_signal_check.py; then
+        :
+    else
+        fail=1
+    fi
+else
+    echo "SKIP terminal_signal_check (no python3)"
+fi
 # vyto/db is pure Vyto and must stay freestanding-safe; its SQLite subpackage is
 # the one part that is not, so db_shim.c carries a VT_NO_LIBC arm that drops the
 # whole library and returns failure sentinels. Both halves are checked because

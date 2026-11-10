@@ -1,0 +1,95 @@
+// vyto/terminal/ansi — escape construction and escape-aware measurement.
+//
+// Runs with stdout redirected by the runner, so `styled()` is false throughout
+// and every styling helper must return "". That is the assertion, not an
+// accident of the environment: colour bytes surviving into a pipe is the one
+// failure mode that would break every golden test in the suite, and
+// lib/vyto/cli stayed monochrome for exactly this reason.
+//
+// The measurement functions are tested against strings carrying escapes built
+// by hand, so width()/truncate() are exercised on their real input even though
+// this process will never emit one.
+
+import { suite } from "vyto/dev/test";
+import { exitWith } from "vyto/dev/test/exit";
+import { styled, paint, painted_bold, fg, bg, bold, dim, underline, reset,
+         up, down, left, right, to, to_col,
+         clear, clear_line, clear_below, hide_cursor, show_cursor,
+         width, truncate,
+         RED, GREEN, BLUE, WHITE, BRIGHT_BLACK, BRIGHT_WHITE } from "vyto/terminal/ansi";
+import { chr } from "vyto/util/text";
+
+// An escape sequence as it would appear on a real terminal. Built here rather
+// than taken from the module, so the expectations are independent of it.
+fn esc(body: string): string { return chr(27) + "[" + body; }
+
+fn main() {
+    let t = suite("terminal/ansi");
+
+    t.section("styling is off when stdout is not a terminal");
+    t.eqBool("styled", styled(), false);
+    t.eq("fg", fg(RED), "");
+    t.eq("bg", bg(BLUE), "");
+    t.eq("bold", bold(), "");
+    t.eq("dim", dim(), "");
+    t.eq("underline", underline(), "");
+    t.eq("reset", reset(), "");
+
+    t.section("paint passes text through unchanged");
+    // Not "" — the TEXT must survive; only the colour is dropped.
+    t.eq("paint", paint("hello", GREEN), "hello");
+    t.eq("painted_bold", painted_bold("hello", GREEN), "hello");
+    t.eq("paint empty", paint("", RED), "");
+
+    t.section("cursor and clearing are also gated on a terminal");
+    t.eq("up", up(2), "");
+    t.eq("down", down(1), "");
+    t.eq("left", left(3), "");
+    t.eq("right", right(4), "");
+    t.eq("to", to(1, 1), "");
+    t.eq("to_col", to_col(1), "");
+    t.eq("clear", clear(), "");
+    t.eq("clear_line", clear_line(), "");
+    t.eq("clear_below", clear_below(), "");
+    t.eq("hide_cursor", hide_cursor(), "");
+    t.eq("show_cursor", show_cursor(), "");
+
+    t.section("width counts printable columns, not bytes");
+    t.eqInt("plain", width("hello"), 5);
+    t.eqInt("empty", width(""), 0);
+    // 14 bytes, 5 columns — the case that makes padding correct.
+    t.eqInt("wrapped in colour",
+            width(esc("31m") + "hello" + esc("0m")), 5);
+    t.eqInt("escape only", width(esc("0m")), 0);
+    t.eqInt("leading escape", width(esc("1m") + "ab"), 2);
+    t.eqInt("trailing escape", width("ab" + esc("0m")), 2);
+    t.eqInt("multi-part escape", width(esc("1;31m") + "x" + esc("0m")), 1);
+    t.eqInt("cursor sequence", width(esc("2K") + "text"), 4);
+    t.eqInt("bare esc at end", width("ab" + chr(27)), 2);
+
+    t.section("truncate counts columns and keeps escapes");
+    t.eq("under the limit", truncate("abc", 10), "abc");
+    t.eq("exactly the limit", truncate("abc", 3), "abc");
+    t.eq("zero", truncate("abc", 0), "");
+    t.eq("negative", truncate("abc", -1), "");
+    t.eq("empty", truncate("", 5), "");
+    // Styling is off, so the reset appended on a cut is itself "".
+    t.eq("plain cut", truncate("abcdefgh", 3), "abc");
+    t.eqInt("cut is measured in columns",
+            width(truncate(esc("31m") + "abcdefgh" + esc("0m"), 4)), 4);
+    // The escapes inside a cut string must survive it, or the colour set
+    // before the cut never gets turned off.
+    t.ok("cut keeps its escapes",
+         truncate(esc("31m") + "abcdefgh", 4).len > 4);
+
+    t.section("colour numbering");
+    // The 8 basics map to 30..37 and the bright forms to 90..97. Asserted
+    // through the numbers rather than the escapes, which are "" here.
+    t.eqInt("RED", RED, 1);
+    t.eqInt("GREEN", GREEN, 2);
+    t.eqInt("WHITE", WHITE, 7);
+    t.eqInt("BRIGHT_BLACK", BRIGHT_BLACK, 8);
+    t.eqInt("BRIGHT_WHITE", BRIGHT_WHITE, 15);
+
+    exitWith(t.done());
+}

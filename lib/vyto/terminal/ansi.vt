@@ -1,0 +1,225 @@
+// vyto/terminal/ansi — escape sequences for colour, cursor and clearing.
+//
+//     emit(fg(RED) + "error" + RESET);
+//     emit(clear_line() + to_col(1));
+//
+// Escape strings are built in pure Vyto — `chr(27)` is the whole dependency —
+// so this module works on a freestanding target, where the shim stubs itself
+// out and every helper below simply returns "". The only C calls are the two
+// "is this worth emitting?" tests, which live in the shim because they need
+// somewhere to cache their answer; see `styled()` for why that matters.
+//
+// ── COLOUR IS GATED ON stdout BEING A TERMINAL ──────────────────────────────
+// Every styling function here returns "" when stdout is not a tty. That is not
+// politeness; it is what keeps `prog > file` and `prog | grep` free of escape
+// bytes, and it is the same reason vyto/cli emits no colour at all today
+// (lib/vyto/cli/README.md). Output that is golden-tested must be byte-stable,
+// and these functions are the boundary that guarantees it.
+//
+// The gate reads stdout, never stdin. `prog | less` has an interactive stdin
+// and a piped stdout; colouring on the strength of stdin would write escapes
+// into the pipe.
+//
+// ── NO_COLOR IS HONOURED ────────────────────────────────────────────────────
+// Setting NO_COLOR (to anything) disables styling even on a real terminal —
+// the cross-tool convention from no-color.org. Cursor movement and clearing
+// are NOT disabled by it: they are layout, not decoration, and a full-screen
+// program still has to work for someone who dislikes colour.
+
+import { chr } from "vyto/util/text";
+
+extern "C" {
+    // 1 when styling should be emitted, 0 otherwise. Computed once on first
+    // call and cached — see `styled()` below for why that is both necessary
+    // and safe. Reads stdout's tty-ness, $NO_COLOR and $TERM in the shim,
+    // which is also why vyto/os is not imported here.
+    fn vterm_styled(): i32;
+
+    // Is stdout a terminal? Same cache, without the NO_COLOR/TERM part, for
+    // cursor movement — which NO_COLOR must not disable.
+    fn vterm_tty_out(): i32;
+}
+
+// Colour numbers, as passed to fg()/bg(). The 8 basics plus their bright
+// forms — the only ones every terminal since 1979 agrees on. A 256-colour or
+// truecolor helper is deliberately absent: it degrades badly and differently
+// everywhere, which is the opposite of what this package is for.
+export const BLACK:   int = 0;
+export const RED:     int = 1;
+export const GREEN:   int = 2;
+export const YELLOW:  int = 3;
+export const BLUE:    int = 4;
+export const MAGENTA: int = 5;
+export const CYAN:    int = 6;
+export const WHITE:   int = 7;
+
+export const BRIGHT_BLACK:   int = 8;    // "grey" on most terminals
+export const BRIGHT_RED:     int = 9;
+export const BRIGHT_GREEN:   int = 10;
+export const BRIGHT_YELLOW:  int = 11;
+export const BRIGHT_BLUE:    int = 12;
+export const BRIGHT_MAGENTA: int = 13;
+export const BRIGHT_CYAN:    int = 14;
+export const BRIGHT_WHITE:   int = 15;
+
+// ESC [ — the Control Sequence Introducer that starts nearly everything here.
+fn csi(): string { return chr(27) + "["; }
+
+// Should styling be emitted at all? See the header for why this reads stdout
+// and why NO_COLOR is consulted.
+//
+// The answer is computed once in C and cached there. Every styling function
+// below consults this, so a redraw emitting a few hundred styled spans was
+// making a few hundred isatty(2) calls per frame. Measured over 200k `paint()`
+// calls: 2.81 us each uncached against 0.27 us cached, a 10x difference on a
+// path that runs every frame. Caching is sound because none of the three
+// inputs can change — a descriptor does not become a terminal mid-process, and
+// the environment is read at startup.
+//
+// It lives in the shim rather than here because Vyto has no module-level `let`
+// and no static class fields (see lib/vyto/dev/test/test.vt:42), so a module
+// has nowhere of its own to keep one.
+export fn styled(): bool { return vterm_styled() as int == 1; }
+
+// ---- colour ---------------------------------------------------------------
+
+// Foreground colour. "" when styling is off.
+export fn fg(color: int): string {
+    if (!styled()) { return ""; }
+    if (color < 8) { return csi() + str(30 + color) + "m"; }
+    return csi() + str(90 + (color - 8)) + "m";
+}
+
+// Background colour. "" when styling is off.
+export fn bg(color: int): string {
+    if (!styled()) { return ""; }
+    if (color < 8) { return csi() + str(40 + color) + "m"; }
+    return csi() + str(100 + (color - 8)) + "m";
+}
+
+export fn bold(): string      { if (!styled()) { return ""; } return csi() + "1m"; }
+export fn dim(): string       { if (!styled()) { return ""; } return csi() + "2m"; }
+export fn italic(): string    { if (!styled()) { return ""; } return csi() + "3m"; }
+export fn underline(): string { if (!styled()) { return ""; } return csi() + "4m"; }
+export fn reverse(): string   { if (!styled()) { return ""; } return csi() + "7m"; }
+
+// Clears every attribute. Emit one after any styled run — terminals have no
+// scope, so an unreset colour bleeds into the shell prompt after exit.
+export fn reset(): string { if (!styled()) { return ""; } return csi() + "0m"; }
+
+// Wrap `s` so the reset can never be forgotten. The common case.
+export fn paint(s: string, color: int): string {
+    if (!styled()) { return s; }
+    return fg(color) + s + reset();
+}
+
+export fn painted_bold(s: string, color: int): string {
+    if (!styled()) { return s; }
+    return bold() + fg(color) + s + reset();
+}
+
+// ---- cursor and clearing --------------------------------------------------
+//
+// Not gated on `styled()`: these are layout, and a redraw loop that silently
+// stopped moving the cursor would overwrite its own output — NO_COLOR turns off
+// decoration, not positioning. They ARE gated on stdout being a terminal,
+// because a cursor sequence in a log file is noise.
+
+// Cached through the same C helper as `styled()`, for the same reason: a redraw
+// calls these dozens of times per frame, and an uncached isatty(2) each time
+// was measurably the dominant cost. `vterm_tty_out` is the tty test alone,
+// without the NO_COLOR/TERM part.
+fn movable(): bool { return vterm_tty_out() as int == 1; }
+
+export fn up(n: int): string    { if (!movable() || n <= 0) { return ""; } return csi() + str(n) + "A"; }
+export fn down(n: int): string  { if (!movable() || n <= 0) { return ""; } return csi() + str(n) + "B"; }
+export fn right(n: int): string { if (!movable() || n <= 0) { return ""; } return csi() + str(n) + "C"; }
+export fn left(n: int): string  { if (!movable() || n <= 0) { return ""; } return csi() + str(n) + "D"; }
+
+// Move to an absolute column on the current row. 1-based, like the escape
+// itself — off-by-ones here are invisible until the output is one column wrong.
+export fn to_col(col: int): string {
+    if (!movable()) { return ""; }
+    return csi() + str(col) + "G";
+}
+
+// Move to an absolute position. Both 1-based, row first.
+export fn to(row: int, col: int): string {
+    if (!movable()) { return ""; }
+    return csi() + str(row) + ";" + str(col) + "H";
+}
+
+export fn clear_line(): string   { if (!movable()) { return ""; } return csi() + "2K"; }
+export fn clear_right(): string  { if (!movable()) { return ""; } return csi() + "0K"; }
+export fn clear_below(): string  { if (!movable()) { return ""; } return csi() + "0J"; }
+
+// Clear the screen and home the cursor.
+export fn clear(): string {
+    if (!movable()) { return ""; }
+    return csi() + "2J" + csi() + "1;1H";
+}
+
+// Hide the cursor while redrawing, or it visibly chases the output.
+//
+// **Always pair these.** A program that exits hidden leaves the user's shell
+// with no cursor, which looks exactly like a hang. Emit show_cursor() on every
+// exit path, and note that this module cannot do it for you — it has no handle
+// with a deinit to hang it on. A `Prompt` (prompt.vt) does this correctly.
+export fn hide_cursor(): string { if (!movable()) { return ""; } return csi() + "?25l"; }
+export fn show_cursor(): string { if (!movable()) { return ""; } return csi() + "?25h"; }
+
+// ---- measuring ------------------------------------------------------------
+
+// Printable width of `s`, ignoring any escape sequences in it.
+//
+// Needed whenever styled text is padded into columns: `s.len` counts the
+// escape bytes, so padding on it indents by however many bytes the colour
+// happened to cost. This counts what the user sees.
+//
+// Counts bytes, not grapheme clusters — a UTF-8 multi-byte character still
+// over-counts. That is a known limit, shared with the rest of the stdlib's
+// column handling; vyto/intl is where character counting lives.
+export fn width(s: string): int {
+    let n = 0;
+    let i = 0;
+    while (i < s.len) {
+        if (s[i] == 27) {
+            // Skip to the sequence terminator: a final byte in @..~ ends a CSI.
+            i = i + 1;
+            if (i < s.len && s[i] == 91) { i = i + 1; }   // '['
+            while (i < s.len && !(s[i] >= 64 && s[i] <= 126)) { i = i + 1; }
+            i = i + 1;
+            continue;
+        }
+        n = n + 1;
+        i = i + 1;
+    }
+    return n;
+}
+
+// Truncate to `max` printable columns, leaving escapes intact.
+//
+// Appends a reset when anything was dropped, because the cut may have landed
+// after a colour was set but before its reset.
+export fn truncate(s: string, max: int): string {
+    if (max <= 0) { return ""; }
+    if (width(s) <= max) { return s; }
+    let out = "";
+    let n = 0;
+    let i = 0;
+    while (i < s.len && n < max) {
+        if (s[i] == 27) {
+            let start = i;
+            i = i + 1;
+            if (i < s.len && s[i] == 91) { i = i + 1; }
+            while (i < s.len && !(s[i] >= 64 && s[i] <= 126)) { i = i + 1; }
+            i = i + 1;
+            out = out + s.slice(start, i);
+            continue;
+        }
+        out = out + s.slice(i, i + 1);
+        n = n + 1;
+        i = i + 1;
+    }
+    return out + reset();
+}
