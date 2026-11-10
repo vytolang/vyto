@@ -1,0 +1,28 @@
+// for-in holds the iterated array at +1 for the whole loop. It used to borrow
+// it, so reassigning the variable inside the body freed the array under the
+// loop (heap-use-after-free under ASan; this printed n=1 instead of n=6).
+// Also covers break / continue / return out of a held loop, and a fresh
+// iterable, whose releases must all still balance.
+
+class Box { v: int; fn init(v: int) { this.v = v; } }
+fn mkarr(): Box[] { let a: Box[] = []; for (let i in 0..3) { a.push(new Box(i)); } return a; }
+fn first_big(xs: Box[]): int {
+    for (let b in xs) { if (b.v > 0) { return b.v; } }
+    return -1;
+}
+fn main() {
+    let xs: Box[] = [];
+    for (let i in 0..4) { xs.push(new Box(i)); }
+    let n = 0;
+    for (let b in xs) { n += b.v; xs = []; }
+    print("reassign n=" + n);
+    let m = 0;
+    for (let b in mkarr()) { m += b.v; }          // fresh iterable
+    print("fresh m=" + m);
+    let k = 0;
+    for (let r in 0..3) {
+        for (let b in mkarr()) { if (b.v == 1) { break; } k += 1; }
+        for (let b in mkarr()) { if (b.v == 0) { continue; } k += 10; }
+    }
+    print("nested k=" + k + " first_big=" + first_big(mkarr()));
+}

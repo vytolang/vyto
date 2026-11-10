@@ -1094,6 +1094,18 @@ else
     fail=1
 fi
 
+# --- for-in holds its array at +1: reassigning the iterated variable inside
+#     the body must not free the array under the loop (was a use-after-free) ---
+got=$(./vytoc run tests/fixtures/forin_hold.vt 2>&1)
+if [ "$got" = "$(cat tests/fixtures/forin_hold.expected)" ]; then
+    echo "PASS forin_hold"
+else
+    echo "FAIL forin_hold"
+    echo "--- expected ---"; cat tests/fixtures/forin_hold.expected
+    echo "--- got ---"; printf '%s\n' "$got"
+    fail=1
+fi
+
 # --- builtin Map: contents and INSERTION ORDER against a parallel-array model,
 #     over a seeded random mix of set/remove/has/get_or/clear, plus merge and
 #     re-insert rules. Order is a documented guarantee since the compact-dict

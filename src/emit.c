@@ -1855,9 +1855,16 @@ static void emit_stmt(Em *em, Stmt *s) {
     }
     case ST_FOR_EACH: {
         Type *et = s->local->type;
+        /* The array is held at +1 for the whole loop, like ST_FOR_ITER's
+           container. It used to be borrowed, and `for (let b in xs) { xs = []; }`
+           freed the array under the loop: the next condition read ->len from
+           freed memory (heap-use-after-free under ASan). One retain/release per
+           loop, not per element. Registered in the ENCLOSING scope, so `return`
+           releases it and `break` -- which stays in that scope -- does not. */
         const char *ta = newtemp(em, s->iter->type, false);
         ind(em);
-        sb_printf(em->out, "%s = %s;\n", ta, ex_b(em, s->iter));
+        sb_printf(em->out, "%s = %s;\n", ta, ex_o(em, s->iter, s->iter->type));
+        ereg(em, ta, s->iter->type);
         ind(em);
         const char *iv = arena_printf(&g_arena, "_i%d", em->tempc++);
         sb_printf(em->out, "for (int64_t %s = 0; %s < vt_len(%s, \"%s\", %d); %s++) {\n", iv, iv,
@@ -1883,6 +1890,14 @@ static void emit_stmt(Em *em, Stmt *s) {
         ind(em);
         sb_puts(em->out, "}\n");
         loop_end(em, ls);
+        /* Drop the loop's hold as soon as the loop is done (normal exit and
+           `break` both land here), not at the end of the enclosing scope --
+           otherwise `for (o in xs) {...} xs = [];` would keep every element
+           alive until the function returned. VT_RELEASE nulls the slot, so
+           the scope-exit release registered above becomes a no-op; it is
+           still what covers a `return` out of the body. */
+        ind(em);
+        sb_printf(em->out, "VT_RELEASE(%s);\n", ta);
         break;
     }
     case ST_FOR_ENUM: {
@@ -1961,6 +1976,10 @@ static void emit_stmt(Em *em, Stmt *s) {
         ind(em);
         sb_puts(em->out, "}\n");
         loop_end(em, ls);
+        /* Same early drop as ST_FOR_EACH: release the container when the loop
+           ends rather than when the enclosing scope does. */
+        ind(em);
+        sb_printf(em->out, "VT_RELEASE(%s);\n", s->iter_local->cname);
         break;
     }
     case ST_SWITCH: {
