@@ -79,6 +79,31 @@ static inline void *vt_retain(void *p) {
     return p;
 }
 
+/* Inline release fast path. Every scope exit, temp, overwritten field and
+   for-in element over a ref array ends in a release, and as an out-of-line call
+   each one cost a call even when the object survives -- the common case. Here
+   the survivor case is one compare and a decrement; only the last reference
+   leaves the call site, to vt_release_last (weak-slot zeroing, deinit, free).
+
+   rc < 0 is immortal or region-owned: a no-op, exactly as before. The function
+   `vt_release` still exists with the same symbol (defined as `(vt_release)` so
+   this macro does not rewrite it), so taking its address, or calling it from a
+   shim built without this header, keeps working.
+
+   VT_ATOMIC_RC keeps the out-of-line call: a load-then-decrement split would
+   race, and the atomic path is not the one this optimises. */
+void vt_release_last(VtObj *o); /* rc was 1: drop it to 0 and destroy */
+#ifndef VT_ATOMIC_RC
+static inline void vt_release_inl(void *p) {
+    if (p) {
+        VtObj *o = (VtObj *)p;
+        if (o->rc > 1) o->rc--;
+        else if (o->rc == 1) vt_release_last(o);
+    }
+}
+#define vt_release(p) vt_release_inl(p)
+#endif
+
 /* release + null in one expression; x must be an lvalue */
 #define VT_RELEASE(x) (vt_release(x), (x) = 0)
 
@@ -167,7 +192,15 @@ VtString *vt_str_from_float(double v);
 VtString *vt_str_from_bool(bool v);
 VtString *vt_str_from_cstr(const char *p); /* NULL → empty string */
 VtString *vt_str_slice(VtString *s, int64_t lo, int64_t hi, const char *file, int line);
-int64_t vt_str_index(VtString *s, int64_t i, const char *file, int line);
+/* Cold failure path for vt_str_index -- out-of-line, never returns. */
+VT_NORETURN void vt_str_oob(const char *file, int line);
+/* Byte at index i. Inline, like vt_arr_ati: every `s[i]` in a hand-written
+   parser lands here, and as an out-of-line call it was the whole 2.3x gap on
+   benchmarks/06_logparse. One unsigned compare folds i<0 and i>=len. */
+static inline int64_t vt_str_index(VtString *s, int64_t i, const char *file, int line) {
+    if (!s || (uint64_t)i >= (uint64_t)s->len) vt_str_oob(file, line);
+    return (int64_t)(unsigned char)s->data[i];
+}
 static inline const char *vt_str_cstr(VtString *s) { return s ? s->data : ""; }
 
 void vt_print(VtString *s);
@@ -228,6 +261,20 @@ static inline void *vt_arr_data(VtArray *a) { return a ? a->data : NULL; }
 void vt_arr_push(VtArray *a, const void *elem);                        /* retains if ref */
 void vt_arr_push_at(VtArray *a, const void *elem, const char *file, int line); /* null-checked push */
 void vt_arr_pop(VtArray *a, void *out, const char *file, int line);    /* transfers ownership */
+/* Slot for one pushed element, len already bumped; the caller stores into it
+   (and retains, for a ref element). The emitter writes
+       *(T*)vt_arr_push_slot(a, sizeof(T), file, line) = v
+   so the common case -- room left -- is a compare, an increment and a typed
+   store at the call site, instead of the three out-of-line calls plus a
+   variable-size memcpy that `push` used to be (6.6 ns vs C's 2.2).
+   Every other case goes to vt_arr_push_grow: a null array, a fixed-length view
+   (cap == len by construction, so it can never take the fast path), and a full
+   buffer. */
+void *vt_arr_push_grow(VtArray *a, size_t scale, const char *file, int line);
+static inline void *vt_arr_push_slot(VtArray *a, size_t scale, const char *file, int line) {
+    if (a && a->len < a->cap) return a->data + (size_t)(a->len++) * scale;
+    return vt_arr_push_grow(a, scale, file, line);
+}
 /* Bounds/null failure path for vt_arr_at — cold, out-of-line, never returns. */
 VT_NORETURN void vt_arr_oob(VtArray *a, int64_t i, const char *file, int line);
 /* Bounds-checked element slot. Hot path is a single unsigned compare (folds the

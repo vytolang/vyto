@@ -507,7 +507,19 @@ static void vt_weak_on_free(void *target) {
     }
 }
 
-void vt_release(void *p) {
+/* The last reference went away (non-atomic build: reached from the inline
+   fast path in vyto_rt.h with rc == 1). */
+void vt_release_last(VtObj *o) {
+    o->rc = 0;
+    if (vt_weak_live) vt_weak_on_free(o);
+    if (o->type && o->type->deinit) o->type->deinit(o);
+    vt_host_free(o);
+}
+
+/* Parenthesised name: vyto_rt.h defines vt_release as a function-like macro
+   over the inline fast path, and this keeps the real symbol for callers that
+   take its address or were compiled without the header. */
+void (vt_release)(void *p) {
     if (!p) return;
     VtObj *o = (VtObj *)p;
     if (o->rc < 0) return; /* immortal */
@@ -521,11 +533,7 @@ void vt_release(void *p) {
         vt_host_free(o);
     }
 #else
-    if (--o->rc == 0) {
-        if (vt_weak_live) vt_weak_on_free(o);
-        if (o->type && o->type->deinit) o->type->deinit(o);
-        vt_host_free(o);
-    }
+    if (--o->rc == 0) vt_release_last(o);
 #endif
 }
 
@@ -779,17 +787,50 @@ bool vt_str_eq(VtString *a, VtString *b) {
     return a->len == b->len && memcmp(a->data, b->data, (size_t)a->len) == 0;
 }
 
+/* Decimal int64 into buf (no NUL), returning the length. Two digits per step
+   from a 200-byte table, so 123456 costs three divides instead of six -- and,
+   more to the point, no trip through vt_snprintf's format interpreter, which
+   was most of the cost of `"k" + i` (35 ns vs 10 ns for plain C). Handles
+   INT64_MIN by negating in unsigned. buf must hold 20 bytes. */
+static const char vt_digits2[201] =
+    "00010203040506070809101112131415161718192021222324252627282930313233343536373839"
+    "40414243444546474849505152535455565758596061626364656667686970717273747576777879"
+    "8081828384858687888990919293949596979899";
+static int vt_fmt_i64(char *buf, int64_t v) {
+    char tmp[20];
+    char *p = tmp + sizeof tmp;
+    uint64_t u = v < 0 ? (uint64_t)0 - (uint64_t)v : (uint64_t)v;
+    while (u >= 100) {
+        unsigned d = (unsigned)(u % 100) * 2;
+        u /= 100;
+        *--p = vt_digits2[d + 1];
+        *--p = vt_digits2[d];
+    }
+    if (u >= 10) {
+        unsigned d = (unsigned)u * 2;
+        *--p = vt_digits2[d + 1];
+        *--p = vt_digits2[d];
+    } else {
+        *--p = (char)('0' + u);
+    }
+    int n = 0;
+    if (v < 0) buf[n++] = '-';
+    int k = (int)(tmp + sizeof tmp - p);
+    memcpy(buf + n, p, (size_t)k);
+    return n + k;
+}
+
 VtString *vt_str_from_int(int64_t v) {
-    char buf[32];
-    int n = vt_snprintf(buf, sizeof buf, "%lld", (long long)v);
+    char buf[24];
+    int n = vt_fmt_i64(buf, v);
     return vt_str_new(buf, n);
 }
 
 /* Fused string + int concat: one allocation instead of vt_str_from_int (alloc)
    then vt_str_concat (alloc). Same result as concat(a, from_int(v)). */
 VtString *vt_str_concat_int(VtString *a, int64_t v) {
-    char buf[32];
-    int n = vt_snprintf(buf, sizeof buf, "%lld", (long long)v);
+    char buf[24];
+    int n = vt_fmt_i64(buf, v);
     int64_t la = a ? a->len : 0;
     VtString *s = str_alloc(la + n);
     if (a) memcpy(s->data, a->data, (size_t)la);
@@ -822,9 +863,8 @@ VtString *vt_str_slice(VtString *s, int64_t lo, int64_t hi, const char *file, in
     return vt_str_new(s->data + lo, hi - lo);
 }
 
-int64_t vt_str_index(VtString *s, int64_t i, const char *file, int line) {
-    if (!s || i < 0 || i >= s->len) vt_panic_c(file, line, "string index out of bounds");
-    return (int64_t)(unsigned char)s->data[i];
+VT_NORETURN void vt_str_oob(const char *file, int line) {
+    vt_panic_c(file, line, "string index out of bounds");
 }
 
 void vt_print(VtString *s) {
@@ -857,11 +897,47 @@ VtString *vt_file_read(VtString *path, const char *file, int line) {
         return s;
     }
     FILE *f = file_open(path, "rb", file, line);
-    /* Read to EOF into a growing buffer rather than trusting the stat size:
-       /proc and /sys files report size 0, and pipes aren't seekable. */
+    /* Fast path: a regular file whose size is known is read ONCE, straight into
+       the result string. The growing-buffer path below copies every byte
+       twice (realloc doubling, then into the string) and peaks at ~2x the
+       file size; on a 55 MB log this halved readfile's time and dropped the
+       ~55 MB transient buffer entirely.
+
+       fseek/ftell rather than fstat so Windows needs nothing extra. It is
+       only a hint: a size of 0 (/proc, /sys), a failed seek (pipes) or an
+       ftell past `long` (a >2 GB file on LLP64 Windows) all fall back to the
+       growing path, and a file that grows mid-read is caught by the extra
+       byte probe and finished there too. */
     size_t cap = 65536, len = 0;
-    char *buf = vt_host_alloc(cap);
-    if (!buf) { fclose(f); vt_panic_c(file, line, "out of memory reading file"); }
+    char *buf = NULL;
+    long hint = -1;
+    if (fseek(f, 0, SEEK_END) == 0) {
+        hint = ftell(f);
+        if (fseek(f, 0, SEEK_SET) != 0) hint = -1;
+    }
+    if (hint > 0) {
+        VtString *s = str_alloc((int64_t)hint);
+        size_t got = fread(s->data, 1, (size_t)hint, f);
+        int extra = (got == (size_t)hint) ? fgetc(f) : EOF;
+        if (extra == EOF) {
+            if (ferror(f)) { vt_release(s); fclose(f); vt_panic_c(file, line, "error reading file"); }
+            fclose(f);
+            s->len = (int64_t)got; /* shrank under us: keep what was there */
+            s->data[got] = 0;
+            return s;
+        }
+        /* Grew while we read it: carry on in the general loop. */
+        cap = (size_t)hint * 2 + 65536;
+        buf = vt_host_alloc(cap);
+        if (!buf) { vt_release(s); fclose(f); vt_panic_c(file, line, "out of memory reading file"); }
+        memcpy(buf, s->data, got);
+        buf[got] = (char)extra;
+        len = got + 1;
+        vt_release(s);
+    } else {
+        buf = vt_host_alloc(cap);
+        if (!buf) { fclose(f); vt_panic_c(file, line, "out of memory reading file"); }
+    }
     for (;;) {
         if (len == cap) {
             cap *= 2;
@@ -1189,6 +1265,19 @@ void vt_arr_push(VtArray *a, const void *elem) {
     memcpy(a->data + a->len * a->elem_size, elem, (size_t)a->elem_size);
     if (a->elem_ref) vt_retain(*(void **)elem);
     a->len++;
+}
+
+/* Slow path of vt_arr_push_slot (vyto_rt.h): same checks and growth policy as
+   vt_arr_push_at, but hands back the slot instead of copying into it. */
+void *vt_arr_push_grow(VtArray *a, size_t scale, const char *file, int line) {
+    if (!a) vt_panic_c(file, line, "push to null array");
+    vt_arr_no_resize(a, "push", file, line);
+    if (a->len == a->cap) {
+        a->cap = a->cap ? a->cap * 2 : 8;
+        a->data = vt_host_realloc(a->data, (size_t)a->cap * scale);
+        if (!a->data) vt_oom();
+    }
+    return a->data + (size_t)(a->len++) * scale;
 }
 
 void vt_arr_push_at(VtArray *a, const void *elem, const char *file, int line) {

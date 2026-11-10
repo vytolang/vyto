@@ -12,12 +12,35 @@ static bool str_is_space(char c) {
 }
 
 /* first index >= from where needle occurs in hay, else -1. Empty needle -> from. */
+/* First occurrence of byte c in [p, p+n), or NULL. memchr where libc exists
+   (it is word-at-a-time or SIMD); a plain loop on a freestanding target, where
+   the runtime supplies only the mem* functions vyto_rt.h declares. */
+static const char *str_chr(const char *p, char c, int64_t n) {
+#ifdef VT_NO_LIBC
+    for (int64_t i = 0; i < n; i++)
+        if (p[i] == c) return p + i;
+    return NULL;
+#else
+    return (const char *)memchr(p, (unsigned char)c, (size_t)n);
+#endif
+}
+
+/* Scan for the needle's first byte, then compare the rest. The old loop called
+   memcmp at EVERY position -- a function call per byte of haystack -- which
+   was most of split()'s 2.8x gap against C. A one-byte needle (the common
+   split separator) never calls memcmp at all. */
 static int64_t str_find(const char *hay, int64_t hlen, const char *ndl, int64_t nlen,
                         int64_t from) {
     if (nlen == 0) return from <= hlen ? from : -1;
     if (nlen > hlen) return -1;
-    for (int64_t i = from; i + nlen <= hlen; i++)
-        if (memcmp(hay + i, ndl, (size_t)nlen) == 0) return i;
+    const char *p = hay + from, *last = hay + (hlen - nlen);
+    while (p <= last) {
+        p = str_chr(p, ndl[0], (int64_t)(last - p) + 1);
+        if (!p) return -1;
+        if (nlen == 1 || memcmp(p + 1, ndl + 1, (size_t)(nlen - 1)) == 0)
+            return (int64_t)(p - hay);
+        p++;
+    }
     return -1;
 }
 
@@ -154,13 +177,26 @@ VtArray *vt_str_split(VtString *s, VtString *sep) {
         vt_release(whole);
         return a;
     }
+    /* Count first, so the result is sized once instead of doubling 8 -> 16 ->
+       ... A count pass is a memchr sweep -- far cheaper than the reallocs. */
+    int64_t n = 1;
+    for (int64_t at = 0;;) {
+        int64_t hit = str_find(s->data, s->len, sep->data, sep->len, at);
+        if (hit < 0) break;
+        n++;
+        at = hit + sep->len;
+    }
+    a->data = vt_host_realloc(a->data, (size_t)n * sizeof(VtString *));
+    if (!a->data) vt_oom();
+    a->cap = n;
+    /* Each piece is fresh (rc 1) and the array takes that reference: stored
+       directly, not pushed-then-released, which was two RC calls per piece. */
+    VtString **slot = (VtString **)a->data;
     int64_t start = 0;
     for (;;) {
         int64_t hit = str_find(s->data, s->len, sep->data, sep->len, start);
         int64_t stop = hit < 0 ? s->len : hit;
-        VtString *piece = vt_str_new(s->data + start, stop - start);
-        vt_arr_push(a, &piece);
-        vt_release(piece);
+        slot[a->len++] = vt_str_new(s->data + start, stop - start);
         if (hit < 0) break;
         start = hit + sep->len;
     }

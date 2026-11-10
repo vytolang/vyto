@@ -161,17 +161,17 @@ growing buffer instead of a fresh string per concatenation, and `clear()`
 deliberately keeps the capacity so the buffer is reused across iterations
 rather than reallocated.
 
-Concrete trap: **`readlines()` allocates a string per line — a memory cost, not
-a speed one.** Measured on a 55 MB / 1M-line file: **157 MB peak RSS vs 110 MB**
-for `readfile()` plus one pass over the single buffer (+43%), while wall time is
-a wash (0.13 s vs 0.14 s — `readlines()` is marginally *faster*). The size-class
-pool makes each small string a bump in a pre-allocated chunk rather than a
-`malloc`, and `vt_file_lines` reads the file once and `memchr`s through it
-(`runtime/vyto_rt.c:869`), so there is no per-line I/O or re-copy to avoid.
+Concrete trap: **`readlines()` allocates a string per line — mostly a memory
+cost.** Measured on a 55 MB / 1M-line file (2026-11-10, after `readfile()`
+learned to read a regular file once, straight into its result): **157 MB peak
+RSS vs 56 MB** for `readfile()` plus one pass over the single buffer (2.8x), and
+wall time 0.13-0.20 s vs 0.09-0.12 s on a loaded machine. The remaining time gap
+is the page faults of touching ~96 MB of fresh pool memory for the line strings,
+not per-line I/O: `vt_file_lines` reads the file once and `memchr`s through it.
 
-So reach for `readfile()` when the file is large relative to available memory —
-not for throughput. Rewriting a working `readlines()` loop to chase latency is
-wasted effort and costs readability.
+So reach for `readfile()` when the file is large relative to available memory,
+or when the read is on a hot path. For an ordinary config or log tool, a working
+`readlines()` loop is fine — rewriting it costs readability for a few tens of ms.
 
 This is a rule for bulk and unbounded data. Do not arena a handful of items —
 it costs readability, and "stupidly easy to read" is in the goal too.

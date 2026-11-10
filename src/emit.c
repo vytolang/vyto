@@ -679,11 +679,25 @@ static char *emit_call(Em *em, Expr *e, bool *fresh) {
             return strconv_frag(em, a[0]);
         case B_PUSH: {
             Type *et = recv->type->elem;
-            const char *tv = newtemp(em, et, false); /* borrowed value; push retains internally */
+            const char *tv = newtemp(em, et, false); /* borrowed value; the store retains */
             *fresh = false;
-            return arena_printf(&g_arena, "(%s = %s, vt_arr_push_at(%s, &%s, \"%s\", %d))", tv,
-                                ex_v(em, a[0], et), ex_b(em, recv), tv,
-                                c_escape(e->loc.file, strlen(e->loc.file)), e->loc.line);
+            /* Inline fast path: vt_arr_push_slot returns the new element's
+               slot (len already bumped) and the typed store happens here, so
+               the scale is a constant and the common case makes no call. The
+               value is still spilled to `tv` FIRST, before the receiver is
+               evaluated, preserving the right-to-left operand order (and a
+               value expression that reads the array sees its old length). A
+               ref element is retained on store, exactly as vt_arr_push did. */
+            const char *ct = c_type(et);
+            if (type_is_ref(et))
+                return arena_printf(&g_arena,
+                                    "(%s = %s, (void)(*(%s*)vt_arr_push_slot(%s, sizeof(%s), \"%s\", %d) = (%s)vt_retain(%s)))",
+                                    tv, ex_v(em, a[0], et), ct, ex_b(em, recv), ct,
+                                    c_escape(e->loc.file, strlen(e->loc.file)), e->loc.line, ct, tv);
+            return arena_printf(&g_arena,
+                                "(%s = %s, (void)(*(%s*)vt_arr_push_slot(%s, sizeof(%s), \"%s\", %d) = %s))",
+                                tv, ex_v(em, a[0], et), ct, ex_b(em, recv), ct,
+                                c_escape(e->loc.file, strlen(e->loc.file)), e->loc.line, tv);
         }
         case B_POP: {
             Type *et = recv->type->elem;
