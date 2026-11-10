@@ -1094,6 +1094,21 @@ else
     fail=1
 fi
 
+# --- vyto/cli/ask under a pipe. The interactive path cannot be golden-tested
+#     (prompting exists to react to a human), but the piped one can, and it is
+#     the path scripts, cron and CI take: every helper must return its fallback
+#     instead of blocking, and fill() must leave the original error alone. A
+#     regression here hangs a pipeline forever with no output saying why ---
+got=$(./vytoc run tests/fixtures/cli_ask.vt 2>&1)
+if [ "$got" = "$(cat tests/fixtures/cli_ask.expected)" ]; then
+    echo "PASS cli_ask"
+else
+    echo "FAIL cli_ask"
+    echo "--- expected ---"; cat tests/fixtures/cli_ask.expected
+    echo "--- got ---"; printf '%s\n' "$got"
+    fail=1
+fi
+
 # --- vyto/cli: generated --help, byte for byte (pure Vyto) ---
 got=$(./vytoc run tests/fixtures/cli_help.vt 2>&1)
 if [ "$got" = "$(cat tests/fixtures/cli_help.expected)" ]; then

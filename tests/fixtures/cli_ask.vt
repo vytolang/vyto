@@ -1,0 +1,49 @@
+// vyto/cli/ask under a pipe — the path a script, a cron job and CI all take.
+//
+// The interactive path cannot be golden-tested: prompting exists to react to a
+// human. What CAN be pinned, and matters more for a CLI, is that none of it
+// engages when stdin is not a terminal — every helper returns its fallback
+// immediately instead of blocking, and fill() leaves the original error alone
+// so a script sees exactly what it saw before this module existed.
+//
+// A regression here is the nastiest kind: the tool hangs forever in a pipeline
+// with no output explaining why.
+import { Cli } from "vyto/cli";
+import { ask, askSecret, confirm, choose, fill } from "vyto/cli/ask";
+
+fn main() {
+    print("---- explicit helpers fall back ----");
+    print("ask:       " + ask("Name", "anon"));
+    print("askSecret: [" + askSecret("Password") + "]");
+    print("confirm t: " + str(confirm("Go?", true)));
+    print("confirm f: " + str(confirm("Go?", false)));
+    print("choose:    " + str(choose("Colour", ["red", "green", "blue"], 1)));
+    print("choose []: " + str(choose("Nothing", [], 7)));
+
+    print("");
+    print("---- fill() does not rescue a piped invocation ----");
+    let a = new Cli("deploy", "ship it");
+    a.option("env", "Environment").choices(["dev", "prod"]).need();
+    a.intOption("port", "Port").need();
+    let parsed = a.parse([]);
+    print("parse:  " + str(parsed));
+    print("fill:   " + str(fill(a)));
+    print("error:  " + a.error());
+
+    print("");
+    print("---- a complete command line still needs no prompting ----");
+    let b = new Cli("deploy", "ship it");
+    b.option("env", "Environment").choices(["dev", "prod"]).need();
+    b.intOption("port", "Port").need();
+    print("parse:  " + str(b.parse(["--env=prod", "--port=8080"])));
+    print("fill:   " + str(fill(b)));
+    print("env=" + b.get("env") + " port=" + str(b.getInt("port")));
+
+    print("");
+    print("---- fill() refuses errors prompting cannot fix ----");
+    let c = new Cli("deploy", "ship it");
+    c.option("env", "Environment").need();
+    print("parse:  " + str(c.parse(["--nope=1"])));
+    print("fill:   " + str(fill(c)));
+    print("error:  " + c.error());
+}

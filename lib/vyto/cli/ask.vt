@@ -1,0 +1,335 @@
+// vyto/cli/ask — asking the user for what the command line did not supply.
+//
+//     import { Cli } from "vyto/cli";
+//     import { ask, confirm, choose, fill } from "vyto/cli/ask";
+//
+//     let name = ask("Project name", "hello");        // "" cancels
+//     if (confirm("Create it?", true)) { ... }
+//     let env = choose("Environment", ["dev", "prod"], 0);
+//
+// Two layers, and the second is built on the first:
+//
+//   * `ask` / `askSecret` / `confirm` / `choose` — call them where you want.
+//   * `fill(cli)` — after `parse()`, prompt for whatever is required and
+//     missing, so a bare invocation becomes a short interview instead of a
+//     usage error.
+//
+// ── A SEPARATE MODULE, NOT PART OF cli.vt ───────────────────────────────────
+// `vyto/cli` imports only `vyto/util/parse`, which is itself import-free and
+// shim-free, so it builds on a freestanding target — and `src/vytopack` and
+// eight other importers get that for free. This file imports `vyto/terminal`,
+// whose shim reaches termios, so folding it into cli.vt would cost every one of
+// them that guarantee. The dependency points one way: cli.vt has never heard of
+// this file. Same split as vyto/media/image vs image/decode.
+//
+// ── NOT A TTY IS A NORMAL STATE ─────────────────────────────────────────────
+// Every function here returns its fallback immediately when stdin is not a
+// terminal, rather than blocking. A CLI is piped, cron'd and CI'd far more
+// often than it is typed at, and a prompt that blocks a pipeline forever is a
+// worse failure than the error it replaced. `fill()` in particular leaves the
+// missing-value error exactly as it was, so a script sees today's behaviour.
+//
+// That is also why the automatic layer is opt-in. `parse()` erroring on a
+// missing required value is correct default behaviour; asking is a choice the
+// application makes, on the line after.
+
+import { Cli, Flag, CLI_BOOL, CLI_INT, CLI_FLOAT } from "vyto/cli";
+import { parse_int, parse_float, parse_bool } from "vyto/util/parse";
+import { raw_mode, isatty, emit,
+         KEY_ENTER, KEY_BACKSPACE, KEY_ESC, KEY_UP, KEY_DOWN,
+         EOF, ERR } from "vyto/terminal";
+import { bold, dim, reset, reverse, paint,
+         clear_line, to_col, up, down, RED } from "vyto/terminal/ansi";
+import { chr } from "vyto/util/text";
+
+// Ctrl+D and Ctrl+C as raw bytes. Raw mode clears ICANON, so neither is
+// translated by the terminal driver — Ctrl+D is not EOF here, it is byte 4.
+// (Ctrl+C still raises SIGINT because ISIG is left on; byte 3 only arrives if
+// an application has disabled that itself.)
+const CTRL_D: int = 4;
+const CTRL_C: int = 3;
+
+// ---- the line editor ------------------------------------------------------
+
+// Read one line with echo, backspace and Esc-to-cancel. Returns the text, or
+// "" if the user cancelled — which is indistinguishable from an empty answer,
+// deliberately: both mean "I am not giving you a value", and every caller here
+// then falls back to its default.
+//
+// `secret` echoes nothing at all rather than asterisks: a masked field still
+// leaks the length, and a shell's own password prompt shows nothing either, so
+// this is the behaviour people already expect.
+fn readLine(prompt: string, dflt: string, secret: bool): string {
+    if (!isatty()) { return dflt; }
+    let t = raw_mode();
+    if (t == null) { return dflt; }
+
+    let hint = "";
+    if (dflt.len > 0 && !secret) { hint = dim() + " [" + dflt + "]" + reset(); }
+    let head = bold() + prompt + reset() + hint + ": ";
+
+    let buf = "";
+    emit(to_col(1) + clear_line() + head);
+
+    let running = true;
+    let cancelled = false;
+    while (running) {
+        let k = t.key(-1);
+        if (k == EOF || k == ERR || k == CTRL_D) { cancelled = true; running = false; }
+        else if (k == CTRL_C) { cancelled = true; running = false; }
+        else if (k == KEY_ENTER) { running = false; }
+        else if (k == KEY_ESC) { cancelled = true; running = false; }
+        else if (k == KEY_BACKSPACE) {
+            if (buf.len > 0) {
+                buf = buf.slice(0, buf.len - 1);
+                emit(to_col(1) + clear_line() + head);
+                if (!secret) { emit(buf); }
+            }
+        }
+        else if (k >= 32 && k < 127) {
+            buf = buf + chr(k);
+            if (!secret) { emit(chr(k)); }
+        }
+    }
+
+    // Leave the answered line on screen — the transcript of an interview is
+    // worth keeping — but never echo a secret into the scrollback.
+    emit(chr(10));
+    if (cancelled) { return dflt; }
+    if (buf.len == 0) { return dflt; }
+    return buf;
+}
+
+// ---- the explicit layer ---------------------------------------------------
+
+// A line of text. `dflt` is returned on an empty answer, on Esc, and whenever
+// stdin is not a terminal.
+export fn ask(prompt: string, dflt: string): string {
+    return readLine(prompt, dflt, false);
+}
+
+// A line of text with nothing echoed. No default is shown (it would defeat the
+// point) and none is offered: a secret with a fallback is a secret in your
+// source. Returns "" when not a terminal.
+export fn askSecret(prompt: string): string {
+    return readLine(prompt, "", true);
+}
+
+// A yes/no question. `dflt` is what Enter alone means, and what a pipe gets.
+//
+// Accepts the same spellings as parse_bool — y/yes/true/1/on and their
+// negatives — so "Y", "yes" and "1" all work without the caller thinking
+// about it.
+export fn confirm(prompt: string, dflt: bool): bool {
+    if (!isatty()) { return dflt; }
+    let shown = "y/N";
+    if (dflt) { shown = "Y/n"; }
+    let running = true;
+    let answer = dflt;
+    while (running) {
+        let text = readLine(prompt + " (" + shown + ")", "", false);
+        if (text.len == 0) { answer = dflt; running = false; }
+        else {
+            let t = text.to_lower();
+            if (t == "y") { answer = true;  running = false; }
+            else if (t == "n") { answer = false; running = false; }
+            else {
+                let out: bool[] = [false];
+                if (parse_bool(text, out)) { answer = out[0]; running = false; }
+                else { emit(paint("  please answer y or n", RED) + chr(10)); }
+            }
+        }
+    }
+    return answer;
+}
+
+// Pick one of `options` with the arrow keys. Returns the chosen index.
+//
+// **Cancelling returns -1, not `dflt`.** Esc, Ctrl+C and Ctrl+D all mean "I am
+// not answering", and that has to be distinguishable from picking the default
+// deliberately — otherwise a caller cannot tell a refusal from a choice and
+// will carry on as though the user agreed. `ask()` can safely return its
+// default on cancel because the caller supplied that string as the fallback;
+// an index into someone else's list is not the same thing.
+//
+// `dflt` is returned when stdin is not a terminal, or when the list is empty:
+// those are the non-interactive fallbacks, not refusals. Pass a `dflt` of -1
+// if you would rather treat them as refusals too.
+export fn choose(prompt: string, options: string[], dflt: int): int {
+    if (options.len == 0) { return dflt; }
+    if (!isatty()) { return dflt; }
+    let t = raw_mode();
+    if (t == null) { return dflt; }
+
+    let sel = dflt;
+    if (sel < 0 || sel >= options.len) { sel = 0; }
+
+    let drawn = 0;
+    let running = true;
+    let picked = false;
+
+    while (running) {
+        // Redraw in place: erase what the last pass wrote, then write again.
+        if (drawn > 0) {
+            for (let i in 0..drawn) { emit(down(1) + clear_line()); }
+            emit(up(drawn));
+        }
+        emit(to_col(1) + clear_line() + bold() + prompt + reset()
+             + dim() + "  (↑↓, Enter)" + reset());
+        for (let i in 0..(options.len)) {
+            emit(chr(10) + to_col(1) + clear_line());
+            if (i == sel) { emit(reverse() + " " + options[i] + " " + reset()); }
+            else          { emit("   " + options[i]); }
+        }
+        emit(up(options.len));
+        drawn = options.len;
+
+        let k = t.key(-1);
+        if (k == EOF || k == ERR || k == CTRL_D || k == CTRL_C) { running = false; }
+        else if (k == KEY_ESC) { running = false; }
+        else if (k == KEY_ENTER) { picked = true; running = false; }
+        else if (k == KEY_UP)   { if (sel > 0) { sel = sel - 1; } }
+        else if (k == KEY_DOWN) { if (sel < options.len - 1) { sel = sel + 1; } }
+    }
+
+    // Erase the list, then leave the prompt and the answer on one line so the
+    // scrollback reads as a transcript rather than a blank.
+    for (let i in 0..drawn) { emit(down(1) + clear_line()); }
+    emit(up(drawn));
+    emit(to_col(1) + clear_line());
+    let chosen = -1;
+    if (picked) { chosen = sel; }
+    if (chosen >= 0 && chosen < options.len) {
+        emit(bold() + prompt + reset() + ": " + options[chosen] + chr(10));
+    } else {
+        emit(chr(10));
+    }
+    return chosen;
+}
+
+// ---- the automatic layer --------------------------------------------------
+
+// What to show as the prompt for a flag: its help text if it has one, else its
+// name. The help text is already written as a phrase describing the value,
+// which is exactly what a prompt wants.
+fn labelFor(f: Flag): string {
+    if (f.about.len > 0) { return f.about; }
+    return f.name;
+}
+
+// Ask for one flag's value and store it, retrying until the answer parses.
+// Returns false if the user gave up, which leaves the flag unset and lets
+// finish()'s original error stand.
+fn askInto(c: Cli, f: Flag): bool {
+    let label = labelFor(f);
+
+    if (f.kind == CLI_BOOL) {
+        let v = confirm(label, f.bval);
+        f.bval = v;
+        f.sval = "false";
+        if (v) { f.sval = "true"; }
+        f.given = true;
+        return true;
+    }
+
+    // A choice list is a menu, not a typing exercise — and it removes the
+    // retry loop entirely, since an arrow key cannot produce an invalid value.
+    if (f.choiceList.len > 0) {
+        let start = 0;
+        for (let i in 0..(f.choiceList.len)) {
+            if (f.choiceList[i] == f.sval) { start = i; }
+        }
+        let idx = choose(label, f.choiceList, start);
+        if (idx < 0 || idx >= f.choiceList.len) { return false; }
+        f.sval = f.choiceList[idx];
+        f.given = true;
+        return true;
+    }
+
+    let tries = 0;
+    while (tries < 3) {
+        tries = tries + 1;
+        let text = ask(label, f.sval);
+        if (text.len == 0) { return false; }
+
+        if (f.kind == CLI_INT) {
+            let out: int[] = [0];
+            if (!parse_int(text, out)) {
+                emit(paint("  not a whole number: " + text, RED) + chr(10));
+                continue;
+            }
+            f.ival = out[0];
+        } else if (f.kind == CLI_FLOAT) {
+            let out: float[] = [0.0];
+            if (!parse_float(text, out)) {
+                emit(paint("  not a number: " + text, RED) + chr(10));
+                continue;
+            }
+            f.fval = out[0];
+        }
+
+        f.sval = text;
+        f.given = true;
+        if (f.isRepeated) { f.list.push(text); }
+        return true;
+    }
+    return false;
+}
+
+// Prompt for every required value the command line did not supply.
+//
+//     if (!app.parse(args())) {
+//         if (!fill(app)) { print(app.report()); exit(app.exitCode()); }
+//     }
+//
+// Returns true when everything required is now present, so the caller can
+// carry on; false when it could not be — not a terminal, the user cancelled,
+// or the failure was something prompting cannot fix (an unknown flag, a bad
+// value that WAS given, a missing subcommand). In every one of those cases the
+// original error is untouched and `report()` still says the right thing.
+//
+// Only required-and-missing values are asked for. An optional flag with a
+// default is not a question — interrogating someone about six things they did
+// not need to set is worse than the usage error this replaces.
+export fn fill(c: Cli): bool {
+    // Nothing missing is success, not a no-op that reads like failure. This
+    // comes before the tty test on purpose: a fully-specified command line is
+    // complete whether or not anyone is watching, so a script calling fill()
+    // unconditionally gets true and carries on.
+    if (c.ok()) { return true; }
+
+    if (c.helpWanted()) { return false; }
+    if (!isatty()) { return false; }
+
+    // Anything other than a missing value is not a prompting problem: an
+    // unknown flag or an unparseable argument means the line was wrong, and
+    // asking questions would bury that.
+    let e = c.error();
+    if (e.len > 0 && !e.starts_with("missing required")) { return false; }
+
+    for (let f in c.flags) {
+        if (f.isRequired && !f.given) {
+            if (!askInto(c, f)) { return false; }
+        }
+    }
+    for (let o in c.operands) {
+        if (o.isRequired && !o.given) {
+            if (!askInto(c, o)) { return false; }
+        }
+    }
+
+    // A required subcommand is a menu over the declared ones.
+    if (c.subRequired && c.chosenName == "") {
+        let names: string[] = [];
+        for (let s in c.subs) { names.push(s.name); }
+        if (names.len == 0) { return false; }
+        let idx = choose("Command", names, 0);
+        if (idx < 0 || idx >= names.len) { return false; }
+        c.chosenName = names[idx];
+        c.chosenCli = c.subs[idx];
+    }
+
+    // Everything asked for is now present, so the recorded error is stale.
+    c.clearError();
+    return true;
+}

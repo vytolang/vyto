@@ -1,9 +1,11 @@
 # vyto/cli — flags, options, operands & subcommands
 
-Pure Vyto with **no imports at all**. Help columns use the `pad_end` string
-builtin and help text is assembled with `string[].join`, so nothing here pulls
-in `vyto/util/fmt` (native-shim-backed) or `vyto/os`. It runs wherever the
-runtime runs, including a freestanding target.
+Pure Vyto. Help columns use the `pad_end` string builtin and help text is
+assembled with `string[].join`, so nothing here pulls in `vyto/util/fmt`
+(native-shim-backed) or `vyto/os`. Its one import is `vyto/util/parse`, which is
+itself import-free and shim-free, so this still runs wherever the runtime runs —
+including a freestanding target. Both halves of that are verified by building
+against `--freestanding`.
 
 It exists because every app in this repo hand-rolled the same `args()` loop, and
 they were all wrong in the same four ways: unknown flags silently ignored,
@@ -49,7 +51,9 @@ idiom, and they are the only ones an app needs to get right.
 
 | Module | What it gives you |
 |--------|-------------------|
-| `vyto/cli` | `Cli` and its `cli()` shorthand, `Flag`, the `CLI_*` kind constants, and the standalone `parse_int` / `parse_float` / `parse_bool` |
+| `vyto/cli` | `Cli` and its `cli()` shorthand, `Flag`, the `CLI_*` kind constants |
+| `vyto/util/parse` | `parse_int` / `parse_float` / `parse_bool` — re-exported here, so the old `from "vyto/cli"` path still resolves |
+| `vyto/cli/ask` | `ask` / `askSecret` / `confirm` / `choose`, and `fill(cli)` to prompt for whatever the command line left out. Opt-in: see below |
 
 ## Declaring
 
@@ -85,13 +89,21 @@ httpd: --port: '80a0' is not an integer
 try 'httpd --help' for usage
 ```
 
-The validators are exported, because they are the repo's first non-panicking
-numeric parses and are useful with no `Cli` in sight:
+**The validators now live in `vyto/util/parse`.** They are the repo's first
+non-panicking numeric parses and are useful with no `Cli` in sight — which is
+exactly why they moved on 2026-09-16: twelve of this module's importers took
+only the parsers and never touched `Cli`, and one of them was `vyto/validator`,
+which has nothing to do with command lines.
 
 ```vyto
+import { parse_int } from "vyto/util/parse";
+
 let out: int[] = [0];
 if (parse_int(text, out)) { use(out[0]); } else { complain(); }
 ```
+
+A Vyto import is a re-export, so `from "vyto/cli"` still resolves all three and
+no existing code broke. New code should take the direct path.
 
 `parse_int` accepts `[+-]?digits` and **rejects int64 overflow**, which `to_int`
 only discovers by aborting. It deliberately rejects surrounding whitespace that
@@ -138,6 +150,72 @@ The short-flag column is reserved even for flags that have no short form, so the
 line rather than indenting every other row. No colour and no terminal-width
 detection: the output is golden-tested, so it must be byte-stable, and there is
 no `isatty` binding to detect a terminal with anyway.
+
+## Asking for what was not typed
+
+`vyto/cli/ask` turns a usage error into a short interview:
+
+```vyto
+import { Cli } from "vyto/cli";
+import { fill } from "vyto/cli/ask";
+
+let app = cli("deploy", "ship it");
+app.option("env", "Environment").choices(["dev", "prod"]).need();
+app.intOption("port", "Port to listen on").need();
+
+if (!app.parse(args()) && !fill(app)) { print(app.report()); exit(app.exitCode()); }
+```
+
+```
+$ deploy
+Environment: prod          <- a choices() list becomes an arrow-key menu
+Port to listen on: 9000
+```
+
+`fill()` asks only for values that are **required and missing**. An optional
+flag with a default is not a question — interrogating someone about six things
+they never needed to set is worse than the error it replaces. A `choices()` list
+becomes a menu, an int option re-asks on bad input (three attempts), and a
+required subcommand becomes a menu over the declared commands.
+
+The four helpers stand alone, for prompting that has nothing to do with parsing:
+
+```vyto
+let name = ask("Project name", "hello");   // "" and Esc both give the default
+let pw   = askSecret("Password");          // echoes nothing at all
+let ok   = confirm("Overwrite?", false);   // y/yes/true/1/on and negatives
+let i    = choose("Colour", ["red", "green"], 0);   // index, or -1 if cancelled
+```
+
+> **`choose()` returns -1 when cancelled, not the default.** Esc has to be
+> distinguishable from deliberately picking the default, or a caller cannot tell
+> a refusal from a choice and carries on as though the user agreed. `ask()` can
+> safely return its default, because the caller supplied that string as the
+> fallback — an index into someone else's list is not the same thing.
+
+### It stays out of the way when nobody is there
+
+Every function returns its fallback **immediately** when stdin is not a
+terminal, and `fill()` returns false leaving the original error untouched. A CLI
+is piped, cron'd and CI'd far more often than it is typed at, and a prompt that
+blocks a pipeline forever is a worse failure than the error it replaced. That
+path is golden-tested (`tests/fixtures/cli_ask.vt`); the interactive one cannot
+be, since prompting exists to react to a human.
+
+`fill()` also refuses errors that prompting cannot fix — an unknown flag, a bad
+value that *was* given — because asking questions would bury the real mistake.
+And it returns true when nothing was missing, so calling it unconditionally is
+safe.
+
+### Why a separate module
+
+`vyto/cli` imports only `vyto/util/parse`, which is itself import-free and
+shim-free, so it builds on a **freestanding** target — `src/vytopack` and eight
+other importers get that for free. `vyto/cli/ask` imports `vyto/terminal`, whose
+shim reaches termios, so folding it into `cli.vt` would cost every one of them
+that guarantee. The dependency points one way: `cli.vt` has never heard of
+`ask.vt`. Verified by building a plain `Cli` program with `--freestanding` and
+checking it links zero terminal symbols.
 
 ## Recipes
 
@@ -195,7 +273,15 @@ parsing is not a goal of a stdlib module.
 covers every rejection, including the int64 overflow boundary
 (`9223372036854775807` accepted, `…808` rejected, and the same either side of
 the negative bound); `cli_help.vt` pins the generated text byte-for-byte for a
-root command and a subcommand. `examples/72_cli.vt` is the runnable tour.
+root command and a subcommand; `cli_ask.vt` pins what `vyto/cli/ask` does under
+a pipe — every fallback, and `fill()` leaving the error alone. `examples/72_cli.vt`
+is the runnable tour.
+
+`ask`'s interactive half is not golden-tested and cannot be: prompting exists to
+react to a human. It was verified by driving the binary through a real pty —
+the arrow-key menu, the retry on a bad number, Esc cancelling back to the
+original error, and `askSecret` keeping its input out of the byte stream
+entirely (grepped for, not eyeballed).
 
 Fixtures feed hand-built `string[]`s rather than `args()`, both because the
 example harness runs with no trailing arguments and because it makes the parser
