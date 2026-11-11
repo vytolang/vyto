@@ -1,3 +1,4 @@
+#include <stdint.h>
 #include "net_shim.h"
 #include <curl/curl.h>
 #include <stdlib.h>
@@ -69,8 +70,8 @@ void net_fetch_free(NetFetch *f) {
     free(f);
 }
 
-long net_fetch_len(NetFetch *f) {
-    return f ? (long)((struct NetFetch *)f)->len : 0;
+int64_t net_fetch_len(NetFetch *f) {
+    return f ? (int64_t)((struct NetFetch *)f)->len : 0;
 }
 
 void *net_fetch_data(NetFetch *f) {

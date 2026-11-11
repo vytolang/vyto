@@ -28,6 +28,7 @@
 
 #define PCRE2_CODE_UNIT_WIDTH 8
 #define HAVE_CONFIG_H
+#include <stdint.h>
 #include "config.h"          /* PCRE2_STATIC, SUPPORT_JIT, … */
 #include "pcre2.h"
 
@@ -219,7 +220,7 @@ static void free_one(VRe *h)
     free(h);
 }
 
-void *vre_compile(const char *pat, long patlen, int flags)
+void *vre_compile(const char *pat, int64_t patlen, int flags)
 {
     return compile_one(pat, patlen, flags);
 }
@@ -227,12 +228,12 @@ void *vre_compile(const char *pat, long patlen, int flags)
 void vre_free(void *vh) { free_one((VRe *)vh); }
 
 int  vre_last_errcode(void)   { return g_errcode; }
-long vre_last_erroffset(void) { return (long)g_erroffset; }
+int64_t vre_last_erroffset(void) { return (int64_t)g_erroffset; }
 
 /* PCRE2's own message text. Only ever shown to a human: the Vyto side keys its
    own behaviour off the RX_ERR_* classification, never off this string, so a
    PCRE2 release rewording a message cannot break a golden test. */
-long vre_error_message(int code, char *out, long cap)
+int64_t vre_error_message(int code, char *out, int64_t cap)
 {
     PCRE2_UCHAR buf[256];
     int n = pcre2_get_error_message(code, buf, sizeof buf);
@@ -249,7 +250,7 @@ long vre_error_message(int code, char *out, long cap)
 
 int vre_jit_ok(void *vh) { return vh != NULL && ((VRe *)vh)->jit; }
 
-void vre_set_limits(void *vh, long match, long depth, long heapKB)
+void vre_set_limits(void *vh, int64_t match, int64_t depth, int64_t heapKB)
 {
     VRe *h = (VRe *)vh;
     if (h == NULL) return;
@@ -299,7 +300,7 @@ static int match_at(VRe *h, const char *subj, long len, long start, uint32_t ext
     return classify(rc);
 }
 
-int vre_match(void *vh, const char *subj, long len, long start, int flags)
+int vre_match(void *vh, const char *subj, int64_t len, int64_t start, int flags)
 {
     VRe *h = (VRe *)vh;
     (void)flags;
@@ -314,7 +315,7 @@ int vre_match(void *vh, const char *subj, long len, long start, int flags)
    offset forbidding an empty match there, and only then to step forward — by a
    whole character, not a byte, and over a CRLF pair as one unit. Doing it here
    rather than in Vyto keeps the code-unit knowledge on the side that has it. */
-int vre_match_next(void *vh, const char *subj, long len, long start)
+int vre_match_next(void *vh, const char *subj, int64_t len, int64_t start)
 {
     VRe *h = (VRe *)vh;
     int rc;
@@ -326,7 +327,7 @@ int vre_match_next(void *vh, const char *subj, long len, long start)
     return VRE_NOMATCH;
 }
 
-long vre_advance(void *vh, const char *subj, long len, long pos)
+int64_t vre_advance(void *vh, const char *subj, int64_t len, int64_t pos)
 {
     VRe *h = (VRe *)vh;
     if (pos >= len) return len + 1;
@@ -390,7 +391,7 @@ static long count_in(VRe *h, const char *subj, long len)
     return n;
 }
 
-long vre_count(void *vh, const char *subj, long len)
+int64_t vre_count(void *vh, const char *subj, int64_t len)
 {
     return count_in((VRe *)vh, subj, len);
 }
@@ -402,22 +403,22 @@ long vre_count(void *vh, const char *subj, long len)
 int  vre_group_count(void *vh) { return vh ? (int)((VRe *)vh)->ngroups : 0; }
 int  vre_pair_count(void *vh)  { return vh ? ((VRe *)vh)->rc : 0; }
 
-long vre_group_start(void *vh, int i)
+int64_t vre_group_start(void *vh, int i)
 {
     VRe *h = (VRe *)vh;
     PCRE2_SIZE *ov;
     if (h == NULL || i < 0 || i >= h->rc) return -1;
     ov = pcre2_get_ovector_pointer(h->md);
-    return ov[2 * i] == PCRE2_UNSET ? -1 : (long)ov[2 * i];
+    return ov[2 * i] == PCRE2_UNSET ? -1 : (int64_t)ov[2 * i];
 }
 
-long vre_group_end(void *vh, int i)
+int64_t vre_group_end(void *vh, int i)
 {
     VRe *h = (VRe *)vh;
     PCRE2_SIZE *ov;
     if (h == NULL || i < 0 || i >= h->rc) return -1;
     ov = pcre2_get_ovector_pointer(h->md);
-    return ov[2 * i + 1] == PCRE2_UNSET ? -1 : (long)ov[2 * i + 1];
+    return ov[2 * i + 1] == PCRE2_UNSET ? -1 : (int64_t)ov[2 * i + 1];
 }
 
 /* ------------------------------------------------------------- named groups */
@@ -433,7 +434,7 @@ int vre_name_count(void *vh)
 
 /* The name table is a flat array of fixed-width entries: two bytes of group
    number, big-endian, then the NUL-terminated name. */
-long vre_name_at(void *vh, int idx, char *out, long cap)
+int64_t vre_name_at(void *vh, int idx, char *out, int64_t cap)
 {
     VRe *h = (VRe *)vh;
     uint32_t count = 0, esize = 0;
@@ -477,9 +478,9 @@ int vre_name_number(void *vh, int idx)
 
 /* ------------------------------------------------------------- substitution */
 
-long vre_substitute(void *vh, const char *subj, long slen,
-                    const char *repl, long rlen, int flags,
-                    char *out, long cap)
+int64_t vre_substitute(void *vh, const char *subj, int64_t slen,
+                    const char *repl, int64_t rlen, int flags,
+                    char *out, int64_t cap)
 {
     VRe *h = (VRe *)vh;
     uint32_t opts = PCRE2_SUBSTITUTE_OVERFLOW_LENGTH;
@@ -506,7 +507,7 @@ long vre_substitute(void *vh, const char *subj, long slen,
 
     /* With OVERFLOW_LENGTH, a too-small buffer still reports the length needed
        (including the terminating NUL, which the caller's retry allows for). */
-    if (rc == PCRE2_ERROR_NOMEMORY) return (long)outlen;
+    if (rc == PCRE2_ERROR_NOMEMORY) return (int64_t)outlen;
     /* A bad replacement is the caller's data, not an engine fault. PCRE2 spells
        it three ways: BADREPLACEMENT for a malformed template, BADREPESCAPE for
        a bad escape in one, NOSUBSTRING for a group reference that does not
@@ -515,7 +516,7 @@ long vre_substitute(void *vh, const char *subj, long slen,
         rc == PCRE2_ERROR_NOSUBSTRING    || rc == PCRE2_ERROR_UNSET)
         return VRE_BADREPL;
     if (rc < 0) return classify(rc);   /* -2 limit, -3 bad utf, -4 internal */
-    return (long)outlen;
+    return (int64_t)outlen;
 }
 
 /* ------------------------------------------------------------- pattern cache
@@ -610,8 +611,8 @@ void vre_cache_clear(void)
 
 /* -1 here means "the pattern would not compile"; the caller reads
    vre_last_errcode/vre_last_erroffset exactly as for vre_compile. */
-int vre_cached_find(const char *pat, long patlen, int flags,
-                    const char *subj, long len, long start)
+int vre_cached_find(const char *pat, int64_t patlen, int flags,
+                    const char *subj, int64_t len, int64_t start)
 {
     VRe *h = cache_get(pat, patlen, flags);
     g_cache_last = h;
@@ -620,8 +621,8 @@ int vre_cached_find(const char *pat, long patlen, int flags,
     return match_at(h, subj, len, start, 0);
 }
 
-int vre_cached_next(const char *pat, long patlen, int flags,
-                    const char *subj, long len, long start)
+int vre_cached_next(const char *pat, int64_t patlen, int flags,
+                    const char *subj, int64_t len, int64_t start)
 {
     VRe *h = cache_get(pat, patlen, flags);
     g_cache_last = h;
@@ -629,24 +630,24 @@ int vre_cached_next(const char *pat, long patlen, int flags,
     return vre_match_next(h, subj, len, start);
 }
 
-long vre_cached_advance(const char *subj, long len, long pos)
+int64_t vre_cached_advance(const char *subj, int64_t len, int64_t pos)
 {
     return vre_advance(g_cache_last, subj, len, pos);
 }
 
 int  vre_cached_group_count(void)      { return vre_group_count(g_cache_last); }
 int  vre_cached_pair_count(void)       { return vre_pair_count(g_cache_last); }
-long vre_cached_group_start(int i)     { return vre_group_start(g_cache_last, i); }
-long vre_cached_group_end(int i)       { return vre_group_end(g_cache_last, i); }
+int64_t vre_cached_group_start(int i)     { return vre_group_start(g_cache_last, i); }
+int64_t vre_cached_group_end(int i)       { return vre_group_end(g_cache_last, i); }
 int  vre_cached_name_count(void)       { return vre_name_count(g_cache_last); }
-long vre_cached_name_at(int i, char *out, long cap)
+int64_t vre_cached_name_at(int i, char *out, int64_t cap)
                                        { return vre_name_at(g_cache_last, i, out, cap); }
 int  vre_cached_name_number(int i)     { return vre_name_number(g_cache_last, i); }
 
-long vre_cached_substitute(const char *pat, long patlen, int flags,
-                           const char *subj, long slen,
-                           const char *repl, long rlen, int sflags,
-                           char *out, long cap)
+int64_t vre_cached_substitute(const char *pat, int64_t patlen, int flags,
+                           const char *subj, int64_t slen,
+                           const char *repl, int64_t rlen, int sflags,
+                           char *out, int64_t cap)
 {
     VRe *h = cache_get(pat, patlen, flags);
     g_cache_last = h;
@@ -654,8 +655,8 @@ long vre_cached_substitute(const char *pat, long patlen, int flags,
     return vre_substitute(h, subj, slen, repl, rlen, sflags, out, cap);
 }
 
-long vre_cached_count(const char *pat, long patlen, int flags,
-                      const char *subj, long len)
+int64_t vre_cached_count(const char *pat, int64_t patlen, int flags,
+                      const char *subj, int64_t len)
 {
     VRe *h = cache_get(pat, patlen, flags);
     g_cache_last = h;

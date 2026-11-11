@@ -11,6 +11,7 @@
 
    Non-Linux builds compile to an empty list (macOS would use IOKit; noted). */
 
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -230,14 +231,14 @@ int usb_release(int fd, int iface) {
 
 /* One bulk/interrupt transfer on endpoint `ep` (direction is the ep's 0x80 bit).
    >=0 bytes transferred, -1 timeout / would-block, -2 error. */
-long usb_bulk(int fd, int ep, char *buf, long len, int timeout_ms) {
+int64_t usb_bulk(int fd, int ep, char *buf, int64_t len, int timeout_ms) {
     struct usbdevfs_bulktransfer bt;
     bt.ep = (unsigned int)ep;
     bt.len = (unsigned int)len;
     bt.timeout = (unsigned int)timeout_ms;
     bt.data = buf;
     int r = ioctl(fd, USBDEVFS_BULK, &bt);
-    if (r >= 0) return (long)r;
+    if (r >= 0) return (int64_t)r;
     if (errno == ETIMEDOUT || errno == EAGAIN) return -1;
     return -2;
 }
@@ -249,7 +250,7 @@ void usb_dev_close(int fd) { if (fd >= 0) close(fd); }
 int  usb_open(int bus, int addr) { (void)bus; (void)addr; return -1; }
 int  usb_claim(int fd, int iface) { (void)fd; (void)iface; return -1; }
 int  usb_release(int fd, int iface) { (void)fd; (void)iface; return -1; }
-long usb_bulk(int fd, int ep, char *buf, long len, int timeout_ms) {
+int64_t usb_bulk(int fd, int ep, char *buf, int64_t len, int timeout_ms) {
     (void)fd; (void)ep; (void)buf; (void)len; (void)timeout_ms; return -2;
 }
 void usb_dev_close(int fd) { (void)fd; }

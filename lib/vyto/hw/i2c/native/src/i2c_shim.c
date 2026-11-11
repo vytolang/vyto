@@ -11,6 +11,7 @@
    denied -> -1). Testable without wiring via the `i2c-stub` kernel module. Non-Linux
    compiles to -1 stubs. */
 
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -29,7 +30,7 @@ int i2c_open(const char *path) {
 }
 
 /* Write `len` bytes to 7-bit device `addr`. Bytes written (>=0), or -1 on error. */
-long i2c_write(int fd, int addr, const char *buf, long len) {
+int64_t i2c_write(int fd, int addr, const char *buf, int64_t len) {
     struct i2c_msg msg;
     msg.addr = (unsigned short)addr;
     msg.flags = 0;
@@ -40,7 +41,7 @@ long i2c_write(int fd, int addr, const char *buf, long len) {
 }
 
 /* Read `len` bytes from 7-bit device `addr`. Bytes read (>=0), or -1 on error. */
-long i2c_read(int fd, int addr, char *buf, long len) {
+int64_t i2c_read(int fd, int addr, char *buf, int64_t len) {
     struct i2c_msg msg;
     msg.addr = (unsigned short)addr;
     msg.flags = I2C_M_RD;
@@ -53,7 +54,7 @@ long i2c_read(int fd, int addr, char *buf, long len) {
 /* Combined write-then-read to device `addr` in one atomic transaction (the classic
    "write register pointer, read register" idiom): send `wlen` bytes, then read `rlen`
    bytes without releasing the bus. `rlen` bytes read (>=0), or -1 on error. */
-long i2c_write_read(int fd, int addr, const char *wbuf, long wlen, char *rbuf, long rlen) {
+int64_t i2c_write_read(int fd, int addr, const char *wbuf, int64_t wlen, char *rbuf, int64_t rlen) {
     struct i2c_msg msgs[2];
     msgs[0].addr = (unsigned short)addr;
     msgs[0].flags = 0;
@@ -72,9 +73,9 @@ void i2c_close(int fd) { if (fd >= 0) close(fd); }
 #else /* non-Linux: no I2C */
 
 int  i2c_open(const char *path) { (void)path; return -1; }
-long i2c_write(int fd, int addr, const char *buf, long len) { (void)fd; (void)addr; (void)buf; (void)len; return -1; }
-long i2c_read(int fd, int addr, char *buf, long len) { (void)fd; (void)addr; (void)buf; (void)len; return -1; }
-long i2c_write_read(int fd, int addr, const char *wbuf, long wlen, char *rbuf, long rlen) {
+int64_t i2c_write(int fd, int addr, const char *buf, int64_t len) { (void)fd; (void)addr; (void)buf; (void)len; return -1; }
+int64_t i2c_read(int fd, int addr, char *buf, int64_t len) { (void)fd; (void)addr; (void)buf; (void)len; return -1; }
+int64_t i2c_write_read(int fd, int addr, const char *wbuf, int64_t wlen, char *rbuf, int64_t rlen) {
     (void)fd; (void)addr; (void)wbuf; (void)wlen; (void)rbuf; (void)rlen; return -1;
 }
 void i2c_close(int fd) { (void)fd; }

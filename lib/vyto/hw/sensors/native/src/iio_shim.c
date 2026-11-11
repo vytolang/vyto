@@ -15,6 +15,7 @@
    (/dev/iio:deviceN with a trigger, an fd folded into a PollSet) is a later increment;
    this proves the sample-read half. Non-Linux compiles to an empty list. */
 
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -160,7 +161,7 @@ int iio_buffer_open(int index) {
 
 /* >0 = bytes of packed scan data, 0 = none/EOF, -1 = would-block, -2 = error. Same
    encoded returns as serial/socket so a poll loop can tell "later" from a failure. */
-long iio_buffer_read(int fd, char *buf, long cap) {
+int64_t iio_buffer_read(int fd, char *buf, int64_t cap) {
     long r = (long)read(fd, buf, (size_t)cap);
     if (r > 0) return r;
     if (r == 0) return 0;
@@ -176,7 +177,7 @@ const char *iio_channels(IioList *l, int i) { (void)l; (void)i; return ""; }
 const char *iio_read_attr(int index, const char *attr) { (void)index; (void)attr; return ""; }
 int  iio_write_attr(int index, const char *attr, const char *val) { (void)index; (void)attr; (void)val; return -1; }
 int  iio_buffer_open(int index) { (void)index; return -1; }
-long iio_buffer_read(int fd, char *buf, long cap) { (void)fd; (void)buf; (void)cap; return -2; }
+int64_t iio_buffer_read(int fd, char *buf, int64_t cap) { (void)fd; (void)buf; (void)cap; return -2; }
 void iio_buffer_close(int fd) { (void)fd; }
 
 #endif

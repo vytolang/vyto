@@ -6,6 +6,7 @@
    the Vyto side copies out (str / http_body_copy) so nothing aliases the
    malloc'd memory past the free. */
 
+#include <stdint.h>
 #include <curl/curl.h>
 #include <stdlib.h>
 #include <string.h>
@@ -184,7 +185,7 @@ static void configure_easy(CURL *curl, const char *method, const char *url,
 /* header_lines: newline-separated "Key: Value" entries (may be empty).
    body/body_len: request body (may be NULL/0). timeout_ms: 0 => defaults. */
 HttpResp *http_perform(const char *method, const char *url, const char *header_lines,
-                       const char *body, long body_len, long timeout_ms) {
+                       const char *body, int64_t body_len, int64_t timeout_ms) {
     ensure_global_init();
 
     CURL *curl = curl_easy_init();
@@ -204,14 +205,14 @@ HttpResp *http_perform(const char *method, const char *url, const char *header_l
     return r;
 }
 
-long http_status(HttpResp *r) { return r ? r->status : 0; }
+int64_t http_status(HttpResp *r) { return r ? r->status : 0; }
 const char *http_body_data(HttpResp *r) { return (r && r->body) ? r->body : ""; }
-long http_body_len(HttpResp *r) { return r ? (long)r->blen : 0; }
+int64_t http_body_len(HttpResp *r) { return r ? (int64_t)r->blen : 0; }
 const char *http_headers(HttpResp *r) { return (r && r->hdr) ? r->hdr : ""; }
 
 /* Binary-safe copy of up to `cap` body bytes into a Vyto buffer; returns the
    number copied. */
-long http_body_copy(HttpResp *r, char *out, long cap) {
+int64_t http_body_copy(HttpResp *r, char *out, int64_t cap) {
     if (!r || !r->body || cap <= 0) return 0;
     long n = (long)r->blen;
     if (n > cap) n = cap;
@@ -250,8 +251,8 @@ static size_t stream_write_cb(void *ptr, size_t sz, size_t nm, void *ud) {
     return n; /* always consume everything so curl keeps going */
 }
 
-long http_stream(const char *method, const char *url, const char *header_lines,
-                 const char *body, long body_len, long timeout_ms,
+int64_t http_stream(const char *method, const char *url, const char *header_lines,
+                 const char *body, int64_t body_len, int64_t timeout_ms,
                  chunk_sink sink, void *sink_ud) {
     static int inited = 0;
     if (!inited) { curl_global_init(CURL_GLOBAL_DEFAULT); inited = 1; }
@@ -349,7 +350,7 @@ static void multi_untrack(HttpMulti *hm, CURL *curl) {
    Owned by Vyto: freed by http_free once the transfer is popped. */
 HttpResp *http_multi_add(HttpMulti *hm, const char *method, const char *url,
                          const char *header_lines, const char *body,
-                         long body_len, long timeout_ms) {
+                         int64_t body_len, int64_t timeout_ms) {
     if (!hm) return NULL;
     CURL *curl = curl_easy_init();
     if (!curl) return NULL;

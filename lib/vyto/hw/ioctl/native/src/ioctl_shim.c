@@ -13,31 +13,31 @@
    Note: ioctl can't do mmap, so devices needing a mapped ring (V4L2 /dev/video*) still
    want a typed package (hw/camera). POSIX. */
 
+#include <stdint.h>
 #include <stdlib.h>
 
 #ifndef _WIN32
-#include <stdint.h>
 #include <sys/ioctl.h>
 #include <asm/ioctl.h>   /* _IOC, _IOC_NONE/_IOC_READ/_IOC_WRITE */
 
 /* ioctl with a byte-buffer argument (the struct-pointer form). The buffer is written
    in place by read-direction ioctls. Returns the driver's result (>=0), or -1. */
-long vt_ioctl_buf(int fd, long req, char *buf) {
+int64_t vt_ioctl_buf(int fd, int64_t req, char *buf) {
     int r = ioctl(fd, (unsigned long)req, buf);
-    return (r < 0) ? -1 : (long)r;
+    return (r < 0) ? -1 : (int64_t)r;
 }
 
 /* ioctl with a scalar argument passed by value (the _IO form, e.g. enable flags).
    Returns the driver's result (>=0), or -1. */
-long vt_ioctl_int(int fd, long req, long val) {
+int64_t vt_ioctl_int(int fd, int64_t req, int64_t val) {
     int r = ioctl(fd, (unsigned long)req, (void *)(intptr_t)val);
-    return (r < 0) ? -1 : (long)r;
+    return (r < 0) ? -1 : (int64_t)r;
 }
 
 /* Build a request number the arch-correct way, exactly as the kernel headers' _IO/
    _IOR/_IOW/_IOWR macros do. dir is a bitwise OR of the vt_ioc_* direction bits. */
-long vt_ioc(int dir, int type, int nr, int size) {
-    return (long)(unsigned long)_IOC((unsigned int)dir, (unsigned int)type,
+int64_t vt_ioc(int dir, int type, int nr, int size) {
+    return (int64_t)(unsigned long)_IOC((unsigned int)dir, (unsigned int)type,
                                      (unsigned int)nr, (unsigned int)size);
 }
 
@@ -47,9 +47,9 @@ int vt_ioc_write(void) { return _IOC_WRITE; }
 
 #else /* _WIN32: no POSIX ioctl */
 
-long vt_ioctl_buf(int fd, long req, char *buf) { (void)fd; (void)req; (void)buf; return -1; }
-long vt_ioctl_int(int fd, long req, long val) { (void)fd; (void)req; (void)val; return -1; }
-long vt_ioc(int dir, int type, int nr, int size) { (void)dir; (void)type; (void)nr; (void)size; return 0; }
+int64_t vt_ioctl_buf(int fd, int64_t req, char *buf) { (void)fd; (void)req; (void)buf; return -1; }
+int64_t vt_ioctl_int(int fd, int64_t req, int64_t val) { (void)fd; (void)req; (void)val; return -1; }
+int64_t vt_ioc(int dir, int type, int nr, int size) { (void)dir; (void)type; (void)nr; (void)size; return 0; }
 int  vt_ioc_none(void)  { return 0; }
 int  vt_ioc_read(void)  { return 0; }
 int  vt_ioc_write(void) { return 0; }

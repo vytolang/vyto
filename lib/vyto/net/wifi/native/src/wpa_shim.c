@@ -10,6 +10,8 @@
    file to clean up and it vanishes on close. Connecting needs access to the control
    socket (the `netdev` group, or root); a denied open is soft (-1). Linux. */
 
+#include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -54,7 +56,7 @@ int wpa_open(const char *ctrl_path) {
 
 /* Send a command, read the reply into `reply` (NUL-terminated). Bytes received (>=0),
    or -1 on error/timeout. */
-long wpa_cmd(int fd, const char *cmd, char *reply, long cap) {
+int64_t wpa_cmd(int fd, const char *cmd, char *reply, int64_t cap) {
     if (send(fd, cmd, strlen(cmd), 0) < 0) return -1;
     long n = (long)recv(fd, reply, (size_t)cap - 1, 0);
     if (n < 0) { reply[0] = 0; return -1; }
@@ -83,7 +85,7 @@ int wpa_attach(const char *ctrl_path) {
 
 /* Read one pushed event line into `buf` (NUL-terminated). >0 bytes, -1 would-block
    (nothing pending), -2 error. Read after the fd polls readable. */
-long wpa_event_read(int fd, char *buf, long cap) {
+int64_t wpa_event_read(int fd, char *buf, int64_t cap) {
     long n = (long)recv(fd, buf, (size_t)cap - 1, 0);
     if (n < 0) { buf[0] = 0; return (errno == EAGAIN || errno == EWOULDBLOCK) ? -1 : -2; }
     buf[n] = 0;
@@ -93,9 +95,9 @@ long wpa_event_read(int fd, char *buf, long cap) {
 #else /* non-Linux: no wpa_supplicant socket */
 
 int  wpa_open(const char *ctrl_path) { (void)ctrl_path; return -1; }
-long wpa_cmd(int fd, const char *cmd, char *reply, long cap) { (void)fd; (void)cmd; (void)cap; if (cap > 0) reply[0] = 0; return -1; }
+int64_t wpa_cmd(int fd, const char *cmd, char *reply, int64_t cap) { (void)fd; (void)cmd; (void)cap; if (cap > 0) reply[0] = 0; return -1; }
 int  wpa_attach(const char *ctrl_path) { (void)ctrl_path; return -1; }
-long wpa_event_read(int fd, char *buf, long cap) { (void)fd; (void)cap; if (cap > 0) buf[0] = 0; return -2; }
+int64_t wpa_event_read(int fd, char *buf, int64_t cap) { (void)fd; (void)cap; if (cap > 0) buf[0] = 0; return -2; }
 void wpa_close(int fd) { (void)fd; }
 
 #endif

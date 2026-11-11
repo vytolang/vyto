@@ -8,6 +8,7 @@
    package. Same encoded returns as serial/socket. POSIX; Windows is a later backend. */
 
 #define _GNU_SOURCE
+#include <stdint.h>
 #include <stdlib.h>
 
 #ifndef _WIN32
@@ -28,23 +29,23 @@ int dev_open(const char *path, int mode, int nonblock) {
 }
 
 /* >0 = bytes read, 0 = EOF, -1 = would-block, -2 = error. */
-long dev_read(int fd, char *buf, long cap) {
+int64_t dev_read(int fd, char *buf, int64_t cap) {
     long r = (long)read(fd, buf, (size_t)cap);
     if (r >= 0) return r;
     return (errno == EAGAIN || errno == EWOULDBLOCK) ? -1 : -2;
 }
 
 /* >=0 = bytes written, -1 = would-block, -2 = error. */
-long dev_write(int fd, const char *buf, long n) {
+int64_t dev_write(int fd, const char *buf, int64_t n) {
     long w = (long)write(fd, buf, (size_t)n);
     if (w >= 0) return w;
     return (errno == EAGAIN || errno == EWOULDBLOCK) ? -1 : -2;
 }
 
 /* Reposition. whence: 0 SEEK_SET, 1 SEEK_CUR, 2 SEEK_END. New offset, or -1. */
-long dev_seek(int fd, long off, int whence) {
+int64_t dev_seek(int fd, int64_t off, int whence) {
     off_t r = lseek(fd, (off_t)off, whence);
-    return (r == (off_t)-1) ? -1 : (long)r;
+    return (r == (off_t)-1) ? -1 : (int64_t)r;
 }
 
 void dev_close(int fd) { if (fd >= 0) close(fd); }
@@ -52,9 +53,9 @@ void dev_close(int fd) { if (fd >= 0) close(fd); }
 #else /* _WIN32: generic device I/O not yet implemented */
 
 int  dev_open(const char *path, int mode, int nonblock) { (void)path; (void)mode; (void)nonblock; return -1; }
-long dev_read(int fd, char *buf, long cap) { (void)fd; (void)buf; (void)cap; return -2; }
-long dev_write(int fd, const char *buf, long n) { (void)fd; (void)buf; (void)n; return -2; }
-long dev_seek(int fd, long off, int whence) { (void)fd; (void)off; (void)whence; return -1; }
+int64_t dev_read(int fd, char *buf, int64_t cap) { (void)fd; (void)buf; (void)cap; return -2; }
+int64_t dev_write(int fd, const char *buf, int64_t n) { (void)fd; (void)buf; (void)n; return -2; }
+int64_t dev_seek(int fd, int64_t off, int whence) { (void)fd; (void)off; (void)whence; return -1; }
 void dev_close(int fd) { (void)fd; }
 
 #endif

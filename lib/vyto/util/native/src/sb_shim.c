@@ -9,6 +9,7 @@
    NULs are preserved); only the strlen-based toString() truncates at a NUL,
    matching str(bytes as cstring) everywhere else in the stdlib. */
 
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -30,7 +31,7 @@ static int sb_ensure(StrBuf *b, size_t extra) {
     return 1;
 }
 
-void *sb_new(long cap) {
+void *sb_new(int64_t cap) {
     StrBuf *b = (StrBuf *)calloc(1, sizeof *b);
     if (!b) return NULL;
     size_t c0 = cap > 0 ? (size_t)cap : 64;
@@ -42,7 +43,7 @@ void *sb_new(long cap) {
     return b;
 }
 
-void sb_append(void *h, const char *s, long n) {
+void sb_append(void *h, const char *s, int64_t n) {
     if (!h || !s || n <= 0) return;
     StrBuf *b = (StrBuf *)h;
     if (!sb_ensure(b, (size_t)n)) return;
@@ -55,7 +56,7 @@ void sb_append(void *h, const char *s, long n) {
    Vyto has no pointer arithmetic on cstring, and without it appending part of a
    string means slicing it first -- an allocation per chunk. Bounds are the
    caller's to validate against the source length; hi <= lo is a no-op. */
-void sb_append_slice(void *h, const char *s, long lo, long hi) {
+void sb_append_slice(void *h, const char *s, int64_t lo, int64_t hi) {
     if (!h || !s || hi <= lo) return;
     sb_append(h, s + lo, hi - lo);
 }
@@ -82,7 +83,7 @@ void sb_append_byte(void *h, int byte) {
     b->buf[b->len] = 0;
 }
 
-long sb_len(void *h) { return h ? (long)((StrBuf *)h)->len : 0; }
+int64_t sb_len(void *h) { return h ? (int64_t)((StrBuf *)h)->len : 0; }
 
 const char *sb_cstr(void *h) { return h ? ((StrBuf *)h)->buf : ""; }
 

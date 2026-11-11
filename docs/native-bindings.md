@@ -118,6 +118,13 @@ A bigger real one: `lib/vyto/surface/vsurf.vt` is generated from
 | struct passed/returned by value | a mapped `struct { field: type; ... }`, only if every field is itself mappable |
 | `#define NAME <int-literal>` | `const NAME: i64 = ...` |
 
+**Writing your own shim: never use C `long` for a Vyto `i64`.** `long` is
+64-bit on Linux and macOS but 32-bit on Windows, so `long f()` bound as
+`fn f(): i64` passes every Linux test and on Windows returns 4294967295 for
+-1. Write `int64_t` (from `<stdint.h>`) in the shim, or bind the `long` as
+`clong`. `tests/ffi_width_check.py` checks every binding in this repo for
+exactly this and runs in `make test`.
+
 Struct fields and function parameters that collide with a Vyto keyword (e.g. a
 field named `len`) are renamed with a trailing `_` for fields, or `a0`, `a1`,
 ... for unnamed/keyword-colliding parameters.

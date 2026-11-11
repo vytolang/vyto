@@ -14,6 +14,7 @@
    fourcc so the caller can tell. A YUYV->RGBA helper produces blit-ready pixels. Zero
    #link. Non-Linux compiles to null/stubs. */
 
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -108,12 +109,12 @@ int  cam_fd(Camera *c)     { return c ? c->fd : -1; }
 int  cam_width(Camera *c)  { return c ? c->width : 0; }
 int  cam_height(Camera *c) { return c ? c->height : 0; }
 int  cam_fourcc(Camera *c) { return c ? (int)c->fourcc : 0; }
-long cam_frame_size(Camera *c) { return c ? (long)c->sizeimage : 0; }
+int64_t cam_frame_size(Camera *c) { return c ? (int64_t)c->sizeimage : 0; }
 
 /* Dequeue one frame, copy up to `cap` bytes into dst, requeue. >=0 bytes copied,
    -1 = no frame ready (would-block), -2 = error. Non-blocking; call after the fd polls
    readable. */
-long cam_grab(Camera *c, char *dst, long cap) {
+int64_t cam_grab(Camera *c, char *dst, int64_t cap) {
     if (!c) return -2;
     struct v4l2_buffer b;
     memset(&b, 0, sizeof b);
@@ -148,8 +149,8 @@ int  cam_fd(Camera *c)     { (void)c; return -1; }
 int  cam_width(Camera *c)  { (void)c; return 0; }
 int  cam_height(Camera *c) { (void)c; return 0; }
 int  cam_fourcc(Camera *c) { (void)c; return 0; }
-long cam_frame_size(Camera *c) { (void)c; return 0; }
-long cam_grab(Camera *c, char *dst, long cap) { (void)c; (void)dst; (void)cap; return -2; }
+int64_t cam_frame_size(Camera *c) { (void)c; return 0; }
+int64_t cam_grab(Camera *c, char *dst, int64_t cap) { (void)c; (void)dst; (void)cap; return -2; }
 void cam_close(Camera *c) { (void)c; }
 
 #endif

@@ -183,7 +183,7 @@ static int ct_grow(CT *t, int64_t need) {
     return 1;
 }
 
-void *ct_new(long ncap) {
+void *ct_new(int64_t ncap) {
     CT *t = (CT *)calloc(1, sizeof *t);
     if (!t) return NULL;
     if (ncap > 0 && !ct_grow(t, ncap)) { free(t); return NULL; }
@@ -193,7 +193,7 @@ void *ct_new(long ncap) {
 /* pre-size all columns + idx to `nrow` rows (one realloc each, no-op if smaller
    than current capacity). Call after the schema is set and the row count is
    known so the bulk append below never reallocs. */
-void ct_reserve(void *h, long nrow) {
+void ct_reserve(void *h, int64_t nrow) {
     if (h && nrow > 0) ct_grow((CT *)h, (int64_t)nrow);
 }
 
@@ -500,7 +500,7 @@ void ct_set_bool(void *h, int col, int v) {
     else scalar_put_i(c, t->nrow, v ? 1 : 0);
 }
 
-void ct_set_str(void *h, int col, const char *s, long n) {
+void ct_set_str(void *h, int col, const char *s, int64_t n) {
     CT *t = (CT *)h;
     if (!t || col < 0 || col >= t->ncol) return;
     Col *c = &t->cols[col];
@@ -538,7 +538,7 @@ void ct_end_row(void *h) {
    permutation, then reuse the same column writers the row builder uses. String
    writes on a CT_STR column append to the arena (old bytes are orphaned, not
    reclaimed); CT_CAT re-interns; the view (sort/filter) is left as-is. */
-void ct_set_cell_i64(void *h, long vrow, int col, long long v) {
+void ct_set_cell_i64(void *h, int64_t vrow, int col, long long v) {
     CT *t = (CT *)h;
     if (!t || vrow < 0 || vrow >= t->vlen || col < 0 || col >= t->ncol) return;
     int64_t row = t->idx[vrow];
@@ -548,7 +548,7 @@ void ct_set_cell_i64(void *h, long vrow, int col, long long v) {
     else scalar_put_i(c, row, (int64_t)v);
 }
 
-void ct_set_cell_f64(void *h, long vrow, int col, double v) {
+void ct_set_cell_f64(void *h, int64_t vrow, int col, double v) {
     CT *t = (CT *)h;
     if (!t || vrow < 0 || vrow >= t->vlen || col < 0 || col >= t->ncol) return;
     int64_t row = t->idx[vrow];
@@ -558,7 +558,7 @@ void ct_set_cell_f64(void *h, long vrow, int col, double v) {
     else scalar_put_f(c, row, v);
 }
 
-void ct_set_cell_str(void *h, long vrow, int col, const char *s, long n) {
+void ct_set_cell_str(void *h, int64_t vrow, int col, const char *s, int64_t n) {
     CT *t = (CT *)h;
     if (!t || vrow < 0 || vrow >= t->vlen || col < 0 || col >= t->ncol || !s || n < 0) return;
     int64_t row = t->idx[vrow];
@@ -575,7 +575,7 @@ void ct_set_cell_str(void *h, long vrow, int col, const char *s, long n) {
 }
 
 /* Whether visible row `vrow`, column `col` is null. */
-int ct_is_null(void *h, long vrow, int col) {
+int ct_is_null(void *h, int64_t vrow, int col) {
     CT *t = (CT *)h;
     if (!t || vrow < 0 || vrow >= t->vlen || col < 0 || col >= t->ncol) return 0;
     return col_is_null(&t->cols[col], t->idx[vrow]);
@@ -584,7 +584,7 @@ int ct_is_null(void *h, long vrow, int col) {
 /* Random-access null toggle (by VISIBLE row). Setting isnull=0 does not
    restore any prior value -- the cell keeps whatever scalar/text it last
    held; only ct_is_null's answer changes. */
-void ct_set_cell_null(void *h, long vrow, int col, int isnull) {
+void ct_set_cell_null(void *h, int64_t vrow, int col, int isnull) {
     CT *t = (CT *)h;
     if (!t || vrow < 0 || vrow >= t->vlen || col < 0 || col >= t->ncol) return;
     col_set_null(&t->cols[col], t->idx[vrow], t->cap, isnull);
@@ -592,17 +592,17 @@ void ct_set_cell_null(void *h, long vrow, int col, int isnull) {
 
 /* ------------------------------------------------------------- shape */
 
-long ct_nrow(void *h) { return h ? (long)((CT *)h)->nrow : 0; }
-long ct_ncol(void *h) { return h ? (long)((CT *)h)->ncol : 0; }
-long ct_view_len(void *h) { return h ? (long)((CT *)h)->vlen : 0; }
+int64_t ct_nrow(void *h) { return h ? (int64_t)((CT *)h)->nrow : 0; }
+int64_t ct_ncol(void *h) { return h ? (int64_t)((CT *)h)->ncol : 0; }
+int64_t ct_view_len(void *h) { return h ? (int64_t)((CT *)h)->vlen : 0; }
 
 /* Source (absolute) row backing visible row `vrow` — the identity that a
    caller can hold across sort/filter, since it survives view permutations.
    Returns -1 if out of range. */
-long ct_src_row(void *h, long vrow) {
+int64_t ct_src_row(void *h, int64_t vrow) {
     CT *t = (CT *)h;
     if (!t || vrow < 0 || vrow >= t->vlen) return -1;
-    return (long)t->idx[vrow];
+    return (int64_t)t->idx[vrow];
 }
 
 int ct_col_kind(void *h, int col) {
@@ -611,7 +611,7 @@ int ct_col_kind(void *h, int col) {
     return t->cols[col].kind;
 }
 
-long ct_col_name(void *h, int col, char *buf, long cap) {
+int64_t ct_col_name(void *h, int col, char *buf, int64_t cap) {
     CT *t = (CT *)h;
     if (!t || col < 0 || col >= t->ncol || cap <= 1) { if (buf && cap > 0) buf[0] = 0; return 0; }
     const char *nm = t->cols[col].name ? t->cols[col].name : "";
@@ -641,7 +641,7 @@ static int kind_is_int(int k) { return k == CT_I64 || k == CT_I32 || k == CT_I16
 /* Format visible row `vrow`, column `col` into buf (NUL-terminated), returning
    the byte length. Scalars via snprintf, strings copied from the arena. This is
    the only text a rendered cell costs — no whole-model string materialization. */
-long ct_cell_str(void *h, long vrow, int col, char *buf, long cap) {
+int64_t ct_cell_str(void *h, int64_t vrow, int col, char *buf, int64_t cap) {
     CT *t = (CT *)h;
     if (!t || vrow < 0 || vrow >= t->vlen || col < 0 || col >= t->ncol || cap <= 1) {
         if (buf && cap > 0) buf[0] = 0;
@@ -670,30 +670,30 @@ long ct_cell_str(void *h, long vrow, int col, char *buf, long cap) {
    which is clipped to a column anyway — so a caller that needs the WHOLE value
    (a value viewer, a CSV export, the clipboard) asks for the length first and
    sizes its buffer to it. A null cell is 0, the same as ct_cell_str writes. */
-long ct_cell_len(void *h, long vrow, int col) {
+int64_t ct_cell_len(void *h, int64_t vrow, int col) {
     CT *t = (CT *)h;
     if (!t || vrow < 0 || vrow >= t->vlen || col < 0 || col >= t->ncol) return 0;
     int64_t row = t->idx[vrow];
     Col *c = &t->cols[col];
     if (col_is_null(c, row)) return 0;
-    if (c->kind == CT_STR) return (long)c->slen[row];
-    if (c->kind == CT_CAT) { int32_t l; cat_str(c, row, &l); return (long)l; }
+    if (c->kind == CT_STR) return (int64_t)c->slen[row];
+    if (c->kind == CT_CAT) { int32_t l; cat_str(c, row, &l); return (int64_t)l; }
     if (c->kind == CT_BOOL) return ((uint8_t *)c->data)[row] ? 4 : 5;
     {
         char buf[64];
         if (kind_is_int(c->kind))
-            return (long)snprintf(buf, sizeof buf, "%lld", (long long)cell_num(c, row));
-        return (long)snprintf(buf, sizeof buf, "%g", cell_num(c, row));
+            return (int64_t)snprintf(buf, sizeof buf, "%lld", (long long)cell_num(c, row));
+        return (int64_t)snprintf(buf, sizeof buf, "%g", cell_num(c, row));
     }
 }
 
-long long ct_cell_i64(void *h, long vrow, int col) {
+long long ct_cell_i64(void *h, int64_t vrow, int col) {
     CT *t = (CT *)h;
     if (!t || vrow < 0 || vrow >= t->vlen || col < 0 || col >= t->ncol) return 0;
     return (long long)cell_num(&t->cols[col], t->idx[vrow]);
 }
 
-double ct_cell_f64(void *h, long vrow, int col) {
+double ct_cell_f64(void *h, int64_t vrow, int col) {
     CT *t = (CT *)h;
     if (!t || vrow < 0 || vrow >= t->vlen || col < 0 || col >= t->ncol) return 0.0;
     return cell_num(&t->cols[col], t->idx[vrow]);

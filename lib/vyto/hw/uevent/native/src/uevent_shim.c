@@ -14,6 +14,7 @@
    Receiving kernel uevents on multicast group 1 is normally unprivileged. Non-Linux
    compiles to -1 stubs. */
 
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -42,7 +43,7 @@ int uevent_open(void) {
 
 /* Read one uevent datagram, NULs rewritten to '\n', NUL-terminated. >0 bytes, -1
    would-block (nothing pending), -2 error. Read after the fd polls readable. */
-long uevent_read(int fd, char *buf, long cap) {
+int64_t uevent_read(int fd, char *buf, int64_t cap) {
     long n = (long)recv(fd, buf, (size_t)cap - 1, 0);
     if (n < 0) return (errno == EAGAIN || errno == EWOULDBLOCK) ? -1 : -2;
     for (long i = 0; i < n; i++) if (buf[i] == 0) buf[i] = '\n';
@@ -55,7 +56,7 @@ void uevent_close(int fd) { if (fd >= 0) close(fd); }
 #else /* non-Linux: no netlink uevents */
 
 int  uevent_open(void) { return -1; }
-long uevent_read(int fd, char *buf, long cap) { (void)fd; (void)buf; (void)cap; return -2; }
+int64_t uevent_read(int fd, char *buf, int64_t cap) { (void)fd; (void)buf; (void)cap; return -2; }
 void uevent_close(int fd) { (void)fd; }
 
 #endif

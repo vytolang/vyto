@@ -9,6 +9,7 @@
    denied open is soft (-1). Encoded returns match vyto/net/socket. Linux only (BSD uses
    BPF; a later backend). */
 
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -47,7 +48,7 @@ int raw_open(const char *iface) {
 }
 
 /* >0 = bytes of a received frame, 0 = none, -1 = would-block, -2 = error. */
-long raw_recv(int fd, char *buf, long cap) {
+int64_t raw_recv(int fd, char *buf, int64_t cap) {
     long r = (long)recv(fd, buf, (size_t)cap, 0);
     if (r > 0) return r;
     if (r == 0) return 0;
@@ -56,7 +57,7 @@ long raw_recv(int fd, char *buf, long cap) {
 
 /* Inject a complete frame (with its own Ethernet header). >=0 sent, -1 would-block,
    -2 error. */
-long raw_send(int fd, const char *buf, long n) {
+int64_t raw_send(int fd, const char *buf, int64_t n) {
     long w = (long)send(fd, buf, (size_t)n, 0);
     if (w >= 0) return w;
     return (errno == EAGAIN || errno == EWOULDBLOCK) ? -1 : -2;
@@ -67,8 +68,8 @@ void raw_close(int fd) { if (fd >= 0) close(fd); }
 #else /* non-Linux: no AF_PACKET */
 
 int  raw_open(const char *iface) { (void)iface; return -1; }
-long raw_recv(int fd, char *buf, long cap) { (void)fd; (void)buf; (void)cap; return -2; }
-long raw_send(int fd, const char *buf, long n) { (void)fd; (void)buf; (void)n; return -2; }
+int64_t raw_recv(int fd, char *buf, int64_t cap) { (void)fd; (void)buf; (void)cap; return -2; }
+int64_t raw_send(int fd, const char *buf, int64_t n) { (void)fd; (void)buf; (void)n; return -2; }
 void raw_close(int fd) { (void)fd; }
 
 #endif

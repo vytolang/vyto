@@ -10,6 +10,7 @@
    POSIX (Linux + macOS + BSD). Windows serial is a separate COM-port backend. */
 
 #define _GNU_SOURCE
+#include <stdint.h>
 #include <stdlib.h>
 
 #ifndef _WIN32
@@ -70,14 +71,14 @@ int ser_open(const char *path, int baud) {
 }
 
 /* >0 = bytes read, 0 = EOF, -1 = would-block (no data yet), -2 = error. */
-long ser_read(int fd, char *buf, long cap) {
+int64_t ser_read(int fd, char *buf, int64_t cap) {
     long r = (long)read(fd, buf, (size_t)cap);
     if (r >= 0) return r;
     return (errno == EAGAIN || errno == EWOULDBLOCK) ? -1 : -2;
 }
 
 /* >=0 = bytes written, -1 = would-block, -2 = error. */
-long ser_write(int fd, const char *buf, long n) {
+int64_t ser_write(int fd, const char *buf, int64_t n) {
     long w = (long)write(fd, buf, (size_t)n);
     if (w >= 0) return w;
     return (errno == EAGAIN || errno == EWOULDBLOCK) ? -1 : -2;
@@ -169,21 +170,21 @@ int ser_open(const char *path, int baud) {
 }
 
 /* >0 bytes, -1 would-block (nothing buffered), -2 error. */
-long ser_read(int fd, char *buf, long cap) {
+int64_t ser_read(int fd, char *buf, int64_t cap) {
     HANDLE h = ser_h(fd);
     if (h == INVALID_HANDLE_VALUE) return -2;
     DWORD got = 0;
     if (!ReadFile(h, buf, (DWORD)cap, &got, NULL)) return -2;
-    return got > 0 ? (long)got : -1;
+    return got > 0 ? (int64_t)got : -1;
 }
 
 /* >=0 bytes written, -2 error. */
-long ser_write(int fd, const char *buf, long n) {
+int64_t ser_write(int fd, const char *buf, int64_t n) {
     HANDLE h = ser_h(fd);
     if (h == INVALID_HANDLE_VALUE) return -2;
     DWORD put = 0;
     if (!WriteFile(h, buf, (DWORD)n, &put, NULL)) return -2;
-    return (long)put;
+    return (int64_t)put;
 }
 
 int ser_drain(int fd) {

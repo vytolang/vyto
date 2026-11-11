@@ -215,6 +215,11 @@ fn fillPolygon(xs: float[], ys: float[], rgb: int) {
 A `float[]` reaches C as `double*`, since Vyto `float` is `f64`. A shim that
 wants `float32` must narrow on the C side.
 
+**A shim never says `long` where its extern says `i64`.** C `long` is 32-bit
+on Windows (LLP64), so -1 arrives as 4294967295 and nothing on Linux can show
+it — 153 bindings shipped that way. Use `int64_t`, or bind as `clong`.
+`tests/ffi_width_check.py` (in `make test`) diffs every extern against its shim.
+
 `vytobind` generates these blocks from a C header — `./vytobind foo.h --lib
 name@platform --filter 'foo_*'` prints a `.vt` module on stdout. Checked-in
 examples: `lib/vyto/surface/vsurf.vt`, `examples/greeter/greeter.vt`.

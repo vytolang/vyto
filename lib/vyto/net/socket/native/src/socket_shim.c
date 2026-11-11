@@ -216,11 +216,11 @@ int vsock_local_port(int fd) {
     return ntohs(a.sin_port);
 }
 
-long vsock_send(int fd, const char *buf, long n) {
-    return (long)send(VS_FD(fd), buf, (vs_iolen_t)n, MSG_NOSIGNAL);
+int64_t vsock_send(int fd, const char *buf, int64_t n) {
+    return (int64_t)send(VS_FD(fd), buf, (vs_iolen_t)n, MSG_NOSIGNAL);
 }
-long vsock_recv(int fd, char *buf, long cap) {
-    return (long)recv(VS_FD(fd), buf, (vs_iolen_t)cap, 0);
+int64_t vsock_recv(int fd, char *buf, int64_t cap) {
+    return (int64_t)recv(VS_FD(fd), buf, (vs_iolen_t)cap, 0);
 }
 
 int vsock_set_timeout(int fd, int ms) {
@@ -280,7 +280,7 @@ int vsock_set_nonblocking(int fd, int on) {
 }
 
 /* >0 = bytes read, 0 = peer closed (EOF), -1 = would-block, -2 = error. */
-long vsock_try_recv(int fd, char *buf, long cap) {
+int64_t vsock_try_recv(int fd, char *buf, int64_t cap) {
     long r = (long)recv(VS_FD(fd), buf, (vs_iolen_t)cap, 0);
     if (r >= 0) return r;
     return vs_would_block(vs_lasterr()) ? -1 : -2;
@@ -290,13 +290,13 @@ long vsock_try_recv(int fd, char *buf, long cap) {
 /* Send from an offset into a caller-owned buffer. Lets a writer resume a
    partial send without slicing or copying the remainder — the buffer is
    typically a StringBuilder's internal storage, which outlives the call. */
-long vsock_try_send_at(int fd, const char *buf, long off, long n) {
+int64_t vsock_try_send_at(int fd, const char *buf, int64_t off, int64_t n) {
     long r = (long)send(VS_FD(fd), buf + off, (vs_iolen_t)n, MSG_NOSIGNAL);
     if (r >= 0) return r;
     return vs_would_block(vs_lasterr()) ? -1 : -2;
 }
 
-long vsock_try_send(int fd, const char *buf, long n) {
+int64_t vsock_try_send(int fd, const char *buf, int64_t n) {
     long r = (long)send(VS_FD(fd), buf, (vs_iolen_t)n, MSG_NOSIGNAL);
     if (r >= 0) return r;
     return vs_would_block(vs_lasterr()) ? -1 : -2;
@@ -592,14 +592,14 @@ int vsock_udp_bind(const char *host, int port) {
     if (bind(s, (struct sockaddr *)&a, sizeof a) != 0) { vs_closesocket(s); return -1; }
     return VS_INT(s);
 }
-long vsock_sendto(int fd, const char *host, int port, const char *buf, long n) {
+int64_t vsock_sendto(int fd, const char *host, int port, const char *buf, int64_t n) {
     struct sockaddr_in a;
     memset(&a, 0, sizeof a);
     a.sin_family = AF_INET;
     a.sin_port = htons((unsigned short)port);
     if (inet_pton(AF_INET, host, &a.sin_addr) != 1) return -1;
-    return (long)sendto(VS_FD(fd), buf, (vs_iolen_t)n, 0, (struct sockaddr *)&a, sizeof a);
+    return (int64_t)sendto(VS_FD(fd), buf, (vs_iolen_t)n, 0, (struct sockaddr *)&a, sizeof a);
 }
-long vsock_recvfrom(int fd, char *buf, long cap) {
-    return (long)recvfrom(VS_FD(fd), buf, (vs_iolen_t)cap, 0, NULL, NULL);
+int64_t vsock_recvfrom(int fd, char *buf, int64_t cap) {
+    return (int64_t)recvfrom(VS_FD(fd), buf, (vs_iolen_t)cap, 0, NULL, NULL);
 }

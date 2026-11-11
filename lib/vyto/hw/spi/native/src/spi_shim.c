@@ -9,11 +9,11 @@
    Zero #link, kernel char device. Bus access needs the `spi` group or root. No easy
    kernel mock (needs a real bus or a MISO->MOSI loopback jumper). Non-Linux → -1. */
 
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
 #ifdef __linux__
-#include <stdint.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <errno.h>
@@ -38,7 +38,7 @@ int spi_configure(int fd, int mode, int bits, int speed_hz) {
 
 /* Full-duplex transfer: clock out `len` bytes from tx while clocking `len` bytes into
    rx. `len` on success, -1 on error. tx and rx may be distinct buffers of length len. */
-long spi_transfer(int fd, const char *tx, char *rx, long len, int speed_hz, int bits) {
+int64_t spi_transfer(int fd, const char *tx, char *rx, int64_t len, int speed_hz, int bits) {
     struct spi_ioc_transfer tr;
     memset(&tr, 0, sizeof tr);
     tr.tx_buf = (unsigned long)(uintptr_t)tx;
@@ -56,7 +56,7 @@ void spi_close(int fd) { if (fd >= 0) close(fd); }
 
 int  spi_open(const char *path) { (void)path; return -1; }
 int  spi_configure(int fd, int mode, int bits, int speed_hz) { (void)fd; (void)mode; (void)bits; (void)speed_hz; return -1; }
-long spi_transfer(int fd, const char *tx, char *rx, long len, int speed_hz, int bits) {
+int64_t spi_transfer(int fd, const char *tx, char *rx, int64_t len, int speed_hz, int bits) {
     (void)fd; (void)tx; (void)rx; (void)len; (void)speed_hz; (void)bits; return -1;
 }
 void spi_close(int fd) { (void)fd; }

@@ -354,6 +354,23 @@ if command -v python3 >/dev/null 2>&1; then
 else
     echo "SKIP terminal_signal_check (no python3)"
 fi
+# Every extern "C" binding must agree with its shim on integer width on every
+# target. C `long` is 64-bit here and 32-bit on Windows (LLP64), so a shim
+# returning `long` to a Vyto `i64` passes every Linux test and returns
+# 4294967295 for -1 on Windows. 153 such bindings shipped and were found only
+# by running the suite on a real Windows 7 box; a Linux build cannot show it,
+# so this compares the declarations instead.
+if command -v python3 >/dev/null 2>&1; then
+    if out=$(python3 tests/ffi_width_check.py 2>&1); then
+        echo "PASS ffi_width_check (${out##*: })"
+    else
+        echo "FAIL ffi_width_check"
+        echo "$out"
+        fail=1
+    fi
+else
+    echo "SKIP ffi_width_check (no python3)"
+fi
 # vyto/db is pure Vyto and must stay freestanding-safe; its SQLite subpackage is
 # the one part that is not, so db_shim.c carries a VT_NO_LIBC arm that drops the
 # whole library and returns failure sentinels. Both halves are checked because

@@ -7,6 +7,7 @@
    whose deinit calls os_capture_free exactly once. */
 
 #define _GNU_SOURCE
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -270,7 +271,7 @@ OsCap *os_capture(const char *cmd) {
     return c;
 }
 const char *os_capture_data(OsCap *c) { return c ? c->data : ""; }
-long os_capture_len(OsCap *c) { return c ? c->len : 0; }
+int64_t os_capture_len(OsCap *c) { return c ? c->len : 0; }
 int os_capture_code(OsCap *c) { return c ? c->code : -1; }
 void os_capture_free(OsCap *c) {
     if (!c) return;

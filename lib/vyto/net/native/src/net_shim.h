@@ -12,7 +12,7 @@ typedef struct NetFetch NetFetch;
    out of scope for this iteration. */
 NetFetch *net_fetch_url(const char *url);
 void net_fetch_free(NetFetch *f);
-long net_fetch_len(NetFetch *f);   /* bytes fetched */
+int64_t net_fetch_len(NetFetch *f);   /* bytes fetched */
 void *net_fetch_data(NetFetch *f); /* borrowed pointer, valid until net_fetch_free */
 
 #endif
