@@ -1,0 +1,376 @@
+// vyto/win/d2d — a Painter on Direct2D + DirectWrite, for Windows.
+//
+// The rich tier without blend2d: system fonts with ClearType and OS font
+// fallback, drawn by the Direct2D that ships with Windows 7 and later.
+// An app opts in from its Windows entry file:
+//
+//     let win = new Window("App", 800, 600);
+//     win.use_painter(new D2DPainter(win.surface(), 15.0));
+//     win.run();
+//
+// Vyto has no conditional imports, and an imported painter's overrides stay
+// live through --gc-sections, so importing both this and vyto/gfx links
+// blend2d too. A cross-platform app keeps one entry file per platform and
+// its shared code in a module: app_win.vt imports this, app.vt imports gfx.
+//
+// The package compiles everywhere — its shim is a stub off Windows — but
+// d2d_available() is false there and constructing a D2DPainter panics.
+//
+// Every Painter op is implemented: shapes, strokes, gradients, paths, rounded
+// clips, transforms, images, text, and the pixel effects (shadow, blur,
+// frosted backdrop), the last three ported from vyto/gfx so both rich tiers
+// agree. Only load_image_url is left to the base Painter, as in GfxPainter.
+
+import { Painter, WEIGHT } from "vyto/surface/painter";
+import { Surface, Rect, rgb } from "vyto/surface";
+import { Path } from "vyto/geom/path";
+
+#link "d2d1" if "windows"
+#link "dwrite" if "windows"
+#link "windowscodecs" if "windows"
+#link "ole32" if "windows"
+
+extern "C" {
+    fn d2d_ok(): i32;
+    fn d2d_new(w: i32, h: i32): rawptr;
+    fn d2d_free(c: rawptr);
+    fn d2d_mode(c: rawptr): i32;
+    fn d2d_stroke_round_rect(c: rawptr, x: f64, y: f64, w: f64, h: f64, r: f64,
+                             width: f64, color: i32);
+    fn d2d_fill_ellipse(c: rawptr, cx: f64, cy: f64, rx: f64, ry: f64, color: i32);
+    fn d2d_stroke_ellipse(c: rawptr, cx: f64, cy: f64, rx: f64, ry: f64, width: f64,
+                          color: i32);
+    fn d2d_gradient_v(c: rawptr, x: f64, y: f64, w: f64, h: f64, r: f64, top: i32,
+                      bottom: i32);
+    fn d2d_gradient_n(c: rawptr, x: f64, y: f64, w: f64, h: f64, r: f64,
+                      colors: rawptr, positions: rawptr, n: i32);
+    fn d2d_radial_gradient(c: rawptr, x: f64, y: f64, w: f64, h: f64,
+                           cx: f64, cy: f64, radius: f64,
+                           colors: rawptr, positions: rawptr, n: i32);
+    fn d2d_bevel(c: rawptr, x: f64, y: f64, w: f64, h: f64, r: f64, width: f64,
+                 light: i32, dark: i32, raised: i32);
+    fn d2d_shadow(c: rawptr, x: f64, y: f64, w: f64, h: f64, r: f64, blur: f64, dy: f64,
+                  color: i32);
+    fn d2d_blur(c: rawptr, x: f64, y: f64, w: f64, h: f64, radius: f64);
+    fn d2d_backdrop(c: rawptr, x: f64, y: f64, w: f64, h: f64, r: f64, radius: f64,
+                    tint: i32);
+    fn d2d_save(c: rawptr);
+    fn d2d_restore(c: rawptr);
+    fn d2d_translate(c: rawptr, dx: f64, dy: f64);
+    fn d2d_scale(c: rawptr, sx: f64, sy: f64);
+    fn d2d_rotate(c: rawptr, deg: f64);
+    fn d2d_fill_path(c: rawptr, cmds: rawptr, nc: i32, coords: rawptr, ncoord: i32,
+                     color: i32);
+    fn d2d_stroke_path(c: rawptr, cmds: rawptr, nc: i32, coords: rawptr, ncoord: i32,
+                       width: f64, color: i32);
+    fn d2d_fill_polygon(c: rawptr, xs: rawptr, ys: rawptr, n: i32, color: i32);
+    fn d2d_stroke_arc(c: rawptr, cx: f64, cy: f64, rx: f64, ry: f64,
+                      start_deg: f64, sweep_deg: f64, width: f64, color: i32);
+    fn d2d_image_load_file(path: cstring): rawptr;
+    fn d2d_image_load_bytes(data: rawptr, len: i32): rawptr;
+    fn d2d_image_free(img: rawptr);
+    fn d2d_draw_image(c: rawptr, img: rawptr, x: f64, y: f64, w: f64, h: f64);
+    // embedded-asset registry (runtime); null / -1 on a miss
+    fn vt_vfs_ptr(key: cstring): rawptr;
+    fn vt_vfs_size(key: cstring): i64;
+    fn d2d_resize(c: rawptr, w: i32, h: i32): i32;
+    fn d2d_end(c: rawptr);
+    fn d2d_fill_rect(c: rawptr, x: f64, y: f64, w: f64, h: f64, color: i32);
+    fn d2d_fill_round_rect(c: rawptr, x: f64, y: f64, w: f64, h: f64, r: f64, color: i32);
+    fn d2d_stroke_line(c: rawptr, x0: f64, y0: f64, x1: f64, y1: f64, width: f64, color: i32);
+    fn d2d_clip_push(c: rawptr, x: f64, y: f64, w: f64, h: f64, r: f64);
+    fn d2d_clip_pop(c: rawptr);
+    fn d2d_set_family(c: rawptr, name: cstring): i32;
+    fn d2d_set_font(c: rawptr, size: f64, weight: i32);
+    fn d2d_font_size(c: rawptr): f64;
+    fn d2d_font_ascent(c: rawptr): f64;
+    fn d2d_font_height(c: rawptr): f64;
+    fn d2d_text_width(c: rawptr, s: cstring): f64;
+    fn d2d_text(c: rawptr, x: f64, y: f64, s: cstring, color: i32);
+    fn d2d_lock(c: rawptr): rawptr;
+    fn d2d_stride(c: rawptr): i32;
+    fn d2d_unlock(c: rawptr);
+    fn d2d_pixel_at(c: rawptr, x: i32, y: i32): i32;
+}
+
+// Render-target modes, as d2d_mode reports them.
+export const D2D_MODE_WIC_BGR: int = 1;    // software target we own; ClearType text
+export const D2D_MODE_WIC_PBGRA: int = 2;  // fallback software target; grayscale text
+
+// True when Direct2D, DirectWrite and WIC all initialise: Windows 7 and
+// later. Always false on other platforms.
+export fn d2d_available(): bool { return d2d_ok() as int != 0; }
+
+export class D2DPainter extends Painter {
+    surf: Surface;
+    ctx: rawptr;
+    w: int;
+    h: int;
+    weight: WEIGHT;
+    size_stack: float[];
+    weight_stack: WEIGHT[];
+
+    // fontSize is in 96-dpi pixels; the painter applies the surface's scale
+    // itself, so the same call is right on every display.
+    fn init(surf: Surface, fontSize: float) {
+        this.surf = surf;
+        this.w = surf.width();
+        this.h = surf.height();
+        this.size_stack = [];
+        this.weight_stack = [];
+        this.weight = WEIGHT.REG;
+        this.ctx = d2d_new(this.w as i32, this.h as i32);
+        if (this.ctx == null) {
+            panic("vyto/win/d2d: Direct2D is unavailable (needs Windows 7 or later)");
+        }
+        d2d_set_font(this.ctx, fontSize * surf.scale(), 0);
+    }
+
+    deinit {
+        d2d_free(this.ctx);
+    }
+
+    // Use a system font family ("Segoe UI", "Tahoma", ...). Returns false if it
+    // is not installed; the painter then keeps its current family.
+    fn useFamily(name: string): bool {
+        return d2d_set_family(this.ctx, name.cstr()) as int != 0;
+    }
+
+    // Which render target is in use — one of the D2D_MODE_* constants.
+    fn mode(): int { return d2d_mode(this.ctx) as int; }
+
+    // 0xFFRRGGBB of a presented-buffer pixel. Ends the frame first. Test hook.
+    // Masked to 32 bits like vyto/gfx's Canvas.pixelAt: the shim returns an
+    // i32, and widening an opaque colour sign-extends it to a negative int
+    // that never equals the same colour from rgb().
+    fn pixelAt(x: int, y: int): int {
+        return (d2d_pixel_at(this.ctx, x as i32, y as i32) as int) & 0xFFFFFFFF;
+    }
+
+    // The buffer is undefined after a resize; the Window repaints in full.
+    override fn on_resize(w: int, h: int) {
+        if (w == this.w && h == this.h) { return; }
+        if (d2d_resize(this.ctx, w as i32, h as i32) as int != 0) {
+            this.w = w;
+            this.h = h;
+        }
+    }
+
+    override fn width(): float { return this.w as float; }
+    override fn height(): float { return this.h as float; }
+
+    override fn fill(r: Rect, color: int) {
+        d2d_fill_rect(this.ctx, r.x, r.y, r.w, r.h, color as i32);
+    }
+
+    // 1px outline as four fills, matching GfxPainter and Surface.frame.
+    override fn frame(r: Rect, color: int) {
+        let c = color as i32;
+        d2d_fill_rect(this.ctx, r.x, r.y, r.w, 1.0, c);
+        d2d_fill_rect(this.ctx, r.x, r.y + r.h - 1.0, r.w, 1.0, c);
+        d2d_fill_rect(this.ctx, r.x, r.y, 1.0, r.h, c);
+        d2d_fill_rect(this.ctx, r.x + r.w - 1.0, r.y, 1.0, r.h, c);
+    }
+
+    override fn line(x0: float, y0: float, x1: float, y1: float, color: int) {
+        d2d_stroke_line(this.ctx, x0, y0, x1, y1, 1.0, color as i32);
+    }
+
+    override fn line_w(x0: float, y0: float, x1: float, y1: float, width: float, color: int) {
+        d2d_stroke_line(this.ctx, x0, y0, x1, y1, width, color as i32);
+    }
+
+    override fn fill_round(r: Rect, radius: float, color: int) {
+        d2d_fill_round_rect(this.ctx, r.x, r.y, r.w, r.h, radius, color as i32);
+    }
+
+    override fn stroke_round(r: Rect, radius: float, width: float, color: int) {
+        d2d_stroke_round_rect(this.ctx, r.x, r.y, r.w, r.h, radius, width, color as i32);
+    }
+
+    override fn circle(cx: float, cy: float, radius: float, color: int) {
+        d2d_fill_ellipse(this.ctx, cx, cy, radius, radius, color as i32);
+    }
+
+    override fn stroke_circle(cx: float, cy: float, radius: float, width: float, color: int) {
+        d2d_stroke_ellipse(this.ctx, cx, cy, radius, radius, width, color as i32);
+    }
+
+    // Gradients fill the rounded shape directly; blend2d has to clip first.
+    override fn gradient_v(r: Rect, radius: float, top: int, bottom: int) {
+        d2d_gradient_v(this.ctx, r.x, r.y, r.w, r.h, radius, top as i32, bottom as i32);
+    }
+
+    override fn gradient_n(r: Rect, radius: float, colors: i32[], positions: float[]) {
+        let n = colors.len;
+        if (positions.len < n) { n = positions.len; }
+        d2d_gradient_n(this.ctx, r.x, r.y, r.w, r.h, radius,
+                       colors as rawptr, positions as rawptr, n as i32);
+    }
+
+    override fn radial_gradient(r: Rect, cx: float, cy: float, radius: float,
+                                colors: i32[], positions: float[]) {
+        let n = colors.len;
+        if (positions.len < n) { n = positions.len; }
+        d2d_radial_gradient(this.ctx, r.x, r.y, r.w, r.h, cx, cy, radius,
+                            colors as rawptr, positions as rawptr, n as i32);
+    }
+
+    override fn bevel(r: Rect, radius: float, width: float, light: int, dark: int, raised: bool) {
+        let up = 0;
+        if (raised) { up = 1; }
+        d2d_bevel(this.ctx, r.x, r.y, r.w, r.h, radius, width,
+                  light as i32, dark as i32, up as i32);
+    }
+
+    // -- shapes ---------------------------------------------------------------
+    override fn polygon(xs: float[], ys: float[], color: int) {
+        let n = xs.len;
+        if (ys.len < n) { n = ys.len; }
+        d2d_fill_polygon(this.ctx, xs as rawptr, ys as rawptr, n as i32, color as i32);
+    }
+
+    override fn stroke_arc(cx: float, cy: float, rx: float, ry: float,
+                           start_deg: float, sweep_deg: float, width: float, color: int) {
+        d2d_stroke_arc(this.ctx, cx, cy, rx, ry, start_deg, sweep_deg, width, color as i32);
+    }
+
+    override fn fill_path(p: Path, color: int) {
+        d2d_fill_path(this.ctx, p.cmds as rawptr, p.cmds.len as i32,
+                      p.coords as rawptr, p.coords.len as i32, color as i32);
+    }
+
+    override fn stroke_path(p: Path, width: float, color: int) {
+        d2d_stroke_path(this.ctx, p.cmds as rawptr, p.cmds.len as i32,
+                        p.coords as rawptr, p.coords.len as i32, width, color as i32);
+    }
+
+    // -- effects --------------------------------------------------------------
+    // Shadows are cached as bitmaps, so a widget redrawing the same shadow
+    // every frame pays for the blur once. blur and backdrop read what is
+    // already drawn: paint the content behind them first.
+    override fn shadow(r: Rect, radius: float, blur: float, dy: float, color: int) {
+        d2d_shadow(this.ctx, r.x, r.y, r.w, r.h, radius, blur, dy, color as i32);
+    }
+
+    override fn can_blur(): bool { return true; }
+
+    override fn blur(r: Rect, radius: float) {
+        d2d_blur(this.ctx, r.x, r.y, r.w, r.h, radius);
+    }
+
+    override fn backdrop(r: Rect, radius: float, amount: float, tint: int) {
+        d2d_backdrop(this.ctx, r.x, r.y, r.w, r.h, radius, amount, tint as i32);
+    }
+
+    // -- transforms -----------------------------------------------------------
+    // A restore also drops clips pushed since its save, as in blend2d.
+    override fn can_transform(): bool { return true; }
+    override fn save() { d2d_save(this.ctx); }
+    override fn restore() { d2d_restore(this.ctx); }
+    override fn translate(dx: float, dy: float) { d2d_translate(this.ctx, dx, dy); }
+    override fn scale(sx: float, sy: float) { d2d_scale(this.ctx, sx, sy); }
+    override fn rotate(deg: float) { d2d_rotate(this.ctx, deg); }
+
+    // -- images ---------------------------------------------------------------
+    // Decoded by WIC: PNG, JPEG, BMP, GIF, TIFF and ICO on every supported
+    // Windows. An embedded asset (--with-assets) wins over the disk.
+    override fn load_image(path: string): rawptr {
+        let vp = vt_vfs_ptr(path.cstr());
+        if (vp != null) {
+            return d2d_image_load_bytes(vp, vt_vfs_size(path.cstr()) as i32);
+        }
+        return d2d_image_load_file(path.cstr());
+    }
+
+    // A failed load still draws the base Painter's grey placeholder.
+    override fn draw_image(handle: rawptr, r: Rect) {
+        if (handle == null) {
+            this.fill(r, rgb(200, 200, 200));
+            return;
+        }
+        d2d_draw_image(this.ctx, handle, r.x, r.y, r.w, r.h);
+    }
+
+    override fn free_image(handle: rawptr) { d2d_image_free(handle); }
+
+    override fn can_clip(): bool { return true; }
+    override fn clip_push(r: Rect, radius: float) {
+        d2d_clip_push(this.ctx, r.x, r.y, r.w, r.h, radius);
+    }
+    override fn clip_pop() { d2d_clip_pop(this.ctx); }
+
+    // -- typography --------------------------------------------------------
+    override fn set_weight(w: WEIGHT) {
+        this.weight = w;
+        d2d_set_font(this.ctx, 0.0, w as i32);
+    }
+
+    override fn push_font(size: float, weight: WEIGHT) {
+        this.size_stack.push(d2d_font_size(this.ctx));
+        this.weight_stack.push(this.weight);
+        this.weight = weight;
+        d2d_set_font(this.ctx, size, weight as i32);
+    }
+
+    // An unbalanced pop leaves the font alone, so the mistake shows up as
+    // "the size never came back" rather than as silently wrong text.
+    override fn pop_font() {
+        if (this.size_stack.len == 0) { return; }
+        let size = this.size_stack.pop();
+        this.weight = this.weight_stack.pop();
+        d2d_set_font(this.ctx, size, this.weight as i32);
+    }
+
+    override fn font_size(): float { return d2d_font_size(this.ctx); }
+
+    override fn text(x: float, y: float, s: string, color: int) {
+        d2d_text(this.ctx, x, y, s.cstr(), color as i32);
+    }
+
+    // Same formula as GfxPainter.text_in: baseline snapped to a whole pixel.
+    override fn text_in(r: Rect, pad: float, s: string, color: int) {
+        let baseline = (r.y + (r.h + this.font_ascent()) / 2.0 - 1.0).round();
+        this.text(r.x + pad, baseline, s, color);
+    }
+
+    override fn text_width(s: string): float { return d2d_text_width(this.ctx, s.cstr()); }
+    override fn font_ascent(): float { return d2d_font_ascent(this.ctx); }
+    override fn font_height(): float { return d2d_font_height(this.ctx); }
+
+    // -- presenting --------------------------------------------------------
+    override fn present() {
+        let p = d2d_lock(this.ctx);
+        if (p != null) {
+            let stride = d2d_stride(this.ctx) as int / 4;
+            this.surf.blitRect(p, stride, 0, 0, this.w, this.h, 0, 0);
+            d2d_unlock(this.ctx);
+        }
+        this.surf.present();
+    }
+
+    // A blit moves whole pixels, so snap outward: a rect rounded inward would
+    // leave the anti-aliased fringe of an edge unpresented.
+    override fn present_rect(r: Rect) {
+        let d = r.round_out();
+        let x = d.x as int;
+        let y = d.y as int;
+        let w = d.w as int;
+        let h = d.h as int;
+        if (x < 0) { w += x; x = 0; }
+        if (y < 0) { h += y; y = 0; }
+        if (x + w > this.w) { w = this.w - x; }
+        if (y + h > this.h) { h = this.h - y; }
+        let p = d2d_lock(this.ctx);
+        if (w <= 0 || h <= 0) {
+            if (p != null) { d2d_unlock(this.ctx); }
+            return;
+        }
+        if (p != null) {
+            let stride = d2d_stride(this.ctx) as int / 4;
+            this.surf.blitRect(p, stride, x, y, w, h, x, y);
+            d2d_unlock(this.ctx);
+        }
+        this.surf.present_rect(Rect(x as float, y as float, w as float, h as float));
+    }
+}

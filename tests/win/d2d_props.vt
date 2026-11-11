@@ -1,0 +1,150 @@
+// D2DPainter property probes, run headless on real Windows by make test-win.
+//
+// Properties, not pixel hashes: Direct2D's software rasteriser is free to
+// differ between Windows 7 and 10 in the last bit of an anti-aliased edge, so
+// every probe reads a pixel the property pins down exactly (a solid interior,
+// an untouched corner) or compares against a threshold. Each one is meant to
+// fail if the behaviour it names is broken, not merely if something crashed.
+import { Window } from "vyto/ui";
+import { D2DPainter, d2d_available } from "vyto/win/d2d";
+import { Rect, rgb, rgba } from "vyto/surface";
+
+const WHITE: int = 0xFFFFFFFF;
+const BLACK: int = 0xFF000000;
+const BLUE: int = 0xFF2050C0;
+
+fn red(px: int): int { return (px >> 16) & 255; }
+fn blue(px: int): int { return px & 255; }
+
+fn check(name: string, ok: bool, detail: string) {
+    if (ok) {
+        print(`ok {name}`);
+    } else {
+        print(`FAIL {name}: {detail}`);
+    }
+}
+
+fn eq(p: D2DPainter, name: string, x: int, y: int, want: int) {
+    let got = p.pixelAt(x, y);
+    check(name, got == want, `pixel {x},{y} is {got}, want {want}`);
+}
+
+// True when any pixel of row y between x0 and x1 is darker than mid-grey.
+fn inked(p: D2DPainter, y: int, x0: int, x1: int): bool {
+    for (let x in x0..x1) {
+        if (red(p.pixelAt(x, y)) < 128) { return true; }
+    }
+    return false;
+}
+
+fn main() {
+    if (!d2d_available()) {
+        print("d2d unavailable");
+        return;
+    }
+    let win = new Window("d2d props", 480, 260);
+    let p = new D2DPainter(win.surface(), 15.0);
+    p.fill(Rect(0.0, 0.0, 480.0, 260.0), WHITE);
+
+    // A pixel-aligned opaque fill is exact.
+    p.fill(Rect(10.0, 10.0, 20.0, 20.0), BLUE);
+    eq(p, "fill_interior", 20, 20, BLUE);
+    eq(p, "fill_outside", 31, 20, WHITE);
+
+    // Rounded clip: the corner outside the radius keeps what was there,
+    // the middle takes the fill. Exercises the corner emulation.
+    p.clip_push(Rect(40.0, 10.0, 40.0, 40.0), 16.0);
+    p.fill(Rect(30.0, 0.0, 60.0, 60.0), BLUE);
+    p.clip_pop();
+    eq(p, "clip_round_corner", 41, 11, WHITE);
+    eq(p, "clip_round_middle", 60, 30, BLUE);
+    eq(p, "clip_round_edge_mid", 41, 30, BLUE);
+
+    // Rectangular clip stops the fill at its edge.
+    p.clip_push(Rect(90.0, 10.0, 20.0, 20.0), 0.0);
+    p.fill(Rect(80.0, 0.0, 60.0, 60.0), BLUE);
+    p.clip_pop();
+    eq(p, "clip_rect_inside", 100, 20, BLUE);
+    eq(p, "clip_rect_outside", 115, 20, WHITE);
+
+    // Blur clamped to the clip: inside, the black/white edge softens;
+    // outside, white stays exactly white.
+    p.fill(Rect(150.0, 10.0, 10.0, 40.0), BLACK);
+    p.clip_push(Rect(150.0, 10.0, 20.0, 40.0), 0.0);
+    p.blur(Rect(150.0, 10.0, 40.0, 40.0), 4.0);
+    p.clip_pop();
+    let soft = red(p.pixelAt(161, 30));
+    check("blur_softens_inside_clip", soft > 0 && soft < 255, `pixel 161,30 red {soft}`);
+    eq(p, "blur_stops_at_clip", 175, 30, WHITE);
+
+    // Shadow: dark just below the caster, white inside it (knocked out),
+    // white far away.
+    p.shadow(Rect(200.0, 20.0, 30.0, 20.0), 4.0, 6.0, 3.0, rgba(0, 0, 0, 105));
+    let under = red(p.pixelAt(215, 44));
+    check("shadow_below_caster", under < 250, `pixel 215,44 red {under}`);
+    eq(p, "shadow_knocked_out", 215, 30, WHITE);
+    eq(p, "shadow_bounded", 215, 90, WHITE);
+    // Drawn twice from the cache: the same pixel must come out the same.
+    p.shadow(Rect(200.0, 20.0, 30.0, 20.0), 4.0, 6.0, 3.0, rgba(0, 0, 0, 105));
+    let twice = red(p.pixelAt(215, 44));
+    check("shadow_cache_stable", twice <= under, `pixel 215,44 red {twice} after {under}`);
+
+    // Untinted backdrop: corners outside the radius untouched, middle blurred.
+    p.fill(Rect(250.0, 10.0, 20.0, 40.0), BLACK);
+    p.backdrop(Rect(250.0, 10.0, 40.0, 40.0), 16.0, 4.0, rgba(0, 0, 0, 0));
+    eq(p, "backdrop_corner_kept", 250, 10, BLACK);
+    let mid = red(p.pixelAt(270, 30));
+    check("backdrop_blurs_middle", mid > 0 && mid < 255, `pixel 270,30 red {mid}`);
+
+    // Vertical gradient: red at the top, blue at the bottom.
+    p.gradient_v(Rect(300.0, 10.0, 10.0, 100.0), 0.0, rgb(255, 0, 0), rgb(0, 0, 255));
+    let top = p.pixelAt(305, 10);
+    let bot = p.pixelAt(305, 109);
+    check("gradient_top_red", red(top) > 200 && blue(top) < 60, `top {top}`);
+    check("gradient_bottom_blue", blue(bot) > 200 && red(bot) < 60, `bottom {bot}`);
+
+    // Rotation is clockwise on screen: a bar along +x, rotated 90 degrees
+    // about (400, 50), points down.
+    p.save();
+    p.translate(400.0, 50.0);
+    p.rotate(90.0);
+    p.fill(Rect(0.0, -5.0, 40.0, 10.0), BLUE);
+    p.restore();
+    eq(p, "rotate_points_down", 400, 80, BLUE);
+    eq(p, "rotate_not_right", 430, 50, WHITE);
+    // restore() really put the transform back.
+    p.fill(Rect(440.0, 10.0, 10.0, 10.0), BLUE);
+    eq(p, "restore_resets_transform", 445, 15, BLUE);
+
+    // Axis-aligned lines take the fill fast path; it must cover exactly the
+    // band a flat-capped stroke covers: rows 199 and 200 for y=200, width 2.
+    p.line_w(10.0, 200.0, 60.0, 200.0, 2.0, BLUE);
+    eq(p, "hline_upper_row", 30, 199, BLUE);
+    eq(p, "hline_lower_row", 30, 200, BLUE);
+    eq(p, "hline_no_spill", 30, 201, WHITE);
+    p.line_w(80.0, 180.0, 80.0, 230.0, 2.0, BLUE);
+    eq(p, "vline_cover", 79, 200, BLUE);
+    eq(p, "vline_no_spill", 81, 200, WHITE);
+
+    // A null image draws the base Painter's grey placeholder.
+    p.draw_image(null, Rect(100.0, 180.0, 20.0, 20.0));
+    eq(p, "image_null_placeholder", 110, 190, rgb(200, 200, 200));
+
+    // Text: y is the baseline. Ink sits on the row above it, none below an
+    // H's baseline, none above its ascent.
+    let base = 240;
+    p.text(140.0, base as float, "HHHH", BLACK);
+    let asc = p.font_ascent();
+    check("text_ink_above_baseline", inked(p, base - 2, 138, 200), "no ink on baseline-2");
+    check("text_no_ink_below_baseline", !inked(p, base + 2, 138, 200), "ink on baseline+2");
+    let over = base - (asc as int) - 2;
+    check("text_no_ink_above_ascent", !inked(p, over, 138, 200), `ink on row {over}`);
+
+    // Measurement.
+    check("width_empty_zero", p.text_width("") == 0.0, "nonzero");
+    let w1 = p.text_width("a");
+    let w2 = p.text_width("ab");
+    check("width_grows", w1 > 0.0 && w2 > w1, `a={w1} ab={w2}`);
+    check("width_cached_stable", p.text_width("ab") == w2, "changed on repeat");
+    print("d2d props done");
+}

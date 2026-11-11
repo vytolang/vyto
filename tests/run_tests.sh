@@ -263,6 +263,38 @@ else
     echo "FAIL freestanding_image_stub (vyto/media/image's VT_NO_LIBC arm does not build)"
     fail=1
 fi
+# vyto/win/d2d off Windows. Its shim is all COM and Direct2D behind
+# `#if defined(_WIN32) && !defined(VT_NO_LIBC)`; everywhere else a stub arm
+# answers. Two checks, because they catch different rot: the hosted run proves
+# the package links and reports itself unavailable; the freestanding build
+# proves no include escaped the guard. The archive check reads nm rather than
+# trusting the exit status: ar resolves nothing, so a broken guard would still
+# "build". The stub object must reference no external symbol at all.
+got=$(./vytoc run tests/fixtures/d2d_stub.vt 2>&1)
+if [ "$got" = "$(cat tests/fixtures/d2d_stub.expected)" ]; then
+    echo "PASS d2d_stub"
+else
+    echo "FAIL d2d_stub"
+    echo "--- expected ---"; cat tests/fixtures/d2d_stub.expected
+    echo "--- got ---"; echo "$got"
+    fail=1
+fi
+if ./vytoc build tests/fixtures/d2d_stub.vt --freestanding --cc gcc \
+        -o examples/.vyto-cache/libd2d_fs.a >/dev/null 2>&1; then
+    d2d_obj=$(nm -A examples/.vyto-cache/libd2d_fs.a 2>/dev/null \
+        | awk '/ T d2d_ok$/ { split($1, a, ":"); print a[2]; exit }')
+    d2d_undef=$(nm -A examples/.vyto-cache/libd2d_fs.a 2>/dev/null \
+        | grep -c ":$d2d_obj: *U ")
+    if [ -n "$d2d_obj" ] && [ "$d2d_undef" -eq 0 ]; then
+        echo "PASS freestanding_d2d_stub"
+    else
+        echo "FAIL freestanding_d2d_stub (shim object '$d2d_obj' has $d2d_undef undefined symbols)"
+        fail=1
+    fi
+else
+    echo "FAIL freestanding_d2d_stub (vyto/win/d2d's stub arm does not build freestanding)"
+    fail=1
+fi
 # And for vyto/compress, whose vendored zlib is built on an allocator — there is
 # nothing to degrade to, so the wrapper TUs compile to nothing under VT_NO_LIBC
 # and zlib_shim.c's stub arm answers instead. Without that guard, merely

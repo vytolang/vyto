@@ -130,6 +130,7 @@ examples/48_websocket.vt|48_websocket|eq|
 examples/49_poll_server.vt|49_poll_server|eq|
 examples/50_worker_pool.vt|50_worker_pool|eq|
 apps/motiondemo/motiondemo.vt|motiondemo|contains||VS_HEADLESS=1 VS_EVENTS=motiondemo.events|--with-assets
+tests/win/d2d_props.vt|d2d_props|eq||VS_HEADLESS=1
 EOF
 )
 

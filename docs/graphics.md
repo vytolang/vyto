@@ -25,7 +25,8 @@ vyto/gfx              rich 2D: blend2d-backed canvas — AA shapes, gradients, t
      ▼                          ▼
 vyto/ui Painter       the seam: widgets draw through this abstract class only
      ├── SurfacePainter   (default, forwards to vyto/surface — lean tier)
-     └── GfxPainter        (forwards to vyto/gfx — rich tier)
+     ├── GfxPainter        (forwards to vyto/gfx — rich tier)
+     └── D2DPainter        (Windows: Direct2D + DirectWrite — rich tier, no blend2d)
 ```
 
 Each layer is independently usable. A game or emulator can draw straight on
@@ -278,8 +279,8 @@ pixels, not stacked translucent rects; notes blur isn't yet exposed through
 import { Painter, Window } from "vyto/ui";
 ```
 
-`Painter` (`lib/vyto/ui/core.vt`) is an abstract class with ~47 virtual
-methods. Widgets only ever call through `Painter` — this is what lets
+`Painter` (`lib/vyto/surface/painter.vt`, re-exported by `vyto/ui`) is an
+abstract class with ~47 virtual methods. Widgets only ever call through `Painter` — this is what lets
 `vyto/ui` itself have zero dependency on `vyto/gfx` (verified: the only
 mentions of `vyto/gfx` anywhere in `lib/vyto/ui` are comments). Every rich
 method has a documented degrade to a lean one in the base class (e.g.
@@ -309,12 +310,40 @@ rich vocabulary still renders, just less prettily, on the lean tier.
 | `SurfacePainter` | `vyto/surface` | the default (lean tier); real geometric clipping via `Surface.clip_set` |
 | `GfxPainter` | `vyto/gfx` `Canvas` | the rich tier (blend2d) |
 | `GfxPainterNet` | `GfxPainter` | + network image loading |
+| `D2DPainter` | Direct2D + DirectWrite | Windows only: the rich tier with native text; see below |
 | `AndroidPainter` | `android.graphics.Canvas` (JNI) | renders through platform Skia; requires Android NDK |
 | `ClippedPainter` | wraps another `Painter` | a *decorator*, not a renderer — clips every draw call to a rect; used by `ScrollView` |
 
 A `Window` defaults to `SurfacePainter`; swap tiers at runtime with
 `win.use_painter(gfxPainter)`. No library constructs a concrete `Painter` —
 only app code does, which is what keeps `vyto/ui` gfx-free.
+
+### `D2DPainter`: native rendering on Windows
+
+```js
+import { D2DPainter } from "vyto/win/d2d";
+
+win.use_painter(new D2DPainter(win.surface(), 15.0));
+```
+
+The Windows rich tier without blend2d. Text uses system fonts (Segoe UI by
+default, `useFamily(name)` for another installed family) with the user's
+ClearType settings and Windows' own font fallback, so it looks native. It needs
+nothing beyond Windows 7 SP1: the exe imports `d2d1.dll`, `DWrite.dll` and
+`ole32.dll`, and ships no DLL and no C++ runtime of its own.
+
+It implements every `Painter` operation `GfxPainter` does, including shadows,
+blur and backdrops. Unlike `GfxPainter` it applies the display scale itself.
+It cannot load an app's own font files yet; an app that needs its typeface on
+Windows stays on `GfxPainter`. It also costs about 3.5 MB more memory than
+`GfxPainter` (Direct2D renders through WARP on Windows 7), so memory-sensitive
+apps should stay on `GfxPainter` too; the README lists every caveat.
+
+Because an imported painter stays linked, a cross-platform app picks its
+painter in a per-platform entry file and keeps everything else in a shared
+module. `apps/d2dbench` shows the layout, and
+[`lib/vyto/win/d2d/README.md`](../lib/vyto/win/d2d/README.md) has the details
+and measured performance.
 
 ### See also: the widget stack
 

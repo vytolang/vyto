@@ -345,6 +345,16 @@ returns the invalid-date sentinel rather than guessing; and `PollSet` uses
 `connectAsync` stays un-ready instead of surfacing an error. Put your own
 timeout around it there.
 
+### Native rendering: D2DPainter
+
+A `vyto/ui` app can draw through Direct2D instead of blend2d with
+`win.use_painter(new D2DPainter(win.surface(), 15.0))` from `vyto/win/d2d`.
+Text then uses the system's fonts and ClearType, and the exe needs no
+blend2d DLL and no `-posix` C++ toolchain, so the section below does not
+apply. Keep the painter choice in a Windows-only entry file: importing
+`vyto/gfx` as well would link blend2d anyway. See
+[Graphics, §5](graphics.md#d2dpainter-native-rendering-on-windows).
+
 ### Graphics apps: blend2d and fonts
 
 `vyto/gfx` is the one stdlib package backed by a **prebuilt** library rather than
