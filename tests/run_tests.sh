@@ -1557,6 +1557,27 @@ if [ -f lib/vyto/gfx/native/linux-x64/libblend2d.so ]; then
         echo "FAIL gfx_canvas_blit (build failed)"
         fail=1
     fi
+    # GfxPainter finds medium/bold siblings for both naming schemes. Inter's
+    # "-Regular" scheme used to load one face and draw every weight as regular.
+    got=$(VS_HEADLESS=1 ./vytoc run tests/fixtures/gfx_font_weights.vt 2>&1)
+    if [ "$got" = "$(cat tests/fixtures/gfx_font_weights.expected)" ]; then
+        echo "PASS gfx_font_weights"
+    else
+        echo "FAIL gfx_font_weights"
+        echo "--- expected ---"; cat tests/fixtures/gfx_font_weights.expected
+        echo "--- got ---"; echo "$got"
+        fail=1
+    fi
+    # A shadow's colour alpha is its opacity (it was ignored until 2026-11).
+    got=$(VS_HEADLESS=1 ./vytoc run tests/fixtures/gfx_shadow_alpha.vt 2>&1)
+    if [ "$got" = "$(cat tests/fixtures/gfx_shadow_alpha.expected)" ]; then
+        echo "PASS gfx_shadow_alpha"
+    else
+        echo "FAIL gfx_shadow_alpha"
+        echo "--- expected ---"; cat tests/fixtures/gfx_shadow_alpha.expected
+        echo "--- got ---"; echo "$got"
+        fail=1
+    fi
     # vyto/ui rendered through GfxPainter (blend2d rich tier)
     uigfx_bin=apps/uigfx/.vyto-cache/uigfx_test
     if ./vytoc build apps/uigfx/uigfx.vt -o "$uigfx_bin" >/dev/null 2>&1; then

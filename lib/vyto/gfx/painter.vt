@@ -26,6 +26,8 @@ extern "C" {
 // Build a candidate bold/medium face path from a regular TTF path by inserting
 // "Bold"/"Medium" before the extension — works for the DejaVu family shipped
 // with most distros. Returns the empty string when no candidate is derivable.
+// Families that name their regular face "-Regular" (Inter, the vendored house
+// face) need swap_regular_path instead.
 fn derive_variant_path(regular: string, tag: string): string {
     let dot = -1;
     let i = regular.len - 1;
@@ -35,6 +37,23 @@ fn derive_variant_path(regular: string, tag: string): string {
     }
     if (dot < 0) { return ""; }
     return regular.slice(0, dot) + tag + regular.slice(dot, regular.len);
+}
+
+// "Inter-Regular.ttf" -> "Inter-Bold.ttf": replace a stem that ends in
+// "Regular" with the weight's name. Returns "" when the stem does not end in
+// "Regular", so the caller falls through to derive_variant_path. Without this,
+// a "-Regular" family derived "Inter-Regular-Bold.ttf", found nothing, and
+// drew medium and bold as regular.
+fn swap_regular_path(regular: string, weight: string): string {
+    let dot = -1;
+    let i = regular.len - 1;
+    while (i >= 0) {
+        if (regular[i] == 46) { dot = i; break; } // '.'
+        i -= 1;
+    }
+    if (dot < 7) { return ""; }
+    if (regular.slice(dot - 7, dot) != "Regular") { return ""; }
+    return regular.slice(0, dot - 7) + weight + regular.slice(dot, regular.len);
 }
 
 export class GfxPainter extends Painter {
@@ -99,19 +118,29 @@ export class GfxPainter extends Painter {
         return this.canvas.loadFontWeight(path, this.base_font_size, w);
     }
 
+    // Load a weight from the first sibling file that exists: the "-Regular"
+    // swap first, then each suffix inserted before the extension.
+    fn load_variant(w: int, weight: string, suffixes: string[]): bool {
+        let swapped = swap_regular_path(this.font_path, weight);
+        if (swapped.len > 0 && this.load_weight(w, swapped)) { return true; }
+        for (let tag in suffixes) {
+            let cand = derive_variant_path(this.font_path, tag);
+            if (cand.len > 0 && this.load_weight(w, cand)) { return true; }
+        }
+        return false;
+    }
+
     fn make_canvas(w: int, h: int) {
         this.canvas = new Canvas(w, h);
         // regular weight always loads; medium/bold are best-effort — widgets
         // fall back to regular if a variant TTF isn't on disk (or not supplied
         // as bytes). load_weight handles the bytes-vs-path choice per weight.
         this.load_weight(WEIGHT.REG, this.font_path);
-        if (!this.load_weight(WEIGHT.MED, derive_variant_path(this.font_path, "-Medium"))) {
+        if (!this.load_variant(WEIGHT.MED, "Medium", ["-Medium"])) {
             // reuse regular for medium so set_weight(med) never blanks text
             this.load_weight(WEIGHT.MED, this.font_path);
         }
-        if (!this.load_weight(WEIGHT.BOLD, derive_variant_path(this.font_path, "-Bold"))) {
-            this.load_weight(WEIGHT.BOLD, derive_variant_path(this.font_path, "Bold"));
-        }
+        this.load_variant(WEIGHT.BOLD, "Bold", ["-Bold", "Bold"]);
         this.canvas.setWeight(this.weight as int);
     }
 

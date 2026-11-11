@@ -451,13 +451,19 @@ static void box_blur_v1(uint8_t *p, intptr_t stride, int w, int h, int rad, int 
     free(sum);
 }
 
-/* Rebuild premultiplied BGRA from the blurred alpha and the shadow's colour. */
+/* Rebuild premultiplied BGRA from the blurred alpha and the shadow's colour.
+   The colour's own alpha scales the coverage, so alpha means opacity here as
+   it does everywhere else in the API. Until 2026-11 it was ignored and every
+   shadow drew at full strength; the default themes now say 255, which is
+   that same look, pixel for pixel. */
 static void shadow_recolor(uint8_t *p, intptr_t stride, int w, int h, uint32_t col) {
     unsigned cr = (col >> 16) & 0xFFu, cg = (col >> 8) & 0xFFu, cb = col & 0xFFu;
+    unsigned ca = (col >> 24) & 0xFFu;
     for (int y = 0; y < h; y++) {
         uint8_t *row = p + (intptr_t)y * stride;
         for (int x = 0; x < w; x++) {
-            unsigned a = row[x * 4 + 3];
+            unsigned a = (row[x * 4 + 3] * ca + 127u) / 255u;
+            row[x * 4 + 3] = (uint8_t)a;
             row[x * 4 + 0] = (uint8_t)((cb * a + 127u) / 255u);
             row[x * 4 + 1] = (uint8_t)((cg * a + 127u) / 255u);
             row[x * 4 + 2] = (uint8_t)((cr * a + 127u) / 255u);
