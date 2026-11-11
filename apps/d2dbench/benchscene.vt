@@ -1,0 +1,433 @@
+// The shared half of the D2DPainter-vs-GfxPainter bench: one widget scene
+// and one timing routine, imported by both entry files. That split is also
+// the pattern a cross-platform app uses to pick a painter per platform —
+// Vyto has no conditional imports, so the choice lives in the entry file.
+import { Window, Column, Row, Label, Button, TextField, Checkbox, Switch, Slider,
+         Widget, Painter, Theme, Size } from "vyto/ui";
+import { Rect, rgb, rgba } from "vyto/surface";
+import { Path } from "vyto/geom/path";
+import { sin, cos } from "vyto/math";
+import { monoUs } from "vyto/util/time";
+import { getenv } from "vyto/os";
+import { memStage } from "memprobe/memprobe";
+
+// Four coloured bars, the backdrop the blur tests soften.
+fn stripes(s: Painter, x: float, y: float) {
+    let cols = [rgb(220, 60, 60), rgb(250, 200, 60), rgb(60, 170, 90), rgb(50, 110, 220)];
+    for (let i in 0..4) {
+        s.fill(Rect(x + (i as float) * 16.0, y, 16.0, 64.0), cols[i]);
+    }
+}
+
+// Five-pointed star, as parallel x/y arrays.
+fn starXs(cx: float, r: float): float[] {
+    let xs: float[] = [];
+    for (let i in 0..5) {
+        xs.push(cx + r * cos(((i as float) * 144.0 - 90.0) * 3.14159265358979 / 180.0));
+    }
+    return xs;
+}
+
+fn starYs(cy: float, r: float): float[] {
+    let ys: float[] = [];
+    for (let i in 0..5) {
+        ys.push(cy + r * sin(((i as float) * 144.0 - 90.0) * 3.14159265358979 / 180.0));
+    }
+    return ys;
+}
+
+// One instance of every drawing op past fills and text, in a fixed layout,
+// so two renderers can be compared op by op.
+//   Row 1: rounded clip over a gradient, rotated square, star polygon, curved
+//          path, arc ring, radial gradient, bevel, image.
+//   Row 2: drop shadow under a white card, blur over bars, frosted backdrop
+//          over bars, blur cut by a clip (right half must stay sharp),
+//          backdrop with no tint (blur inside a rounded shape only).
+class OpsBoard extends Widget {
+    img: rawptr;
+    tried: bool;
+
+    fn init() {
+        super.init();
+        this.img = null;
+        this.tried = false;
+    }
+
+    override fn measure(s: Painter, th: Theme): Size { return Size(608.0, 168.0); }
+
+    override fn render(s: Painter, th: Theme) {
+        let x = this.bounds.x;
+        let y = this.bounds.y + 6.0;
+        let ink = rgb(40, 90, 200);
+
+        // 1. rounded clip: a stripe gradient cut to a 20px-radius card
+        s.clip_push(Rect(x, y, 64.0, 64.0), 20.0);
+        s.gradient_n(Rect(x, y, 64.0, 64.0), 0.0,
+                     [rgb(240, 80, 60) as i32, rgb(250, 200, 60) as i32, rgb(60, 160, 240) as i32],
+                     [0.0, 0.5, 1.0]);
+        s.fill(Rect(x, y + 28.0, 64.0, 8.0), rgb(30, 30, 30));
+        s.clip_pop();
+
+        // 2. transform: a square rotated 30 degrees about its centre
+        x += 76.0;
+        s.save();
+        s.translate(x + 32.0, y + 32.0);
+        s.rotate(30.0);
+        s.fill_round(Rect(-22.0, -22.0, 44.0, 44.0), 6.0, ink);
+        s.restore();
+
+        // 3. polygon: a five-pointed star (non-zero fill keeps the centre solid)
+        x += 76.0;
+        s.polygon(starXs(x + 32.0, 30.0), starYs(y + 34.0, 30.0), rgb(230, 160, 20));
+
+        // 4. path: quad and cubic curves, filled, then stroked on top
+        x += 76.0;
+        let p = new Path();
+        p.moveTo(x + 4.0, y + 60.0)
+         .quadTo(x + 16.0, y + 0.0, x + 32.0, y + 30.0)
+         .cubicTo(x + 44.0, y + 60.0, x + 56.0, y + 0.0, x + 60.0, y + 60.0)
+         .close();
+        s.fill_path(p, rgba(40, 90, 200, 90));
+        s.stroke_path(p, 2.0, ink);
+
+        // 5. arcs: a 270-degree progress ring over a faint full ring
+        x += 76.0;
+        s.stroke_arc(x + 32.0, y + 32.0, 26.0, 26.0, 0.0, 360.0, 6.0, rgb(220, 225, 235));
+        s.stroke_arc(x + 32.0, y + 32.0, 26.0, 26.0, -90.0, 270.0, 6.0, rgb(30, 170, 110));
+
+        // 6. radial gradient filling a circle-sized square
+        x += 76.0;
+        s.radial_gradient(Rect(x, y, 64.0, 64.0), x + 32.0, y + 32.0, 32.0,
+                          [rgb(255, 255, 255) as i32, rgb(120, 60, 200) as i32],
+                          [0.0, 1.0]);
+
+        // 7. bevel: a raised panel
+        x += 76.0;
+        s.fill_round(Rect(x, y + 8.0, 64.0, 48.0), 4.0, rgb(200, 204, 212));
+        s.bevel(Rect(x, y + 8.0, 64.0, 48.0), 4.0, 2.0, rgb(255, 255, 255), rgb(110, 115, 125), true);
+
+        // 8. image: sample.png from the working directory, scaled to 64x64
+        x += 76.0;
+        if (!this.tried) {
+            this.img = s.load_image("sample.png");
+            this.tried = true;
+        }
+        s.draw_image(this.img, Rect(x, y, 64.0, 64.0));
+
+        // row 2: the pixel effects
+        x = this.bounds.x;
+        y = this.bounds.y + 90.0;
+
+        // 9. shadow under a white card
+        s.shadow(Rect(x + 6.0, y + 8.0, 52.0, 44.0), 10.0, 8.0, 4.0, th.shadow_color);
+        s.fill_round(Rect(x + 6.0, y + 8.0, 52.0, 44.0), 10.0, rgb(255, 255, 255));
+
+        // 10. blur over the bars
+        x += 76.0;
+        stripes(s, x, y);
+        s.blur(Rect(x, y, 64.0, 64.0), 4.0);
+
+        // 11. frosted backdrop: blurred bars under a white tint, rounded
+        x += 76.0;
+        stripes(s, x, y);
+        s.backdrop(Rect(x + 8.0, y + 8.0, 48.0, 48.0), 12.0, 6.0, rgba(255, 255, 255, 120));
+
+        // 12. blur cut by a clip: only the left half may soften
+        x += 76.0;
+        stripes(s, x, y);
+        s.clip_push(Rect(x, y, 32.0, 64.0), 0.0);
+        s.blur(Rect(x, y, 64.0, 64.0), 4.0);
+        s.clip_pop();
+
+        // 13. backdrop with no tint: blur inside the rounded shape only
+        x += 76.0;
+        stripes(s, x, y);
+        s.backdrop(Rect(x + 8.0, y + 8.0, 48.0, 48.0), 24.0, 6.0, rgba(0, 0, 0, 0));
+    }
+}
+
+export fn buildScene(): Widget {
+    let kids: Widget[] = [
+        new Label("Painter bench: same widgets, two renderers"),
+        new Row([new TextField("type a task"), new Button("Add")]),
+        new Checkbox("a checkbox"),
+        new Switch(true),
+        new Slider(0.4),
+        new OpsBoard(),
+    ];
+    // Non-ASCII on purpose: exercises the UTF-8 to UTF-16 path and font fallback.
+    let rows = ["Invoice #1042, Zoë Müller, 1.234,50 €",
+                "Rechnung bezahlt: Straße 12, Köln",
+                "Ελληνικά, кириллица, and plain ASCII",
+                "The quick brown fox jumps over the lazy dog 0123456789"];
+    for (let i in 0..16) {
+        kids.push(new Label(rows[i % rows.len]));
+    }
+    return new Column(kids);
+}
+
+fn opBench(win: Window, label: string, name: string, n: int, op: fn(int)) {
+    let t0 = monoUs();
+    for (let i in 0..n) { op(i); }
+    win.painter.present();
+    report(label, `op_{name}`, monoUs() - t0, n);
+    memStage(label, `op_{name}`);
+}
+
+fn report(label: string, name: string, us: i64, n: int) {
+    let per = (us as float) / (n as float);
+    print(`bench {label} {name} {per} us/op ({n} ops)`);
+}
+
+// Time a full redraw and the painter's hot ops. Every timed block ends in a
+// present(): both renderers queue work and rasterise at the flush, so timing
+// without it would measure command recording, not drawing.
+export fn bench(win: Window, label: string) {
+    let t0 = monoUs();
+    win.theme.apply_scale(win.scale);
+    win.layout();
+    win.draw_full();
+    report(label, "first_frame", monoUs() - t0, 1);
+
+    for (let i in 0..3) { win.draw_full(); }
+    let n = 60;
+    t0 = monoUs();
+    for (let i in 0..n) { win.draw_full(); }
+    report(label, "full_redraw", monoUs() - t0, n);
+
+    let p = win.painter;
+    let ops = 2000;
+    t0 = monoUs();
+    for (let i in 0..ops) {
+        p.fill(Rect(((i * 37) % 600) as float, ((i * 53) % 400) as float, 40.0, 20.0),
+               rgb(i % 256, 80, 160));
+    }
+    p.present();
+    report(label, "fill", monoUs() - t0, ops);
+
+    t0 = monoUs();
+    for (let i in 0..ops) {
+        p.fill_round(Rect(((i * 37) % 600) as float, ((i * 53) % 400) as float, 60.0, 24.0),
+                     8.0, rgb(40, i % 256, 120));
+    }
+    p.present();
+    report(label, "fill_round", monoUs() - t0, ops);
+
+    t0 = monoUs();
+    for (let i in 0..ops) {
+        p.text(((i * 37) % 500) as float, (20 + (i * 53) % 380) as float,
+               "The quick brown fox 0123", rgb(230, 230, 230));
+    }
+    p.present();
+    report(label, "text", monoUs() - t0, ops);
+
+    // One op at a time, so a frame-time difference can be traced to its op.
+    // Each draws at a fixed spot, as a widget does frame after frame, which
+    // is the case the shadow and gradient caches are built for.
+    let s = win.painter;
+    let ink = rgb(40, 90, 200);
+    let sx = starXs(300.0, 30.0);
+    let sy = starYs(300.0, 30.0);
+    let path = new Path();
+    path.moveTo(200.0, 260.0).quadTo(212.0, 200.0, 228.0, 230.0)
+        .cubicTo(240.0, 260.0, 252.0, 200.0, 256.0, 260.0).close();
+    let img = s.load_image("sample.png");
+    let shade = win.theme.shadow_color;
+    let k = 500;
+    opBench(win, label, "clip_rect", k, (i) => {
+        s.clip_push(Rect(20.0, 20.0, 64.0, 64.0), 0.0);
+        s.fill(Rect(10.0, 10.0, 90.0, 90.0), ink);
+        s.clip_pop();
+    });
+    opBench(win, label, "clip_round", k, (i) => {
+        s.clip_push(Rect(20.0, 20.0, 64.0, 64.0), 16.0);
+        s.fill(Rect(10.0, 10.0, 90.0, 90.0), ink);
+        s.clip_pop();
+    });
+    opBench(win, label, "rotate", k, (i) => {
+        s.save();
+        s.translate(150.0, 150.0);
+        s.rotate(30.0);
+        s.fill_round(Rect(-22.0, -22.0, 44.0, 44.0), 6.0, ink);
+        s.restore();
+    });
+    opBench(win, label, "polygon", k, (i) => { s.polygon(sx, sy, rgb(230, 160, 20)); });
+    opBench(win, label, "path", k, (i) => {
+        s.fill_path(path, rgba(40, 90, 200, 90));
+        s.stroke_path(path, 2.0, ink);
+    });
+    opBench(win, label, "arc", k, (i) => {
+        s.stroke_arc(300.0, 100.0, 26.0, 26.0, -90.0, 270.0, 6.0, rgb(30, 170, 110));
+    });
+    opBench(win, label, "gradient_v", k, (i) => {
+        s.gradient_v(Rect(20.0, 200.0, 100.0, 32.0), 8.0, rgb(70, 110, 230), rgb(40, 80, 200));
+    });
+    opBench(win, label, "radial", k, (i) => {
+        s.radial_gradient(Rect(400.0, 20.0, 64.0, 64.0), 432.0, 52.0, 32.0,
+                          [rgb(255, 255, 255) as i32, rgb(120, 60, 200) as i32], [0.0, 1.0]);
+    });
+    opBench(win, label, "bevel", k, (i) => {
+        s.bevel(Rect(400.0, 120.0, 64.0, 48.0), 4.0, 2.0, rgb(255, 255, 255),
+                rgb(110, 115, 125), true);
+    });
+    opBench(win, label, "image", k, (i) => { s.draw_image(img, Rect(480.0, 20.0, 64.0, 64.0)); });
+    opBench(win, label, "shadow", k, (i) => {
+        s.shadow(Rect(480.0, 120.0, 100.0, 36.0), 10.0, 8.0, 4.0, shade);
+    });
+    opBench(win, label, "blur", 100, (i) => { s.blur(Rect(20.0, 300.0, 120.0, 80.0), 4.0); });
+    opBench(win, label, "backdrop", 100, (i) => {
+        s.backdrop(Rect(160.0, 300.0, 120.0, 80.0), 12.0, 6.0, rgba(255, 255, 255, 120));
+    });
+
+    s.free_image(img);   // a second bench pass must not count this as a leak
+
+    // Same string every call: what layout does when nothing changed.
+    let hot = 20000;
+    let acc = 0.0;
+    t0 = monoUs();
+    for (let i in 0..hot) { acc += p.text_width("Invoice #1042, Zoë Müller"); }
+    report(label, "text_width_repeat", monoUs() - t0, hot);
+
+    // A fresh string each call: the cold cost, built before the clock starts.
+    let cold: string[] = [];
+    for (let i in 0..ops) { cold.push(`row {i} of the cold set`); }
+    t0 = monoUs();
+    for (let s in cold) { acc += p.text_width(s); }
+    report(label, "text_width_unique", monoUs() - t0, ops);
+    print(`bench {label} checksum {acc}`);
+
+    // Redraw so the window shows the scene again, not the bench's scribbles.
+    win.draw_full();
+}
+
+export fn benchOnly(): bool { return getenv("VYTO_BENCH_ONLY").len > 0; }
+
+// VYTO_LEAK=1: run leakLoops instead of the timing bench.
+export fn leakMode(): bool { return getenv("VYTO_LEAK").len > 0; }
+
+// Leak check: each kind of work five times in a row, memory after each. A
+// cache or a growing batch buffer levels off after the first repetition; a
+// leak keeps climbing by the same step. The churn loops push the shadow and
+// gradient caches past their capacity, so eviction has to release what it
+// drops, and the image loop loads and frees twenty times per repetition.
+export fn leakLoops(win: Window, label: string) {
+    let p = win.painter;
+    let reps = 5;
+    for (let r in 0..reps) {
+        let t0 = monoUs();
+        for (let i in 0..60) { win.draw_full(); }
+        print(`time {label} redraw60_{r} {monoUs() - t0}us`);
+        memStage(label, `redraw60_{r}`);
+    }
+    for (let r in 0..reps) {
+        let t0 = monoUs();
+        for (let i in 0..2000) {
+            p.fill(Rect(((i * 37) % 600) as float, ((i * 53) % 400) as float, 40.0, 20.0),
+                   rgb(i % 256, 80, 160));
+        }
+        p.present();
+        print(`time {label} fill2000_{r} {monoUs() - t0}us`);
+        memStage(label, `fill2000_{r}`);
+    }
+    for (let r in 0..reps) {
+        let t0 = monoUs();
+        for (let i in 0..2000) {
+            p.fill_round(Rect(((i * 37) % 600) as float, ((i * 53) % 400) as float, 60.0, 24.0),
+                         8.0, rgb(40, i % 256, 120));
+        }
+        p.present();
+        print(`time {label} round2000_{r} {monoUs() - t0}us`);
+        memStage(label, `round2000_{r}`);
+    }
+    for (let r in 0..reps) {
+        let t0 = monoUs();
+        for (let i in 0..2000) {
+            p.text(((i * 37) % 500) as float, (20 + (i * 53) % 380) as float,
+                   "The quick brown fox 0123", rgb(230, 230, 230));
+        }
+        p.present();
+        print(`time {label} text2000_{r} {monoUs() - t0}us`);
+        memStage(label, `text2000_{r}`);
+    }
+    for (let r in 0..reps) {
+        let t0 = monoUs();
+        let acc = 0.0;
+        for (let i in 0..2000) { acc += p.text_width(`rep {r} row {i}`); }
+        print(`time {label} width_unique2000_{r} {monoUs() - t0}us`);
+        memStage(label, `width_unique2000_{r}`);
+    }
+    for (let r in 0..reps) {
+        let t0 = monoUs();
+        for (let i in 0..100) {
+            p.shadow(Rect(20.0, 20.0, 40.0 + (i as float), 30.0), 8.0, 8.0, 4.0,
+                     win.theme.shadow_color);
+        }
+        p.present();
+        print(`time {label} shadow_churn100_{r} {monoUs() - t0}us`);
+        memStage(label, `shadow_churn100_{r}`);
+    }
+    for (let r in 0..reps) {
+        let t0 = monoUs();
+        for (let i in 0..50) {
+            p.gradient_v(Rect(20.0, 200.0, 100.0, 32.0), 8.0, rgb(i * 5, 110, 230),
+                         rgb(40, 80, 200));
+        }
+        p.present();
+        print(`time {label} gradient_churn50_{r} {monoUs() - t0}us`);
+        memStage(label, `gradient_churn50_{r}`);
+    }
+    for (let r in 0..reps) {
+        let t0 = monoUs();
+        for (let i in 0..500) {
+            p.clip_push(Rect(20.0, 20.0, 64.0, 64.0), 16.0);
+            p.fill(Rect(10.0, 10.0, 90.0, 90.0), rgb(40, 90, 200));
+            p.clip_pop();
+        }
+        p.present();
+        print(`time {label} clip_round500_{r} {monoUs() - t0}us`);
+        memStage(label, `clip_round500_{r}`);
+    }
+    let path = new Path();
+    path.moveTo(200.0, 260.0).quadTo(212.0, 200.0, 228.0, 230.0)
+        .cubicTo(240.0, 260.0, 252.0, 200.0, 256.0, 260.0).close();
+    for (let r in 0..reps) {
+        let t0 = monoUs();
+        for (let i in 0..500) {
+            p.fill_path(path, rgba(40, 90, 200, 90));
+            p.stroke_path(path, 2.0, rgb(40, 90, 200));
+        }
+        p.present();
+        print(`time {label} path500_{r} {monoUs() - t0}us`);
+        memStage(label, `path500_{r}`);
+    }
+    for (let r in 0..reps) {
+        let t0 = monoUs();
+        for (let i in 0..20) {
+            let img = p.load_image("sample.png");
+            p.draw_image(img, Rect(480.0, 20.0, 64.0, 64.0));
+            p.present();
+            p.free_image(img);
+        }
+        print(`time {label} image_load_free20_{r} {monoUs() - t0}us`);
+        memStage(label, `image_load_free20_{r}`);
+    }
+}
+
+// Window size, VYTO_BENCH_SIZE=WxH (default 640x480): memory that scales with
+// it is surface copies, memory that does not is fixed cost.
+fn benchDim(i: int, fallback: int): int {
+    let v = getenv("VYTO_BENCH_SIZE");
+    let parts = v.split("x");
+    if (parts.len != 2) { return fallback; }
+    let n = 0;
+    for (let k in 0..parts[i].len) {
+        let c = parts[i][k];
+        if (c < 48 || c > 57) { return fallback; }
+        n = n * 10 + (c - 48);
+    }
+    if (n < 64) { return fallback; }
+    return n;
+}
+
+export fn benchW(): int { return benchDim(0, 640); }
+export fn benchH(): int { return benchDim(1, 480); }

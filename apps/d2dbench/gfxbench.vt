@@ -1,0 +1,39 @@
+// The baseline entry: the same bench scene through blend2d's GfxPainter.
+// Reads Inter-Regular.ttf (and its -Medium/-Bold siblings) from the working
+// directory, or from $VYTO_BENCH_FONT, so the bench needs no committed copy.
+import { Window } from "vyto/ui";
+import { GfxPainter } from "vyto/gfx/painter";
+import { getenvOr } from "vyto/os";
+import { buildScene, bench, benchOnly, benchW, benchH, leakMode, leakLoops } from "benchscene";
+import { memStage, memBreakdown } from "memprobe/memprobe";
+
+fn main() {
+    memStage("gfx", "1_start");
+    let win = new Window("gfx (blend2d, Inter)", benchW(), benchH());
+    memStage("gfx", "2_window");
+    memStage("gfx", "3_factories");   // nothing to create; kept to align with d2dbench
+    let font = getenvOr("VYTO_BENCH_FONT", "Inter-Regular.ttf");
+    // GfxPainter does not apply the display scale itself; D2DPainter does.
+    win.use_painter(new GfxPainter(win.surface(), font, 15.0 * win.scale));
+    memStage("gfx", "4_painter");
+    win.root = buildScene();
+    win.theme.apply_scale(win.scale);
+    win.layout();
+    win.draw_full();
+    memStage("gfx", "5_first_frame");
+    if (leakMode()) {
+        leakLoops(win, "gfx");
+        memBreakdown("gfx");
+        return;
+    }
+    print("painter gfx");
+    bench(win, "gfx");
+    memStage("gfx", "6_after_bench");
+    // A second identical pass: memory that grows again is a leak, memory
+    // that holds still was caches filling on the first pass.
+    bench(win, "gfx-again");
+    memStage("gfx", "7_after_bench_again");
+    memBreakdown("gfx");
+    if (benchOnly()) { return; }
+    win.run();
+}

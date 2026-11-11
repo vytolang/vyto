@@ -1,0 +1,50 @@
+// The Windows entry: the bench scene through D2DPainter.
+//
+//   d2dbench.exe                       open the scene in a window
+//   set VYTO_BENCH_ONLY=1              print the timings and exit
+//
+// Build it with --target windows-x64. Off Windows it only reports that
+// Direct2D is unavailable. Memory is reported at each startup stage, in the
+// same order as gfxbench, so the two can be read side by side.
+import { Window } from "vyto/ui";
+import { D2DPainter, d2d_available, D2D_MODE_WIC_PBGRA } from "vyto/win/d2d";
+import { buildScene, bench, benchOnly, benchW, benchH, leakMode, leakLoops } from "benchscene";
+import { memStage, memBreakdown } from "memprobe/memprobe";
+
+fn main() {
+    memStage("d2d", "1_start");
+    let win = new Window("D2DPainter bench", benchW(), benchH());
+    memStage("d2d", "2_window");
+    // Creates the COM, Direct2D, DirectWrite and WIC factories.
+    if (!d2d_available()) {
+        print("d2d unavailable");
+        return;
+    }
+    memStage("d2d", "3_factories");
+    let p = new D2DPainter(win.surface(), 15.0);
+    win.use_painter(p);
+    memStage("d2d", "4_painter");
+    win.root = buildScene();
+    win.theme.apply_scale(win.scale);
+    win.layout();
+    win.draw_full();
+    memStage("d2d", "5_first_frame");
+    if (leakMode()) {
+        leakLoops(win, "d2d");
+        memBreakdown("d2d");
+        return;
+    }
+    // The fallback target draws grayscale text; worth knowing when reading numbers.
+    let label = "d2d";
+    if (p.mode() == D2D_MODE_WIC_PBGRA) { label = "d2d-pbgra"; }
+    print(`painter {label}`);
+    bench(win, label);
+    memStage("d2d", "6_after_bench");
+    // A second identical pass: memory that grows again is a leak, memory
+    // that holds still was caches filling on the first pass.
+    bench(win, "d2d-again");
+    memStage("d2d", "7_after_bench_again");
+    memBreakdown("d2d");
+    if (benchOnly()) { return; }
+    win.run();
+}
