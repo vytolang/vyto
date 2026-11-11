@@ -175,14 +175,36 @@ bottom/left/right` `drop_top/bottom/left/right`; layout `center_box`
 - **Present**: `present()` `present_rect(r)`
 - **Clip**: `clip_set(r)` `clip_clear()`
 - **Events/input**: `wait()` `poll()` `wait_timeout(ms)` `set_vsync(on): bool`
-  `key()` `text_ev()` `mouse_x()` `mouse_y()` `wheel()` `mods()` `now_ms()`
-  `scale()` (HiDPI factor)
+  `key()` `text_ev()` `mouse_x()` `mouse_y()` `wheel()` `wheel_x()`
+  `button()` `mods()` `now_ms()` `scale()` (HiDPI factor)
+- **Text input**: `text_ev()` is UTF-8 — one character per `EV_KEY`, whatever
+  the keyboard layout or input method produced (accents, AltGr characters,
+  CJK from an IME). `key()` is its code for ASCII and 0 otherwise. Text typed
+  with AltGr does not report Ctrl/Alt held, so it is not mistaken for a
+  shortcut. `set_ime_pos(x, y, h)` tells an input method where the caret is,
+  so its candidate window opens beside it (Win32; a no-op elsewhere);
+  `TextField` and `TextArea` call it for you.
+- **Buttons**: left is `EV_MOUSE_DOWN`/`EV_MOUSE_UP`, a right press is
+  `EV_MOUSE_RDOWN`. Every other press or release is `EV_BUTTON_DOWN` /
+  `EV_BUTTON_UP` with `button()` one of `BUTTON_RIGHT` (release only),
+  `BUTTON_MIDDLE`, `BUTTON_BACK`, `BUTTON_FORWARD`. On Windows a press
+  captures the mouse, so a release outside the window still arrives.
+- **Wheel**: `wheel()` is vertical lines, positive = down; `wheel_x()` is
+  horizontal, positive = right. A wheel event carries one or the other.
+  Touchpads' fractional deltas accumulate rather than rounding to nothing.
+- **Pointer**: `set_cursor(CURSOR_*)` — `ARROW`, `IBEAM`, `HAND`, `WAIT`,
+  `CROSS`, `SIZE_WE/NS/NWSE/NESW`, `MOVE`, `HIDDEN`; `cursor()` reads it back.
+  Shown on Win32 and X11, remembered elsewhere. In `vyto/ui` a widget answers
+  `cursor()` and the window applies it on hover.
+- **Frame**: `set_dark_frame(on)` asks for a dark title bar (Windows 10 1809+,
+  GNOME-family X11 window managers; ignored elsewhere). `vyto/ui` sets it when
+  the theme's surface colour is dark.
 - **Clipboard**: `clipboard()` `set_clipboard(t)`
 - **Escape hatches**: `raw_handle()` `native_display()` `native_window()`
   `native_gc()`
 
-Event constants `EV_NONE..EV_VSYNC` (12 kinds), key codes `KEY_SPACE..
-KEY_F12`, modifier masks `MOD_SHIFT/CTRL/ALT/SUPER`.
+Event constants `EV_NONE..EV_BUTTON_UP` (15 kinds, also the `EVENT` enum),
+key codes `KEY_SPACE..KEY_F12`, modifier masks `MOD_SHIFT/CTRL/ALT/SUPER`.
 
 ### Example: a filled rectangle
 

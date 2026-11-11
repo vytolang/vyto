@@ -18,6 +18,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "vyto_win.h" /* vt_fopen: UTF-8 paths on Windows too */
 
 #define GFX_WEIGHTS 3   /* 0=regular, 1=medium/semi, 2=bold */
 
@@ -1238,7 +1239,7 @@ int gfx_write_ppm(GfxCanvas *c, const char *path) {
     unsigned char *row;
     gfx_flush(c);
     bl_image_get_data(&c->img, &d);
-    f = fopen(path, "wb");
+    f = vt_fopen(path, "wb");
     if (!f) return 0;
     fprintf(f, "P6\n%d %d\n255\n", c->w, c->h);
     row = (unsigned char *)malloc((size_t)c->w * 3);

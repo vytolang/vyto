@@ -83,7 +83,14 @@ Every widget goes through the same `virtual` surface, overridden as needed:
 - **Input**: `on_click`, `on_drag`/`on_drag_start`/`on_drag_end`, `on_key`/
   `on_key_up`, `on_scroll`, `on_release`, `on_double_click`, `on_long_press`,
   `on_hover_enter`/`on_hover_leave`, `on_focus`/`on_blur`, `wants_text`
-  (claims the keyboard), `on_context` (right-click/long-press menu).
+  (claims the keyboard), `on_context` (right-click/long-press menu),
+  `on_button(button, down, x, y)` (right release, middle, back, forward;
+  bubbles up the parents until one returns true), `on_scroll_x` (tilt wheel,
+  touchpad, Shift+wheel).
+- **Pointer**: `cursor()` returns the `CURSOR_*` shape shown while the widget
+  is hovered (`TextField`/`TextArea` answer `CURSOR_IBEAM`). A text input
+  calls `ime_caret(x, y, h)` from `render` so an input method's candidate
+  window opens at the caret.
 - **Tree**: `hit(x, y)` finds the deepest widget under a point;
   `collect_focus(out)` builds the tab order.
 

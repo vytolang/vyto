@@ -7,6 +7,7 @@
 
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -15,9 +16,29 @@
 #else
 #include <dirent.h>
 #endif
+#include "vyto_win.h" /* UTF-8 paths through the W APIs on Windows */
+
+/* One stat for both worlds. On Windows the narrow stat() reads the path in
+   the ANSI code page (so C:\Users\Zoë fails) and its st_size is 32-bit, so
+   go through _wstat64 instead. */
+#ifdef _WIN32
+typedef struct _stat64 vf_stat_t;
+static int vf_stat(const char *path, vf_stat_t *st) {
+    VtWBuf w;
+    if (!vt_wbuf_from(&w, path)) { vt_wbuf_free(&w); return -1; }
+    int r = _wstat64(w.p, st);
+    vt_wbuf_free(&w);
+    return r;
+}
+#define VF_ISREG(m) (((m) & _S_IFMT) == _S_IFREG)
+#else
+typedef struct stat vf_stat_t;
+static int vf_stat(const char *path, vf_stat_t *st) { return stat(path, st); }
+#define VF_ISREG(m) S_ISREG(m)
+#endif
 
 void *vfile_open(const char *path, const char *mode) {
-    return (void *)fopen(path, mode);
+    return (void *)vt_fopen(path, mode);
 }
 int64_t vfile_read(void *f, char *buf, int64_t cap) {
     if (!f || cap <= 0) return 0;
@@ -38,32 +59,48 @@ int64_t vfile_write(void *f, const char *buf, int64_t n) {
     if (!f || n < 0) return -1;
     return (int64_t)fwrite(buf, 1, (size_t)n, (FILE *)f);
 }
+/* fseek/ftell take a C long, 32-bit on Windows, so a file past 2 GB could
+   not be positioned there. _fseeki64 is in Windows 7's msvcrt; _ftelli64 is
+   not, but fgetpos is, and msvcrt's fpos_t is a plain 64-bit offset. */
 int vfile_seek(void *f, int64_t off, int whence) {
-    return f ? fseek((FILE *)f, off, whence) : -1;
+#ifdef _WIN32
+    return f ? _fseeki64((FILE *)f, off, whence) : -1;
+#else
+    return f ? fseeko((FILE *)f, (off_t)off, whence) : -1;
+#endif
 }
-int64_t vfile_tell(void *f) { return f ? ftell((FILE *)f) : -1; }
+int64_t vfile_tell(void *f) {
+    if (!f) return -1;
+#ifdef _WIN32
+    fpos_t p;
+    if (fgetpos((FILE *)f, &p) != 0) return -1;
+    return (int64_t)p;
+#else
+    return (int64_t)ftello((FILE *)f);
+#endif
+}
 int vfile_eof(void *f) { return f ? (feof((FILE *)f) ? 1 : 0) : 1; }
 int vfile_flush(void *f) { return f ? fflush((FILE *)f) : -1; }
 void vfile_close(void *f) { if (f) fclose((FILE *)f); }
 
 int64_t vfile_size(const char *path) {
-    struct stat st;
-    if (stat(path, &st) != 0) return -1;
+    vf_stat_t st;
+    if (vf_stat(path, &st) != 0) return -1;
     return (int64_t)st.st_size;
 }
 int64_t vfile_mtime(const char *path) {
-    struct stat st;
-    if (stat(path, &st) != 0) return -1;
+    vf_stat_t st;
+    if (vf_stat(path, &st) != 0) return -1;
     return (int64_t)st.st_mtime;
 }
 int vfile_exists(const char *path) {
-    struct stat st;
-    return stat(path, &st) == 0 ? 1 : 0;
+    vf_stat_t st;
+    return vf_stat(path, &st) == 0 ? 1 : 0;
 }
 int vfile_is_file(const char *path) {
-    struct stat st;
-    if (stat(path, &st) != 0) return 0;
-    return S_ISREG(st.st_mode) ? 1 : 0;
+    vf_stat_t st;
+    if (vf_stat(path, &st) != 0) return 0;
+    return VF_ISREG(st.st_mode) ? 1 : 0;
 }
 /* Can this directory actually be listed?
 
@@ -80,13 +117,21 @@ int vfile_dir_readable(const char *path) {
 #ifdef _WIN32
     /* No opendir in the MSVC runtime. A directory listing needs the search
        permission that FindFirstFile exercises, so probe with that. */
-    char pat[1024];
-    WIN32_FIND_DATAA fd;
+    WIN32_FIND_DATAW fd;
     HANDLE h;
+    VtWBuf w;
+    size_t n;
+    char *pat;
     if (!path) return 0;
-    _snprintf(pat, sizeof pat, "%s\\*", path);
-    pat[sizeof pat - 1] = '\0';
-    h = FindFirstFileA(pat, &fd);
+    n = strlen(path);
+    pat = (char *)malloc(n + 3);
+    if (!pat) return 0;
+    memcpy(pat, path, n);
+    memcpy(pat + n, "\\*", 3);
+    vt_wbuf_from(&w, pat);
+    free(pat);
+    h = FindFirstFileW(w.p, &fd);
+    vt_wbuf_free(&w);
     if (h == INVALID_HANDLE_VALUE) return 0;
     FindClose(h);
     return 1;
@@ -100,13 +145,37 @@ int vfile_dir_readable(const char *path) {
 #endif
 }
 
-int vfile_remove(const char *path) { return remove(path); }
-int vfile_rename(const char *a, const char *b) { return rename(a, b); }
-/* The MSVC runtime's mkdir takes no mode — Windows has no POSIX permission
-   bits to apply, so the directory inherits the parent's ACL either way. */
 #ifdef _WIN32
 #include <direct.h>
-int vfile_mkdir(const char *path) { return _mkdir(path); }
+int vfile_remove(const char *path) {
+    VtWBuf w;
+    vt_wbuf_from(&w, path);
+    int r = _wremove(w.p);
+    vt_wbuf_free(&w);
+    return r;
+}
+/* POSIX rename replaces an existing target; msvcrt's rename refuses. Match
+   POSIX, so a write-temp-then-rename save works the same on both. */
+int vfile_rename(const char *a, const char *b) {
+    VtWBuf wa, wb;
+    vt_wbuf_from(&wa, a);
+    vt_wbuf_from(&wb, b);
+    BOOL ok = MoveFileExW(wa.p, wb.p, MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED);
+    vt_wbuf_free(&wa);
+    vt_wbuf_free(&wb);
+    return ok ? 0 : -1;
+}
+/* The MSVC runtime's mkdir takes no mode — Windows has no POSIX permission
+   bits to apply, so the directory inherits the parent's ACL either way. */
+int vfile_mkdir(const char *path) {
+    VtWBuf w;
+    vt_wbuf_from(&w, path);
+    int r = _wmkdir(w.p);
+    vt_wbuf_free(&w);
+    return r;
+}
 #else
+int vfile_remove(const char *path) { return remove(path); }
+int vfile_rename(const char *a, const char *b) { return rename(a, b); }
 int vfile_mkdir(const char *path) { return mkdir(path, 0777); }
 #endif

@@ -467,6 +467,16 @@ void vs_set_icon(void *s, const unsigned int *argb, int w, int h) {
      * cannot change it from inside a running Activity. */
 }
 
+/* No pointer to shape on a touch screen: remembered, so vs_get_cursor still
+ * answers what was asked for. */
+static int cursor_shape;
+void vs_set_cursor(void *s, int shape) { (void)s; cursor_shape = shape; }
+int vs_get_cursor(void *s) { (void)s; return cursor_shape; }
+/* The soft keyboard places itself; there is no candidate window to move. */
+void vs_set_ime_pos(void *s, int x, int y, int h) { (void)s; (void)x; (void)y; (void)h; }
+/* System bars follow the app theme through the Activity, not per surface. */
+void vs_set_dark_frame(void *s, int on) { (void)s; (void)on; }
+
 void vs_set_decorated(void *s, int on) {
     (void)s; (void)on;
     /* No window manager: an Android surface fills what the system gives it and
@@ -608,6 +618,10 @@ int vs_mods(void *s)  { (void)s; return last_mods; }
 int vs_x(void *s)     { (void)s; return last_x; }
 int vs_y(void *s)     { (void)s; return last_y; }
 int vs_wheel(void *s) { (void)s; return last_wheel; }
+/* Touch has no horizontal wheel and no extra buttons; BUTTON_DOWN/UP are
+   never delivered here, so these only have to answer something sane. */
+int vs_wheel_x(void *s) { (void)s; return 0; }
+int vs_button(void *s)  { (void)s; return 0; }
 
 const char *vs_text(void *s) { (void)s; return last_text_buf ? last_text_buf : ""; }
 

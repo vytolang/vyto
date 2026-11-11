@@ -6,6 +6,7 @@
 // renderers, or visualization tools, or let vyto/ui sit on top of it.
 
 import { vs_open, vs_close, vs_width, vs_height, vs_set_title, vs_set_icon, vs_set_min_size,
+          vs_set_cursor, vs_get_cursor, vs_set_ime_pos, vs_set_dark_frame, vs_wheel_x, vs_button,
           vs_set_decorated, vs_get_position, vs_move, vs_drag_start,
           vs_set_size, vs_set_fullscreen, vs_monitors, vs_capture,
           vs_fill_rect, vs_draw_rect, vs_draw_line, vs_draw_text, vs_blit, vs_present,
@@ -147,18 +148,45 @@ export const EV_KEY_UP: int = 9;  // a key was released; key() gives the code
 export const EV_MOUSE_WHEEL: int = 10; // mouse wheel scrolled; wheel() gives the delta
 export const EV_MOUSE_RDOWN: int = 11; // right button pressed; mouse_x()/mouse_y() give position
 export const EV_VSYNC: int = 12;  // the display is about to scan out; present now (see set_vsync)
+// Every button that is not left: button() names it. Left stays MOUSE_DOWN/UP
+// and a right press stays MOUSE_RDOWN, so code written before these existed
+// sees exactly what it always did. BUTTON_DOWN is middle/back/forward (never a
+// second report of a right press); BUTTON_UP is where the right release, and
+// the others', arrive.
+export const EV_BUTTON_DOWN: int = 13;
+export const EV_BUTTON_UP: int = 14;
 
-// The same 13 classes as a type, for code that would rather switch than chain
+// Surface.button() for EV_BUTTON_DOWN / EV_BUTTON_UP (mirrors VS_BUTTON_*).
+export const BUTTON_LEFT: int = 1;
+export const BUTTON_RIGHT: int = 2;
+export const BUTTON_MIDDLE: int = 3;
+export const BUTTON_BACK: int = 4;    // the thumb button nearest the user
+export const BUTTON_FORWARD: int = 5;
+
+// Pointer shapes for Surface.set_cursor (mirrors VS_CURSOR_*).
+export const CURSOR_ARROW: int = 0;
+export const CURSOR_IBEAM: int = 1;     // over text you can type into
+export const CURSOR_HAND: int = 2;      // over a link
+export const CURSOR_WAIT: int = 3;
+export const CURSOR_CROSS: int = 4;
+export const CURSOR_SIZE_WE: int = 5;   // left-right resize
+export const CURSOR_SIZE_NS: int = 6;   // up-down resize
+export const CURSOR_SIZE_NWSE: int = 7;
+export const CURSOR_SIZE_NESW: int = 8;
+export const CURSOR_MOVE: int = 9;
+export const CURSOR_HIDDEN: int = 10;
+
+// The same 15 classes as a type, for code that would rather switch than chain
 // ifs. wait()/poll()/wait_timeout() still return an int, so this is additive:
 // cast at the boundary and the switch is checked for exhaustiveness.
 //
 //     switch (s.wait() as EVENT) {
 //     case EVENT.VSYNC: { ... }
-//     ...                          // a 14th class is a compile error here
+//     ...                          // a 16th class is a compile error here
 //     }
 //
 // Values are pinned to the EV_* above, which mirror VS_EV_* in vsurf.h. The
-// cast is range-checked in debug builds, so a value outside 0..12 arriving
+// cast is range-checked in debug builds, so a value outside 0..14 arriving
 // from C panics rather than falling silently through an if-chain.
 export enum EVENT {
     NONE = 0,
@@ -174,6 +202,8 @@ export enum EVENT {
     MOUSE_WHEEL = 10,
     MOUSE_RDOWN = 11,
     VSYNC = 12,
+    BUTTON_DOWN = 13,
+    BUTTON_UP = 14,
 }
 
 // Key codes from Surface.key(): printable ASCII, or one of these
@@ -480,6 +510,28 @@ export class Surface {
     // vyto/media/image or draw them. Windows and X11; elsewhere a no-op.
     // A Windows exe already starts with the icon vytoc embedded from its
     // --manifest, so this is only for an icon that changes (a badge, a state).
+    // The pointer shape over this surface (CURSOR_*). Win32 and X11 show it;
+    // headless, framebuffer and Android only remember it, which is what
+    // cursor() reports, so tests can check it.
+    fn set_cursor(shape: int) { vs_set_cursor(this.h, shape as i32); }
+    fn cursor(): int { return vs_get_cursor(this.h) as int; }
+
+    // Where text is being typed: the caret's top-left and height, in surface
+    // pixels. An input method opens its candidate window there, so a CJK user
+    // picks characters next to the caret. Win32 only; a no-op elsewhere.
+    fn set_ime_pos(x: int, y: int, h: int) {
+        vs_set_ime_pos(this.h, x as i32, y as i32, h as i32);
+    }
+
+    // Ask for a dark window frame to match a dark theme. Windows 10 1809+ and
+    // GNOME-family X11 window managers honour it; Windows 7 and the rest
+    // ignore it.
+    fn set_dark_frame(on: bool) {
+        let flag = 0;
+        if (on) { flag = 1; }
+        vs_set_dark_frame(this.h, flag as i32);
+    }
+
     fn set_icon(argb: i32[], w: int, h: int) {
         if (w <= 0 || h <= 0 || argb.len < w * h) { return; }
         vs_set_icon(this.h, argb as rawptr, w as i32, h as i32);
@@ -704,7 +756,13 @@ export class Surface {
     fn text_ev(): string { return str(vs_text(this.h)); }
     fn mouse_x(): int { return vs_x(this.h); }
     fn mouse_y(): int { return vs_y(this.h); }
+    // Wheel deltas of the last EV_MOUSE_WHEEL, in lines: wheel() vertical
+    // (positive = down), wheel_x() horizontal (positive = right). An event
+    // carries one or the other, so the unused one is 0.
     fn wheel(): int { return vs_wheel(this.h); }
+    fn wheel_x(): int { return vs_wheel_x(this.h); }
+    // BUTTON_* of the last EV_BUTTON_DOWN / EV_BUTTON_UP
+    fn button(): int { return vs_button(this.h); }
     // MOD_* bitmask captured with the last delivered event
     fn mods(): int { return vs_mods(this.h); }
     // monotonic milliseconds — the animation/game clock (not wall time)

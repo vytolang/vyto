@@ -53,8 +53,8 @@
 // consumer (a layout pass, a server-side renderer); not worth it until one
 // exists.
 
-import { File, file_open } from "vyto/io/file";
-import { libDir } from "vyto/os";
+import { File, file_open, file_exists } from "vyto/io/file";
+import { libDir, getenv, platform } from "vyto/os";
 import { Surface, Rect } from "vyto/surface";
 
 // ---- byte reading ---------------------------------------------------------
@@ -1132,6 +1132,35 @@ export fn stdFontPath(name: string): string {
     let dir = libDir();
     if (dir.len == 0) { return ""; }
     return dir + "/vyto/gfx/assets/" + name;
+}
+
+// The desktop's own UI typeface, as a path, or "" when none is known.
+// `weight` is 0 regular, 1 medium, 2 bold.
+//
+// Windows: Segoe UI from the system Fonts folder, present on every version
+// since Vista. It has no medium face, so the semibold one stands in, the same
+// substitution Windows itself makes. Linux: DejaVu Sans where installed (the
+// path most distributions use). This is the fallback that lets a surface-only
+// app render real text without bundling a font.
+export fn systemUiFontPath(weight: int): string {
+    let paths: string[] = [];
+    if (platform() == "windows") {
+        let win = getenv("WINDIR");
+        if (win == "") { win = getenv("SystemRoot"); }
+        if (win == "") { return ""; }
+        let dir = win + "/Fonts/";
+        if (weight == 2) { paths.push(dir + "segoeuib.ttf"); }
+        if (weight == 1) { paths.push(dir + "seguisb.ttf"); }
+        paths.push(dir + "segoeui.ttf");
+    } else {
+        let dir = "/usr/share/fonts/truetype/dejavu/";
+        if (weight == 2) { paths.push(dir + "DejaVuSans-Bold.ttf"); }
+        paths.push(dir + "DejaVuSans.ttf");
+    }
+    for (let p in paths) {
+        if (file_exists(p)) { return p; }
+    }
+    return "";
 }
 
 // The vendored Inter regular face at `size` pixels.

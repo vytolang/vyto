@@ -1,0 +1,79 @@
+// Non-ASCII paths, argv and environment, end to end.
+//
+// Run with one argument, "Zöë日" (run_tests.sh passes it literally; run.ps1
+// builds it from [char] codes so the script itself stays ASCII). Every line
+// prints true on a correct build, on every target.
+//
+// On Linux this cannot fail for encoding reasons: the kernel takes bytes. Its
+// real job is on Windows, where the runtime and shims used to hand UTF-8 to
+// the ANSI-code-page APIs (fopen, stat, FindFirstFileA, getenv, msvcrt's
+// argv), so every one of these broke for a name outside the code page.
+import { file_open, file_exists, file_is_file, file_size, file_mtime,
+         file_remove, file_rename, file_mkdirs, dir_readable } from "vyto/io/file";
+import { getenv, setenv, cwd, chdir } from "vyto/os/os";
+import { mmap_file } from "vyto/mmap/mmap";
+
+// In its own function so the mapping is released on return: Windows refuses
+// to replace or delete a file while a mapping of it is open (Linux does not
+// care), which is exactly what the rename and remove below then do.
+fn mappedSize(path: string): string {
+    let m = mmap_file(path);
+    if (m == null) { return "null"; }
+    return "" + m.size();
+}
+
+fn main() {
+    let uni = "Zöë日";
+    let av = args();
+    print("argv: " + (av.len == 1 && av[0] == uni));
+
+    let dir = "tests/tmp/ünï_" + uni;
+    print("mkdirs: " + file_mkdirs(dir));
+    print("isdir: " + isdir(dir));
+    print("dir_readable: " + dir_readable(dir));
+
+    let f = dir + "/日本語.txt";
+    print("writefile: " + writefile(f, "line one\n"));
+    print("appendfile: " + appendfile(f, "zwei ß\n"));
+    print("readfile: " + (readfile(f) == "line one\nzwei ß\n"));
+    let lines = readlines(f);
+    print("readlines: " + (lines.len == 2 && lines[1] == "zwei ß"));
+    print("exists: " + (file_exists(f) && file_is_file(f)));
+    print("size: " + (file_size(f) == 17));
+    print("mtime: " + (file_mtime(f) > 0));
+
+    // seek/tell through vyto/io/file
+    let h = file_open(f, "rb");
+    print("open: " + (h != null));
+    print("seek: " + h.seek(5, 0));
+    print("tell: " + (h.tell() == 5));
+    h.close();
+
+    print("mmap: " + (mappedSize(f) == "17"));
+
+    // listdir hands names back as UTF-8
+    let names = listdir(dir);
+    let seen = false;
+    for (let n in names) {
+        if (n == "日本語.txt") { seen = true; }
+    }
+    print("listdir: " + seen);
+
+    // rename onto an existing name replaces it, as on POSIX
+    let g = dir + "/ëxtra.txt";
+    writefile(g, "x");
+    print("rename: " + file_rename(g, f));
+    print("renamed: " + (readfile(f) == "x" && !file_exists(g)));
+
+    setenv("VYTO_UNI_TEST", uni);
+    print("env roundtrip: " + (getenv("VYTO_UNI_TEST") == uni));
+    print("env inherited: " + (getenv("VYTO_UNI_IN") == uni));
+
+    let home = cwd();
+    print("chdir: " + chdir(dir));
+    print("cwd: " + cwd().ends_with(uni));
+    chdir(home);
+
+    print("remove: " + file_remove(f));
+    print("gone: " + !file_exists(f));
+}

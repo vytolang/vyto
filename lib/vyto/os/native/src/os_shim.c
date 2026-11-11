@@ -17,13 +17,37 @@
 #include <windows.h>
 #include <direct.h>
 #include <process.h>
-#define popen  _popen
-#define pclose _pclose
+#include "vyto_win.h" /* UTF-8 <-> UTF-16 at every CRT/Win32 boundary */
 #else
 #include <unistd.h>
 #include <pwd.h>
 #include <sys/utsname.h>
 #include <sys/wait.h>
+#endif
+
+#ifdef _WIN32
+/* The narrow getenv() returns values in the ANSI code page, so a profile path
+   like C:\Users\Zoë comes back mangled. Read the wide environment and hand
+   back UTF-8. The result has to outlive this call without an owner, so it
+   lives in a small ring of slots: Vyto copies it at once (str()), and the C
+   callers here use one or two values at a time. NULL when unset, like
+   getenv. */
+static const char *os_wgetenv(const char *k) {
+    static char *ring[8];
+    static int next;
+    VtWBuf wk;
+    if (!k || !vt_wbuf_from(&wk, k)) return NULL;
+    const wchar_t *v = _wgetenv(wk.p);
+    vt_wbuf_free(&wk);
+    if (!v) return NULL;
+    char *u = vt_utf8_from_w(v);
+    if (!u) return NULL;
+    free(ring[next]);
+    ring[next] = u;
+    next = (next + 1) % 8;
+    return u;
+}
+#define getenv(k) os_wgetenv(k)
 #endif
 
 const char *os_getenv(const char *k) { return getenv(k); }
@@ -35,24 +59,28 @@ const char *os_getenv(const char *k) { return getenv(k); }
    directory on the (Linux) build host, which does not exist where the exe
    runs. */
 static int exe_dir(char *out, size_t cap) {
-    WCHAR w[32768];
+    static WCHAR w[32768];  /* static: 64 KB is too much stack for a helper */
     DWORD n = GetModuleFileNameW(NULL, w, (DWORD)(sizeof w / sizeof w[0]));
     if (n == 0 || n >= sizeof w / sizeof w[0]) return 0;
     while (n > 0 && w[n - 1] != L'\\' && w[n - 1] != L'/') n--;
     if (n > 1) n--;           /* drop the separator, keep "C:\" whole below */
     if (n == 2 && w[1] == L':') n = 3;
-    w[n] = 0;
-    if (WideCharToMultiByte(CP_UTF8, 0, w, -1, out, (int)cap, NULL, NULL) == 0) return 0;
+    char *u = vt_utf8_from_wn(w, (int)n);
+    if (!u) return 0;
+    size_t len = strlen(u);
+    if (len + 1 > cap) { free(u); return 0; }
+    memcpy(out, u, len + 1);
+    free(u);
     for (char *c = out; *c; c++)
         if (*c == '\\') *c = '/';
     return 1;
 }
 
 static int dir_exists(const char *utf8) {
-    WCHAR w[32768];
-    if (MultiByteToWideChar(CP_UTF8, 0, utf8, -1, w, (int)(sizeof w / sizeof w[0])) == 0)
-        return 0;
-    DWORD a = GetFileAttributesW(w);
+    VtWBuf w;
+    if (!vt_wbuf_from(&w, utf8)) { vt_wbuf_free(&w); return 0; }
+    DWORD a = GetFileAttributesW(w.p);
+    vt_wbuf_free(&w);
     return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY);
 }
 #endif
@@ -107,25 +135,57 @@ const char *os_app_dir(void) {
     return buf;
 }
 #ifdef _WIN32
-/* _putenv_s with an empty value both sets-to-empty and removes on Windows —
-   the CRT drops the variable entirely, which is what unsetenv means. */
-int os_setenv(const char *k, const char *v) { return _putenv_s(k, v) == 0 ? 0 : -1; }
-int os_unsetenv(const char *k) { return _putenv_s(k, "") == 0 ? 0 : -1; }
-int os_chdir(const char *p) { return _chdir(p); }
+/* _wputenv_s with an empty value both sets-to-empty and removes on Windows —
+   the CRT drops the variable entirely, which is what unsetenv means.
+   The wide calls keep msvcrt's narrow and wide environments in step, and
+   pass the change on to child processes. */
+int os_setenv(const char *k, const char *v) {
+    VtWBuf wk, wv;
+    vt_wbuf_from(&wk, k);
+    vt_wbuf_from(&wv, v);
+    int r = _wputenv_s(wk.p, wv.p) == 0 ? 0 : -1;
+    vt_wbuf_free(&wk);
+    vt_wbuf_free(&wv);
+    return r;
+}
+int os_unsetenv(const char *k) { return os_setenv(k, ""); }
+int os_chdir(const char *p) {
+    VtWBuf w;
+    vt_wbuf_from(&w, p);
+    int r = _wchdir(w.p);
+    vt_wbuf_free(&w);
+    return r;
+}
 
 int os_getcwd(char *buf, int cap) {
-    if (!_getcwd(buf, cap)) { if (cap > 0) buf[0] = 0; return 0; }
-    return (int)strlen(buf);
+    if (cap <= 0) return 0;
+    buf[0] = 0;
+    wchar_t *w = _wgetcwd(NULL, 0);  /* malloc'd, any length */
+    if (!w) return 0;
+    char *u = vt_utf8_from_w(w);
+    free(w);
+    if (!u) return 0;
+    size_t n = strlen(u);
+    if ((int)n >= cap) { free(u); return 0; }  /* too small: report failure, not a cut path */
+    memcpy(buf, u, n + 1);
+    free(u);
+    return (int)n;
 }
 int os_pid(void) { return (int)_getpid(); }
 
-/* GetComputerNameA rather than gethostname: the latter would drag in winsock
+/* GetComputerNameW rather than gethostname: the latter would drag in winsock
    (-lws2_32) and require WSAStartup for one string. */
 int os_gethostname(char *buf, int cap) {
-    DWORD n = (DWORD)cap;
+    WCHAR w[MAX_COMPUTERNAME_LENGTH + 1];
+    DWORD n = MAX_COMPUTERNAME_LENGTH + 1;
     if (cap <= 0) return 0;
-    if (!GetComputerNameA(buf, &n)) { buf[0] = 0; return 0; }
+    buf[0] = 0;
+    if (!GetComputerNameW(w, &n)) return 0;
+    char *u = vt_utf8_from_wn(w, (int)n);
+    if (!u) return 0;
+    strncpy(buf, u, (size_t)cap - 1);
     buf[cap - 1] = 0;
+    free(u);
     return (int)strlen(buf);
 }
 
@@ -223,7 +283,14 @@ int os_arch(char *buf, int cap) {
 /* Run through the shell; return the child's exit status (or -1 if it could not
    be launched / did not exit normally). */
 int os_run(const char *cmd) {
+#ifdef _WIN32
+    VtWBuf w;
+    vt_wbuf_from(&w, cmd);
+    int st = _wsystem(w.p);
+    vt_wbuf_free(&w);
+#else
     int st = system(cmd);
+#endif
     if (st == -1) return -1;
 #ifdef _WIN32
     /* The MSVCRT system() returns the child's exit code directly — there is no
@@ -240,8 +307,24 @@ typedef struct {
     int code;
 } OsCap;
 
+#ifdef _WIN32
+/* The command line goes in as UTF-16, so non-ASCII arguments reach the child.
+   Its output comes back as the bytes it wrote: console programs on Windows
+   write in the OEM code page unless they choose otherwise. */
+static FILE *os_popen(const char *cmd) {
+    VtWBuf w;
+    vt_wbuf_from(&w, cmd);
+    FILE *p = _wpopen(w.p, L"r");
+    vt_wbuf_free(&w);
+    return p;
+}
+#define pclose _pclose
+#else
+#define os_popen(cmd) popen((cmd), "r")
+#endif
+
 OsCap *os_capture(const char *cmd) {
-    FILE *p = popen(cmd, "r");
+    FILE *p = os_popen(cmd);
     if (!p) return NULL;
     OsCap *c = (OsCap *)calloc(1, sizeof *c);
     size_t cap = 4096, len = 0;

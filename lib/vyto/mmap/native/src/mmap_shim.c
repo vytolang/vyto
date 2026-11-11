@@ -65,6 +65,7 @@ void       vmm_close(void *h)           { (void)h; }
 #define _WIN32_WINNT 0x0600
 #endif
 #include <windows.h>
+#include "vyto_win.h" /* UTF-8 paths through the W APIs */
 #else
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -117,7 +118,11 @@ long long vmm_granularity(void) {
 
 long long vmm_file_size(const char *path) {
     WIN32_FILE_ATTRIBUTE_DATA fad;
-    if (!GetFileAttributesExA(path, GetFileExInfoStandard, &fad)) return -1;
+    VtWBuf w;
+    vt_wbuf_from(&w, path);
+    BOOL ok = GetFileAttributesExW(w.p, GetFileExInfoStandard, &fad);
+    vt_wbuf_free(&w);
+    if (!ok) return -1;
     return ((long long)fad.nFileSizeHigh << 32) | (long long)fad.nFileSizeLow;
 }
 
@@ -147,10 +152,13 @@ void *vmm_open(const char *path, int writable, long long off, long long len) {
     if (len == 0) len = fsz - off;          /* 0 means "to end of file" */
     if (off + len > fsz) return 0;
 
-    HANDLE hf = CreateFileA(path,
+    VtWBuf wp;
+    vt_wbuf_from(&wp, path);
+    HANDLE hf = CreateFileW(wp.p,
                             writable ? (GENERIC_READ | GENERIC_WRITE) : GENERIC_READ,
                             FILE_SHARE_READ | (writable ? 0 : FILE_SHARE_WRITE),
                             NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    vt_wbuf_free(&wp);
     if (hf == INVALID_HANDLE_VALUE) return 0;
 
     VmmMap *m = calloc(1, sizeof *m);

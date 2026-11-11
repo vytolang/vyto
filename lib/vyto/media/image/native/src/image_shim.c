@@ -61,6 +61,9 @@ int  vimg_available(void)                { return 0; }
 #include <string.h>
 
 #define STB_IMAGE_WRITE_IMPLEMENTATION
+/* Paths are UTF-8 on every target; on Windows stb then opens them with
+   _wfopen instead of the ANSI-code-page fopen. Ignored elsewhere. */
+#define STBIW_WINDOWS_UTF8
 /* stb's own sprintf is only needed for the HDR writer, which is not exposed
    here; without this stb pulls in <stdio.h>'s sprintf and warns on some
    toolchains. Keep the HDR path out entirely. */

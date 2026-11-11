@@ -1,0 +1,121 @@
+// Manual Windows check for Phase 2 (Unicode, input, cursor), built into the
+// Win7 kit. Every line it logs also goes to stdout, so starting it from cmd
+// keeps a transcript.
+//
+// What to check, top to bottom:
+//   - the title bar shows "Vyto Eingabe — Zöë 日本 ✓" correctly (no '?')
+//   - type into the field: é ü ß on US-International, @ € { via AltGr on a
+//     German layout, Chinese through the Microsoft Pinyin IME (its candidate
+//     window should open next to the caret, not in a corner)
+//   - the pointer is an I-beam over the field and the text area, a hand over
+//     the link line, the normal arrow elsewhere and the usual resize arrows at
+//     the window edges
+//   - in the grey pad: right, middle, back and forward each log a press and a
+//     release (right's press shows as "context"); the wheel logs "scroll 3"
+//     for a notch DOWN and "scroll -3" for up; a tilt wheel or Shift+wheel
+//     logs scroll_x; press in the pad, drag out of the window, release
+//     outside: the log must say "drag end"
+//   - the "dark frame" button: no-op on Windows 7, dark title bar on 10/11
+//   - started from a folder with no lib/ beside it, the text is Segoe UI, not
+//     the blocky fallback font
+import { Window, Widget, Column, Row, Expanded, TextField, TextArea, Label, Button,
+         Painter, Theme } from "vyto/ui";
+import { getenv } from "vyto/os";
+import { CURSOR_HAND,
+         BUTTON_RIGHT, BUTTON_MIDDLE, BUTTON_BACK, BUTTON_FORWARD } from "vyto/surface";
+
+fn bname(b: int): string {
+    if (b == BUTTON_RIGHT) { return "right"; }
+    if (b == BUTTON_MIDDLE) { return "middle"; }
+    if (b == BUTTON_BACK) { return "back"; }
+    if (b == BUTTON_FORWARD) { return "forward"; }
+    return "#" + b;
+}
+
+class Log {
+    lines: string[];
+    view: Label;
+    dark: bool;
+    fn init(view: Label) { this.lines = []; this.view = view; this.dark = false; }
+    fn add(s: string) {
+        print(s);
+        this.lines.push(s);
+        if (this.lines.len > 6) { this.lines = this.lines.slice(this.lines.len - 6, this.lines.len); }
+        this.view.text = this.lines.join("  |  ");
+        this.view.invalidate();
+    }
+}
+
+class Link extends Label {
+    fn init(t: string) { super.init(t); }
+    override fn cursor(): int { return CURSOR_HAND; }
+}
+
+// Widget positions, written once so a script driving the demo (the Wine
+// input check in tests/run_tests_wine.sh) knows where to click without
+// guessing the layout.
+fn geom(name: string, w: Widget): string {
+    let b = w.bounds;
+    return `geom {name} {b.x as int} {b.y as int} {b.w as int} {b.h as int}`;
+}
+
+class Pad extends Widget {
+    log: Log;
+    probe: Widget[];
+    probeNames: string[];
+    printed: bool;
+    fn init(log: Log) { super.init(); this.log = log; this.probe = []; this.probeNames = []; this.printed = false; }
+    override fn render(s: Painter, th: Theme) {
+        if (!this.printed) {
+            // To a file named by $VYTO_INPUT_GEOM: stdout to a file is block
+            // buffered, so a script reading it would see nothing until exit.
+            this.printed = true;
+            let out = geom("pad", this) + "\n";
+            for (let i in 0..this.probe.len) { out = out + geom(this.probeNames[i], this.probe[i]) + "\n"; }
+            let path = getenv("VYTO_INPUT_GEOM");
+            if (path != "") { writefile(path, out + "ready\n"); }
+        }
+        s.fill(this.bounds, th.surface_sunken);
+        s.text_in(this.bounds, 12.0, "pad: buttons, wheel, drag out and release", th.on_surface_muted);
+    }
+    override fn on_click(x: int, y: int): bool { this.log.add("left down"); return true; }
+    override fn on_release(x: int, y: int): bool { this.log.add("left up"); return true; }
+    override fn on_drag_end(x: int, y: int): bool { this.log.add("drag end"); return true; }
+    override fn on_context(x: int, y: int): bool { this.log.add("context (right down)"); return true; }
+    override fn on_button(b: int, down: bool, x: int, y: int): bool {
+        let st = "up";
+        if (down) { st = "down"; }
+        this.log.add(bname(b) + " " + st);
+        return true;
+    }
+    override fn on_scroll(d: int): bool { this.log.add("scroll " + d); return true; }
+    override fn on_scroll_x(d: int): bool { this.log.add("scroll_x " + d); return true; }
+}
+
+fn main() {
+    let win = new Window("Vyto Eingabe — Zöë 日本 ✓", 640, 420);
+    let logView = new Label("log");
+    let log = new Log(logView);
+    let field = new TextField("type here: é ü ß @ € 中文");
+    field.onSubmit = (t) => log.add("submit: " + t);
+    let area = new TextArea();
+    let toggle = new Button("dark frame");
+    toggle.onClick = (b) => {
+        log.dark = !log.dark;
+        win.surface().set_dark_frame(log.dark);
+        log.add("dark frame " + log.dark);
+    };
+    let link = new Link("a link: the pointer is a hand here");
+    let pad = new Pad(log);
+    pad.probe = [field, link, area, toggle];
+    pad.probeNames = ["field", "link", "area", "toggle"];
+    win.root = new Column([
+        field,
+        link,
+        new Expanded(area),
+        new Expanded(pad),
+        new Row([toggle]),
+        logView,
+    ]);
+    win.run();
+}

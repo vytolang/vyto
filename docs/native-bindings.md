@@ -97,7 +97,7 @@ A bigger real one: `lib/vyto/surface/vsurf.vt` is generated from
 
 ```sh
 ./vytobind lib/vyto/surface/native/src/vsurf.h \
-    --lib X11@linux --lib X11@macos --lib gdi32@windows --lib user32@windows \
+    --lib X11@linux --lib X11@macos --lib gdi32@windows --lib user32@windows --lib imm32@windows \
     --filter vs_* --filter VS_* > lib/vyto/surface/vsurf.vt
 ```
 

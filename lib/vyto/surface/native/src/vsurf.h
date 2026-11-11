@@ -24,12 +24,42 @@ enum {
     VS_EV_MOUSE_UP = 4,
     VS_EV_RESIZE = 5,
     VS_EV_CLOSE = 6,
-    VS_EV_MOUSE_MOVE = 7, /* reserved; not delivered in v1 */
+    VS_EV_MOUSE_MOVE = 7, /* the pointer moved over the surface */
     VS_EV_TIMER = 8,      /* vs_wait_timeout elapsed with no input (game tick) */
     VS_EV_KEY_UP = 9,     /* a key was released (vs_key() gives the code) */
     VS_EV_MOUSE_WHEEL = 10, /* mouse wheel scrolled (vs_wheel() gives the delta) */
     VS_EV_MOUSE_RDOWN = 11, /* right button pressed (vs_mouse_x/y() give position) */
-    VS_EV_VSYNC = 12        /* display is about to scan out; present now (vs_set_vsync) */
+    VS_EV_VSYNC = 12,       /* display is about to scan out; present now (vs_set_vsync) */
+    /* Every other button. vs_button() names it. Left stays MOUSE_DOWN/UP and
+       the right press stays MOUSE_RDOWN, so code written before these existed
+       sees exactly what it always did; BUTTON_DOWN never repeats a right
+       press, and BUTTON_UP is where the right release arrives. */
+    VS_EV_BUTTON_DOWN = 13, /* middle, back or forward pressed */
+    VS_EV_BUTTON_UP = 14    /* right, middle, back or forward released */
+};
+
+/* vs_button() for VS_EV_BUTTON_DOWN / VS_EV_BUTTON_UP */
+enum {
+    VS_BUTTON_LEFT = 1,
+    VS_BUTTON_RIGHT = 2,
+    VS_BUTTON_MIDDLE = 3,
+    VS_BUTTON_BACK = 4,    /* X1, the thumb button nearest the user */
+    VS_BUTTON_FORWARD = 5  /* X2 */
+};
+
+/* pointer shapes for vs_set_cursor */
+enum {
+    VS_CURSOR_ARROW = 0,
+    VS_CURSOR_IBEAM = 1,     /* text */
+    VS_CURSOR_HAND = 2,      /* link */
+    VS_CURSOR_WAIT = 3,
+    VS_CURSOR_CROSS = 4,
+    VS_CURSOR_SIZE_WE = 5,   /* left-right resize */
+    VS_CURSOR_SIZE_NS = 6,   /* up-down resize */
+    VS_CURSOR_SIZE_NWSE = 7, /* top-left to bottom-right */
+    VS_CURSOR_SIZE_NESW = 8, /* top-right to bottom-left */
+    VS_CURSOR_MOVE = 9,
+    VS_CURSOR_HIDDEN = 10
 };
 
 /* simplified key codes from vs_key: printable ASCII, or one of these.
@@ -90,6 +120,21 @@ void vs_set_title(void *s, const char *t);
    ignore it. On Windows a window starts with the exe's embedded icon, if
    vytoc gave it one; this is for an app that changes its icon while running. */
 void vs_set_icon(void *s, const unsigned int *argb, int w, int h);
+/* The pointer shape while it is over this surface's client area (VS_CURSOR_*;
+   unknown values mean ARROW). Win32 and X11 show it; headless, framebuffer and
+   Android only remember it, which is what vs_get_cursor reports. */
+void vs_set_cursor(void *s, int shape);
+int vs_get_cursor(void *s);
+/* Where text is being typed, in surface pixels: the caret's top-left and its
+   height. An input method places its composition and candidate windows
+   there, so a CJK user picks characters next to the caret rather than in a
+   screen corner. Win32 only; a no-op elsewhere. */
+void vs_set_ime_pos(void *s, int x, int y, int h);
+/* Ask for a dark window frame to match a dark theme. Win32 asks DWM, which
+   honours it on Windows 10 1809+ and ignores it before (Windows 7 included);
+   X11 sets _GTK_THEME_VARIANT, which GNOME-family window managers follow.
+   Elsewhere a no-op. */
+void vs_set_dark_frame(void *s, int on);
 /* Refuse to let the window manager size the window below w x h. Without it a
    WM can drag a window to near-zero, and a layout pass then computes negative
    rects from a width smaller than its fixed children. X11 sets PMinSize,
@@ -278,6 +323,10 @@ int vs_scale_pct(void *s);
 int vs_x(void *s);
 int vs_y(void *s);
 int vs_wheel(void *s);       /* last VS_EV_MOUSE_WHEEL delta (positive = down) */
+int vs_wheel_x(void *s);     /* its horizontal delta (positive = right); 0 for a
+                                vertical-only wheel event, and vs_wheel() is 0
+                                for a horizontal-only one */
+int vs_button(void *s);      /* VS_BUTTON_* of the last BUTTON_DOWN/UP */
 
 /* Clipboard, UTF-8 text. set copies the text out; get returns "" when the
    clipboard is empty or unavailable, and the returned pointer stays valid

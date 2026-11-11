@@ -279,12 +279,22 @@ With no extra flags, a `windows-x64` exe:
     its version to the app
   - asks for no elevation (`asInvoker`), so an exe named like an installer does
     not trigger a UAC prompt
-  - turns on UTF-8 for the ANSI APIs (file names, arguments, window titles) on
-    Windows 10 1903 and later
+  - turns on UTF-8 for the ANSI APIs on Windows 10 1903 and later, for any C
+    code of your own that calls them (Vyto's runtime and stdlib do not need
+    it, see below)
   - declares system DPI awareness, so text renders at the display's scale
     instead of being stretched (125%, 150%)
 - **has ASLR and DEP on**, and under `--release` is stripped of debug info.
 - `--shared` builds `<name>.dll`, exporting `vyto_app_main`.
+
+**Unicode works on every version, Windows 7 included.** File names, directory
+listings, command-line arguments, environment variables, `run`/`capture`
+command lines, window titles and typed text all reach the program as UTF-8:
+the runtime and stdlib convert at the boundary and call the Windows "W" APIs,
+so a profile like `C:\Users\Zoë` or a file named `日本語.txt` just works. (A
+console program's *output* captured by `capture()` is still the bytes it
+wrote, which on Windows is usually the OEM code page.) Files larger than 2 GB
+can be positioned and sized in `vyto/io/file`.
 
 `appDir()` is the directory holding the exe, so an app shipped as
 `app.exe` plus an `assets/` folder finds its files from any working directory.

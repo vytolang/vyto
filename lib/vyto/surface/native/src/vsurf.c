@@ -50,6 +50,9 @@ static long long headless_ms; /* synthetic clock: +16 per scripted event */
    as long as its surface. */
 typedef struct VsInput {
     int key, x, y, wheel, mods;
+    int wheel_x;     /* horizontal wheel delta of the last wheel event */
+    int button;      /* VS_BUTTON_* of the last BUTTON_DOWN/UP */
+    int cursor;      /* VS_CURSOR_* last set; what vs_get_cursor reports */
     char text[32];
     int pending_up;  /* headless: a click's MOUSE_UP still owed to this surface */
     int hl_index;    /* headless: this surface's open order, what `win N` names */
@@ -196,9 +199,17 @@ static void headless_open_script(void) {
  *   down X Y         mouse down at X,Y, no paired up — for drag-hold tests;
  *                    pair with a later "up X Y"
  *   up X Y           mouse up at X,Y
- *   rclick X Y       right-button mouse down at X,Y (VS_EV_MOUSE_RDOWN, no
- *                    paired up event — matches the real backends, which
- *                    don't deliver a right-button release)
+ *   rclick X Y       right-button mouse down at X,Y (VS_EV_MOUSE_RDOWN) with no
+ *                    release, as before the release existed, so every older
+ *                    script replays identically (each event advances the
+ *                    synthetic clock); script the release as "button up right"
+ *   button down|up <right|middle|back|forward> X Y
+ *                    one press or release of a non-left button: BUTTON_DOWN /
+ *                    BUTTON_UP with vs_button() set ("button down right" is
+ *                    MOUSE_RDOWN, as on the real backends)
+ *   move X Y         the pointer moved (VS_EV_MOUSE_MOVE)
+ *   scroll N [X Y]   vertical wheel, N lines (positive = down)
+ *   hscroll N [X Y]  horizontal wheel, N columns (positive = right)
  *   resize W H
  *   expose
  *   tick             a timer tick (VS_EV_TIMER), for game-loop tests
@@ -297,6 +308,23 @@ static int headless_wait(VsInput *in, int *w, int *h) {
         if (sscanf(script_line, "rclick %d %d", &in->x, &in->y) == 2) {
             return VS_EV_MOUSE_RDOWN;
         }
+        {
+            char dir[8], name[16];
+            int bx, by;
+            if (sscanf(script_line, "button %7s %15s %d %d", dir, name, &bx, &by) == 4) {
+                int b = strcmp(name, "right") == 0 ? VS_BUTTON_RIGHT
+                      : strcmp(name, "middle") == 0 ? VS_BUTTON_MIDDLE
+                      : strcmp(name, "back") == 0 ? VS_BUTTON_BACK
+                      : strcmp(name, "forward") == 0 ? VS_BUTTON_FORWARD : 0;
+                int down = strcmp(dir, "down") == 0;
+                if (!b || (!down && strcmp(dir, "up") != 0)) continue;
+                in->x = bx;
+                in->y = by;
+                in->button = b;
+                if (down && b == VS_BUTTON_RIGHT) return VS_EV_MOUSE_RDOWN;
+                return down ? VS_EV_BUTTON_DOWN : VS_EV_BUTTON_UP;
+            }
+        }
         if (sscanf(script_line, "down %d %d", &in->x, &in->y) == 2) {
             return VS_EV_MOUSE_DOWN;
         }
@@ -324,14 +352,18 @@ static int headless_wait(VsInput *in, int *w, int *h) {
         }
         {
             int sc, sx, sy;
-            if (sscanf(script_line, "scroll %d %d %d", &sc, &sx, &sy) == 3) {
-                in->wheel = sc;
+            int horiz = strncmp(script_line, "hscroll ", 8) == 0;
+            const char *sl = script_line + (horiz ? 1 : 0);
+            if (sscanf(sl, "scroll %d %d %d", &sc, &sx, &sy) == 3) {
+                in->wheel = horiz ? 0 : sc;
+                in->wheel_x = horiz ? sc : 0;
                 in->x = sx;
                 in->y = sy;
                 return VS_EV_MOUSE_WHEEL;
             }
-            if (sscanf(script_line, "scroll %d", &sc) == 1) {
-                in->wheel = sc;
+            if (sscanf(sl, "scroll %d", &sc) == 1) {
+                in->wheel = horiz ? 0 : sc;
+                in->wheel_x = horiz ? sc : 0;
                 return VS_EV_MOUSE_WHEEL;
             }
         }
@@ -368,21 +400,39 @@ static int headless_monitors(VsMonitor *out, int max) {
 /* ================================================================ Win32 */
 
 #include <windows.h>
+#include <imm.h>
+#include "vyto_win.h" /* UTF-8 <-> UTF-16 for titles and GDI text */
 
 typedef struct QEv {
     int type, key, x, y, mods;
-    char text[2];
+    int button, wheel_x;
+    char text[8]; /* one code point as UTF-8, NUL-terminated */
 } QEv;
+
+/* held-button mask, for capture: SetCapture on the first press, release once
+   nothing is held */
+#define VS_HELD_LEFT   1
+#define VS_HELD_RIGHT  2
+#define VS_HELD_MIDDLE 4
+#define VS_HELD_X1     8
+#define VS_HELD_X2     16
 
 typedef struct VSurf {
     HWND hwnd; /* NULL in headless mode */
     HDC memdc; /* backbuffer */
     HBITMAP bmp;
     HBITMAP bmp0; /* original 1x1 bitmap of memdc, restored before delete */
+    uint32_t *bits; /* the backbuffer's pixels (a DIB section), or NULL when
+                       only a device-dependent bitmap could be made */
     HFONT font;
     HICON icon;   /* from vs_set_icon, owned here; NULL = class/exe icon */
+    HCURSOR cursor; /* shown over the client area; NULL = hidden */
     int w, h;
     int min_w, min_h; /* client-area floor from vs_set_min_size; 0 = none */
+    WCHAR hi_surrogate; /* first half of a UTF-16 pair awaiting its second */
+    int wheel_acc, hwheel_acc; /* sub-notch wheel remainders (touchpads) */
+    int held;          /* VS_HELD_* buttons currently down */
+    int last_x, last_y; /* last pointer position, for a synthesized release */
 
     VsInput in;   /* this window's input state; see VsInput above */
     QEv evq[64];  /* this window's pending events */
@@ -402,11 +452,14 @@ static int win_mods(void) {
     return m;
 }
 
-static void q_push(VSurf *s, int type, int key, int x, int y, int ch) {
+/* Queue one event and return it, so a caller can fill the fields only some
+   events carry (button, wheel_x, text). NULL when nothing was queued: no
+   surface yet, a full ring, or a move folded into the one before it. */
+static QEv *q_push(VSurf *s, int type, int key, int x, int y) {
     /* Messages arrive before vs_open's SetWindowLongPtr runs (WM_NCCREATE,
        WM_CREATE), so GWLP_USERDATA is still null then. Dropping those is
        correct: there is no surface yet for them to belong to. */
-    if (!s) return;
+    if (!s) return NULL;
     /* coalesce mouse-move bursts: overwrite a trailing queued move */
     if (type == VS_EV_MOUSE_MOVE && s->evq_len > 0) {
         QEv *tail = &s->evq[(s->evq_head + s->evq_len - 1) % 64];
@@ -414,23 +467,65 @@ static void q_push(VSurf *s, int type, int key, int x, int y, int ch) {
             tail->x = x;
             tail->y = y;
             tail->mods = win_mods();
-            return;
+            return NULL;
         }
     }
     if (s->evq_len == 64) {
         /* drop when full — except CLOSE, which must never be lost */
-        if (type != VS_EV_CLOSE) return;
+        if (type != VS_EV_CLOSE) return NULL;
         s->evq_len--; /* sacrifice the newest queued event for the CLOSE */
     }
     QEv *e = &s->evq[(s->evq_head + s->evq_len) % 64];
+    memset(e, 0, sizeof *e);
     e->type = type;
     e->key = key;
     e->x = x;
     e->y = y;
     e->mods = win_mods();
-    e->text[0] = (char)ch;
-    e->text[1] = 0;
     s->evq_len++;
+    return e;
+}
+
+/* one code point -> UTF-8, NUL-terminated; out holds at least 5 bytes */
+static void utf8_put(unsigned cp, char *out) {
+    if (cp < 0x80) {
+        out[0] = (char)cp; out[1] = 0;
+    } else if (cp < 0x800) {
+        out[0] = (char)(0xC0 | (cp >> 6));
+        out[1] = (char)(0x80 | (cp & 0x3F)); out[2] = 0;
+    } else if (cp < 0x10000) {
+        out[0] = (char)(0xE0 | (cp >> 12));
+        out[1] = (char)(0x80 | ((cp >> 6) & 0x3F));
+        out[2] = (char)(0x80 | (cp & 0x3F)); out[3] = 0;
+    } else {
+        out[0] = (char)(0xF0 | (cp >> 18));
+        out[1] = (char)(0x80 | ((cp >> 12) & 0x3F));
+        out[2] = (char)(0x80 | ((cp >> 6) & 0x3F));
+        out[3] = (char)(0x80 | (cp & 0x3F)); out[4] = 0;
+    }
+}
+
+/* Implicit capture is not enough: Windows only captures for the left button
+   during its own drag, and a press whose release lands outside the window is
+   otherwise never released at all. Capture on the first press, release when
+   the last button comes up. */
+static void btn_press(VSurf *s, HWND hwnd, int bit, LPARAM lp) {
+    if (!s) return;
+    if (!s->held) SetCapture(hwnd);
+    s->held |= bit;
+    s->last_x = (short)LOWORD(lp);
+    s->last_y = (short)HIWORD(lp);
+}
+static void btn_release(VSurf *s, int bit, LPARAM lp) {
+    if (!s) return;
+    s->held &= ~bit;
+    s->last_x = (short)LOWORD(lp);
+    s->last_y = (short)HIWORD(lp);
+    if (!s->held && GetCapture() == s->hwnd) ReleaseCapture();
+}
+static void q_button(VSurf *s, int type, int button, LPARAM lp) {
+    QEv *e = q_push(s, type, 0, (short)LOWORD(lp), (short)HIWORD(lp));
+    if (e) e->button = button;
 }
 
 /* shared VK -> VS_KEY_* mapping for WM_KEYDOWN/WM_KEYUP (and SYS variants) */
@@ -465,10 +560,30 @@ static COLORREF cref(int rgb) {
     return RGB((rgb >> 16) & 0xFF, (rgb >> 8) & 0xFF, rgb & 0xFF);
 }
 
+/* The backbuffer is a DIB section: GDI draws into it as before, and the
+   painters' pixels are copied straight into its memory (vs_blit_rect) instead
+   of going through StretchDIBits and a temporary — that path was about half
+   of every windowed frame on Windows 7. A device-dependent bitmap is kept as
+   the fallback for the case a DIB section cannot be made. */
 static void make_backbuffer(VSurf *s) {
     HDC wdc = GetDC(s->hwnd);
     HDC mem = CreateCompatibleDC(wdc);
-    HBITMAP bmp = CreateCompatibleBitmap(wdc, s->w > 0 ? s->w : 1, s->h > 0 ? s->h : 1);
+    int bw = s->w > 0 ? s->w : 1, bh = s->h > 0 ? s->h : 1;
+    BITMAPINFO bmi;
+    memset(&bmi, 0, sizeof bmi);
+    bmi.bmiHeader.biSize = sizeof bmi.bmiHeader;
+    bmi.bmiHeader.biWidth = bw;
+    bmi.bmiHeader.biHeight = -bh; /* top-down: row 0 is y = 0 */
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32; /* 0x00RRGGBB per pixel, our layout */
+    bmi.bmiHeader.biCompression = BI_RGB;
+    void *bits = NULL;
+    HBITMAP bmp = CreateDIBSection(wdc, &bmi, DIB_RGB_COLORS, &bits, NULL, 0);
+    if (!bmp) {
+        bits = NULL;
+        bmp = CreateCompatibleBitmap(wdc, bw, bh);
+    }
+    s->bits = (uint32_t *)bits;
     HBITMAP b0 = SelectObject(mem, bmp);
     SelectObject(mem, s->font);
     SetBkMode(mem, TRANSPARENT);
@@ -484,14 +599,14 @@ static void make_backbuffer(VSurf *s) {
 }
 
 static LRESULT CALLBACK vs_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
-    VSurf *s = (VSurf *)GetWindowLongPtr(hwnd, GWLP_USERDATA);
+    VSurf *s = (VSurf *)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
     switch (msg) {
     case WM_PAINT: {
         PAINTSTRUCT ps;
         HDC dc = BeginPaint(hwnd, &ps);
         if (s && s->memdc) BitBlt(dc, 0, 0, s->w, s->h, s->memdc, 0, 0, SRCCOPY);
         EndPaint(hwnd, &ps);
-        q_push(s, VS_EV_EXPOSE, 0, 0, 0, 0);
+        q_push(s, VS_EV_EXPOSE, 0, 0, 0);
         return 0;
     }
     case WM_SIZE: {
@@ -500,7 +615,7 @@ static LRESULT CALLBACK vs_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             s->w = w;
             s->h = h;
             make_backbuffer(s);
-            q_push(s, VS_EV_RESIZE, 0, 0, 0, 0);
+            q_push(s, VS_EV_RESIZE, 0, 0, 0);
         }
         return 0;
     }
@@ -509,7 +624,7 @@ static LRESULT CALLBACK vs_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             /* min_w/min_h are client-area, but this message wants the whole
                window, so grow them by the frame the current style adds. */
             RECT r = { 0, 0, s->min_w, s->min_h };
-            AdjustWindowRect(&r, (DWORD)GetWindowLongPtr(hwnd, GWL_STYLE), FALSE);
+            AdjustWindowRect(&r, (DWORD)GetWindowLongPtrW(hwnd, GWL_STYLE), FALSE);
             MINMAXINFO *mmi = (MINMAXINFO *)lp;
             mmi->ptMinTrackSize.x = r.right - r.left;
             mmi->ptMinTrackSize.y = r.bottom - r.top;
@@ -522,42 +637,107 @@ static LRESULT CALLBACK vs_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
            setting one later cannot reintroduce a flash on resize. */
         return 1;
     case WM_CLOSE:
-        q_push(s, VS_EV_CLOSE, 0, 0, 0, 0);
+        q_push(s, VS_EV_CLOSE, 0, 0, 0);
         return 0; /* the Vyto loop decides; vs_close destroys the window */
     case WM_LBUTTONDOWN:
-        q_push(s, VS_EV_MOUSE_DOWN, 0, (short)LOWORD(lp), (short)HIWORD(lp), 0);
+        btn_press(s, hwnd, VS_HELD_LEFT, lp);
+        q_push(s, VS_EV_MOUSE_DOWN, 0, (short)LOWORD(lp), (short)HIWORD(lp));
         return 0;
     case WM_LBUTTONUP:
-        q_push(s, VS_EV_MOUSE_UP, 0, (short)LOWORD(lp), (short)HIWORD(lp), 0);
+        btn_release(s, VS_HELD_LEFT, lp);
+        q_push(s, VS_EV_MOUSE_UP, 0, (short)LOWORD(lp), (short)HIWORD(lp));
         return 0;
     case WM_RBUTTONDOWN:
-        q_push(s, VS_EV_MOUSE_RDOWN, 0, (short)LOWORD(lp), (short)HIWORD(lp), 0);
+        btn_press(s, hwnd, VS_HELD_RIGHT, lp);
+        q_push(s, VS_EV_MOUSE_RDOWN, 0, (short)LOWORD(lp), (short)HIWORD(lp));
         return 0;
+    case WM_RBUTTONUP:
+        btn_release(s, VS_HELD_RIGHT, lp);
+        q_button(s, VS_EV_BUTTON_UP, VS_BUTTON_RIGHT, lp);
+        return 0;
+    case WM_MBUTTONDOWN:
+        btn_press(s, hwnd, VS_HELD_MIDDLE, lp);
+        q_button(s, VS_EV_BUTTON_DOWN, VS_BUTTON_MIDDLE, lp);
+        return 0;
+    case WM_MBUTTONUP:
+        btn_release(s, VS_HELD_MIDDLE, lp);
+        q_button(s, VS_EV_BUTTON_UP, VS_BUTTON_MIDDLE, lp);
+        return 0;
+    case WM_XBUTTONDOWN:
+    case WM_XBUTTONUP: {
+        int x1 = GET_XBUTTON_WPARAM(wp) == XBUTTON1;
+        int bit = x1 ? VS_HELD_X1 : VS_HELD_X2;
+        int down = msg == WM_XBUTTONDOWN;
+        if (down) btn_press(s, hwnd, bit, lp);
+        else btn_release(s, bit, lp);
+        q_button(s, down ? VS_EV_BUTTON_DOWN : VS_EV_BUTTON_UP,
+                 x1 ? VS_BUTTON_BACK : VS_BUTTON_FORWARD, lp);
+        return TRUE; /* the X-button messages want TRUE when handled */
+    }
+    case WM_CAPTURECHANGED:
+        /* Capture taken away mid-press (another window grabbed it, a modal
+           loop started): the release will never arrive, so deliver it now at
+           the last known position, or the drag stays stuck down. Our own
+           ReleaseCapture in btn_release has already cleared `held`. */
+        if (s && (HWND)lp != hwnd && s->held) {
+            if (s->held & VS_HELD_LEFT)
+                q_push(s, VS_EV_MOUSE_UP, 0, s->last_x, s->last_y);
+            s->held = 0;
+        }
+        return 0;
+    case WM_SETCURSOR:
+        /* Our shape over the client area only; the frame's resize arrows are
+           DefWindowProc's. */
+        if (s && LOWORD(lp) == HTCLIENT) {
+            SetCursor(s->cursor);
+            return TRUE;
+        }
+        break;
     case WM_MOUSEMOVE:
-        q_push(s, VS_EV_MOUSE_MOVE, 0, (short)LOWORD(lp), (short)HIWORD(lp), 0);
+        if (s) { s->last_x = (short)LOWORD(lp); s->last_y = (short)HIWORD(lp); }
+        q_push(s, VS_EV_MOUSE_MOVE, 0, (short)LOWORD(lp), (short)HIWORD(lp));
         return 0;
-    case WM_MOUSEWHEEL: {
+    case WM_MOUSEWHEEL:
+    case WM_MOUSEHWHEEL: {
         POINT pt;
         pt.x = (short)LOWORD(lp);
         pt.y = (short)HIWORD(lp);
         ScreenToClient(hwnd, &pt);
-        int delta = GET_WHEEL_DELTA_WPARAM(wp);
-        /* normalize: one wheel notch = WHEEL_DELTA (120); map to +/-3 lines */
-        int lines = (delta * 3) / 120;
-        q_push(s, VS_EV_MOUSE_WHEEL, lines, pt.x, pt.y, 0);
-        return 0;
+        if (!s) return 0;
+        /* One notch is WHEEL_DELTA (120) and maps to 3 lines. A touchpad
+           sends a fraction of that per message, so keep the remainder: a
+           plain delta*3/120 rounds every one of those to 0 and the pad
+           never scrolls. */
+        int horiz = msg == WM_MOUSEHWHEEL;
+        int *acc = horiz ? &s->hwheel_acc : &s->wheel_acc;
+        *acc += GET_WHEEL_DELTA_WPARAM(wp) * 3;
+        int lines = *acc / WHEEL_DELTA;
+        *acc -= lines * WHEEL_DELTA;
+        if (lines) {
+            /* Vertical: Windows counts rotation away from the user as
+               positive, which scrolls UP; the contract is positive = down
+               (as X11's Button5), so flip it. Horizontal: tilt right is
+               positive, which already matches. */
+            QEv *e = q_push(s, VS_EV_MOUSE_WHEEL, horiz ? 0 : -lines, pt.x, pt.y);
+            if (e && horiz) e->wheel_x = lines;
+        }
+        return horiz ? TRUE : 0;
     }
     case WM_KEYDOWN:
     case WM_SYSKEYDOWN: { /* SYS variant: Alt itself and Alt-held chords */
         int k = vk_to_key(wp);
-        if (!k && (GetKeyState(VK_CONTROL) & 0x8000)) {
+        /* AltGr arrives as Ctrl+Alt (Windows synthesizes the left Ctrl), and
+           it types characters (@, €, { on German, French, Polish layouts).
+           Not a shortcut, then: leave it to WM_CHAR. */
+        int altgr = (GetKeyState(VK_RMENU) & 0x8000) != 0;
+        if (!k && !altgr && (GetKeyState(VK_CONTROL) & 0x8000)) {
             /* Ctrl chords produce control-char WM_CHARs; report the plain
                key here instead so shortcuts see 'a', not 0x01 (no text) */
             if (wp >= 'A' && wp <= 'Z') k = (int)wp + 32;
             else if (wp >= '0' && wp <= '9') k = (int)wp;
             else if (wp == VK_SPACE) k = VS_KEY_SPACE;
         }
-        if (k) q_push(s, VS_EV_KEY, k, 0, 0, 0);
+        if (k) q_push(s, VS_EV_KEY, k, 0, 0);
         /* unhandled keys fall to DefWindowProc (TranslateMessage yields
            WM_CHAR); SYS messages always fall through so Alt+F4 etc. work */
         if (k && msg == WM_KEYDOWN) return 0;
@@ -572,17 +752,41 @@ static LRESULT CALLBACK vs_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             else if (wp >= '0' && wp <= '9') k = (int)wp;
             else if (wp == VK_SPACE) k = VS_KEY_SPACE;
         }
-        if (k) q_push(s, VS_EV_KEY_UP, k, 0, 0, 0);
+        if (k) q_push(s, VS_EV_KEY_UP, k, 0, 0);
         if (msg == WM_KEYUP) return 0;
         break;
     }
-    case WM_CHAR:
-        if (wp >= 32 && wp < 127) q_push(s, VS_EV_KEY, (int)wp, 0, 0, (int)wp);
+    case WM_CHAR: {
+        /* A W window gets UTF-16 here, including what an IME commits. A
+           character outside the BMP comes as two messages, high half first. */
+        unsigned u = (unsigned)wp;
+        if (!s) return 0;
+        if (u >= 0xD800 && u <= 0xDBFF) { s->hi_surrogate = (WCHAR)u; return 0; }
+        unsigned cp = u;
+        if (u >= 0xDC00 && u <= 0xDFFF) {
+            if (!s->hi_surrogate) return 0; /* stray low half */
+            cp = 0x10000 + (((unsigned)s->hi_surrogate - 0xD800) << 10) + (u - 0xDC00);
+        }
+        s->hi_surrogate = 0;
+        /* Control characters (Enter, Tab, Backspace, Ctrl+letter) are
+           already reported by WM_KEYDOWN as keys. */
+        if (cp < 32 || cp == 127) return 0;
+        /* ASCII keeps its code in vs_key(), as on X11; anything else is
+           text only (key 0). */
+        QEv *e = q_push(s, VS_EV_KEY, cp < 128 ? (int)cp : 0, 0, 0);
+        if (e) {
+            utf8_put(cp, e->text);
+            /* Text typed with AltGr reports Ctrl+Alt held; it is text, not
+               a chord, and is_text_input refuses text under Ctrl or Alt. */
+            if ((e->mods & (VS_MOD_CTRL | VS_MOD_ALT)) == (VS_MOD_CTRL | VS_MOD_ALT))
+                e->mods &= ~(VS_MOD_CTRL | VS_MOD_ALT);
+        }
         return 0;
+    }
     default:
         break;
     }
-    return DefWindowProc(hwnd, msg, wp, lp);
+    return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
 void *vs_open(const char *title, int w, int h) {
@@ -602,30 +806,36 @@ void *vs_open(const char *title, int w, int h) {
            for the title bar and taskbar. Explorer reads the resource on its
            own; a window only shows it if its class names it. With no icon in
            the exe both are NULL and Windows draws its default. */
-        HINSTANCE inst = GetModuleHandle(NULL);
-        WNDCLASSEXA wc;
+        HINSTANCE inst = GetModuleHandleW(NULL);
+        WNDCLASSEXW wc;
         memset(&wc, 0, sizeof wc);
         wc.cbSize = sizeof wc;
         wc.lpfnWndProc = vs_wndproc;
         wc.hInstance = inst;
-        wc.hCursor = LoadCursor(NULL, IDC_ARROW);
-        wc.hIcon = (HICON)LoadImageA(inst, MAKEINTRESOURCEA(1), IMAGE_ICON,
+        wc.hCursor = LoadCursorW(NULL, (LPCWSTR)IDC_ARROW);
+        wc.hIcon = (HICON)LoadImageW(inst, MAKEINTRESOURCEW(1), IMAGE_ICON,
                                      GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON),
                                      LR_DEFAULTCOLOR);
-        wc.hIconSm = (HICON)LoadImageA(inst, MAKEINTRESOURCEA(1), IMAGE_ICON,
+        wc.hIconSm = (HICON)LoadImageW(inst, MAKEINTRESOURCEW(1), IMAGE_ICON,
                                        GetSystemMetrics(SM_CXSMICON),
                                        GetSystemMetrics(SM_CYSMICON), LR_DEFAULTCOLOR);
-        wc.lpszClassName = "VytoSurface";
-        if (!RegisterClassExA(&wc)) { free(s); return NULL; }
+        wc.lpszClassName = L"VytoSurface";
+        /* A W class makes this a Unicode window: WM_CHAR carries UTF-16 and
+           the title is not filtered through the ANSI code page. */
+        if (!RegisterClassExW(&wc)) { free(s); return NULL; }
         registered = 1;
     }
     RECT r = {0, 0, w, h};
     AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
-    s->hwnd = CreateWindowA("VytoSurface", title, WS_OVERLAPPEDWINDOW, CW_USEDEFAULT,
-                            CW_USEDEFAULT, r.right - r.left, r.bottom - r.top, NULL, NULL,
-                            GetModuleHandle(NULL), NULL);
+    VtWBuf wt;
+    vt_wbuf_from(&wt, title ? title : "");
+    s->hwnd = CreateWindowExW(0, L"VytoSurface", wt.p, WS_OVERLAPPEDWINDOW, CW_USEDEFAULT,
+                              CW_USEDEFAULT, r.right - r.left, r.bottom - r.top, NULL, NULL,
+                              GetModuleHandleW(NULL), NULL);
+    vt_wbuf_free(&wt);
     if (!s->hwnd) { free(s); return NULL; }
-    SetWindowLongPtr(s->hwnd, GWLP_USERDATA, (LONG_PTR)s);
+    s->cursor = LoadCursorW(NULL, (LPCWSTR)IDC_ARROW);
+    SetWindowLongPtrW(s->hwnd, GWLP_USERDATA, (LONG_PTR)s);
     {
         HDC wdc = GetDC(s->hwnd);
         g_scale_pct = GetDeviceCaps(wdc, LOGPIXELSX) * 100 / 96;
@@ -645,7 +855,7 @@ void vs_close(void *vs) {
         SelectObject(s->memdc, s->bmp0);
         DeleteObject(s->bmp);
         DeleteDC(s->memdc);
-        SetWindowLongPtr(s->hwnd, GWLP_USERDATA, 0);
+        SetWindowLongPtrW(s->hwnd, GWLP_USERDATA, 0);
         DestroyWindow(s->hwnd);
     }
     if (s->icon) DestroyIcon(s->icon);
@@ -657,7 +867,89 @@ int vs_height(void *vs) { return ((VSurf *)vs)->h; }
 
 void vs_set_title(void *vs, const char *t) {
     VSurf *s = vs;
-    if (s->hwnd) SetWindowTextA(s->hwnd, t);
+    if (!s->hwnd) return;
+    VtWBuf w;
+    vt_wbuf_from(&w, t ? t : "");
+    SetWindowTextW(s->hwnd, w.p);
+    vt_wbuf_free(&w);
+}
+
+static HCURSOR cursor_for(int shape) {
+    static HCURSOR cache[11];
+    static const LPCWSTR ids[11] = {
+        (LPCWSTR)IDC_ARROW, (LPCWSTR)IDC_IBEAM, (LPCWSTR)IDC_HAND, (LPCWSTR)IDC_WAIT,
+        (LPCWSTR)IDC_CROSS, (LPCWSTR)IDC_SIZEWE, (LPCWSTR)IDC_SIZENS,
+        (LPCWSTR)IDC_SIZENWSE, (LPCWSTR)IDC_SIZENESW, (LPCWSTR)IDC_SIZEALL, NULL
+    };
+    if (shape < 0 || shape > 10) shape = VS_CURSOR_ARROW;
+    if (shape == VS_CURSOR_HIDDEN) return NULL;
+    if (!cache[shape]) cache[shape] = LoadCursorW(NULL, ids[shape]);
+    return cache[shape];
+}
+
+void vs_set_cursor(void *vs, int shape) {
+    VSurf *s = vs;
+    if (!s) return;
+    if (shape < 0 || shape > VS_CURSOR_HIDDEN) shape = VS_CURSOR_ARROW;
+    s->in.cursor = shape;
+    if (!s->hwnd) return;
+    s->cursor = cursor_for(shape);
+    /* WM_SETCURSOR only comes with the next move; apply it now if the
+       pointer is over our client area, so a change under a still mouse
+       shows at once. */
+    POINT p;
+    RECT rc;
+    if (GetCursorPos(&p) && WindowFromPoint(p) == s->hwnd) {
+        ScreenToClient(s->hwnd, &p);
+        GetClientRect(s->hwnd, &rc);
+        if (PtInRect(&rc, p)) SetCursor(s->cursor);
+    }
+}
+int vs_get_cursor(void *vs) { VSurf *s = vs; return s ? s->in.cursor : 0; }
+
+void vs_set_ime_pos(void *vs, int x, int y, int h) {
+    VSurf *s = vs;
+    if (!s || !s->hwnd) return;
+    HIMC imc = ImmGetContext(s->hwnd);
+    if (!imc) return; /* no IME on this thread's keyboard layout */
+    COMPOSITIONFORM cf;
+    memset(&cf, 0, sizeof cf);
+    cf.dwStyle = CFS_POINT;
+    cf.ptCurrentPos.x = x;
+    cf.ptCurrentPos.y = y;
+    ImmSetCompositionWindow(imc, &cf);
+    CANDIDATEFORM cand;
+    memset(&cand, 0, sizeof cand);
+    cand.dwIndex = 0;
+    cand.dwStyle = CFS_CANDIDATEPOS;
+    cand.ptCurrentPos.x = x;
+    cand.ptCurrentPos.y = y + (h > 0 ? h : 0);
+    ImmSetCandidateWindow(imc, &cand);
+    ImmReleaseContext(s->hwnd, imc);
+}
+
+/* DwmSetWindowAttribute is resolved at first use, not imported: dwmapi.dll
+   is absent from the Windows 7 export list this project audits against, and
+   the attribute it sets only exists from Windows 10 1809. 20 is
+   DWMWA_USE_IMMERSIVE_DARK_MODE; 19 is the same thing before 20H1. */
+typedef HRESULT (WINAPI *VsDwmSetAttr)(HWND, DWORD, LPCVOID, DWORD);
+void vs_set_dark_frame(void *vs, int on) {
+    VSurf *s = vs;
+    if (!s || !s->hwnd) return;
+    static VsDwmSetAttr fn;
+    static int tried;
+    if (!tried) {
+        tried = 1;
+        HMODULE m = LoadLibraryW(L"dwmapi.dll");
+        if (m) fn = (VsDwmSetAttr)(void *)GetProcAddress(m, "DwmSetWindowAttribute");
+    }
+    if (!fn) return;
+    BOOL v = on ? TRUE : FALSE;
+    if (fn(s->hwnd, 20, &v, sizeof v) != S_OK && fn(s->hwnd, 19, &v, sizeof v) != S_OK)
+        return; /* Windows 7/8/early 10: no dark frame */
+    /* the frame repaints on the next activation otherwise */
+    SetWindowPos(s->hwnd, NULL, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
 }
 
 /* A 32-bit top-down DIB holds the pixels as-is: 0xAARRGGBB in a uint32 is
@@ -915,8 +1207,9 @@ int vs_drag_start(void *vs, int edge, int x_root, int y_root) {
     };
     /* Release the implicit capture from the press, then re-issue the click as a
        non-client one so DefWindowProc starts its drag loop. */
+    s->held = 0; /* the move loop eats the release; deliver none either */
     ReleaseCapture();
-    SendMessage(s->hwnd, WM_NCLBUTTONDOWN, (WPARAM)ht[edge], 0);
+    SendMessageW(s->hwnd, WM_NCLBUTTONDOWN, (WPARAM)ht[edge], 0);
     return 1;
 }
 
@@ -963,10 +1256,13 @@ void vs_draw_text(void *vs, int x, int y, const char *str, int rgb) {
     VSurf *s = vs;
     if (!s->hwnd) return;
     /* the y argument is a baseline (X11 convention); GDI wants the top */
-    TEXTMETRICA tm;
-    GetTextMetricsA(s->memdc, &tm);
+    TEXTMETRICW tm;
+    GetTextMetricsW(s->memdc, &tm);
     SetTextColor(s->memdc, cref(rgb));
-    TextOutA(s->memdc, x, y - tm.tmAscent, str, (int)strlen(str));
+    VtWBuf w;
+    vt_wbuf_from(&w, str);
+    TextOutW(s->memdc, x, y - tm.tmAscent, w.p, w.n);
+    vt_wbuf_free(&w);
 }
 
 void vs_clip_set(void *vs, int x, int y, int w, int h) {
@@ -983,10 +1279,17 @@ void vs_clip_clear(void *vs) {
     SelectClipRgn(s->memdc, NULL);
 }
 
+void vs_blit_rect(void *vs, const int *pixels, int stride_px,
+                  int srcx, int srcy, int w, int h, int dstx, int dsty);
+
 void vs_blit(void *vs, const int *pixels, int srcw, int srch,
              int dstx, int dsty, int dstw, int dsth) {
     VSurf *s = vs;
     if (!s->hwnd || srcw <= 0 || srch <= 0) return;
+    if (s->bits && dstw == srcw && dsth == srch) { /* unscaled: a plain copy */
+        vs_blit_rect(vs, pixels, srcw, 0, 0, srcw, srch, dstx, dsty);
+        return;
+    }
     int saved = SaveDC(s->memdc); /* blits are never clipped */
     SelectClipRgn(s->memdc, NULL);
     BITMAPINFO bmi;
@@ -1008,8 +1311,25 @@ void vs_blit_rect(void *vs, const int *pixels, int stride_px,
                   int srcx, int srcy, int w, int h, int dstx, int dsty) {
     VSurf *s = vs;
     if (!s->hwnd || w <= 0 || h <= 0 || stride_px <= 0) return;
-    /* repack the sub-rect tightly; SetDIBitsToDevice's source-offset rules
-       for top-down DIBs are error-prone, a copy is simple and correct */
+    if (s->bits) {
+        /* Straight into the DIB section, row by row: no temporary, no
+           StretchDIBits. Clipped to the backbuffer, since nothing else
+           bounds a raw copy. GdiFlush first so a batched GDI draw cannot
+           land on top of these pixels afterwards. */
+        if (dstx < 0) { srcx -= dstx; w += dstx; dstx = 0; }
+        if (dsty < 0) { srcy -= dsty; h += dsty; dsty = 0; }
+        if (dstx + w > s->w) w = s->w - dstx;
+        if (dsty + h > s->h) h = s->h - dsty;
+        if (w <= 0 || h <= 0) return;
+        GdiFlush();
+        for (int dy = 0; dy < h; dy++)
+            memcpy(s->bits + (size_t)(dsty + dy) * (size_t)s->w + dstx,
+                   pixels + (size_t)(srcy + dy) * stride_px + srcx, (size_t)w * 4);
+        return;
+    }
+    /* No DIB section (the fallback bitmap): repack the sub-rect tightly;
+       SetDIBitsToDevice's source-offset rules for top-down DIBs are
+       error-prone, a copy is simple and correct */
     int *tmp = malloc((size_t)w * (size_t)h * 4);
     if (!tmp) return;
     for (int dy = 0; dy < h; dy++)
@@ -1075,23 +1395,26 @@ int vs_text_width(void *vs, const char *str) {
     VSurf *s = vs;
     if (!s->hwnd) return 9 * (int)strlen(str);
     SIZE sz;
-    GetTextExtentPoint32A(s->memdc, str, (int)strlen(str), &sz);
+    VtWBuf w;
+    vt_wbuf_from(&w, str);
+    if (!GetTextExtentPoint32W(s->memdc, w.p, w.n, &sz)) sz.cx = 0;
+    vt_wbuf_free(&w);
     return (int)sz.cx;
 }
 
 int vs_font_ascent(void *vs) {
     VSurf *s = vs;
     if (!s->hwnd) return 11;
-    TEXTMETRICA tm;
-    GetTextMetricsA(s->memdc, &tm);
+    TEXTMETRICW tm;
+    GetTextMetricsW(s->memdc, &tm);
     return (int)tm.tmAscent;
 }
 
 int vs_font_height(void *vs) {
     VSurf *s = vs;
     if (!s->hwnd) return 15;
-    TEXTMETRICA tm;
-    GetTextMetricsA(s->memdc, &tm);
+    TEXTMETRICW tm;
+    GetTextMetricsW(s->memdc, &tm);
     return (int)tm.tmHeight;
 }
 
@@ -1104,8 +1427,10 @@ static int q_pop(VSurf *s) {
     s->in.y = e.y;
     s->in.mods = e.mods;
     s->in.wheel = (e.type == VS_EV_MOUSE_WHEEL) ? e.key : 0;
-    s->in.text[0] = e.text[0];
-    s->in.text[1] = 0;
+    s->in.wheel_x = e.wheel_x;
+    s->in.button = e.button;
+    memcpy(s->in.text, e.text, sizeof e.text);
+    s->in.text[sizeof e.text - 1] = 0;
     return e.type;
 }
 
@@ -1117,15 +1442,17 @@ int vs_x(void *vs)     { VSurf *s = vs; return s ? s->in.x : 0; }
 int vs_y(void *vs)     { VSurf *s = vs; return s ? s->in.y : 0; }
 int vs_wheel(void *vs) { VSurf *s = vs; return s ? s->in.wheel : 0; }
 int vs_mods(void *vs)  { VSurf *s = vs; return s ? s->in.mods : 0; }
+int vs_wheel_x(void *vs) { VSurf *s = vs; return s ? s->in.wheel_x : 0; }
+int vs_button(void *vs)  { VSurf *s = vs; return s ? s->in.button : 0; }
 
 int vs_wait(void *vs) {
     VSurf *s = vs;
     if (!s->hwnd) return headless_wait(&s->in, &s->w, &s->h);
     while (s->evq_len == 0) {
         MSG msg;
-        if (GetMessageA(&msg, NULL, 0, 0) <= 0) return VS_EV_CLOSE;
+        if (GetMessageW(&msg, NULL, 0, 0) <= 0) return VS_EV_CLOSE;
         TranslateMessage(&msg);
-        DispatchMessageA(&msg);
+        DispatchMessageW(&msg);
     }
     return q_pop(s);
 }
@@ -1134,9 +1461,9 @@ int vs_poll(void *vs) {
     VSurf *s = vs;
     if (!s->hwnd) return headless_wait(&s->in, &s->w, &s->h);
     MSG msg;
-    while (s->evq_len == 0 && PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
+    while (s->evq_len == 0 && PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE)) {
         TranslateMessage(&msg);
-        DispatchMessageA(&msg);
+        DispatchMessageW(&msg);
     }
     return s->evq_len ? q_pop(s) : VS_EV_NONE;
 }
@@ -1153,9 +1480,9 @@ int vs_wait_timeout(void *vs, int ms) {
                                               MWMO_INPUTAVAILABLE);
         if (r == WAIT_TIMEOUT) return VS_EV_TIMER;
         MSG msg;
-        while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
+        while (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE)) {
             TranslateMessage(&msg);
-            DispatchMessageA(&msg);
+            DispatchMessageW(&msg);
         }
     }
 }
@@ -1263,6 +1590,7 @@ const char *vs_clipboard_get(void *vs) {
 #include <X11/Xatom.h>
 #include <X11/keysym.h>
 #include <X11/XKBlib.h>
+#include <X11/cursorfont.h>
 #include <locale.h>
 #include <sys/select.h>
 
@@ -1299,6 +1627,7 @@ typedef struct VSurf {
     /* clipboard (CLIPBOARD selection) */
     Atom a_clipboard, a_utf8, a_targets, a_incr, a_clip_prop;
     char *clip_got; /* last text fetched from another owner */
+    Cursor cursors[11]; /* per VS_CURSOR_*, created on first use; 0 = none yet */
     /* fbdev mode: fb_on != 0, everything above except w/h unused */
     int fb_on;
     int fb_fd;
@@ -1509,6 +1838,7 @@ static void fb_on_sig(int sig) {
 /* event ring, mirroring the Win32 queue shape */
 typedef struct FbEv {
     int type, key, x, y, wheel, mods;
+    int wheel_x, button;
     char text[8];
 } FbEv;
 static FbEv fbq[64];
@@ -1531,9 +1861,16 @@ static void fbq_push(int type, int key, int wheel, const char *text) {
     e->x = fb_mx;
     e->y = fb_my;
     e->wheel = wheel;
+    e->wheel_x = 0;
+    e->button = 0;
     e->mods = fb_mods_state;
     snprintf(e->text, sizeof e->text, "%s", text ? text : "");
     fbq_len++;
+}
+
+/* the event fbq_push just queued, to fill the fields only some events carry */
+static FbEv *fbq_last(void) {
+    return fbq_len ? &fbq[(fbq_head + fbq_len - 1) % 64] : NULL;
 }
 
 static int fbq_pop(VSurf *s) {
@@ -1544,6 +1881,8 @@ static int fbq_pop(VSurf *s) {
     s->in.x = e.x;
     s->in.y = e.y;
     s->in.wheel = e.wheel;
+    s->in.wheel_x = e.wheel_x;
+    s->in.button = e.button;
     s->in.mods = e.mods;
     snprintf(s->in.text, sizeof s->in.text, "%s", e.text);
     return e.type;
@@ -1562,6 +1901,11 @@ static void fb_handle(VSurf *s, const struct input_event *ev) {
         } else if (ev->code == REL_WHEEL && ev->value != 0) {
             /* evdev: +1 notch = wheel up; match X11's up = -3 lines */
             fbq_push(VS_EV_MOUSE_WHEEL, 0, -3 * ev->value, "");
+        } else if (ev->code == REL_HWHEEL && ev->value != 0) {
+            /* evdev: +1 = tilt right, which is already positive = right */
+            int before = fbq_len;
+            fbq_push(VS_EV_MOUSE_WHEEL, 0, 0, "");
+            if (fbq_len > before) fbq_last()->wheel_x = 3 * ev->value;
         }
         return;
     }
@@ -1574,6 +1918,20 @@ static void fb_handle(VSurf *s, const struct input_event *ev) {
     }
     if (code == BTN_RIGHT) {
         if (val == 1) fbq_push(VS_EV_MOUSE_RDOWN, 0, 0, "");
+        else if (val == 0) {
+            int before = fbq_len;
+            fbq_push(VS_EV_BUTTON_UP, 0, 0, "");
+            if (fbq_len > before) fbq_last()->button = VS_BUTTON_RIGHT;
+        }
+        return;
+    }
+    if (code == BTN_MIDDLE || code == BTN_SIDE || code == BTN_EXTRA) {
+        if (val != 0 && val != 1) return; /* no autorepeat for buttons */
+        int before = fbq_len;
+        fbq_push(val ? VS_EV_BUTTON_DOWN : VS_EV_BUTTON_UP, 0, 0, "");
+        if (fbq_len > before)
+            fbq_last()->button = code == BTN_MIDDLE ? VS_BUTTON_MIDDLE
+                               : code == BTN_SIDE ? VS_BUTTON_BACK : VS_BUTTON_FORWARD;
         return;
     }
     if (code >= BTN_MISC) return; /* other buttons/axes */
@@ -2098,6 +2456,8 @@ void vs_close(void *vs) {
         if (s->img) { XDestroyImage(s->img); s->img = NULL; } /* frees its data too */
         if (s->ic) XDestroyIC(s->ic);
         if (s->im) XCloseIM(s->im);
+        for (int i = 0; i < 11; i++)
+            if (s->cursors[i]) XFreeCursor(s->dpy, s->cursors[i]);
         XFreePixmap(s->dpy, s->back);
         XFreeGC(s->dpy, s->gc);
         XFreeGC(s->dpy, s->pgc);
@@ -2142,6 +2502,57 @@ int vs_height(void *vs) { return ((VSurf *)vs)->h; }
 void vs_set_title(void *vs, const char *t) {
     VSurf *s = vs;
     if (s->dpy) XStoreName(s->dpy, s->win, t);
+}
+
+/* Font cursors exist on every X server; HIDDEN is a 1x1 cursor whose mask is
+   empty. Created per shape on first use, per surface (each surface has its
+   own Display connection). */
+void vs_set_cursor(void *vs, int shape) {
+    VSurf *s = vs;
+    if (!s) return;
+    if (shape < 0 || shape > VS_CURSOR_HIDDEN) shape = VS_CURSOR_ARROW;
+    s->in.cursor = shape;
+    if (!s->dpy) return;
+    if (!s->cursors[shape]) {
+        static const unsigned int glyph[10] = {
+            XC_left_ptr, XC_xterm, XC_hand2, XC_watch, XC_crosshair,
+            XC_sb_h_double_arrow, XC_sb_v_double_arrow,
+            XC_bottom_right_corner, XC_bottom_left_corner, XC_fleur
+        };
+        if (shape == VS_CURSOR_HIDDEN) {
+            static char empty[1];
+            Pixmap pm = XCreateBitmapFromData(s->dpy, s->win, empty, 1, 1);
+            XColor black;
+            memset(&black, 0, sizeof black);
+            s->cursors[shape] = XCreatePixmapCursor(s->dpy, pm, pm, &black, &black, 0, 0);
+            XFreePixmap(s->dpy, pm);
+        } else {
+            s->cursors[shape] = XCreateFontCursor(s->dpy, glyph[shape]);
+        }
+    }
+    XDefineCursor(s->dpy, s->win, s->cursors[shape]);
+    XFlush(s->dpy);
+}
+int vs_get_cursor(void *vs) { VSurf *s = vs; return s ? s->in.cursor : 0; }
+
+/* X11 input methods position their own windows from the XIC's spot, which
+   this backend does not set up (XIMPreeditNothing). */
+void vs_set_ime_pos(void *vs, int x, int y, int h) { (void)vs; (void)x; (void)y; (void)h; }
+
+/* _GTK_THEME_VARIANT is what GNOME-family window managers read to draw a dark
+   frame; others ignore it, which is the right failure. */
+void vs_set_dark_frame(void *vs, int on) {
+    VSurf *s = vs;
+    if (!s || !s->dpy) return;
+    Atom a = XInternAtom(s->dpy, "_GTK_THEME_VARIANT", False);
+    if (on) {
+        Atom utf8 = XInternAtom(s->dpy, "UTF8_STRING", False);
+        XChangeProperty(s->dpy, s->win, a, utf8, 8, PropModeReplace,
+                        (const unsigned char *)"dark", 4);
+    } else {
+        XDeleteProperty(s->dpy, s->win, a);
+    }
+    XFlush(s->dpy);
 }
 
 /* _NET_WM_ICON is width, height, then one ARGB pixel per CARDINAL, top row
@@ -2859,6 +3270,16 @@ static void x11_coalesce_configure(VSurf *s, int *w, int *h) {
 }
 
 /* translate one XEvent into a VS_EV_* code, or -1 to ignore and keep waiting */
+/* Middle and the two thumb buttons. 8 and 9 are back and forward on every
+   mouse X has a driver for; Xlib has no names for them. Right is not here:
+   its press is MOUSE_RDOWN, only its release is a BUTTON_UP. */
+static int x11_button_of(unsigned int b) {
+    if (b == Button2) return VS_BUTTON_MIDDLE;
+    if (b == 8) return VS_BUTTON_BACK;
+    if (b == 9) return VS_BUTTON_FORWARD;
+    return 0;
+}
+
 static int x11_translate(VSurf *s, XEvent *e) {
     switch (e->type) {
     case Expose: {
@@ -2925,17 +3346,30 @@ static int x11_translate(VSurf *s, XEvent *e) {
             s->in.y = e->xbutton.y;
             return VS_EV_MOUSE_RDOWN;
         }
-        if (e->xbutton.button == Button4) {
+        if (e->xbutton.button == Button4 || e->xbutton.button == Button5) {
             s->in.x = e->xbutton.x;
             s->in.y = e->xbutton.y;
-            s->in.wheel = -3; /* up = negative (content moves down) */
+            /* up = negative (content moves down), down = positive */
+            s->in.wheel = e->xbutton.button == Button4 ? -3 : 3;
+            s->in.wheel_x = 0;
             return VS_EV_MOUSE_WHEEL;
         }
-        if (e->xbutton.button == Button5) {
+        if (e->xbutton.button == 6 || e->xbutton.button == 7) {
+            /* the horizontal wheel/tilt: 6 left, 7 right (no Xlib names) */
             s->in.x = e->xbutton.x;
             s->in.y = e->xbutton.y;
-            s->in.wheel = 3; /* down = positive (content moves up) */
+            s->in.wheel = 0;
+            s->in.wheel_x = e->xbutton.button == 6 ? -3 : 3;
             return VS_EV_MOUSE_WHEEL;
+        }
+        {
+            int b = x11_button_of(e->xbutton.button);
+            if (b) {
+                s->in.x = e->xbutton.x;
+                s->in.y = e->xbutton.y;
+                s->in.button = b;
+                return VS_EV_BUTTON_DOWN;
+            }
         }
         return -1;
     case ButtonRelease:
@@ -2944,6 +3378,16 @@ static int x11_translate(VSurf *s, XEvent *e) {
             s->in.x = e->xbutton.x;
             s->in.y = e->xbutton.y;
             return VS_EV_MOUSE_UP;
+        }
+        {
+            int b = e->xbutton.button == Button3 ? VS_BUTTON_RIGHT
+                                                 : x11_button_of(e->xbutton.button);
+            if (b) {
+                s->in.x = e->xbutton.x;
+                s->in.y = e->xbutton.y;
+                s->in.button = b;
+                return VS_EV_BUTTON_UP;
+            }
         }
         return -1;
     case MotionNotify:
@@ -2990,6 +3434,8 @@ int vs_x(void *vs)     { VSurf *s = vs; return s ? s->in.x : 0; }
 int vs_y(void *vs)     { VSurf *s = vs; return s ? s->in.y : 0; }
 int vs_wheel(void *vs) { VSurf *s = vs; return s ? s->in.wheel : 0; }
 int vs_mods(void *vs)  { VSurf *s = vs; return s ? s->in.mods : 0; }
+int vs_wheel_x(void *vs) { VSurf *s = vs; return s ? s->in.wheel_x : 0; }
+int vs_button(void *vs)  { VSurf *s = vs; return s ? s->in.button : 0; }
 
 /* translate + IME filter + motion coalescing for one raw event */
 static int x11_deliver(VSurf *s, XEvent *e) {

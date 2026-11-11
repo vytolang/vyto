@@ -22,7 +22,7 @@ vytobind: src/vytobind.c src/util.c src/util.h
 vytopack: vytoc $(wildcard src/vytopack/*.vt)
 	./vytoc build src/vytopack/vytopack.vt -o $@ --modpath src --release
 
-.PHONY: all test test-charts test-mobile test-win test-pack test-dev clean clean-cache
+.PHONY: all test test-charts test-mobile test-win test-wine test-pack test-dev clean clean-cache
 
 test: vytoc vytobind
 	./tests/run_tests.sh
@@ -57,6 +57,12 @@ test-dev: vytoc
 # Needs: sudo apt-get install -y gcc-mingw-w64-x86-64
 test-win: vytoc
 	./tests/run_tests_win.sh
+
+# Stage the Windows slice (test-win), then RUN it under Wine with the same
+# manifest and goldens as run.ps1. A fast first check, not Windows 7: the Win7
+# box stays the check of record. Needs: sudo apt-get install wine64
+test-wine: test-win
+	./tests/run_tests_wine.sh
 
 # Every .vyto-cache in the tree, including apps/* which `clean` does not cover
 # and the shared object cache at the repo root (also a .vyto-cache, so the same

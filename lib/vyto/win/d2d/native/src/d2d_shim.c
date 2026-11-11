@@ -42,6 +42,7 @@
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
+#include "vyto_win.h"
 
 static const GUID d2d_IID_ID2D1Factory =
     {0x06152247, 0x6f50, 0x465a, {0x92, 0x45, 0x11, 0x8b, 0xfd, 0x3b, 0x60, 0x07}};
@@ -262,30 +263,11 @@ static D2D1_MATRIX_3X2_F mat_mul(const D2D1_MATRIX_3X2_F *a, const D2D1_MATRIX_3
     return r;
 }
 
-/* UTF-8 -> UTF-16 into a stack buffer, spilling to the heap for long text. */
-typedef struct {
-    WCHAR *p;
-    int n;
-    WCHAR stack[256];
-} WBuf;
-
-static int wbuf_from(WBuf *b, const char *s, int len) {
-    b->p = b->stack;
-    b->n = 0;
-    if (len <= 0) return 1;
-    int n = MultiByteToWideChar(CP_UTF8, 0, s, len, b->stack, 256);
-    if (n > 0) { b->n = n; return 1; }
-    n = MultiByteToWideChar(CP_UTF8, 0, s, len, NULL, 0);
-    if (n <= 0) return 0;
-    b->p = (WCHAR *)malloc(sizeof(WCHAR) * (size_t)n);
-    if (!b->p) { b->p = b->stack; return 0; }
-    b->n = MultiByteToWideChar(CP_UTF8, 0, s, len, b->p, n);
-    return b->n > 0;
-}
-
-static void wbuf_free(WBuf *b) {
-    if (b->p != b->stack) free(b->p);
-}
+/* UTF-8 -> UTF-16 into a stack buffer, spilling to the heap for long text:
+   the runtime's shared helper (runtime/vyto_win.h). */
+typedef VtWBuf WBuf;
+#define wbuf_from(b, s, len) vt_wbuf_from_n((b), (s), (len))
+#define wbuf_free(b) vt_wbuf_free(b)
 
 static void reset_state(struct D2dCtx *c);
 static double rrect_sd(double px, double py, double x, double y, double w, double h,

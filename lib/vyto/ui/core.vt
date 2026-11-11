@@ -11,6 +11,7 @@
 import { Surface, Rect, contains, rgb, rgba, with_alpha, alpha_of, mix,
           EV_EXPOSE, EV_KEY, EV_KEY_UP, EV_MOUSE_DOWN, EV_MOUSE_UP, EV_MOUSE_MOVE, EV_MOUSE_WHEEL, EV_MOUSE_RDOWN,
           EV_RESIZE, EV_CLOSE, EV_TIMER, EV_VSYNC, MOD_SHIFT,
+          EV_BUTTON_DOWN, EV_BUTTON_UP, CURSOR_ARROW,
           KEY_ESC, KEY_TAB, KEY_F1, KEY_F12, MOD_CTRL, MOD_ALT } from "vyto/surface";
 import { Animator, Tween, AnimatedFloat } from "vyto/ui/anim";
 import { Spring } from "vyto/anim";
@@ -2095,9 +2096,43 @@ export class Widget {
         return false;
     }
 
+    // Any other button over this widget: the right RELEASE (its press is
+    // on_context), middle, back and forward — BUTTON_* from vyto/surface.
+    // Bubbles from the deepest widget under the pointer up the parent chain
+    // until one returns true, so a page can take back/forward for its own
+    // navigation without every child knowing.
+    virtual fn on_button(button: int, down: bool, x: int, y: int): bool {
+        return false;
+    }
+
+    // The pointer shape while it is over this widget (CURSOR_* from
+    // vyto/surface). Text inputs answer CURSOR_IBEAM; a link CURSOR_HAND.
+    virtual fn cursor(): int { return CURSOR_ARROW; }
+
     // return true when consumed / state changed
     virtual fn on_key(k: int, ch: string): bool {
         return false;
+    }
+
+    // Horizontal wheel (a tilt wheel, a touchpad, or Shift+wheel) over this
+    // widget; delta is positive for right. Scrolls the horizontal content when
+    // this widget has a horizontal overflow. Return true when consumed.
+    virtual fn on_scroll_x(delta: int): bool {
+        if (this.scrollbars != null && this.scroll_content_w() > this.scroll_viewport().w) {
+            this.scroll_off_x += (delta as float) * 24.0;
+            this.scroll_clamp();
+            this.invalidate();
+            return true;
+        }
+        return false;
+    }
+
+    // Where this widget's text caret is, in window pixels, so an input method
+    // opens its candidate window next to it. Text inputs call it from render()
+    // while focused; Window drops repeats, so calling it every frame is free.
+    fn ime_caret(x: float, y: float, h: float) {
+        if (this.win == null) { return; }
+        this.win.set_ime_caret(x as int, y as int, h as int);
     }
 
     // mouse wheel scrolled while the cursor is over this widget; delta is
@@ -2320,6 +2355,10 @@ export class Window {
     pending_full: bool;     // a full redraw is owed at the next vsync
     pending_partial: bool;  // a dirty-rect repaint is owed (region is `dirty`)
     hover_w: Widget;     // WS6: widget currently under the cursor (draws hover state)
+    cursor_now: int;     // CURSOR_* last handed to the surface
+    ime_x: int;          // caret position last handed to the IME (-1 = none)
+    ime_y: int;
+    ime_h: int;
     press_w: Widget;    // WS6: widget capturing the current mouse press
     skin: Skin;          // pluggable widget shape; defaults to today's look
     drag_x: int;         // WS9a: last mouse position while press_w holds capture
@@ -2382,6 +2421,32 @@ export class Window {
         this.close_on_esc = true;
         this.scale = this.surf.scale();
         this.rt = new Reactive();
+        this.cursor_now = CURSOR_ARROW;
+        this.ime_x = -1;
+        this.ime_y = -1;
+        this.ime_h = -1;
+    }
+
+    // Caret position for the input method (see Widget.ime_caret). Only a
+    // change reaches the surface.
+    fn set_ime_caret(x: int, y: int, h: int) {
+        if (x == this.ime_x && y == this.ime_y && h == this.ime_h) { return; }
+        this.ime_x = x;
+        this.ime_y = y;
+        this.ime_h = h;
+        this.surf.set_ime_pos(x, y, h);
+    }
+
+    // Show the hovered widget's cursor shape. Only a change reaches the
+    // surface; a finger has no pointer to shape.
+    fn sync_cursor() {
+        if (this.touch_mode) { return; }
+        let c = CURSOR_ARROW;
+        if (this.hover_w != null) { c = this.hover_w.cursor(); }
+        if (c != this.cursor_now) {
+            this.cursor_now = c;
+            this.surf.set_cursor(c);
+        }
     }
 
     // Watch something the window cannot be woken by: a worker process finishing
@@ -3206,10 +3271,12 @@ export class Window {
             // that "works for a few rows and then stops": it was only ever
             // visible when some unrelated event happened to repaint.
             if (this.has_dirty) { this.repaint(); }
+            this.sync_cursor();
             return;
         }
         let old = this.hover_w;
         this.hover_w = w;
+        this.sync_cursor();
         if (old != null) {
             old.hovered = false;
             old.drive_hover(0.0);
@@ -3258,6 +3325,46 @@ export class Window {
     // parent chain until a widget consumes the scroll (e.g. ScrollView),
     // then repaint just the consumer's bounds — a scroll only changes
     // pixels inside the scrolling widget.
+    // A horizontal wheel delta, or Shift + a vertical one: the same walk up
+    // the parent chain as on_wheel_ev, asking on_scroll_x. Returns whether
+    // anything took it, so Shift+wheel over something that only scrolls
+    // vertically can still scroll it.
+    fn on_wheel_x_ev(x: int, y: int, delta: int): bool {
+        if (this.overlay != null) { return false; }
+        let w: Widget = null;
+        if (this.root != null) { w = this.root.hit(x, y); }
+        while (w != null) {
+            if (w.on_scroll_x(delta)) {
+                this.mark_dirty(w.bounds);
+                this.repaint();
+                return true;
+            }
+            w = w.parent;
+        }
+        return false;
+    }
+
+    // Right release, middle, back, forward: bubble on_button from the widget
+    // under the pointer (the overlay's, when one is open).
+    fn on_button_ev(button: int, down: bool, x: int, y: int) {
+        let w: Widget = null;
+        if (this.overlay != null) {
+            if (!contains(this.overlay.bounds, x, y)) { return; }
+            w = this.overlay.hit(x, y);
+        } else if (this.menubar != null && contains(this.menubar.bounds, x, y)) {
+            w = this.menubar.hit(x, y);
+        } else if (this.root != null) {
+            w = this.root.hit(x, y);
+        }
+        while (w != null) {
+            if (w.on_button(button, down, x, y)) {
+                this.redraw();
+                return;
+            }
+            w = w.parent;
+        }
+    }
+
     fn on_wheel_ev(x: int, y: int, delta: int) {
         if (this.overlay != null) {
             if (contains(this.overlay.bounds, x, y)) {
@@ -3285,6 +3392,10 @@ export class Window {
         // scale the theme's px metrics for HiDPI (idempotent; also covers a
         // theme the app swapped in after construction)
         this.theme.apply_scale(this.scale);
+        // A dark theme gets a dark window frame where the platform has one.
+        let bg = this.theme.surface;
+        let luma = ((bg >> 16) & 255) * 299 + ((bg >> 8) & 255) * 587 + (bg & 255) * 114;
+        if (luma < 128000) { this.surf.set_dark_frame(true); }
         this.layout();
         this.redraw();
         this.running = true;
@@ -3410,10 +3521,23 @@ export class Window {
             } else if (ev == EV_MOUSE_MOVE) {
                 this.on_mouse_move(this.surf.mouse_x(), this.surf.mouse_y());
             } else if (ev == EV_MOUSE_WHEEL) {
-                this.on_wheel_ev(this.surf.mouse_x(), this.surf.mouse_y(),
-                                 this.surf.wheel());
+                let mx = this.surf.mouse_x();
+                let my = this.surf.mouse_y();
+                let dx = this.surf.wheel_x();
+                let dy = this.surf.wheel();
+                if (dx != 0) {
+                    this.on_wheel_x_ev(mx, my, dx);
+                } else if ((this.surf.mods() & MOD_SHIFT) != 0
+                           && this.on_wheel_x_ev(mx, my, dy)) {
+                    // Shift+wheel scrolled something sideways
+                } else if (dy != 0) {
+                    this.on_wheel_ev(mx, my, dy);
+                }
             } else if (ev == EV_MOUSE_RDOWN) {
                 this.on_context_ev(this.surf.mouse_x(), this.surf.mouse_y());
+            } else if (ev == EV_BUTTON_DOWN || ev == EV_BUTTON_UP) {
+                this.on_button_ev(this.surf.button(), ev == EV_BUTTON_DOWN,
+                                  this.surf.mouse_x(), this.surf.mouse_y());
             }
         }
         // Stop the frame clock before teardown. Nothing below presents, so a

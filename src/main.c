@@ -1167,6 +1167,13 @@ int main(int argc, char **argv) {
     if (shared) fsflags = arena_printf(&g_arena, "%s -fPIC", fsflags);
     if (no_float) fsflags = arena_printf(&g_arena, "%s -DVT_NO_FLOAT", fsflags);
     if (no_fs) fsflags = arena_printf(&g_arena, "%s -DVT_NO_FS", fsflags);
+    /* The Windows 7 floor, stated once for every compile instead of per shim.
+       The mingw headers otherwise default to an older target, and a shim that
+       raised it on its own could call a Win8+ API that refuses to load on
+       Windows 7. Anything newer must go through GetProcAddress, and
+       tests/win/pe_audit.sh checks the result against Win7's real exports. */
+    if (win_target)
+        fsflags = arena_printf(&g_arena, "%s -D_WIN32_WINNT=0x0601 -DWINVER=0x0601", fsflags);
     /* Dead-code stripping. Vyto compiles each .vt file as one translation unit
        and does NO symbol-level tree-shaking, so importing a single symbol from a
        module drags the whole module's code into the object. -ffunction-sections
@@ -1283,6 +1290,21 @@ int main(int argc, char **argv) {
                                                    mdir, triple), NULL);
             nsrc_digest *= 1099511628211ULL;
         }
+        /* Shims may include the runtime's shared Windows helpers (vyto_win.h,
+           found via -I<runtime dir> below), so an edit there is an input of
+           every shim object too. Only that one header: keying shims on the
+           whole runtime would recompile every package for any runtime edit. */
+        {
+            const char *wh = arena_printf(&g_arena, "%s/vyto_win.h", rtdir);
+            long t = file_mtime(wh);
+            if (t > nsrc_newest) nsrc_newest = t;
+            size_t wlen = 0;
+            char *wsrc = read_file(wh, &wlen);
+            if (wsrc) {
+                nsrc_digest ^= fnv1a(wsrc, wlen);
+                nsrc_digest *= 1099511628211ULL;
+            }
+        }
         /* Bake the resolved stdlib dir into native shims so vyto_lib_dir() can
            return it at runtime (used to locate vendored assets like fonts).
            Single-quoted so the shell keeps the inner quotes and the C
@@ -1322,9 +1344,9 @@ int main(int argc, char **argv) {
                    what keeps vyto/os honest: its shim is the only one that reads
                    VYTO_APPDIR, and since appdef differs per app it lands on a
                    different key while every other package shares one. */
-                const char *cmd = arena_printf(&g_arena, "%s %s%s%s%s -w%s -I%s", cc,
+                const char *cmd = arena_printf(&g_arena, "%s %s%s%s%s -w%s -I%s -I%s", cc,
                                                release ? "-O2" : opt, fsflags, libdef, appdef,
-                                               incflag, nsrc);
+                                               incflag, nsrc, rtdir);
                 const char *label = arena_printf(&g_arena, "native source of package '%s'",
                                                  m->name);
                 const char *obj = cached_object(csrc, nsrc_digest, cmd, label, verbose, &relink);

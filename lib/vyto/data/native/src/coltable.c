@@ -21,6 +21,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdint.h>
+#include "vyto_win.h" /* vt_fopen: UTF-8 paths on Windows too */
 #include <ctype.h>
 #include <math.h>
 
@@ -1689,7 +1690,7 @@ static void csv_store(CT *t, int col, const char *s, int32_t n) {
 void *ct_load_csv(const char *path, int delim, int quote, int comment,
                   int trimspace, int hasheader) {
     if (!path) return NULL;
-    FILE *f = fopen(path, "rb");
+    FILE *f = vt_fopen(path, "rb");
     if (!f) return NULL;
 
     CsvIn in;

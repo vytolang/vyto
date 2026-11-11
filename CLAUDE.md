@@ -26,10 +26,11 @@ make test-pack        # vytopack: install, manifest, audit, shell-injection
 make test-charts      # lib/vyto/ui/chart.vt
 make test-mobile      # lib/vyto/mobile/android/ui.vt
 make test-win         # cross-build the windows-x64 slice into tests/tmp/win-x64
+make test-wine        # test-win, then run that slice under Wine (not Windows 7)
 make clean-cache      # remove every .vyto-cache in the tree
 ```
 
-**`make test` is not the whole suite.** Five targets are split out of it, so a
+**`make test` is not the whole suite.** Six targets are split out of it, so a
 green `make test` says nothing about what they cover — run the matching one
 after touching its area, and all of them before a release:
 
@@ -40,6 +41,7 @@ after touching its area, and all of them before a release:
 | `test-mobile` | 18 golden cases over `lib/vyto/mobile/android/ui.vt` | same, and the widgets need the headless surface |
 | `test-dev` | unit tests in `tests/unit/` written against `lib/vyto/dev/test` — assertions on values, not a stdout diff | the framework's own selftest is deliberately red, and four fixtures must be *reported* failing, so it needs its own verdict logic |
 | `test-win` | the windows-x64 portable slice | only *stages* into `tests/tmp/win-x64`; runs nothing. Copy it to a Windows box to execute |
+| `test-wine` | the same slice, run under Wine | Wine is not Windows 7: a fast first check, not the check of record. Prefix in `~/.cache/vyto/wineprefix` |
 
 `test-pack`'s rejection cases are the ones worth knowing about: they assert the
 refusal *reason*, not merely that the command failed, because fault injection

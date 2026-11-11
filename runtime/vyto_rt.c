@@ -160,6 +160,7 @@ VT_NORETURN static void vt_host_abort(void) { exit(101); }
 #endif
 
 #ifndef VT_NO_FS
+#include "vyto_win.h" /* vt_fopen; on Windows, UTF-8 paths via the W APIs */
 #ifdef _WIN32
 #include <windows.h>
 #else
@@ -612,9 +613,38 @@ static void vt_attach_console(void) {
 /* ---- command-line arguments ---- */
 static int g_argc;
 static char **g_argv;
+
+#if defined(_WIN32) && !defined(VT_NO_LIBC)
+#include "vyto_win.h"
+/* main()'s argv on Windows is msvcrt's ANSI conversion of the command line: a
+   character outside the code page arrives as '?', so `app.exe Zoë.txt` opens
+   the wrong file. msvcrt also keeps the UTF-16 parse, using the same quoting
+   rules, behind __wgetmainargs (exported by every msvcrt.dll, Windows 7
+   included). Convert that once to UTF-8 and keep it for the process. */
+typedef struct { int newmode; } vt_startupinfo;
+extern int __wgetmainargs(int *argc, wchar_t ***argv, wchar_t ***envp,
+                          int glob, vt_startupinfo *si);
+static void vt_utf8_args(int *argc, char ***argv) {
+    int wc = 0;
+    wchar_t **wv = NULL, **we = NULL;
+    vt_startupinfo si = {0};
+    if (__wgetmainargs(&wc, &wv, &we, 0, &si) != 0 || !wv || wc <= 0) return;
+    char **out = (char **)malloc(sizeof(char *) * ((size_t)wc + 1));
+    if (!out) return;
+    for (int i = 0; i < wc; i++) {
+        out[i] = vt_utf8_from_w(wv[i]);
+        if (!out[i]) { while (i--) free(out[i]); free(out); return; }
+    }
+    out[wc] = NULL;
+    *argc = wc;
+    *argv = out; /* process lifetime, like the CRT's own argv */
+}
+#endif
+
 void vt_set_args(int argc, char **argv) {
 #if defined(_WIN32) && !defined(VT_NO_LIBC)
     vt_attach_console();
+    vt_utf8_args(&argc, &argv);
 #endif
     g_argc = argc;
     g_argv = argv;
@@ -931,7 +961,7 @@ void vt_print(VtString *s) {
 #ifndef VT_NO_FS
 
 static FILE *file_open(VtString *path, const char *mode, const char *file, int line) {
-    FILE *f = fopen(vt_str_cstr(path), mode);
+    FILE *f = vt_fopen(vt_str_cstr(path), mode);
     if (!f) {
         char buf[512];
         vt_snprintf(buf, sizeof buf, "cannot open file: %s", vt_str_cstr(path));
@@ -1011,7 +1041,7 @@ VtString *vt_file_read(VtString *path, const char *file, int line) {
 }
 
 bool vt_file_write(VtString *path, VtString *data, bool append) {
-    FILE *f = fopen(vt_str_cstr(path), append ? "ab" : "wb");
+    FILE *f = vt_fopen(vt_str_cstr(path), append ? "ab" : "wb");
     if (!f) return false;
     size_t n = data ? (size_t)data->len : 0;
     bool ok = fwrite(data ? data->data : "", 1, n, f) == n;
@@ -1062,19 +1092,31 @@ VtArray *vt_dir_list(VtString *path, const char *file, int line) {
     char **names = vt_host_alloc((size_t)cap * sizeof *names);
     if (!names) vt_oom();
 #ifdef _WIN32
-    char pat[1024];
-    vt_snprintf(pat, sizeof pat, "%s\\*", dir);
-    WIN32_FIND_DATAA fd;
-    HANDLE h = FindFirstFileA(pat, &fd);
+    /* The W API, so non-ASCII directory and entry names survive: the names
+       come back UTF-16 and are handed to Vyto as UTF-8. */
+    size_t dl = strlen(dir);
+    char *pat = vt_host_alloc(dl + 3);
+    if (!pat) vt_oom();
+    memcpy(pat, dir, dl);
+    memcpy(pat + dl, "\\*", 3);
+    VtWBuf wp;
+    vt_wbuf_from(&wp, pat);
+    vt_host_free(pat);
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW(wp.p, &fd);
+    vt_wbuf_free(&wp);
     if (h == INVALID_HANDLE_VALUE) {
         char buf[512];
         vt_snprintf(buf, sizeof buf, "cannot open directory: %s", dir);
         vt_panic_c(file, line, buf);
     }
     do {
-        if (strcmp(fd.cFileName, ".") == 0) continue;
-        names = dir_names_push(names, &n, &cap, fd.cFileName);
-    } while (FindNextFileA(h, &fd));
+        if (fd.cFileName[0] == L'.' && fd.cFileName[1] == 0) continue;
+        char *u = vt_utf8_from_w(fd.cFileName);
+        if (!u) vt_oom();
+        names = dir_names_push(names, &n, &cap, u);
+        free(u);
+    } while (FindNextFileW(h, &fd));
     FindClose(h);
 #else
     DIR *d = opendir(dir);
@@ -1105,7 +1147,10 @@ VtArray *vt_dir_list(VtString *path, const char *file, int line) {
 bool vt_is_dir(VtString *path) {
     const char *p = vt_str_cstr(path);
 #ifdef _WIN32
-    DWORD a = GetFileAttributesA(p);
+    VtWBuf w;
+    vt_wbuf_from(&w, p);
+    DWORD a = GetFileAttributesW(w.p);
+    vt_wbuf_free(&w);
     return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY) != 0;
 #else
     struct stat st;

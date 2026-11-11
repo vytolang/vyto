@@ -74,6 +74,9 @@ fi
 #         contains  stdout+stderr merged, <name>.expected holds a substring
 #   args        extra argv, space-separated
 #   env         K=V pairs set for the run, space-separated
+#   {uni} in args or env is replaced by run.ps1 with the non-ASCII string
+#   "Zöë日", built from [char] codes: PowerShell 2.0 reads a BOM-less script
+#   and manifest in the ANSI code page, so the literal cannot travel in them.
 #   buildflags  extra vytoc flags for the cross-build
 programs=$(cat <<'EOF'
 examples/01_hello.vt|01_hello|eq|
@@ -120,6 +123,7 @@ tests/fixtures/regex_extra.vt|regex_extra_nojit|eq||VYTO_REGEX_JIT=0
 examples/85_validator.vt|85_validator|eq|
 tests/fixtures/validator.vt|validator|eq|
 tests/fixtures/args_echo.vt|args_echo|eq|alpha beta
+tests/fixtures/unicode_paths.vt|unicode_paths|eq|{uni}|VYTO_UNI_IN={uni}
 tests/fixtures/anim_clock.vt|anim_clock|eq|
 tests/fixtures/condlink_win.vt|condlink_win|eq|
 tests/fixtures/listdir.vt|listdir|eq|
@@ -204,7 +208,31 @@ else
     echo "FAIL build dump_exports"
     fail=1
 fi
+# The input demo: a manual check on Windows (README there), and the program
+# run_tests_wine.sh drives with xdotool. Not in the manifest: it waits for a
+# person or a script, it does not print-and-exit.
+if ./vytoc build tests/win/input_demo.vt --target "$TRIPLE" --cc "$CC_CMD" \
+        -o "$STAGE/input_demo.exe" >/dev/null 2>"$STAGE/.input_demo.err"; then
+    echo "BUILT input_demo"
+    rm -f "$STAGE/.input_demo.err"
+else
+    echo "FAIL build input_demo"
+    cat "$STAGE/.input_demo.err"
+    fail=1
+fi
 if ! tests/win/pe_audit.sh "$STAGE"/*.exe; then fail=1; fi
+# The DLLs shipped beside the exes are skipped by the exe audit (they are the
+# app's own), so audit them as binaries of their own. All but libcurl: the
+# prebuilt curl links the Universal CRT, which Windows 7 lacks without
+# KB2999226. That is a known gap (rebuilding curl against msvcrt with a
+# vendored TLS library is the fix), reported here but not failed on.
+for dll in "$STAGE"/*.dll; do
+    [ -f "$dll" ] || continue
+    case "$(basename "$dll")" in
+        libcurl*.dll) echo "KNOWN pe_audit $(basename "$dll") (needs the UCRT on Windows 7)" ;;
+        *) if ! tests/win/pe_audit.sh "$dll"; then fail=1; fi ;;
+    esac
+done
 
 # --- the Windows-side runner ---------------------------------------------
 cat > "$STAGE/run.ps1" <<'PS1'
@@ -244,6 +272,11 @@ function Normalize([string]$s) {
     return ($s -replace "`r", "").TrimEnd("`n")
 }
 
+# The unicode_paths fixture's argument: Z, o-umlaut, e-diaeresis and the CJK
+# "sun" (U+65E5), outside every single ANSI code page at once. Kept as [char]
+# codes so this script stays ASCII.
+$uni = "Z" + [char]0x00F6 + [char]0x00EB + [char]0x65E5
+
 # The listdir fixture reads a seeded directory relative to the working dir.
 $pick = Join-Path $root "tests\tmp\pickdir"
 New-Item -ItemType Directory -Force -Path (Join-Path $pick "sub") | Out-Null
@@ -255,6 +288,8 @@ foreach ($line in Get-Content -LiteralPath "manifest.txt") {
     if (-not $line.Trim()) { continue }
     $parts = $line.Split("|")
     $name = $parts[0]; $mode = $parts[1]; $argstr = $parts[2]; $envstr = $parts[3]
+    $argstr = $argstr.Replace("{uni}", $uni)
+    $envstr = $envstr.Replace("{uni}", $uni)
 
     # Per-program environment (e.g. VS_HEADLESS=1 VS_EVENTS=x.events). Set on
     # this process so the child inherits it, then removed again — Start-Process
@@ -350,10 +385,8 @@ run.ps1 also writes win7_exports.txt: the functions this Windows' system DLLs
 export. From a Windows 7 machine, copy it back as tests/win/win7_exports.txt;
 tests/win/pe_audit.sh checks every exe's imports against it.
 
-Note on 45_os: its golden (examples/45_os.expected.windows-x64) was written
-from a prediction of cmd.exe's behaviour for run()/capture(), NOT from an
-observed run. If it fails, the observed output is very likely the correct
-golden — reconcile it on the build machine rather than assuming a code bug.
+Note on 45_os: it uses only shell builtins that sh and cmd.exe share (exit N,
+echo), so its output does not depend on which tools are on PATH.
 
 Not covered here: vyto/hw/* (Linux device interfaces) and vyto/intl (ICU) are
 not portable to Windows yet. Everything else in the stdlib is staged above.

@@ -833,6 +833,21 @@ else
     fail=1
 fi
 
+# --- non-ASCII paths, argv and environment ---
+# Trivially true on Linux (the kernel takes bytes); kept here so the fixture
+# and its golden cannot rot. Its real run is in run_tests_win.sh, where every
+# one of these went through an ANSI-code-page API before.
+rm -rf tests/tmp/ünï_*
+got=$(VYTO_UNI_IN="Zöë日" ./vytoc run tests/fixtures/unicode_paths.vt -- "Zöë日" 2>&1)
+if [ "$got" = "$(cat tests/fixtures/unicode_paths.expected)" ]; then
+    echo "PASS unicode_paths"
+else
+    echo "FAIL unicode_paths"
+    echo "$got" | grep -v ': true$'
+    fail=1
+fi
+rm -rf tests/tmp/ünï_*
+
 # --- vyto/anim + vyto/geom/path: pure-Vyto animation clock & path flatten
 #     (no blend2d — always runs) ---
 got=$(./vytoc run tests/fixtures/anim_clock.vt 2>&1)
@@ -1885,7 +1900,7 @@ fi
 # --- vyto/surface binding: regenerate with vytobind, golden-check ---
 ./vytobind lib/vyto/surface/native/src/vsurf.h \
     --lib X11@linux --lib dl@linux --lib X11@macos \
-    --lib gdi32@windows --lib user32@windows \
+    --lib gdi32@windows --lib user32@windows --lib imm32@windows \
     --filter 'vs_*' --filter 'VS_*' > lib/vyto/surface/vsurf.vt || exit 1
 if diff -u tests/vsurf.vt.expected lib/vyto/surface/vsurf.vt >/dev/null 2>&1; then
     echo "PASS vytobind_vsurf"

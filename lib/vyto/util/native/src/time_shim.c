@@ -29,11 +29,21 @@ long long vtime_real_ns(void) {
     return (long long)(u.QuadPart - 116444736000000000ULL) * 100LL;
 }
 
+/* At least `ns`, like nanosleep. Sleep() alone does not promise that: it
+   wakes on a scheduler tick, and the first tick can be most of a period
+   away, so with the timer at 1 ms (any app that called timeBeginPeriod,
+   browsers included) Sleep(3) can return after ~2.1 ms. Round up, then top
+   up against the monotonic clock until the deadline really has passed. */
 void vtime_sleep_ns(long long ns) {
     if (ns <= 0) return;
-    /* Sleep()'s resolution is milliseconds; round up so a sub-ms request still
-       yields rather than returning immediately. */
+    long long deadline = vtime_mono_ns() + ns;
     Sleep((DWORD)((ns + 999999LL) / 1000000LL));
+    for (;;) {
+        long long left = deadline - vtime_mono_ns();
+        if (left <= 0) break;
+        /* whole milliseconds left: sleep them; under one: just yield */
+        Sleep(left >= 1000000LL ? (DWORD)(left / 1000000LL) : 0);
+    }
 }
 #else
 #include <time.h>
