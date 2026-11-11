@@ -19,9 +19,9 @@ cd "$(dirname "$0")/.."
 CROSS_CC=x86_64-w64-mingw32-gcc
 TRIPLE=windows-x64
 STAGE=tests/tmp/win-x64
-# -static-libgcc so the staged exes need no libgcc_s_*.dll on the target box:
-# the whole staging dir has to be self-contained once it leaves this machine.
-CC_CMD="$CROSS_CC -static-libgcc"
+# vytoc links Windows exes with -static-libgcc itself now, so the staged exes
+# need no libgcc_s_*.dll on the target box without any flag here.
+CC_CMD="$CROSS_CC"
 
 if ! command -v "$CROSS_CC" >/dev/null 2>&1; then
     echo "FATAL: $CROSS_CC not found — install it with:"
@@ -131,6 +131,8 @@ examples/49_poll_server.vt|49_poll_server|eq|
 examples/50_worker_pool.vt|50_worker_pool|eq|
 apps/motiondemo/motiondemo.vt|motiondemo|contains||VS_HEADLESS=1 VS_EVENTS=motiondemo.events|--with-assets
 tests/win/d2d_props.vt|d2d_props|eq||VS_HEADLESS=1
+tests/fixtures/win_gui_app.vt|win_gui_app|eq|||--manifest tests/fixtures/win_gui_manifest.vt
+tests/fixtures/win_console_app.vt|win_console_app|eq|
 EOF
 )
 

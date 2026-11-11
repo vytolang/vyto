@@ -1732,6 +1732,139 @@ if [ -r /proc/self/status ]; then
     fi
 fi
 
+# --- WinManifest: validation and render, no mingw needed (pure Vyto) ---
+got=$(./vytoc run tests/fixtures/win_manifest_validate.vt 2>&1)
+if [ "$got" = "$(cat tests/fixtures/win_manifest_validate.expected)" ]; then
+    echo "PASS win_manifest_validate"
+else
+    echo "FAIL win_manifest_validate"
+    echo "--- expected ---"; cat tests/fixtures/win_manifest_validate.expected
+    echo "--- got ---"; echo "$got"
+    fail=1
+fi
+
+# --- Window.set_icon reaches the surface and is a safe no-op headless ---
+got=$(VS_HEADLESS=1 ./vytoc run tests/fixtures/set_icon_headless.vt 2>&1)
+if [ "$got" = "set_icon ok" ]; then
+    echo "PASS set_icon_headless"
+else
+    echo "FAIL set_icon_headless (got: $got)"
+    fail=1
+fi
+
+# --- Windows exe groundwork: PE headers, resources, the --manifest program --
+# Cross-built here and read back with mingw objdump, so every property of a
+# Windows exe that does not need Windows to observe is checked on every run:
+# subsystem, ASLR/DEP, the embedded manifest, icon and version info, strip,
+# relink on a link-only change, DLL naming and export. Needs mingw; SKIPs
+# without it.
+if command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1 &&
+   command -v x86_64-w64-mingw32-objdump >/dev/null 2>&1 &&
+   command -v x86_64-w64-mingw32-windres >/dev/null 2>&1; then
+    wd=tests/tmp/winpe
+    rm -rf "$wd"; mkdir -p "$wd"
+    OD=x86_64-w64-mingw32-objdump
+    W="--target windows-x64"
+    GM="--manifest tests/fixtures/win_gui_manifest.vt"
+    win_check() {
+        if [ "$2" = ok ]; then echo "PASS $1"; else echo "FAIL $1 ($2)"; fail=1; fi
+    }
+    pe_subsys() { $OD -p "$1" 2>/dev/null | awk '/^Subsystem/{print $2}'; }
+    # top-level resource type IDs: 3 ICON, e GROUP_ICON, 10 VERSION, 18 MANIFEST
+    pe_rtypes() {
+        $OD -p "$1" 2>/dev/null | awk '/^0[0-9a-f][0-9a-f]   Entry: ID: /{print $4}' |
+            tr -d ',' | tr '\n' ' '
+    }
+    gui=$wd/gui.exe; con=$wd/con.exe
+    # shellcheck disable=SC2086
+    ./vytoc build tests/fixtures/win_gui_app.vt $W $GM -o "$gui" >/dev/null 2>&1
+    # shellcheck disable=SC2086
+    ./vytoc build tests/fixtures/win_console_app.vt $W -o "$con" >/dev/null 2>&1
+
+    r=$(pe_subsys "$gui"); [ "$r" = 00000002 ] && r=ok
+    win_check win_pe_gui_subsystem "$r"
+    r=$(pe_subsys "$con"); [ "$r" = 00000003 ] && r=ok
+    win_check win_pe_console_subsystem "$r"
+    dc=$($OD -p "$con" 2>/dev/null | awk '/^DllCharacteristics/{print $2}')
+    # 0x40 DYNAMIC_BASE (ASLR) | 0x100 NX_COMPAT (DEP)
+    r="DllCharacteristics=$dc"; [ -n "$dc" ] && [ $((0x$dc & 0x140)) -eq 320 ] && r=ok
+    win_check win_pe_aslr_dep "$r"
+    r=$(pe_rtypes "$gui")
+    case "$r" in *0x000003*0x00000e*0x000010*0x000018*) r=ok ;; esac
+    win_check win_pe_gui_resources "$r"
+    r=$(pe_rtypes "$con"); [ "$r" = "0x000018 " ] && r=ok
+    win_check win_pe_console_manifest_only "$r"
+    r=missing
+    grep -aq dpiAware "$gui" && grep -aq asInvoker "$gui" && grep -aq activeCodePage "$con" && r=ok
+    win_check win_pe_manifest_content "$r"
+    vi=$(strings -el "$gui")
+    r=missing
+    echo "$vi" | grep -qx "Vyto Test App" && echo "$vi" | grep -qx "1.2.3" &&
+        echo "$vi" | grep -qxF '(c) 2026 Vyto "tests"' && r=ok
+    win_check win_pe_version_info "$r"
+
+    # --console flips the subsystem and back with no --clean: the link stamp
+    # must relink on a link-only change, both ways.
+    # shellcheck disable=SC2086
+    ./vytoc build tests/fixtures/win_gui_app.vt $W $GM --console -o "$gui" >/dev/null 2>&1
+    a=$(pe_subsys "$gui")
+    # shellcheck disable=SC2086
+    ./vytoc build tests/fixtures/win_gui_app.vt $W $GM -o "$gui" >/dev/null 2>&1
+    b=$(pe_subsys "$gui")
+    r="$a then $b"; [ "$a" = 00000003 ] && [ "$b" = 00000002 ] && r=ok
+    win_check win_pe_relink_on_flag "$r"
+
+    # --release strips: the debug build has debug sections, the release none.
+    rel=$wd/rel.exe
+    # shellcheck disable=SC2086
+    ./vytoc build tests/fixtures/win_console_app.vt $W --release -o "$rel" >/dev/null 2>&1
+    nd=$($OD -h "$con" 2>/dev/null | grep -c '\.debug')
+    nr=$($OD -h "$rel" 2>/dev/null | grep -c '\.debug')
+    r="debug sections: debug build $nd, release $nr"; [ "$nd" -gt 0 ] && [ "$nr" -eq 0 ] && r=ok
+    win_check win_pe_release_strip "$r"
+
+    # --shared names a .dll and exports exactly the loader entry.
+    # shellcheck disable=SC2086
+    dll=$(./vytoc build tests/fixtures/win_console_app.vt $W --shared 2>/dev/null | tail -1)
+    ex=$($OD -p "$dll" 2>/dev/null | sed -n '/\[Ordinal\/Name Pointer\] Table/,/^$/p' |
+         grep -c 'vyto_app_main')
+    r="$dll exports vyto_app_main: $ex"
+    case "$dll" in *.dll) [ "$ex" = 1 ] && r=ok ;; esac
+    win_check win_pe_shared_dll "$r"
+
+    # .dpi("unaware") drops dpiAware; no --manifest still embeds the manifest.
+    un=$wd/unaware.exe; plain=$wd/plain.exe
+    # shellcheck disable=SC2086
+    ./vytoc build tests/fixtures/win_gui_app.vt $W \
+        --manifest tests/fixtures/win_unaware_manifest.vt -o "$un" >/dev/null 2>&1
+    # shellcheck disable=SC2086
+    ./vytoc build tests/fixtures/win_gui_app.vt $W -o "$plain" >/dev/null 2>&1
+    r=bad
+    ! grep -aq dpiAware "$un" && grep -aq asInvoker "$un" && grep -aq dpiAware "$plain" &&
+        [ "$(pe_rtypes "$plain")" = "0x000018 " ] && r=ok
+    win_check win_pe_dpi_and_default_manifest "$r"
+
+    # A manifest program that refuses fails the build, naming the problem.
+    # shellcheck disable=SC2086
+    out=$(./vytoc build tests/fixtures/win_gui_app.vt $W \
+          --manifest tests/fixtures/win_bad_manifest.vt -o "$wd/bad.exe" 2>&1)
+    st=$?
+    r="status $st"
+    [ "$st" -ne 0 ] && echo "$out" | grep -q 'version "1.x"' && r=ok
+    win_check win_manifest_refusal_fails_build "$r"
+else
+    echo "SKIP win_pe_headers (no mingw gcc, objdump and windres)"
+fi
+# --manifest is Windows-only: on any other target it is an error, not ignored.
+out=$(./vytoc build tests/fixtures/win_console_app.vt \
+      --manifest tests/fixtures/win_gui_manifest.vt 2>&1)
+if [ $? -ne 0 ] && echo "$out" | grep -q "describes a Windows exe"; then
+    echo "PASS manifest_rejected_off_windows"
+else
+    echo "FAIL manifest_rejected_off_windows (got: $out)"
+    fail=1
+fi
+
 # --- vyto/surface binding: regenerate with vytobind, golden-check ---
 ./vytobind lib/vyto/surface/native/src/vsurf.h \
     --lib X11@linux --lib dl@linux --lib X11@macos \

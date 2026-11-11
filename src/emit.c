@@ -2859,8 +2859,12 @@ void emit_module(Module *m, bool is_entry, bool checks, EntryMode mode, SBuf *h,
                no argc/argv either -- the Android JNI boot thread calls this and
                expects it to return when the app's Window.run() exits. Default
                visibility so the dynamic symbol table carries it (and so
-               --gc-sections treats it as a root). */
-            sb_printf(c, "__attribute__((visibility(\"default\")))\n"
+               --gc-sections treats it as a root). A PE DLL has no visibility:
+               dllexport is what puts it in the export table, and once one
+               symbol is exported explicitly ld stops auto-exporting all of
+               them, so the DLL exports exactly this entry. */
+            sb_printf(c, "#ifdef _WIN32\n__declspec(dllexport)\n#else\n"
+                         "__attribute__((visibility(\"default\")))\n#endif\n"
                          "void vyto_app_main(void) {\n    v_%s_main();\n}\n", m->name);
             break;
         case ENTRY_EXE:

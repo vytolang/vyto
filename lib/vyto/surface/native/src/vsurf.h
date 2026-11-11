@@ -84,6 +84,12 @@ void vs_close(void *s);
 int vs_width(void *s);
 int vs_height(void *s);
 void vs_set_title(void *s, const char *t);
+/* Set the window's icon from w x h pixels, 0xAARRGGBB with straight alpha,
+   top row first; at most 256 x 256. Win32 sends WM_SETICON (title bar,
+   taskbar, Alt+Tab); X11 sets _NET_WM_ICON. Headless, fbdev and Android
+   ignore it. On Windows a window starts with the exe's embedded icon, if
+   vytoc gave it one; this is for an app that changes its icon while running. */
+void vs_set_icon(void *s, const unsigned int *argb, int w, int h);
 /* Refuse to let the window manager size the window below w x h. Without it a
    WM can drag a window to near-zero, and a layout pass then computes negative
    rects from a width smaller than its fixed children. X11 sets PMinSize,

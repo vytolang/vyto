@@ -150,6 +150,19 @@ bottom/left/right` `drop_top/bottom/left/right`; layout `center_box`
 ### `Surface`
 
 - **Lifecycle**: `init(title,w,h)`, `width()`, `height()`, `set_title(t)`
+- **Icon**: `set_icon(argb: i32[], w, h)` sets the window's icon (title bar,
+  taskbar, Alt+Tab) from `0xAARRGGBB` pixels, top row first, up to 256×256.
+  Pixels rather than a file, so this layer needs no image decoder. Win32 and
+  X11; a no-op headless, on fbdev and on Android. `Window.set_icon` forwards to
+  it. A Windows exe already starts with the icon embedded by `--manifest`
+  (see [getting-started §8](getting-started.md)); this is for an icon that
+  changes while the program runs:
+
+  ```js
+  let px: i32[] = [];
+  for (let i in 0..(16 * 16)) { px.push(rgb(40, 90, 200) as i32); }
+  win.set_icon(px, 16, 16);
+  ```
 - **Vector draw** (integer-snapped): `fill(r,color)` `frame(r,color)`
   `line(x0,y0,x1,y1,color)` `text(x,y,s,color)` `text_in(r,pad,s,color)`
   `text_width(s)` `font_ascent()` `font_height()` — a single fixed bitmap

@@ -461,6 +461,12 @@ void vs_set_title(void *s, const char *t) {
      * from the manifest, so this is meaningfully a no-op rather than a gap. */
 }
 
+void vs_set_icon(void *s, const unsigned int *argb, int w, int h) {
+    (void)s; (void)argb; (void)w; (void)h;
+    /* The launcher icon comes from the apk's manifest and resources; an app
+     * cannot change it from inside a running Activity. */
+}
+
 void vs_set_decorated(void *s, int on) {
     (void)s; (void)on;
     /* No window manager: an Android surface fills what the system gives it and

@@ -1,0 +1,153 @@
+// vyto/win/manifest — a Windows app's identity, described in Vyto.
+//
+// The Windows twin of vyto/mobile/android/manifest, and used the same way: an
+// app keeps a small program that builds a WinManifest, refuses to emit a bad
+// one, and prints it. That program runs on the build host — vytoc runs it when
+// given `--manifest` — and what it prints becomes the exe's resources:
+//
+//   - the application manifest (supported Windows versions, no UAC prompt,
+//     UTF-8 code page, DPI awareness)
+//   - the icon Explorer, the title bar and the taskbar show
+//   - the version info on the Properties → Details tab
+//
+//     // win_manifest.vt
+//     import { WinManifest } from "vyto/win/manifest";
+//
+//     fn main() {
+//         let m = new WinManifest("Vyto Files")
+//             .version("1.2.0")
+//             .icon("assets/icon.png")
+//             .company("Vyto");
+//         m.emit();
+//     }
+//
+//     vytoc build app.vt --target windows-x64 --manifest win_manifest.vt
+//
+// These must be fixed when the exe is built, not when it runs: Explorer reads
+// the icon and version without starting the program, and Windows reads the
+// manifest before the program's first instruction. That is why this is a
+// build-time program and not a property on Window. (A window's icon can still
+// change while running: Window.set_icon.)
+//
+// The icon path is relative to this program's own directory. It may be a PNG
+// (vytoc wraps it into an .ico, up to 256x256) or a ready-made .ico.
+
+// The text vytoc reads. The first line names the format so an older vytoc
+// reading a newer manifest fails clearly instead of guessing.
+export const WIN_MANIFEST_FORMAT: string = "vyto-win-manifest 1";
+
+export class WinManifest {
+    app_name: string;
+    app_version: string;
+    app_icon: string;
+    app_company: string;
+    app_description: string;
+    app_copyright: string;
+    app_dpi: string;
+
+    fn init(name: string) {
+        this.app_name = name;
+        this.app_version = "";
+        this.app_icon = "";
+        this.app_company = "";
+        this.app_description = "";
+        this.app_copyright = "";
+        this.app_dpi = "system";
+    }
+
+    // "1.2" to "1.2.3.4": up to four numbers, each 0..65535, which is what the
+    // Windows version resource can hold.
+    builder fn version(v: string) { this.app_version = v; return this; }
+    // A .png (up to 256x256) or an .ico, relative to this program's directory.
+    builder fn icon(path: string) { this.app_icon = path; return this; }
+    builder fn company(v: string) { this.app_company = v; return this; }
+    // Shown as the file description in Explorer and Task Manager.
+    builder fn description(v: string) { this.app_description = v; return this; }
+    builder fn copyright(v: string) { this.app_copyright = v; return this; }
+    // "system" (the default): crisp at the display's scale on the main
+    // monitor. "unaware": Windows stretches the window instead, for an app
+    // that does not scale its own drawing yet.
+    builder fn dpi(mode: string) { this.app_dpi = mode; return this; }
+
+    // -- validation ----------------------------------------------------------
+    // Problems that would produce a broken resource or a confusing exe.
+    // Empty means clean. emit() refuses to print while any remain.
+    fn validate(): string[] {
+        let probs: string[] = [];
+        if (this.app_name.len == 0) { probs.push("name is empty"); }
+        if (this.app_version.len > 0 && !version_ok(this.app_version)) {
+            probs.push("version \"" + this.app_version +
+                       "\" is not 1 to 4 numbers separated by dots, each 0..65535");
+        }
+        if (this.app_dpi != "system" && this.app_dpi != "unaware") {
+            probs.push("dpi \"" + this.app_dpi + "\" must be \"system\" or \"unaware\"");
+        }
+        if (this.app_icon.len > 0) {
+            let low = this.app_icon.to_lower();
+            if (!low.ends_with(".png") && !low.ends_with(".ico")) {
+                probs.push("icon \"" + this.app_icon + "\" must be a .png or an .ico");
+            }
+        }
+        let fields = ["name", "version", "icon", "company", "description", "copyright", "dpi"];
+        let values = [this.app_name, this.app_version, this.app_icon, this.app_company,
+                      this.app_description, this.app_copyright, this.app_dpi];
+        for (let i in 0..fields.len) {
+            if (has_control(values[i])) {
+                probs.push(fields[i] + " contains a control character or line break");
+            }
+        }
+        return probs;
+    }
+
+    // The text vytoc reads: the format line, then one key=value per set field.
+    fn render(): string {
+        let out = WIN_MANIFEST_FORMAT + "\n";
+        out = out + "name=" + this.app_name + "\n";
+        if (this.app_version.len > 0) { out = out + "version=" + this.app_version + "\n"; }
+        if (this.app_icon.len > 0) { out = out + "icon=" + this.app_icon + "\n"; }
+        if (this.app_company.len > 0) { out = out + "company=" + this.app_company + "\n"; }
+        if (this.app_description.len > 0) {
+            out = out + "description=" + this.app_description + "\n";
+        }
+        if (this.app_copyright.len > 0) { out = out + "copyright=" + this.app_copyright + "\n"; }
+        out = out + "dpi=" + this.app_dpi;
+        return out;
+    }
+
+    // Print the manifest for vytoc, or panic listing every problem. A panic is
+    // a non-zero exit, which fails the build with the list on stderr, rather
+    // than an exe built from a manifest that was quietly wrong.
+    fn emit() {
+        let probs = this.validate();
+        if (probs.len > 0) {
+            let msg = "Windows manifest is invalid:";
+            for (let p in probs) { msg = msg + "\n  - " + p; }
+            panic(msg);
+        }
+        print(this.render());
+    }
+}
+
+fn version_ok(v: string): bool {
+    let parts = v.split(".");
+    if (parts.len < 1 || parts.len > 4) { return false; }
+    for (let p in parts) {
+        if (p.len == 0 || p.len > 5) { return false; }
+        let n = 0;
+        for (let i in 0..p.len) {
+            let c = p[i];
+            if (c < 48 || c > 57) { return false; }
+            n = n * 10 + (c - 48);
+        }
+        if (n > 65535) { return false; }
+    }
+    return true;
+}
+
+fn has_control(s: string): bool {
+    for (let i in 0..s.len) {
+        let c = s[i];
+        if (c < 32 || c == 127) { return true; }
+    }
+    return false;
+}

@@ -584,10 +584,41 @@ VT_NORETURN void vt_panic_c(const char *file, int line, const char *msg) {
     vt_host_abort();
 }
 
+/* ---- Windows: a GUI exe started from a console ----
+   A program that opens windows is linked for the GUI subsystem (vytoc picks it
+   when the program imports vyto/surface), so double-clicking it shows no
+   console window. The price is that it gets no console either: started from
+   cmd, its print() output would vanish. So when a standard stream has no
+   handle, attach to the parent's console and reopen just that stream there.
+   A stream that already has one (redirected to a file or pipe, as run.ps1
+   does, or a console-subsystem exe) is left exactly as it is. Started from
+   Explorer there is no parent console, AttachConsole fails, and nothing
+   changes. */
+#if defined(_WIN32) && !defined(VT_NO_LIBC)
+#include <windows.h>
+static int vt_std_missing(DWORD which) {
+    HANDLE h = GetStdHandle(which);
+    return h == NULL || h == INVALID_HANDLE_VALUE;
+}
+static void vt_attach_console(void) {
+    int out = vt_std_missing(STD_OUTPUT_HANDLE), err = vt_std_missing(STD_ERROR_HANDLE);
+    if (!out && !err) return;
+    if (!AttachConsole(ATTACH_PARENT_PROCESS)) return;
+    if (out) freopen("CONOUT$", "w", stdout);
+    if (err) freopen("CONOUT$", "w", stderr);
+}
+#endif
+
 /* ---- command-line arguments ---- */
 static int g_argc;
 static char **g_argv;
-void vt_set_args(int argc, char **argv) { g_argc = argc; g_argv = argv; }
+void vt_set_args(int argc, char **argv) {
+#if defined(_WIN32) && !defined(VT_NO_LIBC)
+    vt_attach_console();
+#endif
+    g_argc = argc;
+    g_argv = argv;
+}
 VtArray *vt_args(void) {
     VtArray *a = vt_arr_new(sizeof(VtString *), true);
     for (int i = 1; i < g_argc; i++) { /* skip argv[0], the program name */

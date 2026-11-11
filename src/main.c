@@ -600,6 +600,252 @@ static const char *gen_asset_source(const char *app_dir) {
     return src;
 }
 
+/* ---- Windows resources: app manifest, icon, version info ----------------
+   Every Windows exe gets an application manifest, and an exe built with
+   --manifest also gets its icon and version info. The manifest program
+   (lib/vyto/win/manifest.vt) runs on the build host and prints a small line
+   format; vytoc owns turning that into the .manifest XML, the .ico and the
+   .rc that windres compiles into a COFF object for the link. */
+
+/* POSIX single-quote a path for a shell command line. */
+static const char *sh_quote(const char *s) {
+    SBuf b;
+    sb_init(&b);
+    sb_puts(&b, "'");
+    for (const char *c = s; *c; c++) {
+        if (*c == '\'') sb_puts(&b, "'\\''");
+        else sb_printf(&b, "%c", *c);
+    }
+    sb_puts(&b, "'");
+    const char *out = arena_strdup(&g_arena, b.data);
+    sb_free(&b);
+    return out;
+}
+
+/* An RC string literal's body: a quote is doubled and a backslash escaped. */
+static const char *rc_escape(const char *s) {
+    SBuf b;
+    sb_init(&b);
+    for (const char *c = s; *c; c++) {
+        if (*c == '"') sb_puts(&b, "\"\"");
+        else if (*c == '\\') sb_puts(&b, "\\\\");
+        else sb_printf(&b, "%c", *c);
+    }
+    const char *out = arena_strdup(&g_arena, b.data);
+    sb_free(&b);
+    return out;
+}
+
+/* XML attribute/text escaping for the manifest. */
+static const char *xml_escape(const char *s) {
+    SBuf b;
+    sb_init(&b);
+    for (const char *c = s; *c; c++) {
+        switch (*c) {
+        case '&': sb_puts(&b, "&amp;"); break;
+        case '<': sb_puts(&b, "&lt;"); break;
+        case '>': sb_puts(&b, "&gt;"); break;
+        case '"': sb_puts(&b, "&quot;"); break;
+        default: sb_printf(&b, "%c", *c);
+        }
+    }
+    const char *out = arena_strdup(&g_arena, b.data);
+    sb_free(&b);
+    return out;
+}
+
+typedef struct {
+    const char *name, *version, *icon, *company, *description, *copyright;
+    bool dpi_unaware;
+} WinApp;
+
+/* Run the --manifest program on this host and parse what it prints. Its
+   stderr is not captured, so a failed validation's panic lands on the
+   terminal next to vytoc's own error. */
+static WinApp read_win_manifest(const char *manifest_vt, bool verbose) {
+    WinApp app = {0};
+    char self[4096];
+    ssize_t n = readlink("/proc/self/exe", self, sizeof self - 1);
+    if (n <= 0) fatal("cannot locate vytoc itself to run %s", manifest_vt);
+    self[n] = 0;
+    const char *cmd = arena_printf(&g_arena, "%s run %s", sh_quote(self), sh_quote(manifest_vt));
+    if (verbose) fprintf(stderr, "%s\n", cmd);
+    FILE *f = popen(cmd, "r");
+    if (!f) fatal("cannot run %s", manifest_vt);
+    SBuf out;
+    sb_init(&out);
+    char buf[4096];
+    size_t got;
+    while ((got = fread(buf, 1, sizeof buf, f)) > 0) sb_printf(&out, "%.*s", (int)got, buf);
+    int status = pclose(f);
+    if (status != 0) fatal("the --manifest program %s failed (its error is above)", manifest_vt);
+
+    const char *base = dir_of(manifest_vt);
+    char *text = arena_strdup(&g_arena, out.data);
+    sb_free(&out);
+    char *line = text;
+    int lineno = 0;
+    bool saw_name = false;
+    while (line && *line) {
+        char *nl = strchr(line, '\n');
+        if (nl) *nl = 0;
+        lineno++;
+        if (lineno == 1) {
+            if (strcmp(line, "vyto-win-manifest 1") != 0)
+                fatal("%s printed \"%s\" where a manifest starts with \"vyto-win-manifest 1\" "
+                      "(build one with lib/vyto/win/manifest.vt and call emit())",
+                      manifest_vt, line);
+        } else if (*line) {
+            char *eq = strchr(line, '=');
+            if (!eq) fatal("%s: manifest line %d has no '=': %s", manifest_vt, lineno, line);
+            *eq = 0;
+            const char *key = line, *val = arena_strdup(&g_arena, eq + 1);
+            if (strcmp(key, "name") == 0) { app.name = val; saw_name = true; }
+            else if (strcmp(key, "version") == 0) app.version = val;
+            else if (strcmp(key, "icon") == 0)
+                app.icon = val[0] == '/' ? val : arena_printf(&g_arena, "%s/%s", base, val);
+            else if (strcmp(key, "company") == 0) app.company = val;
+            else if (strcmp(key, "description") == 0) app.description = val;
+            else if (strcmp(key, "copyright") == 0) app.copyright = val;
+            else if (strcmp(key, "dpi") == 0) app.dpi_unaware = strcmp(val, "unaware") == 0;
+            else fatal("%s: unknown manifest key '%s' (this vytoc is older than the "
+                       "manifest library that printed it?)", manifest_vt, key);
+        }
+        line = nl ? nl + 1 : NULL;
+    }
+    if (!saw_name) fatal("%s printed a manifest with no name", manifest_vt);
+    return app;
+}
+
+/* The application manifest every Windows exe carries. Older Windows ignores
+   what it does not know, so one manifest serves 7 through 11:
+   - supportedOS: without it Windows 8.1+ reports itself as 8.0 to the app
+     and applies compatibility shims
+   - asInvoker: no UAC prompt, even for an exe whose name looks like an
+     installer (setup, update, install)
+   - activeCodePage UTF-8: the ANSI file, argv and window-title APIs speak
+     UTF-8 on Windows 10 1903 and later
+   - longPathAware: paths past 260 characters, where the system allows them
+   - dpiAware: rendered at the display's scale instead of bitmap-stretched */
+static const char *win_manifest_xml(const WinApp *app) {
+    return arena_printf(&g_arena,
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n"
+        "<!-- generated by vytoc; do not edit -->\n"
+        "<assembly xmlns=\"urn:schemas-microsoft-com:asm.v1\" manifestVersion=\"1.0\">\n"
+        "  <assemblyIdentity type=\"win32\" name=\"%s\" version=\"1.0.0.0\"/>\n"
+        "  <trustInfo xmlns=\"urn:schemas-microsoft-com:asm.v3\">\n"
+        "    <security><requestedPrivileges>\n"
+        "      <requestedExecutionLevel level=\"asInvoker\" uiAccess=\"false\"/>\n"
+        "    </requestedPrivileges></security>\n"
+        "  </trustInfo>\n"
+        "  <compatibility xmlns=\"urn:schemas-microsoft-com:compatibility.v1\">\n"
+        "    <application>\n"
+        "      <supportedOS Id=\"{35138b9a-5d96-4fbd-8e2d-a2440225f93a}\"/>\n" /* 7 */
+        "      <supportedOS Id=\"{4a2f28e3-53b9-4441-ba9c-d69d4a4a6e38}\"/>\n" /* 8 */
+        "      <supportedOS Id=\"{1f676c76-80e1-4239-95bb-83d0f6d0da78}\"/>\n" /* 8.1 */
+        "      <supportedOS Id=\"{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}\"/>\n" /* 10, 11 */
+        "    </application>\n"
+        "  </compatibility>\n"
+        "  <application xmlns=\"urn:schemas-microsoft-com:asm.v3\">\n"
+        "    <windowsSettings>\n"
+        "%s"
+        "      <activeCodePage xmlns=\"http://schemas.microsoft.com/SMI/2019/WindowsSettings\">UTF-8</activeCodePage>\n"
+        "      <longPathAware xmlns=\"http://schemas.microsoft.com/SMI/2016/WindowsSettings\">true</longPathAware>\n"
+        "    </windowsSettings>\n"
+        "  </application>\n"
+        "</assembly>\n",
+        xml_escape(app->name),
+        app->dpi_unaware ? ""
+                         : "      <dpiAware xmlns=\"http://schemas.microsoft.com/SMI/2005/WindowsSettings\">true</dpiAware>\n");
+}
+
+/* The icon as .ico bytes: an .ico passes through; a PNG is wrapped as a
+   single-image .ico (PNG-compressed icon images load on Vista and later). */
+static const char *win_icon_bytes(const char *path, size_t *len) {
+    size_t n = 0;
+    char *data = read_file(path, &n);
+    if (!data) fatal("cannot read the manifest's icon %s", path);
+    const unsigned char *u = (const unsigned char *)data;
+    if (n >= 6 && u[0] == 0 && u[1] == 0 && u[2] == 1 && u[3] == 0) { *len = n; return data; }
+    if (n < 24 || memcmp(u, "\x89PNG\r\n\x1a\n", 8) != 0)
+        fatal("icon %s is neither a PNG nor an .ico", path);
+    uint32_t w = (uint32_t)u[16] << 24 | (uint32_t)u[17] << 16 | (uint32_t)u[18] << 8 | u[19];
+    uint32_t h = (uint32_t)u[20] << 24 | (uint32_t)u[21] << 16 | (uint32_t)u[22] << 8 | u[23];
+    if (w == 0 || h == 0 || w > 256 || h > 256)
+        fatal("icon %s is %ux%u; a Windows icon image is at most 256x256", path, w, h);
+    size_t total = 6 + 16 + n;
+    unsigned char *ico = arena_alloc(&g_arena, total);
+    memset(ico, 0, 22);
+    ico[2] = 1;                     /* type: icon */
+    ico[4] = 1;                     /* one image */
+    ico[6] = (unsigned char)(w == 256 ? 0 : w);
+    ico[7] = (unsigned char)(h == 256 ? 0 : h);
+    ico[10] = 1;                    /* planes */
+    ico[12] = 32;                   /* bits per pixel */
+    ico[14] = (unsigned char)(n & 0xFF);
+    ico[15] = (unsigned char)((n >> 8) & 0xFF);
+    ico[16] = (unsigned char)((n >> 16) & 0xFF);
+    ico[17] = (unsigned char)((n >> 24) & 0xFF);
+    ico[18] = 22;                   /* image data offset */
+    memcpy(ico + 22, data, n);
+    *len = total;
+    return (const char *)ico;
+}
+
+/* FILEVERSION wants exactly four numbers; "1.2" becomes "1,2,0,0". */
+static const char *rc_version_quad(const char *v) {
+    unsigned parts[4] = {0, 0, 0, 0};
+    int i = 0;
+    for (const char *c = v; *c && i < 4; c++) {
+        if (*c == '.') { i++; continue; }
+        parts[i] = parts[i] * 10 + (unsigned)(*c - '0');
+    }
+    return arena_printf(&g_arena, "%u,%u,%u,%u", parts[0], parts[1], parts[2], parts[3]);
+}
+
+static const char *win_rc(const WinApp *app, const char *manifest_path, const char *ico_path,
+                          uint64_t ico_digest, const char *exe_name) {
+    SBuf b;
+    sb_init(&b);
+    sb_puts(&b, "// generated by vytoc; do not edit\n");
+    sb_printf(&b, "// icon digest %016llx\n", (unsigned long long)ico_digest);
+    sb_printf(&b, "1 24 \"%s\"\n", rc_escape(manifest_path)); /* 24 = RT_MANIFEST */
+    if (ico_path) sb_printf(&b, "1 ICON \"%s\"\n", rc_escape(ico_path));
+    if (app->version) {
+        const char *quad = rc_version_quad(app->version);
+        sb_printf(&b, "1 VERSIONINFO\nFILEVERSION %s\nPRODUCTVERSION %s\n", quad, quad);
+        sb_puts(&b, "FILEOS 0x40004\nFILETYPE 0x1\nBEGIN\n  BLOCK \"StringFileInfo\"\n  BEGIN\n"
+                    "    BLOCK \"040904B0\"\n    BEGIN\n");
+        sb_printf(&b, "      VALUE \"ProductName\", \"%s\"\n", rc_escape(app->name));
+        sb_printf(&b, "      VALUE \"FileDescription\", \"%s\"\n",
+                  rc_escape(app->description ? app->description : app->name));
+        if (app->company) sb_printf(&b, "      VALUE \"CompanyName\", \"%s\"\n", rc_escape(app->company));
+        if (app->copyright)
+            sb_printf(&b, "      VALUE \"LegalCopyright\", \"%s\"\n", rc_escape(app->copyright));
+        sb_printf(&b, "      VALUE \"FileVersion\", \"%s\"\n", rc_escape(app->version));
+        sb_printf(&b, "      VALUE \"ProductVersion\", \"%s\"\n", rc_escape(app->version));
+        sb_printf(&b, "      VALUE \"OriginalFilename\", \"%s\"\n", rc_escape(exe_name));
+        sb_puts(&b, "    END\n  END\n  BLOCK \"VarFileInfo\"\n  BEGIN\n"
+                    "    VALUE \"Translation\", 0x409, 1200\n  END\nEND\n");
+    }
+    const char *out = arena_strdup(&g_arena, b.data);
+    sb_free(&b);
+    return out;
+}
+
+/* The resource compiler that pairs with this cc: $VYTO_WINDRES, else the
+   cc's own prefix with windres (x86_64-w64-mingw32-gcc -> ...-windres),
+   else the stock mingw one. */
+static const char *find_windres(const char *cc) {
+    const char *env = getenv("VYTO_WINDRES");
+    if (env && *env) return env;
+    const char *sp = strchr(cc, ' ');
+    size_t first = sp ? (size_t)(sp - cc) : strlen(cc);
+    if (first >= 3 && strncmp(cc + first - 3, "gcc", 3) == 0)
+        return arena_printf(&g_arena, "%.*swindres", (int)(first - 3), cc);
+    return "x86_64-w64-mingw32-windres";
+}
+
 /* Locate the runtime directory relative to the vytoc executable. */
 static const char *find_runtime_dir(void) {
     const char *env = getenv("VYTO_HOME");
@@ -702,7 +948,7 @@ static void usage(void) {
             "  vytoc build <file.vt> [-o out] [--release] [--bundle] [--verbose]\n"
             "              [--with-assets] [--target <triple>] [--cc <cmd>] [--clean]\n"
             "              [--modpath <dir>] [--freestanding] [--shared] [--no-float]\n"
-            "              [--no-fs]\n"
+            "              [--no-fs] [--gui | --console] [--manifest <file.vt>]\n"
             "    --modpath      a directory CONTAINING packages (like vyto_modules/),\n"
             "                   searched after the importing file's own directory and\n"
             "                   before the stdlib. Repeatable, relative to the current\n"
@@ -717,8 +963,15 @@ static void usage(void) {
             "                   shared object cache is content-keyed, so it is left alone\n"
             "    --freestanding no libc: route alloc/print/abort through vt_host_* hooks\n"
             "                   the embedder supplies; output is lib<name>.a, not an exe\n"
-            "    --shared       build lib<name>.so instead of an exe: -fPIC throughout and\n"
+            "    --shared       build lib<name>.so (<name>.dll on Windows) instead of an exe:\n"
             "                   an exported vyto_app_main() the loader calls (Android/JNI)\n"
+            "    --gui          Windows: link for the GUI subsystem (no console window).\n"
+            "                   The default when the program imports vyto/surface\n"
+            "    --console      Windows: link for the console subsystem even if the\n"
+            "                   program imports vyto/surface (a CLI tool that also draws)\n"
+            "    --manifest     Windows: run this Vyto program on the build host and embed\n"
+            "                   the app identity it prints (name, version, icon, DPI) —\n"
+            "                   see lib/vyto/win/manifest.vt\n"
             "    --no-float     stub float-to-string (no soft-float formatter pulled in)\n"
             "    --no-fs        drop the filesystem layer (File ops become no-ops/panics)\n"
             "  vytoc run   <file.vt> [--release] [--verbose] [--clean]\n"
@@ -762,7 +1015,8 @@ int main(int argc, char **argv) {
     const char *input = argv[2];
     bool release = false, verbose = false, bundle = false, with_assets = false;
     bool freestanding = false, shared = false, no_float = false, no_fs = false, clean = false;
-    const char *outpath = NULL, *target = NULL, *cc_override = NULL;
+    bool force_gui = false, force_console = false;
+    const char *outpath = NULL, *target = NULL, *cc_override = NULL, *manifest_vt = NULL;
     const char *modpath[MAX_ROOTS];
     int nmodpath = 0;
     int prog_argc = 0;
@@ -777,6 +1031,9 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--no-float") == 0) no_float = true;
         else if (strcmp(argv[i], "--no-fs") == 0) no_fs = true;
         else if (strcmp(argv[i], "--clean") == 0) clean = true;
+        else if (strcmp(argv[i], "--gui") == 0) force_gui = true;
+        else if (strcmp(argv[i], "--console") == 0) force_console = true;
+        else if (strcmp(argv[i], "--manifest") == 0 && i + 1 < argc) manifest_vt = argv[++i];
         else if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) outpath = argv[++i];
         else if (strcmp(argv[i], "--target") == 0 && i + 1 < argc) target = argv[++i];
         else if (strcmp(argv[i], "--cc") == 0 && i + 1 < argc) cc_override = argv[++i];
@@ -798,6 +1055,8 @@ int main(int argc, char **argv) {
     if (shared && freestanding)
         fatal("--shared and --freestanding are different output shapes — "
               "--freestanding archives to lib<name>.a, --shared links lib<name>.so");
+    if (force_gui && force_console)
+        fatal("--gui and --console pick opposite Windows subsystems — pass one");
     if (!cc_override) cc_override = getenv("VYTO_CC");
     if (target && !known_triple(target))
         fatal("unknown target '%s' (see vytoc --help for the list)", target);
@@ -806,6 +1065,9 @@ int main(int argc, char **argv) {
     bool cross = strcmp(triple, host) != 0;
     bool win_target = strncmp(triple, "windows", 7) == 0;
     bool android_target = strncmp(triple, "android", 7) == 0;
+    if (manifest_vt && !win_target)
+        fatal("--manifest describes a Windows exe (name, version, icon, DPI); "
+              "this build targets %s", triple);
     if (do_run && cross)
         fatal("built for %s but this host is %s — copy the binary to the target "
               "or run it under an emulator (qemu/wine)", triple, host);
@@ -1221,6 +1483,53 @@ int main(int argc, char **argv) {
         }
     }
 
+    /* ---- Windows resources (see win_manifest_xml / read_win_manifest) ----
+       Every exe gets the application manifest; --manifest adds its icon and
+       version info. A DLL is left alone: its manifest is resource 2, and
+       supportedOS / DPI / UTF-8 belong to the exe that loads it. */
+    if (win_target && !shared && !freestanding) {
+        WinApp app = {0};
+        if (manifest_vt) app = read_win_manifest(manifest_vt, verbose);
+        else app.name = stem_of(input);
+        const char *mpath = arena_printf(&g_arena, "%s/vyto_app.manifest", cache);
+        const char *mxml = win_manifest_xml(&app);
+        bool rchanged = false, ch = false;
+        if (!write_if_changed(mpath, mxml, strlen(mxml), &ch)) fatal("cannot write %s", mpath);
+        rchanged |= ch;
+        const char *ipath = NULL;
+        uint64_t idigest = 0;
+        if (app.icon) {
+            size_t ilen = 0;
+            const char *ico = win_icon_bytes(app.icon, &ilen);
+            ipath = arena_printf(&g_arena, "%s/vyto_app.ico", cache);
+            idigest = fnv1a(ico, ilen);
+            if (!write_if_changed(ipath, ico, ilen, &ch)) fatal("cannot write %s", ipath);
+            rchanged |= ch;
+        }
+        const char *exe_name = outpath ? stem_of(outpath) : stem_of(input);
+        exe_name = arena_printf(&g_arena, "%s.exe", exe_name);
+        const char *rc = win_rc(&app, mpath, ipath, idigest, exe_name);
+        const char *rcpath = arena_printf(&g_arena, "%s/vyto_res.rc", cache);
+        const char *ropath = arena_printf(&g_arena, "%s/vyto_res%s.o", cache, osuf);
+        if (!write_if_changed(rcpath, rc, strlen(rc), &ch)) fatal("cannot write %s", rcpath);
+        rchanged |= ch;
+        if (rchanged || !file_exists(ropath)) {
+            const char *windres = find_windres(cc);
+            char *probe = arena_printf(&g_arena, "command -v %s >/dev/null 2>&1", windres);
+            if (run_cmd(probe, false) != 0)
+                fatal("the Windows resource compiler '%s' was not found; it ships with the "
+                      "mingw binutils (Debian/Ubuntu: binutils-mingw-w64-x86-64), or set "
+                      "VYTO_WINDRES", windres);
+            /* --codepage 65001: the .rc is UTF-8, so a name like "Zoë's App"
+               reaches the version info intact. */
+            char *cmdline = arena_printf(&g_arena, "%s --codepage=65001 -O coff -i %s -o %s",
+                                         windres, sh_quote(rcpath), sh_quote(ropath));
+            if (run_cmd(cmdline, verbose) != 0) fatal("compiling the Windows resources failed");
+            relink = true;
+        }
+        sb_printf(&objs, " %s", ropath);
+    }
+
     /* ---- freestanding: archive, don't link ----
        Bare-metal has no hosted crt0/main and often no linker at this stage —
        the embedder links libvyto.a with their vt_host_* hooks, startup, and
@@ -1245,7 +1554,9 @@ int main(int argc, char **argv) {
        resolved -l set, plus -shared. The `lib` prefix is what a loader expects
        to find (Android's System.loadLibrary("foo") opens libfoo.so). */
     const char *exe = outpath ? outpath
-                      : shared ? arena_printf(&g_arena, "%s/lib%s.so", cache, stem_of(input))
+                      : shared ? (win_target
+                                      ? arena_printf(&g_arena, "%s/%s.dll", cache, stem_of(input))
+                                      : arena_printf(&g_arena, "%s/lib%s.so", cache, stem_of(input)))
                                : arena_printf(&g_arena, "%s/%s%s", cache, stem_of(input),
                                               win_target ? ".exe" : "");
     const char *rpath_flag = "";
@@ -1268,7 +1579,7 @@ int main(int argc, char **argv) {
         }
     for (int i = 0; i < ncopy; i++)
         if (!file_exists(exe) || file_mtime(copy_libs[i]) > file_mtime(exe)) relink = true;
-    if (relink || !file_exists(exe)) {
+    {
         /* --bundle: bake the static archives + their deps and the C++/GCC
            runtimes into the exe (no shipped .so). System libs (libc, libX11)
            stay dynamic — fully static X11/glibc needs archives that usually
@@ -1309,11 +1620,47 @@ int main(int argc, char **argv) {
            a target API level. */
         const char *page_flag =
             (shared && android_target) ? " -Wl,-z,max-page-size=16384" : "";
-        char *cmdline = arena_printf(&g_arena, "%s%s%s%s%s%s -o %s%s%s%s%s%s -lm", cc, san,
-                                     bundle_flags, gcsec, shared_flag, page_flag, exe,
+        /* Windows defaults, so an exe built with no extra flags runs on a bare
+           machine and looks like a native app:
+           - -static-libgcc: no libgcc_s DLL to ship (it used to take --cc)
+           - ASLR and DEP, stated rather than left to the binutils version
+           - the subsystem: GUI for a program that opens windows (it imports
+             vyto/surface), so no console window appears behind it; console
+             otherwise, or when --console asks. A GUI exe started from cmd
+             still prints there: the runtime attaches to the parent console.
+           - -s under --release: a stripped exe, a fraction of the size */
+        const char *win_flags = "";
+        if (win_target) {
+            bool gui = false;
+            if (force_gui) gui = true;
+            else if (!force_console)
+                for (Module *m = g_modules; m && !gui; m = m->next)
+                    if (strcmp(m->name, "vyto_surface") == 0) gui = true;
+            win_flags = arena_printf(&g_arena,
+                                     " -static-libgcc -Wl,--dynamicbase,--nxcompat,--high-entropy-va"
+                                     " -Wl,--subsystem,%s%s",
+                                     gui ? "windows" : "console", release ? " -s" : "");
+        }
+        char *cmdline = arena_printf(&g_arena, "%s%s%s%s%s%s%s -o %s%s%s%s%s%s -lm", cc, san,
+                                     bundle_flags, gcsec, shared_flag, page_flag, win_flags, exe,
                                      objs.data, shlibs.data, libs.data, bundle_link,
                                      rpath_flag);
-        if (run_cmd(cmdline, verbose) != 0) fatal("link failed");
+        /* Relink when the link command itself changed, not only when an object
+           was rebuilt. Without this a link-only change — --console, --release's
+           strip, a new resource object, a different --cc — left the old exe in
+           place until --clean. */
+        const char *stamp = arena_printf(&g_arena, "%s/link%s.cmd", cache, osuf);
+        bool lchanged = false;
+        if (!write_if_changed(stamp, cmdline, strlen(cmdline), &lchanged))
+            fatal("cannot write %s", stamp);
+        if (lchanged) relink = true;
+        if (relink || !file_exists(exe)) {
+            if (run_cmd(cmdline, verbose) != 0) {
+                /* a failed link must not leave a stamp claiming it succeeded */
+                remove(stamp);
+                fatal("link failed");
+            }
+        }
     }
     /* ship prebuilt libraries next to the executable */
     const char *exedir = dir_of(exe);

@@ -27,9 +27,40 @@
 
 const char *os_getenv(const char *k) { return getenv(k); }
 
+#ifdef _WIN32
+/* The directory holding the running exe, as UTF-8 with forward slashes, so
+   appDir() + "/assets/x.png" reads the same on every platform. 0 on failure.
+   This replaces the compile-time paths below on Windows: those name a
+   directory on the (Linux) build host, which does not exist where the exe
+   runs. */
+static int exe_dir(char *out, size_t cap) {
+    WCHAR w[32768];
+    DWORD n = GetModuleFileNameW(NULL, w, (DWORD)(sizeof w / sizeof w[0]));
+    if (n == 0 || n >= sizeof w / sizeof w[0]) return 0;
+    while (n > 0 && w[n - 1] != L'\\' && w[n - 1] != L'/') n--;
+    if (n > 1) n--;           /* drop the separator, keep "C:\" whole below */
+    if (n == 2 && w[1] == L':') n = 3;
+    w[n] = 0;
+    if (WideCharToMultiByte(CP_UTF8, 0, w, -1, out, (int)cap, NULL, NULL) == 0) return 0;
+    for (char *c = out; *c; c++)
+        if (*c == '\\') *c = '/';
+    return 1;
+}
+
+static int dir_exists(const char *utf8) {
+    WCHAR w[32768];
+    if (MultiByteToWideChar(CP_UTF8, 0, utf8, -1, w, (int)(sizeof w / sizeof w[0])) == 0)
+        return 0;
+    DWORD a = GetFileAttributesW(w);
+    return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY);
+}
+#endif
+
 /* Resolved stdlib directory, for locating vendored assets (e.g. fonts) at
-   runtime. Runtime VYTO_HOME wins; otherwise the compiler bakes the path it
-   resolved via -DVYTO_LIBDIR. Empty string when neither is available. */
+   runtime. Runtime VYTO_HOME wins. On Windows it is <exe dir>/lib, else
+   <exe dir>/../lib, the same layouts vytoc itself searches; elsewhere the
+   compiler bakes the path it resolved via -DVYTO_LIBDIR. Empty string when
+   none is available. */
 const char *os_lib_dir(void) {
     static char buf[4096];
     static int cached = 0;
@@ -37,7 +68,15 @@ const char *os_lib_dir(void) {
     cached = 1;
     const char *e = getenv("VYTO_HOME");
     if (e && *e) { snprintf(buf, sizeof buf, "%s/lib", e); return buf; }
-#ifdef VYTO_LIBDIR
+#ifdef _WIN32
+    char dir[4096];
+    buf[0] = 0;
+    if (exe_dir(dir, sizeof dir)) {
+        snprintf(buf, sizeof buf, "%s/lib", dir);
+        if (!dir_exists(buf)) snprintf(buf, sizeof buf, "%s/../lib", dir);
+        if (!dir_exists(buf)) buf[0] = 0;
+    }
+#elif defined(VYTO_LIBDIR)
     snprintf(buf, sizeof buf, "%s", VYTO_LIBDIR);
 #else
     buf[0] = 0;
@@ -45,9 +84,11 @@ const char *os_lib_dir(void) {
     return buf;
 }
 
-/* The app's own directory (entry file's dir), for locating its assets/conf/
-   storage at runtime. Runtime VYTO_APP_DIR wins; otherwise the compiler bakes
-   the path via -DVYTO_APPDIR. Empty string when neither is available. */
+/* The app's own directory, for locating its assets/conf/storage at runtime.
+   Runtime VYTO_APP_DIR wins. On Windows it is the directory holding the exe,
+   because an exe is shipped with its assets beside it; elsewhere the compiler
+   bakes the entry file's directory via -DVYTO_APPDIR. Empty string when none
+   is available. */
 const char *os_app_dir(void) {
     static char buf[4096];
     static int cached = 0;
@@ -55,7 +96,9 @@ const char *os_app_dir(void) {
     cached = 1;
     const char *e = getenv("VYTO_APP_DIR");
     if (e && *e) { snprintf(buf, sizeof buf, "%s", e); return buf; }
-#ifdef VYTO_APPDIR
+#ifdef _WIN32
+    if (!exe_dir(buf, sizeof buf)) buf[0] = 0;
+#elif defined(VYTO_APPDIR)
     snprintf(buf, sizeof buf, "%s", VYTO_APPDIR);
 #else
     buf[0] = 0;

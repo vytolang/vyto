@@ -1,0 +1,57 @@
+// Manual Windows check for the exe groundwork, built into the Win7 kit.
+//
+// Double-click it: no console window opens; the title bar and taskbar show the
+// exe's embedded icon; two seconds later the window icon changes to a red square
+// (Surface.set_icon at runtime). Start it from cmd instead and the appDir line
+// below appears in that console (the GUI exe attaches to it).
+//
+// DPI: it shows the scale Windows reports and sizes a box and the window by it.
+// A DPI-aware build at 150% reports 150% and draws crisp; a dpi "unaware" build
+// is told 100% and Windows stretches it (blurry). Windows 7 only stretches
+// from 150% up: at 125% it uses XP-style scaling and tells every app the truth.
+import { Surface, Rect, rgb, EV_CLOSE } from "vyto/surface";
+import { appDir } from "vyto/os";
+
+fn draw(s: Surface, line: string) {
+    let k = s.scale();
+    let w = (s.width() as float);
+    let h = (s.height() as float);
+    s.fill(Rect(0.0, 0.0, w, h), rgb(245, 246, 250));
+    s.text(16, 40, "Vyto exe groundwork check", rgb(30, 30, 40));
+    s.text(16, 70, line, rgb(40, 90, 200));
+    s.text(16, 100, `appDir: {appDir()}`, rgb(90, 90, 100));
+    s.text(16, 130, `scale Windows reports: {(k * 100.0).round()}%`, rgb(200, 40, 40));
+    // a 100-pixel box at 96 dpi, scaled: its edge is where blur shows
+    let b = 100.0 * k;
+    s.fill(Rect(16.0, 150.0, b, b), rgb(40, 90, 200));
+    s.fill(Rect(16.0 + b / 4.0, 150.0 + b / 4.0, b / 2.0, b / 2.0), rgb(255, 255, 255));
+    s.present();
+}
+
+fn main() {
+    print(`appDir {appDir()}`);
+    let s = new Surface("Vyto icon demo", 420, 160);
+    let k = s.scale();
+    print(`scale {(k * 100.0).round()}%`);
+    // Size the window by the scale too, so an aware build at 150% is visibly
+    // bigger than its 100% self rather than a smaller window stretched.
+    s.set_size((420.0 * k) as int, ((170.0 + 100.0) * k) as int);
+    draw(s, "icon: the exe's own (blue). Turns red in 2 s.");
+    let t0 = s.now_ms();
+    let changed = false;
+    while (true) {
+        let ev = s.wait_timeout(100);
+        if (ev == EV_CLOSE) { break; }
+        if (!changed && s.now_ms() - t0 > 2000) {
+            let px: i32[] = [];
+            for (let i in 0..(32 * 32)) { px.push(rgb(220, 40, 40) as i32); }
+            s.set_icon(px, 32, 32);
+            changed = true;
+            draw(s, "icon: set at runtime (red square).");
+        } else if (ev != 0) {
+            let line = "icon: the exe's own (blue). Turns red in 2 s.";
+            if (changed) { line = "icon: set at runtime (red square)."; }
+            draw(s, line);
+        }
+    }
+}

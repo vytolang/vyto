@@ -380,6 +380,7 @@ typedef struct VSurf {
     HBITMAP bmp;
     HBITMAP bmp0; /* original 1x1 bitmap of memdc, restored before delete */
     HFONT font;
+    HICON icon;   /* from vs_set_icon, owned here; NULL = class/exe icon */
     int w, h;
     int min_w, min_h; /* client-area floor from vs_set_min_size; 0 = none */
 
@@ -597,13 +598,25 @@ void *vs_open(const char *title, int w, int h) {
     }
     static int registered;
     if (!registered) {
-        WNDCLASSA wc;
+        /* The exe's own icon (resource 1, which vytoc embeds from --manifest)
+           for the title bar and taskbar. Explorer reads the resource on its
+           own; a window only shows it if its class names it. With no icon in
+           the exe both are NULL and Windows draws its default. */
+        HINSTANCE inst = GetModuleHandle(NULL);
+        WNDCLASSEXA wc;
         memset(&wc, 0, sizeof wc);
+        wc.cbSize = sizeof wc;
         wc.lpfnWndProc = vs_wndproc;
-        wc.hInstance = GetModuleHandle(NULL);
+        wc.hInstance = inst;
         wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+        wc.hIcon = (HICON)LoadImageA(inst, MAKEINTRESOURCEA(1), IMAGE_ICON,
+                                     GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON),
+                                     LR_DEFAULTCOLOR);
+        wc.hIconSm = (HICON)LoadImageA(inst, MAKEINTRESOURCEA(1), IMAGE_ICON,
+                                       GetSystemMetrics(SM_CXSMICON),
+                                       GetSystemMetrics(SM_CYSMICON), LR_DEFAULTCOLOR);
         wc.lpszClassName = "VytoSurface";
-        if (!RegisterClassA(&wc)) { free(s); return NULL; }
+        if (!RegisterClassExA(&wc)) { free(s); return NULL; }
         registered = 1;
     }
     RECT r = {0, 0, w, h};
@@ -635,6 +648,7 @@ void vs_close(void *vs) {
         SetWindowLongPtr(s->hwnd, GWLP_USERDATA, 0);
         DestroyWindow(s->hwnd);
     }
+    if (s->icon) DestroyIcon(s->icon);
     free(s);
 }
 
@@ -644,6 +658,53 @@ int vs_height(void *vs) { return ((VSurf *)vs)->h; }
 void vs_set_title(void *vs, const char *t) {
     VSurf *s = vs;
     if (s->hwnd) SetWindowTextA(s->hwnd, t);
+}
+
+/* A 32-bit top-down DIB holds the pixels as-is: 0xAARRGGBB in a uint32 is
+   B, G, R, A in memory, which is a DIB's layout, and an icon's alpha is
+   straight like ours. The monochrome mask is all zero (opaque); with a 32-bit
+   colour bitmap Windows takes transparency from the alpha channel instead. */
+void vs_set_icon(void *vs, const unsigned int *argb, int w, int h) {
+    VSurf *s = vs;
+    if (!s || !s->hwnd || !argb || w <= 0 || h <= 0 || w > 256 || h > 256) return;
+    BITMAPV5HEADER bi;
+    memset(&bi, 0, sizeof bi);
+    bi.bV5Size = sizeof bi;
+    bi.bV5Width = w;
+    bi.bV5Height = -h; /* top row first */
+    bi.bV5Planes = 1;
+    bi.bV5BitCount = 32;
+    bi.bV5Compression = BI_BITFIELDS;
+    bi.bV5RedMask = 0x00FF0000;
+    bi.bV5GreenMask = 0x0000FF00;
+    bi.bV5BlueMask = 0x000000FF;
+    bi.bV5AlphaMask = 0xFF000000;
+    void *bits = NULL;
+    HDC dc = GetDC(NULL);
+    HBITMAP color = CreateDIBSection(dc, (BITMAPINFO *)&bi, DIB_RGB_COLORS, &bits, NULL, 0);
+    ReleaseDC(NULL, dc);
+    if (!color || !bits) { if (color) DeleteObject(color); return; }
+    memcpy(bits, argb, (size_t)w * (size_t)h * 4);
+    size_t mrow = (size_t)((w + 15) / 16) * 2; /* monochrome rows pad to 16 bits */
+    void *mbits = calloc((size_t)h, mrow);
+    HBITMAP mask = mbits ? CreateBitmap(w, h, 1, 1, mbits) : NULL;
+    free(mbits);
+    if (!mask) { DeleteObject(color); return; }
+    ICONINFO ii;
+    memset(&ii, 0, sizeof ii);
+    ii.fIcon = TRUE;
+    ii.hbmMask = mask;
+    ii.hbmColor = color;
+    HICON icon = CreateIconIndirect(&ii);
+    DeleteObject(color);
+    DeleteObject(mask);
+    if (!icon) return;
+    SendMessageA(s->hwnd, WM_SETICON, ICON_BIG, (LPARAM)icon);
+    SendMessageA(s->hwnd, WM_SETICON, ICON_SMALL, (LPARAM)icon);
+    /* Only an icon this function made is ours to destroy; the class icon
+       WM_SETICON hands back belongs to the exe. */
+    if (s->icon) DestroyIcon(s->icon);
+    s->icon = icon;
 }
 
 
@@ -2081,6 +2142,26 @@ int vs_height(void *vs) { return ((VSurf *)vs)->h; }
 void vs_set_title(void *vs, const char *t) {
     VSurf *s = vs;
     if (s->dpy) XStoreName(s->dpy, s->win, t);
+}
+
+/* _NET_WM_ICON is width, height, then one ARGB pixel per CARDINAL, top row
+   first. Xlib passes format-32 data as longs, whatever their width, so the
+   array is unsigned long rather than uint32. Headless and fbdev have no
+   window manager to show an icon. */
+void vs_set_icon(void *vs, const unsigned int *argb, int w, int h) {
+    VSurf *s = vs;
+    if (!s || !s->dpy || !argb || w <= 0 || h <= 0 || w > 256 || h > 256) return;
+    size_t n = 2 + (size_t)w * (size_t)h;
+    unsigned long *data = malloc(n * sizeof *data);
+    if (!data) return;
+    data[0] = (unsigned long)w;
+    data[1] = (unsigned long)h;
+    for (size_t i = 0; i < (size_t)w * (size_t)h; i++) data[2 + i] = argb[i];
+    Atom a = XInternAtom(s->dpy, "_NET_WM_ICON", False);
+    XChangeProperty(s->dpy, s->win, a, XA_CARDINAL, 32, PropModeReplace,
+                    (unsigned char *)data, (int)n);
+    XFlush(s->dpy);
+    free(data);
 }
 
 

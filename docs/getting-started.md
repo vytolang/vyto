@@ -256,13 +256,81 @@ sudo apt-get install -y gcc-mingw-w64-x86-64      # provides x86_64-w64-mingw32-
 ./vytoc build app.vt --release --target windows-x64 -o app.exe
 ```
 
-`vytoc` picks `x86_64-w64-mingw32-gcc` for that triple automatically. Add
-`-static-libgcc` if the `.exe` has to run on a machine with no mingw runtime
-DLLs:
+`vytoc` picks `x86_64-w64-mingw32-gcc` for that triple automatically, and the
+resource compiler `x86_64-w64-mingw32-windres` from the same binutils package.
+
+### What every Windows exe gets
+
+With no extra flags, a `windows-x64` exe:
+
+- **needs no mingw DLLs.** `libgcc` is linked statically. The CRT is
+  `msvcrt.dll`, which every Windows since XP ships, so nothing needs installing
+  on Windows 7 either.
+- **is a GUI app if it opens windows.** A program that imports `vyto/surface`
+  (directly, or through `vyto/ui`, `vyto/gfx` or `vyto/win/d2d`) is linked for
+  the GUI subsystem, so double-clicking it shows no console window. Anything
+  else is a console program. Override with `--console` (a command-line tool that
+  also happens to draw) or `--gui`. A GUI exe started from `cmd` still prints
+  there: it attaches to the parent's console. Because cmd does not wait for a
+  GUI program, that output can arrive after the prompt returns; a tool meant for
+  the command line should be built with `--console`.
+- **carries an application manifest**, which:
+  - lists Windows 7 through 11 as supported, so newer Windows does not misreport
+    its version to the app
+  - asks for no elevation (`asInvoker`), so an exe named like an installer does
+    not trigger a UAC prompt
+  - turns on UTF-8 for the ANSI APIs (file names, arguments, window titles) on
+    Windows 10 1903 and later
+  - declares system DPI awareness, so text renders at the display's scale
+    instead of being stretched (125%, 150%)
+- **has ASLR and DEP on**, and under `--release` is stripped of debug info.
+- `--shared` builds `<name>.dll`, exporting `vyto_app_main`.
+
+`appDir()` is the directory holding the exe, so an app shipped as
+`app.exe` plus an `assets/` folder finds its files from any working directory.
+`libDir()` is `<exe dir>/lib`, else `<exe dir>/../lib`.
+
+### Name, version and icon: `--manifest`
+
+An exe's icon, its version info (Explorer's Properties → Details tab) and its
+DPI mode come from a small Vyto program, the same way an Android app's
+`AndroidManifest.xml` comes from its `manifest.vt`:
+
+```js
+// win_manifest.vt
+import { WinManifest } from "vyto/win/manifest";
+
+fn main() {
+    let m = new WinManifest("Vyto Files")
+        .version("1.2.0")
+        .icon("assets/icon.png")        // a .png up to 256x256, or an .ico
+        .company("Vyto")
+        .description("A two-pane file manager")
+        .copyright("(c) 2026 Vyto");
+    m.emit();
+}
+```
 
 ```sh
-./vytoc build app.vt --target windows-x64 --cc "x86_64-w64-mingw32-gcc -static-libgcc"
+./vytoc build app.vt --release --target windows-x64 --manifest win_manifest.vt -o app.exe
 ```
+
+`vytoc` runs that program on the build machine and embeds what it prints.
+`emit()` validates first: a bad version, an unknown DPI mode or a non-image
+icon fails the build with the reason instead of producing a broken exe. The
+icon path is relative to the manifest program. `.dpi("unaware")` opts an app
+out of DPI awareness, for one that does not scale its own drawing yet. These
+settings belong to the build, not the running program, because Explorer and
+the Windows loader read them from the file without starting it. A window's icon
+can still change while the program runs: `Window.set_icon(pixels, w, h)`.
+
+### Will it run on Windows 7?
+
+`tests/win/pe_audit.sh app.exe` checks every function the exe imports against
+the exports of a real Windows 7 install (`tests/win/win7_exports.txt`), plus
+any Universal CRT dependency, which Windows 7 lacks without KB2999226. `make
+test-win` runs it on every staged exe. A newer API used without a runtime
+check is caught here instead of as "entry point not found" on a user's machine.
 
 ### What is portable today
 
@@ -398,9 +466,10 @@ fn font_path(): string {
     --target windows-x64 -o charts.exe
 ```
 
-One path serves both cases. Unbundled, `appDir()` makes it absolute so it
-resolves from any working directory; bundled, the runtime VFS matches it by
-suffix and the font comes out of the binary. `Canvas.loadFont` and
+One path serves both cases. Unbundled, `appDir()` is the directory holding
+the exe, so ship `assets/` beside it and the path resolves from any working
+directory; bundled, the runtime VFS matches it by suffix and the font comes out
+of the binary. `Canvas.loadFont` and
 `GfxPainter` both consult the VFS before the disk. If you use `GfxPainter`,
 ship the `-Medium` and `-Bold` siblings alongside the regular face — it derives
 their paths from it.
