@@ -389,5 +389,52 @@ installer_check() {
 }
 installer_check
 
+# --- vyto/desktop/channel on Windows: the GUI loop sleeps on the socket --------
+# gui_probe.exe idle connects to the channel test server and waits. Its
+# voluntary context switches over 2 s are counted: the Win32 loop now waits on
+# the socket itself (WSAEventSelect + MsgWaitForMultipleObjectsEx), measured at
+# ~64 under Wine, where the old 16 ms polling was ~480 and a mis-armed event
+# spun at ~170000. Then cli.exe pushes and the window must close.
+channel_check() {
+    for t in Xvfb; do command -v "$t" >/dev/null 2>&1 || { echo "SKIP wine_channel_gui (no $t)"; return 0; }; done
+    cdir="$STAGE/channel"
+    [ -f "$cdir/gui_probe.exe" ] || { echo "FAIL wine_channel_gui (not staged)"; fail=$((fail + 1)); return 0; }
+    wineserver -k >/dev/null 2>&1; sleep 1
+    rm -rf "$cdir/dir"; mkdir -p "$cdir/dir"
+    VYTO_CHANNEL_DIR="Z:$(cd "$cdir" && pwd | tr / '\\')\\dir"; export VYTO_CHANNEL_DIR
+    # The display comes first: the first Wine process of a session decides
+    # whether that session has X, so a server started without DISPLAY leaves
+    # the GUI started after it unable to open a window.
+    Xvfb -displayfd 3 -screen 0 800x600x24 -nolisten tcp 3>"$tmp/cdpy" >/dev/null 2>&1 & xp=$!
+    i=0; while [ ! -s "$tmp/cdpy" ] && [ $i -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+    cdisp=":$(cat "$tmp/cdpy")"
+    (cd "$cdir" && DISPLAY=$cdisp exec timeout 60 "$WINE" ./srv.exe > /dev/null 2>&1 < /dev/null) & sp=$!
+    sleep 3
+    (cd "$cdir" && DISPLAY=$cdisp timeout 40 "$WINE" ./gui_probe.exe idle > "$tmp/gp.log" 2>&1) & gp=$!
+    sleep 4
+    pid=$(pgrep -x gui_probe.exe | head -1)
+    wk=-1
+    if [ -n "$pid" ]; then
+        a=$(awk '/^voluntary_ctxt/{print $2}' /proc/$pid/status)
+        sleep 2
+        b=$(awk '/^voluntary_ctxt/{print $2}' /proc/$pid/status)
+        wk=$((b - a))
+    fi
+    (cd "$cdir" && DISPLAY=$cdisp timeout 20 "$WINE" ./cli.exe pushone > /dev/null 2>&1)
+    wait $gp
+    kill $sp $xp 2>/dev/null
+    got=$(tr -d '\r' < "$tmp/gp.log")
+    unset VYTO_CHANNEL_DIR
+    if [ "$got" = "state: true
+push: hello gui
+window closed" ] && [ "$wk" -ge 0 ] && [ "$wk" -lt 200 ]; then
+        echo "PASS wine_channel_gui ($wk wakeups in 2 s idle)"; pass=$((pass + 1))
+    else
+        echo "FAIL wine_channel_gui (wakeups $wk; got: $got)"; fail=$((fail + 1))
+    fi
+    wineserver -k >/dev/null 2>&1
+}
+channel_check
+
 echo "wine: $pass passed, $fail failed (Wine $("$WINE" --version 2>/dev/null), not Windows 7)"
 [ "$fail" -eq 0 ]

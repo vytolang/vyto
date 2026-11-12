@@ -226,6 +226,17 @@ fi
 # local test server (https_local): both need something on the other end — a
 # person or xdotool, an openssl s_server — so they are staged, not in the
 # manifest. run_tests_wine.sh drives both; the README says how by hand.
+# The channel's Windows side: its test server and client, and the GUI probe
+# whose idle wakeups run_tests_wine.sh counts (the Win32 socket wait).
+mkdir -p "$STAGE/channel"
+for t in srv cli gui_probe; do
+    if ./vytoc build "tests/fixtures/channel/$t.vt" --target "$TRIPLE" --cc "$CC_CMD" \
+            -o "$STAGE/channel/$t.exe" >/dev/null 2>"$STAGE/.ch_$t.err"; then
+        rm -f "$STAGE/.ch_$t.err"
+    else
+        echo "FAIL build channel/$t"; cat "$STAGE/.ch_$t.err"; fail=1
+    fi
+done
 for t in desktop_demo https_local service_demo; do
     if ./vytoc build "tests/win/$t.vt" --target "$TRIPLE" --cc "$CC_CMD" \
             -o "$STAGE/$t.exe" >/dev/null 2>"$STAGE/.$t.err"; then
@@ -256,7 +267,7 @@ else
 fi
 mkdir -p "$STAGE/tls"
 cp tests/fixtures/tls/root.crt tests/fixtures/tls/other-root.crt "$STAGE/tls/"
-if ! ./vytoc audit "$STAGE"/*.exe "$STAGE"/inst/*/*-setup.exe; then fail=1; fi
+if ! ./vytoc audit "$STAGE"/*.exe "$STAGE"/inst/*/*-setup.exe "$STAGE"/channel/*.exe; then fail=1; fi
 # The DLLs shipped beside the exes are skipped by the exe audit (they are the
 # app's own), so audit them as binaries of their own. No exceptions: curl used
 # to be a UCRT-linked DLL here and was reported KNOWN; it is now built from

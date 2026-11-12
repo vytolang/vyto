@@ -305,6 +305,12 @@ constructs one — only app code does.
 `Path` comes from `vyto/geom/path`, deliberately: it is the one structured type
 in the `Painter` API and it must stay renderer-neutral.
 
+**The Win32 window loop waits on sockets** (`vsurf.c` `vs_wait_timeout_fds`:
+`WSAEventSelect` + `MsgWaitForMultipleObjectsEx`, ws2_32 looked up only if
+already loaded). Never add `FD_CONNECT` to its mask: re-arming it on a
+connected socket fires at once and the loop spun at ~85k wakeups/s. The idle
+count is checked by `wine_channel_gui`.
+
 **`Window.repaint()` does partial *drawing*, not just partial presenting.**
 `ui/core.vt:2111-2146` clips to the dirty rect and redraws only intersecting
 widgets, assuming everything outside is still in the backbuffer. Any renderer

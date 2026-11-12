@@ -1487,18 +1487,78 @@ int vs_wait_timeout(void *vs, int ms) {
     }
 }
 
-/* No fd folding on Win32: a C runtime fd is not a WaitForMultipleObjects
-   handle, and MsgWaitForMultipleObjectsEx takes the latter. (A *socket* could
-   be bridged with WSAEventSelect, but a poll source is not necessarily a
-   socket -- a worker channel here is a pipe -- so bridging would work for some
-   callers and silently not others.)
+/* Waiting on window messages AND sockets at once: each fd is a socket bound to
+   an event with WSAEventSelect, and MsgWaitForMultipleObjectsEx sleeps until a
+   message or any of them fires. That is what lets a GUI with a channel to its
+   services (vyto/desktop/channel/gui) sleep at 0% CPU instead of waking 60
+   times a second.
 
-   Degrades to the bounded wait, which is exactly the 16ms polling the caller
-   would have done anyway: correct, just not power-optimal. vs_can_wait_fds()
-   reports which behaviour a caller is getting. */
+   ws2_32 is not linked here: an app that has sockets already loaded it, so the
+   three functions are looked up from the loaded module, and an app without
+   sockets pays nothing. Anything that is not a socket (WSAEventSelect fails),
+   or no ws2_32 at all, degrades for that call to a bounded wait of at most
+   16 ms -- the caller asked for a longer one only because it believed the fds
+   would wake it, so a fallback must not stretch its latency to that.
+
+   WSAEventSelect leaves the socket non-blocking, which every poll source is
+   already; the association is removed again after each wait. */
+#define VS_FD_READ    0x01
+#define VS_FD_ACCEPT  0x08
+#define VS_FD_CLOSE   0x20
+/* Not FD_CONNECT: re-arming it on an already-connected socket on every wait
+   signals the event at once, and the loop spun at ~85k wakeups a second
+   (measured under Wine). A connect in progress is the poll source's own
+   business (vyto/desktop/channel polls it); the loop's own timer ceiling
+   bounds how late it is noticed. FD_WRITE is not watched either: poll
+   sources only ever wait to read. */
+
+typedef HANDLE (WINAPI *vs_wsa_create_fn)(void);
+typedef int (WINAPI *vs_wsa_select_fn)(UINT_PTR, HANDLE, long);
+typedef BOOL (WINAPI *vs_wsa_close_fn)(HANDLE);
+
 int vs_wait_timeout_fds(void *vs, int ms, const int *fds, int n) {
-    (void)fds; (void)n;
-    return vs_wait_timeout(vs, ms);
+    VSurf *s = vs;
+    if (!s->hwnd || n <= 0) return vs_wait_timeout(vs, ms);
+    if (s->evq_len) return q_pop(s);
+    int fallback = ms < 0 || ms > 16 ? 16 : ms;
+    HMODULE ws = GetModuleHandleW(L"ws2_32.dll");
+    if (!ws) return vs_wait_timeout(vs, fallback);
+    vs_wsa_create_fn wcreate = (vs_wsa_create_fn)(void (*)(void))GetProcAddress(ws, "WSACreateEvent");
+    vs_wsa_select_fn wselect = (vs_wsa_select_fn)(void (*)(void))GetProcAddress(ws, "WSAEventSelect");
+    vs_wsa_close_fn wclose = (vs_wsa_close_fn)(void (*)(void))GetProcAddress(ws, "WSACloseEvent");
+    if (!wcreate || !wselect || !wclose) return vs_wait_timeout(vs, fallback);
+    HANDLE evs[MAXIMUM_WAIT_OBJECTS - 1];
+    int k = 0;
+    int ok = 1;
+    for (int i = 0; i < n && k < MAXIMUM_WAIT_OBJECTS - 1; i++) {
+        HANDLE ev = wcreate();
+        if (ev == NULL || ev == INVALID_HANDLE_VALUE) { ok = 0; break; }
+        if (wselect((UINT_PTR)(unsigned)fds[i], ev,
+                    VS_FD_READ | VS_FD_ACCEPT | VS_FD_CLOSE) != 0) {
+            wclose(ev);
+            ok = 0;
+            break;
+        }
+        evs[k++] = ev;
+    }
+    DWORD r = WAIT_TIMEOUT;
+    if (ok) {
+        r = MsgWaitForMultipleObjectsEx((DWORD)k, evs, ms < 0 ? INFINITE : (DWORD)ms, QS_ALLINPUT,
+                                        MWMO_INPUTAVAILABLE);
+    }
+    for (int i = 0; i < k; i++) {
+        wselect((UINT_PTR)(unsigned)fds[i], NULL, 0);
+        wclose(evs[i]);
+    }
+    if (!ok) return vs_wait_timeout(vs, fallback);
+    if (r == WAIT_TIMEOUT || (r >= WAIT_OBJECT_0 && r < WAIT_OBJECT_0 + (DWORD)k))
+        return VS_EV_TIMER;   /* a socket is ready: the caller pumps its poll sources */
+    MSG msg;
+    while (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE)) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+    return s->evq_len ? q_pop(s) : VS_EV_TIMER;
 }
 
 /* Win32 has no waitable descriptor for window events: the loop blocks in
@@ -1525,7 +1585,8 @@ int vs_damage(void *vs, VsRect *out) {
 /* Messages already decoded into the queue by a previous PeekMessage. */
 int vs_events_pending(void *vs) { VSurf *s = vs; return s ? s->evq_len : 0; }
 
-int vs_can_wait_fds(void *vs) { (void)vs; return 0; }
+/* Sockets, yes (vs_wait_timeout_fds above); anything else degrades per call. */
+int vs_can_wait_fds(void *vs) { VSurf *s = vs; return s && s->hwnd ? 1 : 0; }
 
 void *vs_native_display(void *vs) {
     (void)vs;
