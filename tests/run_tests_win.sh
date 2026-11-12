@@ -8,7 +8,7 @@
 #
 # Scope: core language + runtime + every stdlib package that has a Windows
 # story. That is most of them: vyto/surface, vyto/ui and vyto/gfx (blend2d
-# cross-builds), vyto/net/* (Winsock + a staged libcurl DLL) and vyto/os/worker
+# cross-builds), vyto/net/* (Winsock + curl and mbedTLS built from vendored source) and vyto/os/worker
 # (a re-exec pool rather than fork) are all staged here.
 #
 # Only vyto/hw/* (Linux device interfaces) and vyto/intl (ICU) are excluded —
@@ -137,6 +137,7 @@ apps/motiondemo/motiondemo.vt|motiondemo|contains||VS_HEADLESS=1 VS_EVENTS=motio
 tests/win/d2d_props.vt|d2d_props|eq||VS_HEADLESS=1
 tests/fixtures/win_gui_app.vt|win_gui_app|eq|||--manifest tests/fixtures/win_gui_manifest.vt
 tests/fixtures/win_console_app.vt|win_console_app|eq|
+tests/win/desktop_dirs_win.vt|desktop_dirs_win|eq|
 EOF
 )
 
@@ -199,7 +200,7 @@ if [ -f "$STAGE/.failed" ]; then fail=1; rm -f "$STAGE/.failed"; fi
 # --- Windows 7 import audit ------------------------------------------------
 # dump_exports.exe lists a real Windows install's system DLL exports; run.ps1
 # runs it, and its win7_exports.txt from a Windows 7 box is committed as
-# tests/win/win7_exports.txt. pe_audit.sh then checks every staged binary
+# lib/vyto/win/win7_exports.txt. `vytoc audit` then checks every staged binary
 # against that list here, before anything is copied to Windows: an import
 # Windows 7 lacks fails the exe at load with "entry point not found".
 if $CROSS_CC -O2 -o "$STAGE/dump_exports.exe" tests/win/dump_exports.c; then
@@ -220,18 +221,31 @@ else
     cat "$STAGE/.input_demo.err"
     fail=1
 fi
-if ! tests/win/pe_audit.sh "$STAGE"/*.exe; then fail=1; fi
+# vyto/desktop's dialogs one after another (desktop_demo) and HTTPS against a
+# local test server (https_local): both need something on the other end — a
+# person or xdotool, an openssl s_server — so they are staged, not in the
+# manifest. run_tests_wine.sh drives both; the README says how by hand.
+for t in desktop_demo https_local; do
+    if ./vytoc build "tests/win/$t.vt" --target "$TRIPLE" --cc "$CC_CMD" \
+            -o "$STAGE/$t.exe" >/dev/null 2>"$STAGE/.$t.err"; then
+        echo "BUILT $t"
+        rm -f "$STAGE/.$t.err"
+    else
+        echo "FAIL build $t"
+        cat "$STAGE/.$t.err"
+        fail=1
+    fi
+done
+mkdir -p "$STAGE/tls"
+cp tests/fixtures/tls/root.crt tests/fixtures/tls/other-root.crt "$STAGE/tls/"
+if ! ./vytoc audit "$STAGE"/*.exe; then fail=1; fi
 # The DLLs shipped beside the exes are skipped by the exe audit (they are the
-# app's own), so audit them as binaries of their own. All but libcurl: the
-# prebuilt curl links the Universal CRT, which Windows 7 lacks without
-# KB2999226. That is a known gap (rebuilding curl against msvcrt with a
-# vendored TLS library is the fix), reported here but not failed on.
+# app's own), so audit them as binaries of their own. No exceptions: curl used
+# to be a UCRT-linked DLL here and was reported KNOWN; it is now built from
+# source into each exe (lib/vyto/net/native/refresh-curl.sh).
 for dll in "$STAGE"/*.dll; do
     [ -f "$dll" ] || continue
-    case "$(basename "$dll")" in
-        libcurl*.dll) echo "KNOWN pe_audit $(basename "$dll") (needs the UCRT on Windows 7)" ;;
-        *) if ! tests/win/pe_audit.sh "$dll"; then fail=1; fi ;;
-    esac
+    if ! ./vytoc audit "$dll"; then fail=1; fi
 done
 
 # --- the Windows-side runner ---------------------------------------------
@@ -349,8 +363,8 @@ foreach ($line in Get-Content -LiteralPath "manifest.txt") {
     }
 }
 
-# The system DLL exports this Windows has, for tests/win/pe_audit.sh. Copy
-# win7_exports.txt back as tests/win/win7_exports.txt when this is Windows 7.
+# The system DLL exports this Windows has, for `vytoc audit`. Copy
+# win7_exports.txt back as lib/vyto/win/win7_exports.txt when this is Windows 7.
 $dump = Join-Path $root "dump_exports.exe"
 if (Test-Path -LiteralPath $dump) {
     $exportsFile = Join-Path $root "win7_exports.txt"
@@ -382,11 +396,41 @@ file. Results go to the console and to results.txt — copy results.txt back to
 the build machine.
 
 run.ps1 also writes win7_exports.txt: the functions this Windows' system DLLs
-export. From a Windows 7 machine, copy it back as tests/win/win7_exports.txt;
-tests/win/pe_audit.sh checks every exe's imports against it.
+export. From a Windows 7 machine, copy it back as lib/vyto/win/win7_exports.txt;
+`vytoc audit` (and `vytoc build --audit`) checks every exe's imports against it.
 
 Note on 45_os: it uses only shell builtins that sh and cmd.exe share (exit N,
 echo), so its output does not depend on which tools are on PATH.
+
+By hand, after run.ps1 (these need a person or a network):
+
+  HTTPS (vendored curl + mbedTLS). From cmd in this directory:
+      set VYTO_HTTP_LIVE=1 & 47_http.exe          -> live.status=200 ok=true
+      set HTTPS_URL=https://letsencrypt.org/& https_local.exe
+                                                   -> status=200 ok=true
+      set HTTPS_URL=https://self-signed.badssl.com/& https_local.exe
+                                                   -> status=0 ok=false (MUST fail)
+      set HTTPS_URL=https://expired.badssl.com/& https_local.exe
+                                                   -> status=0 ok=false (MUST fail)
+    Then rename cacert.pem away and run the letsencrypt line again: that is
+    the Windows ROOT store alone. Note the result either way — on a box that
+    rarely browses it may fail, which is why cacert.pem ships with the exe.
+
+  vyto/desktop:  desktop_demo.exe window
+    A window opens, then one dialog after another. Check each:
+      - message box: information icon, title and text show "Zöë 日本"
+      - Yes/No box: question icon; press Yes
+      - open: the Explorer-style dialog with a "Text" filter; pick a file
+        whose name has non-ASCII letters; its full path is printed
+      - open many: Ctrl+click two files; both paths are printed
+      - save: suggests vyto-new.txt; choosing an existing file asks first.
+        The dialog only picks the path; the demo then writes a small file
+        there and prints "wrote: true" — check the file exists
+      - folder: the modern folder picker; the folder path is printed
+      - every dialog above stays in front of the window, and the window
+        cannot be clicked while one is open (they are owned by it)
+      - a warning box with no owner, then example.com opens in the browser
+    desktop_dirs_win.exe prints its checks (also in run.ps1).
 
 Not covered here: vyto/hw/* (Linux device interfaces) and vyto/intl (ICU) are
 not portable to Windows yet. Everything else in the stdlib is staged above.

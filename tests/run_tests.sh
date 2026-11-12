@@ -295,6 +295,151 @@ else
     echo "FAIL freestanding_d2d_stub (vyto/win/d2d's stub arm does not build freestanding)"
     fail=1
 fi
+# native/<triple>/src and native/<triple>/stage (src/main.c). Each triple dir
+# of the fixture defines its own pt_target(), so the string that links says
+# which dir compiled; a Linux build must contain none of the Windows source and
+# must not receive the Windows-only staged file. The edit check copies the
+# fixture so a per-triple source change is proven to reach the object (it keys
+# on its own tree, not native/src's).
+got=$(./vytoc run tests/fixtures/pertriple_main.vt 2>&1)
+if [ "$got" = "common + linux-x64 src" ]; then
+    echo "PASS pertriple_host"
+else
+    echo "FAIL pertriple_host (got: $got)"
+    fail=1
+fi
+ptd=tests/tmp/pertriple; rm -rf "$ptd"; mkdir -p "$ptd/bin"
+if ./vytoc build tests/fixtures/pertriple_main.vt -o "$ptd/bin/pt" >/dev/null 2>&1 \
+        && ! grep -aq PT_WIN_MARKER "$ptd/bin/pt" && [ ! -e "$ptd/bin/pt_staged.txt" ]; then
+    echo "PASS pertriple_host_excludes_windows"
+else
+    echo "FAIL pertriple_host_excludes_windows (Windows-only source or staged file reached a Linux build)"
+    fail=1
+fi
+if command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1; then
+    r=bad
+    if ./vytoc build tests/fixtures/pertriple_main.vt --target windows-x64 \
+            -o "$ptd/bin/pt.exe" >/dev/null 2>&1 \
+            && grep -aq PT_WIN_MARKER "$ptd/bin/pt.exe" \
+            && ! grep -aq "linux-x64 src" "$ptd/bin/pt.exe" \
+            && [ -f "$ptd/bin/pt_staged.txt" ]; then
+        r=ok
+    fi
+    [ $r = ok ] && echo "PASS pertriple_windows" || { echo "FAIL pertriple_windows"; fail=1; }
+    cp -r tests/fixtures/pertriple tests/fixtures/pertriple_main.vt "$ptd/"
+    sed -i 's/PT_WIN_MARKER/PT_WIN_EDITED/' "$ptd/pertriple/native/windows-x64/src/pt_target.c"
+    if ./vytoc build "$ptd/pertriple_main.vt" --target windows-x64 \
+            -o "$ptd/bin/pt2.exe" >/dev/null 2>&1 \
+            && grep -aq PT_WIN_EDITED "$ptd/bin/pt2.exe"; then
+        echo "PASS pertriple_edit_recompiles"
+    else
+        echo "FAIL pertriple_edit_recompiles (an edit under native/windows-x64/src served a stale object)"
+        fail=1
+    fi
+else
+    echo "SKIP pertriple_windows (no mingw-w64)"
+fi
+# --- vyto/desktop: dialogs, open, per-user folders ---
+# The dialog programs are fakes (tests/fixtures/desktop/fake_dialog.sh) that
+# log every argv element and replay canned answers, so each backend's exact
+# command line is checked against a golden: the same fixture once as zenity,
+# once as kdialog, once with no program at all. The hostile-title call is the
+# shell-injection check — the title must arrive as one argument, unchanged,
+# and the file it tries to create must not exist afterwards.
+dk=tests/tmp/desktop; rm -rf "$dk"
+for b in zenity kdialog none; do
+    bd=$dk/$b; mkdir -p "$bd/bin"
+    if [ "$b" = none ]; then
+        prog=/nonexistent/zenity; fdir=
+    else
+        cp tests/fixtures/desktop/fake_dialog.sh "$bd/bin/$b"
+        cp tests/fixtures/desktop/replies.txt "$bd/replies"
+        prog=$(pwd)/$bd/bin/$b; fdir=$(pwd)/$bd
+    fi
+    got=$(cd "$bd" && FAKE_DIR=$fdir VYTO_DESKTOP_DIALOG=$prog \
+          ../../../../vytoc run ../../../../tests/fixtures/desktop_dialogs.vt 2>&1)
+    if [ "$got" = "$(cat tests/fixtures/desktop_dialogs.$b.expected)" ] && [ ! -e "$bd/pwned" ]; then
+        echo "PASS desktop_dialogs_$b"
+    else
+        echo "FAIL desktop_dialogs_$b"
+        echo "$got" | diff tests/fixtures/desktop_dialogs.$b.expected - | head -20
+        fail=1
+    fi
+done
+# zenity 4 (GTK 4) refuses the options it dropped; they must not be passed.
+bd=$dk/zenity4; mkdir -p "$bd/bin"
+cp tests/fixtures/desktop/fake_dialog.sh "$bd/bin/zenity"
+cp tests/fixtures/desktop/replies.txt "$bd/replies"
+(cd "$bd" && FAKE_ZENITY_VERSION=4.0.1 FAKE_DIR=$(pwd) VYTO_DESKTOP_DIALOG=$(pwd)/bin/zenity \
+    ../../../../vytoc run ../../../../tests/fixtures/desktop_dialogs.vt >/dev/null 2>&1)
+if [ -s "$bd/log" ] && ! grep -q -- "--attach\|--confirm-overwrite" "$bd/log"; then
+    echo "PASS desktop_zenity4_flags"
+else
+    echo "FAIL desktop_zenity4_flags (GTK 3-only options passed to zenity 4)"
+    fail=1
+fi
+# openUrl: refused schemes never reach xdg-open; accepted ones arrive whole.
+# xdg-open runs detached, so give its log a moment to appear.
+bd=$dk/open; mkdir -p "$bd/bin"
+cp tests/fixtures/desktop/fake_dialog.sh "$bd/bin/xdg-open"
+got=$(cd "$bd" && FAKE_DIR=$(pwd) VYTO_DESKTOP_OPEN=$(pwd)/bin/xdg-open \
+      ../../../../vytoc run ../../../../tests/fixtures/desktop_open.vt 2>&1)
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+    [ "$(grep -c '^xdg-open:' "$bd/log" 2>/dev/null)" -ge 3 ] && break
+    sleep 0.2
+done
+want="https: true
+mailto: true
+javascript: false
+file: false
+bare path: false
+empty: false
+scheme only: false
+newline: false
+dash path: true"
+if [ "$got" = "$want" ] && [ "$(grep -c '^xdg-open:' "$bd/log")" -eq 3 ] &&
+   grep -qxF "  [https://example.com/a b?q=1&x='y']" "$bd/log" &&
+   grep -qxF "  [./-x]" "$bd/log" && ! grep -q "javascript\|passwd\|xterm" "$bd/log"; then
+    echo "PASS desktop_open_url"
+else
+    echo "FAIL desktop_open_url (got: $got)"; cat "$bd/log" 2>/dev/null
+    fail=1
+fi
+# Per-user folders: XDG values win when absolute, a relative one is ignored
+# (the spec says so), and an app name that is not a plain name gives "".
+got=$(env -u XDG_CONFIG_HOME -u XDG_CACHE_HOME HOME=/home/t XDG_DATA_HOME=relative/x \
+      ./vytoc run tests/fixtures/desktop_dirs.vt 2>&1)
+got2=$(XDG_CONFIG_HOME=/cfg XDG_DATA_HOME=/dat XDG_CACHE_HOME=/c HOME=/home/t \
+       ./vytoc run tests/fixtures/desktop_dirs.vt 2>&1 | head -3 | tr '\n' ' ')
+if [ "$got" = "config: /home/t/.config/myapp
+data: /home/t/.local/share/myapp
+cache: /home/t/.cache/myapp
+dotdot: []
+slash: []
+empty: []
+colon: []" ] && [ "$got2" = "config: /cfg/myapp data: /dat/myapp cache: /c/myapp " ]; then
+    echo "PASS desktop_dirs"
+else
+    echo "FAIL desktop_dirs (got: $got | $got2)"
+    fail=1
+fi
+# Freestanding: the stub arm must build with no libc, and its object must
+# reference nothing external (nm, not the exit status — see d2d above).
+if ./vytoc build tests/fixtures/desktop_freestanding.vt --freestanding --cc gcc \
+        -o examples/.vyto-cache/libdesk_fs.a >/dev/null 2>&1; then
+    dobj=$(nm -A examples/.vyto-cache/libdesk_fs.a 2>/dev/null \
+        | awk '/ T vdesk_available$/ { split($1, a, ":"); print a[2]; exit }')
+    dund=$(nm -A examples/.vyto-cache/libdesk_fs.a 2>/dev/null | grep -c ":$dobj: *U ")
+    if [ -n "$dobj" ] && [ "$dund" -eq 0 ]; then
+        echo "PASS freestanding_desktop_stub"
+    else
+        echo "FAIL freestanding_desktop_stub (shim object '$dobj' has $dund undefined symbols)"
+        fail=1
+    fi
+else
+    echo "FAIL freestanding_desktop_stub (vyto/desktop's stub arm does not build freestanding)"
+    fail=1
+fi
 # And for vyto/compress, whose vendored zlib is built on an allocator — there is
 # nothing to degrade to, so the wrapper TUs compile to nothing under VT_NO_LIBC
 # and zlib_shim.c's stub arm answers instead. Without that guard, merely
@@ -518,6 +663,15 @@ if sh lib/vyto/compress/native/refresh-zlib.sh --verify >/dev/null 2>&1; then
     echo "PASS compress_vendored_zlib_unmodified"
 else
     echo "FAIL compress_vendored_zlib_unmodified (native/src/zlib/ has been edited)"
+    fail=1
+fi
+# vyto/net's windows-x64 curl + mbedTLS + CA bundle: same rule. Build options
+# belong in refresh-curl.sh (curl_config.h is generated from them) or
+# vyto_mbedtls_user.h; glue in native/windows-x64/src/vnet_*.c.
+if sh lib/vyto/net/native/refresh-curl.sh --verify >/dev/null 2>&1; then
+    echo "PASS net_vendored_curl_unmodified"
+else
+    echo "FAIL net_vendored_curl_unmodified (native/windows-x64/ differs from refresh-curl.sh's output)"
     fail=1
 fi
 
@@ -1884,6 +2038,112 @@ if command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1 &&
     r="status $st"
     [ "$st" -ne 0 ] && echo "$out" | grep -q 'version "1.x"' && r=ok
     win_check win_manifest_refusal_fails_build "$r"
+
+    # --- the Windows 7 import audit (src/peaudit.c) ---
+    # A clean exe passes; an exe importing a Windows 8 function and a DLL
+    # built against the Universal CRT must each fail with their own reason.
+    # The two failures are the audit's fault injection: an audit stubbed out to
+    # PASS everything fails both, and one that only checks the exit status
+    # would not tell the two rules apart.
+    # shellcheck disable=SC2086
+    out=$(./vytoc build tests/fixtures/win_console_app.vt $W --audit -o "$wd/aud.exe" 2>&1)
+    st=$?
+    r="status $st: $out"
+    [ "$st" -eq 0 ] && echo "$out" | grep -q "^PASS pe_audit aud.exe" && r=ok
+    win_check win_audit_pass "$r"
+    # shellcheck disable=SC2086
+    out=$(./vytoc build tests/fixtures/win_win8_import.vt $W --audit -o "$wd/w8.exe" 2>&1)
+    st=$?
+    r="status $st"
+    [ "$st" -ne 0 ] &&
+        echo "$out" | grep -q "kernel32.dll!GetSystemTimePreciseAsFileTime does not exist on Windows 7" &&
+        r=ok
+    win_check win_audit_win8_fails "$r"
+    r="no ucrt dll"
+    if x86_64-w64-mingw32-gcc -shared -nostdlib -o "$wd/ucrt.dll" tests/fixtures/win_ucrt.c \
+            -lucrt -lkernel32 >/dev/null 2>&1; then
+        out=$(./vytoc audit "$wd/ucrt.dll" 2>&1)
+        st=$?
+        r="status $st"
+        [ "$st" -ne 0 ] && echo "$out" | grep -q "imports the Universal CRT (api-ms-win-crt-" && r=ok
+    fi
+    win_check win_audit_ucrt_fails "$r"
+
+    # --- vyto/net on Windows: curl + mbedTLS from vendored source ---
+    # No curl DLL beside the exe any more, the CA bundle staged instead, and
+    # an import table that passes the Windows 7 audit; then the same with
+    # --bundle, which the DLL never allowed.
+    nd=$wd/net; mkdir -p "$nd/b"
+    # shellcheck disable=SC2086
+    ./vytoc build examples/47_http.vt $W -o "$nd/h.exe" >/dev/null 2>&1
+    r=bad
+    [ -f "$nd/h.exe" ] && [ -f "$nd/cacert.pem" ] && ! ls "$nd"/*.dll >/dev/null 2>&1 &&
+        ./vytoc audit "$nd/h.exe" >/dev/null 2>&1 && r=ok
+    win_check win_net_static "$r"
+    # shellcheck disable=SC2086
+    ./vytoc build examples/47_http.vt $W --bundle -o "$nd/b/h.exe" >/dev/null 2>&1
+    r=bad
+    [ -f "$nd/b/h.exe" ] && [ -f "$nd/b/cacert.pem" ] && ./vytoc audit "$nd/b/h.exe" >/dev/null 2>&1 &&
+        r=ok
+    win_check win_net_bundle "$r"
+
+    # --- --sign: Authenticode via osslsigncode, with a throwaway self-signed
+    # certificate made here. The signature must be real (a non-empty
+    # certificate table that osslsigncode verifies against that certificate),
+    # must not disturb the import audit, and the password must reach
+    # osslsigncode without appearing in --verbose output.
+    if command -v osslsigncode >/dev/null 2>&1 && command -v openssl >/dev/null 2>&1; then
+        sd=$wd/sign; mkdir -p "$sd"
+        pw="vyto-test-$$-secret"
+        openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj "/CN=Vyto Test Signer" \
+            -keyout "$sd/k.pem" -out "$sd/c.pem" >/dev/null 2>&1 &&
+        openssl pkcs12 -export -inkey "$sd/k.pem" -in "$sd/c.pem" -out "$sd/c.pfx" \
+            -passout "pass:$pw" >/dev/null 2>&1
+        # shellcheck disable=SC2086
+        out=$(VYTO_SIGN_PASS=$pw ./vytoc build tests/fixtures/win_console_app.vt $W --verbose \
+              --sign "$sd/c.pfx" -o "$sd/s.exe" 2>&1)
+        st=$?
+        r="status $st"
+        secdir=$($OD -p "$sd/s.exe" 2>/dev/null | awk '/Security Directory/{print $4}')
+        [ "$st" -eq 0 ] && [ -n "$secdir" ] && [ "$secdir" != "00000000" ] &&
+            osslsigncode verify -CAfile "$sd/c.pem" -in "$sd/s.exe" >/dev/null 2>&1 &&
+            ./vytoc audit "$sd/s.exe" >/dev/null 2>&1 && r=ok
+        win_check win_sign "$r"
+        r=ok
+        echo "$out" | grep -q "$pw" && r="password appeared in --verbose output"
+        ls "$wd"/sign/*.pass* tests/fixtures/.vyto-cache/sign.pass* >/dev/null 2>&1 &&
+            r="password file left behind"
+        win_check win_sign_no_pass_leak "$r"
+        # dropping --sign relinks to an unsigned exe rather than keeping the
+        # signed one (the flag is part of the link stamp)
+        # shellcheck disable=SC2086
+        ./vytoc build tests/fixtures/win_console_app.vt $W -o "$sd/s.exe" >/dev/null 2>&1
+        secdir=$($OD -p "$sd/s.exe" 2>/dev/null | awk '/Security Directory/{print $4}')
+        r="still signed ($secdir)"
+        { [ -z "$secdir" ] || [ "$secdir" = "00000000" ]; } && r=ok
+        win_check win_sign_dropped_relinks "$r"
+        # A failed signing (wrong password) must fail the build AND leave no
+        # exe: the stamp already records --sign, so an unsigned exe left
+        # behind would survive the next unchanged rebuild looking finished.
+        # The retry with the right password must then produce a signed one.
+        # shellcheck disable=SC2086
+        VYTO_SIGN_PASS=wrong ./vytoc build tests/fixtures/win_console_app.vt $W \
+            --sign "$sd/c.pfx" -o "$sd/f.exe" >/dev/null 2>&1
+        st=$?
+        r="status $st"
+        if [ "$st" -ne 0 ] && [ ! -e "$sd/f.exe" ]; then
+            # shellcheck disable=SC2086
+            VYTO_SIGN_PASS=$pw ./vytoc build tests/fixtures/win_console_app.vt $W \
+                --sign "$sd/c.pfx" -o "$sd/f.exe" >/dev/null 2>&1
+            osslsigncode verify -CAfile "$sd/c.pem" -in "$sd/f.exe" >/dev/null 2>&1 && r=ok ||
+                r="retry not signed"
+        elif [ -e "$sd/f.exe" ]; then
+            r="unsigned exe left behind"
+        fi
+        win_check win_sign_failure_leaves_nothing "$r"
+    else
+        echo "SKIP win_sign (no osslsigncode: apt install osslsigncode)"
+    fi
 else
     echo "SKIP win_pe_headers (no mingw gcc, objdump and windres)"
 fi

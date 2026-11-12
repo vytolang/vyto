@@ -223,3 +223,21 @@ Worked example: [`examples/100_struct_rawptr.vt`](../examples/100_struct_rawptr.
 See [`docs/types.md`](types.md) for the full type reference — value vs.
 reference types, the fixed-width FFI family (§2), and `rawptr`/`cstring`
 (§4).
+
+## Where a package's C lives
+
+A package directory can carry native code beside its `.vt` files. `vytoc`
+looks for each of these, per package, on every build:
+
+| Path | What happens |
+|---|---|
+| `native/src/*.c` | Compiled for **every** target, flat (subdirectories are not globbed; vendored trees live there and are `#include`d by a top-level wrapper `.c`). A source that cannot build everywhere must `#ifdef` its whole body |
+| `native/<triple>/src/*.c` | Compiled **only** for that triple, the same way. For sources that make no sense elsewhere — `vyto/net` builds its vendored curl + mbedTLS from `native/windows-x64/src/` — without an `#ifdef` per file and without other targets compiling hundreds of empty files. These objects see their own dir and the triple's `include/`, not `native/src` |
+| `native/<triple>/src/include-dirs.txt` | Extra `-I` dirs for that triple's sources, one per line, relative to `src/`. Vendored code written for a build system that passes `-I` flags (curl expects `-Ilib`) needs it |
+| `native/<triple>/include/` | Searched ahead of `native/src` for that triple only |
+| `native/<triple>/*.so`, `*.dll`, `*.dylib` | Linked and copied beside the output. With `--bundle`, `*.a` instead (plus a `<lib>.a.deps` line of extra `-l` flags) |
+| `native/<triple>/stage/*` | Data files copied beside the output for that triple, with or without `--bundle` (`vyto/net`'s `cacert.pem`) |
+
+Shim objects compile `VYTO_JOBS` at a time (default: the CPU count) and land
+in the shared object cache keyed by their whole source dir, so editing a
+header rebuilds every object that might include it, and nothing else.

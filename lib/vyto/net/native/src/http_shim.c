@@ -7,7 +7,7 @@
    malloc'd memory past the free. */
 
 #include <stdint.h>
-#include <curl/curl.h>
+#include "net_ca.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -129,16 +129,11 @@ void http_ipresolve_set(int mode) {
    certificate. libcurl reads $CURL_CA_BUNDLE only as a COMPILE-TIME default,
    not at runtime, so an explicit CURLOPT_CAINFO is the only way to do this
    from inside a program. */
-static char g_ca_file[4096] = {0};
+/* The trust store itself lives in net_ca.c, shared with net_shim.c. */
 
-/* path: a PEM bundle to trust instead of the system store, or NULL/"" to go
+/* path: a PEM bundle to trust instead of the default store, or NULL/"" to go
    back to the default. Affects requests started after the call. */
-void http_ca_file_set(const char *path) {
-    if (!path || !*path) { g_ca_file[0] = 0; return; }
-    size_t n = strlen(path);
-    if (n >= sizeof g_ca_file) { g_ca_file[0] = 0; return; }
-    memcpy(g_ca_file, path, n + 1);
-}
+void http_ca_file_set(const char *path) { vnet_ca_file_set(path); }
 
 /* Configure a fresh easy handle to write into `r`. Stashes the header slist in
    r->hl so it outlives the transfer (needed for the multi path) and is freed by
@@ -155,7 +150,7 @@ static void configure_easy(CURL *curl, const char *method, const char *url,
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(curl, CURLOPT_USERAGENT, "vyto-http/0.1");
     curl_easy_setopt(curl, CURLOPT_IPRESOLVE, g_ip_resolve);
-    if (g_ca_file[0]) curl_easy_setopt(curl, CURLOPT_CAINFO, g_ca_file);
+    vnet_ca_apply(curl);
     if (timeout_ms > 0) {
         curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, timeout_ms);
     } else {
@@ -271,7 +266,7 @@ int64_t http_stream(const char *method, const char *url, const char *header_line
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(curl, CURLOPT_USERAGENT, "vyto-http/0.1");
     curl_easy_setopt(curl, CURLOPT_IPRESOLVE, g_ip_resolve);
-    if (g_ca_file[0]) curl_easy_setopt(curl, CURLOPT_CAINFO, g_ca_file);
+    vnet_ca_apply(curl);
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
     if (timeout_ms > 0) curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, timeout_ms);
 

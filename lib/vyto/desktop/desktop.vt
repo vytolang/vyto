@@ -1,0 +1,232 @@
+// vyto/desktop — the operating system's own file dialogs, message boxes,
+// "open this in the default app", and the per-user folders an app keeps its
+// settings and data in.
+//
+//     import { FileDialog, message, confirm, openUrl, configDir, MSG_INFO } from "vyto/desktop";
+//
+//     let d = new FileDialog().title("Open image").filter("Images", "*.png;*.jpg");
+//     let p = d.open();                       // string?, null = cancelled
+//     if (p != null) { print(p); }
+//     if (confirm("Quit", "Discard changes?")) { ... }
+//     openUrl("https://example.com");
+//     let cfg = configDir("myapp");           // ~/.config/myapp, %APPDATA%\myapp
+//
+// Windows uses its own dialogs (comdlg32, IFileOpenDialog, MessageBoxW) and
+// shell (ShellExecuteW, SHGetKnownFolderPath) — all present on Windows 7.
+// Linux runs zenity or kdialog, and xdg-open, as separate programs; there is
+// no GTK or Qt linked into the app, so binaries stay small. Those programs are
+// started from an argument list, never through a shell: a title, a path or a
+// URL can contain anything and is passed through exactly. When neither
+// dialog program is installed, desktop_available() is false and dialogs
+// answer null.
+//
+// Dialogs are modal and block the calling thread until answered. On X11 the
+// app's own window does not repaint meanwhile; pass .owner(...) so the
+// dialog at least sits on top of it.
+//
+// Independent of vyto/ui and vyto/surface: an owner window is passed as its
+// native id (`win.surface().native_window()`), so a command-line tool can use
+// configDir() without linking a window system.
+
+extern "C" {
+    fn vdesk_available(): i32;
+    fn vdesk_dialog(kind: i32, title: cstring, start: cstring, filters: cstring, owner: culong): rawptr;
+    fn vdesk_result_status(h: rawptr): i32;
+    fn vdesk_result_count(h: rawptr): i32;
+    fn vdesk_result_path(h: rawptr, i: i32): cstring;
+    fn vdesk_result_free(h: rawptr);
+    fn vdesk_message(kind: i32, title: cstring, text: cstring, owner: culong): i32;
+    fn vdesk_open(target: cstring): i32;
+    fn vdesk_dir(which: i32, app: cstring): cstring;
+}
+
+#link "comdlg32" if "windows"
+#link "shell32" if "windows"
+#link "ole32" if "windows"
+#link "uuid" if "windows"
+#link "user32" if "windows"
+
+// Message box kinds: the icon shown, and for confirm() the Yes/No buttons.
+export const MSG_INFO: int = 0;
+export const MSG_WARN: int = 1;
+export const MSG_ERROR: int = 2;
+
+const KIND_OPEN: int = 0;
+const KIND_OPEN_MANY: int = 1;
+const KIND_SAVE: int = 2;
+const KIND_FOLDER: int = 3;
+const KIND_QUESTION: int = 3;
+
+const ST_OK: int = 0;
+
+// Can this machine show dialogs at all? False on Linux without zenity or
+// kdialog, and in a freestanding or Android build.
+export fn desktop_available(): bool { return vdesk_available() != 0; }
+
+// A file or folder chooser. Configure with the builders, then ask with one of
+// open / openMany / save / folder.
+export class FileDialog {
+    dlg_title: string;
+    dlg_start: string;
+    dlg_filters: string;
+    dlg_owner: culong;
+
+    fn init() {
+        this.dlg_title = "";
+        this.dlg_start = "";
+        this.dlg_filters = "";
+        this.dlg_owner = 0 as culong;
+    }
+
+    builder fn title(t: string) { this.dlg_title = t; return this; }
+
+    // The folder the dialog opens in.
+    builder fn startIn(dir: string) { this.dlg_start = dir; return this; }
+
+    // Offer a file type. `patterns` is ';'-separated: "*.png;*.jpg". The
+    // first filter added is the one selected. Tabs and newlines in either
+    // argument are dropped: they separate filters on the way to C.
+    builder fn filter(name: string, patterns: string) {
+        let n = clean(name);
+        let p = clean(patterns);
+        if (n != "" && p != "") {
+            if (this.dlg_filters != "") { this.dlg_filters = this.dlg_filters + "\n"; }
+            this.dlg_filters = this.dlg_filters + n + "\t" + p;
+        }
+        return this;
+    }
+
+    // Keep the dialog on top of this window: Surface.native_window(), or 0
+    // for none.
+    builder fn owner(native_window: culong) { this.dlg_owner = native_window; return this; }
+
+    // One existing file, or null when cancelled.
+    fn open(): string? { return first(this.ask(KIND_OPEN, this.dlg_start)); }
+
+    // Several existing files; empty when cancelled.
+    fn openMany(): string[] { return this.ask(KIND_OPEN_MANY, this.dlg_start); }
+
+    // A path to write to, or null when cancelled. Nothing is written: like
+    // every OS save dialog, this only asks where — the app writes the file. `suggested` is the name the
+    // field starts with (it may include a folder). The dialog asks before
+    // overwriting an existing file.
+    fn save(suggested: string): string? {
+        let s = suggested;
+        if (s == "") { s = this.dlg_start; }
+        else if (this.dlg_start != "" && !has_dir(s)) { s = join(this.dlg_start, s); }
+        return first(this.ask(KIND_SAVE, s));
+    }
+
+    // An existing folder, or null when cancelled.
+    fn folder(): string? { return first(this.ask(KIND_FOLDER, this.dlg_start)); }
+
+    fn ask(kind: int, start: string): string[] {
+        let out: string[] = [];
+        let h = vdesk_dialog(kind as i32, this.dlg_title.cstr(), start.cstr(),
+                             this.dlg_filters.cstr(), this.dlg_owner);
+        if (h == null) { return out; }
+        if (vdesk_result_status(h) as int == ST_OK) {
+            let n = vdesk_result_count(h) as int;
+            for (let i in 0..n) { out.push(str(vdesk_result_path(h, i as i32))); }
+        }
+        vdesk_result_free(h);
+        return out;
+    }
+}
+
+// Show a message with an OK button. kind: MSG_INFO, MSG_WARN or MSG_ERROR.
+// Returns false only when no message box could be shown.
+export fn message(title: string, text: string, kind: int): bool {
+    let k = kind;
+    if (k < MSG_INFO || k > MSG_ERROR) { k = MSG_INFO; }
+    return vdesk_message(k as i32, title.cstr(), text.cstr(), 0 as culong) as int >= 0;
+}
+
+// The same, kept on top of a window (Surface.native_window()).
+export fn messageFor(owner: culong, title: string, text: string, kind: int): bool {
+    let k = kind;
+    if (k < MSG_INFO || k > MSG_ERROR) { k = MSG_INFO; }
+    return vdesk_message(k as i32, title.cstr(), text.cstr(), owner) as int >= 0;
+}
+
+// Ask a yes/no question. True only for Yes; No, closing the box, and "no
+// dialog available" are all false — so a destructive action guarded by
+// confirm() never runs by default.
+export fn confirm(title: string, text: string): bool {
+    return vdesk_message(KIND_QUESTION as i32, title.cstr(), text.cstr(), 0 as culong) as int == 1;
+}
+
+export fn confirmFor(owner: culong, title: string, text: string): bool {
+    return vdesk_message(KIND_QUESTION as i32, title.cstr(), text.cstr(), owner) as int == 1;
+}
+
+// Open a web or mail link in the default browser or mail program. Only
+// http:, https: and mailto: are accepted: anything else (file:, javascript:,
+// a custom handler, a bare path) is refused, because on Windows the shell
+// would happily run a program named by it. Returns whether it was handed off.
+export fn openUrl(url: string): bool {
+    if (!safe_url(url)) { return false; }
+    return vdesk_open(url.cstr()) as int != 0;
+}
+
+// Open a file or folder the way a double-click in the file manager would.
+// This RUNS programs when given one (an .exe on Windows, an executable
+// script on Linux with some file managers) — pass only paths the app chose or
+// the user picked, never one from the network.
+export fn openPath(path: string): bool {
+    if (path == "" || path.contains("\n") || path.contains("\r")) { return false; }
+    return vdesk_open(path.cstr()) as int != 0;
+}
+
+// Per-user folders for an app's files, by platform convention. None is
+// created: make it before writing. "" when `app` is not a plain name (it may
+// not be empty or contain '/', '\', "..", a control character or ':').
+//
+//   configDir  settings     ~/.config/<app>          %APPDATA%\<app>
+//   dataDir    documents,   ~/.local/share/<app>     %LOCALAPPDATA%\<app>
+//              databases
+//   cacheDir   regenerable  ~/.cache/<app>           %LOCALAPPDATA%\<app>\cache
+//
+// On Linux the XDG_*_HOME variables win when they hold an absolute path.
+export fn configDir(app: string): string { return dir_for(0, app); }
+export fn dataDir(app: string): string { return dir_for(1, app); }
+export fn cacheDir(app: string): string { return dir_for(2, app); }
+
+fn dir_for(which: int, app: string): string {
+    if (!plain_name(app)) { return ""; }
+    return str(vdesk_dir(which as i32, app.cstr()));
+}
+
+fn plain_name(s: string): bool {
+    if (s == "" || s == "." || s.contains("..")) { return false; }
+    for (let i in 0..s.len) {
+        let c = s[i];
+        if (c < 32 || c == 127 || c == 47 || c == 92 || c == 58) { return false; }
+    }
+    return true;
+}
+
+fn safe_url(u: string): bool {
+    for (let i in 0..u.len) {
+        if (u[i] < 32 || u[i] == 127) { return false; }
+    }
+    let l = u.to_lower();
+    return (l.starts_with("https://") && u.len > 8) ||
+           (l.starts_with("http://") && u.len > 7) ||
+           (l.starts_with("mailto:") && u.len > 7);
+}
+
+fn clean(s: string): string { return s.replace("\t", "").replace("\n", "").replace("\r", ""); }
+
+fn first(xs: string[]): string? {
+    if (xs.len == 0) { return null; }
+    return xs[0];
+}
+
+fn has_dir(p: string): bool { return p.contains("/") || p.contains("\\"); }
+
+fn join(dir: string, name: string): string {
+    if (dir.ends_with("/") || dir.ends_with("\\")) { return dir + name; }
+    if (dir.contains("\\") && !dir.contains("/")) { return dir + "\\" + name; }
+    return dir + "/" + name;
+}

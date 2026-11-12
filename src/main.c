@@ -3,9 +3,11 @@
 #include "check.h"
 #include "emit.h"
 #include "parse.h"
+#include "peaudit.h"
 
 #include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <libgen.h>
 #include <limits.h>
 #include <sys/stat.h>
@@ -422,6 +424,146 @@ static const char *cached_object(const char *csrc, uint64_t inputs, const char *
         fprintf(f, "%s\n%s -c -o %s %s\n", csrc, cmd_head, obj, csrc);
         fclose(f);
     }
+    if (compiled) *compiled = true;
+    return obj;
+}
+
+/* ---- parallel native compiles ----
+ *
+ * Package shims used to compile one at a time through system(). That was fine
+ * for a handful of files, and wrong once a package vendored a library: vyto/net
+ * builds curl + mbedTLS (~270 TUs) for windows-x64, and serially a cold build
+ * took about two minutes. Shim objects are therefore queued and compiled
+ * VYTO_JOBS at a time (default: the online CPU count) just before the link.
+ *
+ * A queued job compiles to a private temporary and is renamed into place only
+ * after it succeeded, so the cache never holds a half-written object — the same
+ * guarantee cached_object() gives inline. */
+typedef struct {
+    const char *cmd;   /* full compile command, writing to tmp */
+    const char *tmp;   /* where the compiler writes */
+    const char *obj;   /* where the object ends up */
+    const char *side;  /* cache sidecar to write on success, or NULL */
+    const char *src;   /* for the sidecar and the error message */
+    const char *what;  /* "native source of package 'x'" */
+    pid_t pid;
+    int status;
+} CJob;
+static CJob *g_cjobs;
+static int g_ncjobs, g_capcjobs;
+
+static bool cjob_queued(const char *obj) {
+    for (int i = 0; i < g_ncjobs; i++)
+        if (strcmp(g_cjobs[i].obj, obj) == 0) return true;
+    return false;
+}
+
+static void cjob_add(const char *cmd_head, const char *src, const char *obj, const char *side,
+                     const char *what) {
+    if (cjob_queued(obj)) return;   /* identical source and flags in two packages */
+    if (g_ncjobs == g_capcjobs) {
+        g_capcjobs = g_capcjobs ? g_capcjobs * 2 : 64;
+        g_cjobs = realloc(g_cjobs, sizeof *g_cjobs * (size_t)g_capcjobs);
+        if (!g_cjobs) fatal("out of memory");
+    }
+    CJob *j = &g_cjobs[g_ncjobs];
+    j->tmp = arena_printf(&g_arena, "%s.tmp.%d.%d", obj, (int)getpid(), g_ncjobs);
+    j->cmd = arena_printf(&g_arena, "%s -c -o %s %s", cmd_head, j->tmp, src);
+    j->obj = obj;
+    j->side = side;
+    j->src = src;
+    j->what = what;
+    j->pid = 0;
+    j->status = -1;
+    g_ncjobs++;
+}
+
+static int compile_jobs_limit(void) {
+    const char *e = getenv("VYTO_JOBS");
+    if (e && *e) {
+        int n = atoi(e);
+        if (n >= 1) return n;
+    }
+    long n = sysconf(_SC_NPROCESSORS_ONLN);
+    return n >= 1 ? (int)n : 1;
+}
+
+/* Run every queued compile, at most VYTO_JOBS at once. Returns only when all
+   have finished; a failure is reported after the rest complete, so a broken
+   file does not leave sibling compilers running behind a fatal(). */
+static void run_compile_jobs(bool verbose) {
+    if (g_ncjobs == 0) return;
+    int limit = compile_jobs_limit();
+    int next = 0, running = 0, failed = -1;
+    while (next < g_ncjobs || running > 0) {
+        while (running < limit && next < g_ncjobs && failed < 0) {
+            CJob *j = &g_cjobs[next++];
+            if (verbose) fprintf(stderr, "+ %s\n", j->cmd);
+            fflush(NULL);
+            pid_t pid = fork();
+            if (pid < 0) fatal("cannot fork a compiler: %s", strerror(errno));
+            if (pid == 0) {
+                execl("/bin/sh", "sh", "-c", j->cmd, (char *)NULL);
+                _exit(127);
+            }
+            j->pid = pid;
+            running++;
+        }
+        if (running == 0) break;   /* a failure stopped new starts and all are done */
+        int st;
+        pid_t pid = wait(&st);
+        if (pid < 0) {
+            if (errno == EINTR) continue;
+            fatal("lost track of a compiler: %s", strerror(errno));
+        }
+        for (int i = 0; i < next; i++) {
+            if (g_cjobs[i].pid != pid) continue;
+            g_cjobs[i].pid = 0;
+            g_cjobs[i].status = WIFEXITED(st) ? WEXITSTATUS(st) : 128;
+            if (g_cjobs[i].status != 0 && failed < 0) failed = i;
+            running--;
+            break;
+        }
+    }
+    for (int i = 0; i < next; i++) {
+        CJob *j = &g_cjobs[i];
+        if (j->status != 0) { unlink(j->tmp); continue; }
+        if (failed >= 0) { unlink(j->tmp); continue; }
+        /* Same directory, so this is atomic. */
+        if (rename(j->tmp, j->obj) != 0) {
+            unlink(j->tmp);
+            fatal("cannot write %s", j->obj);
+        }
+        if (j->side) {
+            FILE *f = fopen(j->side, "w");
+            if (f) {
+                fprintf(f, "%s\n%s\n", j->src, j->cmd);
+                fclose(f);
+            }
+        }
+    }
+    if (failed >= 0) fatal("%s failed to compile", g_cjobs[failed].what);
+    g_ncjobs = 0;
+}
+
+/* cached_object(), but queued: returns the object's final path at once and
+   adds a compile job when it is not in the cache yet. NULL means "no shared
+   cache", exactly as there. */
+static const char *cached_object_queued(const char *csrc, uint64_t inputs, const char *cmd_head,
+                                        const char *what, bool *compiled) {
+    const char *root = find_obj_cache_dir();
+    if (!root) return NULL;
+    uint64_t h = inputs;
+    h ^= fnv1a(cmd_head, strlen(cmd_head));
+    h *= 1099511628211ULL;
+    h ^= fnv1a(csrc, strlen(csrc));
+    h *= 1099511628211ULL;
+    const char *shard = arena_printf(&g_arena, "%s/%02x", root, (unsigned)(h >> 56) & 0xff);
+    mkdir(shard, 0755);
+    const char *obj = arena_printf(&g_arena, "%s/%016llx.o", shard, (unsigned long long)h);
+    if (file_exists(obj)) return obj;
+    const char *side = arena_printf(&g_arena, "%s/%016llx.txt", shard, (unsigned long long)h);
+    cjob_add(cmd_head, csrc, obj, side, what);
     if (compiled) *compiled = true;
     return obj;
 }
@@ -846,6 +988,70 @@ static const char *find_windres(const char *cc) {
     return "x86_64-w64-mingw32-windres";
 }
 
+static const char *base_of(const char *path) {
+    const char *s = strrchr(path, '/');
+    return s ? s + 1 : path;
+}
+
+/* ---- --sign: Authenticode via osslsigncode ----
+ *
+ * osslsigncode is the one Authenticode signer that runs on Linux; there is no
+ * signing code in vytoc itself. It writes a new file (never in place), so the
+ * signature goes to <file>.signed and is renamed over the original.
+ *
+ * Signing must come after everything that rewrites the file: the link's -s
+ * strip happens inside the link, and the audit only reads, so the order in the
+ * build is link -> copy DLLs -> audit -> sign.
+ *
+ * The password never reaches a command line, where `ps` and --verbose would
+ * show it: it is read from $VYTO_SIGN_PASS, written to a 0600 file in the
+ * cache, handed over with -readpass and deleted again. */
+static void win_sign(const char *file, const char *pfx, const char *ts, const char *name,
+                     const char *cache, bool verbose) {
+    const char *tool = getenv("VYTO_OSSLSIGNCODE");
+    if (!tool || !*tool) tool = "osslsigncode";
+    if (run_cmd(arena_printf(&g_arena, "command -v %s >/dev/null 2>&1", sh_quote(tool)), false) != 0)
+        fatal("--sign needs osslsigncode (apt install osslsigncode, or set VYTO_OSSLSIGNCODE)");
+    const char *passflag = "";
+    const char *passfile = NULL;
+    const char *pass = getenv("VYTO_SIGN_PASS");
+    if (pass && *pass) {
+        passfile = arena_printf(&g_arena, "%s/sign.pass.%d", cache, (int)getpid());
+        unlink(passfile);
+        int fd = open(passfile, O_WRONLY | O_CREAT | O_EXCL, 0600);
+        if (fd < 0) fatal("cannot write a private password file in %s", cache);
+        size_t n = strlen(pass);
+        bool ok = write(fd, pass, n) == (ssize_t)n;
+        close(fd);
+        if (!ok) { unlink(passfile); fatal("cannot write a private password file in %s", cache); }
+        passflag = arena_printf(&g_arena, " -readpass %s", sh_quote(passfile));
+    }
+    const char *out = arena_printf(&g_arena, "%s.signed", file);
+    unlink(out);
+    char *cl = arena_printf(&g_arena, "%s sign -pkcs12 %s%s -h sha256%s%s%s%s -in %s -out %s >/dev/null",
+                            sh_quote(tool), sh_quote(pfx), passflag,
+                            name ? " -n " : "", name ? sh_quote(name) : "",
+                            ts ? " -ts " : "", ts ? sh_quote(ts) : "",
+                            sh_quote(file), sh_quote(out));
+    int rc = run_cmd(cl, verbose);
+    if (passfile) unlink(passfile);
+    if (rc != 0) {
+        unlink(out);
+        /* Delete the unsigned file too. The link stamp already records
+           --sign, so a rebuild with nothing changed would otherwise skip the
+           link, skip signing (it only signs a fresh link) and leave an
+           unsigned exe that looks finished. With the file gone the next
+           build relinks and signs again. */
+        unlink(file);
+        fatal("signing %s failed (osslsigncode exit %d)%s", file, rc,
+              pass && *pass ? "" : " — if the certificate has a password, set VYTO_SIGN_PASS");
+    }
+    if (rename(out, file) != 0) {
+        unlink(out);
+        fatal("cannot replace %s with its signed copy", file);
+    }
+}
+
 /* Locate the runtime directory relative to the vytoc executable. */
 static const char *find_runtime_dir(void) {
     const char *env = getenv("VYTO_HOME");
@@ -949,6 +1155,7 @@ static void usage(void) {
             "              [--with-assets] [--target <triple>] [--cc <cmd>] [--clean]\n"
             "              [--modpath <dir>] [--freestanding] [--shared] [--no-float]\n"
             "              [--no-fs] [--gui | --console] [--manifest <file.vt>]\n"
+            "              [--audit] [--sign <cert.pfx> [--timestamp <url>]]\n"
             "    --modpath      a directory CONTAINING packages (like vyto_modules/),\n"
             "                   searched after the importing file's own directory and\n"
             "                   before the stdlib. Repeatable, relative to the current\n"
@@ -972,10 +1179,20 @@ static void usage(void) {
             "    --manifest     Windows: run this Vyto program on the build host and embed\n"
             "                   the app identity it prints (name, version, icon, DPI) —\n"
             "                   see lib/vyto/win/manifest.vt\n"
+            "    --audit        Windows: check every import of the exe and the DLLs shipped\n"
+            "                   beside it against Windows 7's real exports; fail if one\n"
+            "                   would not load there (same check as `vytoc audit`)\n"
+            "    --sign         Windows: Authenticode-sign the exe and its shipped DLLs\n"
+            "                   with this PKCS#12 certificate via osslsigncode. The\n"
+            "                   password, if any, comes from $VYTO_SIGN_PASS\n"
+            "    --timestamp    with --sign: RFC 3161 timestamp server URL, so the\n"
+            "                   signature outlives the certificate (needs the network)\n"
             "    --no-float     stub float-to-string (no soft-float formatter pulled in)\n"
             "    --no-fs        drop the filesystem layer (File ops become no-ops/panics)\n"
             "  vytoc run   <file.vt> [--release] [--verbose] [--clean]\n"
             "              [--modpath <dir>] [-- args...]\n"
+            "  vytoc audit <file.exe|file.dll>...\n"
+            "                   will these Windows binaries load on Windows 7? (see --audit)\n"
             "targets: linux-x64 linux-arm64 macos-x64 macos-arm64 windows-x64 android-arm64\n"
             "  --cc (or VYTO_CC) overrides the C compiler; put sysroots/flags inside it,\n"
             "  e.g. --cc 'zig cc -target aarch64-linux-gnu' or (freestanding)\n"
@@ -1009,13 +1226,27 @@ static const char *default_cross_cc(const char *triple) {
     return NULL;
 }
 
+/* The Windows 7 export allowlist: $WIN7_EXPORTS, else the one that ships in
+   the stdlib (lib/vyto/win/win7_exports.txt, regenerated by
+   tests/win/dump_exports.c on a real Windows 7 box). */
+static const char *win7_exports_path(void) {
+    const char *e = getenv("WIN7_EXPORTS");
+    if (e && *e) return e;
+    const char *lib = find_lib_dir();
+    if (!lib) fatal("cannot find the stdlib (set VYTO_HOME) for lib/vyto/win/win7_exports.txt");
+    return arena_printf(&g_arena, "%s/vyto/win/win7_exports.txt", lib);
+}
+
 int main(int argc, char **argv) {
     if (argc < 3) usage();
     const char *cmd = argv[1];
+    if (strcmp(cmd, "audit") == 0)
+        return pe_audit(win7_exports_path(), argc - 2, (const char **)argv + 2);
     const char *input = argv[2];
     bool release = false, verbose = false, bundle = false, with_assets = false;
     bool freestanding = false, shared = false, no_float = false, no_fs = false, clean = false;
-    bool force_gui = false, force_console = false;
+    bool force_gui = false, force_console = false, audit = false;
+    const char *sign_pfx = NULL, *sign_ts = NULL;
     const char *outpath = NULL, *target = NULL, *cc_override = NULL, *manifest_vt = NULL;
     const char *modpath[MAX_ROOTS];
     int nmodpath = 0;
@@ -1034,6 +1265,9 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--gui") == 0) force_gui = true;
         else if (strcmp(argv[i], "--console") == 0) force_console = true;
         else if (strcmp(argv[i], "--manifest") == 0 && i + 1 < argc) manifest_vt = argv[++i];
+        else if (strcmp(argv[i], "--audit") == 0) audit = true;
+        else if (strcmp(argv[i], "--sign") == 0 && i + 1 < argc) sign_pfx = argv[++i];
+        else if (strcmp(argv[i], "--timestamp") == 0 && i + 1 < argc) sign_ts = argv[++i];
         else if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) outpath = argv[++i];
         else if (strcmp(argv[i], "--target") == 0 && i + 1 < argc) target = argv[++i];
         else if (strcmp(argv[i], "--cc") == 0 && i + 1 < argc) cc_override = argv[++i];
@@ -1068,6 +1302,13 @@ int main(int argc, char **argv) {
     if (manifest_vt && !win_target)
         fatal("--manifest describes a Windows exe (name, version, icon, DPI); "
               "this build targets %s", triple);
+    if (audit && !win_target)
+        fatal("--audit checks a Windows exe against Windows 7's exports; "
+              "this build targets %s", triple);
+    if (sign_pfx && !win_target)
+        fatal("--sign is Authenticode, for Windows exes; this build targets %s", triple);
+    if (sign_ts && !sign_pfx) fatal("--timestamp stamps a signature: pass --sign too");
+    if (sign_pfx && !file_exists(sign_pfx)) fatal("--sign: no certificate at %s", sign_pfx);
     if (do_run && cross)
         fatal("built for %s but this host is %s — copy the binary to the target "
               "or run it under an emulator (qemu/wine)", triple, host);
@@ -1171,7 +1412,7 @@ int main(int argc, char **argv) {
        The mingw headers otherwise default to an older target, and a shim that
        raised it on its own could call a Win8+ API that refuses to load on
        Windows 7. Anything newer must go through GetProcAddress, and
-       tests/win/pe_audit.sh checks the result against Win7's real exports. */
+       `vytoc audit` (src/peaudit.c) checks the result against Win7's real exports. */
     if (win_target)
         fsflags = arena_printf(&g_arena, "%s -D_WIN32_WINNT=0x0601 -DWINVER=0x0601", fsflags);
     /* Dead-code stripping. Vyto compiles each .vt file as one translation unit
@@ -1209,6 +1450,7 @@ int main(int argc, char **argv) {
     SBuf objs;
     sb_init(&objs);
     bool relink = false;
+    bool linked_now = false;
 
     /* Runtime object. Compiled from fixed sources with a fixed command line, so
        it does not depend on the program being built and is shared across every
@@ -1262,33 +1504,20 @@ int main(int argc, char **argv) {
         if (seen) continue;
         if (nseen < 128) seen_dirs[nseen++] = mdir;
 
-        const char *nsrc = arena_printf(&g_arena, "%s/native/src", mdir);
-        /* Headers aren't tracked per-object (no dependency scanner), so a .h edit
-           would otherwise serve a stale .o. Both paths below therefore key on
-           the whole directory rather than the single translation unit: the
-           shared cache digests its contents, the local fallback takes the
-           newest mtime in it. */
-        unsigned nsrc_uses = 0;
-        uint64_t nsrc_digest = dir_digest(nsrc, &nsrc_uses);
-        long nsrc_newest = -1;
-        DIR *ndp = opendir(nsrc);
-        if (ndp) {
-            struct dirent *de;
-            while ((de = readdir(ndp))) {
-                if (de->d_name[0] == '.') continue;
-                long t = file_mtime(arena_printf(&g_arena, "%s/%s", nsrc, de->d_name));
-                if (t > nsrc_newest) nsrc_newest = t;
-            }
-            closedir(ndp);
-        }
+        /* Inputs every native object of this package shares: the per-triple
+           include dir and the runtime's Windows helper header. Kept apart from
+           the source-dir digests below so each source dir can be keyed on its
+           own tree plus these, and nothing more. */
+        uint64_t shared_digest = 1469598103934665603ULL;
+        long shared_newest = -1;
         /* Re-provisioning native/<triple>/include has to invalidate the objects
            too, or a header swap is served from a stale .o. */
         {
-            long t = file_mtime(arena_printf(&g_arena, "%s/native/%s/include", mdir, triple));
-            if (t > nsrc_newest) nsrc_newest = t;
-            nsrc_digest ^= dir_digest(arena_printf(&g_arena, "%s/native/%s/include",
-                                                   mdir, triple), NULL);
-            nsrc_digest *= 1099511628211ULL;
+            const char *ip = arena_printf(&g_arena, "%s/native/%s/include", mdir, triple);
+            long t = file_mtime(ip);
+            if (t > shared_newest) shared_newest = t;
+            shared_digest ^= dir_digest(ip, NULL);
+            shared_digest *= 1099511628211ULL;
         }
         /* Shims may include the runtime's shared Windows helpers (vyto_win.h,
            found via -I<runtime dir> below), so an edit there is an input of
@@ -1297,31 +1526,14 @@ int main(int argc, char **argv) {
         {
             const char *wh = arena_printf(&g_arena, "%s/vyto_win.h", rtdir);
             long t = file_mtime(wh);
-            if (t > nsrc_newest) nsrc_newest = t;
+            if (t > shared_newest) shared_newest = t;
             size_t wlen = 0;
             char *wsrc = read_file(wh, &wlen);
             if (wsrc) {
-                nsrc_digest ^= fnv1a(wsrc, wlen);
-                nsrc_digest *= 1099511628211ULL;
+                shared_digest ^= fnv1a(wsrc, wlen);
+                shared_digest *= 1099511628211ULL;
             }
         }
-        /* Bake the resolved stdlib dir into native shims so vyto_lib_dir() can
-           return it at runtime (used to locate vendored assets like fonts).
-           Single-quoted so the shell keeps the inner quotes and the C
-           preprocessor sees a string literal. Runtime VYTO_HOME still wins.
-           Also the app's own directory (the entry file's dir, canonical) so
-           os_app_dir()/appDir() can find its assets/conf/storage. Runtime
-           VYTO_APP_DIR still wins.
-           Passed ONLY to packages whose sources mention them. VYTO_APPDIR
-           differs per program, so handing it to a package that ignores it --
-           which is every package except vyto/os -- would make otherwise
-           identical objects unshareable for no benefit. */
-        const char *lib_dir = find_lib_dir();
-        const char *libdef = (lib_dir && (nsrc_uses & USES_LIBDIR))
-            ? arena_printf(&g_arena, " -DVYTO_LIBDIR='\"%s\"'", lib_dir) : "";
-        const char *app_dir = dir_of(entry->path);
-        const char *appdef = (app_dir && (nsrc_uses & USES_APPDIR))
-            ? arena_printf(&g_arena, " -DVYTO_APPDIR='\"%s\"'", app_dir) : "";
         /* Headers that belong to one target only. native/src is shared by every
            triple, so a package vendoring headers there imposes them on all of
            them — vyto/intl hit exactly that: ICU headers vendored for Windows
@@ -1331,33 +1543,113 @@ int main(int argc, char **argv) {
         const char *ninc = arena_printf(&g_arena, "%s/native/%s/include", mdir, triple);
         const char *incflag = dir_exists(ninc)
             ? arena_printf(&g_arena, " -I%s", ninc) : "";
+        const char *lib_dir = find_lib_dir();
+        const char *app_dir = dir_of(entry->path);
 
-        DIR *dp = opendir(nsrc);
-        if (dp) {
+        /* Two source dirs, compiled the same way:
+           - native/src: every target. Its objects key on the whole of
+             native/src (headers aren't tracked per object -- there is no
+             dependency scanner -- so a .h edit must not serve a stale .o).
+           - native/<triple>/src: this target only. It is how a package carries
+             sources that cannot compile elsewhere (vyto/net's vendored curl and
+             mbedTLS for windows-x64) without an #ifdef around every file and
+             without every other target compiling hundreds of empty TUs. Its
+             objects key on their own tree and see only their own headers (no
+             -I native/src), so a shim edit does not recompile the vendored
+             library and the library cannot silently depend on the shim's dir.
+           Both glob flat: vendored trees live in subdirs that are included
+           into, not compiled directly. */
+        bool has_tsrc = false;
+        for (int pass = 0; pass < 2; pass++) {
+            const char *sdir = pass == 0
+                ? arena_printf(&g_arena, "%s/native/src", mdir)
+                : arena_printf(&g_arena, "%s/native/%s/src", mdir, triple);
+            if (!dir_exists(sdir)) continue;
+            if (pass == 1) has_tsrc = true;
+            unsigned uses = 0;
+            uint64_t digest = dir_digest(sdir, &uses);
+            digest ^= shared_digest;
+            digest *= 1099511628211ULL;
+            /* The local fallback (no shared cache) takes the newest mtime. */
+            long newest = shared_newest;
+            DIR *ndp = opendir(sdir);
+            if (ndp) {
+                struct dirent *de;
+                while ((de = readdir(ndp))) {
+                    if (de->d_name[0] == '.') continue;
+                    long t = file_mtime(arena_printf(&g_arena, "%s/%s", sdir, de->d_name));
+                    if (t > newest) newest = t;
+                }
+                closedir(ndp);
+            }
+            /* Bake the resolved stdlib dir into native shims so vyto_lib_dir()
+               can return it at runtime (used to locate vendored assets like
+               fonts). Single-quoted so the shell keeps the inner quotes and the
+               C preprocessor sees a string literal. Runtime VYTO_HOME still
+               wins. Also the app's own directory (the entry file's dir,
+               canonical) so os_app_dir()/appDir() can find its
+               assets/conf/storage. Runtime VYTO_APP_DIR still wins.
+               Passed ONLY to sources that mention them. VYTO_APPDIR differs per
+               program, so handing it to a package that ignores it -- which is
+               every package except vyto/os -- would make otherwise identical
+               objects unshareable for no benefit. */
+            const char *libdef = (lib_dir && (uses & USES_LIBDIR))
+                ? arena_printf(&g_arena, " -DVYTO_LIBDIR='\"%s\"'", lib_dir) : "";
+            const char *appdef = (app_dir && (uses & USES_APPDIR))
+                ? arena_printf(&g_arena, " -DVYTO_APPDIR='\"%s\"'", app_dir) : "";
+            /* A per-triple src dir may name extra include dirs, one per line,
+               relative to itself, in include-dirs.txt. Vendored libraries are
+               written for a build system that passes -I flags (curl's sources
+               include "curl_setup.h" from every subdirectory and expect -Ilib),
+               and there is no other per-package way to say so. The file sits
+               inside the src dir, so it is part of that dir's digest; the dirs
+               it names should too, or an edit there would not rebuild. */
+            const char *xinc = "";
+            if (pass == 1) {
+                char *lst = read_file(arena_printf(&g_arena, "%s/include-dirs.txt", sdir), NULL);
+                if (lst) {
+                    SBuf xb;
+                    sb_init(&xb);
+                    for (char *line = strtok(lst, "\r\n"); line; line = strtok(NULL, "\r\n")) {
+                        while (*line == ' ' || *line == '\t') line++;
+                        if (!*line || *line == '#') continue;
+                        if (line[0] == '/' || strstr(line, ".."))
+                            fatal("%s/include-dirs.txt: '%s' must be a path inside that "
+                                  "directory", sdir, line);
+                        sb_printf(&xb, " -I%s/%s", sdir, line);
+                    }
+                    xinc = arena_strdup(&g_arena, xb.data ? xb.data : "");
+                    sb_free(&xb);
+                }
+            }
+
+            DIR *dp = opendir(sdir);
+            if (!dp) continue;
             struct dirent *de;
             while ((de = readdir(dp))) {
                 if (!has_suffix(de->d_name, ".c")) continue;
-                const char *csrc = arena_printf(&g_arena, "%s/%s", nsrc, de->d_name);
+                const char *csrc = arena_printf(&g_arena, "%s/%s", sdir, de->d_name);
                 /* The command line carries cc, opt, sanitizer and freestanding
                    flags, both -D bakes and every -I, so hashing it keys the
                    object by target triple and build profile as well. It is also
                    what keeps vyto/os honest: its shim is the only one that reads
                    VYTO_APPDIR, and since appdef differs per app it lands on a
                    different key while every other package shares one. */
-                const char *cmd = arena_printf(&g_arena, "%s %s%s%s%s -w%s -I%s -I%s", cc,
+                const char *cmd = arena_printf(&g_arena, "%s %s%s%s%s -w%s -I%s%s -I%s", cc,
                                                release ? "-O2" : opt, fsflags, libdef, appdef,
-                                               incflag, nsrc, rtdir);
+                                               incflag, sdir, xinc, rtdir);
                 const char *label = arena_printf(&g_arena, "native source of package '%s'",
                                                  m->name);
-                const char *obj = cached_object(csrc, nsrc_digest, cmd, label, verbose, &relink);
+                const char *obj = cached_object_queued(csrc, digest, cmd, label, &relink);
                 if (!obj) {
-                    /* No shared cache: keep the object beside the program. */
-                    obj = arena_printf(&g_arena, "%s/native_%s_%s%s%s.o", cache, m->name,
-                                       stem_of(de->d_name), release ? "_rel" : "", prof);
-                    if (!file_exists(obj) || nsrc_newest > file_mtime(obj)) {
-                        char *cl = arena_printf(&g_arena, "%s -c -o %s %s", cmd, obj, csrc);
-                        if (run_cmd(cl, verbose) != 0)
-                            fatal("native source of package '%s' failed to compile", m->name);
+                    /* No shared cache: keep the object beside the program. The
+                       per-triple pass gets its own infix so a.c in both dirs
+                       cannot overwrite one another. */
+                    obj = arena_printf(&g_arena, "%s/native_%s_%s%s%s%s.o", cache, m->name,
+                                       pass ? "t_" : "", stem_of(de->d_name),
+                                       release ? "_rel" : "", prof);
+                    if (!file_exists(obj) || newest > file_mtime(obj)) {
+                        cjob_add(cmd, csrc, obj, NULL, label);
                         relink = true;
                     }
                 }
@@ -1366,8 +1658,27 @@ int main(int argc, char **argv) {
             closedir(dp);
         }
 
+        /* native/<triple>/stage/: files shipped beside the output for this
+           target (vyto/net's cacert.pem). Data, not code, so they go with
+           --bundle too. */
+        {
+            const char *stdir = arena_printf(&g_arena, "%s/native/%s/stage", mdir, triple);
+            DIR *sp = opendir(stdir);
+            if (sp) {
+                struct dirent *de;
+                while ((de = readdir(sp))) {
+                    if (de->d_name[0] == '.') continue;
+                    const char *f = arena_printf(&g_arena, "%s/%s", stdir, de->d_name);
+                    if (!file_exists(f) || dir_exists(f)) continue;
+                    if (ncopy < 64) copy_libs[ncopy++] = f;
+                    else fatal("too many files to ship beside the executable (max 64)");
+                }
+                closedir(sp);
+            }
+        }
+
         const char *pdir = arena_printf(&g_arena, "%s/native/%s", mdir, triple);
-        dp = opendir(pdir);
+        DIR *dp = opendir(pdir);
         if (dp) {
             struct dirent *de;
             bool any = false;
@@ -1397,7 +1708,10 @@ int main(int argc, char **argv) {
                 }
             }
             closedir(dp);
-            if (!any) fatal(bundle
+            /* A triple provided from source (native/<triple>/src) needs no
+               prebuilt; neither does one that only ships headers or staged
+               files alongside such sources. */
+            if (!any && !has_tsrc) fatal(bundle
                 ? "package '%s' has no static library (.a) in native/%s for --bundle"
                 : "package '%s' has native/%s/ but no shared library in it", m->name, triple);
         } else {
@@ -1435,6 +1749,9 @@ int main(int argc, char **argv) {
             sb_free(&have);
         }
     }
+
+    /* every queued package shim compiles here, VYTO_JOBS at a time */
+    run_compile_jobs(verbose);
 
     for (Module *m = g_modules; m; m = m->next) {
         SBuf h, c;
@@ -1505,6 +1822,7 @@ int main(int argc, char **argv) {
         }
     }
 
+    const char *sign_name = NULL;   /* the signature's program name (osslsigncode -n) */
     /* ---- Windows resources (see win_manifest_xml / read_win_manifest) ----
        Every exe gets the application manifest; --manifest adds its icon and
        version info. A DLL is left alone: its manifest is resource 2, and
@@ -1513,6 +1831,7 @@ int main(int argc, char **argv) {
         WinApp app = {0};
         if (manifest_vt) app = read_win_manifest(manifest_vt, verbose);
         else app.name = stem_of(input);
+        sign_name = app.name;
         const char *mpath = arena_printf(&g_arena, "%s/vyto_app.manifest", cache);
         const char *mxml = win_manifest_xml(&app);
         bool rchanged = false, ch = false;
@@ -1672,11 +1991,21 @@ int main(int argc, char **argv) {
            strip, a new resource object, a different --cc — left the old exe in
            place until --clean. */
         const char *stamp = arena_printf(&g_arena, "%s/link%s.cmd", cache, osuf);
+        /* --sign is part of the stamp too, with the certificate's mtime: signing
+           happens right after a link, so turning it on or off, or renewing the
+           certificate, has to produce a fresh link to sign (or to leave
+           unsigned). A rebuild with nothing changed keeps the already-signed
+           exe instead of signing a signed file again. */
+        const char *stampdata = sign_pfx
+            ? arena_printf(&g_arena, "%s\n#sign %s %ld %s", cmdline, sign_pfx,
+                           file_mtime(sign_pfx), sign_ts ? sign_ts : "")
+            : cmdline;
         bool lchanged = false;
-        if (!write_if_changed(stamp, cmdline, strlen(cmdline), &lchanged))
+        if (!write_if_changed(stamp, stampdata, strlen(stampdata), &lchanged))
             fatal("cannot write %s", stamp);
         if (lchanged) relink = true;
         if (relink || !file_exists(exe)) {
+            linked_now = true;
             if (run_cmd(cmdline, verbose) != 0) {
                 /* a failed link must not leave a stamp claiming it succeeded */
                 remove(stamp);
@@ -1690,6 +2019,24 @@ int main(int argc, char **argv) {
         if (strcmp(dir_of(copy_libs[i]), exedir) == 0) continue;
         char *cl = arena_printf(&g_arena, "cp -p %s %s/", copy_libs[i], exedir);
         if (run_cmd(cl, verbose) != 0) fatal("cannot copy %s next to the executable", copy_libs[i]);
+    }
+    /* The exe plus every DLL it ships: what --audit checks and --sign signs. */
+    const char *shipped[65];
+    int nshipped = 0;
+    shipped[nshipped++] = exe;
+    for (int i = 0; i < ncopy; i++)
+        if (has_suffix(copy_libs[i], ".dll") || has_suffix(copy_libs[i], ".DLL"))
+            shipped[nshipped++] = arena_printf(&g_arena, "%s/%s", exedir, base_of(copy_libs[i]));
+    if (audit) {
+        fflush(stdout);
+        if (pe_audit(win7_exports_path(), nshipped, shipped) != 0)
+            fatal("%s would not load on Windows 7 (see above); the import audit failed", exe);
+    }
+    if (sign_pfx) {
+        /* The exe is signed only when it was just linked (see the stamp); the
+           DLLs are fresh copies on every build, so they always are. */
+        for (int i = linked_now ? 0 : 1; i < nshipped; i++)
+            win_sign(shipped[i], sign_pfx, sign_ts, sign_name, cache, verbose);
     }
     sb_free(&objs);
     sb_free(&shlibs);

@@ -336,11 +336,40 @@ can still change while the program runs: `Window.set_icon(pixels, w, h)`.
 
 ### Will it run on Windows 7?
 
-`tests/win/pe_audit.sh app.exe` checks every function the exe imports against
-the exports of a real Windows 7 install (`tests/win/win7_exports.txt`), plus
-any Universal CRT dependency, which Windows 7 lacks without KB2999226. `make
-test-win` runs it on every staged exe. A newer API used without a runtime
-check is caught here instead of as "entry point not found" on a user's machine.
+```sh
+./vytoc build app.vt --target windows-x64 --release --audit
+./vytoc audit app.exe libsomething.dll       # any PE file, built by anything
+```
+
+`--audit` checks every function the exe imports — and every DLL vytoc ships
+beside it — against the exports of a real Windows 7 install
+(`lib/vyto/win/win7_exports.txt`), and fails the build if one is missing. It
+also refuses a Universal CRT dependency (`api-ms-win-crt-*`), which Windows 7
+lacks without KB2999226, a DLL that is neither a Windows 7 system DLL nor
+shipped beside the exe, and an import by ordinal. A newer API used without a
+runtime check is caught here instead of as "entry point not found" on a
+user's machine. It reads the PE file itself, so it needs no objdump and works
+for an exe from any toolchain; `make test-win` runs it over everything it
+stages.
+
+### Signing: `--sign`
+
+```sh
+VYTO_SIGN_PASS=... ./vytoc build app.vt --target windows-x64 --release \
+    --sign cert.pfx --timestamp http://timestamp.digicert.com
+```
+
+Authenticode-signs the exe and each DLL shipped beside it with a PKCS#12
+certificate, through [osslsigncode](https://github.com/mtrojnar/osslsigncode)
+(`apt install osslsigncode`). A signed exe shows its publisher in the UAC and
+SmartScreen prompts instead of "Unknown publisher"; SmartScreen's reputation
+still has to build up per certificate. The password is read from
+`$VYTO_SIGN_PASS` and handed over in a private file, never on a command line.
+`--timestamp` (needs the network) keeps the signature valid after the
+certificate expires — use it for anything you ship. Signing runs after the
+strip and the audit, and is part of the link stamp: dropping `--sign` gives an
+unsigned exe on the next build, and an unchanged rebuild does not re-sign.
+Don't pack signed exes with UPX: Defender treats packed binaries as suspect.
 
 ### What is portable today
 
@@ -348,8 +377,14 @@ The **core language, the runtime, and the stdlib packages with no POSIX
 dependency**: `vyto/math`, `vyto/reactive`, `vyto/util/*` (fmt, json, sort, text,
 time, date, and the data-format modules — csv, xml, toml, ini, markdown, html,
 url, mime, log), `vyto/io/file`, `vyto/data/frame`, `vyto/os/os`, `vyto/anim`,
-`vyto/cli`, `vyto/geom/*`, `vyto/geo/*`, plus FFI, native packages with in-tree C,
-and prebuilt `native/windows-x64/*.dll` packages.
+`vyto/cli`, `vyto/geom/*`, `vyto/geo/*`, `vyto/desktop`, plus FFI, native
+packages with in-tree C, and prebuilt `native/windows-x64/*.dll` packages.
+
+`vyto/desktop` gives the OS's own file dialogs, message boxes, "open in the
+default app" and per-user folders (`configDir`, `dataDir`, `cacheDir`). On
+Windows that is comdlg32, `IFileOpenDialog`, `MessageBoxW`, `ShellExecuteW`
+and `SHGetKnownFolderPath`, all present on Windows 7; on Linux it runs zenity
+or kdialog and xdg-open. See `lib/vyto/desktop/README.md`.
 
 `vyto/util/uuid` is portable too, though unlike its `vyto/util` siblings it does
 carry a native shim: `getrandom(2)` on Linux, `BCryptGenRandom` on Windows (so it
@@ -375,11 +410,23 @@ prerequisite `vyto/gfx` has.
 
 **Networking**: `vyto/net/socket` builds on Winsock2 (`ws2_32`, linked
 conditionally), covering TCP, UDP and `PollSet`. `vyto/net/http` and
-`vyto/net/websocket` build too, against the prebuilt `libcurl-x64.dll` in
-`lib/vyto/net/native/windows-x64/` — the ordinary prebuilt-native-package path,
-so `vytoc` copies the DLL next to your executable. One caveat that is not
-Vyto's: that DLL imports `api-ms-win-crt-*`, so it needs the Universal CRT.
-Windows 10 and later ship it; Windows 7 needs KB2999226.
+`vyto/net/websocket` build too, with **HTTPS working on Windows 7 through 11**:
+Windows has no system libcurl, so vyto/net carries curl and mbedTLS as
+vendored source (`lib/vyto/net/native/windows-x64/`, compiled for that target
+only) and they link statically into your exe — no DLL, `--bundle` works, and
+the only system DLLs it adds are `ws2_32` and `bcrypt`. TLS 1.2 and 1.3 are
+done by mbedTLS, independent of the OS's Schannel. The first Windows build
+compiles about 270 files (around 25 s on 8 cores, `VYTO_JOBS` to change the
+parallelism); after that they come from the object cache.
+
+Certificates are trusted from the Windows ROOT store **plus** `cacert.pem`, the
+Mozilla bundle vytoc copies beside the exe. Ship that file with the app:
+Windows installs most roots lazily, only when its own TLS stack first needs
+one, so on a machine that rarely browses the ROOT store alone can miss one as
+common as Let's Encrypt's. `http_set_ca_file(path)` replaces both with your own
+bundle (any path, Unicode included). Verification cannot be turned off. TLS
+fixes now arrive by updating the vendored copy (`refresh-curl.sh`), not
+through Windows Update.
 
 **Parallelism**: `vyto/os/worker` builds, but it is a **re-exec pool rather than
 `fork()`** — Windows has no `fork`. Workers are the same executable relaunched

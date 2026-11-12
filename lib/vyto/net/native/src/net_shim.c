@@ -1,6 +1,6 @@
 #include <stdint.h>
 #include "net_shim.h"
-#include <curl/curl.h>
+#include "net_ca.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -50,6 +50,7 @@ NetFetch *net_fetch_url(const char *url) {
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 5L); /* total-time cap */
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(curl, CURLOPT_USERAGENT, "vyto-net/0.1");
+    vnet_ca_apply(curl);
 
     CURLcode res = curl_easy_perform(curl);
     long code = 0;

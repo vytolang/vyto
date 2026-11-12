@@ -1,7 +1,7 @@
 CC      ?= cc
 CFLAGS  ?= -std=c99 -O2 -Wall -Wextra -g
-SRC     := src/main.c src/util.c src/lex.c src/parse.c src/check.c src/emit.c
-HDR     := src/util.h src/lex.h src/ast.h src/parse.h src/check.h src/emit.h
+SRC     := src/main.c src/util.c src/lex.c src/parse.c src/check.c src/emit.c src/peaudit.c
+HDR     := src/util.h src/lex.h src/ast.h src/parse.h src/check.h src/emit.h src/peaudit.h
 
 all: vytoc vytobind vytopack
 

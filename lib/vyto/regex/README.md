@@ -257,7 +257,7 @@ holds with JIT on and off. If you want the depth limit to bite, run with
 This repository's standing rule is *fetch, don't vendor*, and it is written down
 in at least five places — `.gitignore:25-27` (which rejects exactly this for the
 SQLite amalgamation), `.gitignore:33-40`,
-`lib/vyto/gfx/native/build-blend2d.sh:3-5`,
+`lib/vyto/gfx/native/build-blend2d.sh:3-5`, the since-retired
 `lib/vyto/net/native/provision-curl.sh`, and `benchmarks/README.md:30-33`. Until
 this module there was no third-party C in the tree at all.
 

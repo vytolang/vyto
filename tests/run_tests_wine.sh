@@ -9,7 +9,7 @@
 #
 # What it is NOT: Windows 7. Wine reimplements msvcrt, kernel32, GDI and the
 # rest, so a pass here does not prove a pass there (nor the reverse). The Win7
-# box stays the check of record; tests/win/pe_audit.sh stays the import check.
+# box stays the check of record; `vytoc audit` (run by run_tests_win.sh) stays the import check.
 #
 # The prefix lives in $VYTO_WINEPREFIX (default: ~/.cache/vyto/wineprefix),
 # outside tests/tmp so a restage does not throw away the ~50 s it takes Wine
@@ -206,6 +206,96 @@ WANT
     fi
 }
 input_check
+
+# --- vyto/desktop: answer each of desktop_demo's dialogs ----------------------
+# Message box, Yes/No, open, multi-select open, save and the folder picker, in
+# that order, each found by its title. Wine's comdlg32 and IFileOpenDialog
+# are Wine's, not Windows 7's, so this proves our calls and the result
+# parsing (the double-NUL multi-select list, the shell item path), not the
+# look of the dialogs.
+desktop_check() {
+    for t in Xvfb xdotool; do
+        command -v "$t" >/dev/null 2>&1 || { echo "SKIP wine_desktop (no $t)"; return 0; }
+    done
+    [ -f "$STAGE/desktop_demo.exe" ] || { echo "FAIL wine_desktop (not staged)"; fail=$((fail + 1)); return 0; }
+    # A wineserver left over from the display-less manifest runs makes the
+    # dialogs return at once without ever mapping a window.
+    wineserver -k >/dev/null 2>&1; sleep 1
+    dd="$STAGE/desk"; rm -rf "$dd"; mkdir -p "$dd/dfold"
+    printf a > "$dd/desk_a.txt"; printf b > "$dd/desk_b.txt"
+    Xvfb -displayfd 3 -screen 0 1280x800x24 -nolisten tcp 3>"$tmp/ddpy" >/dev/null 2>&1 &
+    xp=$!
+    i=0; while [ ! -s "$tmp/ddpy" ] && [ $i -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+    DISPLAY=":$(cat "$tmp/ddpy")"; export DISPLAY
+    (cd "$dd" && "$WINE" ../desktop_demo.exe > "$tmp/desk.log" 2>&1) &
+    dp=$!
+    wp="Z:$(cd "$dd" && pwd | tr / '\\')"
+    step() {
+        w=$(timeout 20 xdotool search --sync --name "^$1\$" 2>/dev/null | head -1)
+        [ -n "$w" ] || return 1
+        sleep 0.8; xdotool windowfocus "$w" 2>/dev/null; sleep 0.3
+    }
+    step vyto-desk-msg && xdotool key Return; sleep 0.5
+    step vyto-desk-ask && xdotool key Return; sleep 0.5
+    step vyto-desk-open && { xdotool type --delay 30 "$wp\\desk_a.txt"; xdotool key Return; }; sleep 0.8
+    step vyto-desk-many && { xdotool type --delay 30 '"desk_a.txt" "desk_b.txt"'; xdotool key Return; }; sleep 0.8
+    step vyto-desk-save && { xdotool key ctrl+a; xdotool type --delay 30 "$wp\\saved.txt"; xdotool key Return; }; sleep 0.8
+    step vyto-desk-folder && { xdotool type --delay 30 "$wp\\dfold"; xdotool key Return; }; sleep 1
+    i=0; while kill -0 "$dp" 2>/dev/null && [ $i -lt 75 ]; do sleep 0.2; i=$((i + 1)); done
+    kill "$dp" 2>/dev/null
+    kill "$xp" 2>/dev/null
+    cat > "$tmp/desk.want" <<WANT
+message: true
+confirm: true
+open: $wp\desk_a.txt
+many: 2
+  $wp\desk_a.txt
+  $wp\desk_b.txt
+save: $wp\saved.txt
+wrote: true
+folder: $wp\dfold
+done
+WANT
+    tr -d '\r' < "$tmp/desk.log" | grep -v "^X connection" > "$tmp/desk.got"
+    if cmp -s "$tmp/desk.want" "$tmp/desk.got"; then
+        echo "PASS wine_desktop_dialogs"; pass=$((pass + 1))
+    else
+        echo "FAIL wine_desktop_dialogs"; diff "$tmp/desk.want" "$tmp/desk.got" | head -20
+        fail=$((fail + 1))
+    fi
+    unset DISPLAY
+}
+desktop_check
+
+# --- HTTPS: the vendored curl + mbedTLS against a local server ----------------
+# No network: openssl s_server on loopback with the test PKI in
+# tests/fixtures/tls. Trusting the fixture root must succeed — from a path
+# with non-ASCII in it, since mbedTLS's own fopen could not open one; the
+# default trust store and an unrelated root must both FAIL, which is the proof
+# that verification is on rather than merely that a handshake happened.
+https_check() {
+    command -v openssl >/dev/null 2>&1 || { echo "SKIP wine_https (no openssl)"; return 0; }
+    [ -f "$STAGE/https_local.exe" ] || { echo "FAIL wine_https (not staged)"; fail=$((fail + 1)); return 0; }
+    port=$((20000 + $$ % 20000))
+    (cd tests/fixtures/tls && exec openssl s_server -quiet -accept "127.0.0.1:$port" \
+        -cert leaf.crt -key leaf.key -www) >/dev/null 2>&1 &
+    sp=$!
+    sleep 1
+    hd="$STAGE/tls/$UNI"; mkdir -p "$hd"; cp "$STAGE/tls/root.crt" "$hd/root.pem"
+    url="https://127.0.0.1:$port/"
+    r_ok=$(cd "$STAGE" && HTTPS_URL=$url HTTPS_CA="tls\\$UNI\\root.pem" "$WINE" ./https_local.exe 2>&1 | tr -d '\r')
+    r_def=$(cd "$STAGE" && HTTPS_URL=$url "$WINE" ./https_local.exe 2>&1 | tr -d '\r')
+    r_bad=$(cd "$STAGE" && HTTPS_URL=$url HTTPS_CA='tls\other-root.crt' "$WINE" ./https_local.exe 2>&1 | tr -d '\r')
+    kill "$sp" 2>/dev/null
+    if [ "$r_ok" = "status=200 ok=true" ] && [ "$r_def" = "status=0 ok=false" ] &&
+       [ "$r_bad" = "status=0 ok=false" ]; then
+        echo "PASS wine_https_verify"; pass=$((pass + 1))
+    else
+        echo "FAIL wine_https_verify (fixture CA: $r_ok | default store: $r_def | other root: $r_bad)"
+        fail=$((fail + 1))
+    fi
+}
+https_check
 
 echo "wine: $pass passed, $fail failed (Wine $("$WINE" --version 2>/dev/null), not Windows 7)"
 [ "$fail" -eq 0 ]

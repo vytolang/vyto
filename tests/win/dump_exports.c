@@ -1,8 +1,8 @@
 /* dump_exports.c — list what a Windows install's system DLLs export.
  *
  * Built by tests/run_tests_win.sh with mingw and run by run.ps1 on the
- * Windows box. Its output, committed as tests/win/win7_exports.txt from a
- * Windows 7 run, is the allowlist tests/win/pe_audit.sh checks every exe's
+ * Windows box. Its output, committed as lib/vyto/win/win7_exports.txt from a
+ * Windows 7 run, is the allowlist `vytoc audit` (src/peaudit.c) checks every exe's
  * imports against: an import missing from it would fail to load on Windows 7
  * with "entry point not found", the kind of break nothing else catches until
  * a user hits it.
