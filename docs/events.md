@@ -68,6 +68,20 @@ That is `apps/snake/snake.vt` in miniature.
 `wait_timeout` is how a game gets a frame clock: input returns early, the
 timeout is the tick.
 
+`waitTimeoutFds` returns `EV_TIMER` both when the time ran out and when one of
+your descriptors became readable, so **check your descriptors on every
+return**. `s.canWaitFds()` says whether the backend really sleeps on them:
+
+| Backend | Waits on your descriptors |
+|---|---|
+| X11 | yes |
+| Win32 | yes for sockets (`WSAEventSelect`); anything else falls back to a wait of at most 16 ms |
+| Android, Linux framebuffer, headless | no: a bounded wait, so the call stays correct but polls |
+
+Where it is false, a loop that wants to sleep while idle still needs a timer
+ceiling. In `vyto/ui` you do not call this yourself — see
+[Waking on your own work](#waking-on-your-own-work).
+
 ### Event classes
 
 | Constant | Meaning | Read it with |
@@ -79,15 +93,23 @@ timeout is the tick.
 | `EV_MOUSE_DOWN` | left button pressed | `mouse_x()`, `mouse_y()`, `mods()` |
 | `EV_MOUSE_UP` | left button released | `mouse_x()`, `mouse_y()` |
 | `EV_MOUSE_RDOWN` | **right** button pressed | `mouse_x()`, `mouse_y()` |
+| `EV_BUTTON_DOWN` | middle, back or forward pressed | `button()`, `mouse_x()`, `mouse_y()` |
+| `EV_BUTTON_UP` | right, middle, back or forward released | `button()`, `mouse_x()`, `mouse_y()` |
 | `EV_MOUSE_MOVE` | cursor moved (the hover source) | `mouse_x()`, `mouse_y()` |
-| `EV_MOUSE_WHEEL` | wheel scrolled | `wheel()` — see below |
+| `EV_MOUSE_WHEEL` | wheel scrolled | `wheel()`, `wheel_x()` — see below |
 | `EV_RESIZE` | window resized | `width()`, `height()` |
 | `EV_TIMER` | `wait_timeout` elapsed with no input | — |
 | `EV_CLOSE` | the user closed the window | exit your loop |
 | `EV_VSYNC` | the display is about to scan out; present now | see `set_vsync` |
 
-There is **no `EV_MOUSE_RUP`** — the backends do not deliver a right-button
-release, so a right-click is a press with no pair.
+**Buttons.** Left is `EV_MOUSE_DOWN`/`EV_MOUSE_UP`, and a right **press** is
+`EV_MOUSE_RDOWN`, as they always were. Every other press or release is
+`EV_BUTTON_DOWN`/`EV_BUTTON_UP`, with `button()` one of `BUTTON_MIDDLE`,
+`BUTTON_BACK` (the thumb button nearest you), `BUTTON_FORWARD`, or
+`BUTTON_RIGHT` — which only ever appears on `EV_BUTTON_UP`, as the release of
+an `EV_MOUSE_RDOWN`. A right press is never reported twice. X11 and Win32
+deliver all of them; on Windows a press captures the mouse, so the release
+arrives even when it happens outside the window.
 
 ### Accessors
 
@@ -99,7 +121,9 @@ s.key()          // int: ASCII code, or a KEY_* constant
 s.text_ev()      // string: the text this keypress inserts ("" for e.g. arrows)
 s.mouse_x()      // int
 s.mouse_y()      // int
-s.wheel()        // int: scroll delta
+s.wheel()        // int: vertical scroll delta, + = down
+s.wheel_x()      // int: horizontal scroll delta, + = right
+s.button()       // int: BUTTON_* of the last EV_BUTTON_DOWN / EV_BUTTON_UP
 s.mods()         // int: MOD_* bitmask at the time of the event
 s.now_ms()       // int: monotonic ms — the animation/game clock, not wall time
 s.scale()        // float: 1.0 = 96dpi, 2.0 = HiDPI
@@ -116,7 +140,27 @@ with `key() == 0` and the UTF-8 sequence in `text_ev()`.
 *content*, not the finger. One notch is `±3`, not `±1`: the backend maps a
 wheel click to three lines (X11 `Button4`/`Button5`, and Windows normalizes its
 120-unit `WHEEL_DELTA` to the same). Treat it as a delta to accumulate, not as a
-count of notches.
+count of notches. On Windows a touchpad's fractional deltas accumulate until
+they make a line, rather than each rounding to nothing.
+
+`wheel_x()` is the horizontal wheel: a tilt wheel, a touchpad's sideways
+swipe (X11 buttons 6/7, Windows `WM_MOUSEHWHEEL`), positive = right. A wheel
+event carries one direction or the other, so the unused one is `0`.
+
+### Pointer shape and the input method
+
+```js
+s.set_cursor(CURSOR_IBEAM)     // CURSOR_ARROW IBEAM HAND WAIT CROSS SIZE_WE SIZE_NS
+                               // SIZE_NWSE SIZE_NESW MOVE HIDDEN
+s.cursor()                     // reads it back
+s.set_ime_pos(x, y, h)         // the caret: top-left and height, in surface pixels
+```
+
+`set_cursor` is shown on Win32 and X11; headless, framebuffer and Android only
+remember it, which lets tests check it. `set_ime_pos` tells an input method
+(Chinese, Japanese, Korean typing) where the caret is, so its candidate window
+opens beside it; it does something on Win32 and is a no-op elsewhere. In
+`vyto/ui` both are handled for you (§3).
 
 ### Key codes
 
@@ -167,10 +211,12 @@ class Key extends Widget {
 | `on_double_click(x, y)` | second press within `DOUBLE_CLICK_MS`, inside the slop |
 | `on_long_press(x, y)` | press held past `LONG_PRESS_MS` without moving |
 | `on_context(x, y)` | right button pressed |
+| `on_button(button, down, x, y)` | any other button: the right **release**, middle, back, forward (`BUTTON_*`). Bubbles up the parent chain, so a page can take back/forward for its own navigation |
 | `on_drag_start(x, y)` | a press first moves past `DRAG_SLOP` |
 | `on_drag(dx, dy)` | every move while holding capture — **deltas**, not positions |
 | `on_drag_end(x, y)` | release after a drag |
 | `on_scroll(delta)` | wheel over this widget; +down, −up |
+| `on_scroll_x(delta)` | horizontal wheel over this widget, or **Shift + wheel**; +right. The default scrolls horizontal overflow |
 | `on_key(k, ch)` | key down while focused; `ch` is the insertable text |
 | `on_key_up(k)` | key released while focused |
 | `on_hover_enter()` / `on_hover_leave()` | cursor entered / left the bounds |
@@ -187,6 +233,68 @@ Gesture thresholds are constants you can read: `DOUBLE_CLICK_MS` (400),
 `on_click` fires on press-*down*. If you want the click-completed semantics a
 button has, use `on_release`, which only fires if the cursor is still inside
 the widget.
+
+Shift + a vertical wheel is first offered sideways (`on_scroll_x`); only if
+nothing under the pointer takes it does it scroll vertically.
+
+### Pointer shape and the caret
+
+Two more hooks, neither of them an event:
+
+```js
+override fn cursor(): int { return CURSOR_HAND; }   // shown while hovered
+```
+
+`cursor()` answers the pointer shape for the widget under the pointer; the
+window applies it on hover, and only a change reaches the backend. `TextField`
+and `TextArea` answer `CURSOR_IBEAM`. Touch windows (`touch_mode`) skip it.
+
+A text widget calls `this.ime_caret(x, y, h)` from `render()` while focused, so
+an input method opens its candidate window at the caret. The window drops
+repeats, so calling it every frame is free. `TextField` and `TextArea` already
+do; a custom text widget should too.
+
+### Waking on your own work
+
+A window loop sleeps until an event arrives. Work that finishes somewhere else
+— a worker process, a socket, a background service — has to be able to wake
+it:
+
+| Call | Use for |
+|---|---|
+| `win.add_poll_fd(fd, body)` | the work **is** a descriptor: a socket, a pipe, a worker's channel (`WorkerPool.workerFds()`). The loop sleeps on it, so an idle app stays asleep |
+| `win.add_poll_source(body)` | work that is not a descriptor: a flag another thread sets, a file's mtime. The loop wakes about every 16 ms while it is registered |
+| `win.remove_poll_source(id)` | both return an id; remove the source when the work is done |
+
+`body` runs once per pass of the loop while the source is registered. It does
+**not** repaint: call `redraw()` or `invalidate()` when something visible
+changed. Register on submit, remove on completion; a source left registered
+forever turns `add_poll_source` into a 60 Hz wakeup.
+
+```js
+class Pending { id: int; }     // closures capture by value: keep the id in an object
+
+let fd = pool.workerFds()[0];
+let job = new Pending();
+job.id = win.add_poll_fd(fd, () => {
+    let r = pool.onReady(fd);
+    if (r != null) { show(r); win.redraw(); win.remove_poll_source(job.id); }
+});
+```
+
+The holder object matters: the closure is made before `add_poll_fd` returns
+the id, and it captures values, so a plain `let id` would still read `0`
+inside it.
+
+`add_poll_fd` sleeps on the descriptor where the backend can
+([`canWaitFds`](#waiting)): X11, and Win32 for sockets. Elsewhere it falls
+back to the 16 ms poll, so it is always correct and sometimes cheaper.
+
+For talking to a background service, `attachChannel(win, ch)` from
+`vyto/desktop/channel/gui` does this for a `vyto/desktop/channel` `Channel`,
+including re-registering after a reconnect. Measured under Wine: about 64
+wakeups in 2 s with a channel attached and idle, against about 480 with 16 ms
+polling.
 
 ### Focus and typing
 
@@ -231,9 +339,14 @@ keyup Enter          same names, delivered as a release
 click X Y            mouse down, then up, at X,Y
 down X Y             down with no paired up — for drag-hold tests
 up X Y               the matching release
-rclick X Y           right button (no paired up — matches the real backends)
+rclick X Y           right press only; script its release as "button up right X Y"
+button down|up B X Y one non-left button: B is right, middle, back or forward
+                     ("button down right" is EV_MOUSE_RDOWN, as on real backends)
 move X Y             cursor motion — the hover source
 scroll N [X Y]       wheel; N is the delta (one real notch is ±3, +down)
+hscroll N [X Y]      horizontal wheel; N is the delta, +right
+win N                send everything that follows to window N (open order,
+                     0-based); absent means window 0. Emits no event
 resize W H
 expose
 tick                 a timer tick, for game-loop tests
@@ -242,8 +355,9 @@ clip some text       seed the clipboard — the paste-test hook
 close
 ```
 
-`mods` and `clip` emit no event of their own; they set state the following
-directives read. Each delivered event advances the synthetic clock 16 ms, so
+`mods`, `clip` and `win` emit no event of their own; they set state the
+following directives read. `rclick` stays a lone press so that scripts
+written before the right release existed replay exactly as they did. Each delivered event advances the synthetic clock 16 ms, so
 `now_ms()` behaves like one frame per event.
 
 ## 5. Android — touch, Back, and the IME
@@ -408,7 +522,13 @@ the timeout in your own loop.
 tween *duration*, not an interval. Misreading it produces a benchmark that
 measures your own timer.
 
-**Right-click has no release event.** Do not wait for one.
+**A right click is two different events.** The press is `EV_MOUSE_RDOWN`
+(`on_context`); the release is `EV_BUTTON_UP` with `BUTTON_RIGHT`
+(`on_button`). Code that only handles the press keeps working, and a context
+menu should open on the press, as it does today.
+
+**`add_poll_source` is not a timer.** Left registered, it wakes the loop every
+16 ms forever. For a descriptor use `add_poll_fd`; for animation, a `Tween`.
 
 **On Android, a custom text widget without `wants_text()` never sees a key.**
 It takes focus and draws a caret, and the keyboard never comes up.
@@ -431,6 +551,8 @@ no-op.
 | the constants | `lib/vyto/surface/surface.vt` |
 | scripted-event tests | `tests/ui/*.events` |
 | raw hardware devices | `docs/hardware.md`, `examples/54_input.vt` |
+| Windows and X11 event translation | `lib/vyto/surface/native/src/vsurf.c` |
+| a GUI waking on a service's messages | `lib/vyto/desktop/channel/gui.vt`, `apps/pos_suite` |
 | Android event translation | `lib/vyto/surface/native/src/vsurf_android.c` |
 | Android window, Back, IME | `lib/vyto/mobile/android/ui.vt` (`AndroidWindow`) |
 | the Back-depth publish | `lib/vyto/mobile/android/native/src/aback.c` |

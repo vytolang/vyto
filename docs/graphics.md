@@ -9,31 +9,31 @@ What a Vyto program can draw with, top to bottom.
 > 3D-capable canvas method anywhere. Every actual drawing surface described
 > below (`vyto/surface`, `vyto/gfx`) is exhaustively 2D. If you want a
 > rotating cube on screen, the math to compute its transform exists; the
-> rasterizer to paint it does not — you'd be writing one. See §6.
+> rasterizer to paint it does not — you'd be writing one. See §8.
 
 ## 1. The stack
 
 ```
-vyto/geom            math: vectors, Mat4, vector paths — no drawing surface, no window
+vyto/geom              math: vectors, Mat4, vector paths — no drawing surface, no window
      │
      ▼
-vyto/surface          Layer 0: a window + pixel canvas + event queue (lean 2D)
-     │                          ▲
-     ▼                          │ blitPtr (blend2d's buffer onto the window)
-vyto/gfx              rich 2D: blend2d-backed canvas — AA shapes, gradients, text, images
-     │                          │
-     ▼                          ▼
-vyto/ui Painter       the seam: widgets draw through this abstract class only
-     ├── SurfacePainter   (default, forwards to vyto/surface — lean tier)
-     ├── GfxPainter        (forwards to vyto/gfx — rich tier)
-     └── D2DPainter        (Windows: Direct2D + DirectWrite — rich tier, no blend2d)
+vyto/surface           Layer 0: a window + pixel canvas + event queue (lean 2D)
+vyto/surface/painter   the seam: the abstract Painter, and SurfacePainter (lean tier,
+     │                 anti-aliased text through vyto/surface/ttf)
+     │        ▲
+     │        ├── GfxPainter   vyto/gfx: blend2d canvas — AA shapes, gradients, text, images,
+     │        │                blitted onto the window
+     │        └── D2DPainter   vyto/win/d2d: Windows, Direct2D + DirectWrite, no blend2d
+     ▼
+vyto/ui                widgets; they draw through Painter only (re-exported from here)
 ```
 
 Each layer is independently usable. A game or emulator can draw straight on
 `vyto/surface` and never touch `vyto/gfx` or `vyto/ui`. A custom renderer can
-use `vyto/gfx`'s `Canvas` with no window at all. `vyto/ui`'s widgets never
-import `vyto/gfx` directly — they draw through `Painter`, and an app wires in
-whichever tier it wants at runtime.
+use `vyto/gfx`'s `Canvas` with no window at all. `Painter` lives **below** the
+toolkit, in `vyto/surface/painter`, so a rich painter compiles without any
+`vyto/ui` module, and `vyto/ui`'s widgets never import `vyto/gfx` — they draw
+through `Painter`, and an app wires in whichever tier it wants at runtime.
 
 ## 2. `vyto/geom` — the math, no drawing
 
@@ -77,7 +77,7 @@ Constructors (free functions): `mat4Zero` `mat4Identity` `mat4FromRows`
 Convention: right-handed, looking down -z, clip depth in `[-1, 1]` (OpenGL,
 not D3D). A full model-view-projection pipeline is `Vec4` in, perspective
 divide, `Vec3` out — the math for it is complete. What consumes that math
-(§6) is the open question.
+(§8) is the open question.
 
 **Deliberately out of scope** (`geom/README.md`): `Mat3`, camera controllers,
 frustum culling, scene graphs, 2D affine transforms (`vyto/gfx` has its own),
@@ -133,7 +133,8 @@ import { Surface, rgb, Rect } from "vyto/surface";
 "Layer 0 of the bundled UI stack... a supported public layer: consume it
 directly for games, custom renderers, or visualization tools, or let
 `vyto/ui` sit on top of it." Backed by X11 on Linux (`native/src/vsurf.c`),
-GDI on Windows.
+Win32 + GDI on Windows, and on Android, the Linux framebuffer, and a headless
+backend for tests (`VS_HEADLESS=1`, see [events.md §4](events.md#4-scripted-events--testing-without-a-human)).
 
 ### `Rect`
 
@@ -174,8 +175,8 @@ bottom/left/right` `drop_top/bottom/left/right`; layout `center_box`
   to move a blend2d canvas onto the window)
 - **Present**: `present()` `present_rect(r)`
 - **Clip**: `clip_set(r)` `clip_clear()`
-- **Events/input**: `wait()` `poll()` `wait_timeout(ms)` `set_vsync(on): bool`
-  `key()` `text_ev()` `mouse_x()` `mouse_y()` `wheel()` `wheel_x()`
+- **Events/input**: `wait()` `poll()` `wait_timeout(ms)`
+  `waitTimeoutFds(ms, fds)` `canWaitFds()` `set_vsync(on): bool` `key()` `text_ev()` `mouse_x()` `mouse_y()` `wheel()` `wheel_x()`
   `button()` `mods()` `now_ms()` `scale()` (HiDPI factor)
 - **Text input**: `text_ev()` is UTF-8 — one character per `EV_KEY`, whatever
   the keyboard layout or input method produced (accents, AltGr characters,
@@ -256,8 +257,8 @@ blit onto a `Surface` window (or export standalone).
 - **Fonts/text**: `loadFont(path,size)` `loadFontWeight(path,size,weight)`
   `loadFontBytes(data,len,size,weight)` `setWeight(w)` `setFontSize(size)`
   `fontSize()` `text(x,y,s,rgb)` `textWidth(s)` `fontAscent()` `fontHeight()`
-  — embedded-asset paths shadow disk automatically (§7)
-- **Images**: `drawImage(img,x,y,w,h)`, plus the free functions in §8
+  — embedded-asset paths shadow disk automatically (§6)
+- **Images**: `drawImage(img,x,y,w,h)`, plus the free functions in §7
 - **Output**: `flush()` `pixels(): rawptr` `stride(): int` — hand to
   `Surface.blitRect`
 - **Testing/debug**: `hash()` (FNV fingerprint for golden tests),
@@ -342,7 +343,7 @@ rich vocabulary still renders, just less prettily, on the lean tier.
 
 | Painter | Backs onto | Notes |
 |---|---|---|
-| `SurfacePainter` | `vyto/surface` | the default (lean tier); real geometric clipping via `Surface.clip_set` |
+| `SurfacePainter` | `vyto/surface` | the default (lean tier); anti-aliased text via `vyto/surface/ttf` (§6); real geometric clipping via `Surface.clip_set` |
 | `GfxPainter` | `vyto/gfx` `Canvas` | the rich tier (blend2d) |
 | `GfxPainterNet` | `GfxPainter` | + network image loading |
 | `D2DPainter` | Direct2D + DirectWrite | Windows only: the rich tier with native text; see below |
@@ -350,16 +351,25 @@ rich vocabulary still renders, just less prettily, on the lean tier.
 | `ClippedPainter` | wraps another `Painter` | a *decorator*, not a renderer — clips every draw call to a rect; used by `ScrollView` |
 
 A `Window` defaults to `SurfacePainter`; swap tiers at runtime with
-`win.use_painter(gfxPainter)`. No library constructs a concrete `Painter` —
-only app code does, which is what keeps `vyto/ui` gfx-free.
+`win.use_painter(gfxPainter)`. `vyto/ui` never constructs a rich painter —
+the program does, which is what keeps `vyto/ui` gfx-free. (The stdlib's own
+programs count as programs here: the installer, `vyto/win/setup`, picks
+`D2DPainter` for itself.)
 
 ### `D2DPainter`: native rendering on Windows
 
 ```js
-import { D2DPainter } from "vyto/win/d2d";
+import { D2DPainter, d2d_usable } from "vyto/win/d2d";
 
-win.use_painter(new D2DPainter(win.surface(), 15.0));
+if (d2d_usable(win.surface())) {
+    win.use_painter(new D2DPainter(win.surface(), 15.0));
+}
 ```
+
+`d2d_usable` checks that Direct2D can really draw here. It cannot on some
+broken graphics drivers, some remote sessions, and Wine, and constructing a
+`D2DPainter` there panics; with the check, the window keeps the lean tier
+instead.
 
 The Windows rich tier without blend2d. Text uses system fonts (Segoe UI by
 default, `useFamily(name)` for another installed family) with the user's
@@ -376,9 +386,10 @@ apps should stay on `GfxPainter` too; the README lists every caveat.
 
 Because an imported painter stays linked, a cross-platform app picks its
 painter in a per-platform entry file and keeps everything else in a shared
-module. `apps/d2dbench` shows the layout, and
+module. `apps/d2dbench` and `apps/pos` show the layout,
 [`lib/vyto/win/d2d/README.md`](../lib/vyto/win/d2d/README.md) has the details
-and measured performance.
+and measured performance, and [desktop.md](desktop.md) walks through building
+and shipping such an app.
 
 ### See also: the widget stack
 
@@ -401,7 +412,8 @@ vector icons + `Avatar`/`Image` widgets), `apps/datagrid` (spreadsheet-grade
 | Tier | Mechanism |
 |---|---|
 | `vyto/gfx` (rich) | blend2d: proportional, AA, kerning. `Canvas.loadFont/loadFontWeight/loadFontBytes` load TTF regular/medium/bold "slots"; `GfxPainter` auto-derives `-Medium`/`-Bold` sibling filenames from a regular path and falls back to the regular face if a variant is missing, so text never blanks. `push_font`/`pop_font` nest size+weight for type scales. |
-| `vyto/surface` (lean) | one fixed bitmap font baked into the X11 backend — no resizing, no weight. `SurfacePainter`'s `push_font`/`pop_font`/`set_weight` are no-ops. |
+| `SurfacePainter` (lean) | `vyto/surface/ttf`, a TrueType parser and rasterizer written in Vyto: anti-aliased, proportional, full Unicode, no native dependency. It loads the stdlib's Inter (regular/medium/bold, so `set_weight` and `push_font`/`pop_font` work); a lone exe with no stdlib beside it uses the desktop's UI font instead (Segoe UI on Windows, DejaVu Sans on Linux), and only if neither loads does it fall back to `Surface.text`. |
+| `Surface.text` (raw) | the backend's own fixed-width font (the X11 core font; GDI's `ANSI_FIXED_FONT` on Windows) — no AA, no resizing, no weight. What a program drawing on `Surface` directly gets. |
 | `vyto/mobile/android` | platform `android.graphics.Paint`/Canvas — system fonts, automatic CJK/emoji fallback "for free," contrasted with blend2d needing a vendored font per script. |
 
 **Vendored house font**: `lib/vyto/gfx/fonts.vt` — `fontPath(name)` /
