@@ -324,6 +324,52 @@ function Normalize([string]$s) {
     return ($s -replace "`r", "").TrimEnd("`n")
 }
 
+# Run a program to completion, its stdout and stderr copied byte for byte into
+# two files. Not Start-Process -Wait: that looks the process up again after
+# starting it (to put it in a job object) and throws "Cannot process request
+# because the process N has exited" when a fast program such as 01_hello has
+# already finished — a race, so it failed a varying handful of tests per run.
+# Process.Start keeps the handle CreateProcess returned, so an exited program
+# is still waited on. The pumps are background threads, given 5 s after the
+# exit: a grandchild that inherited a pipe cannot hang the run. C# 2 syntax,
+# since PowerShell 2.0 compiles this with the .NET 2.0 compiler.
+Add-Type -TypeDefinition @'
+using System;
+using System.Diagnostics;
+using System.IO;
+using System.Threading;
+public static class VytoRun {
+    static Thread Pump(Stream from, string path) {
+        Thread t = new Thread(delegate() {
+            using (FileStream to = new FileStream(path, FileMode.Create, FileAccess.Write,
+                                                  FileShare.ReadWrite | FileShare.Delete)) {
+                byte[] buf = new byte[65536];
+                int n;
+                while ((n = from.Read(buf, 0, buf.Length)) > 0) { to.Write(buf, 0, n); to.Flush(); }
+            }
+        });
+        t.IsBackground = true;
+        t.Start();
+        return t;
+    }
+    public static int Run(string exe, string args, string dir, string outFile, string errFile) {
+        ProcessStartInfo si = new ProcessStartInfo(exe, args);
+        si.UseShellExecute = false;
+        si.WorkingDirectory = dir;
+        si.RedirectStandardOutput = true;
+        si.RedirectStandardError = true;
+        using (Process p = Process.Start(si)) {
+            Thread o = Pump(p.StandardOutput.BaseStream, outFile);
+            Thread e = Pump(p.StandardError.BaseStream, errFile);
+            p.WaitForExit();
+            o.Join(5000);
+            e.Join(5000);
+            return p.ExitCode;
+        }
+    }
+}
+'@
+
 # The unicode_paths fixture's argument: Z, o-umlaut, e-diaeresis and the CJK
 # "sun" (U+65E5), outside every single ANSI code page at once. Kept as [char]
 # codes so this script stays ASCII.
@@ -344,8 +390,8 @@ foreach ($line in Get-Content -LiteralPath "manifest.txt") {
     $envstr = $envstr.Replace("{uni}", $uni)
 
     # Per-program environment (e.g. VS_HEADLESS=1 VS_EVENTS=x.events). Set on
-    # this process so the child inherits it, then removed again — Start-Process
-    # has no environment parameter in PowerShell 2.0.
+    # this process so the child inherits it (VytoRun passes no environment of
+    # its own), then removed again.
     $setKeys = @()
     if ($envstr) {
         foreach ($kv in $envstr.Split(" ")) {
@@ -361,12 +407,11 @@ foreach ($line in Get-Content -LiteralPath "manifest.txt") {
     $exe = Join-Path $root "$name.exe"
     $outFile = [System.IO.Path]::GetTempFileName()
     $errFile = [System.IO.Path]::GetTempFileName()
-    $spArgs = @{ FilePath = $exe; NoNewWindow = $true; Wait = $true
-                 RedirectStandardOutput = $outFile; RedirectStandardError = $errFile }
-    if ($argstr) { $spArgs.ArgumentList = $argstr.Split(" ") }
+    # The argument string goes through as is: Start-Process joined its
+    # ArgumentList with spaces and no quoting, so this is the same command line.
     $started = $true
     try {
-        Start-Process @spArgs | Out-Null
+        [VytoRun]::Run($exe, $argstr, $root, $outFile, $errFile) | Out-Null
     } catch {
         Emit "FAIL $name (could not start: $_)"
         $fail = 1
@@ -406,7 +451,9 @@ foreach ($line in Get-Content -LiteralPath "manifest.txt") {
 $dump = Join-Path $root "dump_exports.exe"
 if (Test-Path -LiteralPath $dump) {
     $exportsFile = Join-Path $root "win7_exports.txt"
-    Start-Process -FilePath $dump -NoNewWindow -Wait -RedirectStandardOutput $exportsFile | Out-Null
+    $dumpErr = [System.IO.Path]::GetTempFileName()
+    [VytoRun]::Run($dump, "", $root, $exportsFile, $dumpErr) | Out-Null
+    Remove-Item -LiteralPath $dumpErr -Force
     Emit "WROTE win7_exports.txt"
 }
 
