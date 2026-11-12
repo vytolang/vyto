@@ -351,6 +351,96 @@ else
     echo "FAIL mkdirs_backslash (got: $got)"
     fail=1
 fi
+# --- vyto/desktop/channel: GUI <-> services over loopback ---
+# Server and clients are separate processes under a private VYTO_CHANNEL_DIR.
+# basic/push/abuse/watch compare against goldens in tests/fixtures/channel;
+# the rest check the transport promises: loopback only, an OS-chosen port held
+# exclusively (two servers never share one, a restart gets a new one and the
+# client follows), a stale discovery file is not trusted, and the token file
+# is world-readable JSON (GUI users read it) written whole.
+cd_=tests/tmp/channel; rm -rf "$cd_"; mkdir -p "$cd_"
+VYTO_CHANNEL_DIR="$(pwd)/$cd_/dir"; export VYTO_CHANNEL_DIR
+chf=tests/fixtures/channel
+if ./vytoc build $chf/srv.vt -o "$cd_/srv" >/dev/null 2>&1 &&
+   ./vytoc build $chf/cli.vt -o "$cd_/cli" >/dev/null 2>&1; then
+    chan_port() { tr -d '\n' < "$VYTO_CHANNEL_DIR/vyto-test/$1.chan" | sed 's/.*"port":\([0-9]*\).*/\1/'; }
+    "$cd_/srv" > "$cd_/srv.log" 2>&1 & sp=$!
+    i=0; while [ ! -f "$VYTO_CHANNEL_DIR/vyto-test/test.chan" ] && [ $i -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+    for m in basic push abuse; do
+        got=$("$cd_/cli" $m 2>&1)
+        if [ "$got" = "$(cat $chf/$m.expected)" ]; then echo "PASS channel_$m"; else
+            echo "FAIL channel_$m"; echo "$got" | diff $chf/$m.expected - | head; fail=1; fi
+    done
+    port=$(chan_port test)
+    r="ok"
+    ss -ltn 2>/dev/null | grep -q "127.0.0.1:$port " || r="no 127.0.0.1:$port listener"
+    ss -ltn 2>/dev/null | grep ":$port " | grep -vq "127.0.0.1:$port " && r="also listening beyond loopback"
+    [ "$r" = ok ] && echo "PASS channel_loopback_only" || { echo "FAIL channel_loopback_only ($r)"; fail=1; }
+    f="$VYTO_CHANNEL_DIR/vyto-test/test.chan"
+    mode=$(stat -c %a "$f")
+    if [ "$mode" = 644 ] && python3 -c "import json,sys; d=json.load(open(sys.argv[1])); assert len(d['token'])==32 and d['pid']>0 and d['port']>0" "$f" 2>/dev/null &&
+       ! ls "$VYTO_CHANNEL_DIR"/vyto-test/*.tmp* >/dev/null 2>&1; then
+        echo "PASS channel_token_file"
+    else
+        echo "FAIL channel_token_file (mode $mode)"; fail=1
+    fi
+    # ports: a second server gets another port, both ephemeral; nothing else
+    # can bind the first one while it is held. On Linux a LISTEN port cannot be
+    # taken even with SO_REUSEADDR, so this guards Linux behaviour only (it
+    # stayed green with the exclusive bind removed): the Windows hijack that
+    # SO_EXCLUSIVEADDRUSE closes is checked on Windows by channel_probe.exe
+    # steal (run.ps1), since Wine follows Linux socket rules.
+    "$cd_/srv" other > /dev/null 2>&1 & sp2=$!
+    i=0; while [ ! -f "$VYTO_CHANNEL_DIR/vyto-test/other.chan" ] && [ $i -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+    p2=$(chan_port other)
+    # awk, not `read`: this script changes IFS elsewhere
+    lo=$(awk '{print $1}' /proc/sys/net/ipv4/ip_local_port_range)
+    hi=$(awk '{print $2}' /proc/sys/net/ipv4/ip_local_port_range)
+    steal=$(python3 -c "
+import socket,sys
+s=socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+try:
+    s.bind(('127.0.0.1', int(sys.argv[1]))); s.listen(1); print('stolen')
+except OSError: print('refused')" "$port")
+    kill $sp2 2>/dev/null; wait $sp2 2>/dev/null
+    r=ok
+    [ "$p2" != "$port" ] || r="same port twice"
+    [ "$port" -ge "$lo" ] && [ "$port" -le "$hi" ] && [ "$p2" -ge "$lo" ] && [ "$p2" -le "$hi" ] || r="outside $lo-$hi"
+    [ "$steal" = refused ] || r="port could be taken by another socket"
+    # restart: the client sees offline, a request in flight fails, the stale
+    # file is not trusted, and the new port is followed
+    "$cd_/cli" watch 7 > "$cd_/watch.txt" 2>&1 & wp=$!
+    sleep 1.5; kill $sp; wait $sp 2>/dev/null
+    stale=$("$cd_/cli" probe 2>&1)
+    "$cd_/srv" > /dev/null 2>&1 & sp=$!
+    sleep 0.5
+    [ "$(chan_port test)" != "$port" ] || r="restart reused the port"
+    wait $wp
+    if [ "$(cat "$cd_/watch.txt")" = "$(cat $chf/watch.expected)" ]; then echo "PASS channel_restart"; else
+        echo "FAIL channel_restart"; diff $chf/watch.expected "$cd_/watch.txt" | head; fail=1; fi
+    [ "$stale" = "probe: false offline (not running)" ] || r="stale file: $stale"
+    [ "$r" = ok ] && echo "PASS channel_ports" || { echo "FAIL channel_ports ($r)"; fail=1; }
+    kill $sp 2>/dev/null; wait $sp 2>/dev/null
+else
+    echo "FAIL channel (build)"; fail=1
+fi
+# The GUI hookup (vyto/desktop/channel/gui): a real X11 window loop, idle,
+# receives a push and closes. Needs Xvfb; headless windows end their loop
+# when the event script runs out, so they cannot show an idle wait.
+if command -v Xvfb >/dev/null 2>&1 && ./vytoc build $chf/gui_probe.vt -o "$cd_/gui_probe" >/dev/null 2>&1; then
+    "$cd_/srv" > /dev/null 2>&1 & sp=$!
+    sleep 0.5
+    Xvfb -displayfd 3 -screen 0 800x600x24 -nolisten tcp 3>"$cd_/dpy" >/dev/null 2>&1 & xp=$!
+    i=0; while [ ! -s "$cd_/dpy" ] && [ $i -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+    got=$(DISPLAY=":$(cat "$cd_/dpy")" timeout 15 "$cd_/gui_probe" 2>&1)
+    kill $sp $xp 2>/dev/null; wait $sp $xp 2>/dev/null
+    if [ "$got" = "state: true
+push: hello gui
+window closed" ]; then echo "PASS channel_gui"; else echo "FAIL channel_gui (got: $got)"; fail=1; fi
+else
+    echo "SKIP channel_gui (no Xvfb)"
+fi
+unset VYTO_CHANNEL_DIR
 # --- vyto/desktop/service ---
 # As an ordinary program: SIGTERM (what systemd sends) must reach stopping()
 # and wake a 60 s wait() at once. Under a NOTIFY_SOCKET it must also report

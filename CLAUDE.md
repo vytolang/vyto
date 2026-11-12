@@ -275,6 +275,10 @@ known triples are a closed table in `src/main.c` (`cross_cc_table`).
 
 **Generics are monomorphized**, non-generic base classes only, no bounds.
 
+**Closures do not nest**, and a closure's parameters take no type annotations
+(types come from the target). A callback built inside another closure is a
+compile error: make it first, or keep it in a field, and pass it by name.
+
 ## Architectural seams worth not breaking
 
 **`vyto/ui` must not depend on `vyto/gfx`.** The invariant is stated in

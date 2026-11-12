@@ -207,6 +207,41 @@ int vsock_listen(const char *host, int port, int backlog) {
     return VS_INT(s);
 }
 
+/* A listener nobody else can share or hijack, on exactly the address given.
+   vsock_listen is permissive on purpose (SO_REUSEADDR so a restarted server
+   rebinds at once; an unparsable host means "every interface"); this is the
+   strict one, for a service talking to its own GUI over loopback
+   (vyto/desktop/channel):
+   - the host must be a numeric IPv4 address: anything else fails rather than
+     silently widening to INADDR_ANY
+   - Windows: SO_EXCLUSIVEADDRUSE, so no other process can bind the same
+     address and port while this one holds it (with SO_REUSEADDR, Windows
+     lets a second socket bind it and steal connections)
+   - POSIX: no SO_REUSEADDR, and close-on-exec so a child does not inherit it
+   Port 0 asks the OS for a free ephemeral port; read it with localPort(). */
+int vsock_listen_exclusive(const char *host, int port, int backlog) {
+    if (vs_startup() != 0) return -1;
+    struct sockaddr_in a;
+    memset(&a, 0, sizeof a);
+    a.sin_family = AF_INET;
+    a.sin_port = htons((unsigned short)port);
+    if (!host || inet_pton(AF_INET, host, &a.sin_addr) != 1) return -1;
+    vsock_t s = socket(AF_INET, SOCK_STREAM, 0);
+    if (VS_INT(s) < 0) return -1;
+#ifdef _WIN32
+    int yes = 1;
+    if (setsockopt(s, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, VS_OPTVAL(&yes), sizeof yes) != 0) {
+        vs_closesocket(s); return -1;
+    }
+    SetHandleInformation((HANDLE)s, HANDLE_FLAG_INHERIT, 0);
+#else
+    fcntl(s, F_SETFD, FD_CLOEXEC);
+#endif
+    if (bind(s, (struct sockaddr *)&a, sizeof a) != 0) { vs_closesocket(s); return -1; }
+    if (listen(s, backlog) != 0) { vs_closesocket(s); return -1; }
+    return VS_INT(s);
+}
+
 int vsock_accept(int fd) { return VS_INT(accept(VS_FD(fd), NULL, NULL)); }
 
 int vsock_local_port(int fd) {

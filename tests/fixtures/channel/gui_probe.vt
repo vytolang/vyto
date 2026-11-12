@@ -1,0 +1,30 @@
+// vyto/desktop/channel/gui: a Window event loop drives a Channel. Once up, it
+// asks the test server to push; the push arriving (with no input events at
+// all) closes the window. Run headless by tests/run_tests.sh and, built for
+// Windows, by run_tests_wine.sh (the Win32 loop waiting on the socket).
+import { Window, Label } from "vyto/ui";
+import { Channel, ChannelReply } from "vyto/desktop/channel";
+import { attachChannel } from "vyto/desktop/channel/gui";
+import { jstr } from "vyto/util/json";
+
+fn main() {
+    let win = new Window("channel probe", 320, 120);
+    win.root = new Label("waiting for a push");
+    let ch = new Channel("vyto-test", "test", "gui");
+    // closures do not nest: the reply callback is made first and passed in
+    let ignore: fn(ChannelReply) = (r) => { };
+    // "idle": connect and wait; the test measures how often the process
+    // wakes, then pushes from another client to close the window
+    let idle = args().len > 0 && args()[0] == "idle";
+    ch.onState((up) => {
+        print(`state: {up}`);
+        if (up && !idle) { ch.request("push", jstr("hello gui"), ignore); }
+    });
+    ch.onPush("news", (d) => {
+        print("push: " + d.asString());
+        win.close();
+    });
+    attachChannel(win, ch);
+    win.run();
+    print("window closed");
+}

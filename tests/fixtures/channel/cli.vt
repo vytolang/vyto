@@ -1,0 +1,134 @@
+// Channel test client (tests/run_tests.sh). Modes:
+//   basic   request/reply, an error reply, an unknown op, a 200 KB reply,
+//           the client name reaching the server
+//   push    two clients; one asks the server to push, both receive it
+//   abuse   raw sockets: a wrong token, an oversized frame, malformed JSON
+//           and a silent connection; after each, a good client still works
+//   probe   one short call: no service, or a stale discovery file
+//   watch   print online/offline transitions for N seconds while the test
+//           restarts the server; a request in flight fails "disconnected"
+import { Channel, ChannelReply } from "vyto/desktop/channel";
+import { JsonValue, json_parse, jobj, jstr, jint } from "vyto/util/json";
+import { socket_connect, Socket } from "vyto/net/socket";
+import { getenv } from "vyto/os";
+import { monoMs, sleepMs } from "vyto/util/time";
+import { file_open } from "vyto/io/file";
+
+fn show(label: string, r: ChannelReply) {
+    if (r.ok) { print(`{label}: ok {r.data.stringify()}`); } else { print(`{label}: error {r.err}`); }
+}
+
+fn chan_info(): JsonValue {
+    let f = file_open(getenv("VYTO_CHANNEL_DIR") + "/vyto-test/test.chan", "rb");
+    let t = f.readText();
+    f.close();
+    return json_parse(t);
+}
+
+// one raw frame: 4-byte length + bytes, as given
+fn raw_frame(s: Socket, len: int, body: string) {
+    let h: byte[] = [((len >> 24) & 255) as byte, ((len >> 16) & 255) as byte,
+                     ((len >> 8) & 255) as byte, (len & 255) as byte];
+    s.send(h);
+    if (body.len > 0) { s.sendText(body); }
+}
+
+// true when the server closed the connection within ~2 s
+fn closed_by_server(s: Socket): bool {
+    s.setTimeoutMs(2500);
+    let b = s.recv(64);
+    let closed = b.len == 0;
+    s.close();
+    return closed;
+}
+
+fn good(label: string) {
+    let c = new Channel("vyto-test", "test", "good");
+    show(label, c.call("echo", jstr("still serving"), 3000));
+    c.close();
+}
+
+fn main() {
+    let a = args();
+    let mode = a[0];
+    if (mode == "basic") {
+        let c = new Channel("vyto-test", "test", "cli");
+        let body = jobj();
+        body.set("x", jint(1));
+        body.set("name", jstr("Zoë 日本"));
+        show("echo", c.call("echo", body, 3000));
+        show("fail", c.call("fail", jobj(), 3000));
+        show("unknown", c.call("nosuch", jobj(), 3000));
+        show("who", c.call("who", jobj(), 3000));
+        let big = c.call("big", jobj(), 3000);
+        print(`big: {big.ok} {big.data.asString().len}`);
+        c.close();
+    } else if (mode == "push") {
+        let x = new Channel("vyto-test", "test", "x");
+        let y = new Channel("vyto-test", "test", "y");
+        let got = new Counter();
+        x.onPush("news", (d) => { print("x got " + d.asString()); got.n += 1; });
+        y.onPush("news", (d) => { print("y got " + d.asString()); got.n += 1; });
+        show("y up", y.call("echo", jstr("hi"), 3000));
+        show("push", x.call("push", jstr("payment 450"), 3000));
+        let end = monoMs() + 3000;
+        while (got.n < 2 && monoMs() < end) { x.poll(20); y.poll(20); }
+        show("clients", x.call("clients", jobj(), 3000));
+    } else if (mode == "abuse") {
+        let info = chan_info();
+        let port = info.get("port").asInt();
+        let s1 = socket_connect("127.0.0.1", port);
+        let bad = jobj();
+        bad.set("t", jstr("hello"));
+        bad.set("token", jstr("0".repeat(32)));
+        let bt = bad.stringify();
+        raw_frame(s1, bt.len, bt);
+        print(`wrong token closed: {closed_by_server(s1)}`);
+        good("after wrong token");
+        let s2 = socket_connect("127.0.0.1", port);
+        raw_frame(s2, 2000000, "");
+        print(`oversized frame closed: {closed_by_server(s2)}`);
+        good("after oversized frame");
+        let s3 = socket_connect("127.0.0.1", port);
+        raw_frame(s3, 5, "{bad,");
+        print(`malformed json closed: {closed_by_server(s3)}`);
+        good("after malformed json");
+        let s4 = socket_connect("127.0.0.1", port);
+        s4.setTimeoutMs(7000);
+        let t0 = monoMs();
+        let b = s4.recv(64);
+        let waited = monoMs() - t0;
+        print(`silent client dropped: {b.len == 0 && waited >= 4000 && waited < 7000}`);
+        s4.close();
+        good("after silent client");
+    } else if (mode == "pushone") {
+        let c = new Channel("vyto-test", "test", "pusher");
+        show("pushone", c.call("push", jstr("hello gui"), 5000));
+    } else if (mode == "probe") {
+        // one call with a short deadline: no service, or a stale .chan
+        let c = new Channel("vyto-test", "test", "probe");
+        let r = c.call("echo", jstr("x"), 1500);
+        print(`probe: {r.ok} {r.err} ({c.last_err})`);
+    } else if (mode == "watch") {
+        let c = new Channel("vyto-test", "test", "watcher");
+        c.onState((up) => {
+            if (up) { print("state: online"); } else { print("state: offline"); }
+        });
+        let end = monoMs() + (a[1].to_int() as i64) * 1000;
+        let asked = false;
+        while (monoMs() < end) {
+            c.poll(20);
+            if (c.up() && !asked) {
+                asked = true;
+                // the test kills the server while this is unanswered
+                c.request("slow", jobj(), (r) => { print("in flight: " + r.err); });
+            }
+        }
+        show("after restart", c.call("echo", jstr("back"), 3000));
+    }
+}
+
+class Counter {
+    n: int;
+    fn init() { this.n = 0; }
+}

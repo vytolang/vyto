@@ -1,0 +1,55 @@
+// vyto/desktop/channel/gui — run a Channel inside a vyto/ui Window's event
+// loop. Kept out of vyto/desktop/channel itself so services, which have no
+// window, never link the toolkit.
+//
+//     let ch = new Channel("vyto-cafe-suite", "payments", "pos");
+//     ch.onPush("payment.received", (d) => { ...; win.redraw(); });
+//     attachChannel(win, ch);
+//
+// The channel's socket is a Window poll source, so the loop sleeps until a
+// message arrives (X11, and Win32 since it waits on sockets too) and callbacks
+// run on the GUI thread, between events, where touching widgets is safe. A
+// reconnect gets a new socket; the source is re-registered for it. While the
+// service is down there is no socket, and the loop wakes on its short timer
+// to retry.
+import { Window } from "vyto/ui";
+import { Channel } from "channel";
+
+class Attachment {
+    win: weak Window;
+    ch: Channel;
+    id: int;
+    fd: int;
+
+    fn init(win: Window, ch: Channel) {
+        this.win = win;
+        this.ch = ch;
+        this.id = -1;
+        this.fd = -1;
+    }
+
+    fn arm() {
+        let w = this.win;
+        if (w == null) { return; }
+        let self = this;
+        this.fd = this.ch.fd();
+        this.id = w.add_poll_fd(this.fd, () => { self.tick(); });
+    }
+
+    fn tick() {
+        this.ch.poll(0);
+        if (this.ch.fd() != this.fd) {
+            // connected, reconnected or dropped: wait on the new socket
+            let w = this.win;
+            if (w == null) { return; }
+            w.remove_poll_source(this.id);
+            this.arm();
+        }
+    }
+}
+
+// Drive `ch` from `win`'s event loop until the window closes.
+export fn attachChannel(win: Window, ch: Channel) {
+    let a = new Attachment(win, ch);
+    a.arm();
+}

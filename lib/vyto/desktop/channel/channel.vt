@@ -1,0 +1,667 @@
+// vyto/desktop/channel — a local message channel between the programs of one
+// app suite: a GUI and the services behind it. See README.md.
+//
+//     // a service (vyto/desktop/service)
+//     let srv = new ChannelServer("vyto-cafe-suite", "payments");
+//     srv.handle("pay.simulate", (req) => { ... });     // returns JsonValue, or req.fail("why")
+//     while (!svc.stopping()) { srv.poll(250); }
+//     srv.close();
+//
+//     // the GUI (vyto/desktop/channel/gui hooks it into the Window)
+//     let ch = new Channel("vyto-cafe-suite", "payments", "pos");
+//     ch.onPush("payment.received", (d) => { ... });
+//     ch.request("pay.simulate", body, (r) => { ... });  // r.ok, r.data, r.err
+//
+// Transport: TCP on 127.0.0.1 only, on a port the OS picks (port 0), held
+// exclusively — never a fixed port, so nothing can collide with another
+// program, and nothing else can take the port while the service runs. The
+// service writes <dir>/<suite>/<name>.chan = {"port","token","pid"}; clients
+// read it on every connect, so a restarted service on a new port is found
+// again. A client proves itself with the token (constant-time compare); a
+// connection that does not within 5 s is dropped.
+//
+// Frames: 4-byte big-endian length + UTF-8 JSON, at most 1 MiB. Messages:
+//   {"t":"hello","token","client"}  {"t":"welcome","server"}
+//   {"t":"req","id","op","data"}    {"t":"res","id","ok","data"|"err"}
+//   {"t":"push","topic","data"}
+//
+// Non-blocking throughout: poll(ms) does whatever is ready and returns. Pure
+// Vyto over vyto/net/socket; the shim only knows the discovery dirs, writes
+// the file with the right readers, and checks a pid.
+import { Socket, PollSet, socket_listen_exclusive, socket_connect_async,
+         POLL_READ, POLL_WRITE, POLL_ERR } from "vyto/net/socket";
+import { JsonValue, json_parse, jobj, jstr, jint, jbool, jnull } from "vyto/util/json";
+import { secureToken } from "vyto/math/securerandom";
+import { monoMs } from "vyto/util/time";
+import { file_open, file_exists, file_remove } from "vyto/io/file";
+
+extern "C" {
+    fn vch_dirs(): cstring;
+    fn vch_prepare_dir(path: cstring): i32;
+    fn vch_write(path: cstring, text: cstring, len: i32): i32;
+    fn vch_pid(): i32;
+    fn vch_pid_alive(pid: i32): i32;
+}
+
+#link "ws2_32" if "windows"
+#link "advapi32" if "windows"
+#link "shell32" if "windows"
+#link "ole32" if "windows"
+#link "uuid" if "windows"
+
+export const CHANNEL_MAX_FRAME: int = 1048576;     // 1 MiB
+const SEND_QUEUE_MAX: int = 8388608;               // 8 MiB per client, then it is dropped
+const HELLO_MS: int = 5000;
+const CONNECT_MS: int = 3000;
+const REQUEST_MS: int = 10000;
+
+// ---- paths -------------------------------------------------------------------
+
+fn sep_of(d: string): string {
+    if (d.contains("\\")) { return "\\"; }
+    return "/";
+}
+
+fn dirs(): string[] {
+    let out: string[] = [];
+    for (let d in str(vch_dirs()).split("\n")) { if (d != "") { out.push(d); } }
+    return out;
+}
+
+fn safe_part(s: string): bool {
+    if (s == "" || s.len > 100) { return false; }
+    for (let i in 0..s.len) {
+        let c = s[i];
+        let ok = (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) ||
+                 c == 45 || c == 95 || c == 46;
+        if (!ok) { return false; }
+    }
+    return !s.starts_with(".");
+}
+
+fn read_text(path: string): string {
+    if (!file_exists(path)) { return ""; }
+    let f = file_open(path, "rb");
+    if (f == null) { return ""; }
+    let t = f.readText();
+    f.close();
+    return t;
+}
+
+// ---- frames ------------------------------------------------------------------
+
+// An outgoing frame: the 4-byte header, then the JSON, sent from offsets so a
+// partial write resumes exactly where it stopped.
+class Out {
+    hdr: byte[];
+    body: string;
+    pos: int;
+    fn init(body: string) {
+        let n = body.len;
+        this.hdr = [((n >> 24) & 255) as byte, ((n >> 16) & 255) as byte,
+                    ((n >> 8) & 255) as byte, (n & 255) as byte];
+        this.body = body;
+        this.pos = 0;
+    }
+    fn total(): int { return 4 + this.body.len; }
+}
+
+// One end of a connection: incremental frame reader + queued writer.
+class Wire {
+    sock: Socket;
+    inbuf: byte[];
+    outq: Out[];
+    queued: int;
+    dead: bool;
+
+    fn init(sock: Socket) {
+        this.sock = sock;
+        this.inbuf = [];
+        this.outq = [];
+        this.queued = 0;
+        this.dead = false;
+    }
+
+    fn send(json: string) {
+        if (this.dead) { return; }
+        let o = new Out(json);
+        this.outq.push(o);
+        this.queued += o.total();
+    }
+
+    fn wants_write(): bool { return this.outq.len > 0; }
+
+    // Write what the socket takes now. False when the connection failed.
+    fn flush(): bool {
+        while (this.outq.len > 0) {
+            let o = this.outq[0];
+            let n = 0;
+            if (o.pos < 4) {
+                n = this.sock.trySendRaw(o.hdr as cstring, o.pos, 4 - o.pos);
+            } else {
+                let off = o.pos - 4;
+                n = this.sock.trySendRaw(o.body.cstr(), off, o.body.len - off);
+            }
+            if (n == -1) { return true; }      // would block: the rest goes next time
+            if (n < 0) { return false; }
+            o.pos += n;
+            this.queued -= n;
+            if (o.pos >= o.total()) { this.outq.remove_at(0); }
+        }
+        return true;
+    }
+
+    // Read everything available. False on EOF/error.
+    fn fill(): bool {
+        let guard = 0;
+        while (guard < 64) {
+            let r = this.sock.tryRecv(65536);
+            if (r.wouldBlock()) { return true; }
+            if (r.eof() || r.status < 0) { return false; }
+            this.inbuf = this.inbuf.concat(r.data);
+            guard += 1;
+        }
+        return true;
+    }
+
+    // Complete frames, as strings; null entry = a protocol violation.
+    fn frames(): string[] {
+        let out: string[] = [];
+        let i = 0;
+        let b = this.inbuf;
+        while (b.len - i >= 4) {
+            let n = ((b[i] as int) << 24) | ((b[i + 1] as int) << 16) | ((b[i + 2] as int) << 8) | (b[i + 3] as int);
+            if (n < 0 || n > CHANNEL_MAX_FRAME) {
+                this.dead = true;
+                return out;
+            }
+            if (b.len - i - 4 < n) { break; }
+            out.push(strbytes(b.slice(i + 4, i + 4 + n), n));
+            i += 4 + n;
+        }
+        if (i > 0) { this.inbuf = b.slice(i, b.len); }
+        return out;
+    }
+
+    fn close() {
+        this.dead = true;
+        this.sock.close();
+    }
+}
+
+// ---- server ------------------------------------------------------------------
+
+export class ChannelRequest {
+    op: string;
+    data: JsonValue;
+    client: string;
+    failed: bool;
+    err: string;
+    fn init(op: string, data: JsonValue, client: string) {
+        this.op = op;
+        this.data = data;
+        this.client = client;
+        this.failed = false;
+        this.err = "";
+    }
+    // Return this from a handler to send an error reply.
+    fn fail(msg: string): JsonValue {
+        this.failed = true;
+        this.err = msg;
+        return jnull();
+    }
+}
+
+class Peer {
+    wire: Wire;
+    authed: bool;
+    client: string;
+    deadline: i64;
+    fn init(s: Socket) {
+        this.wire = new Wire(s);
+        this.authed = false;
+        this.client = "";
+        this.deadline = monoMs() + HELLO_MS;
+    }
+}
+
+// Constant-time string comparison: the token check must not leak, by timing,
+// how much of a guess was right.
+fn same(a: string, b: string): bool {
+    if (a.len != b.len) { return false; }
+    let d = 0;
+    for (let i in 0..a.len) { d = d | (a[i] ^ b[i]); }
+    return d == 0;
+}
+
+export class ChannelServer {
+    suite: string;
+    name: string;
+    token: string;
+    path: string;
+    err: string;
+    lsn: Socket?;
+    port: int;
+    peers: Peer[];
+    handlers: Map<string, fn(ChannelRequest): JsonValue>;
+    retry_at: i64;
+    on_error: fn(string);
+
+    fn init(suite: string, name: string) {
+        this.suite = suite;
+        this.name = name;
+        this.token = secureToken(16);
+        this.path = "";
+        this.err = "";
+        this.lsn = null;
+        this.port = 0;
+        this.peers = [];
+        this.handlers = new Map<string, fn(ChannelRequest): JsonValue>();
+        this.retry_at = 0 as i64;
+        this.on_error = (m) => { };
+        if (!safe_part(suite) || !safe_part(name)) {
+            this.err = "suite and channel names may use letters, digits, '-', '_' and '.'";
+            return;
+        }
+        this.open();
+    }
+
+    fn handle(op: string, h: fn(ChannelRequest): JsonValue) { this.handlers.set(op, h); }
+
+    // Listening, with its discovery file written.
+    fn ready(): bool { return this.lsn != null; }
+
+    fn report(msg: string) {
+        this.err = msg;
+        this.on_error(msg);
+    }
+
+    // Bind a free loopback port and publish it. On failure, poll() retries
+    // every 2 s; there is never a fallback to a guessed fixed port.
+    fn open() {
+        this.retry_at = monoMs() + 2000;
+        let s = socket_listen_exclusive("127.0.0.1", 0, 16);
+        if (s == null) { this.report("cannot listen on a loopback port"); return; }
+        s.setNonBlocking(true);
+        let dir = "";
+        for (let d in dirs()) {
+            let cand = d + sep_of(d) + this.suite;
+            if (vch_prepare_dir(cand.cstr()) as int != 0) { dir = cand; break; }
+        }
+        if (dir == "") { s.close(); this.report("no writable directory for the channel file"); return; }
+        this.path = dir + sep_of(dir) + this.name + ".chan";
+        this.port = s.localPort();
+        let info = jobj();
+        info.set("port", jint(this.port));
+        info.set("token", jstr(this.token));
+        info.set("pid", jint(vch_pid() as int));
+        info.set("name", jstr(this.name));
+        let body = info.stringify() + "\n";
+        if (vch_write(this.path.cstr(), body.cstr(), body.len as i32) as int == 0) {
+            s.close();
+            this.report("cannot write " + this.path);
+            return;
+        }
+        this.lsn = s;
+        this.err = "";
+    }
+
+    // Send an event to every connected client.
+    fn push(topic: string, data: JsonValue) {
+        let m = jobj();
+        m.set("t", jstr("push"));
+        m.set("topic", jstr(topic));
+        m.set("data", data);
+        let text = m.stringify();
+        for (let p in this.peers) { if (p.authed) { p.wire.send(text); } }
+        this.flush_all();
+    }
+
+    fn clients(): int {
+        let n = 0;
+        for (let p in this.peers) { if (p.authed) { n += 1; } }
+        return n;
+    }
+
+    fn flush_all() {
+        for (let p in this.peers) { if (!p.wire.dead && !p.wire.flush()) { p.wire.close(); } }
+    }
+
+    // Accept, read, dispatch, write: whatever is ready within `ms`.
+    fn poll(ms: int) {
+        let l = this.lsn;
+        if (l == null) {
+            if (monoMs() >= this.retry_at && this.err != "" && safe_part(this.suite)) { this.open(); }
+            return;
+        }
+        let ps = new PollSet();
+        ps.add(l, POLL_READ);
+        for (let p in this.peers) {
+            let ev = POLL_READ;
+            if (p.wire.wants_write()) { ev = ev | POLL_WRITE; }
+            ps.add(p.wire.sock, ev);
+        }
+        let wait = ms;
+        if (wait > 0 && this.peers.len > 0) {
+            // an unauthenticated peer's deadline may come first
+            let now = monoMs();
+            for (let p in this.peers) {
+                if (!p.authed) {
+                    let left = (p.deadline - now) as int;
+                    if (left < wait) { wait = left; }
+                }
+            }
+            if (wait < 0) { wait = 0; }
+        }
+        ps.wait(wait);
+        // new connections
+        let guard = 0;
+        while (guard < 32) {
+            let c = l.tryAccept();
+            if (c == null) { break; }
+            this.peers.push(new Peer(c));
+            guard += 1;
+        }
+        let now = monoMs();
+        for (let p in this.peers) {
+            if (p.wire.dead) { continue; }
+            if (!p.wire.fill()) { p.wire.close(); continue; }
+            for (let f in p.wire.frames()) { this.on_frame(p, f); if (p.wire.dead) { break; } }
+            if (p.wire.dead) { p.wire.close(); continue; }
+            if (!p.authed && now > p.deadline) { p.wire.close(); continue; }
+            if (p.wire.queued > SEND_QUEUE_MAX) { p.wire.close(); continue; }
+            if (!p.wire.flush()) { p.wire.close(); }
+        }
+        let keep: Peer[] = [];
+        for (let p in this.peers) { if (!p.wire.dead) { keep.push(p); } }
+        this.peers = keep;
+    }
+
+    fn on_frame(p: Peer, text: string) {
+        let m = json_parse(text);
+        if (m.parseError() != "" || !m.isObj()) { p.wire.dead = true; return; }
+        let t = m.get("t").asString();
+        if (!p.authed) {
+            if (t != "hello" || !same(m.get("token").asString(), this.token)) {
+                p.wire.dead = true;
+                return;
+            }
+            p.authed = true;
+            p.client = m.get("client").asString();
+            let w = jobj();
+            w.set("t", jstr("welcome"));
+            w.set("server", jstr(this.name));
+            p.wire.send(w.stringify());
+            return;
+        }
+        if (t != "req") { return; }
+        let id = m.get("id").asInt();
+        let op = m.get("op").asString();
+        let res = jobj();
+        res.set("t", jstr("res"));
+        res.set("id", jint(id));
+        if (!this.handlers.has(op)) {
+            res.set("ok", jbool(false));
+            res.set("err", jstr("unknown operation: " + op));
+        } else {
+            let req = new ChannelRequest(op, m.get("data"), p.client);
+            let h = this.handlers.get(op);
+            let data = h(req);
+            if (req.failed) {
+                res.set("ok", jbool(false));
+                res.set("err", jstr(req.err));
+            } else {
+                res.set("ok", jbool(true));
+                res.set("data", data);
+            }
+        }
+        p.wire.send(res.stringify());
+    }
+
+    // Stop listening, drop every client and remove the discovery file.
+    fn close() {
+        for (let p in this.peers) { p.wire.close(); }
+        this.peers = [];
+        let l = this.lsn;
+        if (l != null) { l.close(); }
+        this.lsn = null;
+        if (this.path != "") { file_remove(this.path); }
+    }
+}
+
+// ---- client ------------------------------------------------------------------
+
+export class ChannelReply {
+    ok: bool;
+    data: JsonValue;
+    err: string;
+    fn init(ok: bool, data: JsonValue, err: string) {
+        this.ok = ok;
+        this.data = data;
+        this.err = err;
+    }
+}
+
+// call()'s reply, filled in by the request callback.
+class ReplyBox {
+    r: ChannelReply?;
+    fn init() { this.r = null; }
+}
+
+class Pending {
+    cb: fn(ChannelReply);
+    deadline: i64;
+    fn init(cb: fn(ChannelReply), deadline: i64) { this.cb = cb; this.deadline = deadline; }
+}
+
+const ST_DOWN: int = 0;
+const ST_CONNECTING: int = 1;
+const ST_HELLO: int = 2;
+const ST_UP: int = 3;
+
+export class Channel {
+    suite: string;
+    name: string;
+    client: string;
+    state: int;
+    wire: Wire?;
+    token: string;
+    next_try: i64;
+    backoff: int;
+    phase_deadline: i64;
+    next_id: int;
+    pending: Map<string, Pending>;
+    pushes: Map<string, fn(JsonValue)>;
+    on_state: fn(bool);
+    last_err: string;
+
+    fn init(suite: string, name: string, client: string) {
+        this.suite = suite;
+        this.name = name;
+        this.client = client;
+        this.state = ST_DOWN;
+        this.wire = null;
+        this.token = "";
+        this.next_try = 0 as i64;
+        this.backoff = 500;
+        this.phase_deadline = 0 as i64;
+        this.next_id = 1;
+        this.pending = new Map<string, Pending>();
+        this.pushes = new Map<string, fn(JsonValue)>();
+        this.on_state = (up) => { };
+        this.last_err = "";
+    }
+
+    fn onPush(topic: string, cb: fn(JsonValue)) { this.pushes.set(topic, cb); }
+    fn onState(cb: fn(bool)) { this.on_state = cb; }
+    fn up(): bool { return this.state == ST_UP; }
+
+    // The socket to wait on (for a GUI event loop), or -1 while there is none.
+    fn fd(): int {
+        let w = this.wire;
+        if (w == null) { return -1; }
+        return w.sock.fd as int;
+    }
+
+    // Send a request; `cb` gets the reply, or a failure ("offline",
+    // "timed out", "disconnected") — exactly once either way.
+    fn request(op: string, data: JsonValue, cb: fn(ChannelReply)) {
+        let w = this.wire;
+        if (this.state != ST_UP || w == null) {
+            cb(new ChannelReply(false, jnull(), "offline"));
+            return;
+        }
+        let id = this.next_id;
+        this.next_id += 1;
+        if (this.next_id > 2000000000) { this.next_id = 1; }
+        let m = jobj();
+        m.set("t", jstr("req"));
+        m.set("id", jint(id));
+        m.set("op", jstr(op));
+        m.set("data", data);
+        this.pending.set(`{id}`, new Pending(cb, monoMs() + REQUEST_MS));
+        w.send(m.stringify());
+        if (!w.flush()) { this.drop("disconnected"); }
+    }
+
+    // A request that waits for its reply, for scripts and service-to-service
+    // calls. Connects first if needed.
+    fn call(op: string, data: JsonValue, timeout_ms: int): ChannelReply {
+        let end = monoMs() + timeout_ms;
+        while (this.state != ST_UP && monoMs() < end) { this.poll(50); }
+        let box = new ReplyBox();
+        this.request(op, data, (r) => { box.r = r; });
+        while (box.r == null && monoMs() < end) { this.poll(50); }
+        let got = box.r;
+        if (got == null) { return new ChannelReply(false, jnull(), "timed out"); }
+        return got;
+    }
+
+    fn set_state(st: int) {
+        let was = this.state == ST_UP;
+        this.state = st;
+        let now = st == ST_UP;
+        if (was != now) { this.on_state(now); }
+    }
+
+    fn drop(why: string) {
+        let w = this.wire;
+        if (w != null) { w.close(); }
+        this.wire = null;
+        this.last_err = why;
+        let fails = this.pending.values();
+        this.pending.clear();
+        this.set_state(ST_DOWN);
+        this.next_try = monoMs() + this.backoff;
+        this.backoff = this.backoff * 2;
+        if (this.backoff > 5000) { this.backoff = 5000; }
+        for (let p in fails) { p.cb(new ChannelReply(false, jnull(), why)); }
+    }
+
+    // Find the service: its discovery file, if its process is alive.
+    fn discover(): JsonValue? {
+        for (let d in dirs()) {
+            let path = d + sep_of(d) + this.suite + sep_of(d) + this.name + ".chan";
+            let t = read_text(path);
+            if (t == "") { continue; }
+            let j = json_parse(t);
+            if (j.parseError() != "" || !j.isObj()) { continue; }
+            if (vch_pid_alive(j.get("pid").asInt() as i32) as int == 0) { continue; }  // stale
+            return j;
+        }
+        return null;
+    }
+
+    // Connect / reconnect, read, dispatch replies and pushes, write — whatever
+    // is ready within `ms` (0 for a GUI loop, which does its own waiting).
+    fn poll(ms: int) {
+        let now = monoMs();
+        if (this.state == ST_DOWN) {
+            if (now < this.next_try) { return; }
+            let info = this.discover();
+            if (info == null) {
+                this.next_try = now + this.backoff;
+                this.backoff = this.backoff * 2;
+                if (this.backoff > 5000) { this.backoff = 5000; }
+                this.last_err = "not running";
+                return;
+            }
+            let s = socket_connect_async("127.0.0.1", info.get("port").asInt());
+            if (s == null) { this.drop("cannot connect"); return; }
+            this.token = info.get("token").asString();
+            this.wire = new Wire(s);
+            this.phase_deadline = now + CONNECT_MS;
+            this.state = ST_CONNECTING;
+        }
+        let w = this.wire;
+        if (w == null) { return; }
+        let ps = new PollSet();
+        let ev = POLL_READ;
+        if (this.state == ST_CONNECTING || w.wants_write()) { ev = ev | POLL_WRITE; }
+        ps.add(w.sock, ev);
+        let n = ps.wait(ms);
+        let rev = 0;
+        if (n > 0) { rev = ps.readyEvents(0); }
+        if (this.state == ST_CONNECTING) {
+            if ((rev & POLL_ERR) != 0 || (rev & POLL_WRITE) != 0 && w.sock.connResult() != 0) {
+                this.drop("cannot connect"); return;
+            }
+            if ((rev & POLL_WRITE) != 0) {
+                let h = jobj();
+                h.set("t", jstr("hello"));
+                h.set("token", jstr(this.token));
+                h.set("client", jstr(this.client));
+                w.send(h.stringify());
+                this.state = ST_HELLO;
+                this.phase_deadline = monoMs() + CONNECT_MS;
+            } else if (monoMs() > this.phase_deadline) {
+                // Windows' WSAPoll never reports a refused connect: a deadline does
+                this.drop("cannot connect"); return;
+            }
+        }
+        if (!w.fill()) { this.drop("disconnected"); return; }
+        for (let f in w.frames()) {
+            this.on_frame(f);
+            if (this.wire == null) { return; }
+        }
+        if (w.dead) { this.drop("protocol error"); return; }
+        if (!w.flush()) { this.drop("disconnected"); return; }
+        if (this.state == ST_HELLO && monoMs() > this.phase_deadline) { this.drop("not accepted"); return; }
+        // requests whose reply never came
+        if (!this.pending.is_empty()) {
+            let t = monoMs();
+            for (let k in this.pending.keys()) {
+                let p = this.pending.get(k);
+                if (t > p.deadline) {
+                    this.pending.remove(k);
+                    p.cb(new ChannelReply(false, jnull(), "timed out"));
+                }
+            }
+        }
+    }
+
+    fn on_frame(text: string) {
+        let m = json_parse(text);
+        if (m.parseError() != "" || !m.isObj()) { this.drop("protocol error"); return; }
+        let t = m.get("t").asString();
+        if (t == "welcome") {
+            this.backoff = 500;
+            this.last_err = "";
+            this.set_state(ST_UP);
+        } else if (t == "res") {
+            let k = `{m.get("id").asInt()}`;
+            if (!this.pending.has(k)) { return; }
+            let p = this.pending.get(k);
+            this.pending.remove(k);
+            p.cb(new ChannelReply(m.get("ok").asBool(), m.get("data"), m.get("err").asString()));
+        } else if (t == "push") {
+            let topic = m.get("topic").asString();
+            if (this.pushes.has(topic)) {
+                let cb = this.pushes.get(topic);
+                cb(m.get("data"));
+            }
+        }
+    }
+
+    fn close() { this.drop("closed"); }
+}

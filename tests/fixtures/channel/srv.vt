@@ -1,0 +1,37 @@
+// Channel test server (tests/run_tests.sh): suite "vyto-test", channel given
+// as the first argument. Ops: echo, fail, big (a 200 KB reply), slow (3 s), push (pushes
+// the request data as topic "news" to every client), clients, quit.
+import { ChannelServer, ChannelRequest } from "vyto/desktop/channel";
+import { JsonValue, jobj, jstr, jint } from "vyto/util/json";
+import { sleepMs } from "vyto/util/time";
+
+fn main() {
+    let a = args();
+    let name = "test";
+    if (a.len > 0) { name = a[0]; }
+    let srv = new ChannelServer("vyto-test", name);
+    if (!srv.ready()) { print("server: " + srv.err); return; }
+    let quit = new Flag();
+    srv.handle("echo", (r) => { return r.data; });
+    srv.handle("fail", (r) => { return r.fail("asked to fail"); });
+    srv.handle("big", (r) => { return jstr("x".repeat(200000)); });
+    srv.handle("push", (r) => {
+        srv.push("news", r.data);
+        return jstr("pushed");
+    });
+    srv.handle("clients", (r) => { return jint(srv.clients()); });
+    srv.handle("who", (r) => { return jstr(r.client); });
+    // answers after 3 s: the restart test kills the server while it sleeps
+    srv.handle("slow", (r) => { sleepMs(3000); return jstr("slow done"); });
+    srv.handle("quit", (r) => { quit.set = true; return jstr("bye"); });
+    print(`server: listening`);
+    while (!quit.set) { srv.poll(100); }
+    srv.poll(100);   // flush the last reply
+    srv.close();
+    print("server: closed");
+}
+
+class Flag {
+    set: bool;
+    fn init() { this.set = false; }
+}
