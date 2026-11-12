@@ -579,9 +579,14 @@ void *vt_checked_cast(void *p, const VtType *t, const char *file, int line) {
 }
 
 VT_NORETURN void vt_panic_c(const char *file, int line, const char *msg) {
+    /* The message goes out whole, not through the fixed buffer: a panic that
+       lists several problems (WinManifest.emit names every one) was cut off
+       at 255 bytes, mid-sentence. Only the short prefix is formatted. */
     char buf[256];
-    vt_snprintf(buf, sizeof buf, "%s:%d: panic: %s\n", file, line, msg);
+    vt_snprintf(buf, sizeof buf, "%s:%d: panic: ", file, line);
     vt_puts_err(buf);
+    vt_puts_err(msg ? msg : "(null)");
+    vt_puts_err("\n");
     vt_host_abort();
 }
 
