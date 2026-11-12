@@ -11,6 +11,7 @@
 #include <fcntl.h>
 #include <libgen.h>
 #include <limits.h>
+#include <strings.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -801,7 +802,14 @@ typedef struct {
     const char *name, *version, *icon, *company, *description, *copyright;
     bool dpi_unaware;
     /* WinManifest.service(): the installer registers the exe as a service */
-    const char *svc_name, *svc_display, *svc_desc, *svc_start;
+    const char *svc_name, *svc_display, *svc_desc, *svc_start, *svc_deps;
+    /* WinManifest.program()/.serviceFor(): more programs of the suite, built
+       and installed beside the main exe, and services for them (raw "svc="
+       values, passed through to the setup program) */
+    int nprog;
+    const char *prog_id[16], *prog_path[16];
+    int nsvc;
+    const char *svc_line[16];
     /* internal, for the installer's own builds (--win-elevate, --win-rcdata):
        require administrator rights; embed a payload as RCDATA 100 */
     bool elevate;
@@ -861,6 +869,20 @@ static WinApp read_win_manifest(const char *manifest_vt, bool verbose) {
             else if (strcmp(key, "service_display") == 0) app.svc_display = val;
             else if (strcmp(key, "service_desc") == 0) app.svc_desc = val;
             else if (strcmp(key, "service_start") == 0) app.svc_start = val;
+            else if (strcmp(key, "service_deps") == 0) app.svc_deps = val;
+            else if (strcmp(key, "program") == 0) {
+                const char *tab = strchr(val, '\t');
+                if (!tab || app.nprog >= 16)
+                    fatal("%s: bad program line (or more than 16 programs): %s", manifest_vt, val);
+                const char *rel = arena_strdup(&g_arena, tab + 1);
+                app.prog_id[app.nprog] = arena_printf(&g_arena, "%.*s", (int)(tab - val), val);
+                app.prog_path[app.nprog] = rel[0] == '/' ? rel : arena_printf(&g_arena, "%s/%s", base, rel);
+                app.nprog++;
+            }
+            else if (strcmp(key, "svc") == 0) {
+                if (app.nsvc >= 16) fatal("%s: more than 16 services", manifest_vt);
+                app.svc_line[app.nsvc++] = val;
+            }
             else fatal("%s: unknown manifest key '%s' (this vytoc is older than the "
                        "manifest library that printed it?)", manifest_vt, key);
         }
@@ -1104,7 +1126,7 @@ static void make_installer(const WinApp *app, const char *exe, const char **ship
                            const char *cache, const char *cc_override, const char *manifest_vt,
                            bool per_user, const char *sign_pfx, const char *sign_ts, bool audit,
                            bool verbose) {
-    if (app->svc_name && per_user)
+    if ((app->svc_name || app->nsvc > 0) && per_user)
         fatal("%s declares a Windows service, and installing a service needs a per-machine "
               "installer: drop --per-user", manifest_vt ? manifest_vt : "the app");
     char self[4096];
@@ -1158,7 +1180,9 @@ static void make_installer(const WinApp *app, const char *exe, const char **ship
         sb_printf(&ini, "service_name=%s\nservice_display=%s\nservice_desc=%s\nservice_start=%s\n",
                   app->svc_name, app->svc_display ? app->svc_display : app->svc_name,
                   app->svc_desc ? app->svc_desc : "", app->svc_start ? app->svc_start : "manual");
+        if (app->svc_deps) sb_printf(&ini, "service_deps=%s\n", app->svc_deps);
     }
+    for (int i = 0; i < app->nsvc; i++) sb_printf(&ini, "svc=%s\n", app->svc_line[i]);
     const char *inipath = arena_printf(&g_arena, "%s/setup.ini", work);
     if (!write_if_changed(inipath, ini.data, strlen(ini.data), &ch)) fatal("cannot write %s", inipath);
     sb_free(&ini);
@@ -1169,6 +1193,53 @@ static void make_installer(const WinApp *app, const char *exe, const char **ship
         const char *b = base_of(ship[i]);
         sb_printf(&list, "%s\t%s/%s\n", b, exedir, b);
     }
+    /* The suite's other programs: each built like the app, into its own dir,
+       then installed beside it. One folder holds every exe; a file two builds
+       both ship (cacert.pem) goes in once, and two different files under one
+       name are an error rather than a silent pick. */
+    const char *names[256];
+    const char *srcs[256];
+    int nnames = 0;
+    names[nnames] = exebase; srcs[nnames++] = exe;
+    for (int i = 0; i < nship && nnames < 256; i++) {
+        names[nnames] = base_of(ship[i]);
+        srcs[nnames++] = arena_printf(&g_arena, "%s/%s", exedir, base_of(ship[i]));
+    }
+    for (int p = 0; p < app->nprog; p++) {
+        const char *pdir = arena_printf(&g_arena, "%s/programs/%s", work, app->prog_id[p]);
+        if (mkdir_p(pdir) != 0) fatal("cannot create %s", pdir);
+        const char *pexe = arena_printf(&g_arena, "%s/%s.exe", pdir, app->prog_id[p]);
+        if (strcmp(arena_printf(&g_arena, "%s.exe", app->prog_id[p]), exebase) == 0)
+            fatal("program \"%s\" would replace the main exe %s", app->prog_id[p], exebase);
+        if (run_cmd(arena_printf(&g_arena, "%s build %s%s%s -o %s >/dev/null", sh_quote(self),
+                                 sh_quote(app->prog_path[p]), common.data, audit ? " --audit" : "",
+                                 sh_quote(pexe)), verbose) != 0)
+            fatal("building program \"%s\" (%s) failed", app->prog_id[p], app->prog_path[p]);
+        DIR *d = opendir(pdir);
+        if (!d) fatal("cannot read %s", pdir);
+        struct dirent *de;
+        while ((de = readdir(d))) {
+            if (de->d_name[0] == '.') continue;
+            const char *src = arena_printf(&g_arena, "%s/%s", pdir, de->d_name);
+            if (dir_exists(src)) continue;
+            int dup = -1;
+            for (int k = 0; k < nnames; k++) if (strcasecmp(names[k], de->d_name) == 0) dup = k;
+            if (dup >= 0) {
+                size_t la = 0, lb = 0;
+                char *a = read_file(srcs[dup], &la), *b = read_file(src, &lb);
+                if (!a || !b || la != lb || memcmp(a, b, la) != 0)
+                    fatal("two programs of the suite ship different files named %s", de->d_name);
+                continue;
+            }
+            if (nnames >= 256) fatal("too many files in the suite");
+            names[nnames] = arena_strdup(&g_arena, de->d_name);
+            srcs[nnames++] = src;
+        }
+        closedir(d);
+    }
+    for (int k = 1 + nship; k < nnames; k++) sb_printf(&list, "%s\t%s\n", names[k], srcs[k]);
+    if (verbose)
+        for (int k = 0; k < nnames; k++) fprintf(stderr, "installer payload: %s\n", names[k]);
     sb_printf(&list, "uninstall.exe\t%s\n.setup.ini\t%s\n", uninst, inipath);
     const char *listpath = arena_printf(&g_arena, "%s/files.txt", work);
     if (!write_if_changed(listpath, list.data, strlen(list.data), &ch)) fatal("cannot write %s", listpath);

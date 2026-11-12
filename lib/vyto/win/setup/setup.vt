@@ -26,7 +26,7 @@ import { Painter, WEIGHT } from "vyto/surface/painter";
 import { Rect, rgba } from "vyto/surface";
 import { D2DPainter, d2d_usable } from "vyto/win/d2d";
 import { FileDialog } from "vyto/desktop";
-import { serviceInstall, serviceUninstall, serviceStart, serviceStop, serviceState, serviceError,
+import { serviceInstallWith, serviceUninstall, serviceStart, serviceStop, serviceState, serviceError,
          selfPath, START_MANUAL, START_AUTO, START_AUTO_DELAYED } from "vyto/desktop/service";
 import { Tween } from "vyto/ui/anim";
 import { sleepUs } from "vyto/util/time";
@@ -135,6 +135,54 @@ fn svc_start_of(s: string): int {
 
 // ---- the job --------------------------------------------------------------------
 
+// One service of the suite: the main exe's (WinManifest.service) or a
+// program's (.serviceFor), with the services it needs (.dependsOn).
+class Svc {
+    name: string;
+    display: string;
+    desc: string;
+    start: string;
+    exe: string;
+    deps: string[];
+    fn init(name: string, display: string, desc: string, start: string, exe: string, deps: string[]) {
+        this.name = name;
+        this.display = display;
+        if (display == "") { this.display = name; }
+        this.desc = desc;
+        this.start = start;
+        this.exe = exe;
+        this.deps = deps;
+    }
+}
+
+fn split_deps(s: string): string[] {
+    let out: string[] = [];
+    for (let d in s.split(",")) { if (d != "") { out.push(d); } }
+    return out;
+}
+
+// Dependencies before the services that need them.
+fn dep_order(list: Svc[]): Svc[] {
+    let out: Svc[] = [];
+    let placed = new Map<string, bool>();
+    let rounds = 0;
+    while (out.len < list.len && rounds <= list.len) {
+        for (let v in list) {
+            if (placed.has(v.name)) { continue; }
+            let ready = true;
+            for (let d in v.deps) {
+                let ours = false;
+                for (let w in list) { if (w.name == d) { ours = true; } }
+                if (ours && !placed.has(d)) { ready = false; }
+            }
+            if (ready) { out.push(v); placed.set(v.name, true); }
+        }
+        rounds += 1;
+    }
+    for (let v in list) { if (!placed.has(v.name)) { out.push(v); } }   // a cycle: keep going
+    return out;
+}
+
 const ST_WELCOME: int = 0;
 const ST_WORKING: int = 1;
 const ST_DONE: int = 2;
@@ -159,6 +207,7 @@ class Job {
     written: string[];
     shortcuts: string[];
     self_temp: string;
+    ini_text: string;
     win: weak Window;
 
     fn init() {
@@ -178,12 +227,63 @@ class Job {
         this.written = [];
         this.shortcuts = [];
         this.self_temp = "";
+        this.ini_text = "";
     }
 
     fn m(k: string): string { return this.meta.get_or(k, ""); }
     fn name(): string { return this.m("name"); }
     fn key(): string { return this.m("key"); }
-    fn has_service(): bool { return this.m("service_name") != "" && this.machine; }
+    fn has_service(): bool { return this.services().len > 0 && this.machine; }
+
+    // Every service, dependencies first: from .setup.ini when installing,
+    // from uninstall.ini when removing (both carry the same keys).
+    fn services(): Svc[] {
+        let list: Svc[] = [];
+        if (this.m("service_name") != "") {
+            list.push(new Svc(this.m("service_name"), this.m("service_display"), this.m("service_desc"),
+                              this.m("service_start"), this.m("exe"), split_deps(this.m("service_deps"))));
+        }
+        for (let ln in this.ini_text.lines()) {
+            if (!ln.starts_with("svc=")) { continue; }
+            let f = ln.slice(4, ln.len).split("\t");
+            if (f.len < 6) { continue; }
+            list.push(new Svc(f[1], f[2], f[5], f[3], f[0] + ".exe", split_deps(f[4])));
+        }
+        return dep_order(list);
+    }
+
+    fn svc_summary(): string {
+        let v = this.services();
+        if (v.len == 1) { return "the " + v[0].display + " service"; }
+        return `the {v.len} services`;
+    }
+
+    // Stop running services, the ones that depend on others first (Windows
+    // refuses to stop a service whose dependents still run). "" or an error.
+    fn stop_services(): string {
+        let v = this.services();
+        let i = v.len - 1;
+        while (i >= 0) {
+            if (serviceState(v[i].name) == 4) {
+                this.current = "Stopping the " + v[i].display + " service";
+                if (!serviceStop(v[i].name)) {
+                    return "Could not stop the " + v[i].display + " service: " + serviceError();
+                }
+            }
+            i -= 1;
+        }
+        return "";
+    }
+
+    // The suite's exes in this folder that some process still holds open.
+    fn exe_in_use(names: string[]): string {
+        for (let n in names) {
+            if (!n.to_lower().ends_with(".exe") || n == "uninstall.exe") { continue; }
+            let p = join(this.dir, n);
+            if (file_exists(p) && vset_in_use(p.cstr()) as int != 0) { return n; }
+        }
+        return "";
+    }
     fn mach(): i32 {
         if (this.machine) { return 1 as i32; }
         return 0 as i32;
@@ -228,16 +328,19 @@ class Job {
     }
 
     fn prepare() {
-        if (this.has_service() && serviceState(this.m("service_name")) == 4) {
-            this.current = "Stopping the " + this.m("service_display") + " service";
-            if (!serviceStop(this.m("service_name"))) {
-                this.fail("Could not stop the " + this.m("service_display") + " service: " + serviceError());
-                return;
-            }
+        if (this.has_service()) {
+            let e = this.stop_services();
+            if (e != "") { this.fail(e); return; }
         }
-        let exe = join(this.dir, this.m("exe"));
-        if (file_exists(exe) && vset_in_use(exe.cstr()) as int != 0) {
-            this.fail(this.name() + " is running. Close it, then run setup again.");
+        let names: string[] = [];
+        for (let f in this.files) { names.push(win_path(f.path)); }
+        let busy = this.exe_in_use(names);
+        if (busy != "") {
+            if (busy == this.m("exe")) {
+                this.fail(this.name() + " is running. Close it, then run setup again.");
+            } else {
+                this.fail(busy + " is running. Close it, then run setup again.");
+            }
             return;
         }
         if (!file_mkdirs(this.dir)) { this.fail("Could not create the folder " + this.dir); }
@@ -279,7 +382,11 @@ class Job {
         let ini = "name=" + this.name() + "\r\nversion=" + this.m("version") + "\r\nkey=" + this.key() +
                   "\r\nscope=" + this.m("scope") + "\r\nexe=" + this.m("exe") +
                   "\r\nservice_name=" + this.m("service_name") +
-                  "\r\nservice_display=" + this.m("service_display") + "\r\n";
+                  "\r\nservice_display=" + this.m("service_display") +
+                  "\r\nservice_deps=" + this.m("service_deps") + "\r\n";
+        for (let ln in this.ini_text.lines()) {
+            if (ln.starts_with("svc=")) { ini = ini + ln + "\r\n"; }
+        }
         for (let f in this.written) { ini = ini + "file=" + f + "\r\n"; }
         for (let s in this.shortcuts) { ini = ini + "shortcut=" + s + "\r\n"; }
         if (!write_text(join(this.dir, "uninstall.ini"), ini)) {
@@ -296,17 +403,32 @@ class Job {
                                     ((size + 1023) / 1024) as i32) as int != 0;
         if (!ok) { this.fail("Could not add " + this.name() + " to Add/Remove Programs."); return; }
         if (this.has_service()) {
-            let sn = this.m("service_name");
-            if (serviceState(sn) != -1) { serviceUninstall(sn); }
-            if (!serviceInstall(sn, this.m("service_display"), this.m("service_desc"), exe, "",
-                                svc_start_of(this.m("service_start")))) {
-                this.fail("Could not register the " + this.m("service_display") + " service: " + serviceError());
-                return;
+            let v = this.services();
+            // a fresh registration each time, so a moved folder or a changed
+            // dependency is picked up; remove dependents first, add
+            // dependencies first
+            let i = v.len - 1;
+            while (i >= 0) {
+                if (serviceState(v[i].name) != -1) { serviceUninstall(v[i].name); }
+                i -= 1;
             }
-            if (this.start_svc && !serviceStart(sn)) {
-                this.fail("Installed, but the " + this.m("service_display") + " service did not start: " +
-                          serviceError());
-                return;
+            for (let sv in v) {
+                this.current = "Registering the " + sv.display + " service";
+                if (!serviceInstallWith(sv.name, sv.display, sv.desc, join(this.dir, sv.exe), "",
+                                        svc_start_of(sv.start), sv.deps)) {
+                    this.fail("Could not register the " + sv.display + " service: " + serviceError());
+                    return;
+                }
+            }
+            if (this.start_svc) {
+                for (let sv in v) {
+                    this.current = "Starting the " + sv.display + " service";
+                    if (!serviceStart(sv.name)) {
+                        this.fail("Installed, but the " + sv.display + " service did not start: " +
+                                  serviceError());
+                        return;
+                    }
+                }
             }
         }
         vset_shell_changed();
@@ -314,17 +436,26 @@ class Job {
 
     // ---- uninstall (runs from the %TEMP% copy)
     fn remove_all() {
-        let sn = this.m("service_name");
-        if (sn != "" && serviceState(sn) != -1) {
-            this.current = "Removing the service";
-            if (!serviceUninstall(sn)) {
-                this.fail("Could not remove the " + this.m("service_display") + " service: " + serviceError());
-                return;
+        // services: the ones depending on others go first
+        let v = this.services();
+        let i = v.len - 1;
+        while (i >= 0) {
+            if (serviceState(v[i].name) != -1) {
+                this.current = "Removing the " + v[i].display + " service";
+                if (!serviceUninstall(v[i].name)) {
+                    this.fail("Could not remove the " + v[i].display + " service: " + serviceError());
+                    return;
+                }
             }
+            i -= 1;
         }
-        let exe = join(this.dir, this.m("exe"));
-        if (file_exists(exe) && vset_in_use(exe.cstr()) as int != 0) {
-            this.fail(this.name() + " is running. Close it, then uninstall again.");
+        let busy = this.exe_in_use(this.meta_list("file"));
+        if (busy != "") {
+            if (busy == this.m("exe")) {
+                this.fail(this.name() + " is running. Close it, then uninstall again.");
+            } else {
+                this.fail(busy + " is running. Close it, then uninstall again.");
+            }
             return;
         }
         for (let s in this.meta_list("shortcut")) { file_remove(s); }
@@ -506,7 +637,7 @@ class SetupScreen extends Widget {
             this.add(new Check("Create a desktop shortcut", () => { return j.desktop; },
                                (v) => { j.desktop = v; }));
             if (j.has_service()) {
-                this.add(new Check("Start the " + j.m("service_display") + " service",
+                this.add(new Check("Start " + j.svc_summary(),
                                    () => { return j.start_svc; }, (v) => { j.start_svc = v; }));
             }
         } else if (j.state == ST_CONFIRM) {
@@ -517,7 +648,7 @@ class SetupScreen extends Widget {
             // An app that is a service is already running, started by the
             // Service Control Manager; launching its exe again would only
             // start a second, console-mode copy in the user's session.
-            if (j.m("service_name") == "") {
+            if (j.m("service_name") == "") {   // the main exe is not a service: it can be launched
                 this.add(new Check("Launch " + j.name() + " now", () => { return j.launch; },
                                    (v) => { j.launch = v; }));
             } else {
@@ -658,9 +789,11 @@ class SetupScreen extends Widget {
                 s.text(b.x, base_at(s, y), ln, C_INK);
                 y += lh;
             }
-            if (j.m("service_name") != "") {
+            if (j.services().len > 0) {
                 y += this.dp(6.0);
-                s.text(b.x, base_at(s, y), fit(s, "The " + j.m("service_display") + " service will be stopped and removed.", b.w), C_MUTED);
+                let what = "The " + j.services()[0].display + " service will be stopped and removed.";
+                if (j.services().len > 1) { what = `Its {j.services().len} services will be stopped and removed.`; }
+                s.text(b.x, base_at(s, y), fit(s, what, b.w), C_MUTED);
                 y += lh;
             }
             y += this.dp(6.0);
@@ -683,8 +816,12 @@ class SetupScreen extends Widget {
             s.pop_font();
             s.text(b.x, base_at(s, b.y + this.dp(36.0)), fit(s, j.dir, b.w), C_MUTED);
             if (j.has_service() && j.start_svc) {
-                s.text(b.x, base_at(s, b.y + this.dp(66.0)),
-                       fit(s, "The " + j.m("service_display") + " service is running.", b.w), C_INK);
+                let sy = b.y + this.dp(66.0);
+                if (j.m("service_name") == "") { sy = b.y + this.dp(100.0); }   // below "Launch"
+                for (let sv in j.services()) {
+                    s.text(b.x, base_at(s, sy), fit(s, "✓ " + sv.display + " service is running", b.w), C_INK);
+                    sy += lh;
+                }
             }
         } else if (j.state == ST_REMOVED) {
             s.push_font(this.dp(18.0), WEIGHT.BOLD);
@@ -771,7 +908,8 @@ export fn setupMain() {
         if (!ar.ok) { print("setup: " + ar.err); exit(1); return; }
         let ini = ar.find(".setup.ini");
         if (ini == null) { print("setup: the installer has no .setup.ini"); exit(1); return; }
-        j.meta = parse_ini(strbytes(ini.data, ini.data.len));
+        j.ini_text = strbytes(ini.data, ini.data.len);
+        j.meta = parse_ini(j.ini_text);
         for (let e in ar.entries) { if (e.path != ".setup.ini") { j.files.push(e); } }
         j.machine = j.m("scope") != "user";
         if (no_desktop) { j.desktop = false; }
@@ -814,7 +952,8 @@ export fn setupMain() {
     vset_wait_pid(p2_pid as i32, 15000 as i32);
     j.dir = p2_dir;
     j.self_temp = selfPath();
-    j.meta = parse_ini(read_text(join(j.dir, "uninstall.ini")));
+    j.ini_text = read_text(join(j.dir, "uninstall.ini"));
+    j.meta = parse_ini(j.ini_text);
     if (j.name() == "") {
         print("uninstall: no uninstall.ini in " + j.dir);
         exit(1);

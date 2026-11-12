@@ -52,12 +52,19 @@ serviceStart("VytoSync");
   text), then `systemctl daemon-reload` and, unless `START_MANUAL`, `enable`.
   `Restart=on-failure`.
 
+`serviceInstallWith(..., deps)` also names the services this one needs:
+Windows starts them first and will not stop one while this runs; systemd gets
+`After=` and `Requires=`.
+
 `serviceStart`, `serviceStop`, `serviceState` (`SVC_NOT_INSTALLED`,
 `SVC_STOPPED`, `SVC_RUNNING`) and `serviceUninstall` manage it afterwards.
 
 For a Windows app, the usual way is to let the installer do it: declare the
 service in the app's `--manifest` and build with `--installer`, which
-registers it on install, stops it on upgrade and removes it on uninstall:
+registers it on install, stops it on upgrade and removes it on uninstall. A
+suite of several programs uses `.program()` + `.serviceFor()` +
+`.dependsOn()` (see `apps/pos_suite`); a GUI talks to its services over
+`vyto/desktop/channel`. For one exe that is itself the service:
 
 ```vyto
 new WinManifest("Vyto Sync").version("1.0.0")

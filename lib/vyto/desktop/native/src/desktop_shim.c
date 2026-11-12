@@ -281,7 +281,8 @@ int32_t vdesk_open(const char *target) {
 }
 
 const char *vdesk_dir(int32_t which, const char *app) {
-    const KNOWNFOLDERID *id = which == 0 ? &FOLDERID_RoamingAppData : &FOLDERID_LocalAppData;
+    const KNOWNFOLDERID *id = which == 0 ? &FOLDERID_RoamingAppData
+                            : which == 3 ? &FOLDERID_ProgramData : &FOLDERID_LocalAppData;
     PWSTR base = NULL;
     if (FAILED(SHGetKnownFolderPath(id, 0, NULL, &base)) || !base) return "";
     char *u = vt_utf8_from_w(base);
@@ -636,8 +637,18 @@ int32_t vdesk_open(const char *target) {
 const char *vdesk_dir(int32_t which, const char *app) {
     static const char *envs[] = { "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME" };
     static const char *defs[] = { ".config", ".local/share", ".cache" };
-    if (which < 0 || which > 2) return "";
     char tmp[4096];
+    if (which == 3) {
+        /* shared: a system service's own state (root), else the user's data
+           dir, so the same service runs from a terminal while developing */
+        if (geteuid() == 0) {
+            int k = snprintf(tmp, sizeof tmp, "/var/lib/%s", app);
+            if (k < 0 || (size_t)k >= sizeof tmp) return "";
+            return vd_dir_out(tmp);
+        }
+        which = 1;
+    }
+    if (which < 0 || which > 2) return "";
     const char *x = getenv(envs[which]);
     int n;
     /* The XDG spec: a relative value is invalid and must be ignored. */

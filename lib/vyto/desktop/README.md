@@ -35,6 +35,7 @@ let settings = configDir("myapp") + "/settings.ini";
 | `openUrl(url)` | `bool` | `http:`, `https:`, `mailto:` only |
 | `openPath(path)` | `bool` | like a double-click in the file manager |
 | `configDir(app)`, `dataDir(app)`, `cacheDir(app)` | `string` | not created; `""` for a bad app name |
+| `sharedDataDir(app)` | `string` | for services: `%ProgramData%\<app>`; `/var/lib/<app>` as root on Linux, else `dataDir(app)` |
 | `desktop_available()` | `bool` | false on Linux with neither zenity nor kdialog, and in freestanding/Android builds |
 
 | | Linux | Windows |

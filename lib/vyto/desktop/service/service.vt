@@ -40,7 +40,7 @@ extern "C" {
     fn vsvc_uses_scm(): i32;
     fn vsvc_self_path(): cstring;
     fn vsvc_install(name: cstring, display: cstring, desc: cstring, exe: cstring,
-                    args: cstring, start: i32): i32;
+                    args: cstring, start: i32, deps: cstring): i32;
     fn vsvc_install_unit(name: cstring, unit: cstring, enable: i32): i32;
     fn vsvc_uninstall(name: cstring): i32;
     fn vsvc_start(name: cstring): i32;
@@ -111,12 +111,27 @@ export fn serviceError(): string { return str(vsvc_error()); }
 // The systemd unit for a service: Type=notify (Service.run sends READY=1),
 // restart on failure, journald logging. `exec` is the full command line.
 export fn systemdUnit(name: string, description: string, exec: string, start: int): string {
+    return systemdUnitWith(name, description, exec, start, []);
+}
+
+// The same, with the units this one needs: started first (After=) and
+// required (Requires=), the systemd side of serviceInstallWith's deps.
+export fn systemdUnitWith(name: string, description: string, exec: string, start: int,
+                          deps: string[]): string {
     let desc = description;
     if (desc == "") { desc = name; }
+    let after = "network.target";
+    let req = "";
+    for (let d in deps) {
+        after = after + " " + d + ".service";
+        if (req != "") { req = req + " "; }
+        req = req + d + ".service";
+    }
+    let unit = "[Unit]\nDescription=" + desc + "\nAfter=" + after + "\n";
+    if (req != "") { unit = unit + "Requires=" + req + "\n"; }
     let wanted = "";
     if (start != START_MANUAL) { wanted = "\n[Install]\nWantedBy=multi-user.target\n"; }
-    return "[Unit]\nDescription=" + desc + "\nAfter=network.target\n\n" +
-           "[Service]\nType=notify\nExecStart=" + exec + "\nRestart=on-failure\nRestartSec=5\n" +
+    return unit + "\n[Service]\nType=notify\nExecStart=" + exec + "\nRestart=on-failure\nRestartSec=5\n" +
            wanted;
 }
 
@@ -127,12 +142,21 @@ export fn systemdUnit(name: string, description: string, exec: string, start: in
 // failure.
 export fn serviceInstall(name: string, display: string, description: string,
                          exe: string, args: string, start: int): bool {
+    return serviceInstallWith(name, display, description, exe, args, start, []);
+}
+
+// The same, needing services `deps` to run first: Windows starts them before
+// this one and will not stop one of them while this runs; systemd gets
+// After= and Requires=.
+export fn serviceInstallWith(name: string, display: string, description: string,
+                             exe: string, args: string, start: int, deps: string[]): bool {
     let path = exe;
     if (path == "") { path = selfPath(); }
     if (!plain_service_name(name)) { return false; }
+    for (let d in deps) { if (!plain_service_name(d)) { return false; } }
     if (vsvc_uses_scm() as int != 0) {
         return vsvc_install(name.cstr(), display.cstr(), description.cstr(), path.cstr(),
-                            args.cstr(), start as i32) as int != 0;
+                            args.cstr(), start as i32, deps.join("\n").cstr()) as int != 0;
     }
     // systemd: quote a path with spaces, as ExecStart's own syntax requires
     let exec = path;
@@ -142,7 +166,8 @@ export fn serviceInstall(name: string, display: string, description: string,
     if (d == "") { d = display; }
     let en = 1;
     if (start == START_MANUAL) { en = 0; }
-    return vsvc_install_unit(name.cstr(), systemdUnit(name, d, exec, start).cstr(), en as i32) as int != 0;
+    return vsvc_install_unit(name.cstr(), systemdUnitWith(name, d, exec, start, deps).cstr(),
+                             en as i32) as int != 0;
 }
 
 export fn serviceUninstall(name: string): bool { return vsvc_uninstall(name.cstr()) as int != 0; }

@@ -48,6 +48,12 @@ export class WinManifest {
     svc_display: string;
     svc_desc: string;
     svc_start: string;
+    // more programs in the same install folder, and services for them
+    prog_ids: string[];
+    prog_paths: string[];
+    svcs: SuiteService[];
+    main_deps: string[];
+    dep_requests: string[];
 
     fn init(name: string) {
         this.app_name = name;
@@ -61,6 +67,11 @@ export class WinManifest {
         this.svc_display = "";
         this.svc_desc = "";
         this.svc_start = "";
+        this.prog_ids = [];
+        this.prog_paths = [];
+        this.svcs = [];
+        this.main_deps = [];
+        this.dep_requests = [];
     }
 
     // "1.2" to "1.2.3.4": up to four numbers, each 0..65535, which is what the
@@ -82,6 +93,32 @@ export class WinManifest {
     // Control Manager and the uninstaller removes it. The exe uses
     // vyto/desktop/service's Service.run(). `start` is "manual", "auto" or
     // "delayed" (automatic, after boot settles).
+    // Another program of the suite: `entry` (a .vt file, relative to this
+    // manifest program) is built too and installed beside the main exe as
+    // <id>.exe — all of a suite's exes live in one folder.
+    builder fn program(id: string, entry: string) {
+        this.prog_ids.push(id);
+        this.prog_paths.push(entry);
+        return this;
+    }
+
+    // Run program `id` as a Windows service (it uses vyto/desktop/service's
+    // Service.run). `start` is "manual", "auto" or "delayed".
+    builder fn serviceFor(id: string, name: string, display: string, description: string, start: string) {
+        this.svcs.push(new SuiteService(id, name, display, description, start));
+        return this;
+    }
+
+    // Service `name` needs service `on` running first. Windows starts `on`
+    // before it and will not stop `on` while it runs; the installer stops and
+    // starts the suite's services in that order.
+    builder fn dependsOn(name: string, on: string) {
+        for (let v in this.svcs) { if (v.name == name) { v.deps.push(on); } }
+        if (this.svc_name == name) { this.main_deps.push(on); }
+        this.dep_requests.push(name + "\t" + on);
+        return this;
+    }
+
     builder fn service(name: string, display: string, description: string, start: string) {
         this.svc_name = name;
         this.svc_display = display;
@@ -118,6 +155,7 @@ export class WinManifest {
                 probs.push("service start \"" + this.svc_start + "\" must be manual, auto or delayed");
             }
         }
+        this.validate_suite(probs);
         let fields = ["name", "version", "icon", "company", "description", "copyright", "dpi",
                       "service name", "service display name", "service description"];
         let values = [this.app_name, this.app_version, this.app_icon, this.app_company,
@@ -129,6 +167,69 @@ export class WinManifest {
             }
         }
         return probs;
+    }
+
+    fn validate_suite(probs: string[]) {
+        let seen = new Map<string, bool>();
+        for (let i in 0..this.prog_ids.len) {
+            let id = this.prog_ids[i];
+            if (!program_id_ok(id)) {
+                probs.push("program id \"" + id + "\" may only use a-z, 0-9, '-' and '_'");
+            } else if (seen.has(id)) {
+                probs.push("program \"" + id + "\" is declared twice");
+            }
+            seen.set(id, true);
+            let pth = this.prog_paths[i];
+            if (!pth.ends_with(".vt") || has_control(pth)) {
+                probs.push("program \"" + id + "\": \"" + pth + "\" is not a .vt file");
+            }
+        }
+        let names = new Map<string, bool>();
+        if (this.svc_name.len > 0) { names.set(this.svc_name, true); }
+        for (let v in this.svcs) {
+            if (!seen.has(v.prog)) {
+                probs.push("serviceFor names program \"" + v.prog + "\", which no .program() declares");
+            }
+            if (!service_name_ok(v.name)) {
+                probs.push("service name \"" + v.name + "\" may only use letters, digits, '-', '_' and '.'");
+            } else if (names.has(v.name)) {
+                probs.push("service \"" + v.name + "\" is declared twice");
+            }
+            names.set(v.name, true);
+            if (v.start != "manual" && v.start != "auto" && v.start != "delayed") {
+                probs.push("service start \"" + v.start + "\" must be manual, auto or delayed");
+            }
+            if (has_control(v.display) || has_control(v.desc)) {
+                probs.push("service \"" + v.name + "\" has a control character in its texts");
+            }
+        }
+        for (let r in this.dep_requests) {
+            let t = r.index_of("\t");
+            let a = r.slice(0, t);
+            let b = r.slice(t + 1, r.len);
+            if (!names.has(a)) { probs.push("dependsOn: no service \"" + a + "\""); }
+            if (!names.has(b)) { probs.push("dependsOn: no service \"" + b + "\""); }
+            if (a == b) { probs.push("service \"" + a + "\" cannot depend on itself"); }
+        }
+        if (this.dep_cycle()) { probs.push("the services' dependsOn form a cycle"); }
+    }
+
+    // Walk the dependency graph from each service; seeing it again is a cycle.
+    fn dep_cycle(): bool {
+        for (let start in this.svcs) {
+            let stack: string[] = [];
+            for (let d in start.deps) { stack.push(d); }
+            let steps = 0;
+            while (stack.len > 0 && steps < 1000) {
+                let cur = stack.pop();
+                steps += 1;
+                if (cur == start.name) { return true; }
+                for (let v in this.svcs) {
+                    if (v.name == cur) { for (let d in v.deps) { stack.push(d); } }
+                }
+            }
+        }
+        return false;
     }
 
     // The text vytoc reads: the format line, then one key=value per set field.
@@ -146,6 +247,14 @@ export class WinManifest {
         if (this.svc_name.len > 0) {
             out = out + "\nservice_name=" + this.svc_name + "\nservice_display=" + this.svc_display +
                   "\nservice_desc=" + this.svc_desc + "\nservice_start=" + this.svc_start;
+            if (this.main_deps.len > 0) { out = out + "\nservice_deps=" + this.main_deps.join(","); }
+        }
+        for (let i in 0..this.prog_ids.len) {
+            out = out + "\nprogram=" + this.prog_ids[i] + "\t" + this.prog_paths[i];
+        }
+        for (let v in this.svcs) {
+            out = out + "\nsvc=" + v.prog + "\t" + v.name + "\t" + v.display + "\t" + v.start + "\t" +
+                  v.deps.join(",") + "\t" + v.desc;
         }
         return out;
     }
@@ -195,6 +304,33 @@ fn service_name_ok(s: string): bool {
         let ok = (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) ||
                  c == 45 || c == 95 || c == 46;
         if (!ok) { return false; }
+    }
+    return true;
+}
+
+// One .serviceFor() declaration.
+class SuiteService {
+    prog: string;
+    name: string;
+    display: string;
+    desc: string;
+    start: string;
+    deps: string[];
+    fn init(prog: string, name: string, display: string, desc: string, start: string) {
+        this.prog = prog;
+        this.name = name;
+        this.display = display;
+        this.desc = desc;
+        this.start = start;
+        this.deps = [];
+    }
+}
+
+fn program_id_ok(s: string): bool {
+    if (s.len == 0 || s.len > 40) { return false; }
+    for (let i in 0..s.len) {
+        let c = s[i];
+        if (!((c >= 48 && c <= 57) || (c >= 97 && c <= 122) || c == 45 || c == 95)) { return false; }
     }
     return true;
 }

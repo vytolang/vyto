@@ -205,8 +205,9 @@ static SC_HANDLE open_scm(DWORD access) {
    quoted, so a path with spaces ("C:\Program Files\...") cannot be
    misread as a different program — the classic unquoted-service-path
    hole. */
+/* deps: the services this one needs, '\n'-separated ("" for none). */
 int32_t vsvc_install(const char *name, const char *display, const char *desc,
-                     const char *exe, const char *args, int32_t start) {
+                     const char *exe, const char *args, int32_t start, const char *deps) {
     SC_HANDLE m = open_scm(SC_MANAGER_CREATE_SERVICE);
     if (!m) return 0;
     char cmd[8192];
@@ -216,9 +217,20 @@ int32_t vsvc_install(const char *name, const char *display, const char *desc,
     vt_wbuf_from(&wn, name);
     vt_wbuf_from(&wd, display && *display ? display : name);
     vt_wbuf_from(&wc, cmd);
+    /* lpDependencies is a double-NUL-terminated list */
+    VtWBuf wdep;
+    vt_wbuf_from(&wdep, deps ? deps : "");
+    size_t dl = wcslen(wdep.p);
+    wchar_t *deplist = calloc(dl + 2, sizeof *deplist);
+    if (deplist) {
+        for (size_t i = 0; i < dl; i++) deplist[i] = wdep.p[i] == L'\n' ? 0 : wdep.p[i];
+    }
+    vt_wbuf_free(&wdep);
     SC_HANDLE s = CreateServiceW(m, wn.p, wd.p, SERVICE_ALL_ACCESS, SERVICE_WIN32_OWN_PROCESS,
                                  start == 0 ? SERVICE_DEMAND_START : SERVICE_AUTO_START,
-                                 SERVICE_ERROR_NORMAL, wc.p, NULL, NULL, NULL, NULL, NULL);
+                                 SERVICE_ERROR_NORMAL, wc.p, NULL, NULL,
+                                 dl > 0 ? deplist : NULL, NULL, NULL);
+    free(deplist);
     int ok = 0;
     if (!s) {
         set_err("CreateService", GetLastError());
@@ -507,8 +519,8 @@ int32_t vsvc_install_unit(const char *name, const char *unit, int32_t enable) {
 /* The Windows-shaped install entry point has no meaning here; the Vyto side
    calls vsvc_install_unit on POSIX instead. */
 int32_t vsvc_install(const char *name, const char *display, const char *desc,
-                     const char *exe, const char *args, int32_t start) {
-    (void)name; (void)display; (void)desc; (void)exe; (void)args; (void)start;
+                     const char *exe, const char *args, int32_t start, const char *deps) {
+    (void)name; (void)display; (void)desc; (void)exe; (void)args; (void)start; (void)deps;
     snprintf(g_err, sizeof g_err, "use the unit-file install on this platform");
     return 0;
 }
@@ -556,8 +568,8 @@ const char *vsvc_error(void) { return "services are not available on this target
 int32_t vsvc_uses_scm(void) { return 0; }
 const char *vsvc_self_path(void) { return ""; }
 int32_t vsvc_install(const char *name, const char *display, const char *desc,
-                     const char *exe, const char *args, int32_t start) {
-    (void)name; (void)display; (void)desc; (void)exe; (void)args; (void)start;
+                     const char *exe, const char *args, int32_t start, const char *deps) {
+    (void)name; (void)display; (void)desc; (void)exe; (void)args; (void)start; (void)deps;
     return 0;
 }
 int32_t vsvc_install_unit(const char *name, const char *unit, int32_t enable) {

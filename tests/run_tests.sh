@@ -524,6 +524,14 @@ if echo "$out" | grep -q "makes a Windows setup.exe" && echo "$out2" | grep -q "
 else
     echo "FAIL installer_flags_refused (got: $out | $out2)"; fail=1
 fi
+# Suite manifests: every wrong .program/.serviceFor/.dependsOn is named.
+out=$(./vytoc run tests/fixtures/win_bad_suite_manifest.vt 2>&1)
+r=ok
+for want in 'program id "Bad Id"' 'program "dup" is declared twice' '"readme.txt" is not a .vt file' \
+            'program "ghost", which no .program() declares' 'no service "Nowhere"' 'form a cycle'; do
+    echo "$out" | grep -qF "$want" || r="missing: $want"
+done
+[ "$r" = ok ] && echo "PASS win_manifest_programs_refused" || { echo "FAIL win_manifest_programs_refused ($r)"; fail=1; }
 # --- vyto/desktop: dialogs, open, per-user folders ---
 # The dialog programs are fakes (tests/fixtures/desktop/fake_dialog.sh) that
 # log every argv element and replay canned answers, so each backend's exact
