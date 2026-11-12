@@ -1,0 +1,164 @@
+// vyto/desktop/service — run a Vyto program as a Windows service or a systemd
+// service, from the same code, and install or remove one.
+//
+//     import { Service } from "vyto/desktop/service";
+//
+//     fn main() {
+//         let svc = new Service("VytoSync");
+//         svc.run(() => {
+//             svc.log("started");
+//             while (!svc.stopping()) {
+//                 syncOnce();
+//                 svc.wait(5000);          // sleeps, but wakes at once on stop
+//             }
+//             svc.log("stopped");
+//         });
+//     }
+//
+// Started by Windows' Service Control Manager, run() reports RUNNING, and
+// stopping() turns true on a stop or a shutdown. Started by systemd it is the
+// same with SIGTERM, and READY=1/STOPPING=1 are sent for Type=notify units.
+// Started from a terminal it runs as an ordinary program and Ctrl+C stops it
+// — the way to debug a service.
+//
+// The body runs on the program's main thread; the Windows dispatcher lives on
+// a helper thread in C and only ever sets events, so nothing calls into Vyto
+// from another thread.
+//
+// Installing (administrator / root): serviceInstall registers this or another
+// executable — the Service Control Manager on Windows, a unit file plus
+// `systemctl enable` on Linux — serviceStart/serviceStop/serviceState/
+// serviceUninstall manage it, and serviceError says why a call failed.
+
+extern "C" {
+    fn vsvc_begin(name: cstring): i32;
+    fn vsvc_stopping(): i32;
+    fn vsvc_wait(ms: i32): i32;
+    fn vsvc_end(code: i32);
+    fn vsvc_log(msg: cstring): i32;
+    fn vsvc_error(): cstring;
+    fn vsvc_uses_scm(): i32;
+    fn vsvc_self_path(): cstring;
+    fn vsvc_install(name: cstring, display: cstring, desc: cstring, exe: cstring,
+                    args: cstring, start: i32): i32;
+    fn vsvc_install_unit(name: cstring, unit: cstring, enable: i32): i32;
+    fn vsvc_uninstall(name: cstring): i32;
+    fn vsvc_start(name: cstring): i32;
+    fn vsvc_stop(name: cstring, timeout_ms: i32): i32;
+    fn vsvc_state(name: cstring): i32;
+}
+
+#link "advapi32" if "windows"
+#link "shell32" if "windows"
+#link "ole32" if "windows"
+#link "uuid" if "windows"
+
+// How an installed service starts.
+export const START_MANUAL: int = 0;
+export const START_AUTO: int = 1;
+export const START_AUTO_DELAYED: int = 2;   // Windows: after boot settles; Linux: same as AUTO
+
+// serviceState()
+export const SVC_NOT_INSTALLED: int = -1;
+export const SVC_STOPPED: int = 1;
+export const SVC_RUNNING: int = 4;
+
+export class Service {
+    name: string;
+    mode: int;    // 1 under a service manager, 0 console, -1 not started
+
+    fn init(name: string) {
+        this.name = name;
+        this.mode = -1;
+    }
+
+    // Run `body` as the service. Returns when the body returns; the service
+    // is reported stopped afterwards. The exit code (non-zero = failure, as
+    // Windows' recovery actions and systemd's Restart=on-failure see it)
+    // comes from exitWith() if the body set one.
+    fn run(body: fn()) {
+        this.mode = vsvc_begin(this.name.cstr()) as int;
+        if (this.mode < 0) {
+            panic("vyto/desktop/service: " + str(vsvc_error()));
+        }
+        body();
+        vsvc_end(0 as i32);
+    }
+
+    // True once a stop was asked for: the service manager, SIGTERM, Ctrl+C.
+    fn stopping(): bool { return vsvc_stopping() as int != 0; }
+
+    // Sleep up to `ms` milliseconds, waking early on a stop request. Returns
+    // stopping().
+    fn wait(ms: int): bool { return vsvc_wait(ms as i32) as int != 0; }
+
+    // Started by the Service Control Manager / systemd, rather than from a
+    // terminal.
+    fn isService(): bool { return this.mode == 1; }
+
+    // A line for the service's log: stderr (journald) on Linux and in a
+    // console; %ProgramData%\<name>\<name>.log for a Windows service, which
+    // has no console.
+    fn log(msg: string) { vsvc_log(msg.cstr()); }
+}
+
+// The running executable's own path.
+export fn selfPath(): string { return str(vsvc_self_path()); }
+
+// Why the last install/control call failed.
+export fn serviceError(): string { return str(vsvc_error()); }
+
+// The systemd unit for a service: Type=notify (Service.run sends READY=1),
+// restart on failure, journald logging. `exec` is the full command line.
+export fn systemdUnit(name: string, description: string, exec: string, start: int): string {
+    let desc = description;
+    if (desc == "") { desc = name; }
+    let wanted = "";
+    if (start != START_MANUAL) { wanted = "\n[Install]\nWantedBy=multi-user.target\n"; }
+    return "[Unit]\nDescription=" + desc + "\nAfter=network.target\n\n" +
+           "[Service]\nType=notify\nExecStart=" + exec + "\nRestart=on-failure\nRestartSec=5\n" +
+           wanted;
+}
+
+// Register a service. `exe` "" means this program. Windows: the Service
+// Control Manager, with restart-on-failure and the path quoted; Linux: a
+// unit file in /etc/systemd/system, then daemon-reload and (unless MANUAL)
+// enable. Needs administrator / root. False with serviceError() set on
+// failure.
+export fn serviceInstall(name: string, display: string, description: string,
+                         exe: string, args: string, start: int): bool {
+    let path = exe;
+    if (path == "") { path = selfPath(); }
+    if (!plain_service_name(name)) { return false; }
+    if (vsvc_uses_scm() as int != 0) {
+        return vsvc_install(name.cstr(), display.cstr(), description.cstr(), path.cstr(),
+                            args.cstr(), start as i32) as int != 0;
+    }
+    // systemd: quote a path with spaces, as ExecStart's own syntax requires
+    let exec = path;
+    if (path.contains(" ")) { exec = "\"" + path + "\""; }
+    if (args != "") { exec = exec + " " + args; }
+    let d = description;
+    if (d == "") { d = display; }
+    let en = 1;
+    if (start == START_MANUAL) { en = 0; }
+    return vsvc_install_unit(name.cstr(), systemdUnit(name, d, exec, start).cstr(), en as i32) as int != 0;
+}
+
+export fn serviceUninstall(name: string): bool { return vsvc_uninstall(name.cstr()) as int != 0; }
+export fn serviceStart(name: string): bool { return vsvc_start(name.cstr()) as int != 0; }
+export fn serviceStop(name: string): bool { return vsvc_stop(name.cstr(), 30000 as i32) as int != 0; }
+export fn serviceState(name: string): int { return vsvc_state(name.cstr()) as int; }
+
+// Letters, digits, '-', '_' and '.': a valid Windows service name and a safe
+// systemd unit file name.
+fn plain_service_name(s: string): bool {
+    if (s == "" || s.len > 200) { return false; }
+    for (let i in 0..s.len) {
+        let c = s[i];
+        let ok = (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) ||
+                 c == 45 || c == 95 || c == 46;
+        if (!ok) { return false; }
+    }
+    return true;
+}

@@ -3,6 +3,9 @@
 The operating system's own file dialogs, message boxes, "open this in the
 default app", and the per-user folders an app keeps its files in.
 
+Running as a Windows or systemd service is the sibling package
+[`vyto/desktop/service`](service/README.md).
+
 ```vyto
 import { FileDialog, message, confirm, openUrl, configDir, MSG_INFO } from "vyto/desktop";
 
