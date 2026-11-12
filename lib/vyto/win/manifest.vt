@@ -44,6 +44,10 @@ export class WinManifest {
     app_description: string;
     app_copyright: string;
     app_dpi: string;
+    svc_name: string;
+    svc_display: string;
+    svc_desc: string;
+    svc_start: string;
 
     fn init(name: string) {
         this.app_name = name;
@@ -53,6 +57,10 @@ export class WinManifest {
         this.app_description = "";
         this.app_copyright = "";
         this.app_dpi = "system";
+        this.svc_name = "";
+        this.svc_display = "";
+        this.svc_desc = "";
+        this.svc_start = "";
     }
 
     // "1.2" to "1.2.3.4": up to four numbers, each 0..65535, which is what the
@@ -68,6 +76,19 @@ export class WinManifest {
     // monitor. "unaware": Windows stretches the window instead, for an app
     // that does not scale its own drawing yet.
     builder fn dpi(mode: string) { this.app_dpi = mode; return this; }
+
+    // The app's exe runs as a Windows service too: the installer
+    // (`vytoc build --installer`, per-machine) registers it with the Service
+    // Control Manager and the uninstaller removes it. The exe uses
+    // vyto/desktop/service's Service.run(). `start` is "manual", "auto" or
+    // "delayed" (automatic, after boot settles).
+    builder fn service(name: string, display: string, description: string, start: string) {
+        this.svc_name = name;
+        this.svc_display = display;
+        this.svc_desc = description;
+        this.svc_start = start;
+        return this;
+    }
 
     // -- validation ----------------------------------------------------------
     // Problems that would produce a broken resource or a confusing exe.
@@ -88,9 +109,20 @@ export class WinManifest {
                 probs.push("icon \"" + this.app_icon + "\" must be a .png or an .ico");
             }
         }
-        let fields = ["name", "version", "icon", "company", "description", "copyright", "dpi"];
+        if (this.svc_name.len > 0) {
+            if (!service_name_ok(this.svc_name)) {
+                probs.push("service name \"" + this.svc_name +
+                           "\" may only use letters, digits, '-', '_' and '.'");
+            }
+            if (this.svc_start != "manual" && this.svc_start != "auto" && this.svc_start != "delayed") {
+                probs.push("service start \"" + this.svc_start + "\" must be manual, auto or delayed");
+            }
+        }
+        let fields = ["name", "version", "icon", "company", "description", "copyright", "dpi",
+                      "service name", "service display name", "service description"];
         let values = [this.app_name, this.app_version, this.app_icon, this.app_company,
-                      this.app_description, this.app_copyright, this.app_dpi];
+                      this.app_description, this.app_copyright, this.app_dpi,
+                      this.svc_name, this.svc_display, this.svc_desc];
         for (let i in 0..fields.len) {
             if (has_control(values[i])) {
                 probs.push(fields[i] + " contains a control character or line break");
@@ -111,6 +143,10 @@ export class WinManifest {
         }
         if (this.app_copyright.len > 0) { out = out + "copyright=" + this.app_copyright + "\n"; }
         out = out + "dpi=" + this.app_dpi;
+        if (this.svc_name.len > 0) {
+            out = out + "\nservice_name=" + this.svc_name + "\nservice_display=" + this.svc_display +
+                  "\nservice_desc=" + this.svc_desc + "\nservice_start=" + this.svc_start;
+        }
         return out;
     }
 
@@ -150,4 +186,15 @@ fn has_control(s: string): bool {
         if (c < 32 || c == 127) { return true; }
     }
     return false;
+}
+
+fn service_name_ok(s: string): bool {
+    if (s.len == 0 || s.len > 200) { return false; }
+    for (let i in 0..s.len) {
+        let c = s[i];
+        let ok = (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) ||
+                 c == 45 || c == 95 || c == 46;
+        if (!ok) { return false; }
+    }
+    return true;
 }

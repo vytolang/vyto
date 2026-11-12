@@ -5,6 +5,7 @@
 #include "parse.h"
 #include "peaudit.h"
 
+#include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -799,6 +800,12 @@ static const char *xml_escape(const char *s) {
 typedef struct {
     const char *name, *version, *icon, *company, *description, *copyright;
     bool dpi_unaware;
+    /* WinManifest.service(): the installer registers the exe as a service */
+    const char *svc_name, *svc_display, *svc_desc, *svc_start;
+    /* internal, for the installer's own builds (--win-elevate, --win-rcdata):
+       require administrator rights; embed a payload as RCDATA 100 */
+    bool elevate;
+    const char *rcdata;
 } WinApp;
 
 /* Run the --manifest program on this host and parse what it prints. Its
@@ -850,6 +857,10 @@ static WinApp read_win_manifest(const char *manifest_vt, bool verbose) {
             else if (strcmp(key, "description") == 0) app.description = val;
             else if (strcmp(key, "copyright") == 0) app.copyright = val;
             else if (strcmp(key, "dpi") == 0) app.dpi_unaware = strcmp(val, "unaware") == 0;
+            else if (strcmp(key, "service_name") == 0) app.svc_name = val;
+            else if (strcmp(key, "service_display") == 0) app.svc_display = val;
+            else if (strcmp(key, "service_desc") == 0) app.svc_desc = val;
+            else if (strcmp(key, "service_start") == 0) app.svc_start = val;
             else fatal("%s: unknown manifest key '%s' (this vytoc is older than the "
                        "manifest library that printed it?)", manifest_vt, key);
         }
@@ -877,7 +888,7 @@ static const char *win_manifest_xml(const WinApp *app) {
         "  <assemblyIdentity type=\"win32\" name=\"%s\" version=\"1.0.0.0\"/>\n"
         "  <trustInfo xmlns=\"urn:schemas-microsoft-com:asm.v3\">\n"
         "    <security><requestedPrivileges>\n"
-        "      <requestedExecutionLevel level=\"asInvoker\" uiAccess=\"false\"/>\n"
+        "      <requestedExecutionLevel level=\"%s\" uiAccess=\"false\"/>\n"
         "    </requestedPrivileges></security>\n"
         "  </trustInfo>\n"
         "  <compatibility xmlns=\"urn:schemas-microsoft-com:compatibility.v1\">\n"
@@ -897,6 +908,9 @@ static const char *win_manifest_xml(const WinApp *app) {
         "  </application>\n"
         "</assembly>\n",
         xml_escape(app->name),
+        /* An installer for all users needs administrator rights before it
+           starts; everything else runs as the user who launched it. */
+        app->elevate ? "requireAdministrator" : "asInvoker",
         app->dpi_unaware ? ""
                          : "      <dpiAware xmlns=\"http://schemas.microsoft.com/SMI/2005/WindowsSettings\">true</dpiAware>\n");
 }
@@ -953,6 +967,15 @@ static const char *win_rc(const WinApp *app, const char *manifest_path, const ch
     sb_printf(&b, "// icon digest %016llx\n", (unsigned long long)ico_digest);
     sb_printf(&b, "1 24 \"%s\"\n", rc_escape(manifest_path)); /* 24 = RT_MANIFEST */
     if (ico_path) sb_printf(&b, "1 ICON \"%s\"\n", rc_escape(ico_path));
+    /* the installer's payload (vyto/win/setup reads RCDATA 100); its digest
+       is in the text so a new payload changes the .rc and rebuilds it */
+    if (app->rcdata) {
+        size_t plen = 0;
+        char *pd = read_file(app->rcdata, &plen);
+        if (!pd) fatal("cannot read the installer payload %s", app->rcdata);
+        sb_printf(&b, "// payload digest %016llx\n", (unsigned long long)fnv1a(pd, plen));
+        sb_printf(&b, "100 RCDATA \"%s\"\n", rc_escape(app->rcdata));
+    }
     if (app->version) {
         const char *quad = rc_version_quad(app->version);
         sb_printf(&b, "1 VERSIONINFO\nFILEVERSION %s\nPRODUCTVERSION %s\n", quad, quad);
@@ -1050,6 +1073,121 @@ static void win_sign(const char *file, const char *pfx, const char *ts, const ch
         unlink(out);
         fatal("cannot replace %s with its signed copy", file);
     }
+}
+
+/* ---- --installer: <App>-<version>-setup.exe ----
+ *
+ * The setup program is vyto/win/setup, a stdlib package; this only drives it.
+ * Three runs of this same vytoc, in a work dir inside the app's cache:
+ *
+ *   1. build the setup program bare            -> uninstall.exe
+ *   2. run vyto/win/setup/pack on this host    -> payload.bin (zlib)
+ *      over the app's exe, everything shipped beside it (DLLs, cacert.pem),
+ *      uninstall.exe and a .setup.ini describing the install
+ *   3. build the setup program again with payload.bin as RCDATA 100
+ *      -> <exe dir>/<App>-<version>-setup.exe
+ *
+ * Both setup builds carry the app's --manifest identity (icon, name, version
+ * info) and, for a per-machine install, requireAdministrator; --sign signs
+ * them like the app. The entry files are generated here rather than built
+ * from lib/, so a read-only installed stdlib is never written to. */
+static const char *installer_key(const char *name) {
+    char *k = arena_strdup(&g_arena, name);
+    for (char *p = k; *p; p++) {
+        unsigned char c = (unsigned char)*p;
+        if (!(isalnum(c) || c == ' ' || c == '.' || c == '_' || c == '-' || c >= 0x80)) *p = '_';
+    }
+    return k;
+}
+
+static void make_installer(const WinApp *app, const char *exe, const char **ship, int nship,
+                           const char *cache, const char *cc_override, const char *manifest_vt,
+                           bool per_user, const char *sign_pfx, const char *sign_ts, bool audit,
+                           bool verbose) {
+    if (app->svc_name && per_user)
+        fatal("%s declares a Windows service, and installing a service needs a per-machine "
+              "installer: drop --per-user", manifest_vt ? manifest_vt : "the app");
+    char self[4096];
+    ssize_t n = readlink("/proc/self/exe", self, sizeof self - 1);
+    if (n <= 0) fatal("cannot locate vytoc itself to build the installer");
+    self[n] = 0;
+    const char *work = arena_printf(&g_arena, "%s/installer", cache);
+    if (mkdir_p(work) != 0) fatal("cannot create %s", work);
+    const char *exedir = dir_of(exe);
+    const char *exebase = base_of(exe);
+    const char *version = app->version ? app->version : "1.0.0";
+
+    const char *entry = arena_printf(&g_arena, "%s/setup_main.vt", work);
+    const char *etext = "// generated by vytoc --installer\n"
+                        "import { setupMain } from \"vyto/win/setup\";\n"
+                        "fn main() { setupMain(); }\n";
+    const char *pentry = arena_printf(&g_arena, "%s/pack_main.vt", work);
+    const char *ptext = "// generated by vytoc --installer\n"
+                        "import { packMain } from \"vyto/win/setup/pack\";\n"
+                        "import { exit } from \"vyto/os\";\n"
+                        "fn main() { exit(packMain(args())); }\n";
+    bool ch;
+    if (!write_if_changed(entry, etext, strlen(etext), &ch) ||
+        !write_if_changed(pentry, ptext, strlen(ptext), &ch))
+        fatal("cannot write the installer's entry files in %s", work);
+
+    SBuf common;
+    sb_init(&common);
+    sb_puts(&common, " --target windows-x64 --release");
+    if (cc_override) sb_printf(&common, " --cc %s", sh_quote(cc_override));
+    if (manifest_vt) sb_printf(&common, " --manifest %s", sh_quote(manifest_vt));
+    if (!per_user) sb_puts(&common, " --win-elevate");
+    if (sign_pfx) sb_printf(&common, " --sign %s", sh_quote(sign_pfx));
+    if (sign_ts) sb_printf(&common, " --timestamp %s", sh_quote(sign_ts));
+    if (verbose) sb_puts(&common, " --verbose");
+
+    /* 1. the uninstaller: the setup program with no payload */
+    const char *uninst = arena_printf(&g_arena, "%s/uninstall.exe", work);
+    if (run_cmd(arena_printf(&g_arena, "%s build %s%s -o %s >/dev/null", sh_quote(self),
+                             sh_quote(entry), common.data, sh_quote(uninst)), verbose) != 0)
+        fatal("building the uninstaller failed");
+
+    /* 2. the payload */
+    SBuf ini;
+    sb_init(&ini);
+    sb_printf(&ini, "name=%s\nversion=%s\nexe=%s\nscope=%s\nkey=%s\n", app->name, version, exebase,
+              per_user ? "user" : "machine", installer_key(app->name));
+    if (app->company) sb_printf(&ini, "company=%s\n", app->company);
+    if (app->description) sb_printf(&ini, "description=%s\n", app->description);
+    if (app->svc_name) {
+        sb_printf(&ini, "service_name=%s\nservice_display=%s\nservice_desc=%s\nservice_start=%s\n",
+                  app->svc_name, app->svc_display ? app->svc_display : app->svc_name,
+                  app->svc_desc ? app->svc_desc : "", app->svc_start ? app->svc_start : "manual");
+    }
+    const char *inipath = arena_printf(&g_arena, "%s/setup.ini", work);
+    if (!write_if_changed(inipath, ini.data, strlen(ini.data), &ch)) fatal("cannot write %s", inipath);
+    sb_free(&ini);
+    SBuf list;
+    sb_init(&list);
+    sb_printf(&list, "%s\t%s\n", exebase, exe);
+    for (int i = 0; i < nship; i++) {
+        const char *b = base_of(ship[i]);
+        sb_printf(&list, "%s\t%s/%s\n", b, exedir, b);
+    }
+    sb_printf(&list, "uninstall.exe\t%s\n.setup.ini\t%s\n", uninst, inipath);
+    const char *listpath = arena_printf(&g_arena, "%s/files.txt", work);
+    if (!write_if_changed(listpath, list.data, strlen(list.data), &ch)) fatal("cannot write %s", listpath);
+    sb_free(&list);
+    const char *payload = arena_printf(&g_arena, "%s/payload.bin", work);
+    if (run_cmd(arena_printf(&g_arena, "%s run %s -- %s %s", sh_quote(self), sh_quote(pentry),
+                             sh_quote(payload), sh_quote(listpath)), verbose) != 0)
+        fatal("packing the installer failed (the reason is above)");
+
+    /* 3. the installer: the same program, carrying the payload */
+    char *fname = arena_printf(&g_arena, "%s-%s-setup.exe", installer_key(app->name), version);
+    for (char *p = fname; *p; p++) if (*p == ' ') *p = '-';
+    const char *setup = arena_printf(&g_arena, "%s/%s", exedir, fname);
+    if (run_cmd(arena_printf(&g_arena, "%s build %s%s --win-rcdata %s%s -o %s >/dev/null",
+                             sh_quote(self), sh_quote(entry), common.data, sh_quote(payload),
+                             audit ? " --audit" : "", sh_quote(setup)), verbose) != 0)
+        fatal("building the installer failed");
+    sb_free(&common);
+    fprintf(stderr, "installer: %s\n", setup);
 }
 
 /* Locate the runtime directory relative to the vytoc executable. */
@@ -1246,6 +1384,8 @@ int main(int argc, char **argv) {
     bool release = false, verbose = false, bundle = false, with_assets = false;
     bool freestanding = false, shared = false, no_float = false, no_fs = false, clean = false;
     bool force_gui = false, force_console = false, audit = false;
+    bool installer = false, per_user = false, win_elevate = false;
+    const char *win_rcdata = NULL;
     const char *sign_pfx = NULL, *sign_ts = NULL;
     const char *outpath = NULL, *target = NULL, *cc_override = NULL, *manifest_vt = NULL;
     const char *modpath[MAX_ROOTS];
@@ -1266,6 +1406,11 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--console") == 0) force_console = true;
         else if (strcmp(argv[i], "--manifest") == 0 && i + 1 < argc) manifest_vt = argv[++i];
         else if (strcmp(argv[i], "--audit") == 0) audit = true;
+        else if (strcmp(argv[i], "--installer") == 0) installer = true;
+        else if (strcmp(argv[i], "--per-user") == 0) per_user = true;
+        /* internal: used by --installer for its own two builds */
+        else if (strcmp(argv[i], "--win-elevate") == 0) win_elevate = true;
+        else if (strcmp(argv[i], "--win-rcdata") == 0 && i + 1 < argc) win_rcdata = argv[++i];
         else if (strcmp(argv[i], "--sign") == 0 && i + 1 < argc) sign_pfx = argv[++i];
         else if (strcmp(argv[i], "--timestamp") == 0 && i + 1 < argc) sign_ts = argv[++i];
         else if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) outpath = argv[++i];
@@ -1308,6 +1453,11 @@ int main(int argc, char **argv) {
     if (sign_pfx && !win_target)
         fatal("--sign is Authenticode, for Windows exes; this build targets %s", triple);
     if (sign_ts && !sign_pfx) fatal("--timestamp stamps a signature: pass --sign too");
+    if (installer && !win_target)
+        fatal("--installer makes a Windows setup.exe; this build targets %s", triple);
+    if (installer && (do_run || shared))
+        fatal("--installer packages an exe: use it with `vytoc build`, without --shared");
+    if (per_user && !installer) fatal("--per-user chooses the installer's scope: pass --installer too");
     if (sign_pfx && !file_exists(sign_pfx)) fatal("--sign: no certificate at %s", sign_pfx);
     if (do_run && cross)
         fatal("built for %s but this host is %s — copy the binary to the target "
@@ -1823,6 +1973,7 @@ int main(int argc, char **argv) {
     }
 
     const char *sign_name = NULL;   /* the signature's program name (osslsigncode -n) */
+    WinApp installer_app = {0};     /* the identity --installer packages */
     /* ---- Windows resources (see win_manifest_xml / read_win_manifest) ----
        Every exe gets the application manifest; --manifest adds its icon and
        version info. A DLL is left alone: its manifest is resource 2, and
@@ -1831,7 +1982,10 @@ int main(int argc, char **argv) {
         WinApp app = {0};
         if (manifest_vt) app = read_win_manifest(manifest_vt, verbose);
         else app.name = stem_of(input);
+        app.elevate = win_elevate;
+        app.rcdata = win_rcdata;
         sign_name = app.name;
+        installer_app = app;
         const char *mpath = arena_printf(&g_arena, "%s/vyto_app.manifest", cache);
         const char *mxml = win_manifest_xml(&app);
         bool rchanged = false, ch = false;
@@ -2038,6 +2192,9 @@ int main(int argc, char **argv) {
         for (int i = linked_now ? 0 : 1; i < nshipped; i++)
             win_sign(shipped[i], sign_pfx, sign_ts, sign_name, cache, verbose);
     }
+    if (installer)
+        make_installer(&installer_app, exe, copy_libs, ncopy, cache, cc_override, manifest_vt,
+                       per_user, sign_pfx, sign_ts, audit, verbose);
     sb_free(&objs);
     sb_free(&shlibs);
     sb_free(&libs);

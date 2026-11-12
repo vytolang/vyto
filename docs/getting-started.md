@@ -371,6 +371,32 @@ strip and the audit, and is part of the link stamp: dropping `--sign` gives an
 unsigned exe on the next build, and an unchanged rebuild does not re-sign.
 Don't pack signed exes with UPX: Defender treats packed binaries as suspect.
 
+### An installer: `--installer`
+
+```sh
+./vytoc build app.vt --target windows-x64 --release --audit \
+    --manifest win_manifest.vt --installer            # -> App-1.2.0-setup.exe
+./vytoc build app.vt ... --installer --per-user       # no admin, %LOCALAPPDATA%\Programs
+```
+
+Produces `<Name>-<version>-setup.exe` beside the exe: one file holding the
+app, everything vytoc ships beside it (DLLs, `cacert.pem`) and an uninstaller,
+compressed. It installs to `Program Files\<company>\<name>` (asking for
+administrator rights) or, with `--per-user`, to the user's own programs folder
+(asking for nothing); adds a Start menu shortcut and, if ticked, a desktop
+one; and registers in Programs and Features, whose Uninstall removes exactly
+what was installed. Running a newer setup upgrades in place and asks for a
+running app to be closed first. `setup.exe /S` installs silently (exit status
+0 on success), `/D=<folder>` picks the folder and `/NODESKTOP` skips the
+desktop shortcut; `uninstall.exe /S` removes silently.
+
+The setup program is Vyto too (`lib/vyto/win/setup`), so it needs nothing but
+Windows 7, passes `--audit`, and `--sign` signs it with the app.
+
+If the `--manifest` declares `.service(...)`, the installer also registers
+the exe as a Windows service and starts it; see `vyto/desktop/service`. A
+service needs a per-machine install, so `--per-user` is refused then.
+
 ### What is portable today
 
 The **core language, the runtime, and the stdlib packages with no POSIX
@@ -381,7 +407,9 @@ url, mime, log), `vyto/io/file`, `vyto/data/frame`, `vyto/os/os`, `vyto/anim`,
 packages with in-tree C, and prebuilt `native/windows-x64/*.dll` packages.
 
 `vyto/desktop` gives the OS's own file dialogs, message boxes, "open in the
-default app" and per-user folders (`configDir`, `dataDir`, `cacheDir`). On
+default app" and per-user folders (`configDir`, `dataDir`, `cacheDir`);
+`vyto/desktop/service` runs a program as a Windows or systemd service from the
+same code. On
 Windows that is comdlg32, `IFileOpenDialog`, `MessageBoxW`, `ShellExecuteW`
 and `SHGetKnownFolderPath`, all present on Windows 7; on Linux it runs zenity
 or kdialog and xdg-open. See `lib/vyto/desktop/README.md`.

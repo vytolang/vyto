@@ -1,0 +1,817 @@
+// vyto/win/setup — the setup program `vytoc build --installer` produces: one
+// Vyto program that is both the installer (when it carries a payload) and the
+// uninstaller (when it does not). vytoc builds it twice — once bare, which
+// becomes uninstall.exe inside the payload, once with the payload embedded as
+// a resource, which is <App>-<version>-setup.exe — so neither needs anything
+// but itself and Windows 7.
+//
+// Installer:  setup.exe [/S] [/D=<folder>] [/NODESKTOP]
+//   copies the app into Program Files (or %LOCALAPPDATA%\Programs for a
+//   per-user build), adds Start menu and optional desktop shortcuts, the
+//   Add/Remove Programs entry and uninstall.exe, and registers the app's
+//   service when its --manifest declared one. An installed copy is upgraded in
+//   place: its service is stopped first, and a running app is asked to close.
+//
+// Uninstaller: uninstall.exe [/S]
+//   copies itself to %TEMP% and continues from there (a running exe cannot
+//   delete itself), stops and removes the service, then removes exactly the
+//   files, shortcuts and registry entry the installer recorded in
+//   uninstall.ini — never the whole folder, so files a user put there stay.
+//
+// /S is silent: no window, exit status 0 on success. That is what IT
+// deployment tools run. /NODESKTOP skips the desktop shortcut (the window
+// offers it as a checkbox).
+import { Window, Widget, Theme, Size } from "vyto/ui";
+import { Painter, WEIGHT } from "vyto/surface/painter";
+import { Rect, rgba } from "vyto/surface";
+import { D2DPainter, d2d_usable } from "vyto/win/d2d";
+import { FileDialog } from "vyto/desktop";
+import { serviceInstall, serviceUninstall, serviceStart, serviceStop, serviceState, serviceError,
+         selfPath, START_MANUAL, START_AUTO, START_AUTO_DELAYED } from "vyto/desktop/service";
+import { Tween } from "vyto/ui/anim";
+import { sleepUs } from "vyto/util/time";
+import { file_mkdirs, file_open, file_exists, file_remove, file_copy } from "vyto/io/file";
+import { exit } from "vyto/os";
+import { readArchiveFile, Archive, Entry } from "pack";
+
+extern "C" {
+    fn vset_payload_to_file(out: cstring): i32;
+    fn vset_folder(which: i32): cstring;
+    fn vset_shortcut(lnk: cstring, target: cstring, args: cstring, workdir: cstring, desc: cstring): i32;
+    fn vset_reg_uninstall(machine: i32, key: cstring, name: cstring, version: cstring,
+                          publisher: cstring, location: cstring, icon: cstring,
+                          uninstall: cstring, quiet: cstring, size_kb: i32): i32;
+    fn vset_reg_get(machine: i32, key: cstring, value: cstring): cstring;
+    fn vset_reg_remove(machine: i32, key: cstring): i32;
+    fn vset_is_admin(): i32;
+    fn vset_in_use(path: cstring): i32;
+    fn vset_spawn(exe: cstring, args: cstring, wait: i32): i32;
+    fn vset_pid(): i32;
+    fn vset_wait_pid(pid: i32, ms: i32): i32;
+    fn vset_rmdir(path: cstring): i32;
+    fn vset_delete_on_reboot(path: cstring): i32;
+    fn vset_shell_changed();
+    fn vset_available(): i32;
+}
+
+#link "shell32" if "windows"
+#link "ole32" if "windows"
+#link "uuid" if "windows"
+#link "advapi32" if "windows"
+
+// ---- palette (ARGB) -----------------------------------------------------------
+
+const C_BG: int = 0xFFF4F6F8;
+const C_HEAD: int = 0xFF1F2933;
+const C_INK: int = 0xFF1F2933;
+const C_MUTED: int = 0xFF6B7785;
+const C_LINE: int = 0xFFDDE1E6;
+const C_BLUE: int = 0xFF2F6FDE;
+const C_GREEN: int = 0xFF1E9E5A;
+const C_RED: int = 0xFFD64545;
+const C_KEY: int = 0xFFE9ECF0;
+const C_WHITE: int = 0xFFFFFFFF;
+
+// ---- small helpers --------------------------------------------------------------
+
+fn win_path(p: string): string { return p.replace("/", "\\"); }
+
+fn join(a: string, b: string): string {
+    if (a.ends_with("\\")) { return a + win_path(b); }
+    return a + "\\" + win_path(b);
+}
+
+fn parent_of(p: string): string {
+    let i = p.last_index_of("\\");
+    if (i <= 0) { return ""; }
+    return p.slice(0, i);
+}
+
+fn base_of(p: string): string {
+    let i = p.last_index_of("\\");
+    if (i < 0) { return p; }
+    return p.slice(i + 1, p.len);
+}
+
+fn parse_ini(text: string): Map<string, string> {
+    let m = new Map<string, string>();
+    for (let ln in text.lines()) {
+        let eq = ln.index_of("=");
+        if (eq > 0) { m.set(ln.slice(0, eq), ln.slice(eq + 1, ln.len)); }
+    }
+    return m;
+}
+
+fn read_text(path: string): string {
+    if (!file_exists(path)) { return ""; }
+    let f = file_open(path, "rb");
+    if (f == null) { return ""; }
+    let t = f.readText();
+    f.close();
+    return t;
+}
+
+fn write_bytes(path: string, data: byte[]): bool {
+    let f = file_open(path, "wb");
+    if (f == null) { return false; }
+    let n = f.writeBytes(data);
+    f.close();
+    return n == data.len;
+}
+
+fn write_text(path: string, text: string): bool {
+    let f = file_open(path, "wb");
+    if (f == null) { return false; }
+    f.writeText(text);
+    f.close();
+    return true;
+}
+
+fn svc_start_of(s: string): int {
+    if (s == "auto") { return START_AUTO; }
+    if (s == "delayed") { return START_AUTO_DELAYED; }
+    return START_MANUAL;
+}
+
+// ---- the job --------------------------------------------------------------------
+
+const ST_WELCOME: int = 0;
+const ST_WORKING: int = 1;
+const ST_DONE: int = 2;
+const ST_ERROR: int = 3;
+const ST_CONFIRM: int = 4;     // uninstaller
+const ST_REMOVED: int = 5;
+
+class Job {
+    uninstall: bool;
+    meta: Map<string, string>;
+    files: Entry[];
+    dir: string;
+    machine: bool;
+    desktop: bool;
+    start_svc: bool;
+    launch: bool;
+    old_version: string;
+    state: int;
+    step: int;       // install: -1 prepare, 0..n-1 files, n finish
+    current: string;
+    error: string;
+    written: string[];
+    shortcuts: string[];
+    self_temp: string;
+    win: weak Window;
+
+    fn init() {
+        this.uninstall = false;
+        this.meta = new Map<string, string>();
+        this.files = [];
+        this.dir = "";
+        this.machine = true;
+        this.desktop = true;
+        this.start_svc = true;
+        this.launch = true;
+        this.old_version = "";
+        this.state = ST_WELCOME;
+        this.step = -1;
+        this.current = "";
+        this.error = "";
+        this.written = [];
+        this.shortcuts = [];
+        this.self_temp = "";
+    }
+
+    fn m(k: string): string { return this.meta.get_or(k, ""); }
+    fn name(): string { return this.m("name"); }
+    fn key(): string { return this.m("key"); }
+    fn has_service(): bool { return this.m("service_name") != "" && this.machine; }
+    fn mach(): i32 {
+        if (this.machine) { return 1 as i32; }
+        return 0 as i32;
+    }
+
+    fn default_dir(): string {
+        if (!this.machine) { return join(str(vset_folder(1 as i32)), this.name()); }
+        let base = str(vset_folder(0 as i32));
+        if (this.m("company") != "") { return join(join(base, this.m("company")), this.name()); }
+        return join(base, this.name());
+    }
+
+    // ---- install
+    fn total_steps(): int { return this.files.len + 2; }
+    fn progress(): float {
+        let done = this.step + 1;
+        if (done < 0) { done = 0; }
+        return (done as float) / (this.total_steps() as float);
+    }
+
+    fn fail(msg: string) {
+        this.error = msg;
+        this.state = ST_ERROR;
+    }
+
+    // One unit of work; false when nothing is left. The window runs this from
+    // a ticker so the progress bar moves; /S runs it in a loop.
+    fn advance(): bool {
+        if (this.state != ST_WORKING) { return false; }
+        if (this.uninstall) { this.remove_all(); return false; }
+        if (this.step == -1) {
+            this.prepare();
+        } else if (this.step < this.files.len) {
+            this.put(this.files[this.step]);
+        } else {
+            this.finish();
+            if (this.state == ST_WORKING) { this.state = ST_DONE; }
+            return false;
+        }
+        this.step += 1;
+        return this.state == ST_WORKING;
+    }
+
+    fn prepare() {
+        if (this.has_service() && serviceState(this.m("service_name")) == 4) {
+            this.current = "Stopping the " + this.m("service_display") + " service";
+            if (!serviceStop(this.m("service_name"))) {
+                this.fail("Could not stop the " + this.m("service_display") + " service: " + serviceError());
+                return;
+            }
+        }
+        let exe = join(this.dir, this.m("exe"));
+        if (file_exists(exe) && vset_in_use(exe.cstr()) as int != 0) {
+            this.fail(this.name() + " is running. Close it, then run setup again.");
+            return;
+        }
+        if (!file_mkdirs(this.dir)) { this.fail("Could not create the folder " + this.dir); }
+    }
+
+    fn put(e: Entry) {
+        this.current = e.path;
+        let dest = join(this.dir, e.path);
+        let p = parent_of(dest);
+        if (p != "" && !file_mkdirs(p)) { this.fail("Could not create the folder " + p); return; }
+        if (!write_bytes(dest, e.data)) {
+            this.fail("Could not write " + dest + ". Is the disk full, or the file in use?");
+            return;
+        }
+        this.written.push(win_path(e.path));
+    }
+
+    fn finish() {
+        this.current = "Shortcuts and registration";
+        let exe = join(this.dir, this.m("exe"));
+        // Start menu, and the desktop when asked
+        let progs = str(vset_folder(2 as i32));
+        let desk = str(vset_folder(4 as i32));
+        if (!this.machine) {
+            progs = str(vset_folder(3 as i32));
+            desk = str(vset_folder(5 as i32));
+        }
+        let lnk = join(progs, this.name() + ".lnk");
+        if (vset_shortcut(lnk.cstr(), exe.cstr(), "".cstr(), this.dir.cstr(), this.m("description").cstr()) as int != 0) {
+            this.shortcuts.push(lnk);
+        }
+        if (this.desktop) {
+            let dl = join(desk, this.name() + ".lnk");
+            if (vset_shortcut(dl.cstr(), exe.cstr(), "".cstr(), this.dir.cstr(), this.m("description").cstr()) as int != 0) {
+                this.shortcuts.push(dl);
+            }
+        }
+        // what the uninstaller removes, and nothing more
+        let ini = "name=" + this.name() + "\r\nversion=" + this.m("version") + "\r\nkey=" + this.key() +
+                  "\r\nscope=" + this.m("scope") + "\r\nexe=" + this.m("exe") +
+                  "\r\nservice_name=" + this.m("service_name") +
+                  "\r\nservice_display=" + this.m("service_display") + "\r\n";
+        for (let f in this.written) { ini = ini + "file=" + f + "\r\n"; }
+        for (let s in this.shortcuts) { ini = ini + "shortcut=" + s + "\r\n"; }
+        if (!write_text(join(this.dir, "uninstall.ini"), ini)) {
+            this.fail("Could not write " + join(this.dir, "uninstall.ini"));
+            return;
+        }
+        let un = join(this.dir, "uninstall.exe");
+        let size = 0;
+        for (let e in this.files) { size += e.data.len; }
+        let ok = vset_reg_uninstall(this.mach(), this.key().cstr(), this.name().cstr(),
+                                    this.m("version").cstr(), this.m("company").cstr(),
+                                    this.dir.cstr(), exe.cstr(),
+                                    ("\"" + un + "\"").cstr(), ("\"" + un + "\" /S").cstr(),
+                                    ((size + 1023) / 1024) as i32) as int != 0;
+        if (!ok) { this.fail("Could not add " + this.name() + " to Add/Remove Programs."); return; }
+        if (this.has_service()) {
+            let sn = this.m("service_name");
+            if (serviceState(sn) != -1) { serviceUninstall(sn); }
+            if (!serviceInstall(sn, this.m("service_display"), this.m("service_desc"), exe, "",
+                                svc_start_of(this.m("service_start")))) {
+                this.fail("Could not register the " + this.m("service_display") + " service: " + serviceError());
+                return;
+            }
+            if (this.start_svc && !serviceStart(sn)) {
+                this.fail("Installed, but the " + this.m("service_display") + " service did not start: " +
+                          serviceError());
+                return;
+            }
+        }
+        vset_shell_changed();
+    }
+
+    // ---- uninstall (runs from the %TEMP% copy)
+    fn remove_all() {
+        let sn = this.m("service_name");
+        if (sn != "" && serviceState(sn) != -1) {
+            this.current = "Removing the service";
+            if (!serviceUninstall(sn)) {
+                this.fail("Could not remove the " + this.m("service_display") + " service: " + serviceError());
+                return;
+            }
+        }
+        let exe = join(this.dir, this.m("exe"));
+        if (file_exists(exe) && vset_in_use(exe.cstr()) as int != 0) {
+            this.fail(this.name() + " is running. Close it, then uninstall again.");
+            return;
+        }
+        for (let s in this.meta_list("shortcut")) { file_remove(s); }
+        for (let f in this.meta_list("file")) {
+            this.current = f;
+            let p = join(this.dir, f);
+            file_remove(p);
+            // folders the installer created, if now empty
+            let d = parent_of(p);
+            while (d.len > this.dir.len && vset_rmdir(d.cstr()) as int != 0) { d = parent_of(d); }
+        }
+        file_remove(join(this.dir, "uninstall.ini"));
+        // uninstall.exe belongs to the first stage, which has exited by now
+        let un = join(this.dir, "uninstall.exe");
+        let tries = 0;
+        while (file_exists(un) && !file_remove(un) && tries < 20) {
+            sleepUs(250000);
+            tries += 1;
+        }
+        // Still held (an antivirus scan, a slow exit): remove it, and the
+        // then-empty folder, at the next restart rather than leave them.
+        if (file_exists(un)) { vset_delete_on_reboot(un.cstr()); }
+        if (vset_rmdir(this.dir.cstr()) as int == 0 && file_exists(un)) {
+            vset_delete_on_reboot(this.dir.cstr());
+        }
+        let parent = parent_of(this.dir);
+        if (this.m("scope") == "machine" && parent != "") { vset_rmdir(parent.cstr()); }  // company folder, if empty
+        vset_reg_remove(this.mach(), this.key().cstr());
+        vset_shell_changed();
+        if (this.self_temp != "") { vset_delete_on_reboot(this.self_temp.cstr()); }
+        this.state = ST_REMOVED;
+    }
+
+    fn meta_list(k: string): string[] {
+        let out: string[] = [];
+        let text = read_text(join(this.dir, "uninstall.ini"));
+        for (let ln in text.lines()) {
+            if (ln.starts_with(k + "=")) { out.push(ln.slice(k.len + 1, ln.len)); }
+        }
+        return out;
+    }
+
+    fn start_work() {
+        this.state = ST_WORKING;
+        this.step = -1;
+        let w = this.win;
+        if (w != null) { w.layout(); w.redraw(); }
+    }
+}
+
+// ---- widgets ---------------------------------------------------------------------
+
+fn base_at(s: Painter, cy: float): float { return (cy + s.font_ascent() / 2.0 - 1.0).round(); }
+
+fn fit(s: Painter, t: string, w: float): string {
+    if (s.text_width(t) <= w) { return t; }
+    let u = t;
+    while (u.len > 1 && s.text_width("…" + u) > w) { u = u.slice(1, u.len); }
+    return "…" + u;
+}
+
+// Word-wrap into lines no wider than w.
+fn wrap(s: Painter, t: string, w: float): string[] {
+    let out: string[] = [];
+    let line = "";
+    for (let word in t.split(" ")) {
+        let cand = word;
+        if (line != "") { cand = line + " " + word; }
+        if (line != "" && s.text_width(cand) > w) {
+            out.push(line);
+            line = word;
+        } else {
+            line = cand;
+        }
+    }
+    if (line != "") { out.push(line); }
+    return out;
+}
+
+class Btn extends Widget {
+    label: string;
+    bg: int;
+    fg: int;
+    on: fn();
+
+    fn init(label: string, bg: int, fg: int, on: fn()) {
+        super.init();
+        this.label = label;
+        this.bg = bg;
+        this.fg = fg;
+        this.on = on;
+    }
+
+    override fn measure(s: Painter, th: Theme): Size { return Size(this.dp(120.0), this.dp(44.0)); }
+
+    override fn on_click(x: int, y: int): bool {
+        if (this.disabled) { return false; }
+        this.on();
+        return true;
+    }
+
+    override fn render(s: Painter, th: Theme) {
+        let r = this.bounds;
+        let bg = this.bg;
+        if (this.pressed) { bg = 0xFF000000 | (((bg >> 16) & 255) * 85 / 100 << 16) |
+                                 (((bg >> 8) & 255) * 85 / 100 << 8) | ((bg & 255) * 85 / 100); }
+        s.fill_round(r, this.dp(8.0), bg);
+        s.push_font(this.dp(15.0), WEIGHT.BOLD);
+        s.text(r.x + (r.w - s.text_width(this.label)) / 2.0, base_at(s, r.y + r.h / 2.0), this.label, this.fg);
+        s.pop_font();
+    }
+}
+
+class Check extends Widget {
+    label: string;
+    read: fn(): bool;
+    write: fn(bool);
+
+    fn init(label: string, read: fn(): bool, write: fn(bool)) {
+        super.init();
+        this.label = label;
+        this.read = read;
+        this.write = write;
+    }
+
+    override fn measure(s: Painter, th: Theme): Size { return Size(this.dp(300.0), this.dp(30.0)); }
+    override fn on_click(x: int, y: int): bool { this.write(!this.read()); return true; }
+
+    override fn render(s: Painter, th: Theme) {
+        let r = this.bounds;
+        let bx = Rect(r.x, r.y + (r.h - this.dp(20.0)) / 2.0, this.dp(20.0), this.dp(20.0));
+        if (this.read()) {
+            s.fill_round(bx, this.dp(4.0), C_BLUE);
+            s.line_w(bx.x + this.dp(5.0), bx.y + this.dp(10.0), bx.x + this.dp(9.0), bx.y + this.dp(14.0),
+                     this.dp(2.2), C_WHITE);
+            s.line_w(bx.x + this.dp(9.0), bx.y + this.dp(14.0), bx.x + this.dp(15.5), bx.y + this.dp(6.0),
+                     this.dp(2.2), C_WHITE);
+        } else {
+            s.fill_round(bx, this.dp(4.0), C_WHITE);
+            s.stroke_round(bx, this.dp(4.0), this.dp(1.5), 0xFF9AA5B1);
+        }
+        s.push_font(this.dp(14.0), WEIGHT.REG);
+        s.text(bx.x + bx.w + this.dp(10.0), base_at(s, r.y + r.h / 2.0), this.label, C_INK);
+        s.pop_font();
+    }
+}
+
+class SetupScreen extends Widget {
+    job: Job;
+    body: Rect;
+    path_box: Rect;
+    tick: Tween?;
+
+    fn init(job: Job) {
+        super.init();
+        this.job = job;
+        this.body = Rect(0.0, 0.0, 0.0, 0.0);
+        this.path_box = this.body;
+        this.tick = null;
+    }
+
+    override fn shows_press(): bool { return false; }
+    override fn measure(s: Painter, th: Theme): Size { return Size(this.dp(620.0), this.dp(430.0)); }
+
+    fn btn(label: string, bg: int, fg: int, on: fn()): Btn {
+        let b = new Btn(label, bg, fg, on);
+        this.add(b);
+        return b;
+    }
+
+    fn rebuild() {
+        this.children = [];
+        let j = this.job;
+        let self = this;
+        if (j.state == ST_WELCOME) {
+            this.btn("Cancel", C_KEY, C_INK, () => { self.close(); });
+            this.btn("Install", C_BLUE, C_WHITE, () => { j.start_work(); self.go(); });
+            this.btn("Change…", C_KEY, C_INK, () => { self.pick_dir(); });
+            this.add(new Check("Create a desktop shortcut", () => { return j.desktop; },
+                               (v) => { j.desktop = v; }));
+            if (j.has_service()) {
+                this.add(new Check("Start the " + j.m("service_display") + " service",
+                                   () => { return j.start_svc; }, (v) => { j.start_svc = v; }));
+            }
+        } else if (j.state == ST_CONFIRM) {
+            this.btn("Cancel", C_KEY, C_INK, () => { self.close(); });
+            this.btn("Remove", C_RED, C_WHITE, () => { j.start_work(); self.go(); });
+        } else if (j.state == ST_DONE) {
+            this.btn("Finish", C_GREEN, C_WHITE, () => { self.finish(); });
+            this.add(new Check("Launch " + j.name() + " now", () => { return j.launch; },
+                               (v) => { j.launch = v; }));
+        } else if (j.state == ST_ERROR || j.state == ST_REMOVED) {
+            this.btn("Close", C_KEY, C_INK, () => { self.close(); });
+        }
+    }
+
+    fn close() {
+        let w = this.job.win;
+        if (w != null) { w.close(); }
+    }
+
+    fn finish() {
+        let j = this.job;
+        if (j.launch) {
+            let exe = join(j.dir, j.m("exe"));
+            vset_spawn(exe.cstr(), "".cstr(), 0 as i32);
+        }
+        this.close();
+    }
+
+    fn pick_dir() {
+        let j = this.job;
+        let w = j.win;
+        let owner = 0 as culong;
+        if (w != null) { owner = w.surface().native_window(); }
+        let p = new FileDialog().title("Install " + j.name() + " to").startIn(parent_of(j.dir))
+            .owner(owner).folder();
+        if (p != null) {
+            // installing straight into a folder that holds other things would
+            // mix files; put the app in its own subfolder unless it is one
+            if (base_of(p) != j.name()) { j.dir = join(p, j.name()); } else { j.dir = p; }
+        }
+    }
+
+    // Run the job a step per frame so the bar moves; relayout when the state
+    // changes (the buttons differ per state).
+    fn go() {
+        let self = this;
+        let j = this.job;
+        this.rebuild();
+        let t = this.ticker(16, () => {
+            let before = j.state;
+            let more = j.advance();
+            if (j.state != before || !more) {
+                self.rebuild();
+                let w = j.win;
+                if (w != null) { w.layout(); w.redraw(); }
+            } else {
+                self.invalidate();
+            }
+            if (!more) { self.stop_ticker(); }
+        });
+        this.tick = t;
+    }
+
+    fn stop_ticker() {
+        let t = this.tick;
+        if (t != null) { t.cancel(); }
+        this.tick = null;
+    }
+
+    override fn arrange(s: Painter, th: Theme, r: Rect) {
+        this.layout_to(r);
+        let j = this.job;
+        let p = this.dp(28.0);
+        let hh = this.dp(96.0);
+        this.body = Rect(r.x + p, r.y + hh + this.dp(22.0), r.w - 2.0 * p, r.h - hh - this.dp(100.0));
+        let by = r.y + r.h - this.dp(66.0);
+        let bw = this.dp(124.0);
+        let bh = this.dp(42.0);
+        let rx = r.x + r.w - p;
+        let k = 0;
+        if (j.state == ST_WELCOME || j.state == ST_CONFIRM) {
+            this.children[0].arrange(s, th, Rect(rx - 2.0 * bw - this.dp(10.0), by, bw, bh));
+            this.children[1].arrange(s, th, Rect(rx - bw, by, bw, bh));
+            k = 2;
+        } else if (this.children.len > 0) {
+            this.children[0].arrange(s, th, Rect(rx - bw, by, bw, bh));
+            k = 1;
+        }
+        if (j.state == ST_WELCOME) {
+            let py = this.body.y + this.dp(64.0);
+            this.path_box = Rect(this.body.x, py, this.body.w - bw - this.dp(10.0), this.dp(40.0));
+            this.children[2].arrange(s, th, Rect(this.body.x + this.body.w - bw, py, bw, this.dp(40.0)));
+            let cy = py + this.dp(58.0);
+            for (let i in 3..this.children.len) {
+                this.children[i].arrange(s, th, Rect(this.body.x, cy, this.body.w, this.dp(30.0)));
+                cy += this.dp(34.0);
+            }
+        } else if (j.state == ST_DONE && this.children.len > 1) {
+            this.children[1].arrange(s, th, Rect(this.body.x, this.body.y + this.dp(56.0), this.body.w, this.dp(30.0)));
+        }
+    }
+
+    override fn render(s: Painter, th: Theme) {
+        this.draw_chrome(s, th);
+        for (let c in this.children) { c.draw(s, th); }
+    }
+
+    override fn draw_chrome(s: Painter, th: Theme) {
+        let j = this.job;
+        let r = this.bounds;
+        s.fill(r, C_BG);
+        let head = Rect(r.x, r.y, r.w, this.dp(96.0));
+        s.fill(head, C_HEAD);
+        let x = r.x + this.dp(28.0);
+        s.push_font(this.dp(24.0), WEIGHT.BOLD);
+        s.text(x, r.y + this.dp(46.0), j.name(), C_WHITE);
+        s.pop_font();
+        s.push_font(this.dp(14.0), WEIGHT.MED);
+        let sub = "Version " + j.m("version");
+        if (j.m("company") != "") { sub = sub + "  ·  " + j.m("company"); }
+        if (j.uninstall) { sub = "Uninstall  ·  " + sub; }
+        s.text(x, r.y + this.dp(72.0), sub, 0xFFB8C2CC);
+        s.pop_font();
+        s.line(r.x, r.y + r.h - this.dp(86.0), r.x + r.w, r.y + r.h - this.dp(86.0), C_LINE);
+
+        let b = this.body;
+        s.push_font(this.dp(15.0), WEIGHT.REG);
+        let lh = this.dp(22.0);
+        if (j.state == ST_WELCOME) {
+            let msg = "Setup will install " + j.name() + " on this computer.";
+            if (j.old_version != "") { msg = "Version " + j.old_version + " is installed and will be updated to " + j.m("version") + "."; }
+            s.text(b.x, base_at(s, b.y + this.dp(8.0)), fit(s, msg, b.w), C_INK);
+            s.text(b.x, base_at(s, b.y + this.dp(44.0)), "Install to:", C_MUTED);
+            s.fill_round(this.path_box, this.dp(6.0), C_WHITE);
+            s.stroke_round(this.path_box, this.dp(6.0), this.dp(1.0), C_LINE);
+            s.text(this.path_box.x + this.dp(10.0), base_at(s, this.path_box.y + this.path_box.h / 2.0),
+                   fit(s, j.dir, this.path_box.w - this.dp(20.0)), C_INK);
+        } else if (j.state == ST_CONFIRM) {
+            let y = b.y + this.dp(8.0);
+            for (let ln in wrap(s, "Remove " + j.name() + " " + j.m("version") +
+                                " and its shortcuts from this computer?", b.w)) {
+                s.text(b.x, base_at(s, y), ln, C_INK);
+                y += lh;
+            }
+            if (j.m("service_name") != "") {
+                y += this.dp(6.0);
+                s.text(b.x, base_at(s, y), fit(s, "The " + j.m("service_display") + " service will be stopped and removed.", b.w), C_MUTED);
+                y += lh;
+            }
+            y += this.dp(6.0);
+            s.text(b.x, base_at(s, y), fit(s, "Files you added to " + j.dir + " are kept.", b.w), C_MUTED);
+        } else if (j.state == ST_WORKING) {
+            let verb = "Installing ";
+            if (j.uninstall) { verb = "Removing "; }
+            s.text(b.x, base_at(s, b.y + this.dp(8.0)), verb + j.name() + "…", C_INK);
+            let bar = Rect(b.x, b.y + this.dp(40.0), b.w, this.dp(12.0));
+            s.fill_round(bar, this.dp(6.0), C_KEY);
+            let pr = j.progress();
+            if (j.uninstall) { pr = 0.5; }
+            s.fill_round(Rect(bar.x, bar.y, bar.w * pr, bar.h), this.dp(6.0), C_BLUE);
+            s.push_font(this.dp(13.0), WEIGHT.REG);
+            s.text(b.x, base_at(s, b.y + this.dp(74.0)), fit(s, j.current, b.w), C_MUTED);
+            s.pop_font();
+        } else if (j.state == ST_DONE) {
+            s.push_font(this.dp(18.0), WEIGHT.BOLD);
+            s.text(b.x, base_at(s, b.y + this.dp(10.0)), j.name() + " is installed.", C_GREEN);
+            s.pop_font();
+            s.text(b.x, base_at(s, b.y + this.dp(36.0)), fit(s, j.dir, b.w), C_MUTED);
+        } else if (j.state == ST_REMOVED) {
+            s.push_font(this.dp(18.0), WEIGHT.BOLD);
+            s.text(b.x, base_at(s, b.y + this.dp(10.0)), j.name() + " was removed.", C_GREEN);
+            s.pop_font();
+        } else {
+            s.push_font(this.dp(17.0), WEIGHT.BOLD);
+            let head = "Setup could not finish";
+            if (j.uninstall) { head = "Uninstall could not finish"; }
+            s.text(b.x, base_at(s, b.y + this.dp(10.0)), head, C_RED);
+            s.pop_font();
+            let y = b.y + this.dp(44.0);
+            for (let ln in wrap(s, j.error, b.w)) {
+                s.text(b.x, base_at(s, y), ln, C_INK);
+                y += lh;
+            }
+        }
+        s.pop_font();
+    }
+}
+
+// ---- entry ------------------------------------------------------------------------
+
+fn run_ui(j: Job) {
+    let title = j.name() + " Setup";
+    if (j.uninstall) { title = "Uninstall " + j.name(); }
+    let win = new Window(title, 620, 430);
+    if (d2d_usable(win.surface())) { win.use_painter(new D2DPainter(win.surface(), 15.0)); }
+    win.theme.apply_scale(win.scale);
+    win.theme.bg = C_BG;
+    j.win = win;
+    let screen = new SetupScreen(j);
+    screen.rebuild();
+    win.root = screen;
+    win.run();
+}
+
+fn run_silent(j: Job): int {
+    j.state = ST_WORKING;
+    j.step = -1;
+    while (j.advance()) { }
+    if (j.state == ST_ERROR) {
+        print("setup: " + j.error);
+        return 1;
+    }
+    return 0;
+}
+
+export fn setupMain() {
+    if (vset_available() as int == 0) {
+        print("This is a Windows installer.");
+        exit(2);
+        return;
+    }
+    let a = args();
+    let silent = false;
+    let dir_arg = "";
+    let no_desktop = false;
+    let phase2 = false;
+    let p2_dir = "";
+    let p2_pid = 0;
+    let i = 0;
+    while (i < a.len) {
+        let x = a[i];
+        if (x == "/S" || x == "/s") { silent = true; }
+        else if (x.starts_with("/D=")) { dir_arg = x.slice(3, x.len); }
+        else if (x == "/NODESKTOP") { no_desktop = true; }
+        else if (x == "/phase2" && i + 2 < a.len) {
+            phase2 = true;
+            p2_dir = a[i + 1];
+            p2_pid = a[i + 2].to_int();
+            i += 2;
+        }
+        i += 1;
+    }
+
+    let j = new Job();
+    let tmp = str(vset_folder(6 as i32));
+    let payload = join(tmp, `vyto-setup-{vset_pid()}.bin`);
+    let has = vset_payload_to_file(payload.cstr()) as int;
+    if (has == 1) {
+        let ar = readArchiveFile(payload);
+        file_remove(payload);
+        if (!ar.ok) { print("setup: " + ar.err); exit(1); return; }
+        let ini = ar.find(".setup.ini");
+        if (ini == null) { print("setup: the installer has no .setup.ini"); exit(1); return; }
+        j.meta = parse_ini(strbytes(ini.data, ini.data.len));
+        for (let e in ar.entries) { if (e.path != ".setup.ini") { j.files.push(e); } }
+        j.machine = j.m("scope") != "user";
+        if (no_desktop) { j.desktop = false; }
+        j.old_version = str(vset_reg_get(j.mach(), j.key().cstr(), "DisplayVersion".cstr()));
+        let loc = str(vset_reg_get(j.mach(), j.key().cstr(), "InstallLocation".cstr()));
+        if (j.default_dir().starts_with("\\")) {
+            print("setup: Windows did not say where programs are installed");
+            exit(1);
+            return;
+        }
+        if (dir_arg != "") { j.dir = win_path(dir_arg); }
+        else if (loc != "") { j.dir = loc; }       // an upgrade stays where it was
+        else { j.dir = j.default_dir(); }
+        if (silent) { exit(run_silent(j)); return; }
+        run_ui(j);
+        return;
+    }
+
+    // ---- the uninstaller
+    j.uninstall = true;
+    if (!phase2) {
+        // a running exe cannot delete itself: continue from a copy in %TEMP%
+        let me = selfPath();
+        let copy = join(tmp, `vyto-uninstall-{vset_pid()}.exe`);
+        if (!file_copy(me, copy)) { print("uninstall: cannot copy to " + copy); exit(1); return; }
+        let rest = `/phase2 "{parent_of(me)}" {vset_pid()}`;
+        if (silent) { rest = rest + " /S"; }
+        // Hand off and exit at once, even with /S: the second stage has to
+        // delete this very exe, which it cannot do while we wait for it.
+        // (The same contract as NSIS: a silent uninstall returns as soon as
+        // the removal has started.)
+        if (vset_spawn(copy.cstr(), rest.cstr(), 0 as i32) as int < 0) {
+            print("uninstall: cannot start " + copy);
+            exit(1);
+            return;
+        }
+        exit(0);
+        return;
+    }
+    vset_wait_pid(p2_pid as i32, 15000 as i32);
+    j.dir = p2_dir;
+    j.self_temp = selfPath();
+    j.meta = parse_ini(read_text(join(j.dir, "uninstall.ini")));
+    if (j.name() == "") {
+        print("uninstall: no uninstall.ini in " + j.dir);
+        exit(1);
+        return;
+    }
+    j.machine = j.m("scope") != "user";
+    if (silent) { exit(run_silent(j)); return; }
+    j.state = ST_CONFIRM;
+    run_ui(j);
+}
+

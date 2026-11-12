@@ -1,0 +1,45 @@
+// vyto/win/setup/pack: the installer payload round-trips byte for byte
+// (binary data, a NUL, a sub-folder, non-ASCII names), and both writer and
+// reader refuse any path that could land outside the install folder.
+import { writeArchive, readArchiveFile, readArchive, safe_rel } from "vyto/win/setup/pack";
+import { zlib_compress } from "vyto/compress";
+import { file_open } from "vyto/io/file";
+
+fn put(path: string, data: byte[]) {
+    let f = file_open(path, "wb");
+    f.writeBytes(data);
+    f.close();
+}
+
+fn main() {
+    let d = "tests/tmp/setup_pack";
+    let bin: byte[] = [];
+    for (let i in 0..1000) { bin.push((i * 37 % 256) as byte); }
+    put(d + "/app.bin", bin);
+    put(d + "/note.txt", [72 as byte, 105 as byte, 0 as byte, 10 as byte]);
+    let err = writeArchive(d + "/payload.bin", [
+        "app.exe\t" + d + "/app.bin",
+        "data/Zoë 日.txt\t" + d + "/note.txt",
+        ".setup.ini\t" + d + "/note.txt",
+    ]);
+    print(`write: [{err}]`);
+    let a = readArchiveFile(d + "/payload.bin");
+    print(`read: {a.ok} {a.entries.len} entries [{a.err}]`);
+    for (let e in a.entries) { print(`  {e.path} {e.data.len}`); }
+    let same = a.entries[0].data.len == bin.len;
+    for (let i in 0..bin.len) { if (a.entries[0].data[i] != bin[i]) { same = false; } }
+    print(`binary intact: {same}`);
+    print(`nul kept: {a.entries[1].data[2] == (0 as byte)}`);
+
+    print(`writer refuses ..: [{writeArchive(d + "/bad.bin", ["../x\t" + d + "/note.txt"])}]`);
+    let bad = ["/etc/passwd", "../up", "a/../../b", "C:\\Windows\\x", "a\\b", "", "a//b", "./a"];
+    for (let p in bad) { print(`safe {p}: {safe_rel(p)}`); }
+    // a hand-made payload naming a path outside the folder
+    let evil = "VYPK1\nF 1 ../../evil.txt\nX";
+    let raw: byte[] = [];
+    for (let i in 0..evil.len) { raw.push(evil[i] as byte); }
+    let ea = readArchive(zlib_compress(raw, 6));
+    print(`evil payload: {ea.ok} [{ea.err}]`);
+    let junk = readArchive([1 as byte, 2 as byte, 3 as byte]);
+    print(`junk payload: {junk.ok}`);
+}

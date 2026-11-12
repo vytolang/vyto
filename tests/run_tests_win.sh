@@ -226,7 +226,7 @@ fi
 # local test server (https_local): both need something on the other end — a
 # person or xdotool, an openssl s_server — so they are staged, not in the
 # manifest. run_tests_wine.sh drives both; the README says how by hand.
-for t in desktop_demo https_local; do
+for t in desktop_demo https_local service_demo; do
     if ./vytoc build "tests/win/$t.vt" --target "$TRIPLE" --cc "$CC_CMD" \
             -o "$STAGE/$t.exe" >/dev/null 2>"$STAGE/.$t.err"; then
         echo "BUILT $t"
@@ -237,9 +237,26 @@ for t in desktop_demo https_local; do
         fail=1
     fi
 done
+# Installers (vytoc --installer): a per-machine one for an app that is also a
+# service, and a per-user one. run_tests_wine.sh installs, upgrades and
+# uninstalls both silently; the README says how to check them by hand.
+mkdir -p "$STAGE/inst/machine" "$STAGE/inst/user"
+if ./vytoc build tests/win/service_demo.vt --target "$TRIPLE" --cc "$CC_CMD" --release \
+        --manifest tests/win/service_demo_manifest.vt --installer \
+        -o "$STAGE/inst/machine/service_demo.exe" >/dev/null 2>"$STAGE/.inst.err" &&
+   ./vytoc build tests/fixtures/win_console_app.vt --target "$TRIPLE" --cc "$CC_CMD" --release \
+        --manifest tests/fixtures/win_gui_manifest.vt --installer --per-user \
+        -o "$STAGE/inst/user/app.exe" >/dev/null 2>>"$STAGE/.inst.err"; then
+    echo "BUILT installers"
+    rm -f "$STAGE/.inst.err" "$STAGE/inst/machine/service_demo.exe" "$STAGE/inst/user/app.exe"
+else
+    echo "FAIL build installers"
+    cat "$STAGE/.inst.err"
+    fail=1
+fi
 mkdir -p "$STAGE/tls"
 cp tests/fixtures/tls/root.crt tests/fixtures/tls/other-root.crt "$STAGE/tls/"
-if ! ./vytoc audit "$STAGE"/*.exe; then fail=1; fi
+if ! ./vytoc audit "$STAGE"/*.exe "$STAGE"/inst/*/*-setup.exe; then fail=1; fi
 # The DLLs shipped beside the exes are skipped by the exe audit (they are the
 # app's own), so audit them as binaries of their own. No exceptions: curl used
 # to be a UCRT-linked DLL here and was reported KNOWN; it is now built from
@@ -432,6 +449,17 @@ By hand, after run.ps1 (these need a person or a network):
         cannot be clicked while one is open (they are owned by it)
       - a warning box with no owner, then example.com opens in the browser
     desktop_dirs_win.exe prints its checks (also in run.ps1).
+
+  Installers (inst\): run each setup.exe by double-click.
+    - inst\machine\Vyto-Demo-Service-1.2.3-setup.exe asks for administrator
+      rights (UAC), installs to C:\Program Files\Vyto Tests\..., and
+      services.msc then lists "Vyto Demo Service", running. Run it again:
+      it says the installed version will be updated.
+    - inst\user\Vyto-Test-App-1.2.3-setup.exe asks for nothing and installs
+      to %LOCALAPPDATA%\Programs.
+    - Both show in Programs and Features (Add/Remove Programs) with name,
+      version and publisher; their Start menu shortcut works; uninstalling
+      from there removes the files, shortcuts, the entry and the service.
 
 Not covered here: vyto/hw/* (Linux device interfaces) and vyto/intl (ICU) are
 not portable to Windows yet. Everything else in the stdlib is staged above.

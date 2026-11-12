@@ -351,6 +351,89 @@ else
     echo "FAIL mkdirs_backslash (got: $got)"
     fail=1
 fi
+# --- vyto/desktop/service ---
+# As an ordinary program: SIGTERM (what systemd sends) must reach stopping()
+# and wake a 60 s wait() at once. Under a NOTIFY_SOCKET it must also report
+# service mode and send READY=1 then STOPPING=1 — checked with a datagram
+# listener standing in for systemd. INVOCATION_ID is stripped: it leaks into
+# whole desktop sessions and must not count as "started by systemd".
+sv=tests/tmp/service; rm -rf "$sv"; mkdir -p "$sv"
+if ./vytoc build tests/fixtures/service_console.vt -o "$sv/svc" >/dev/null 2>&1; then
+    env -u INVOCATION_ID -u NOTIFY_SOCKET "$sv/svc" > "$sv/plain.txt" 2>&1 &
+    sp=$!; sleep 1; kill -TERM "$sp" 2>/dev/null; wait "$sp"
+    if [ "$(cat "$sv/plain.txt")" = "service mode: false
+running
+stopped after 1 tick(s), early: true
+exited cleanly" ]; then
+        echo "PASS service_sigterm"
+    else
+        echo "FAIL service_sigterm (got: $(cat "$sv/plain.txt"))"; fail=1
+    fi
+    python3 - "$sv/notify.sock" > "$sv/notify.txt" 2>&1 <<'PY' &
+import socket, sys
+s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+s.bind(sys.argv[1]); s.settimeout(10)
+try:
+    for _ in range(2): print(s.recv(256).decode(), flush=True)
+except Exception as e:
+    print("ERR", e)
+PY
+    lp=$!; sleep 0.5
+    env -u INVOCATION_ID NOTIFY_SOCKET="$(pwd)/$sv/notify.sock" "$sv/svc" > "$sv/notified.txt" 2>&1 &
+    sp=$!; sleep 1; kill -TERM "$sp" 2>/dev/null; wait "$sp"; wait "$lp"
+    if head -1 "$sv/notified.txt" | grep -qx "service mode: true" &&
+       [ "$(cat "$sv/notify.txt")" = "READY=1
+STOPPING=1" ]; then
+        echo "PASS service_sd_notify"
+    else
+        echo "FAIL service_sd_notify (notify: $(cat "$sv/notify.txt"))"; fail=1
+    fi
+else
+    echo "FAIL service_sigterm (build)"; fail=1
+fi
+# The systemd unit, and install/state/uninstall into a temp unit dir.
+rm -rf "$sv/units"; mkdir -p "$sv/units"
+got=$(VYTO_SYSTEMD_DIR="$(pwd)/$sv/units" ./vytoc run tests/fixtures/service_unit.vt 2>&1)
+if [ "$got" = "$(cat tests/fixtures/service_unit.expected)" ]; then
+    echo "PASS service_unit"
+else
+    echo "FAIL service_unit"; echo "$got" | diff tests/fixtures/service_unit.expected - | head; fail=1
+fi
+if ./vytoc build tests/fixtures/service_freestanding.vt --freestanding --cc gcc \
+        -o examples/.vyto-cache/libsvc_fs.a >/dev/null 2>&1; then
+    sobj=$(nm -A examples/.vyto-cache/libsvc_fs.a 2>/dev/null \
+        | awk '/ T vsvc_state$/ { split($1, a, ":"); print a[2]; exit }')
+    sund=$(nm -A examples/.vyto-cache/libsvc_fs.a 2>/dev/null | grep -c ":$sobj: *U ")
+    if [ -n "$sobj" ] && [ "$sund" -eq 0 ]; then
+        echo "PASS freestanding_service_stub"
+    else
+        echo "FAIL freestanding_service_stub ('$sobj' has $sund undefined symbols)"; fail=1
+    fi
+else
+    echo "FAIL freestanding_service_stub (does not build freestanding)"; fail=1
+fi
+# --- vytoc --installer: the payload format, the manifest's service, flags ---
+rm -rf tests/tmp/setup_pack; mkdir -p tests/tmp/setup_pack
+got=$(./vytoc run tests/fixtures/setup_pack.vt 2>&1)
+if [ "$got" = "$(cat tests/fixtures/setup_pack.expected)" ]; then
+    echo "PASS setup_pack_roundtrip"
+else
+    echo "FAIL setup_pack_roundtrip"; echo "$got" | diff tests/fixtures/setup_pack.expected - | head; fail=1
+fi
+out=$(./vytoc run tests/fixtures/win_bad_service_manifest.vt 2>&1)
+if [ $? -ne 0 ] && echo "$out" | grep -q 'service name "bad name!"' &&
+   echo "$out" | grep -q 'service start "sometimes"'; then
+    echo "PASS win_manifest_service_refused"
+else
+    echo "FAIL win_manifest_service_refused (got: $out)"; fail=1
+fi
+out=$(./vytoc build tests/fixtures/win_console_app.vt --installer 2>&1)
+out2=$(./vytoc build tests/fixtures/win_console_app.vt --target windows-x64 --per-user 2>&1)
+if echo "$out" | grep -q "makes a Windows setup.exe" && echo "$out2" | grep -q "pass --installer too"; then
+    echo "PASS installer_flags_refused"
+else
+    echo "FAIL installer_flags_refused (got: $out | $out2)"; fail=1
+fi
 # --- vyto/desktop: dialogs, open, per-user folders ---
 # The dialog programs are fakes (tests/fixtures/desktop/fake_dialog.sh) that
 # log every argv element and replay canned answers, so each backend's exact
@@ -2098,6 +2181,37 @@ if command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1 &&
     [ -f "$nd/b/h.exe" ] && [ -f "$nd/b/cacert.pem" ] && ./vytoc audit "$nd/b/h.exe" >/dev/null 2>&1 &&
         r=ok
     win_check win_net_bundle "$r"
+
+    # --- --installer: a per-machine setup asks for administrator rights and
+    # carries the payload as RCDATA (type 0x0a), a per-user one does not ask;
+    # both, and the uninstaller inside, pass the Windows 7 audit. A service
+    # with --per-user is refused: a service needs a per-machine install.
+    idir=$wd/inst; mkdir -p "$idir/m" "$idir/u"
+    # shellcheck disable=SC2086
+    ./vytoc build tests/fixtures/win_console_app.vt $W $GM --installer -o "$idir/m/app.exe" >/dev/null 2>&1
+    ms=$(ls "$idir"/m/*-setup.exe 2>/dev/null | head -1)
+    r="no setup.exe"
+    if [ -n "$ms" ]; then
+        r="resources: $(pe_rtypes "$ms")"
+        grep -aq requireAdministrator "$ms" && pe_rtypes "$ms" | grep -q "0x00000a" &&
+            ./vytoc audit "$ms" >/dev/null 2>&1 && r=ok
+    fi
+    win_check win_installer_machine "$r"
+    # shellcheck disable=SC2086
+    ./vytoc build tests/fixtures/win_console_app.vt $W $GM --installer --per-user -o "$idir/u/app.exe" >/dev/null 2>&1
+    us=$(ls "$idir"/u/*-setup.exe 2>/dev/null | head -1)
+    r="no per-user setup.exe"
+    if [ -n "$us" ]; then
+        r="manifest level wrong"
+        ! grep -aq requireAdministrator "$us" && grep -aq asInvoker "$us" && r=ok
+    fi
+    win_check win_installer_per_user "$r"
+    # shellcheck disable=SC2086
+    out=$(./vytoc build tests/win/service_demo.vt $W --manifest tests/win/service_demo_manifest.vt \
+          --installer --per-user -o "$idir/u/svc.exe" 2>&1)
+    r="status ok: $out"
+    echo "$out" | grep -q "needs a per-machine" && r=ok
+    win_check win_installer_service_needs_machine "$r"
 
     # --- --sign: Authenticode via osslsigncode, with a throwaway self-signed
     # certificate made here. The signature must be real (a non-empty

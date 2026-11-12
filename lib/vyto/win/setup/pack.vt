@@ -1,0 +1,141 @@
+// vyto/win/setup/pack — the installer's payload: the app's files in one
+// zlib-compressed archive. vytoc runs packMain() on the build host to write it
+// (`vytoc build --installer`); the setup program reads it back with
+// readArchive().
+//
+// Format, before compression:
+//
+//     VYPK1\n
+//     F <size> <relative/path>\n<size raw bytes>      (repeated)
+//
+// Paths use '/' and are relative to the install folder. readArchive refuses
+// any entry that could land outside it — absolute, a drive letter, "..", a
+// backslash — so a tampered or corrupt payload cannot write elsewhere on the
+// machine (the "zip slip" class of bug). Pure Vyto, so it is tested on Linux.
+import { zlib_compress, zlib_decompress } from "vyto/compress";
+import { file_open, file_exists } from "vyto/io/file";
+
+export class Entry {
+    path: string;
+    data: byte[];
+    fn init(path: string, data: byte[]) { this.path = path; this.data = data; }
+}
+
+export class Archive {
+    ok: bool;
+    err: string;
+    entries: Entry[];
+    fn init() { this.ok = false; this.err = ""; this.entries = []; }
+
+    fn find(path: string): Entry? {
+        for (let e in this.entries) { if (e.path == path) { return e; } }
+        return null;
+    }
+}
+
+// A path that stays inside the install folder.
+export fn safe_rel(p: string): bool {
+    if (p == "" || p.len > 1024) { return false; }
+    if (p.starts_with("/") || p.contains("\\") || p.contains(":")) { return false; }
+    for (let part in p.split("/")) {
+        if (part == "" || part == "." || part == "..") { return false; }
+    }
+    for (let i in 0..p.len) { if (p[i] < 32 || p[i] == 127) { return false; } }
+    return true;
+}
+
+fn read_all(path: string): byte[]? {
+    if (!file_exists(path)) { return null; }
+    let f = file_open(path, "rb");
+    if (f == null) { return null; }
+    let b = f.readBytes();
+    f.close();
+    return b;
+}
+
+// Pack `pairs` ("relative/dest\tsource/path" per line) into a compressed
+// archive at `out`. Returns "" or what went wrong.
+export fn writeArchive(out: string, pairs: string[]): string {
+    let tmp = out + ".raw";
+    let f = file_open(tmp, "wb");
+    if (f == null) { return "cannot write " + tmp; }
+    f.writeText("VYPK1\n");
+    for (let line in pairs) {
+        if (line == "") { continue; }
+        let t = line.index_of("\t");
+        if (t <= 0) { f.close(); return "bad pack line: " + line; }
+        let dest = line.slice(0, t);
+        let src = line.slice(t + 1, line.len);
+        if (!safe_rel(dest)) { f.close(); return "unsafe destination: " + dest; }
+        let data = read_all(src);
+        if (data == null) { f.close(); return "cannot read " + src; }
+        f.writeText(`F {data.len} {dest}` + "\n");
+        f.writeBytes(data);
+    }
+    f.close();
+    let raw = read_all(tmp);
+    if (raw == null) { return "cannot read back " + tmp; }
+    let z = zlib_compress(raw, 9);
+    let o = file_open(out, "wb");
+    if (o == null) { return "cannot write " + out; }
+    o.writeBytes(z);
+    o.close();
+    return "";
+}
+
+// Decompress and parse a payload.
+export fn readArchive(z: byte[]): Archive {
+    let a = new Archive();
+    let r = zlib_decompress(z, 2147483647);
+    if (!r.ok) { a.err = "the installer's data is damaged (" + r.err + ")"; return a; }
+    let b = r.data;
+    let i = 0;
+    let first = true;
+    while (i < b.len) {
+        let nl = i;
+        while (nl < b.len && b[nl] != 10) { nl += 1; }
+        if (nl >= b.len) { a.err = "truncated header"; return a; }
+        let head = strbytes(b.slice(i, nl), nl - i);
+        i = nl + 1;
+        if (first) {
+            if (head != "VYPK1") { a.err = "not an installer payload"; return a; }
+            first = false;
+            continue;
+        }
+        if (!head.starts_with("F ")) { a.err = "bad entry header"; return a; }
+        let rest = head.slice(2, head.len);
+        let sp = rest.index_of(" ");
+        if (sp <= 0) { a.err = "bad entry header"; return a; }
+        let size = rest.slice(0, sp).to_int();
+        let path = rest.slice(sp + 1, rest.len);
+        if (!safe_rel(path)) { a.err = "unsafe path in the installer: " + path; return a; }
+        if (size < 0 || i + size > b.len) { a.err = "truncated entry " + path; return a; }
+        a.entries.push(new Entry(path, b.slice(i, i + size)));
+        i += size;
+    }
+    if (first) { a.err = "empty payload"; return a; }
+    a.ok = true;
+    return a;
+}
+
+export fn readArchiveFile(path: string): Archive {
+    let z = read_all(path);
+    if (z == null) {
+        let a = new Archive();
+        a.err = "cannot read " + path;
+        return a;
+    }
+    return readArchive(z);
+}
+
+// The host-side entry vytoc runs: <out> <listfile>.
+export fn packMain(a: string[]): int {
+    if (a.len < 2) { print("usage: pack <out> <list>"); return 2; }
+    let lf = file_open(a[1], "rb");
+    if (lf == null) { print("cannot read " + a[1]); return 1; }
+    let text = lf.readText();
+    lf.close();
+    let err = writeArchive(a[0], text.lines());
+    if (err != "") { print(err); return 1; }
+    return 0;
+}

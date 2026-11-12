@@ -297,5 +297,97 @@ https_check() {
 }
 https_check
 
+# --- vyto/desktop/service: a Windows service, end to end ----------------------
+# service_demo.exe installs itself with the Service Control Manager, is started
+# by it (no argument = the service body, logging to %ProgramData%), stopped,
+# and uninstalled. Wine shuts its session down — sending services SHUTDOWN —
+# when the last ordinary process exits, so a console copy of the demo keeps the
+# session alive meanwhile (it is killed by PID afterwards).
+service_check() {
+    [ -f "$STAGE/service_demo.exe" ] || { echo "FAIL wine_service (not staged)"; fail=$((fail + 1)); return 0; }
+    wineserver -k >/dev/null 2>&1; sleep 1
+    log="$WINEPREFIX/drive_c/ProgramData/VytoDemoSvc/VytoDemoSvc.log"
+    rm -f "$log"
+    (cd "$STAGE" && timeout 90 "$WINE" ./service_demo.exe uninstall >/dev/null 2>&1)
+    (cd "$STAGE" && exec timeout 90 "$WINE" ./service_demo.exe > "$tmp/keep.log" 2>&1 < /dev/null) &
+    kp=$!
+    sleep 3
+    sv() { (cd "$STAGE" && timeout 40 "$WINE" ./service_demo.exe "$1" 2>&1 | tr -d '\r'); }
+    got="$(sv install); $(sv start); $(sv state)"
+    sleep 2
+    got="$got; $(sv state); $(sv stop); $(sv state); $(sv uninstall); $(sv state)"
+    kill "$kp" 2>/dev/null
+    want="install: ok; start: ok; state: 4; state: 4; stop: ok; state: 1; uninstall: ok; state: -1"
+    logtxt=$(tr -d '\r' < "$log" 2>/dev/null | sed 's/^[0-9 :-]*  //' | sed 's/after [0-9]* heartbeat/after N heartbeat/')
+    if [ "$got" = "$want" ] && [ "$logtxt" = "started (service: true)
+stopped after N heartbeat(s)" ]; then
+        echo "PASS wine_service_lifecycle"; pass=$((pass + 1))
+    else
+        echo "FAIL wine_service_lifecycle"
+        echo "  got:  $got"
+        echo "  want: $want"
+        echo "  log:  $logtxt"
+        fail=$((fail + 1))
+    fi
+    wineserver -k >/dev/null 2>&1
+}
+service_check
+
+# --- vytoc --installer: silent install, upgrade and uninstall ------------------
+# Every artifact is checked, not just exit codes: the files, the Add/Remove
+# Programs entry, the Start menu shortcut, the service (per-machine), and that
+# all of it is gone afterwards. /NODESKTOP keeps the shortcut off the desktop:
+# Wine maps a user's Desktop to the real ~/Desktop of whoever runs this.
+installer_check() {
+    ms=$(ls "$STAGE"/inst/machine/*-setup.exe 2>/dev/null | head -1)
+    us=$(ls "$STAGE"/inst/user/*-setup.exe 2>/dev/null | head -1)
+    if [ -z "$ms" ] || [ -z "$us" ]; then
+        echo "FAIL wine_installer (not staged)"; fail=$((fail + 1)); return 0
+    fi
+    wineserver -k >/dev/null 2>&1; sleep 1
+    w() { timeout 90 "$WINE" "$@" 2>&1 | tr -d '\r'; }
+    regq() { timeout 30 "$WINE" reg query "$1" >/dev/null 2>&1 && echo yes || echo no; }
+    st() { (cd "$STAGE" && w ./service_demo.exe state); }
+    pf="$WINEPREFIX/drive_c/Program Files/Vyto Tests"
+    key='HKLM\Software\Microsoft\Windows\CurrentVersion\Uninstall\Vyto Demo Service'
+    lnk="$WINEPREFIX/drive_c/ProgramData/Microsoft/Windows/Start Menu/Programs/Vyto Demo Service.lnk"
+    (cd "$STAGE" && exec timeout 120 "$WINE" ./service_demo.exe > "$tmp/keep2.log" 2>&1 < /dev/null) &
+    kp=$!
+    sleep 3
+    out=""
+    w "$ms" /S /NODESKTOP >/dev/null; out="install=$?"
+    out="$out files=$([ -f "$pf/Vyto Demo Service/service_demo.exe" ] && [ -f "$pf/Vyto Demo Service/uninstall.exe" ] && echo yes || echo no)"
+    out="$out reg=$(regq "$key") lnk=$([ -f "$lnk" ] && echo yes || echo no) $(st)"
+    w "$ms" /S /NODESKTOP >/dev/null; out="$out | upgrade $(st)"
+    w "C:\\Program Files\\Vyto Tests\\Vyto Demo Service\\uninstall.exe" /S >/dev/null
+    i=0; while [ -d "$pf" ] && [ $i -lt 40 ]; do sleep 0.5; i=$((i + 1)); done
+    out="$out | gone=$([ -d "$pf" ] && echo no || echo yes) reg=$(regq "$key") lnk=$([ -f "$lnk" ] && echo yes || echo no) $(st)"
+    kill "$kp" 2>/dev/null
+    want="install=0 files=yes reg=yes lnk=yes state: 4 | upgrade state: 4 | gone=yes reg=no lnk=no state: -1"
+    if [ "$out" = "$want" ]; then
+        echo "PASS wine_installer_machine"; pass=$((pass + 1))
+    else
+        echo "FAIL wine_installer_machine"; echo "  got:  $out"; echo "  want: $want"; fail=$((fail + 1))
+    fi
+
+    ukey='HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\Vyto Test App'
+    w "$us" /S /NODESKTOP >/dev/null
+    ud=$(find "$WINEPREFIX/drive_c/users" -type d -path "*Programs/Vyto Test App" 2>/dev/null | head -1)
+    out="dir=$([ -n "$ud" ] && [ -f "$ud/app.exe" ] && echo yes || echo no) reg=$(regq "$ukey")"
+    if [ -n "$ud" ]; then
+        win_ud=$(timeout 30 "$WINE" winepath -w "$ud" 2>/dev/null | tr -d '\r')
+        w "$win_ud\\uninstall.exe" /S >/dev/null
+        i=0; while [ -d "$ud" ] && [ $i -lt 40 ]; do sleep 0.5; i=$((i + 1)); done
+    fi
+    out="$out | gone=$([ -n "$ud" ] && [ ! -d "$ud" ] && echo yes || echo no) reg=$(regq "$ukey")"
+    if [ "$out" = "dir=yes reg=yes | gone=yes reg=no" ]; then
+        echo "PASS wine_installer_user"; pass=$((pass + 1))
+    else
+        echo "FAIL wine_installer_user ($out)"; fail=$((fail + 1))
+    fi
+    wineserver -k >/dev/null 2>&1
+}
+installer_check
+
 echo "wine: $pass passed, $fail failed (Wine $("$WINE" --version 2>/dev/null), not Windows 7)"
 [ "$fail" -eq 0 ]
