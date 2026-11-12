@@ -138,6 +138,7 @@ tests/win/d2d_props.vt|d2d_props|eq||VS_HEADLESS=1
 tests/fixtures/win_gui_app.vt|win_gui_app|eq|||--manifest tests/fixtures/win_gui_manifest.vt
 tests/fixtures/win_console_app.vt|win_console_app|eq|
 tests/win/desktop_dirs_win.vt|desktop_dirs_win|eq|
+tests/fixtures/mkdirs_backslash.vt|mkdirs_backslash|eq|
 EOF
 )
 

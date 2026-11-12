@@ -174,8 +174,12 @@ int vfile_mkdir(const char *path) {
     vt_wbuf_free(&w);
     return r;
 }
+/* '\\' separates path components here as well as '/'. */
+int vfile_backslash_sep(void) { return 1; }
 #else
 int vfile_remove(const char *path) { return remove(path); }
 int vfile_rename(const char *a, const char *b) { return rename(a, b); }
 int vfile_mkdir(const char *path) { return mkdir(path, 0777); }
+/* '\\' is an ordinary filename character on POSIX, never a separator. */
+int vfile_backslash_sep(void) { return 0; }
 #endif

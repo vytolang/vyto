@@ -339,6 +339,18 @@ if command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1; then
 else
     echo "SKIP pertriple_windows (no mingw-w64)"
 fi
+# file_mkdirs with backslashes: one folder name on POSIX (its Windows golden,
+# nested folders, runs in the staged Windows suite). Before the fix Windows
+# made nothing at all, since only '/' split components — every app that made
+# a folder under dataDir()/configDir() silently failed to save there.
+rm -rf tests/tmp/mkbs*
+got=$(./vytoc run tests/fixtures/mkdirs_backslash.vt 2>&1)
+if [ "$got" = "$(cat tests/fixtures/mkdirs_backslash.expected)" ]; then
+    echo "PASS mkdirs_backslash"
+else
+    echo "FAIL mkdirs_backslash (got: $got)"
+    fail=1
+fi
 # --- vyto/desktop: dialogs, open, per-user folders ---
 # The dialog programs are fakes (tests/fixtures/desktop/fake_dialog.sh) that
 # log every argv element and replay canned answers, so each backend's exact
