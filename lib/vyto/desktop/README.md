@@ -82,12 +82,24 @@ Android apps use `vyto/mobile/android` for the system UI.
   is passed `--no-markup`. Neither can run anything from it.
 - zenity's `--attach` (keep on top of a window) works on X11 with zenity 3
   only.
+- **GTK multi-select quirk (zenity):** entering a folder auto-selects its
+  first row, even when that row is a folder, and Ctrl+click *adds* to it. With
+  a folder in the selection, GTK refuses OK — the dialog flashes and stays
+  open. Plain-click the first file, then Ctrl+click the rest (or Shift+click a
+  range). This is GTK's file chooser, not something zenity lets a caller
+  change; reproduced with Mutter on Xvfb, 2026-11-12.
 
 ## Tests
 
 - `make test`: `desktop_dialogs_{zenity,kdialog,none}` (argv goldens against a
   fake dialog program), `desktop_zenity4_flags`, `desktop_open_url`,
   `desktop_dirs`, `freestanding_desktop_stub`.
+- `make test-desktop`: the **real** zenity (or kdialog) on a private Xvfb
+  display, every dialog answered with xdotool, with and without an owner
+  window (`--attach`); the saved file is checked on disk. Needs Xvfb, xdotool
+  and a dialog program, SKIPs otherwise. Run from a snap terminal (VS Code's)
+  it still works: the dialog program gets a scrubbed environment, since the
+  snap's `GTK_PATH`/`LOCPATH` crash any GTK program started from it.
 - `make test-wine`: `wine_desktop_dialogs` answers each dialog of
   `tests/win/desktop_demo.vt` with xdotool. `desktop_dirs_win` runs in the
   staged Windows suite.
