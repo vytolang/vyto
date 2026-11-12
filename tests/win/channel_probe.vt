@@ -1,0 +1,29 @@
+// One channel call from the command line, for tests and by hand:
+//
+//   channel_probe <suite> <channel> <op> [json]   call op, print the reply
+//   channel_probe <suite> <channel> steal          try to bind the service's
+//       port the way a hijacker would (SO_REUSEADDR); must print "refused"
+//       while the service runs (Windows: SO_EXCLUSIVEADDRUSE)
+import { Channel } from "vyto/desktop/channel";
+import { json_parse, jobj } from "vyto/util/json";
+import { socket_listen_on } from "vyto/net/socket";
+import { getenv } from "vyto/os";
+import { file_open } from "vyto/io/file";
+
+fn main() {
+    let a = args();
+    if (a.len < 3) { print("usage: channel_probe <suite> <channel> <op> [json]"); return; }
+    if (a[2] == "steal") {
+        let probe = new Channel(a[0], a[1], "probe");
+        let info = probe.discover();
+        if (info == null) { print("steal: no service"); return; }
+        let s = socket_listen_on("127.0.0.1", info.get("port").asInt(), 4);
+        if (s == null) { print("steal: refused"); } else { print("steal: TAKEN"); s.close(); }
+        return;
+    }
+    let body = jobj();
+    if (a.len > 3) { body = json_parse(a[3]); }
+    let ch = new Channel(a[0], a[1], "probe");
+    let r = ch.call(a[2], body, 8000);
+    if (r.ok) { print("ok " + r.data.stringify()); } else { print("error " + r.err); }
+}

@@ -397,6 +397,33 @@ If the `--manifest` declares `.service(...)`, the installer also registers
 the exe as a Windows service and starts it; see `vyto/desktop/service`. A
 service needs a per-machine install, so `--per-user` is refused then.
 
+### App suites: a GUI and its services, one installer
+
+A product is often a GUI plus programs that run in the background — checking
+stock, taking payments, holding a database connection. Declare them in the
+manifest; `--installer` builds every program and installs them **into one
+folder**, registers the services (in dependency order), stops them for an
+upgrade and removes them on uninstall:
+
+```vyto
+new WinManifest("Vyto Café POS Suite").version("0.2.0").company("Vyto")
+    .program("payments", "payments.vt")          // -> payments.exe beside pos.exe
+    .program("stock", "stock.vt")
+    .serviceFor("payments", "VytoCafePayments", "Vyto Café Payments", "...", "auto")
+    .serviceFor("stock", "VytoCafeStock", "Vyto Café Stock", "...", "auto")
+    .dependsOn("VytoCafePayments", "VytoCafeStock")
+    .emit();
+```
+
+The GUI and the services talk over `vyto/desktop/channel`: loopback only, a
+port the OS picks (never a fixed number, so nothing collides), held
+exclusively, found through a discovery file with a token. Requests get
+replies, services push events, and the GUI's window loop sleeps until one
+arrives. `apps/pos_suite` is the worked example: the till asks the payments
+service for a (simulated) M-Pesa payment of the sale's total and gets the
+payment record back; the stock service tracks what is left and pushes low-stock
+warnings. Either service can stop and the till keeps selling for cash.
+
 ### What is portable today
 
 The **core language, the runtime, and the stdlib packages with no POSIX

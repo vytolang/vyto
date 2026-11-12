@@ -1,0 +1,134 @@
+// Vyto Café Stock — a background service of the POS suite: how many of each
+// item are left. Runs as Windows service "VytoCafeStock" or from a terminal:
+//
+//     ./vytoc run apps/pos_suite/stock.vt
+//
+// Channel "stock", operations:
+//   stock.all {}                         -> {"Espresso": 30, ...}
+//   stock.sell {"lines":[{"name","qty"}]} -> the counts that changed
+//   stock.restock {}                     -> every item back to 30 (for demos)
+// and pushes to every till:
+//   stock.changed {"Croissant": 4, ...}   after any change
+//   stock.low {"name":"Croissant","left":4} when an item drops below 5
+//
+// Counts persist in stock.json in sharedDataDir("vyto-cafe-suite"), seeded
+// from the shared menu on first run.
+import { Service } from "vyto/desktop/service";
+import { ChannelServer, ChannelRequest } from "vyto/desktop/channel";
+import { sharedDataDir } from "vyto/desktop";
+import { JsonValue, json_parse, jobj, jstr, jint } from "vyto/util/json";
+import { file_mkdirs, file_open, file_exists, file_rename } from "vyto/io/file";
+import { menuItems, SUITE, STOCK_SERVICE } from "menu";
+
+const START_COUNT: int = 30;
+const LOW: int = 5;
+
+class Stock {
+    srv: ChannelServer;
+    svc: Service;
+    dir: string;
+    names: string[];
+    counts: Map<string, int>;
+
+    fn init(srv: ChannelServer, svc: Service) {
+        this.srv = srv;
+        this.svc = svc;
+        this.dir = sharedDataDir(SUITE);
+        this.names = [];
+        this.counts = new Map<string, int>();
+        for (let it in menuItems()) {
+            this.names.push(it.name);
+            this.counts.set(it.name, START_COUNT);
+        }
+        this.load();
+    }
+
+    fn path(): string {
+        if (this.dir.contains("\\")) { return this.dir + "\\stock.json"; }
+        return this.dir + "/stock.json";
+    }
+
+    fn load() {
+        let p = this.path();
+        if (!file_exists(p)) { this.save(); return; }
+        let fh = file_open(p, "rb");
+        if (fh == null) { return; }
+        let j = json_parse(fh.readText());
+        fh.close();
+        if (j.parseError() != "" || !j.isObj()) { return; }
+        for (let n in this.names) {
+            if (j.has(n)) { this.counts.set(n, j.get(n).asInt()); }
+        }
+    }
+
+    // Written to a temp file and renamed over, so a crash never leaves half a file.
+    fn save() {
+        if (this.dir == "" || !file_mkdirs(this.dir)) { return; }
+        let tmp = this.path() + ".tmp";
+        let fh = file_open(tmp, "wb");
+        if (fh == null) { return; }
+        fh.writeText(this.all_json().stringifyPretty());
+        fh.close();
+        file_rename(tmp, this.path());
+    }
+
+    fn all_json(): JsonValue {
+        let o = jobj();
+        for (let n in this.names) { o.set(n, jint(this.counts.get(n))); }
+        return o;
+    }
+
+    fn all(r: ChannelRequest): JsonValue { return this.all_json(); }
+
+    fn sell(r: ChannelRequest): JsonValue {
+        let lines = r.data.get("lines");
+        let changed = jobj();
+        for (let i in 0..lines.len()) {
+            let ln = lines.at(i);
+            let name = ln.get("name").asString();
+            let qty = ln.get("qty").asInt();
+            if (!this.counts.has(name) || qty <= 0) { continue; }
+            let before = this.counts.get(name);
+            let after = before - qty;
+            if (after < 0) { after = 0; }
+            this.counts.set(name, after);
+            changed.set(name, jint(after));
+            if (before >= LOW && after < LOW) {
+                let low = jobj();
+                low.set("name", jstr(name));
+                low.set("left", jint(after));
+                this.srv.push("stock.low", low);
+            }
+        }
+        this.save();
+        this.srv.push("stock.changed", changed);
+        return changed;
+    }
+
+    fn restock(r: ChannelRequest): JsonValue {
+        for (let n in this.names) { this.counts.set(n, START_COUNT); }
+        this.save();
+        let all = this.all_json();
+        this.srv.push("stock.changed", all);
+        this.svc.log("restocked by " + r.client);
+        return all;
+    }
+}
+
+fn serve(svc: Service) {
+    let srv = new ChannelServer(SUITE, "stock");
+    srv.on_error = (m) => { svc.log("channel: " + m); };
+    let st = new Stock(srv, svc);
+    srv.handle("stock.all", (r) => { return st.all(r); });
+    srv.handle("stock.sell", (r) => { return st.sell(r); });
+    srv.handle("stock.restock", (r) => { return st.restock(r); });
+    svc.log("stock service started");
+    while (!svc.stopping()) { srv.poll(250); }
+    srv.close();
+    svc.log("stock service stopped");
+}
+
+fn main() {
+    let svc = new Service(STOCK_SERVICE);
+    svc.run(() => { serve(svc); });
+}

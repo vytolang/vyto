@@ -2311,6 +2311,18 @@ if command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1 &&
     echo "$out" | grep -q "needs a per-machine" && r=ok
     win_check win_installer_service_needs_machine "$r"
 
+    # A suite: the till plus two services, one installer. --verbose lists the
+    # payload; every program and the uninstaller must be in it, once.
+    sdir=$wd/suite; mkdir -p "$sdir"
+    # shellcheck disable=SC2086
+    out=$(./vytoc build apps/pos_suite/pos_win.vt $W --release --installer --verbose \
+          --manifest apps/pos_suite/pos_manifest.vt -o "$sdir/pos.exe" 2>&1)
+    names=$(echo "$out" | sed -n 's/^installer payload: //p' | sort | tr '\n' ' ')
+    ss=$(ls "$sdir"/*-setup.exe 2>/dev/null | head -1)
+    r="payload: $names"
+    [ "$names" = "payments.exe pos.exe stock.exe " ] && [ -n "$ss" ] && ./vytoc audit "$ss" >/dev/null 2>&1 && r=ok
+    win_check win_installer_suite "$r"
+
     # --- --sign: Authenticode via osslsigncode, with a throwaway self-signed
     # certificate made here. The signature must be real (a non-empty
     # certificate table that osslsigncode verifies against that certificate),

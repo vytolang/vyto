@@ -1,0 +1,1223 @@
+// Vyto Café POS Suite — the till of a suite: this GUI plus two background
+// services it talks to over vyto/desktop/channel, all installed together by
+// one setup.exe (pos_manifest.vt). Started as a copy of apps/pos.
+//
+//   payments.vt  "pay with M-Pesa (simulated)": the till asks for amount X,
+//                the service sends back the payment record
+//   stock.vt     counts per item; tiles show what is left, a sale decrements,
+//                a low-stock push shows on the status line
+//
+// The till never depends on a service to sell: either can be stopped and the
+// header pill goes grey, its button disables, and cash sales carry on.
+//
+// Shared by the Windows entry (pos_win.vt, Direct2D) and the Linux one
+// (pos.vt, blend2d).
+//
+//   left   category tabs over a grid of big product tiles
+//   right  the ticket: lines (tap to select), qty -/+ and void, discount,
+//          totals with 16% VAT included, and PAY
+//   pay    the right side becomes a cash keypad: tendered, quick-cash
+//          buttons, change due, complete
+//   done   a receipt preview; the receipt is saved and the sale appended to
+//          today's CSV under vyto/desktop's dataDir("vyto-pos")
+//
+// Money is integer cents throughout (KES, whole-shilling prices). VAT is
+// inclusive: the shelf price already contains it, so the receipt shows the
+// VAT share of the total rather than adding it on.
+//
+// Ownership: Pos (the model) is held by the root widget; every widget reaches
+// it through the closures the root built. Pos refers back to the window and
+// the root only weakly, so the widget tree and the model never form a strong
+// cycle (CLAUDE.md, "Any back-reference must be weak").
+import { Window, Widget, Theme, Size } from "vyto/ui";
+import { Painter, WEIGHT } from "vyto/surface/painter";
+import { Rect, rgb, rgba } from "vyto/surface";
+import { date_now, date_format } from "vyto/util/date";
+import { dataDir, FileDialog, openPath, desktop_available } from "vyto/desktop";
+import { Channel, ChannelReply } from "vyto/desktop/channel";
+import { attachChannel } from "vyto/desktop/channel/gui";
+import { JsonValue, jobj, jarr, jstr, jint } from "vyto/util/json";
+import { Item, menuCategories, menuItems, SUITE } from "menu";
+import { file_exists, file_mkdirs, file_open } from "vyto/io/file";
+import { charCount } from "vyto/util/text";
+
+// ---- palette ---------------------------------------------------------------
+// ARGB, opaque: the painter reads the top byte as alpha (rgb() sets 0xFF).
+
+const C_BG: int = 0xFFEEF0F3;
+const C_HEADER: int = 0xFF1F2933;
+const C_PANEL: int = 0xFFFFFFFF;
+const C_INK: int = 0xFF1F2933;
+const C_MUTED: int = 0xFF6B7785;
+const C_LINE: int = 0xFFDDE1E6;
+const C_SEL: int = 0xFFFFF4D6;
+const C_GREEN: int = 0xFF1E9E5A;
+const C_RED: int = 0xFFD64545;
+const C_AMBER: int = 0xFFE8A317;
+const C_BLUE: int = 0xFF2F6FDE;
+const C_KEY: int = 0xFFF4F5F7;
+const C_GREEN_MPESA: int = 0xFF43B02A;   // M-Pesa's green
+const C_DOT_ON: int = 0xFF3DD68C;
+const C_DOT_OFF: int = 0xFF6B7785;
+
+fn cat_color(i: int): int {
+    if (i == 0) { return 0xFF8B5A2B; }   // coffee
+    if (i == 1) { return 0xFFC0392B; }   // tea & hot
+    if (i == 2) { return 0xFFE09F3E; }   // bakery
+    if (i == 3) { return 0xFF2E8B57; }   // food
+    return 0xFF2F6FDE;                   // cold drinks
+}
+
+fn darken(c: int, pct: int): int {
+    let r = ((c >> 16) & 255) * (100 - pct) / 100;
+    let g = ((c >> 8) & 255) * (100 - pct) / 100;
+    let b = (c & 255) * (100 - pct) / 100;
+    return 0xFF000000 | (r << 16) | (g << 8) | b;
+}
+
+fn mix_white(c: int, pct: int): int {
+    let r = (c >> 16) & 255;
+    let g = (c >> 8) & 255;
+    let b = c & 255;
+    r = r + (255 - r) * pct / 100;
+    g = g + (255 - g) * pct / 100;
+    b = b + (255 - b) * pct / 100;
+    return 0xFF000000 | (r << 16) | (g << 8) | b;
+}
+
+// ---- money -----------------------------------------------------------------
+
+// 125000 -> "1,250.00"
+export fn money(cents: int): string {
+    let neg = cents < 0;
+    let c = cents;
+    if (neg) { c = 0 - c; }
+    let whole = c / 100;
+    let frac = c % 100;
+    let ws = `{whole}`;
+    let out = "";
+    let n = 0;
+    let i = ws.len;
+    while (i > 0) {
+        if (n > 0 && n % 3 == 0) { out = "," + out; }
+        out = ws.slice(i - 1, i) + out;
+        i -= 1;
+        n += 1;
+    }
+    let fs = `{frac}`;
+    if (frac < 10) { fs = "0" + fs; }
+    if (neg) { return "-" + out + "." + fs; }
+    return out + "." + fs;
+}
+
+// Template literals do not process escapes (a backtick "\t" is a backslash
+// and a t), so separators are built from these plain-string constants.
+const TAB: string = "\t";
+const CRLF: string = "\r\n";
+
+fn pad4(n: int): string {
+    let s = `{n}`;
+    while (s.len < 4) { s = "0" + s; }
+    return s;
+}
+
+// ---- the model ---------------------------------------------------------------
+
+class Line {
+    item: Item;
+    qty: int;
+    fn init(item: Item) { this.item = item; this.qty = 1; }
+    fn amount(): int { return this.item.price * this.qty; }
+}
+
+const MODE_SELL: int = 0;
+const MODE_PAY: int = 1;
+const MODE_DONE: int = 2;
+
+export class Pos {
+    cats: string[];
+    items: Item[];
+    cat: int;
+    lines: Line[];
+    sel: int;
+    disc: int;          // percent
+    mode: int;
+    entry: string;      // keypad digits, whole shillings
+    paid: int;          // cents, set when the sale completes
+    change: int;
+    receipt_no: int;
+    receipt: string[];  // the last receipt, line by line
+    receipt_path: string;
+    day_sales: int;
+    day_total: int;
+    status: string;
+    dir: string;
+    win: weak Window;
+    screen: weak PosScreen;
+    // the suite's services
+    pay_ch: Channel;
+    stock_ch: Channel;
+    stock: Map<string, int>;
+    waiting: bool;      // an M-Pesa payment is in flight
+    method: string;     // how the last sale was paid
+    pay_ref: string;
+    reply_cb: fn(ChannelReply);
+    ignore_cb: fn(ChannelReply);
+
+    fn init() {
+        this.cats = menuCategories();
+        this.items = menuItems();
+        this.cat = 0;
+        this.lines = [];
+        this.sel = -1;
+        this.disc = 0;
+        this.mode = MODE_SELL;
+        this.entry = "";
+        this.paid = 0;
+        this.change = 0;
+        this.receipt = [];
+        this.receipt_path = "";
+        this.day_sales = 0;
+        this.day_total = 0;
+        this.status = "";
+        this.dir = dataDir("vyto-pos-suite");
+        this.load_day();
+        this.receipt_no = this.day_sales + 1;
+        this.stock = new Map<string, int>();
+        this.waiting = false;
+        this.method = "Cash";
+        this.pay_ref = "";
+        let self = this;
+        this.reply_cb = (r) => { self.on_mpesa(r); };
+        this.ignore_cb = (r) => { };
+        this.pay_ch = new Channel(SUITE, "payments", "till-1");
+        this.stock_ch = new Channel(SUITE, "stock", "till-1");
+        this.pay_ch.onState((up) => { self.relayout(); });
+        this.pay_ch.onPush("payment.received", (d) => { self.on_payment_feed(d); });
+        this.stock_ch.onState((up) => { self.on_stock_state(up); });
+        this.stock_ch.onPush("stock.changed", (d) => { self.on_stock(d); });
+        this.stock_ch.onPush("stock.low", (d) => { self.on_low(d); });
+    }
+
+    // ---- the services
+    fn on_stock_state(up: bool) {
+        if (up) {
+            let self = this;
+            this.stock_ch.request("stock.all", jobj(), self.stock_reply_cb());
+        }
+        this.relayout();
+    }
+    fn stock_reply_cb(): fn(ChannelReply) {
+        let self = this;
+        return (r) => { if (r.ok) { self.on_stock(r.data); } };
+    }
+    fn on_stock(d: JsonValue) {
+        for (let k in d.objKeys()) { this.stock.set(k, d.get(k).asInt()); }
+        this.relayout();
+    }
+    fn on_low(d: JsonValue) {
+        this.status = `Low stock: {d.get("name").asString()} ({d.get("left").asInt()} left)`;
+        this.relayout();
+    }
+    // Another till's payment (or this one's): a line on the status bar.
+    fn on_payment_feed(d: JsonValue) {
+        if (d.get("till").asString() != "till-1") {
+            this.status = `M-Pesa {d.get("ref").asString()}: KES {money(d.get("amount_cents").asInt())} at {d.get("till").asString()}`;
+            this.relayout();
+        }
+    }
+    // -1 when the stock service has not said (offline, or not started yet)
+    fn left(it: Item): int { return this.stock.get_or(it.name, -1); }
+
+    fn mpesa() {
+        if (this.mode != MODE_PAY || this.waiting || !this.pay_ch.up()) { return; }
+        let body = jobj();
+        body.set("amount_cents", jint(this.total()));
+        body.set("phone", jstr("254712345678"));
+        this.waiting = true;
+        this.status = "Waiting for M-Pesa…";
+        this.pay_ch.request("pay.simulate", body, this.reply_cb);
+        this.relayout();
+    }
+    fn on_mpesa(r: ChannelReply) {
+        this.waiting = false;
+        if (!r.ok) {
+            this.status = "M-Pesa failed: " + r.err;
+            this.relayout();
+            return;
+        }
+        this.status = "";
+        this.finish_sale("M-Pesa", r.data.get("ref").asString(), r.data.get("amount_cents").asInt());
+    }
+
+    // ---- totals
+    fn subtotal(): int {
+        let s = 0;
+        for (let l in this.lines) { s += l.amount(); }
+        return s;
+    }
+    fn discount(): int { return (this.subtotal() * this.disc + 50) / 100; }
+    fn total(): int { return this.subtotal() - this.discount(); }
+    // the VAT share of a VAT-inclusive amount: 16/116, rounded
+    fn vat(): int { return (this.total() * 32 + 116) / 232; }
+    fn count(): int {
+        let n = 0;
+        for (let l in this.lines) { n += l.qty; }
+        return n;
+    }
+    fn qty_of(it: Item): int {
+        for (let l in this.lines) { if (l.item == it) { return l.qty; } }
+        return 0;
+    }
+
+    // ---- selling
+    fn add(it: Item) {
+        if (this.mode != MODE_SELL) { return; }
+        for (let i in 0..this.lines.len) {
+            if (this.lines[i].item == it) {
+                this.lines[i].qty += 1;
+                this.sel = i;
+                return;
+            }
+        }
+        this.lines.push(new Line(it));
+        this.sel = this.lines.len - 1;
+    }
+    fn select(i: int) { if (i >= 0 && i < this.lines.len) { this.sel = i; } }
+    fn bump(d: int) {
+        if (this.sel < 0 || this.sel >= this.lines.len) { return; }
+        let l = this.lines[this.sel];
+        l.qty += d;
+        if (l.qty <= 0) { this.void_line(); }
+    }
+    fn void_line() {
+        if (this.sel < 0 || this.sel >= this.lines.len) { return; }
+        let keep: Line[] = [];
+        for (let i in 0..this.lines.len) { if (i != this.sel) { keep.push(this.lines[i]); } }
+        this.lines = keep;
+        if (this.sel >= this.lines.len) { this.sel = this.lines.len - 1; }
+    }
+    fn clear() {
+        this.lines = [];
+        this.sel = -1;
+        this.disc = 0;
+    }
+    fn set_cat(i: int) { this.cat = i; this.relayout(); }
+    // relayout, not just a redraw: the pills record which one is active
+    fn set_disc(p: int) { this.disc = p; this.relayout(); }
+
+    // ---- paying
+    fn start_pay() {
+        if (this.lines.len == 0) { return; }
+        this.mode = MODE_PAY;
+        this.entry = "";
+        this.relayout();
+    }
+    fn cancel_pay() { this.mode = MODE_SELL; this.relayout(); }
+    fn tendered(): int {
+        if (this.entry == "") { return 0; }
+        return this.entry.to_int() * 100;
+    }
+    fn key(k: string) {
+        if (k == "⌫") {
+            if (this.entry.len > 0) { this.entry = this.entry.slice(0, this.entry.len - 1); }
+            return;
+        }
+        if (k == "C") { this.entry = ""; return; }
+        if (this.entry.len >= 7) { return; }
+        if (this.entry == "" && (k == "0" || k == "00")) { return; }
+        this.entry = this.entry + k;
+    }
+    // quick cash: "exact", or a note value in shillings
+    fn quick(shillings: int) {
+        if (shillings == 0) {
+            let t = this.total();
+            this.entry = `{(t + 99) / 100}`;
+        } else {
+            this.entry = `{shillings}`;
+        }
+    }
+    fn complete() {
+        let t = this.total();
+        let given = this.tendered();
+        if (given < t) { return; }
+        this.finish_sale("Cash", "", given);
+    }
+
+    fn finish_sale(method: string, ref: string, given: int) {
+        this.method = method;
+        this.pay_ref = ref;
+        this.paid = given;
+        this.change = given - this.total();
+        this.receipt = this.build_receipt();
+        this.save();
+        // tell the stock service what left the shop
+        let lines = jarr();
+        for (let l in this.lines) {
+            let o = jobj();
+            o.set("name", jstr(l.item.name));
+            o.set("qty", jint(l.qty));
+            lines.append(o);
+        }
+        let body = jobj();
+        body.set("lines", lines);
+        this.stock_ch.request("stock.sell", body, this.ignore_cb);
+        this.mode = MODE_DONE;
+        this.relayout();
+    }
+    fn new_sale() {
+        this.clear();
+        this.waiting = false;
+        this.mode = MODE_SELL;
+        this.receipt_no += 1;
+        this.status = "";
+        this.relayout();
+    }
+
+    // ---- receipt and log
+    fn build_receipt(): string[] {
+        let r: string[] = [];
+        let now = date_now();
+        r.push("VYTO CAFÉ");
+        r.push("Kimathi Street, Nairobi");
+        r.push(`Till 1    Receipt #{pad4(this.receipt_no)}`);
+        r.push(date_format(now, "%d %b %Y  %H:%M"));
+        r.push("-");
+        for (let l in this.lines) {
+            r.push(`{l.qty} x {l.item.name}` + TAB + `{money(l.amount())}`);
+        }
+        r.push("-");
+        r.push(`Subtotal` + TAB + `{money(this.subtotal())}`);
+        if (this.disc > 0) { r.push(`Discount {this.disc}%` + TAB + `-{money(this.discount())}`); }
+        r.push(`TOTAL KES` + TAB + `{money(this.total())}`);
+        r.push(`incl. VAT 16%` + TAB + `{money(this.vat())}`);
+        if (this.method == "M-Pesa") {
+            r.push(`M-Pesa` + TAB + `{money(this.paid)}`);
+            r.push(`Ref` + TAB + this.pay_ref);
+        } else {
+            r.push(`Cash` + TAB + `{money(this.paid)}`);
+            r.push(`Change` + TAB + `{money(this.change)}`);
+        }
+        r.push("-");
+        r.push("Asante! Karibu tena.");
+        return r;
+    }
+
+    fn receipt_text(): string {
+        let out = "";
+        for (let ln in this.receipt) {
+            if (ln == "-") { out = out + "--------------------------------\r\n"; continue; }
+            let t = ln.index_of("\t");
+            if (t < 0) { out = out + ln + "\r\n"; continue; }
+            let left = ln.slice(0, t);
+            let right = ln.slice(t + 1, ln.len);
+            // characters, not bytes: "Café Latte" is 10 wide, 11 bytes long
+            let gap = 32 - charCount(left) - charCount(right);
+            if (gap < 1) { gap = 1; }
+            out = out + left + " ".repeat(gap) + right + "\r\n";
+        }
+        return out;
+    }
+
+    fn path(name: string): string {
+        if (this.dir.contains("\\")) { return this.dir + "\\" + name; }
+        return this.dir + "/" + name;
+    }
+
+    fn day_file(): string { return this.path("sales-" + date_format(date_now(), "%Y-%m-%d") + ".csv"); }
+
+    // Today's sales so far, from the CSV a previous run may have left.
+    fn load_day() {
+        if (this.dir == "") { return; }
+        let f = this.day_file();
+        if (!file_exists(f)) { return; }
+        let fh = file_open(f, "rb");
+        if (fh == null) { return; }
+        let text = fh.readText();
+        fh.close();
+        for (let ln in text.lines()) {
+            if (ln == "" || ln.starts_with("receipt")) { continue; }
+            let cols = ln.split(",");
+            if (cols.len < 7) { continue; }
+            this.day_sales += 1;
+            let tc = cols[6].replace(".", "");
+            this.day_total += tc.to_int();
+        }
+    }
+
+    fn save() {
+        this.day_sales += 1;
+        this.day_total += this.total();
+        if (this.dir == "" || !file_mkdirs(this.path("receipts"))) {
+            this.status = "Not saved: no data folder";
+            return;
+        }
+        let f = this.day_file();
+        let fresh = !file_exists(f);
+        let fh = file_open(f, "ab");
+        if (fh != null) {
+            if (fresh) {
+                fh.writeText("receipt,time,items,subtotal,discount_pct,discount,total,vat,tendered,change,method,ref\r\n");
+            }
+            let now = date_format(date_now(), "%H:%M:%S");
+            fh.writeText(`{pad4(this.receipt_no)},{now},{this.count()},{money(this.subtotal()).replace(",", "")},` +
+                         `{this.disc},{money(this.discount()).replace(",", "")},{money(this.total()).replace(",", "")},` +
+                         `{money(this.vat()).replace(",", "")},{money(this.paid).replace(",", "")},` +
+                         `{money(this.change).replace(",", "")},{this.method},{this.pay_ref}` + CRLF);
+            fh.close();
+        }
+        this.receipt_path = this.path("receipts") + sep_of(this.dir) + "receipt-" +
+            date_format(date_now(), "%Y%m%d") + "-" + pad4(this.receipt_no) + ".txt";
+        let rf = file_open(this.receipt_path, "wb");
+        if (rf != null) {
+            rf.writeText(this.receipt_text());
+            rf.close();
+            this.status = "Saved " + this.receipt_path;
+        } else {
+            this.status = "Receipt not saved";
+        }
+    }
+
+    fn save_copy() {
+        let p = new FileDialog().title("Save receipt copy").filter("Text", "*.txt")
+            .owner(this.owner()).save("receipt-" + pad4(this.receipt_no) + ".txt");
+        if (p == null) { return; }
+        let fh = file_open(p, "wb");
+        if (fh == null) { this.status = "Could not write " + p; return; }
+        fh.writeText(this.receipt_text());
+        fh.close();
+        this.status = "Copy saved to " + p;
+    }
+
+    fn open_log() {
+        if (this.dir != "") { openPath(this.dir); }
+    }
+
+    fn owner(): culong {
+        let w = this.win;
+        if (w == null) { return 0 as culong; }
+        return w.surface().native_window();
+    }
+
+    fn relayout() {
+        let w = this.win;
+        if (w == null) { return; }
+        let sc = this.screen;
+        if (sc != null) { sc.rebuild(); }
+        w.layout();
+        w.redraw();
+    }
+}
+
+fn sep_of(dir: string): string {
+    if (dir.contains("\\")) { return "\\"; }
+    return "/";
+}
+
+// ---- drawing helpers ---------------------------------------------------------
+
+// baseline that centres a line of the current font on cy
+fn base_at(s: Painter, cy: float): float { return (cy + s.font_ascent() / 2.0 - 1.0).round(); }
+
+fn text_left(s: Painter, x: float, cy: float, t: string, col: int) { s.text(x, base_at(s, cy), t, col); }
+
+fn text_right(s: Painter, right: float, cy: float, t: string, col: int) {
+    s.text(right - s.text_width(t), base_at(s, cy), t, col);
+}
+
+fn text_mid(s: Painter, r: Rect, cy: float, t: string, col: int) {
+    s.text(r.x + (r.w - s.text_width(t)) / 2.0, base_at(s, cy), t, col);
+}
+
+// Shorten t with an ellipsis until it fits w.
+fn fit(s: Painter, t: string, w: float): string {
+    if (s.text_width(t) <= w) { return t; }
+    let u = t;
+    while (u.len > 1 && s.text_width(u + "…") > w) { u = u.slice(0, u.len - 1); }
+    return u + "…";
+}
+
+// Up to two lines at word breaks.
+fn wrap2(s: Painter, t: string, w: float): string[] {
+    if (s.text_width(t) <= w) { return [t]; }
+    let words = t.split(" ");
+    let first = "";
+    let i = 0;
+    while (i < words.len) {
+        let cand = words[i];
+        if (first != "") { cand = first + " " + words[i]; }
+        if (s.text_width(cand) > w && first != "") { break; }
+        first = cand;
+        i += 1;
+    }
+    let rest = "";
+    while (i < words.len) {
+        if (rest != "") { rest = rest + " "; }
+        rest = rest + words[i];
+        i += 1;
+    }
+    if (rest == "") { return [fit(s, first, w)]; }
+    return [fit(s, first, w), fit(s, rest, w)];
+}
+
+fn press_amount(w: Widget): float {
+    if (w.anim_press != null) { return w.anim_press.value(); }
+    if (w.pressed) { return 1.0; }
+    return 0.0;
+}
+
+// ---- widgets -----------------------------------------------------------------
+
+// A big touch button: a filled rounded rect with one or two centred lines.
+class Btn extends Widget {
+    label: string;
+    sub: string;
+    bg: int;
+    fg: int;
+    size: float;
+    active: bool;      // pills: the selected one is drawn filled
+    outline: bool;     // pills: unselected ones are drawn as an outline
+    on: fn();
+
+    fn init(label: string, bg: int, fg: int, on: fn()) {
+        super.init();
+        this.label = label;
+        this.sub = "";
+        this.bg = bg;
+        this.fg = fg;
+        this.size = 18.0;
+        this.active = false;
+        this.outline = false;
+        this.on = on;
+    }
+
+    override fn measure(s: Painter, th: Theme): Size { return Size(this.dp(80.0), this.dp(52.0)); }
+
+    override fn on_click(x: int, y: int): bool {
+        if (this.disabled) { return false; }
+        this.on();
+        return true;
+    }
+
+    override fn render(s: Painter, th: Theme) {
+        let r = this.bounds;
+        let rad = this.dp(10.0);
+        let bg = this.bg;
+        let fg = this.fg;
+        if (this.outline && !this.active) { bg = C_PANEL; fg = C_INK; }
+        let pr = press_amount(this);
+        if (pr > 0.0) { bg = darken(bg, (pr * 14.0) as int); }
+        if (this.disabled) { bg = mix_white(bg, 60); fg = mix_white(fg, 40); }
+        s.fill_round(r, rad, bg);
+        if (this.outline && !this.active) { s.stroke_round(r, rad, this.dp(1.5), C_LINE); }
+        s.push_font(this.dp(this.size), WEIGHT.BOLD);
+        if (this.sub == "") {
+            text_mid(s, r, r.y + r.h / 2.0, fit(s, this.label, r.w - this.dp(12.0)), fg);
+            s.pop_font();
+            return;
+        }
+        text_mid(s, r, r.y + r.h * 0.38, fit(s, this.label, r.w - this.dp(12.0)), fg);
+        s.pop_font();
+        s.push_font(this.dp(this.size * 0.72), WEIGHT.MED);
+        text_mid(s, r, r.y + r.h * 0.70, fit(s, this.sub, r.w - this.dp(12.0)), mix_white(fg, 15));
+        s.pop_font();
+    }
+}
+
+// A product: white card, category stripe, name, price, and a badge with how
+// many are already on the ticket.
+class Tile extends Widget {
+    item: Item;
+    app: Pos;
+
+    fn init(item: Item, app: Pos) {
+        super.init();
+        this.item = item;
+        this.app = app;
+    }
+
+    override fn measure(s: Painter, th: Theme): Size { return Size(this.dp(160.0), this.dp(104.0)); }
+
+    override fn on_click(x: int, y: int): bool {
+        if (this.disabled) { return false; }
+        this.app.add(this.item);
+        return true;
+    }
+
+    override fn render(s: Painter, th: Theme) {
+        let r = this.bounds;
+        let rad = this.dp(12.0);
+        let col = cat_color(this.item.cat);
+        let pr = press_amount(this);
+        let card = C_PANEL;
+        if (pr > 0.0) { card = mix_white(col, 100 - (pr * 18.0) as int); }
+        if (this.disabled) { card = 0xFFF7F8FA; }
+        s.shadow(r, rad, this.dp(6.0), this.dp(2.0), rgba(20, 30, 40, 40));
+        s.fill_round(r, rad, card);
+        s.clip_push(r, rad);
+        let stripe = col;
+        if (this.disabled) { stripe = mix_white(col, 60); }
+        s.fill(Rect(r.x, r.y, this.dp(7.0), r.h), stripe);
+        s.clip_pop();
+
+        let pad = this.dp(18.0);
+        let ink = C_INK;
+        if (this.disabled) { ink = 0xFFA9B1BA; }
+        s.push_font(this.dp(17.0), WEIGHT.BOLD);
+        let lines = wrap2(s, this.item.name, r.w - pad - this.dp(40.0));
+        let lh = s.font_height();
+        for (let i in 0..lines.len) {
+            s.text(r.x + pad, r.y + this.dp(14.0) + s.font_ascent() + (i as float) * lh, lines[i], ink);
+        }
+        s.pop_font();
+        s.push_font(this.dp(16.0), WEIGHT.MED);
+        let pc = darken(col, 10);
+        if (this.disabled) { pc = 0xFFA9B1BA; }
+        s.text(r.x + pad, r.y + r.h - this.dp(16.0), "KES " + money(this.item.price), pc);
+        s.pop_font();
+
+        let left = this.app.left(this.item);
+        if (left >= 0) {
+            s.push_font(this.dp(13.0), WEIGHT.MED);
+            let lt = `{left} left`;
+            if (left == 0) { lt = "Sold out"; }
+            let lc = C_MUTED;
+            if (left < 5) { lc = C_RED; }
+            text_right(s, r.x + r.w - this.dp(14.0), r.y + r.h - this.dp(20.0), lt, lc);
+            s.pop_font();
+        }
+        let q = this.app.qty_of(this.item);
+        if (q > 0) {
+            let br = this.dp(15.0);
+            let cx = r.x + r.w - this.dp(22.0);
+            let cy = r.y + this.dp(22.0);
+            s.circle(cx, cy, br, col);
+            s.push_font(this.dp(14.0), WEIGHT.BOLD);
+            let t = `{q}`;
+            s.text(cx - s.text_width(t) / 2.0, base_at(s, cy), t, 0xFFFFFFFF);
+            s.pop_font();
+        }
+    }
+}
+
+// The ticket lines. Tap a row to select it; the selected row is what the
+// -/+/Void buttons act on, and the list scrolls to keep it in view.
+class TicketList extends Widget {
+    app: Pos;
+    first: int;
+
+    fn init(app: Pos) {
+        super.init();
+        this.app = app;
+        this.first = 0;
+    }
+
+    override fn shows_press(): bool { return false; }
+    override fn measure(s: Painter, th: Theme): Size { return Size(this.dp(300.0), this.dp(200.0)); }
+
+    fn row_h(): float { return this.dp(50.0); }
+
+    fn visible_rows(): int {
+        let n = (this.bounds.h / this.row_h()) as int;
+        if (n < 1) { n = 1; }
+        return n;
+    }
+
+    override fn on_click(x: int, y: int): bool {
+        if (this.app.mode != MODE_SELL) { return false; }
+        let i = this.first + ((y as float - this.bounds.y) / this.row_h()) as int;
+        if (i < 0 || i >= this.app.lines.len) { return false; }
+        this.app.select(i);
+        return true;
+    }
+
+    override fn render(s: Painter, th: Theme) {
+        let r = this.bounds;
+        let a = this.app;
+        if (a.lines.len == 0) {
+            s.push_font(this.dp(16.0), WEIGHT.REG);
+            text_mid(s, r, r.y + r.h / 2.0 - this.dp(12.0), "No items yet", C_MUTED);
+            text_mid(s, r, r.y + r.h / 2.0 + this.dp(14.0), "Tap a product to start an order", C_MUTED);
+            s.pop_font();
+            return;
+        }
+        let rows = this.visible_rows();
+        if (a.sel >= 0) {
+            if (a.sel < this.first) { this.first = a.sel; }
+            if (a.sel >= this.first + rows) { this.first = a.sel - rows + 1; }
+        }
+        if (this.first > a.lines.len - rows) { this.first = a.lines.len - rows; }
+        if (this.first < 0) { this.first = 0; }
+        let rh = this.row_h();
+        s.clip_push(r, 0.0);
+        for (let k in 0..rows) {
+            let i = this.first + k;
+            if (i >= a.lines.len) { break; }
+            let l = a.lines[i];
+            let ry = r.y + (k as float) * rh;
+            let row = Rect(r.x, ry, r.w, rh);
+            if (i == a.sel && a.mode == MODE_SELL) {
+                s.fill_round(Rect(r.x, ry + this.dp(3.0), r.w, rh - this.dp(6.0)), this.dp(8.0), C_SEL);
+            }
+            let cy = ry + rh / 2.0;
+            // qty bubble
+            let bx = r.x + this.dp(22.0);
+            s.circle(bx, cy, this.dp(15.0), mix_white(cat_color(l.item.cat), 82));
+            s.push_font(this.dp(15.0), WEIGHT.BOLD);
+            let qs = `{l.qty}`;
+            s.text(bx - s.text_width(qs) / 2.0, base_at(s, cy), qs, darken(cat_color(l.item.cat), 20));
+            s.pop_font();
+            s.push_font(this.dp(16.0), WEIGHT.BOLD);
+            let amt = money(l.amount());
+            let aw = s.text_width(amt);
+            text_right(s, r.x + r.w - this.dp(8.0), cy - this.dp(7.0), amt, C_INK);
+            s.pop_font();
+            s.push_font(this.dp(16.0), WEIGHT.MED);
+            text_left(s, r.x + this.dp(48.0), cy - this.dp(7.0),
+                      fit(s, l.item.name, r.w - this.dp(64.0) - aw), C_INK);
+            s.pop_font();
+            s.push_font(this.dp(13.0), WEIGHT.REG);
+            text_left(s, r.x + this.dp(48.0), cy + this.dp(12.0), `@ {money(l.item.price)}`, C_MUTED);
+            s.pop_font();
+            s.line(r.x, ry + rh - 0.5, r.x + r.w, ry + rh - 0.5, C_LINE);
+        }
+        s.clip_pop();
+        if (a.lines.len > rows) {
+            s.push_font(this.dp(12.0), WEIGHT.REG);
+            text_right(s, r.x + r.w, r.y + r.h + this.dp(9.0),
+                       `{this.first + 1}–{this.first + rows} of {a.lines.len} lines`, C_MUTED);
+            s.pop_font();
+        }
+    }
+}
+
+// ---- the screen ---------------------------------------------------------------
+
+export class PosScreen extends Widget {
+    app: Pos;
+    list: TicketList;
+    // regions, set by arrange() and painted by draw_chrome()
+    hdr: Rect;
+    left: Rect;
+    right: Rect;
+    info: Rect;      // right panel: the block between the buttons (totals, pay display, receipt)
+    status_y: float;
+
+    fn init(app: Pos) {
+        super.init();
+        this.app = app;
+        this.list = new TicketList(app);
+        this.hdr = Rect(0.0, 0.0, 0.0, 0.0);
+        this.left = this.hdr;
+        this.right = this.hdr;
+        this.info = this.hdr;
+        this.status_y = 0.0;
+    }
+
+    override fn shows_press(): bool { return false; }
+    override fn measure(s: Painter, th: Theme): Size { return Size(this.dp(1280.0), this.dp(800.0)); }
+
+    fn btn(label: string, bg: int, fg: int, on: fn()): Btn {
+        let b = new Btn(label, bg, fg, on);
+        this.add(b);
+        return b;
+    }
+
+    // The children for the current mode, in a fixed order arrange() relies on.
+    fn rebuild() {
+        this.children = [];
+        let a = this.app;
+        for (let i in 0..a.cats.len) { this.add_pill(i); }
+        for (let it in a.items) {
+            if (it.cat != a.cat) { continue; }
+            let t = new Tile(it, a);
+            t.disabled = a.mode != MODE_SELL || a.left(it) == 0;
+            this.add(t);
+        }
+        if (a.mode == MODE_SELL) {
+            this.add(this.list);
+            this.btn("−", C_KEY, C_INK, () => { a.bump(-1); }).size = 26.0;
+            this.btn("+", C_KEY, C_INK, () => { a.bump(1); }).size = 26.0;
+            this.btn("Void line", 0xFFFCE8E8, C_RED, () => { a.void_line(); });
+            this.btn("Clear", 0xFFFCE8E8, C_RED, () => { a.clear(); a.relayout(); });
+            let pcts = [0, 5, 10, 15];
+            for (let p in pcts) { this.add_disc(p); }
+            let pay = this.btn("PAY", C_GREEN, 0xFFFFFFFF, () => { a.start_pay(); });
+            pay.size = 24.0;
+        } else if (a.mode == MODE_PAY) {
+            let notes = [0, 500, 1000, 2000];
+            for (let n in notes) { this.add_quick(n); }
+            let keys = ["7", "8", "9", "4", "5", "6", "1", "2", "3", "00", "0", "⌫"];
+            for (let k in keys) { this.add_key(k); }
+            let mlabel = "M-Pesa (simulated)";
+            if (a.waiting) { mlabel = "Waiting for M-Pesa…"; }
+            else if (!a.pay_ch.up()) { mlabel = "Payments offline"; }
+            let mp = this.btn(mlabel, C_GREEN_MPESA, 0xFFFFFFFF, () => { a.mpesa(); });
+            mp.size = 20.0;
+            mp.disabled = a.waiting || !a.pay_ch.up();
+            this.btn("Cancel", 0xFFFCE8E8, C_RED, () => { a.cancel_pay(); });
+            let done = this.btn("Complete sale", C_GREEN, 0xFFFFFFFF, () => { a.complete(); });
+            done.size = 22.0;
+        } else {
+            this.btn("Save copy…", C_KEY, C_INK, () => { a.save_copy(); });
+            let of = this.btn("Open sales folder", C_KEY, C_INK, () => { a.open_log(); });
+            of.disabled = !desktop_available() || a.dir == "";
+            let ns = this.btn("New sale", C_BLUE, 0xFFFFFFFF, () => { a.new_sale(); });
+            ns.size = 22.0;
+        }
+    }
+
+    fn add_pill(i: int) {
+        let a = this.app;
+        let b = this.btn(a.cats[i], cat_color(i), 0xFFFFFFFF, () => { a.set_cat(i); });
+        b.outline = true;
+        b.active = i == a.cat;
+        b.size = 17.0;
+    }
+
+    fn add_disc(p: int) {
+        let a = this.app;
+        let label = `{p}%`;
+        if (p == 0) { label = "No disc."; }
+        let b = this.btn(label, C_AMBER, 0xFFFFFFFF, () => { a.set_disc(p); });
+        b.outline = true;
+        b.active = a.disc == p;
+        b.size = 15.0;
+    }
+
+    fn add_quick(n: int) {
+        let a = this.app;
+        let label = "Exact";
+        if (n > 0) { label = money(n * 100).replace(".00", ""); }
+        let b = this.btn(label, 0xFFE7F0FD, C_BLUE, () => { a.quick(n); });
+        b.size = 17.0;
+    }
+
+    fn add_key(k: string) {
+        let a = this.app;
+        let b = this.btn(k, C_KEY, C_INK, () => { a.key(k); });
+        b.size = 26.0;
+    }
+
+    override fn arrange(s: Painter, th: Theme, r: Rect) {
+        this.layout_to(r);
+        let a = this.app;
+        let g = this.dp(14.0);
+        let hh = this.dp(60.0);
+        let rw = r.w * 0.36;
+        if (rw < this.dp(420.0)) { rw = this.dp(420.0); }
+        this.hdr = Rect(r.x, r.y, r.w, hh);
+        this.left = Rect(r.x + g, r.y + hh + g, r.w - rw - 3.0 * g, r.h - hh - 2.0 * g - this.dp(26.0));
+        this.right = Rect(r.x + r.w - rw - g, r.y + hh + g, rw, r.h - hh - 2.0 * g);
+        this.status_y = r.y + r.h - g - this.dp(10.0);
+        let k = 0;
+
+        // category pills
+        let n = a.cats.len;
+        let pw = (this.left.w - g * ((n - 1) as float)) / (n as float);
+        let ph = this.dp(54.0);
+        for (let i in 0..n) {
+            this.children[k].arrange(s, th, Rect(this.left.x + (i as float) * (pw + g), this.left.y, pw, ph));
+            k += 1;
+        }
+        // product tiles
+        let cols = 4;
+        if (this.left.w < this.dp(680.0)) { cols = 3; }
+        let tw = (this.left.w - g * ((cols - 1) as float)) / (cols as float);
+        let th2 = this.dp(108.0);
+        let ty = this.left.y + ph + g + this.dp(6.0);
+        let idx = 0;
+        for (let it in a.items) {
+            if (it.cat != a.cat) { continue; }
+            let col = idx % cols;
+            let row = idx / cols;
+            this.children[k].arrange(s, th, Rect(this.left.x + (col as float) * (tw + g),
+                                                 ty + (row as float) * (th2 + g), tw, th2));
+            k += 1;
+            idx += 1;
+        }
+
+        // right panel
+        let p = this.dp(18.0);
+        let ix = this.right.x + p;
+        let iw = this.right.w - 2.0 * p;
+        let top = this.right.y + this.dp(64.0);          // under the panel title
+        let bottom = this.right.y + this.right.h - p;
+        if (a.mode == MODE_SELL) {
+            let payh = this.dp(72.0);
+            let pay_y = bottom - payh;
+            let tot_h = this.dp(124.0);
+            let disc_y = pay_y - g - tot_h - g - this.dp(46.0);
+            let act_y = disc_y - g / 2.0 - this.dp(56.0);
+            this.list.arrange(s, th, Rect(ix, top, iw, act_y - g - top - this.dp(10.0)));
+            k += 1;
+            let aw = (iw - 3.0 * this.dp(10.0)) / 4.0;
+            for (let i in 0..4) {
+                this.children[k].arrange(s, th, Rect(ix + (i as float) * (aw + this.dp(10.0)), act_y, aw, this.dp(56.0)));
+                k += 1;
+            }
+            let dw = (iw - 3.0 * this.dp(8.0)) / 4.0;
+            for (let i in 0..4) {
+                this.children[k].arrange(s, th, Rect(ix + (i as float) * (dw + this.dp(8.0)), disc_y, dw, this.dp(46.0)));
+                k += 1;
+            }
+            this.info = Rect(ix, disc_y + this.dp(46.0) + g, iw, tot_h);
+            this.children[k].arrange(s, th, Rect(ix, pay_y, iw, payh));
+            k += 1;
+        } else if (a.mode == MODE_PAY) {
+            this.info = Rect(ix, top, iw, this.dp(150.0));
+            let qy = top + this.dp(150.0) + g;
+            let qh = this.dp(52.0);
+            let qw = (iw - 3.0 * this.dp(8.0)) / 4.0;
+            for (let i in 0..4) {
+                this.children[k].arrange(s, th, Rect(ix + (i as float) * (qw + this.dp(8.0)), qy, qw, qh));
+                k += 1;
+            }
+            let ky = qy + qh + g;
+            let bh = this.dp(68.0);
+            let mh = this.dp(56.0);
+            let kh = (bottom - bh - g - mh - g - ky - 3.0 * this.dp(8.0)) / 4.0;
+            if (kh > this.dp(66.0)) { kh = this.dp(66.0); }
+            let kw = (iw - 2.0 * this.dp(8.0)) / 3.0;
+            for (let i in 0..12) {
+                let c = i % 3;
+                let rr = i / 3;
+                this.children[k].arrange(s, th, Rect(ix + (c as float) * (kw + this.dp(8.0)),
+                                                     ky + (rr as float) * (kh + this.dp(8.0)), kw, kh));
+                k += 1;
+            }
+            // M-Pesa: full width above Cancel / Complete
+            this.children[k].arrange(s, th, Rect(ix, bottom - bh - g - mh, iw, mh));
+            k += 1;
+            let cw = iw * 0.34;
+            this.children[k].arrange(s, th, Rect(ix, bottom - bh, cw, bh));
+            k += 1;
+            this.children[k].arrange(s, th, Rect(ix + cw + g, bottom - bh, iw - cw - g, bh));
+            k += 1;
+        } else {
+            let bh = this.dp(68.0);
+            let rowh = this.dp(52.0);
+            let row_y = bottom - bh - g - rowh;
+            this.info = Rect(ix, top, iw, row_y - g - top);
+            let hw = (iw - g) / 2.0;
+            this.children[k].arrange(s, th, Rect(ix, row_y, hw, rowh));
+            k += 1;
+            this.children[k].arrange(s, th, Rect(ix + hw + g, row_y, hw, rowh));
+            k += 1;
+            this.children[k].arrange(s, th, Rect(ix, bottom - bh, iw, bh));
+            k += 1;
+        }
+    }
+
+    override fn render(s: Painter, th: Theme) {
+        this.draw_chrome(s, th);
+        for (let c in this.children) { c.draw(s, th); }
+    }
+
+    override fn draw_chrome(s: Painter, th: Theme) {
+        let a = this.app;
+        let r = this.bounds;
+        s.fill(r, C_BG);
+
+        // header
+        s.fill(this.hdr, C_HEADER);
+        let cy = this.hdr.y + this.hdr.h / 2.0;
+        s.push_font(this.dp(22.0), WEIGHT.BOLD);
+        text_left(s, this.hdr.x + this.dp(20.0), cy, "Vyto Café", 0xFFFFFFFF);
+        let nw = s.text_width("Vyto Café");
+        s.pop_font();
+        s.push_font(this.dp(15.0), WEIGHT.MED);
+        text_left(s, this.hdr.x + this.dp(36.0) + nw, cy, "Till 1  ·  Cashier: Amina", 0xFFB8C2CC);
+        let dt = date_format(date_now(), "%a %d %b %Y   %H:%M");
+        let dx = this.hdr.x + this.hdr.w - this.dp(20.0);
+        text_right(s, dx, cy, dt, 0xFFFFFFFF);
+        // service pills: green dot when connected
+        let px2 = dx - s.text_width(dt) - this.dp(28.0);
+        px2 = this.pill(s, px2, cy, "Stock", a.stock_ch.up());
+        px2 = this.pill(s, px2 - this.dp(10.0), cy, "Payments", a.pay_ch.up());
+        s.pop_font();
+
+        // status line under the products
+        s.push_font(this.dp(14.0), WEIGHT.MED);
+        let sales = "sales";
+        if (a.day_sales == 1) { sales = "sale"; }
+        let st = `Today: {a.day_sales} {sales}  ·  KES {money(a.day_total)}`;
+        text_left(s, this.left.x, this.status_y, st, C_MUTED);
+        if (a.status != "") {
+            text_right(s, this.left.x + this.left.w, this.status_y,
+                       fit(s, a.status, this.left.w - s.text_width(st) - this.dp(30.0)), C_MUTED);
+        }
+        s.pop_font();
+
+        // right panel card and title
+        let rad = this.dp(14.0);
+        s.shadow(this.right, rad, this.dp(10.0), this.dp(3.0), rgba(20, 30, 40, 45));
+        s.fill_round(this.right, rad, C_PANEL);
+        let px = this.right.x + this.dp(18.0);
+        let pr = this.right.x + this.right.w - this.dp(18.0);
+        let ty = this.right.y + this.dp(32.0);
+        s.push_font(this.dp(20.0), WEIGHT.BOLD);
+        let title = `Order #{pad4(a.receipt_no)}`;
+        if (a.mode == MODE_PAY) { title = "Payment"; }
+        if (a.mode == MODE_DONE) { title = "Sale complete"; }
+        text_left(s, px, ty, title, C_INK);
+        s.pop_font();
+        s.push_font(this.dp(14.0), WEIGHT.MED);
+        let items = `{a.count()} items`;
+        if (a.count() == 1) { items = "1 item"; }
+        if (a.mode == MODE_DONE) { items = `Receipt #{pad4(a.receipt_no)}`; }
+        text_right(s, pr, ty, items, C_MUTED);
+        s.pop_font();
+        s.line(px, this.right.y + this.dp(56.0), pr, this.right.y + this.dp(56.0), C_LINE);
+
+        if (a.mode == MODE_SELL) { this.draw_totals(s); }
+        else if (a.mode == MODE_PAY) { this.draw_pay(s); }
+        else { this.draw_receipt(s); }
+    }
+
+    // A "● Name" pill ending at `right`; returns its left edge.
+    fn pill(s: Painter, right: float, cy: float, label: string, up: bool): float {
+        let w = s.text_width(label) + this.dp(34.0);
+        let r = Rect(right - w, cy - this.dp(14.0), w, this.dp(28.0));
+        let bg = 0xFF2C3A47;
+        s.fill_round(r, this.dp(14.0), bg);
+        let dot = C_DOT_OFF;
+        if (up) { dot = C_DOT_ON; }
+        s.circle(r.x + this.dp(14.0), cy, this.dp(5.0), dot);
+        let tc = 0xFFE6EBF0;
+        if (!up) { tc = 0xFF8D99A6; }
+        text_left(s, r.x + this.dp(25.0), cy, label, tc);
+        return r.x;
+    }
+
+    fn draw_totals(s: Painter) {
+        let a = this.app;
+        let r = this.info;
+        let rx = r.x + r.w;
+        let row = this.dp(24.0);
+        s.push_font(this.dp(15.0), WEIGHT.MED);
+        let y = r.y + row / 2.0;
+        text_left(s, r.x, y, "Subtotal", C_MUTED);
+        text_right(s, rx, y, money(a.subtotal()), C_INK);
+        y += row;
+        let dl = "Discount";
+        if (a.disc > 0) { dl = `Discount {a.disc}%`; }
+        text_left(s, r.x, y, dl, C_MUTED);
+        let dv = "—";
+        if (a.disc > 0) { dv = "−" + money(a.discount()); }
+        text_right(s, rx, y, dv, C_AMBER);
+        y += row;
+        text_left(s, r.x, y, "VAT 16% (included)", C_MUTED);
+        text_right(s, rx, y, money(a.vat()), C_INK);
+        s.pop_font();
+        s.line(r.x, r.y + 3.0 * row + this.dp(4.0), rx, r.y + 3.0 * row + this.dp(4.0), C_LINE);
+        let ty = r.y + 3.0 * row + this.dp(26.0);
+        s.push_font(this.dp(18.0), WEIGHT.BOLD);
+        text_left(s, r.x, ty, "TOTAL", C_INK);
+        s.pop_font();
+        s.push_font(this.dp(28.0), WEIGHT.BOLD);
+        text_right(s, rx, ty, "KES " + money(a.total()), C_INK);
+        s.pop_font();
+    }
+
+    fn draw_pay(s: Painter) {
+        let a = this.app;
+        let r = this.info;
+        let rx = r.x + r.w;
+        s.push_font(this.dp(15.0), WEIGHT.MED);
+        text_left(s, r.x, r.y + this.dp(14.0), "Amount due", C_MUTED);
+        s.pop_font();
+        s.push_font(this.dp(30.0), WEIGHT.BOLD);
+        text_right(s, rx, r.y + this.dp(16.0), "KES " + money(a.total()), C_INK);
+        s.pop_font();
+
+        // tendered display
+        let d = Rect(r.x, r.y + this.dp(40.0), r.w, this.dp(60.0));
+        s.fill_round(d, this.dp(10.0), 0xFFF4F7FB);
+        s.stroke_round(d, this.dp(10.0), this.dp(1.5), 0xFFC9D6EA);
+        s.push_font(this.dp(14.0), WEIGHT.MED);
+        text_left(s, d.x + this.dp(14.0), d.y + d.h / 2.0, "Cash received", C_MUTED);
+        s.pop_font();
+        let shown = "0";
+        if (a.entry != "") { shown = money(a.tendered()); }
+        s.push_font(this.dp(30.0), WEIGHT.BOLD);
+        text_right(s, d.x + d.w - this.dp(14.0), d.y + d.h / 2.0, shown, C_BLUE);
+        s.pop_font();
+
+        // change
+        let cy = r.y + this.dp(126.0);
+        let given = a.tendered();
+        let t = a.total();
+        s.push_font(this.dp(17.0), WEIGHT.BOLD);
+        if (given >= t && given > 0) {
+            text_left(s, r.x, cy, "Change due", C_GREEN);
+            text_right(s, rx, cy, "KES " + money(given - t), C_GREEN);
+        } else if (given > 0) {
+            text_left(s, r.x, cy, "Still owed", C_RED);
+            text_right(s, rx, cy, "KES " + money(t - given), C_RED);
+        } else {
+            s.pop_font();
+            s.push_font(this.dp(15.0), WEIGHT.MED);
+            text_left(s, r.x, cy, "Enter the cash received, or tap a note", C_MUTED);
+        }
+        s.pop_font();
+        // Complete is only live once the cash covers the total.
+        let n = this.children.len;
+        if (n > 0) { this.children[n - 1].disabled = given < t; }
+    }
+
+    fn draw_receipt(s: Painter) {
+        let a = this.app;
+        let r = this.info;
+        // paper
+        let paper = Rect(r.x + this.dp(16.0), r.y, r.w - this.dp(32.0), r.h);
+        s.shadow(paper, this.dp(4.0), this.dp(8.0), this.dp(2.0), rgba(20, 30, 40, 50));
+        s.fill_round(paper, this.dp(4.0), 0xFFFFFEF8);
+        let x0 = paper.x + this.dp(20.0);
+        let x1 = paper.x + paper.w - this.dp(20.0);
+        let y = paper.y + this.dp(26.0);
+        let lh = this.dp(22.0);
+        s.clip_push(paper, this.dp(4.0));
+        for (let i in 0..a.receipt.len) {
+            let ln = a.receipt[i];
+            if (ln == "-") {
+                s.line(x0, y - this.dp(4.0), x1, y - this.dp(4.0), 0xFFC9CED4);
+                y += this.dp(10.0);
+                continue;
+            }
+            let w = WEIGHT.REG;
+            let size = 14.0;
+            if (i == 0) { w = WEIGHT.BOLD; size = 18.0; }
+            if (ln.starts_with("TOTAL")) { w = WEIGHT.BOLD; size = 17.0; }
+            s.push_font(this.dp(size), w);
+            let t = ln.index_of("\t");
+            if (t < 0) {
+                if (i < 4 || i == a.receipt.len - 1) {
+                    text_mid(s, paper, y, ln, C_INK);
+                } else {
+                    text_left(s, x0, y, ln, C_INK);
+                }
+            } else {
+                text_left(s, x0, y, ln.slice(0, t), C_INK);
+                text_right(s, x1, y, ln.slice(t + 1, ln.len), C_INK);
+            }
+            s.pop_font();
+            y += lh;
+        }
+        s.clip_pop();
+    }
+}
+
+// Build the screen into a window. The caller picks the painter first.
+export fn buildPos(win: Window): PosScreen {
+    let app = new Pos();
+    let screen = new PosScreen(app);
+    app.win = win;
+    app.screen = screen;
+    win.theme.bg = C_BG;
+    screen.rebuild();
+    win.root = screen;
+    attachChannel(win, app.pay_ch);
+    attachChannel(win, app.stock_ch);
+    return screen;
+}

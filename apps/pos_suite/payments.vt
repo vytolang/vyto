@@ -1,0 +1,145 @@
+// Vyto Café Payments — a background service of the POS suite (simulated
+// M-Pesa). Runs as Windows service "VytoCafePayments" (installed by the
+// suite's setup) or from a terminal while developing:
+//
+//     ./vytoc run apps/pos_suite/payments.vt
+//
+// Channel "payments" (vyto/desktop/channel), operations:
+//   pay.simulate {amount_cents, phone}  -> a confirmed payment record:
+//       {"id":"PAY-000123","method":"M-Pesa","ref":"SGH7K2Q9XL",
+//        "amount_cents":96300,"phone":"2547****678","status":"confirmed",
+//        "time":"2026-11-12T18:40:05"}
+//     and the same record pushed to every till as "payment.received"
+//   pay.today {}  -> {"count": n, "total_cents": t}
+//
+// Each payment is appended to payments-YYYY-MM-DD.csv in
+// sharedDataDir("vyto-cafe-suite") (%ProgramData% on Windows).
+import { Service } from "vyto/desktop/service";
+import { ChannelServer, ChannelRequest } from "vyto/desktop/channel";
+import { sharedDataDir } from "vyto/desktop";
+import { JsonValue, jobj, jstr, jint } from "vyto/util/json";
+import { secureBelow } from "vyto/math/securerandom";
+import { date_now, date_format } from "vyto/util/date";
+import { file_mkdirs, file_open, file_exists } from "vyto/io/file";
+import { SUITE, PAYMENTS_SERVICE } from "menu";
+
+const MAX_CENTS: int = 100000000;   // KES 1,000,000
+
+class Payments {
+    srv: ChannelServer;
+    svc: Service;
+    dir: string;
+    count: int;
+    total: int;
+
+    fn init(srv: ChannelServer, svc: Service) {
+        this.srv = srv;
+        this.svc = svc;
+        this.dir = sharedDataDir(SUITE);
+        this.count = 0;
+        this.total = 0;
+        this.load_day();
+    }
+
+    fn sep(): string {
+        if (this.dir.contains("\\")) { return "\\"; }
+        return "/";
+    }
+
+    fn day_file(): string {
+        return this.dir + this.sep() + "payments-" + date_format(date_now(), "%Y-%m-%d") + ".csv";
+    }
+
+    // Numbering and today's total carry on from a previous run's CSV.
+    fn load_day() {
+        let f = this.day_file();
+        if (!file_exists(f)) { return; }
+        let fh = file_open(f, "rb");
+        if (fh == null) { return; }
+        let text = fh.readText();
+        fh.close();
+        for (let ln in text.lines()) {
+            if (ln == "" || ln.starts_with("id,")) { continue; }
+            let c = ln.split(",");
+            if (c.len < 4) { continue; }
+            this.count += 1;
+            this.total += c[3].to_int();
+        }
+    }
+
+    // What an M-Pesa confirmation code looks like: 10 capitals and digits.
+    fn ref(): string {
+        let alpha = "ABCDEFGHJKLMNPQRSTUVWXYZ0123456789";
+        let out = "";
+        for (let i in 0..10) {
+            let k = secureBelow(alpha.len);
+            out = out + alpha.slice(k, k + 1);
+        }
+        return out;
+    }
+
+    fn mask(phone: string): string {
+        if (phone.len < 8) { return phone; }
+        return phone.slice(0, 4) + "****" + phone.slice(phone.len - 3, phone.len);
+    }
+
+    fn simulate(r: ChannelRequest): JsonValue {
+        let amount = r.data.get("amount_cents").asInt();
+        if (amount <= 0) { return r.fail("amount must be more than zero"); }
+        if (amount > MAX_CENTS) { return r.fail("amount is over the KES 1,000,000 limit"); }
+        this.count += 1;
+        this.total += amount;
+        let id = `{this.count}`;
+        while (id.len < 6) { id = "0" + id; }
+        let rec = jobj();
+        rec.set("id", jstr("PAY-" + id));
+        rec.set("method", jstr("M-Pesa"));
+        rec.set("ref", jstr(this.ref()));
+        rec.set("amount_cents", jint(amount));
+        rec.set("phone", jstr(this.mask(r.data.get("phone").asString())));
+        rec.set("status", jstr("confirmed"));
+        rec.set("time", jstr(date_format(date_now(), "%Y-%m-%dT%H:%M:%S")));
+        rec.set("till", jstr(r.client));
+        this.record(rec);
+        this.srv.push("payment.received", rec);
+        this.svc.log(`payment {rec.get("id").asString()} KES {amount / 100} from {r.client}`);
+        return rec;
+    }
+
+    fn record(rec: JsonValue) {
+        if (this.dir == "" || !file_mkdirs(this.dir)) { return; }
+        let f = this.day_file();
+        let fresh = !file_exists(f);
+        let fh = file_open(f, "ab");
+        if (fh == null) { return; }
+        if (fresh) { fh.writeText("id,time,ref,amount_cents,phone,till\r\n"); }
+        fh.writeText(rec.get("id").asString() + "," + rec.get("time").asString() + "," +
+                     rec.get("ref").asString() + "," + `{rec.get("amount_cents").asInt()}` + "," +
+                     rec.get("phone").asString() + "," + rec.get("till").asString() + "\r\n");
+        fh.close();
+    }
+
+    fn today(r: ChannelRequest): JsonValue {
+        let o = jobj();
+        o.set("count", jint(this.count));
+        o.set("total_cents", jint(this.total));
+        return o;
+    }
+}
+
+fn serve(svc: Service) {
+    let srv = new ChannelServer(SUITE, "payments");
+    srv.on_error = (m) => { svc.log("channel: " + m); };
+    let p = new Payments(srv, svc);
+    srv.handle("pay.simulate", (r) => { return p.simulate(r); });
+    srv.handle("pay.today", (r) => { return p.today(r); });
+    svc.log("payments service started");
+    while (!svc.stopping()) { srv.poll(250); }
+    srv.close();
+    svc.log("payments service stopped");
+}
+
+fn main() {
+    let svc = new Service(PAYMENTS_SERVICE);
+    svc.run(() => { serve(svc); });
+}

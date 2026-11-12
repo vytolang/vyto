@@ -436,5 +436,44 @@ window closed" ] && [ "$wk" -ge 0 ] && [ "$wk" -lt 200 ]; then
 }
 channel_check
 
+# --- an app suite: the till + two services from one installer -----------------
+# All exes in one folder; both services running; Payments' dependency on
+# Stock recorded where Windows keeps it (DependOnService); the installed
+# payments service answers channel_probe with a payment record; an upgrade
+# leaves both running; uninstall removes both and the folder.
+suite_check() {
+    ss=$(ls "$STAGE"/inst/suite/*-setup.exe 2>/dev/null | head -1)
+    [ -n "$ss" ] || { echo "FAIL wine_installer_suite (not staged)"; fail=$((fail + 1)); return 0; }
+    wineserver -k >/dev/null 2>&1; sleep 1
+    (cd "$STAGE" && exec timeout 200 "$WINE" ./service_demo.exe > /dev/null 2>&1 < /dev/null) & kp=$!
+    sleep 3
+    w() { timeout 90 "$WINE" "$@" 2>&1 | tr -d '\r'; }
+    pf="$WINEPREFIX/drive_c/Program Files/Vyto/Vyto Café POS Suite"
+    st() { (cd "$STAGE" && w ./svc_state.exe VytoCafeStock VytoCafePayments | tr '\n' ' '); }
+    w "$ss" /S /NODESKTOP >/dev/null
+    files=$(cd "$pf" 2>/dev/null && ls | tr '\n' ' ')
+    deps=$(w reg query 'HKLM\SYSTEM\CurrentControlSet\Services\VytoCafePayments' /v DependOnService | grep -c VytoCafeStock)
+    pay=$(cd "$STAGE" && w ./channel_probe.exe vyto-cafe-suite payments pay.simulate '{"amount_cents":45000,"phone":"254700000123"}')
+    s1=$(st)
+    w "$ss" /S /NODESKTOP >/dev/null
+    s2=$(st)
+    w "C:\\Program Files\\Vyto\\Vyto Café POS Suite\\uninstall.exe" /S >/dev/null
+    i=0; while [ -d "$pf" ] && [ $i -lt 40 ]; do sleep 0.5; i=$((i + 1)); done
+    s3=$(st)
+    gone=yes; [ -d "$pf" ] && gone=no
+    kill $kp 2>/dev/null
+    wineserver -k >/dev/null 2>&1
+    r=ok
+    [ "$files" = "payments.exe pos.exe stock.exe uninstall.exe uninstall.ini " ] || r="files: $files"
+    [ "$deps" = 1 ] || r="no DependOnService"
+    echo "$pay" | grep -q '"amount_cents":45000' && echo "$pay" | grep -q '"method":"M-Pesa"' || r="payment: $pay"
+    [ "$s1" = "VytoCafeStock: 4 VytoCafePayments: 4 " ] || r="after install: $s1"
+    [ "$s2" = "VytoCafeStock: 4 VytoCafePayments: 4 " ] || r="after upgrade: $s2"
+    [ "$s3" = "VytoCafeStock: -1 VytoCafePayments: -1 " ] && [ $gone = yes ] || r="after uninstall: $s3 gone=$gone"
+    if [ "$r" = ok ]; then echo "PASS wine_installer_suite"; pass=$((pass + 1)); else
+        echo "FAIL wine_installer_suite ($r)"; fail=$((fail + 1)); fi
+}
+suite_check
+
 echo "wine: $pass passed, $fail failed (Wine $("$WINE" --version 2>/dev/null), not Windows 7)"
 [ "$fail" -eq 0 ]

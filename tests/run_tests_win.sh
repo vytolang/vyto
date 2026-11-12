@@ -257,9 +257,18 @@ if ./vytoc build tests/win/service_demo.vt --target "$TRIPLE" --cc "$CC_CMD" --r
         -o "$STAGE/inst/machine/service_demo.exe" >/dev/null 2>"$STAGE/.inst.err" &&
    ./vytoc build tests/fixtures/win_console_app.vt --target "$TRIPLE" --cc "$CC_CMD" --release \
         --manifest tests/fixtures/win_gui_manifest.vt --installer --per-user \
-        -o "$STAGE/inst/user/app.exe" >/dev/null 2>>"$STAGE/.inst.err"; then
+        -o "$STAGE/inst/user/app.exe" >/dev/null 2>>"$STAGE/.inst.err" &&
+   mkdir -p "$STAGE/inst/suite" &&
+   ./vytoc build apps/pos_suite/pos_win.vt --target "$TRIPLE" --cc "$CC_CMD" --release \
+        --manifest apps/pos_suite/pos_manifest.vt --installer \
+        -o "$STAGE/inst/suite/pos.exe" >/dev/null 2>>"$STAGE/.inst.err" &&
+   ./vytoc build tests/win/svc_state.vt --target "$TRIPLE" --cc "$CC_CMD" \
+        -o "$STAGE/svc_state.exe" >/dev/null 2>>"$STAGE/.inst.err" &&
+   ./vytoc build tests/win/channel_probe.vt --target "$TRIPLE" --cc "$CC_CMD" \
+        -o "$STAGE/channel_probe.exe" >/dev/null 2>>"$STAGE/.inst.err"; then
     echo "BUILT installers"
-    rm -f "$STAGE/.inst.err" "$STAGE/inst/machine/service_demo.exe" "$STAGE/inst/user/app.exe"
+    rm -f "$STAGE/.inst.err" "$STAGE/inst/machine/service_demo.exe" "$STAGE/inst/user/app.exe" \
+          "$STAGE/inst/suite/pos.exe"
 else
     echo "FAIL build installers"
     cat "$STAGE/.inst.err"
@@ -471,6 +480,18 @@ By hand, after run.ps1 (these need a person or a network):
     - Both show in Programs and Features (Add/Remove Programs) with name,
       version and publisher; their Start menu shortcut works; uninstalling
       from there removes the files, shortcuts, the entry and the service.
+    - inst\suite\Vyto-Café-POS-Suite-0.2.0-setup.exe: the till and two
+      services in one folder (C:\Program Files\Vyto\Vyto Café POS Suite).
+      services.msc lists "Vyto Café Payments" and "Vyto Café Stock",
+      running; Payments' Dependencies tab shows Stock. Open the till: both
+      header pills green, tiles show "30 left". Sell, pay with
+      "M-Pesa (simulated)": the receipt shows the M-Pesa ref, the counts drop.
+      Stop "Vyto Café Payments" in services.msc: its pill goes grey and the
+      button says "Payments offline", cash still works; start it again: the
+      pill turns green on its own. Task Manager: pos.exe near 0% CPU idle.
+    - With the suite installed, from cmd:
+          channel_probe.exe vyto-cafe-suite stock steal     -> steal: refused
+      (another program cannot take a service's port: SO_EXCLUSIVEADDRUSE)
 
 Not covered here: vyto/hw/* (Linux device interfaces) and vyto/intl (ICU) are
 not portable to Windows yet. Everything else in the stdlib is staged above.
