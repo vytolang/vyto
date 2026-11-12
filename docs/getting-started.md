@@ -249,6 +249,11 @@ statically link everything into one file.
 
 ## 8. Cross-compiling for Windows
 
+> **Shipping a Windows desktop app?** [desktop.md](desktop.md) walks through it
+> step by step: the exe, its icon and version, the Windows 7 check, an
+> installer, signing, and background services. This section is the reference
+> behind it.
+
 `windows-x64` builds are produced on Linux with the mingw-w64 toolchain:
 
 ```sh
@@ -625,6 +630,8 @@ as `examples/45_os.vt`) is handled.
 - **Showcase apps** — [apps/charts](../apps/charts/charts.vt) (15-chart gallery),
   [apps/datagrid](../apps/datagrid/datagrid.vt) (spreadsheet-grade DataTable),
   [apps/vytopad](../apps/vytopad/vytopad.vt) (a text editor).
+- **[Windows desktop apps](desktop.md)**: building, installing, signing and
+  shipping a Windows app, step by step.
 - **[Strings & regular expressions](strings.md)** — every string operation in
   one place: the built-in methods and their exact edge cases, `vyto/util/text`,
   the `vyto/regex` engine, and the Unicode-aware operations in
