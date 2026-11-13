@@ -395,9 +395,15 @@ void *ser_ports(void) {
         snprintf(lk, sizeof lk, "%s/driver", dev);
         link_base(lk, drv, sizeof drv);
         if (!drv[0]) continue;
-        /* The legacy 8250 driver registers ttyS0..31 whether or not a UART is
-           behind them; those placeholders hang off the platform bus. A real
-           built-in port is on pnp or pci. */
+        /* The 8250 driver registers ttyS0..31 whether or not a UART is behind
+           them. The serial core says which are empty: its `type` attribute
+           is 0 (PORT_UNKNOWN) for a port with no hardware. Kernels before
+           6.5 hang those placeholders off the platform bus, and some lack
+           `type`, so that check stays as the fallback; a real built-in
+           port is on pnp or pci. */
+        char ty[16];
+        snprintf(lk, sizeof lk, "/sys/class/tty/%.200s/type", e->d_name);
+        if (read_line(lk, ty, sizeof ty) && strcmp(ty, "0") == 0) continue;
         snprintf(lk, sizeof lk, "%s/subsystem", dev);
         link_base(lk, sub, sizeof sub);
         if (strncmp(e->d_name, "ttyS", 4) == 0 && strcmp(sub, "platform") == 0) continue;
@@ -824,10 +830,12 @@ static void list_class_ports(SerPorts *l) {
         copy_str(p->kind, sizeof p->kind, kind);
 
         /* The serial number lives in the instance ID: the port's own, or for
-           a composite device (one of several interfaces) its parent's. */
+           a composite device (one of several interfaces) its parent's. Only
+           a USB device's ID carries one; elsewhere the last part is just the
+           device's own name (com0com's "COM0COM\PORT\CNCA1"). */
         WCHAR wid[512];
         char id[512];
-        if (SetupDiGetDeviceInstanceIdW(set, &dd, wid, 511, NULL)) {
+        if (strcmp(kind, "usb") == 0 && SetupDiGetDeviceInstanceIdW(set, &dd, wid, 511, NULL)) {
             to_utf8(wid, id, sizeof id);
             if (!serial_of(id, p->serial, sizeof p->serial)) {
                 DEVINST parent;

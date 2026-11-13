@@ -2417,7 +2417,7 @@ fi
 # --- vyto/hw property fixtures: machine-independent shape checks ---------------
 # Each prints only properties (true/false), so one golden holds on this machine,
 # on any other, and on Windows (the same files are in the Windows kit).
-for t in power_props usb_props device_props input_props; do
+for t in power_props usb_props device_props input_props serial_props; do
     got=$(timeout 60 ./vytoc run "tests/hw/$t.vt" 2>&1)
     if [ "$got" = "$(cat "tests/hw/$t.expected")" ]; then
         echo "PASS hw_$t"

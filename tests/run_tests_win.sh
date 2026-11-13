@@ -146,6 +146,7 @@ tests/hw/power_props.vt|power_props|eq|
 tests/hw/usb_props.vt|usb_props|eq|
 tests/hw/device_props.vt|device_props|eq|
 tests/hw/input_props.vt|input_props|eq|
+tests/hw/serial_props.vt|serial_props|eq|
 EOF
 )
 

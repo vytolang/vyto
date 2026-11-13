@@ -1,0 +1,29 @@
+// vyto/hw/serial's port listing: properties that hold on any machine. Every
+// entry is well-formed, and on Linux no listed port is one of the 8250
+// driver's placeholders (ttyS0..31 with no UART behind them, which the
+// serial core marks with type 0); on kernel 6.8 all 32 used to be listed.
+import { serial_ports } from "vyto/hw/serial";
+import { platform } from "vyto/os";
+import { file_exists } from "vyto/io/file";
+
+fn main() {
+    let kinds = ["usb", "native", "bluetooth", "virtual"];
+    let shape = true;
+    let empty_uart = false;
+    let serial_only_usb = true;
+    for (let p in serial_ports()) {
+        let known = false;
+        for (let k in kinds) { if (p.kind == k) { known = true; } }
+        if (p.path == "" || p.name == "" || !known) { shape = false; }
+        if (p.id() != "" && p.id().len != 9) { shape = false; }
+        // com0com's renamed ports once reported their instance name ("CNCA1")
+        if (p.kind != "usb" && p.serial != "") { serial_only_usb = false; }
+        if (platform() == "linux" && p.path.starts_with("/dev/ttyS")) {
+            let t = "/sys/class/tty/" + p.path.slice(5, p.path.len) + "/type";
+            if (file_exists(t) && readfile(t).trim() == "0") { empty_uart = true; }
+        }
+    }
+    print(`entries have a path, a name, a known kind and a vid:pid id: {shape}`);
+    print(`no empty 8250 placeholder is listed: {!empty_uart}`);
+    print(`only USB ports carry a serial number: {serial_only_usb}`);
+}
