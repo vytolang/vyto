@@ -1,0 +1,56 @@
+// vyto/os/worker's Windows arm (staged by run_tests_win.sh): the two ways a
+// re-launched worker used to leave its parent stuck or itself orphaned.
+//
+// 1. A worker that dies before it reaches the pool. The parent waited in
+//    accept() for a connection that never came, forever. It must now notice the
+//    exit and report the slot dead, well inside the 30 s connect deadline.
+// 2. A worker mid-job when its parent dies. It ran on until it next read its
+//    channel. It must now end with the parent: the job below would write a
+//    marker file 2.5 s in, and the parent exits at 0.5 s.
+//
+// Workers re-run main with the same arguments, which is what routes each mode's
+// workers to the right branch.
+import { WorkerPool } from "vyto/os/worker";
+import { hasEnv, appDir, run, exit } from "vyto/os";
+import { file_exists, file_remove } from "vyto/io/file";
+import { monoMs, sleepMs } from "vyto/util/time";
+
+fn marker(): string { return appDir() + "\\worker_win.marker"; }
+
+fn slow(input: byte[]): byte[] {
+    sleepMs(2500);
+    writefile(marker(), "finished\n");
+    return input;
+}
+
+// The parent of case 2: hand one worker the slow job, then exit without
+// tearing the pool down, as a crash would.
+fn orphanParent() {
+    let pool = new WorkerPool(1, (b) => slow(b));
+    pool.submit(bytes(1));
+    sleepMs(500);
+    exit(0);
+}
+
+fn main() {
+    let a = args();
+    if (a.len > 0 && a[0] == "orphan") {
+        orphanParent();
+        return;
+    }
+    // Case 1. This mode's own workers die at once, before the pool.
+    if (hasEnv("VYTO_WORKER_PORT")) { exit(3); }
+    let t0 = monoMs();
+    let pool = new WorkerPool(2, (b) => b);
+    let dt = monoMs() - t0;
+    print(`early exit: live workers {pool.size()}`);
+    print(`early exit noticed within 5 s: {dt < 5000}`);
+
+    // Case 2.
+    file_remove(marker());
+    let rc = run("\"" + appDir() + "\\worker_win.exe\" orphan");
+    print(`orphan parent exit code: {rc}`);
+    sleepMs(4000);
+    print(`orphaned job was stopped: {!file_exists(marker())}`);
+    file_remove(marker());
+}

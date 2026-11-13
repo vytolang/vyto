@@ -285,6 +285,37 @@ int w_worker_control(void) { return g_ctl_channel; }
    then control — proving identity with the token each time. The parent accepts
    in the same order, which is what pairs the two. -1 means "not a worker" (the
    normal case). */
+/* A worker ends when its parent does, however the parent ends. A POSIX worker
+   gets there by itself: it reads EOF on its channel and exits. So does this
+   one, but only at its next read — one in the middle of a long job used to run
+   on, orphaned, after a parent that crashed or was ended from Task Manager.
+
+   A thread that waits on the parent's process handle and ends this process
+   closes that gap. The handle is opened here, at startup, while the parent is
+   provably alive (it is blocked in accept() waiting for us), so a recycled pid
+   cannot be mistaken for it. Not a job object with KILL_ON_JOB_CLOSE: Windows
+   7 cannot nest jobs, and launchers, service hosts and PowerShell already put
+   processes in one, where assigning a worker would fail silently.
+   TerminateProcess rather than ExitProcess: the main thread may be anywhere,
+   and running atexit handlers underneath it would race the runtime. */
+static DWORD WINAPI w_watch_parent(LPVOID h) {
+    WaitForSingleObject((HANDLE)h, INFINITE);
+    TerminateProcess(GetCurrentProcess(), 1);
+    return 0;
+}
+
+static void w_start_watchdog(void) {
+    const char *pp = getenv("VYTO_WORKER_PARENT");
+    if (!pp || !*pp) return;
+    DWORD pid = (DWORD)strtoul(pp, NULL, 10);
+    HANDLE h = OpenProcess(SYNCHRONIZE, FALSE, pid);
+    if (!h) return;
+    HANDLE t = CreateThread(NULL, 64 * 1024, w_watch_parent, h,
+                            STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
+    if (t) CloseHandle(t);
+    else CloseHandle(h);
+}
+
 int w_worker_channel(void) {
     static int ch = -2;                 /* -2 = not yet resolved */
     if (ch != -2) return ch;
@@ -301,6 +332,7 @@ int w_worker_channel(void) {
     if (c == INVALID_SOCKET) { closesocket(d); return ch; }
     g_ctl_channel = W_INT(c);
     ch = W_INT(d);
+    w_start_watchdog();
     return ch;
 }
 
@@ -315,9 +347,36 @@ static int w_proc_slot(void) {
     return g_nprocs;
 }
 
+/* How long a re-launched worker gets to connect back. It has to re-run main up
+   to the WorkerPool constructor (or workerEntry) first, so this is generous.
+   Without a limit, a child that never gets there — main opens a window or a
+   listener before building the pool and runs forever — hung the parent inside
+   accept() for good. */
+#define W_CONNECT_MS 30000
+
+/* Wait for the child's connection on `lsn`, giving up if the child exits first
+   or the deadline passes. 1 = a connection is waiting, 0 = gave up. Checked in
+   100 ms steps: a child that panics before reaching the pool is reported within
+   one step rather than after the whole deadline. */
+static int w_await_child(SOCKET lsn, HANDLE proc, ULONGLONG deadline) {
+    for (;;) {
+        fd_set rd;
+        FD_ZERO(&rd);
+        FD_SET(lsn, &rd);
+        struct timeval tv = {0, 100 * 1000};
+        int r = select(0, &rd, NULL, NULL, &tv);
+        if (r > 0) return 1;
+        if (r < 0) return 0;
+        if (WaitForSingleObject(proc, 0) == WAIT_OBJECT_0) return 0;
+        if (GetTickCount64() >= deadline) return 0;
+    }
+}
+
 /* Accept one connection and require the token, so a local process that races the
-   child onto the port cannot become our worker. INVALID_SOCKET on failure. */
-static SOCKET w_accept_auth(SOCKET lsn, const char *tok) {
+   child onto the port cannot become our worker. INVALID_SOCKET on failure,
+   including the child exiting or missing the deadline before it connects. */
+static SOCKET w_accept_auth(SOCKET lsn, const char *tok, HANDLE proc, ULONGLONG deadline) {
+    if (!w_await_child(lsn, proc, deadline)) return INVALID_SOCKET;
     SOCKET c = accept(lsn, NULL, NULL);
     if (c == INVALID_SOCKET) return INVALID_SOCKET;
     char got[W_TOKEN_HEX];
@@ -362,6 +421,9 @@ int w_spawn(int slot) {
     SetEnvironmentVariableA("VYTO_WORKER_SLOT", slotbuf);
     SetEnvironmentVariableA("VYTO_WORKER_PORT", portbuf);
     SetEnvironmentVariableA("VYTO_WORKER_TOKEN", tok);
+    char ppidbuf[16];
+    snprintf(ppidbuf, sizeof ppidbuf, "%lu", (unsigned long)GetCurrentProcessId());
+    SetEnvironmentVariableA("VYTO_WORKER_PARENT", ppidbuf);
 
     STARTUPINFOW si;
     PROCESS_INFORMATION pi;
@@ -384,13 +446,14 @@ int w_spawn(int slot) {
     free(cmd);
     if (!ok) goto unset;
     CloseHandle(pi.hThread);
+    ULONGLONG deadline = GetTickCount64() + W_CONNECT_MS;
 
     /* Two authenticated connections, in the order the child makes them: data
        first, then control. Anything short of both is a half-built worker, so it
        is torn down rather than handed back. */
-    SOCKET c = w_accept_auth(lsn, tok);
+    SOCKET c = w_accept_auth(lsn, tok, pi.hProcess, deadline);
     if (c == INVALID_SOCKET) { TerminateProcess(pi.hProcess, 1); CloseHandle(pi.hProcess); goto unset; }
-    SOCKET cc = w_accept_auth(lsn, tok);
+    SOCKET cc = w_accept_auth(lsn, tok, pi.hProcess, deadline);
     if (cc == INVALID_SOCKET) {
         closesocket(c);
         TerminateProcess(pi.hProcess, 1);
@@ -415,6 +478,7 @@ unset:
     SetEnvironmentVariableA("VYTO_WORKER_SLOT", NULL);
     SetEnvironmentVariableA("VYTO_WORKER_PORT", NULL);
     SetEnvironmentVariableA("VYTO_WORKER_TOKEN", NULL);
+    SetEnvironmentVariableA("VYTO_WORKER_PARENT", NULL);
 done:
     closesocket(lsn);
     return fd;
