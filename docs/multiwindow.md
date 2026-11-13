@@ -225,9 +225,21 @@ oversizes everything by ~48%.
 list naming monitors in order (`100,200`) — the list form exists to test
 mixed-DPI behaviour on a single-screen machine.
 
-> **Scale is read once**, at `Window` construction, and applied once in `run()`.
-> Dragging a window to a different-DPI monitor does not re-scale it. That needs
-> a Theme rebuild path that does not exist yet.
+**A move to a monitor of another scale rescales the window** on Windows 8.1 and
+later. Windows sends the window `WM_DPICHANGED` with a new size; vsurf takes
+that size and queues an `EV_RESIZE`, and `s.scale_changed()` is true once for
+it. `Window.run()` checks that on every resize and calls `Window.rescale`,
+which moves the theme by the ratio of new to old (`Theme.rescale`), tells the
+painter (`Painter.on_scale`, which `GfxPainter` and `D2DPainter` use to move
+their default font size), and lets the relayout and full redraw that follow
+any resize do the rest. A program on `Surface` alone does the same itself:
+on `EV_RESIZE`, ask `scale_changed()`, then read `scale()`.
+
+There is no new event type for it: `EV_*` is a wire contract shared with three
+other backends. X11 and Android never report a change; headless scripts can,
+with `scale N` (percent), which is how `tests/ui/103_rescale.vt` covers it.
+What does not follow: a size an app computed once at startup in raw pixels, and
+the floor set by `set_min_size`.
 
 ## 5. Chromeless windows
 

@@ -224,6 +224,8 @@ else
     cat "$STAGE/.input_demo.err"
     fail=1
 fi
+# dpi_demo is the per-monitor DPI check: it needs two displays of different
+# scale on Windows 8.1+, so it is staged for a person, not run.
 # vyto/desktop's dialogs one after another (desktop_demo) and HTTPS against a
 # local test server (https_local): both need something on the other end — a
 # person or xdotool, an openssl s_server — so they are staged, not in the
@@ -239,7 +241,7 @@ for t in srv cli gui_probe; do
         echo "FAIL build channel/$t"; cat "$STAGE/.ch_$t.err"; fail=1
     fi
 done
-for t in desktop_demo https_local service_demo; do
+for t in desktop_demo https_local service_demo dpi_demo; do
     if ./vytoc build "tests/win/$t.vt" --target "$TRIPLE" --cc "$CC_CMD" \
             -o "$STAGE/$t.exe" >/dev/null 2>"$STAGE/.$t.err"; then
         echo "BUILT $t"
@@ -525,6 +527,14 @@ By hand, after run.ps1 (these need a person or a network):
         cannot be clicked while one is open (they are owned by it)
       - a warning box with no owner, then example.com opens in the browser
     desktop_dirs_win.exe prints its checks (also in run.ps1).
+
+  Per-monitor DPI (Windows 8.1 or later, two displays set to different
+  scales, e.g. 100% and 150%):  dpi_demo.exe
+    Drag the window to the other display. Once most of it is across, it
+    resizes and redraws for that scale: "scale now" changes, text stays
+    sharp (not blurry), buttons and spacing grow or shrink with it. Drag it
+    back: everything returns to how it started. On Windows 7 nothing changes
+    while dragging; that is expected (no per-monitor DPI there).
 
   Installers (inst\): run each setup.exe by double-click.
     - inst\machine\Vyto-Demo-Service-1.2.3-setup.exe asks for administrator

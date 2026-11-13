@@ -112,11 +112,12 @@ Windows. Tested on Windows 7 SP1.
 works through `useFamily`, but expect it to be slow: Inter installed that way
 drew about 6× slower than Segoe UI, and measured new text about 12× slower.
 
-**System DPI awareness only.** Every Vyto exe now declares system DPI
-awareness in its manifest, so on a scaled display (125%, 150%) text renders at
-the display's scale. Moving the window to a monitor with a different scale
-still falls back to Windows stretching it as a bitmap; per-monitor awareness
-needs `WM_DPICHANGED` handling in the window layer, which is not there yet.
+**Per-monitor DPI is new and checked headless only.** Every Vyto exe declares
+per-monitor awareness, and a `Window` moved to a display of another scale
+rescales its theme and calls `on_scale`, which moves this painter's default
+font size. That path is covered by a headless test; it has not yet been tried
+on a real two-display Windows 10 machine (`dpi_demo.exe` in the Windows kit is
+the manual check).
 
 **The first launch after a reboot is slow to draw.** DirectWrite builds its
 font cache on first use: the first frame took about 200–270 ms once, then

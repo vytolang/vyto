@@ -56,6 +56,10 @@ typedef struct VsInput {
     char text[32];
     int pending_up;  /* headless: a click's MOUSE_UP still owed to this surface */
     int hl_index;    /* headless: this surface's open order, what `win N` names */
+    int dpi_pct;     /* the window's scale as the platform last reported it
+                        (Win32 WM_DPICHANGED, headless `scale N`); 0 = never
+                        reported, so vs_scale_pct asks the monitor instead */
+    int scale_changed; /* set with dpi_pct, cleared by vs_take_scale_change */
 } VsInput;
 
 /* Headless multi-window routing. The event script is one process-global reader,
@@ -211,6 +215,10 @@ static void headless_open_script(void) {
  *   scroll N [X Y]   vertical wheel, N lines (positive = down)
  *   hscroll N [X Y]  horizontal wheel, N columns (positive = right)
  *   resize W H
+ *   scale PCT        the window moved to a display of a different scale, as
+ *                    Win32's WM_DPICHANGED reports it: vs_scale_pct answers
+ *                    PCT from now on and the event is a RESIZE at the same
+ *                    size, with vs_take_scale_change() true once
  *   expose
  *   tick             a timer tick (VS_EV_TIMER), for game-loop tests
  *   mods <spec>      set the modifier state reported by vs_mods() for all
@@ -336,6 +344,13 @@ static int headless_wait(VsInput *in, int *w, int *h) {
             if (sscanf(script_line, "resize %d %d", &nw, &nh) == 2) {
                 *w = nw;
                 *h = nh;
+                return VS_EV_RESIZE;
+            }
+            int pct;
+            if (sscanf(script_line, "scale %d", &pct) == 1) {
+                if (pct < 25 || pct > 800) continue;
+                in->dpi_pct = pct;
+                in->scale_changed = 1;
                 return VS_EV_RESIZE;
             }
         }
@@ -619,6 +634,27 @@ static LRESULT CALLBACK vs_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         return 0;
     }
+    case 0x02E0: /* WM_DPICHANGED: Windows 8.1+, and only to a per-monitor
+                    aware process (the manifest asks for that; Windows 7
+                    reads it as system aware and never sends this). */
+        if (s) {
+            int dpi = LOWORD(wp);
+            if (dpi >= 24) {
+                s->in.dpi_pct = (dpi * 100 + 48) / 96;
+                s->in.scale_changed = 1;
+            }
+            /* Take the rect Windows suggests: it keeps the window where the
+               user dropped it, at the size the new scale implies. That runs
+               WM_SIZE, which remakes the backbuffer and queues the RESIZE
+               Window.run() reacts to. At the same size (a rect Windows did
+               not change) nothing would be queued, so queue it here. */
+            int ow = s->w, oh = s->h;
+            const RECT *r = (const RECT *)lp;
+            SetWindowPos(hwnd, NULL, r->left, r->top, r->right - r->left,
+                         r->bottom - r->top, SWP_NOZORDER | SWP_NOACTIVATE);
+            if (s->w == ow && s->h == oh) q_push(s, VS_EV_RESIZE, 0, 0, 0);
+        }
+        return 0;
     case WM_GETMINMAXINFO:
         if (s && s->min_w > 0 && s->min_h > 0) {
             /* min_w/min_h are client-area, but this message wants the whole
@@ -1380,6 +1416,10 @@ int vs_scale_pct(void *vs) {
         int idx = monitor_index_at(x, y);
         int env = scale_from_env_at(idx);
         if (env) return env;
+        /* What WM_DPICHANGED last said. It outranks asking the monitor under
+           the window's corner: mid-drag the corner can sit on one display
+           while Windows has already moved the window to the other's DPI. */
+        if (s->in.dpi_pct > 0) return s->in.dpi_pct;
         /* Ask the monitor itself. win_monitor_dpi falls back to the global when
            the platform cannot say, which is every pre-8.1 Windows. */
         VsMonitor mons[16];
@@ -1388,7 +1428,19 @@ int vs_scale_pct(void *vs) {
     }
     int env = scale_from_env();
     if (env) return env;
+    if (s && s->in.dpi_pct > 0) return s->in.dpi_pct; /* headless `scale N` */
     return g_scale_pct ? g_scale_pct : 100;
+}
+
+/* 1 once after the window's scale changed (WM_DPICHANGED, or a headless
+   `scale N`), then 0 until it changes again. Window.run() asks on every
+   RESIZE, which is how a scale change reaches the toolkit without a new
+   event type: VS_EV_* is a wire contract with three other backends. */
+int vs_take_scale_change(void *vs) {
+    VSurf *s = vs;
+    if (!s || !s->in.scale_changed) return 0;
+    s->in.scale_changed = 0;
+    return 1;
 }
 
 int vs_text_width(void *vs, const char *str) {
@@ -3694,7 +3746,17 @@ int vs_scale_pct(void *vs) {
     }
     int env = scale_from_env();
     if (env) return env;
+    if (s && s->in.dpi_pct > 0) return s->in.dpi_pct; /* headless `scale N` */
     return g_scale_pct ? g_scale_pct : 100;
+}
+
+/* X11 has no per-window DPI-change notice, so only a headless `scale N` ever
+   sets this here; see the Win32 arm. */
+int vs_take_scale_change(void *vs) {
+    VSurf *s = vs;
+    if (!s || !s->in.scale_changed) return 0;
+    s->in.scale_changed = 0;
+    return 1;
 }
 
 void *vs_native_display(void *vs) { return ((VSurf *)vs)->dpy; }

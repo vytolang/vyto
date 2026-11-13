@@ -287,8 +287,10 @@ With no extra flags, a `windows-x64` exe:
   - turns on UTF-8 for the ANSI APIs on Windows 10 1903 and later, for any C
     code of your own that calls them (Vyto's runtime and stdlib do not need
     it, see below)
-  - declares system DPI awareness, so text renders at the display's scale
-    instead of being stretched (125%, 150%)
+  - declares per-monitor DPI awareness, so text renders at the display's
+    scale instead of being stretched (125%, 150%), and a `vyto/ui` window
+    rescales itself when it moves to a display with another scale (Windows
+    8.1 and later; Windows 7 and 8 read it as system-wide awareness)
 - **has ASLR and DEP on**, and under `--release` is stripped of debug info.
 - `--shared` builds `<name>.dll`, exporting `vyto_app_main`.
 
@@ -334,8 +336,10 @@ fn main() {
 `vytoc` runs that program on the build machine and embeds what it prints.
 `emit()` validates first: a bad version, an unknown DPI mode or a non-image
 icon fails the build with the reason instead of producing a broken exe. The
-icon path is relative to the manifest program. `.dpi("unaware")` opts an app
-out of DPI awareness, for one that does not scale its own drawing yet. These
+icon path is relative to the manifest program. `.dpi("system")` keeps one
+scale for the whole session, for a `Surface` program that cannot redraw at a
+new one; `.dpi("unaware")` opts an app out of DPI awareness, for one that does
+not scale its own drawing yet. These
 settings belong to the build, not the running program, because Explorer and
 the Windows loader read them from the file without starting it. A window's icon
 can still change while the program runs: `Window.set_icon(pixels, w, h)`.

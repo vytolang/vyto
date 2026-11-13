@@ -798,9 +798,12 @@ static const char *xml_escape(const char *s) {
     return out;
 }
 
+/* Zero is the default, so a WinApp that is only zeroed gets per-monitor. */
+enum { WIN_DPI_PERMONITOR = 0, WIN_DPI_SYSTEM = 1, WIN_DPI_UNAWARE = 2 };
+
 typedef struct {
     const char *name, *version, *icon, *company, *description, *copyright;
-    bool dpi_unaware;
+    int dpi;            /* WIN_DPI_*: per-monitor unless the manifest says */
     /* WinManifest.service(): the installer registers the exe as a service */
     const char *svc_name, *svc_display, *svc_desc, *svc_start, *svc_deps;
     /* WinManifest.program()/.serviceFor(): more programs of the suite, built
@@ -864,7 +867,10 @@ static WinApp read_win_manifest(const char *manifest_vt, bool verbose) {
             else if (strcmp(key, "company") == 0) app.company = val;
             else if (strcmp(key, "description") == 0) app.description = val;
             else if (strcmp(key, "copyright") == 0) app.copyright = val;
-            else if (strcmp(key, "dpi") == 0) app.dpi_unaware = strcmp(val, "unaware") == 0;
+            else if (strcmp(key, "dpi") == 0)
+                app.dpi = strcmp(val, "unaware") == 0 ? WIN_DPI_UNAWARE
+                        : strcmp(val, "system") == 0  ? WIN_DPI_SYSTEM
+                                                      : WIN_DPI_PERMONITOR;
             else if (strcmp(key, "service_name") == 0) app.svc_name = val;
             else if (strcmp(key, "service_display") == 0) app.svc_display = val;
             else if (strcmp(key, "service_desc") == 0) app.svc_desc = val;
@@ -901,7 +907,24 @@ static WinApp read_win_manifest(const char *manifest_vt, bool verbose) {
    - activeCodePage UTF-8: the ANSI file, argv and window-title APIs speak
      UTF-8 on Windows 10 1903 and later
    - longPathAware: paths past 260 characters, where the system allows them
-   - dpiAware: rendered at the display's scale instead of bitmap-stretched */
+   - dpiAware / dpiAwareness: rendered at the display's scale instead of
+     bitmap-stretched. Per-monitor by default: Windows 10 1703+ reads
+     dpiAwareness and gets PerMonitorV2 (title bar and dialogs scale too),
+     8.1 reads "true/pm" as per-monitor, and 7 and 8 read "true/pm" as
+     system aware, which is what they had before. The window then hears
+     WM_DPICHANGED when it moves to a display of another scale, and vyto/ui
+     rescales itself (Window.run, Surface.scale_changed). */
+static const char *win_dpi_xml(int mode) {
+    switch (mode) {
+    case WIN_DPI_UNAWARE: return "";
+    case WIN_DPI_SYSTEM:
+        return "      <dpiAware xmlns=\"http://schemas.microsoft.com/SMI/2005/WindowsSettings\">true</dpiAware>\n";
+    default:
+        return "      <dpiAware xmlns=\"http://schemas.microsoft.com/SMI/2005/WindowsSettings\">true/pm</dpiAware>\n"
+               "      <dpiAwareness xmlns=\"http://schemas.microsoft.com/SMI/2016/WindowsSettings\">PerMonitorV2, PerMonitor</dpiAwareness>\n";
+    }
+}
+
 static const char *win_manifest_xml(const WinApp *app) {
     return arena_printf(&g_arena,
         "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n"
@@ -933,8 +956,7 @@ static const char *win_manifest_xml(const WinApp *app) {
         /* An installer for all users needs administrator rights before it
            starts; everything else runs as the user who launched it. */
         app->elevate ? "requireAdministrator" : "asInvoker",
-        app->dpi_unaware ? ""
-                         : "      <dpiAware xmlns=\"http://schemas.microsoft.com/SMI/2005/WindowsSettings\">true</dpiAware>\n");
+        win_dpi_xml(app->dpi));
 }
 
 /* The icon as .ico bytes: an .ico passes through; a PNG is wrapped as a

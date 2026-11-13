@@ -320,6 +320,9 @@ long long vs_now_ms(void);
  * ("100,200" = first screen 1x, second 2x). The list form exists to make
  * mixed-DPI behaviour testable on a single-monitor machine. */
 int vs_scale_pct(void *s);
+/* 1 once after the window's scale changed (Win32 WM_DPICHANGED, headless
+   `scale N`), else 0. Read on each VS_EV_RESIZE. */
+int vs_take_scale_change(void *s);
 int vs_x(void *s);
 int vs_y(void *s);
 int vs_wheel(void *s);       /* last VS_EV_MOUSE_WHEEL delta (positive = down) */

@@ -315,7 +315,7 @@ Each setting, and where Windows shows it:
 | `.description("...")` | any text | Task Manager's process list and Properties → Details |
 | `.copyright("...")` | any text | Properties → Details |
 | `.icon("assets/icon.png")` | a `.png` (up to 256×256) or an `.ico`. The path is **relative to the manifest file**, not to where you run `vytoc` | Explorer, the taskbar, the window's title bar, Start menu shortcuts |
-| `.dpi("unaware")` | `"system"` (the default) or `"unaware"` | Use `"unaware"` only if your app draws pixel-sized content that breaks when scaled; Windows then stretches the window instead, which looks blurry |
+| `.dpi("system")` | `"permonitor"` (the default), `"system"` or `"unaware"` | `"permonitor"`: sharp on every display; a `vyto/ui` app rescales itself when its window moves to a display with another scale (Windows 8.1 and later; Windows 7 and 8 treat it as `"system"`). `"system"`: sharp on the main display, stretched by Windows on others, for a `Surface` program that cannot redraw at a new scale. `"unaware"`: stretched everywhere, which looks blurry, for an app that draws pixel-sized content that breaks when scaled |
 
 None of the text values may contain line breaks. A mistake does not produce a
 broken exe: `m.emit()` checks everything first and the build stops with a
@@ -964,7 +964,7 @@ Before you give a version to users:
 | "Windows protected your PC" | SmartScreen and an unsigned (or newly signed) exe. Users click **More info → Run anyway**; signing removes it as the certificate gains reputation ([Step 8](#10-step-8-sign-it)) |
 | A black console window opens with the app | The program does not import `vyto/ui` or `vyto/surface`, so it was built as a console program. Add `--gui` |
 | The app starts and immediately closes | Run it from `cmd` to see its error message. Common causes: a file it expected in `assets/` that was not embedded (`--with-assets`), or writing next to the exe in Program Files |
-| Text and shapes look blurry | The manifest has `.dpi("unaware")`, or the window was moved to a second monitor with a different scale (see [Section 18](#18-what-is-not-available-yet)) |
+| Text and shapes look blurry | The manifest has `.dpi("unaware")`, or `.dpi("system")` and the window was moved to a monitor with a different scale |
 | Setup says "`<App>` is running. Close it, then run setup again." | Close the app (check the taskbar's hidden icons and Task Manager) and run setup again |
 | Settings are lost after an upgrade | The name passed to `configDir`/`dataDir` changed between versions. Keep it fixed |
 | HTTPS fails on some PCs | `cacert.pem` is not next to the exe. Use `--installer`, or ship the file with the bare exe |
@@ -980,9 +980,11 @@ So you can plan around them:
 - **32-bit Windows and Windows on ARM.** Only 64-bit x86 (`windows-x64`).
 - **Testing on Windows 10 and 11.** Declared supported, but the project's
   own tests so far ran on Windows 7 SP1 and under Wine.
-- **Moving between monitors with different scaling.** The app is sharp on the
-  main display's scale; on a second monitor with a different scale, Windows
-  stretches it, which looks blurry.
+- **Moving between monitors with different scaling, verified.** The window
+  rescales itself on Windows 8.1 and later (theme, painter font, layout), but
+  this has only been checked headless so far, not on a real two-display
+  Windows 10 machine. Sizes an app computes once at startup in raw pixels do
+  not follow; compute them through `Widget.dp()` or the theme.
 - **Your own font files with Direct2D.** Use system fonts, or `GfxPainter`.
 - **A tray icon, single-instance apps, and start at sign-in.** No API for
   these yet.

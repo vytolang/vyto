@@ -309,6 +309,30 @@ export class Theme {
         if (this.scale_applied > 0.0) { return; }
         this.scale_applied = f;
         if (f > 0.99 && f < 1.01) { return; }
+        this.scale_metrics(f);
+    }
+
+    // Move an already-scaled theme to a new scale: the window went to a
+    // display of another density (Window.run calls this on
+    // Surface.scale_changed). Scales by the ratio of new to old, so it is
+    // exact for every metric apply_scale multiplied; a hairline it floored at
+    // 0.5px is floored again rather than restored. Before apply_scale has run
+    // this simply is apply_scale.
+    fn rescale(f: float) {
+        if (f <= 0.0) { return; }
+        if (this.scale_applied <= 0.0) {
+            this.apply_scale(f);
+            return;
+        }
+        let k = f / this.scale_applied;
+        this.scale_applied = f;
+        if (k > 0.999 && k < 1.001) { return; }
+        this.scale_metrics(k);
+    }
+
+    // Multiply every px metric by k. The one body behind apply_scale and
+    // rescale, so the two cannot drift apart as metrics are added.
+    fn scale_metrics(f: float) {
         this.radius_sm = scale_px(this.radius_sm, f);
         this.radius_md = scale_px(this.radius_md, f);
         this.radius_lg = scale_px(this.radius_lg, f);
@@ -3389,6 +3413,20 @@ export class Window {
         }
     }
 
+    // Re-scale the whole window to `f`: the theme's metrics, the painter's
+    // default font, and `scale` itself. run() calls it when the surface says
+    // its scale changed; the layout and full redraw that follow every resize
+    // do the rest. Widgets that compute sizes through dp() or the theme follow
+    // on their own; a raw px value an app stored at startup does not.
+    fn rescale(f: float) {
+        if (f <= 0.0) { return; }
+        let old = this.scale;
+        if (f - old < 0.001 && old - f < 0.001) { return; }
+        this.scale = f;
+        this.theme.rescale(f);
+        if (old > 0.0) { this.painter.on_scale(old, f); }
+    }
+
     fn run() {
         // scale the theme's px metrics for HiDPI (idempotent; also covers a
         // theme the app swapped in after construction)
@@ -3506,6 +3544,9 @@ export class Window {
                     this.redraw();
                 }
             } else if (ev == EV_RESIZE) {
+                // A move to a display of another scale arrives as a resize
+                // (Windows also hands the window a new size for it).
+                if (this.surf.scale_changed()) { this.rescale(this.surf.scale()); }
                 this.painter.on_resize(this.surf.width(), this.surf.height());
                 this.layout();
                 this.redraw();

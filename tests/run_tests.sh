@@ -2211,15 +2211,23 @@ if command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1 &&
     case "$dll" in *.dll) [ "$ex" = 1 ] && r=ok ;; esac
     win_check win_pe_shared_dll "$r"
 
-    # .dpi("unaware") drops dpiAware; no --manifest still embeds the manifest.
-    un=$wd/unaware.exe; plain=$wd/plain.exe
+    # .dpi("unaware") drops dpiAware; no --manifest still embeds the manifest,
+    # and per-monitor is its default: "true/pm" (what Windows 7 and 8 read, as
+    # system aware) plus dpiAwareness for 10. .dpi("system") is plain "true".
+    un=$wd/unaware.exe; plain=$wd/plain.exe; sys=$wd/sysdpi.exe
     # shellcheck disable=SC2086
     ./vytoc build tests/fixtures/win_gui_app.vt $W \
         --manifest tests/fixtures/win_unaware_manifest.vt -o "$un" >/dev/null 2>&1
     # shellcheck disable=SC2086
     ./vytoc build tests/fixtures/win_gui_app.vt $W -o "$plain" >/dev/null 2>&1
+    # shellcheck disable=SC2086
+    ./vytoc build tests/fixtures/win_gui_app.vt $W \
+        --manifest tests/fixtures/win_system_dpi_manifest.vt -o "$sys" >/dev/null 2>&1
     r=bad
-    ! grep -aq dpiAware "$un" && grep -aq asInvoker "$un" && grep -aq dpiAware "$plain" &&
+    ! grep -aq dpiAware "$un" && grep -aq asInvoker "$un" &&
+        grep -aq '>true/pm</dpiAware>' "$plain" &&
+        grep -aq '>PerMonitorV2, PerMonitor</dpiAwareness>' "$plain" &&
+        grep -aq '>true</dpiAware>' "$sys" && ! grep -aq dpiAwareness "$sys" &&
         [ "$(pe_rtypes "$plain")" = "0x000018 " ] && r=ok
     win_check win_pe_dpi_and_default_manifest "$r"
 
