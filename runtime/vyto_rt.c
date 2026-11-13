@@ -975,6 +975,51 @@ static FILE *file_open(VtString *path, const char *mode, const char *file, int l
     return f;
 }
 
+/* The size of an open file, for readfile's one-read fast path; -1 when it
+   cannot be known (a pipe). Plain ftell returns a C long, which is 32 bits on
+   Windows, so a file past 2 GB used to report -1 there and fall back to the
+   doubling path at twice the memory. _fseeki64 is in Windows 7's msvcrt;
+   _ftelli64 is not, but fgetpos is, and its fpos_t is a 64-bit offset. */
+static int64_t file_size_hint(FILE *f) {
+#ifdef _WIN32
+    if (_fseeki64(f, 0, SEEK_END) != 0) return -1;
+    fpos_t p;
+    int64_t n = fgetpos(f, &p) == 0 ? (int64_t)p : -1;
+    if (_fseeki64(f, 0, SEEK_SET) != 0) return -1;
+    return n;
+#else
+    if (fseek(f, 0, SEEK_END) != 0) return -1;
+    long n = ftell(f);
+    if (fseek(f, 0, SEEK_SET) != 0) return -1;
+    return (int64_t)n;
+#endif
+}
+
+/* fread/fwrite of a large buffer in 1 GiB pieces. msvcrt's underlying
+   _read/_write take an unsigned int count, so one call of 4 GB or more is not
+   safe to hand it; the chunking costs nothing anywhere else. */
+#define VT_IO_CHUNK ((size_t)1 << 30)
+static size_t fread_big(void *p, size_t n, FILE *f) {
+    size_t got = 0;
+    while (got < n) {
+        size_t want = n - got < VT_IO_CHUNK ? n - got : VT_IO_CHUNK;
+        size_t r = fread((char *)p + got, 1, want, f);
+        got += r;
+        if (r < want) break;
+    }
+    return got;
+}
+static size_t fwrite_big(const void *p, size_t n, FILE *f) {
+    size_t put = 0;
+    while (put < n) {
+        size_t want = n - put < VT_IO_CHUNK ? n - put : VT_IO_CHUNK;
+        size_t r = fwrite((const char *)p + put, 1, want, f);
+        put += r;
+        if (r < want) break;
+    }
+    return put;
+}
+
 VtString *vt_file_read(VtString *path, const char *file, int line) {
     /* Embedded asset (--with-assets) shadows disk: readfile/readlines and any
        config/JSON built on them resolve from the binary when a key matches. */
@@ -991,21 +1036,16 @@ VtString *vt_file_read(VtString *path, const char *file, int line) {
        file size; on a 55 MB log this halved readfile's time and dropped the
        ~55 MB transient buffer entirely.
 
-       fseek/ftell rather than fstat so Windows needs nothing extra. It is
-       only a hint: a size of 0 (/proc, /sys), a failed seek (pipes) or an
-       ftell past `long` (a >2 GB file on LLP64 Windows) all fall back to the
-       growing path, and a file that grows mid-read is caught by the extra
+       A seek rather than fstat so Windows needs nothing extra. It is only a
+       hint: a size of 0 (/proc, /sys) or a failed seek (pipes) falls back to
+       the growing path, and a file that grows mid-read is caught by the extra
        byte probe and finished there too. */
     size_t cap = 65536, len = 0;
     char *buf = NULL;
-    long hint = -1;
-    if (fseek(f, 0, SEEK_END) == 0) {
-        hint = ftell(f);
-        if (fseek(f, 0, SEEK_SET) != 0) hint = -1;
-    }
+    int64_t hint = file_size_hint(f);
     if (hint > 0) {
-        VtString *s = str_alloc((int64_t)hint);
-        size_t got = fread(s->data, 1, (size_t)hint, f);
+        VtString *s = str_alloc(hint);
+        size_t got = fread_big(s->data, (size_t)hint, f);
         int extra = (got == (size_t)hint) ? fgetc(f) : EOF;
         if (extra == EOF) {
             if (ferror(f)) { vt_release(s); fclose(f); vt_panic_c(file, line, "error reading file"); }
@@ -1033,7 +1073,7 @@ VtString *vt_file_read(VtString *path, const char *file, int line) {
             if (!nb) { vt_host_free(buf); fclose(f); vt_panic_c(file, line, "out of memory reading file"); }
             buf = nb;
         }
-        size_t got = fread(buf + len, 1, cap - len, f);
+        size_t got = fread_big(buf + len, cap - len, f);
         len += got;
         if (got == 0) break; /* EOF or error */
     }
@@ -1049,7 +1089,7 @@ bool vt_file_write(VtString *path, VtString *data, bool append) {
     FILE *f = vt_fopen(vt_str_cstr(path), append ? "ab" : "wb");
     if (!f) return false;
     size_t n = data ? (size_t)data->len : 0;
-    bool ok = fwrite(data ? data->data : "", 1, n, f) == n;
+    bool ok = fwrite_big(data ? data->data : "", n, f) == n;
     return (fclose(f) == 0) && ok;
 }
 

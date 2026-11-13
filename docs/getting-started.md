@@ -299,7 +299,8 @@ the runtime and stdlib convert at the boundary and call the Windows "W" APIs,
 so a profile like `C:\Users\Zoë` or a file named `日本語.txt` just works. (A
 console program's *output* captured by `capture()` is still the bytes it
 wrote, which on Windows is usually the OEM code page.) Files larger than 2 GB
-can be positioned and sized in `vyto/io/file`.
+can be positioned and sized in `vyto/io/file`, and `readfile`/`writefile`
+read and write them in one pass as on Linux.
 
 `appDir()` is the directory holding the exe, so an app shipped as
 `app.exe` plus an `assets/` folder finds its files from any working directory.

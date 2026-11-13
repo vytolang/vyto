@@ -1706,7 +1706,17 @@ void *ct_load_csv(const char *path, int delim, int quote, int comment,
     /* Pre-size from the file's byte length and the first record's width, so the
        column buffers double a handful of times instead of log2(nrow) times. */
     long long fsize = 0;
+#ifdef _WIN32
+    /* ftell's long is 32-bit on Windows: past 2 GB it fails and the pre-size
+       is lost. _fseeki64 + fgetpos are both in Windows 7's msvcrt. */
+    if (_fseeki64(f, 0, SEEK_END) == 0) {
+        fpos_t pos;
+        if (fgetpos(f, &pos) == 0) fsize = (long long)pos;
+        _fseeki64(f, 0, SEEK_SET);
+    }
+#else
     if (fseek(f, 0, SEEK_END) == 0) { fsize = ftell(f); fseek(f, 0, SEEK_SET); }
+#endif
 
     const char *fs; int32_t fn; int eor, eof;
     int sized = 0;

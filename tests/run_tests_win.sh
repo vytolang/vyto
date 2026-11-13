@@ -139,6 +139,7 @@ tests/fixtures/win_gui_app.vt|win_gui_app|eq|||--manifest tests/fixtures/win_gui
 tests/fixtures/win_console_app.vt|win_console_app|eq|
 tests/win/desktop_dirs_win.vt|desktop_dirs_win|eq|
 tests/fixtures/mkdirs_backslash.vt|mkdirs_backslash|eq|
+tests/win/bigfile_win.vt|bigfile_win|eq|
 EOF
 )
 
@@ -486,6 +487,10 @@ export. From a Windows 7 machine, copy it back as lib/vyto/win/win7_exports.txt;
 
 Note on 45_os: it uses only shell builtins that sh and cmd.exe share (exit N,
 echo), so its output does not depend on which tools are on PATH.
+
+Note on bigfile_win: it writes one byte just past 2 GB. NTFS is not sparse
+by default, so that really writes ~2 GB of zeros next to the exe (removed
+afterwards): it needs the free space and can take a minute on a slow disk.
 
 By hand, after run.ps1 (these need a person or a network):
 

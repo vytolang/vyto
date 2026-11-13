@@ -1,0 +1,30 @@
+// File positions past 2 GB on Windows (staged by run_tests_win.sh), where a C
+// long is 32 bits and plain fseek/ftell cannot reach them.
+//
+// Writes one byte just past 2^31. NTFS is not sparse by default, so this
+// really writes ~2 GB of zeros: it needs that much free space beside the exe
+// and takes a while on a spinning disk. The file is removed at the end.
+import { file_open, file_size, file_remove, SEEK_SET, SEEK_END } from "vyto/io/file";
+import { appDir } from "vyto/os";
+
+fn main() {
+    let p = appDir() + "\\bigfile_win.bin";
+    let off = 2147483648 + 4096;
+
+    let f = file_open(p, "wb");
+    print(`seek past 2 GB: {f.seek(off, SEEK_SET)}`);
+    f.writeText("Z");
+    print(`tell after the write: {f.tell() == off + 1}`);
+    f.close();
+
+    print(`file_size: {file_size(p) == off + 1}`);
+
+    let g = file_open(p, "rb");
+    g.seek(-1, SEEK_END);
+    print(`tell from the end: {g.tell() == off}`);
+    let b = g.read(1);
+    print(`byte read back: {b.len == 1 && b[0] as int == 90}`);
+    g.close();
+
+    print(`removed: {file_remove(p)}`);
+}
