@@ -232,6 +232,9 @@ static void headless_open_script(void) {
  *                    every pre-existing script still behaves identically.
  *                    Indices are open order, so closing and reopening a surface
  *                    renumbers: fine for a scripted test, not a general API.
+ *   command N        a native menu command with id N (VS_EV_COMMAND, the
+ *                    WM_COMMAND a Win32 menu bar sends): the hook that lets
+ *                    the menu dispatch path be tested off Windows
  *   close
  * '#' starts a comment; EOF acts as close. */
 static int headless_wait(VsInput *in, int *w, int *h) {
@@ -356,6 +359,7 @@ static int headless_wait(VsInput *in, int *w, int *h) {
         }
         if (strcmp(script_line, "expose") == 0) return VS_EV_EXPOSE;
         if (strcmp(script_line, "tick") == 0) return VS_EV_TIMER;
+        if (sscanf(script_line, "command %d", &in->key) == 1) return VS_EV_COMMAND;
         if (strcmp(script_line, "close") == 0) return VS_EV_CLOSE;
         {
             int mx, my;
@@ -796,6 +800,15 @@ static LRESULT CALLBACK vs_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (msg == WM_KEYUP) return 0;
         break;
     }
+    case WM_COMMAND:
+        /* A menu bar item (HIWORD 0, no control handle). The menu itself is
+           built and owned by vyto/desktop/menu; the surface only forwards
+           the id, so this backend holds no menu state of its own. */
+        if (HIWORD(wp) == 0 && lp == 0) {
+            q_push(s, VS_EV_COMMAND, (int)LOWORD(wp), 0, 0);
+            return 0;
+        }
+        break;
     case WM_CHAR: {
         /* A W window gets UTF-16 here, including what an IME commits. A
            character outside the BMP comes as two messages, high half first. */

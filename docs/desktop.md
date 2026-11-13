@@ -714,6 +714,52 @@ Dialogs wait for the user's answer before your code continues. All of them
 work on Windows 7 and pass `--audit`. Full details:
 [`lib/vyto/desktop/README.md`](../lib/vyto/desktop/README.md).
 
+### 12.1 A menu bar
+
+`vyto/desktop/menu` gives the window a real Windows menu bar — the same one
+Notepad has, drawn by Windows, with Alt+letter, F10, the arrow keys and the
+user's theme all working the way they do everywhere else. On Linux the same
+code shows `vyto/ui`'s drawn menu bar, which behaves the same way.
+
+```js
+import { AppMenu } from "vyto/desktop/menu";
+
+let menus = new AppMenu(win);
+
+let file = menus.file();                            // "File"
+file.item("&New", "Ctrl+N", () => newDocument());
+file.item("&Open…", "Ctrl+O", () => openDocument());
+file.item("&Save", "Ctrl+S", () => save());
+file.separator();
+menus.addQuit(file);                                // Exit (Windows) / Quit (Linux)
+
+menus.addClipboard(menus.edit());                   // Cut, Copy, Paste, Select All
+menus.search().item("&Find…", "Ctrl+F", () => find());
+menus.settings().check("&Dark Theme", "", false, (on) => setDark(on));
+menus.addFullScreen(menus.window());                // F11
+menus.addAbout(menus.help(), "About Hello", "Hello 1.0");
+
+menus.attach();
+win.run();
+```
+
+- **`&` picks the underlined letter**: `"&Open…"` is opened with Alt, then O.
+  Write `&&` for a real `&`.
+- **The shortcut you write is the shortcut you get.** `"Ctrl+S"` is shown
+  beside the item *and* fires it from anywhere in the window. To show one
+  without binding it, call `.hint("Ctrl+S")` on the item instead.
+- **Keep the item to change it later**: `let save = file.item(...)`, then
+  `save.set_enabled(false)`, `item.set_checked(true)` or `item.set_label("…")`.
+  The Windows menu updates at once.
+- **Add every menu and item before `attach()`.** The structure is copied into
+  Windows then; only the state above can change afterwards.
+- `attach()` also stops Escape from closing the window — in an app with a menu
+  bar, Escape backs out of menus and dialogs, and File > Exit quits.
+- An app with its own dark theme can call `menus.drawn()` before `attach()` to
+  use the drawn bar on Windows too: Windows 7 has no dark menu bar.
+
+Full details: [`lib/vyto/desktop/menu/README.md`](../lib/vyto/desktop/menu/README.md).
+
 ---
 
 ## 13. Networking and HTTPS

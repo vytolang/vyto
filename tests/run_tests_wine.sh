@@ -299,6 +299,74 @@ WANT
 }
 desktop_check
 
+# --- vyto/desktop/menu: the native Win32 menu bar -----------------------------
+# Keys and clicks go to the OS's menu exactly as a person's would; every choice
+# comes back through WM_COMMAND -> EV_COMMAND -> MenuBar.on_command, which is
+# the path nothing on Linux can exercise (tests/ui/105 fakes it with ids).
+# Covered: the window grew by the bar so the client area is what the app asked
+# for; a bound shortcut with the menus closed; Alt+letter and Enter; a submenu
+# cascaded with Right; a check item toggled by its access key, live state
+# (ticking it greys New) reaching the OS menu — so neither the menu, the
+# shortcut nor the access key fires New while it is grey; Escape out of a menu
+# NOT closing the app (attach() turns close_on_esc off); a mouse click on the
+# bar and on an item; and Exit.
+menu_check() {
+    for t in Xvfb xdotool; do
+        command -v "$t" >/dev/null 2>&1 || { echo "SKIP wine_menu (no $t)"; return 0; }
+    done
+    [ -f "$STAGE/menu_demo.exe" ] || { echo "FAIL wine_menu (not staged)"; fail=$((fail + 1)); return 0; }
+    Xvfb -displayfd 3 -screen 0 1280x800x24 -nolisten tcp 3>"$tmp/mdpy" >/dev/null 2>&1 &
+    xp=$!
+    i=0; while [ ! -s "$tmp/mdpy" ] && [ $i -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+    DISPLAY=":$(cat "$tmp/mdpy")"; export DISPLAY
+    (cd "$STAGE" && "$WINE" ./menu_demo.exe > "$tmp/menu.log" 2>&1) &
+    dp=$!
+    W=$(timeout 30 xdotool search --sync --name "^Vyto Menu\$" 2>/dev/null | head -1)
+    if [ -z "$W" ]; then
+        echo "FAIL wine_menu (menu_demo did not come up)"
+        fail=$((fail + 1)); kill "$dp" "$xp" 2>/dev/null; unset DISPLAY; return 0
+    fi
+    sleep 1.5
+    k() { xdotool key "$@" 2>/dev/null; sleep 0.5; }
+    xdotool windowfocus "$W" 2>/dev/null; sleep 0.3
+    # X, Y: the top left of the X window, which holds the menu bar (Wine draws
+    # it) above the client area
+    eval "$(xdotool getwindowgeometry --shell "$W")"
+    k ctrl+n                              # shortcut, menus closed
+    k alt+f; k Return                     # File > New
+    k alt+f; k Down; k Right; k Return    # File > Open Recent > a.txt
+    k alt+e; k w                          # Edit > Word Wrap on: New greys
+    k alt+f; k Return; k Escape; k Escape # New is grey: nothing, app stays up
+    k ctrl+n                              # grey: the shortcut does nothing
+    k alt+f; k d; k Escape; k Escape      # a grey item's access key: nothing
+    k alt+e; k w                          # Word Wrap off: New back
+    xdotool mousemove $((X + 14)) $((Y + 9)) click 1 2>/dev/null; sleep 0.5
+    xdotool mousemove $((X + 30)) $((Y + 30)) click 1 2>/dev/null; sleep 0.5
+    k alt+f; k x                          # File > Exit
+    i=0; while kill -0 "$dp" 2>/dev/null && [ $i -lt 100 ]; do sleep 0.1; i=$((i + 1)); done
+    if kill -0 "$dp" 2>/dev/null; then echo "  menu_demo still running after Exit"; kill "$dp" 2>/dev/null; fi
+    kill "$xp" 2>/dev/null
+    cat > "$tmp/menu.want" <<'WANT'
+native=true
+fire:new client=420x260
+fire:new client=420x260
+fire:recent a.txt
+wrap=true
+wrap=false
+fire:new client=420x260
+done
+WANT
+    tr -d '\r' < "$tmp/menu.log" | grep -v "^X connection" > "$tmp/menu.got"
+    if cmp -s "$tmp/menu.want" "$tmp/menu.got"; then
+        echo "PASS wine_menu_native"; pass=$((pass + 1))
+    else
+        echo "FAIL wine_menu_native"; diff "$tmp/menu.want" "$tmp/menu.got" | head -20
+        fail=$((fail + 1))
+    fi
+    unset DISPLAY
+}
+menu_check
+
 # --- HTTPS: the vendored curl + mbedTLS against a local server ----------------
 # No network: openssl s_server on loopback with the test PKI in
 # tests/fixtures/tls. Trusting the fixture root must succeed — from a path

@@ -1,0 +1,43 @@
+// The seam vyto/desktop/menu's Win32 bar plugs into, driven without Windows:
+// a MenuBackend installed on a MenuBar, ids assigned the way the native
+// builder assigns them, and `command N` events standing in for WM_COMMAND
+// (vsurf turns a menu's WM_COMMAND into EV_COMMAND carrying the id).
+//
+// What has to hold: a native bar takes no client space and draws nothing;
+// EV_COMMAND reaches the item with that id (a check item flips and the OS
+// copy is told); a disabled or unknown id fires nothing; state changed from
+// code reaches the backend; bound shortcuts still fire from Vyto; and
+// Alt+letter is left to the OS rather than opening a drawn popup.
+import { Window, Column, Label } from "vyto/ui";
+import { MenuBar, MenuItem, MenuBackend } from "vyto/ui/menu";
+
+class FakeOs extends MenuBackend {
+    override fn update(it: MenuItem) {
+        print("os: id=" + it.id + " " + it.label + " enabled=" + it.enabled
+              + " checked=" + it.checked);
+    }
+    override fn release() { print("os: released"); }
+}
+
+fn main() {
+    let win = new Window("Native", 300, 200);
+    let body = new Label("body");
+    let bar = new MenuBar();
+    let file = bar.menu("&File");
+    file.item("&New", "Ctrl+N", () => print("fire:new root.y=" + win.root.bounds.y));
+    let save = file.item("&Save", "Ctrl+S", () => print("fire:save"));
+    let sub = file.submenu("&More");
+    sub.check("&Wrap", "", false, (on) => print("wrap=" + on));
+    file.item("&Lock", "", () => save.set_enabled(false));
+    bar.backend = new FakeOs();
+    // ids in builder order: New 100, Save 101, Wrap 102, Lock 103
+    let next = 100;
+    for (let it in bar.all_items()) {
+        if (!it.separator && it.submenu == null) { it.id = next; next += 1; }
+    }
+    print("strip=" + bar.strip_height(win.painter, win.theme));
+    win.menubar = bar;
+    win.root = new Column([body]);
+    win.run();
+    print("overlay_after=" + (win.overlay != null) + " done");
+}

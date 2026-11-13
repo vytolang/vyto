@@ -11,7 +11,7 @@
 import { Surface, Rect, contains, rgb, rgba, with_alpha, alpha_of, mix,
           EV_EXPOSE, EV_KEY, EV_KEY_UP, EV_MOUSE_DOWN, EV_MOUSE_UP, EV_MOUSE_MOVE, EV_MOUSE_WHEEL, EV_MOUSE_RDOWN,
           EV_RESIZE, EV_CLOSE, EV_TIMER, EV_VSYNC, MOD_SHIFT,
-          EV_BUTTON_DOWN, EV_BUTTON_UP, CURSOR_ARROW,
+          EV_BUTTON_DOWN, EV_BUTTON_UP, EV_COMMAND, CURSOR_ARROW,
           KEY_ESC, KEY_TAB, KEY_F1, KEY_F12, MOD_CTRL, MOD_ALT } from "vyto/surface";
 import { Animator, Tween, AnimatedFloat } from "vyto/ui/anim";
 import { Spring } from "vyto/anim";
@@ -2214,6 +2214,40 @@ export class Widget {
         return false;
     }
 
+    // The pointer moved to (x, y). Asked of the open overlay (wherever the
+    // pointer is, not only inside it) and of the menubar strip while the
+    // pointer is over it — the two places that track a hot row inside one
+    // widget rather than per child, the way a menu does. Return true after
+    // marking what changed with Window.mark_dirty; the Window then repaints
+    // just that.
+    virtual fn on_pointer_move(x: int, y: int): bool {
+        return false;
+    }
+
+    // ---- the Window.menubar seam -------------------------------------------
+    // Window.menubar is typed Widget, because core cannot import the menu
+    // module that imports it. These are the three things a Window asks of
+    // whatever sits there; MenuBar answers them, and any other widget keeps
+    // the defaults, which are exactly what a menubar strip did before.
+
+    // Height of the strip the Window reserves above root. 0 = no strip: a
+    // menu bar the OS draws in the window frame takes no client space.
+    virtual fn strip_height(s: Painter, th: Theme): float {
+        return s.font_height() + 8.0;
+    }
+
+    // A native menu item with this id was chosen (EV_COMMAND).
+    virtual fn on_command(id: int): bool {
+        return false;
+    }
+
+    // A key chord no overlay took (k, with the Window's modifier state):
+    // a menu item's shortcut, or Alt+letter opening a menu. Asked before the
+    // app's onShortcut for chords, and after the focused widget for bare keys.
+    virtual fn on_accel(k: int, mods: int): bool {
+        return false;
+    }
+
     // This widget gained / lost keyboard focus — callback companions to the
     // `focused` flag. Return true when consumed / state changed.
     virtual fn on_focus(): bool {
@@ -2805,7 +2839,7 @@ export class Window {
         let h = this.surf.height() as float;
         let top = 0.0;
         if (this.menubar != null) {
-            let sh = this.painter.font_height() + 8.0;
+            let sh = this.menubar.strip_height(this.painter, this.theme);
             this.menubar.win = this;
             this.menubar.arrange(this.painter, this.theme, Rect(0, 0, w, sh));
             top = sh;
@@ -3035,8 +3069,8 @@ export class Window {
                     this.repaint();
                 }
             }
-        } else if (this.app_chord(k) && this.fire_shortcut(k, ch)) {
-            // consumed by the app
+        } else if (this.app_chord(k) && this.fire_accel(k, ch)) {
+            // consumed by a menu item or the app
         } else {
             let f = this.focused_widget();
             if (f != null && f.on_key(k, ch)) {
@@ -3045,9 +3079,23 @@ export class Window {
             } else {
                 // Nothing focused wanted it: the app gets last refusal, so a
                 // bare key can still be a shortcut without stealing typing.
-                this.fire_shortcut(k, ch);
+                this.fire_accel(k, ch);
             }
         }
+    }
+
+    // A shortcut: the menu bar's items first — a shortcut printed beside a
+    // menu item is a promise that the key does that — then the app's hook.
+    fn fire_accel(k: int, ch: string): bool {
+        if (this.menubar != null && this.menubar.on_accel(k, this.mods)) {
+            this.redraw();
+            return true;
+        }
+        return this.fire_shortcut(k, ch);
+    }
+
+    fn on_command_ev(id: int) {
+        if (this.menubar != null && this.menubar.on_command(id)) { this.redraw(); }
     }
 
     fn focus_wants_tab(k: int, ch: string): bool {
@@ -3235,10 +3283,12 @@ export class Window {
                 target = null;
             }
             this.set_hover(target);
+            if (this.overlay != null && this.overlay.on_pointer_move(x, y)) { this.repaint(); }
             return;
         }
         if (this.menubar != null && contains(this.menubar.bounds, x, y)) {
             this.set_hover(this.menubar.hit(x, y));
+            if (this.menubar.on_pointer_move(x, y)) { this.repaint(); }
             return;
         }
         if (this.root != null) { target = this.root.hit(x, y); }
@@ -3580,6 +3630,8 @@ export class Window {
             } else if (ev == EV_BUTTON_DOWN || ev == EV_BUTTON_UP) {
                 this.on_button_ev(this.surf.button(), ev == EV_BUTTON_DOWN,
                                   this.surf.mouse_x(), this.surf.mouse_y());
+            } else if (ev == EV_COMMAND) {
+                this.on_command_ev(this.surf.command());
             }
         }
         // Stop the frame clock before teardown. Nothing below presents, so a

@@ -1,0 +1,324 @@
+// vyto/desktop/menu — a desktop application's menu bar, built once and shown
+// the way the platform shows menus: the real Win32 menu bar on Windows, and
+// vyto/ui's drawn MenuBar everywhere else.
+//
+//     import { AppMenu } from "vyto/desktop/menu";
+//
+//     let menus = new AppMenu(win);
+//     let file = menus.file();
+//     file.item("&New", "Ctrl+N", () => doc.reset());
+//     file.item("&Open…", "Ctrl+O", () => openDoc());
+//     file.separator();
+//     menus.addQuit(file);
+//     menus.addClipboard(menus.edit());
+//     menus.search().item("&Find…", "Ctrl+F", () => find.show());
+//     menus.settings().check("&Dark Theme", "", dark, (on) => setDark(on));
+//     menus.addFullScreen(menus.window());
+//     menus.addAbout(menus.help(), "About Notes", "Notes 1.0");
+//     menus.attach();                     // before or after win.run() starts
+//     win.run();
+//
+// The menus are vyto/ui `Menu`s, so everything there applies: `&` marks an
+// access key, a shortcut beside an item is bound (it fires from anywhere in
+// the window, native or drawn), `hint()` shows one without binding it, and
+// `set_enabled` / `set_checked` / `set_label` reach the native menu live.
+//
+// The **structure** is read once, by attach(): add every menu and item first.
+// Item state can change any time after.
+//
+// No GTK or Qt is linked on Linux — X11 has no menu bar of its own, so the
+// drawn one is the native look there, and it behaves like one: Alt+letter and
+// F10 open it, arrows walk it and cascade submenus, and pointing at another
+// title while a menu is open switches to it.
+
+import { Window, TextField, TextArea } from "vyto/ui";
+import { MenuBar, Menu, MenuItem, MenuBackend } from "vyto/ui/menu";
+import { messageFor, MSG_INFO } from "vyto/desktop";
+
+extern "C" {
+    fn vdmenu_supported(): i32;
+    fn vdmenu_is_windows(): i32;
+    fn vdmenu_create(is_bar: i32): rawptr;
+    fn vdmenu_destroy(m: rawptr);
+    fn vdmenu_append(m: rawptr, id: i32, label: cstring, shortcut: cstring, flags: i32): i32;
+    fn vdmenu_append_sub(m: rawptr, sub: rawptr, label: cstring, flags: i32): i32;
+    fn vdmenu_attach(hwnd: culong, bar: rawptr): i32;
+    fn vdmenu_update(bar: rawptr, id: i32, label: cstring, shortcut: cstring, flags: i32): i32;
+}
+
+#link "user32" if "windows"
+
+// Item flags, shared with menu_shim.c.
+const F_SEPARATOR: int = 1;
+const F_DISABLED: int = 2;
+const F_CHECKED: int = 4;
+
+// Native ids start clear of the dialog ids (IDOK = 1 ...) a WM_COMMAND can
+// also carry, and stay under the 16 bits WM_COMMAND has room for.
+const FIRST_ID: int = 100;
+const LAST_ID: int = 65000;
+
+// True where attach() can show the OS's own menu bar.
+export fn nativeMenusAvailable(): bool {
+    return vdmenu_supported() as int != 0;
+}
+
+export class AppMenu {
+    bar: MenuBar;
+    win: Window;
+    preferDrawn: bool;
+    fileM: Menu;
+    editM: Menu;
+    searchM: Menu;
+    settingsM: Menu;
+    windowM: Menu;
+    helpM: Menu;
+
+    fn init(win: Window) {
+        this.win = win;
+        this.bar = new MenuBar();
+    }
+
+    // Any top-level menu, placed after the ones made so far.
+    fn menu(title: string): Menu { return this.bar.menu(title); }
+
+    // The conventional menus. Each is made on its first call (so the bar
+    // shows them in the order the app first asks for them) and the same Menu
+    // comes back after.
+    fn file(): Menu {
+        if (this.fileM == null) { this.fileM = this.bar.menu("&File"); }
+        return this.fileM;
+    }
+    fn edit(): Menu {
+        if (this.editM == null) { this.editM = this.bar.menu("&Edit"); }
+        return this.editM;
+    }
+    fn search(): Menu {
+        if (this.searchM == null) { this.searchM = this.bar.menu("&Search"); }
+        return this.searchM;
+    }
+    // "Se&ttings": Alt+S is Search's.
+    fn settings(): Menu {
+        if (this.settingsM == null) { this.settingsM = this.bar.menu("Se&ttings"); }
+        return this.settingsM;
+    }
+    fn window(): Menu {
+        if (this.windowM == null) { this.windowM = this.bar.menu("&Window"); }
+        return this.windowM;
+    }
+    fn help(): Menu {
+        if (this.helpM == null) { this.helpM = this.bar.menu("&Help"); }
+        return this.helpM;
+    }
+
+    // ---- standard items ----------------------------------------------------
+
+    // Close the window: "E&xit" with Alt+F4 shown on Windows (the window
+    // manager already owns that key, so it is a hint, not a binding), "&Quit"
+    // bound to Ctrl+Q elsewhere.
+    fn addQuit(m: Menu): MenuItem {
+        let w = this.win;
+        if (vdmenu_is_windows() as int != 0) {
+            let it = m.item("E&xit", "", () => w.close());
+            it.hint("Alt+F4");
+            return it;
+        }
+        return m.item("&Quit", "Ctrl+Q", () => w.close());
+    }
+
+    // Cut, Copy, Paste and Select All for whichever text field or text area
+    // has focus. The shortcuts are hints: Ctrl+X/C/V/A already reach the
+    // focused widget, and binding them here would take them from widgets that
+    // do their own (a DataTable's Ctrl+C).
+    fn addClipboard(m: Menu) {
+        let w = this.win;
+        m.item("Cu&t", "", () => clip_action(w, 0)).hint("Ctrl+X");
+        m.item("&Copy", "", () => clip_action(w, 1)).hint("Ctrl+C");
+        m.item("&Paste", "", () => clip_action(w, 2)).hint("Ctrl+V");
+        m.separator();
+        m.item("Select &All", "", () => clip_action(w, 3)).hint("Ctrl+A");
+    }
+
+    // Toggle full screen; F11.
+    fn addFullScreen(m: Menu): MenuItem {
+        let w = this.win;
+        return m.check("&Full Screen", "F11", false, (on) => set_full(w, on));
+    }
+
+    // A message box with the app's name and version.
+    fn addAbout(m: Menu, title: string, text: string): MenuItem {
+        let w = this.win;
+        return m.item("&About…", "", () => about_box(w, title, text));
+    }
+
+    // ---- showing it --------------------------------------------------------
+
+    // Draw the bar even where a native one exists — for a themed app that
+    // wants its menus to match. Call before attach().
+    fn drawn(): AppMenu {
+        this.preferDrawn = true;
+        return this;
+    }
+
+    // Put the bar on the window: the OS's own where there is one, else the
+    // drawn MenuBar. True when the native bar went in.
+    //
+    // Also turns off the Window's close_on_esc. An app with a menu bar quits
+    // from File > Exit; Escape closes menus and dialogs. Left on, the Escape
+    // that a person presses to back out of a native menu — which the OS may
+    // already have closed — reaches the window and quits the app.
+    fn attach(): bool {
+        this.win.menubar = this.bar;
+        this.win.close_on_esc = false;
+        let native = false;
+        if (!this.preferDrawn && nativeMenusAvailable()) {
+            native = attach_native(this.bar, this.win);
+        }
+        // Before run() there is nothing to redo: run() lays out and paints.
+        if (this.win.running) {
+            this.win.layout();
+            this.win.redraw();
+        }
+        return native;
+    }
+
+    fn isNative(): bool { return this.bar.is_native(); }
+}
+
+// ---- the native bar ---------------------------------------------------------
+
+class Win32MenuBar extends MenuBackend {
+    hbar: rawptr;
+
+    fn init(hbar: rawptr) {
+        this.hbar = hbar;
+    }
+
+    override fn update(it: MenuItem) {
+        if (this.hbar == null || it.id <= 0) { return; }
+        vdmenu_update(this.hbar, it.id as i32, native_label(it.label, it.mnemonic).cstr(),
+                      it.shortcut.cstr(), item_flags(it) as i32);
+    }
+
+    // The window destroys its menu; the handle just stops being ours to use.
+    override fn release() { this.hbar = null; }
+}
+
+// Numbers items and builds the OS menus; one counter for the whole bar so an
+// id names one item.
+class Builder {
+    next_id: int;
+    ok: bool;
+
+    fn init() {
+        this.next_id = FIRST_ID;
+        this.ok = true;
+    }
+
+    fn popup(m: Menu): rawptr {
+        let h = vdmenu_create(0 as i32);
+        if (h == null) {
+            this.ok = false;
+            return h;
+        }
+        for (let it in m.items) {
+            if (it.separator) {
+                vdmenu_append(h, 0 as i32, "".cstr(), "".cstr(), F_SEPARATOR as i32);
+            } else if (it.submenu != null) {
+                let sub = this.popup(it.submenu);
+                if (sub == null) { return h; }
+                let flags = 0;
+                if (!it.enabled) { flags = F_DISABLED; }
+                if (vdmenu_append_sub(h, sub, native_label(it.label, it.mnemonic).cstr(),
+                                      flags as i32) as int == 0) {
+                    vdmenu_destroy(sub);
+                    this.ok = false;
+                }
+            } else {
+                if (this.next_id > LAST_ID) {
+                    this.ok = false;
+                    return h;
+                }
+                it.id = this.next_id;
+                this.next_id += 1;
+                if (vdmenu_append(h, it.id as i32, native_label(it.label, it.mnemonic).cstr(),
+                                  it.shortcut.cstr(), item_flags(it) as i32) as int == 0) {
+                    this.ok = false;
+                }
+            }
+        }
+        return h;
+    }
+}
+
+fn attach_native(bar: MenuBar, win: Window): bool {
+    let hwnd = win.surface().native_window();
+    if (hwnd as int == 0) { return false; }      // headless, or no window yet
+    let hb = vdmenu_create(1 as i32);
+    if (hb == null) { return false; }
+    let b = new Builder();
+    for (let m in bar.menus) {
+        let hp = b.popup(m);
+        if (hp == null) { break; }
+        if (vdmenu_append_sub(hb, hp, native_label(m.title, m.mnemonic).cstr(), 0 as i32) as int == 0) {
+            vdmenu_destroy(hp);
+            b.ok = false;
+        }
+    }
+    if (!b.ok || vdmenu_attach(hwnd, hb) as int == 0) {
+        vdmenu_destroy(hb);
+        for (let it in bar.all_items()) { it.id = 0; }
+        return false;
+    }
+    for (let m in bar.menus) { bar.adopt(m); }
+    bar.backend = new Win32MenuBar(hb);
+    return true;
+}
+
+// Back to Win32 markup: a literal & doubles, and the access key gets its &.
+fn native_label(label: string, at: int): string {
+    let out = "";
+    for (let i in 0..label.len) {
+        if (i == at) { out = out + "&"; }
+        let c = label.char_at(i);
+        if (c == "&") { out = out + "&&"; } else { out = out + c; }
+    }
+    return out;
+}
+
+fn item_flags(it: MenuItem): int {
+    let f = 0;
+    if (!it.enabled) { f = f | F_DISABLED; }
+    if (it.checkable && it.checked) { f = f | F_CHECKED; }
+    return f;
+}
+
+// ---- standard actions (top-level: closures do not nest) --------------------
+
+fn clip_action(w: Window, which: int) {
+    let f = w.focused_widget();
+    if (f == null) { return; }
+    let tf = f as TextField;
+    if (tf != null) {
+        if (which == 0) { tf.clip_cut(); }
+        else if (which == 1) { tf.clip_copy(); }
+        else if (which == 2) { tf.clip_paste(); }
+        else { tf.select_all(); }
+        return;
+    }
+    let ta = f as TextArea;
+    if (ta != null) {
+        if (which == 0) { ta.clip_cut(); }
+        else if (which == 1) { ta.clip_copy(); }
+        else if (which == 2) { ta.clip_paste(); }
+        else { ta.select_all(); }
+    }
+}
+
+fn set_full(w: Window, on: bool) {
+    w.surface().set_fullscreen(on);
+}
+
+fn about_box(w: Window, title: string, text: string) {
+    messageFor(w.surface().native_window(), title, text, MSG_INFO);
+}

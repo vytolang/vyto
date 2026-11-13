@@ -1,68 +1,404 @@
-// vyto/ui/menu — the menu model (MenuItem, Menu) plus the MenuBar strip and
-// the MenuPopup overlay it opens. Menus are pointer-driven (not in the focus
-// ring); popups drive the Window through the `win` weak ref.
+// vyto/ui/menu — the menu model (MenuItem, Menu), the MenuBar strip and the
+// MenuPopup overlay it opens.
+//
+//     let bar = new MenuBar();
+//     let file = bar.menu("&File");
+//     file.item("&Open…", "Ctrl+O", () => open());
+//     file.separator();
+//     let recent = file.submenu("Open &Recent");
+//     let wrap = view.check("&Word Wrap", "", true, (on) => setWrap(on));
+//     win.menubar = bar;
+//
+// **`&` marks the access key** in the builder calls (`menu`, `item`, `check`,
+// `submenu`, `set_label`): "&File" draws File with the F underlined while the
+// menu is driven from the keyboard, and Alt+F opens it. "&&" is a literal &.
+// `add(label)` and `new Menu(title)` take their text LITERALLY, because those
+// are what context menus build from data — a table called "R&D" must not lose
+// its ampersand.
+//
+// **A shortcut beside an item is bound.** "Ctrl+S" on an item fires it from
+// anywhere in the window (Window asks the bar before the app's onShortcut).
+// `hint(text)` shows one without binding it — for a key something else
+// already handles, like Ctrl+C in a text field or Alt+F4.
+//
+// The same model drives the OS's own menu bar: vyto/desktop/menu builds a
+// Win32 menu from a MenuBar and installs a MenuBackend, after which the bar
+// takes no client space and draws nothing. Shortcuts stay handled here, on
+// every platform, so they work identically native or drawn.
+//
+// Menus are pointer- and Alt-driven; they are not in the focus ring.
 
-import { Widget, Painter, Theme, Window,
-         WEIGHT } from "vyto/ui/core";
-import { Rect, mix, KEY_UP, KEY_DOWN, KEY_ENTER, KEY_SPACE } from "vyto/surface";
+import { Widget, Painter, Theme, Window } from "vyto/ui/core";
+import { Rect, contains, mix,
+         KEY_UP, KEY_DOWN, KEY_LEFT, KEY_RIGHT, KEY_ENTER, KEY_SPACE, KEY_HOME,
+         KEY_END, KEY_ESC, KEY_TAB, KEY_BACKSPACE, KEY_DELETE, KEY_INSERT,
+         KEY_PAGEUP, KEY_PAGEDOWN, KEY_F1, KEY_F10,
+         MOD_SHIFT, MOD_CTRL, MOD_ALT, MOD_SUPER } from "vyto/surface";
+
+// ---------------------------------------------------------------- the model
 
 // A single command in a menu. onSelect fires after the popup is dismissed.
 export class MenuItem {
-    label: string;
+    label: string;      // as drawn: access-key markers already removed
+    mnemonic: int;      // byte index of the access key in label; -1 = none
+    shortcut: string;   // as drawn, e.g. "Ctrl+S"; "" = none
+    accel_key: int;     // the bound key (KEY_*, lowercase letters); 0 = none
+    accel_mods: int;    // MOD_* the shortcut needs, exactly
+    enabled: bool;
+    checkable: bool;
+    checked: bool;
+    separator: bool;
+    submenu: Menu;
+    id: int;            // native command id; 0 until a native bar is built
+    host: weak MenuBar; // the bar whose backend mirrors this item
     onSelect: fn();
+    onToggle: fn(bool); // checkable items: the new state, before onSelect
 
     fn init(label: string) {
         this.label = label;
+        this.mnemonic = -1;
+        this.shortcut = "";
+        this.enabled = true;
     }
 
     fn fire() {
+        if (this.onToggle != null) { this.onToggle(this.checked); }
         if (this.onSelect != null) { this.onSelect(); }
+    }
+
+    // Choose this item: a checkable one flips first, then the handlers run.
+    // False for what cannot be chosen (separator, disabled, a submenu).
+    fn activate(): bool {
+        if (!this.selectable() || this.submenu != null) { return false; }
+        if (this.checkable) { this.set_checked(!this.checked); }
+        this.fire();
+        return true;
+    }
+
+    fn selectable(): bool { return this.enabled && !this.separator; }
+
+    // Bind a shortcut ("Ctrl+Shift+S", "F5", "Del"). An unparseable one is
+    // still shown, just not bound — a typo costs a key, not a crash.
+    fn bind(spec: string): MenuItem {
+        this.shortcut = spec;
+        let a = parse_accel(spec);
+        this.accel_key = a.key;
+        this.accel_mods = a.mods;
+        return this;
+    }
+
+    // Show a shortcut without binding it (see the header).
+    fn hint(spec: string): MenuItem {
+        this.shortcut = spec;
+        this.accel_key = 0;
+        this.accel_mods = 0;
+        return this;
+    }
+
+    // ---- live state: these reach a native menu too -----------------------
+
+    fn set_enabled(on: bool) {
+        if (this.enabled == on) { return; }
+        this.enabled = on;
+        this.changed();
+    }
+
+    fn set_checked(on: bool) {
+        this.checkable = true;
+        if (this.checked == on) { return; }
+        this.checked = on;
+        this.changed();
+    }
+
+    // Takes `&` markup, like item().
+    fn set_label(text: string) {
+        set_marked(this, text);
+        this.changed();
+    }
+
+    fn changed() {
+        let h = this.host;
+        if (h == null) { return; }
+        if (h.backend != null) { h.backend.update(this); }
+        // A drawn bar repaints on the next frame anyway; there is nothing to
+        // invalidate for a closed menu, and an open one redraws on input.
     }
 }
 
-// A titled group of MenuItems. `add` returns the item so the caller can wire
-// its onSelect closure over app-local state.
+// A titled group of MenuItems. The builder calls return the item (or the
+// submenu) so the caller can keep it to toggle later.
 export class Menu {
     title: string;
+    mnemonic: int;
     items: MenuItem[];
+    host: weak MenuBar;
 
     fn init(title: string) {
         this.title = title;
+        this.mnemonic = -1;
         this.items = [];
     }
 
-    fn add(label: string): MenuItem {
-        let it = new MenuItem(label);
+    fn push(it: MenuItem): MenuItem {
+        it.host = this.host;
         this.items.push(it);
         return it;
     }
+
+    // Literal text (see the header). Wire onSelect on the result.
+    fn add(label: string): MenuItem {
+        return this.push(new MenuItem(label));
+    }
+
+    // "&Save", "Ctrl+S" ("" for none), and what it does.
+    fn item(label: string, shortcut: string, on_select: fn()): MenuItem {
+        let it = new MenuItem("");
+        set_marked(it, label);
+        if (shortcut.len > 0) { it.bind(shortcut); }
+        it.onSelect = on_select;
+        return this.push(it);
+    }
+
+    // A toggle. on_toggle gets the new state; may be null.
+    fn check(label: string, shortcut: string, on: bool, on_toggle: fn(bool)): MenuItem {
+        let it = new MenuItem("");
+        set_marked(it, label);
+        if (shortcut.len > 0) { it.bind(shortcut); }
+        it.checkable = true;
+        it.checked = on;
+        it.onToggle = on_toggle;
+        return this.push(it);
+    }
+
+    fn separator(): MenuItem {
+        let it = new MenuItem("");
+        it.separator = true;
+        return this.push(it);
+    }
+
+    // A cascading submenu; returns it to fill in.
+    fn submenu(label: string): Menu {
+        let it = new MenuItem("");
+        set_marked(it, label);
+        let m = new Menu("");
+        m.host = this.host;
+        it.submenu = m;
+        this.push(it);
+        return m;
+    }
 }
+
+// "&Save &&Close" -> label "Save &Close", mnemonic 0.
+fn set_marked(it: MenuItem, text: string) {
+    let m = strip_marks(text);
+    it.label = m.text;
+    it.mnemonic = m.at;
+}
+
+class Marked {
+    text: string;
+    at: int;
+
+    fn init(text: string, at: int) {
+        this.text = text;
+        this.at = at;
+    }
+}
+
+fn strip_marks(s: string): Marked {
+    if (!s.contains("&")) { return new Marked(s, -1); }
+    let out = "";
+    let at = -1;
+    let i = 0;
+    while (i < s.len) {
+        let c = s[i];
+        if (c == 38 && i + 1 < s.len) {         // '&'
+            if (s[i + 1] == 38) {
+                out = out + "&";
+            } else {
+                if (at < 0 && s[i + 1] != 32) { at = out.len; }
+                out = out + s.char_at(i + 1);
+            }
+            i += 2;
+        } else {
+            out = out + s.char_at(i);
+            i += 1;
+        }
+    }
+    return new Marked(out, at);
+}
+
+// The access key as a lowercase ASCII code, or 0.
+fn mnemonic_key(text: string, at: int): int {
+    if (at < 0 || at >= text.len) { return 0; }
+    return lower_key(text[at]);
+}
+
+fn lower_key(k: int): int {
+    if (k >= 65 && k <= 90) { return k + 32; }
+    return k;
+}
+
+// ---------------------------------------------------------------- shortcuts
+
+struct Accel {
+    key: int;
+    mods: int;
+}
+
+// "Ctrl+Shift+S" -> ('s', CTRL|SHIFT). "Ctrl++" is Ctrl and the plus key.
+// Unknown names give key 0 (shown, not bound).
+fn parse_accel(spec: string): Accel {
+    let s = spec.trim();
+    if (s.len == 0) { return Accel(0, 0); }
+    let key_part = s;
+    let mod_part = "";
+    if (s.len > 1 && s.ends_with("++")) {
+        key_part = "+";
+        mod_part = s.slice(0, s.len - 2);
+    } else {
+        let p = s.last_index_of("+");
+        if (p > 0 && p < s.len - 1) {
+            key_part = s.slice(p + 1, s.len);
+            mod_part = s.slice(0, p);
+        }
+    }
+    let mods = 0;
+    if (mod_part.len > 0) {
+        for (let m in mod_part.split("+")) {
+            let t = m.trim().to_lower();
+            if (t == "ctrl" || t == "control") { mods = mods | MOD_CTRL; }
+            else if (t == "shift") { mods = mods | MOD_SHIFT; }
+            else if (t == "alt") { mods = mods | MOD_ALT; }
+            else if (t == "super" || t == "win" || t == "meta" || t == "cmd") { mods = mods | MOD_SUPER; }
+            else { return Accel(0, 0); }
+        }
+    }
+    return Accel(key_code(key_part.trim()), mods);
+}
+
+fn key_code(name: string): int {
+    if (name.len == 1) { return lower_key(name[0]); }
+    let n = name.to_lower();
+    if (n.len >= 2 && n.len <= 3 && n[0] == 102) {    // f1 .. f12
+        let d = n.slice(1, n.len);
+        let v = 0;
+        for (let i in 0..d.len) {
+            if (d[i] < 48 || d[i] > 57) { return 0; }
+            v = v * 10 + (d[i] - 48);
+        }
+        if (v >= 1 && v <= 12) { return KEY_F1 + v - 1; }
+        return 0;
+    }
+    if (n == "del" || n == "delete") { return KEY_DELETE; }
+    if (n == "ins" || n == "insert") { return KEY_INSERT; }
+    if (n == "enter" || n == "return") { return KEY_ENTER; }
+    if (n == "esc" || n == "escape") { return KEY_ESC; }
+    if (n == "tab") { return KEY_TAB; }
+    if (n == "space") { return KEY_SPACE; }
+    if (n == "backspace") { return KEY_BACKSPACE; }
+    if (n == "home") { return KEY_HOME; }
+    if (n == "end") { return KEY_END; }
+    if (n == "pgup" || n == "pageup") { return KEY_PAGEUP; }
+    if (n == "pgdn" || n == "pagedown") { return KEY_PAGEDOWN; }
+    if (n == "up") { return KEY_UP; }
+    if (n == "down") { return KEY_DOWN; }
+    if (n == "left") { return KEY_LEFT; }
+    if (n == "right") { return KEY_RIGHT; }
+    if (n == "plus") { return 43; }
+    if (n == "minus") { return 45; }
+    return 0;
+}
+
+// ------------------------------------------------------------ native seam
+
+// What a native menu bar implements. vyto/desktop/menu supplies the Win32
+// one; with none installed the bar draws itself.
+export class MenuBackend {
+    // An item's label, enabled or checked state changed.
+    virtual fn update(it: MenuItem) { }
+    // The window is closing; forget the OS handles (the OS frees a window's
+    // menu with the window).
+    virtual fn release() { }
+}
+
+// ---------------------------------------------------------------- MenuBar
 
 const MENU_PAD: float = 12.0;
 
-// The horizontal strip of menu titles. Clicking a title opens its popup as
-// a Window overlay. Not part of the focus ring — menus are pointer-driven.
+// The horizontal strip of menu titles. Clicking a title, or Alt + its access
+// key, opens its popup as a Window overlay; while one is open, pointing at
+// another title switches to it.
 export class MenuBar extends Widget {
     menus: Menu[];
     title_x: float[];   // cached in draw for hit-testing
     title_w: float[];
+    backend: MenuBackend;   // non-null = the OS draws this bar
+    hot: int;               // title under the pointer, -1 = none
+    popup: weak MenuPopup;  // the popup this bar opened last
+    cue: bool;              // underline access keys (keyboard-driven)
 
     fn init() {
         super.init();
         this.menus = [];
         this.title_x = [];
         this.title_w = [];
+        this.hot = -1;
     }
 
     fn add_menu(menu: Menu): Menu {
         this.menus.push(menu);
+        this.adopt(menu);
         return menu;
     }
 
+    // A new top-level menu; `&` marks its access key.
+    fn menu(title: string): Menu {
+        let m = new Menu("");
+        let k = strip_marks(title);
+        m.title = k.text;
+        m.mnemonic = k.at;
+        return this.add_menu(m);
+    }
+
+    // Point every item (and nested menu) at this bar, so state changes reach
+    // a native backend.
+    fn adopt(m: Menu) {
+        m.host = this;
+        for (let it in m.items) {
+            it.host = this;
+            if (it.submenu != null) { this.adopt(it.submenu); }
+        }
+    }
+
+    fn is_native(): bool { return this.backend != null; }
+
+    // Every item, depth first — the order native ids are assigned in.
+    fn all_items(): MenuItem[] {
+        let out: MenuItem[] = [];
+        for (let m in this.menus) { collect_items(m, out); }
+        return out;
+    }
+
+    override fn strip_height(s: Painter, th: Theme): float {
+        if (this.backend != null) { return 0.0; }
+        return s.font_height() + 8.0;
+    }
+
+    fn open_index(): int {
+        let p = this.popup;
+        let win = this.win;
+        if (p == null || win == null) { return -1; }
+        if (win.overlay != p) { return -1; }
+        return p.bar_i;
+    }
+
     override fn render(s: Painter, th: Theme) {
+        if (this.backend != null || this.bounds.h <= 0.0) { return; }
         s.fill(this.bounds, th.surface_raised);
         s.line(this.bounds.x, this.bounds.bottom() - 1,
                this.bounds.right(), this.bounds.bottom() - 1, th.divider);
+        let open = this.open_index();
         let xs: float[] = [];
         let ws: float[] = [];
         let x = this.bounds.x + MENU_PAD;
@@ -71,124 +407,525 @@ export class MenuBar extends Widget {
             let w = s.text_width(m.title);
             xs.push(x - MENU_PAD / 2.0);
             ws.push(w + MENU_PAD);
+            let cell = Rect(x - MENU_PAD / 2.0, this.bounds.y + 3.0, w + MENU_PAD,
+                            this.bounds.h - 6.0);
+            if (i == open) {
+                s.fill_round(cell, th.radius_sm, th.selection);
+            } else if (i == this.hot && open < 0) {
+                s.fill_round(cell, th.radius_sm, mix(th.surface_raised, th.on_surface, 0.08));
+            }
             let r = Rect(x, this.bounds.y, w, this.bounds.h);
-            s.set_weight(WEIGHT.BOLD);
             s.text_in(r, 0, m.title, th.on_surface);
-            s.set_weight(WEIGHT.REG);
+            // only while a keyboard-opened menu is open, as on every desktop
+            if (this.cue && open >= 0) { underline(s, r, 0.0, m.title, m.mnemonic, th.on_surface); }
             x += w + MENU_PAD * 2.0;
         }
         this.title_x = xs;
         this.title_w = ws;
     }
 
+    fn title_at(x: int, y: int): int {
+        if (!contains(this.bounds, x, y)) { return -1; }
+        for (let i in 0..this.menus.len) {
+            if (i < this.title_x.len
+                && x as float >= this.title_x[i]
+                && x as float < this.title_x[i] + this.title_w[i]) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    // Open menu i as the window's overlay, replacing whatever menu is open.
+    fn open_menu(i: int, keyboard: bool): bool {
+        let win = this.win;
+        if (win == null || i < 0 || i >= this.menus.len) { return false; }
+        let ax = this.bounds.x + MENU_PAD / 2.0;
+        if (i < this.title_x.len) { ax = this.title_x[i]; }
+        let p = new MenuPopup(this.menus[i], ax, this.bounds.bottom());
+        p.bar = this;
+        p.bar_i = i;
+        p.cue = keyboard;
+        this.cue = keyboard;
+        this.hot = -1;
+        this.popup = p;
+        win.open_overlay(p);
+        return true;
+    }
+
     override fn on_click(x: int, y: int): bool {
         // A menu bar with no window has nothing to open a popup on. Not an
         // error: an unmounted widget can be clicked by a test harness.
+        let i = this.title_at(x, y);
+        if (i < 0) { return false; }
+        return this.open_menu(i, false);
+    }
+
+    override fn on_pointer_move(x: int, y: int): bool {
+        let i = this.title_at(x, y);
+        if (i == this.hot) { return false; }
+        this.hot = i;
         let win = this.win;
-        if (win == null) { return false; }
-        for (let i in 0..this.menus.len) {
-            if (i < this.title_x.len
-                && x as float >= this.title_x[i] && x as float < this.title_x[i] + this.title_w[i]) {
-                let popup = new MenuPopup(this.menus[i], this.title_x[i],
-                                          this.bounds.bottom());
-                win.open_overlay(popup);
-                return true;
+        if (win != null) { win.mark_dirty(this.bounds); }
+        return true;
+    }
+
+    override fn on_hover_leave(): bool {
+        this.hot = -1;
+        return true;
+    }
+
+    override fn shows_press(): bool { return false; }
+
+    override fn on_command(id: int): bool {
+        if (id <= 0) { return false; }
+        for (let it in this.all_items()) {
+            if (it.id == id) { return it.activate(); }
+        }
+        return false;
+    }
+
+    override fn on_accel(k: int, mods: int): bool {
+        let key = lower_key(k);
+        let want = mods & (MOD_CTRL | MOD_SHIFT | MOD_ALT | MOD_SUPER);
+        for (let it in this.all_items()) {
+            if (it.accel_key != 0 && it.accel_key == key && it.accel_mods == want
+                && it.enabled) {
+                return it.activate();
             }
+        }
+        // A native bar handles Alt+letter and F10 itself (DefWindowProc).
+        if (this.backend != null) { return false; }
+        if (want == MOD_ALT) {
+            for (let i in 0..this.menus.len) {
+                let m = this.menus[i];
+                if (mnemonic_key(m.title, m.mnemonic) == key && key != 0) {
+                    return this.open_menu(i, true);
+                }
+            }
+        }
+        if (key == KEY_F10 && want == 0 && this.menus.len > 0) {
+            return this.open_menu(0, true);
         }
         return false;
     }
 
     override fn drop_handlers() {
-        for (let m in this.menus) {
-            for (let it in m.items) { it.onSelect = null; }
+        for (let it in this.all_items()) {
+            it.onSelect = null;
+            it.onToggle = null;
+        }
+        if (this.backend != null) {
+            this.backend.release();
+            this.backend = null;
         }
     }
 }
 
+fn collect_items(m: Menu, out: MenuItem[]) {
+    for (let it in m.items) {
+        out.push(it);
+        if (it.submenu != null) { collect_items(it.submenu, out); }
+    }
+}
+
+// The access key's underline, under byte `at` of `text` drawn in r at pad.
+fn underline(s: Painter, r: Rect, pad: float, text: string, at: int, color: int) {
+    if (at < 0 || at >= text.len) { return; }
+    let x0 = r.x + pad + s.text_width(text.slice(0, at));
+    let x1 = x0 + s.text_width(text.slice(at, at + 1));
+    let y = s.baseline_in(r) + 2.0;
+    s.line(x0, y, x1, y, color);
+}
+
+// ---------------------------------------------------------------- MenuPopup
+
 const POPUP_PAD: float = 16.0;
 
-// A dropdown list of one menu's items, shown as an overlay.
-export class MenuPopup extends Widget {
+// One open menu box: the top menu, or a submenu cascaded off it.
+class MenuLevel {
     menu: Menu;
+    rect: Rect;
+    sel: int;
+    row_y: float[];     // top of each row, absolute
+    row_hs: float[];
+    gutter: float;      // label x offset (room for a check mark)
+    sc_w: float;        // widest shortcut
+    arrow_w: float;
+
+    fn init(menu: Menu) {
+        this.menu = menu;
+        this.sel = -1;
+        this.row_y = [];
+        this.row_hs = [];
+    }
+
+    fn row_at(y: int): int {
+        for (let i in 0..this.row_y.len) {
+            if (y as float >= this.row_y[i] && y as float < this.row_y[i] + this.row_hs[i]) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    fn first(): int { return this.next_from(-1, 1); }
+
+    // The next selectable row after `start` in direction d, wrapping; -1 if none.
+    fn next_from(start: int, d: int): int {
+        let n = this.menu.items.len;
+        if (n == 0) { return -1; }
+        let i = start;
+        for (let step in 0..n) {
+            i = i + d;
+            if (i < 0) { i = n - 1; }
+            if (i >= n) { i = 0; }
+            if (this.menu.items[i].selectable()) { return i; }
+        }
+        return -1;
+    }
+}
+
+// A menu's items as an overlay — the popup a MenuBar opens, and the one
+// ContextMenu and the text widgets open at a point. Covers the whole window
+// while open, so it sees the pointer everywhere: a click outside closes it
+// (and is swallowed, as on every desktop), pointing at another title on the
+// bar switches menus, and submenus cascade off it on hover.
+export class MenuPopup extends Widget {
+    menu: Menu;         // the top level
     anchor_x: float;
     anchor_y: float;
-    sel: int;
+    sel: int;           // selected row of the top level (kept in sync)
     row_h: float;
+    levels: MenuLevel[];
+    bar: weak MenuBar;  // set when a MenuBar opened it
+    bar_i: int;
+    cue: bool;          // underline access keys
 
     fn init(menu: Menu, ax: float, ay: float) {
         super.init();
         this.menu = menu;
         this.anchor_x = ax;
         this.anchor_y = ay;
-        this.sel = 0;
         this.row_h = 20.0;
+        this.bar_i = -1;
+        let top = new MenuLevel(menu);
+        // The first selectable row starts selected: Down then Enter picks the
+        // second, as it always has.
+        top.sel = top.first();
+        this.sel = top.sel;
+        this.levels = [top];
     }
 
+    fn ui_scale(): float {
+        let win = this.win;
+        if (win == null || win.scale <= 0.0) { return 1.0; }
+        return win.scale;
+    }
+
+    override fn shows_press(): bool { return false; }
+
     override fn place(s: Painter, th: Theme) {
+        this.bounds = Rect(0, 0, s.width(), s.height());
         this.row_h = s.font_height() + 8;
-        let w = 40.0;
-        for (let it in this.menu.items) {
-            let iw = s.text_width(it.label) + 2.0 * POPUP_PAD;
-            if (iw > w) { w = iw; }
+        for (let i in 0..this.levels.len) { this.place_level(s, i); }
+    }
+
+    fn place_level(s: Painter, li: int) {
+        let k = this.ui_scale();
+        let lv = this.levels[li];
+        let pad_y = 4.0 * k;
+        let sep_h = 9.0 * k;
+        let checks = false;
+        let label_w = 0.0;
+        let sc_w = 0.0;
+        let subs = false;
+        for (let it in lv.menu.items) {
+            if (it.checkable) { checks = true; }
+            if (it.submenu != null) { subs = true; }
+            let lw = s.text_width(it.label);
+            if (lw > label_w) { label_w = lw; }
+            if (it.shortcut.len > 0) {
+                let sw = s.text_width(it.shortcut);
+                if (sw > sc_w) { sc_w = sw; }
+            }
         }
-        let h = (this.menu.items.len as float) * this.row_h + 2.0;
+        lv.gutter = POPUP_PAD * k;
+        if (checks) { lv.gutter = 28.0 * k; }
+        lv.sc_w = sc_w;
+        lv.arrow_w = 0.0;
+        if (subs) { lv.arrow_w = 14.0 * k; }
+        let w = lv.gutter + label_w + POPUP_PAD * k + lv.arrow_w;
+        if (sc_w > 0.0) { w = w + 28.0 * k + sc_w; }
+        if (w < 40.0) { w = 40.0; }
+        let h = pad_y * 2.0;
+        for (let it in lv.menu.items) {
+            if (it.separator) { h = h + sep_h; } else { h = h + this.row_h; }
+        }
         let x = this.anchor_x;
         let y = this.anchor_y;
+        if (li > 0) {
+            // cascade off the parent's selected row
+            let pv = this.levels[li - 1];
+            x = pv.rect.right() - 3.0 * k;
+            if (pv.sel >= 0 && pv.sel < pv.row_y.len) { y = pv.row_y[pv.sel] - pad_y; }
+            if (x + w > s.width()) { x = pv.rect.x - w + 3.0 * k; }
+        }
         if (x + w > s.width()) { x = s.width() - w; }
         if (y + h > s.height()) { y = s.height() - h; }
-        this.bounds = Rect(x, y, w, h);
+        if (x < 0.0) { x = 0.0; }
+        if (y < 0.0) { y = 0.0; }
+        lv.rect = Rect(x, y, w, h);
+        let ys: float[] = [];
+        let hs: float[] = [];
+        let ry = y + pad_y;
+        for (let it in lv.menu.items) {
+            let rh = this.row_h;
+            if (it.separator) { rh = sep_h; }
+            ys.push(ry);
+            hs.push(rh);
+            ry = ry + rh;
+        }
+        lv.row_y = ys;
+        lv.row_hs = hs;
+    }
+
+    fn deepest(): MenuLevel { return this.levels[this.levels.len - 1]; }
+
+    // Close every level deeper than li.
+    fn truncate(li: int) {
+        if (this.levels.len <= li + 1) { return; }
+        let keep: MenuLevel[] = [];
+        for (let i in 0..li + 1) { keep.push(this.levels[i]); }
+        this.levels = keep;
+    }
+
+    // Open the submenu of level li's selected row as level li + 1.
+    fn open_sub(li: int, keyboard: bool): bool {
+        let lv = this.levels[li];
+        if (lv.sel < 0 || lv.sel >= lv.menu.items.len) { return false; }
+        let it = lv.menu.items[lv.sel];
+        if (it.submenu == null || !it.enabled) { return false; }
+        this.truncate(li);
+        let sub = new MenuLevel(it.submenu);
+        if (keyboard) { sub.sel = sub.first(); }
+        this.levels.push(sub);
+        let win = this.win;
+        if (win != null) { this.place_level(win.painter, li + 1); }
+        return true;
     }
 
     fn choose() {
+        let lv = this.deepest();
+        this.choose_in(lv);
+    }
+
+    fn choose_in(lv: MenuLevel) {
         let win = this.win;
         if (win == null) { return; }
-        if (this.sel < 0 || this.sel >= this.menu.items.len) { return; }
-        let it = this.menu.items[this.sel];
-        win.dismiss_overlay();  // drop the popup first so onSelect can open another overlay
-        it.fire();
+        if (lv.sel < 0 || lv.sel >= lv.menu.items.len) { return; }
+        let it = lv.menu.items[lv.sel];
+        if (!it.selectable()) { return; }
+        if (it.submenu != null) { return; }
+        win.dismiss_overlay();  // drop the popup first so the item can open another overlay
+        it.activate();
     }
 
     override fn render(s: Painter, th: Theme) {
         let win = this.win;
         if (win == null) { return; }
-        let radius = th.radius_md;
-        win.skin.panel.paint(s, th, this.bounds, radius, th.surface_raised, th.border, 2);
-        for (let i in 0..this.menu.items.len) {
-            let r = Rect(this.bounds.x + 2.0, this.bounds.y + 1.0 + (i as float) * this.row_h,
-                         this.bounds.w - 4, this.row_h);
-            let color = th.on_surface;
-            if (i == this.sel) {
-                s.fill_round(r, th.radius_sm, th.selection);
-                color = th.primary;
-                s.set_weight(WEIGHT.BOLD);
+        let k = this.ui_scale();
+        for (let lv in this.levels) {
+            win.skin.panel.paint(s, th, lv.rect, th.radius_sm, th.surface_raised, th.border, 2);
+            for (let i in 0..lv.menu.items.len) {
+                if (i >= lv.row_y.len) { break; }
+                let it = lv.menu.items[i];
+                let row = Rect(lv.rect.x + 4.0 * k, lv.row_y[i], lv.rect.w - 8.0 * k, lv.row_hs[i]);
+                if (it.separator) {
+                    let cy = row.y + row.h / 2.0;
+                    s.line(row.x + 6.0 * k, cy, row.right() - 6.0 * k, cy, th.divider);
+                    continue;
+                }
+                let fg = th.on_surface;
+                let sub_fg = th.on_surface_muted;
+                if (!it.enabled) {
+                    fg = th.disabled_fg;
+                    sub_fg = th.disabled_fg;
+                }
+                if (i == lv.sel && it.enabled) {
+                    s.fill_round(row, th.radius_sm, th.selection);
+                }
+                let lx = lv.rect.x + lv.gutter;
+                let tr = Rect(lx, row.y, row.right() - lx, row.h);
+                if (it.checkable && it.checked) {
+                    draw_check(s, lv.rect.x + 10.0 * k, row.y + row.h / 2.0, k, fg);
+                }
+                s.text_in(tr, 0, it.label, fg);
+                if (this.cue) { underline(s, tr, 0.0, it.label, it.mnemonic, fg); }
+                let right = lv.rect.right() - POPUP_PAD * k;
+                if (it.submenu != null) {
+                    draw_chevron(s, right, row.y + row.h / 2.0, k, sub_fg);
+                }
+                if (it.shortcut.len > 0) {
+                    let sx = right - lv.arrow_w - s.text_width(it.shortcut);
+                    s.text_in(Rect(sx, row.y, row.right() - sx, row.h), 0, it.shortcut, sub_fg);
+                }
             }
-            s.text_in(r, POPUP_PAD, this.menu.items[i].label, color);
-            s.set_weight(WEIGHT.REG);
         }
     }
 
-    override fn on_key(k: int, ch: string): bool {
-        if (k == KEY_UP) {
-            if (this.sel > 0) { this.sel -= 1; }
-            return true;
+    // The deepest level containing (x, y), or -1.
+    fn level_at(x: int, y: int): int {
+        let n = this.levels.len;
+        for (let j in 0..n) {
+            let i = n - 1 - j;
+            if (contains(this.levels[i].rect, x, y)) { return i; }
         }
-        if (k == KEY_DOWN) {
-            if (this.sel < this.menu.items.len - 1) { this.sel += 1; }
-            return true;
+        return -1;
+    }
+
+    fn mark_levels() {
+        let win = this.win;
+        if (win == null) { return; }
+        for (let lv in this.levels) { win.mark_dirty(lv.rect.inset(-12.0)); }
+    }
+
+    override fn on_pointer_move(x: int, y: int): bool {
+        let li = this.level_at(x, y);
+        if (li < 0) {
+            // Over another title of the bar that opened us: switch to it.
+            let b = this.bar;
+            if (b != null) {
+                let t = b.title_at(x, y);
+                if (t >= 0 && t != this.bar_i) {
+                    b.open_menu(t, this.cue);
+                    return false;   // open_overlay already redrew
+                }
+            }
+            return false;
         }
-        if (k == KEY_ENTER || k == KEY_SPACE) {
-            this.choose();
-            return true;
-        }
-        return false;
+        let lv = this.levels[li];
+        let row = lv.row_at(y);
+        if (row < 0 || row == lv.sel) { return false; }
+        if (!lv.menu.items[row].selectable()) { return false; }
+        this.mark_levels();     // before: a closing submenu must be repainted away
+        lv.sel = row;
+        if (li == 0) { this.sel = row; }
+        if (!this.open_sub(li, false)) { this.truncate(li); }
+        this.mark_levels();
+        return true;
     }
 
     override fn on_click(x: int, y: int): bool {
-        let row = ((y as float - this.bounds.y - 1.0) / this.row_h) as int;
-        if (row >= 0 && row < this.menu.items.len) {
-            this.sel = row;
-            this.choose();
+        let win = this.win;
+        if (win == null) { return true; }
+        let li = this.level_at(x, y);
+        if (li >= 0) {
+            let lv = this.levels[li];
+            let row = lv.row_at(y);
+            if (row < 0 || !lv.menu.items[row].selectable()) { return true; }
+            lv.sel = row;
+            if (li == 0) { this.sel = row; }
+            if (lv.menu.items[row].submenu != null) {
+                this.open_sub(li, false);
+                return true;
+            }
+            this.truncate(li);
+            this.choose_in(lv);
+            return true;
         }
+        let b = this.bar;
+        if (b != null) {
+            let t = b.title_at(x, y);
+            if (t >= 0 && t != this.bar_i) {
+                b.open_menu(t, false);
+                return true;
+            }
+        }
+        // Outside every box (or on our own title): close. Swallowed, as on
+        // every desktop — the click that dismisses a menu does nothing else.
+        win.dismiss_overlay();
         return true;
     }
+
+    override fn on_key(k: int, ch: string): bool {
+        let win = this.win;
+        if (win == null) { return false; }
+        let li = this.levels.len - 1;
+        let lv = this.levels[li];
+        let b = this.bar;
+        if (k == KEY_UP || k == KEY_DOWN) {
+            let d = 1;
+            if (k == KEY_UP) { d = -1; }
+            let n = lv.next_from(lv.sel, d);
+            if (n >= 0) { lv.sel = n; }
+            if (li == 0) { this.sel = lv.sel; }
+            this.cue = true;
+            return true;
+        }
+        if (k == KEY_HOME || k == KEY_END) {
+            if (k == KEY_HOME) { lv.sel = lv.next_from(-1, 1); }
+            else { lv.sel = lv.next_from(lv.menu.items.len, -1); }
+            if (li == 0) { this.sel = lv.sel; }
+            return true;
+        }
+        if (k == KEY_RIGHT) {
+            if (this.open_sub(li, true)) { return true; }
+            if (b != null && b.menus.len > 0) {
+                b.open_menu((this.bar_i + 1) % b.menus.len, true);
+            }
+            return true;
+        }
+        if (k == KEY_LEFT) {
+            if (li > 0) {
+                this.truncate(li - 1);
+                return true;
+            }
+            if (b != null && b.menus.len > 0) {
+                b.open_menu((this.bar_i + b.menus.len - 1) % b.menus.len, true);
+            }
+            return true;
+        }
+        if (k == KEY_ENTER || k == KEY_SPACE) {
+            if (this.open_sub(li, true)) { return true; }
+            this.choose_in(lv);
+            return true;
+        }
+        // An access key: within the open box, or Alt+key for another title.
+        let key = lower_key(k);
+        if (key == 0) { return false; }
+        if ((win.mods & MOD_ALT) != 0 && b != null) {
+            for (let i in 0..b.menus.len) {
+                let m = b.menus[i];
+                if (mnemonic_key(m.title, m.mnemonic) == key) {
+                    b.open_menu(i, true);
+                    return true;
+                }
+            }
+        }
+        for (let i in 0..lv.menu.items.len) {
+            let it = lv.menu.items[i];
+            if (it.selectable() && mnemonic_key(it.label, it.mnemonic) == key) {
+                lv.sel = i;
+                if (li == 0) { this.sel = i; }
+                if (!this.open_sub(li, true)) { this.choose_in(lv); }
+                return true;
+            }
+        }
+        return false;
+    }
+}
+
+// A check mark centred on (cx, cy).
+fn draw_check(s: Painter, cx: float, cy: float, k: float, color: int) {
+    let w = 1.6 * k;
+    s.line_w(cx - 4.0 * k, cy, cx - 1.5 * k, cy + 3.0 * k, w, color);
+    s.line_w(cx - 1.5 * k, cy + 3.0 * k, cx + 4.0 * k, cy - 3.5 * k, w, color);
+}
+
+// A right-pointing chevron whose tip is at (rx, cy).
+fn draw_chevron(s: Painter, rx: float, cy: float, k: float, color: int) {
+    let w = 1.4 * k;
+    s.line_w(rx - 4.0 * k, cy - 4.0 * k, rx, cy, w, color);
+    s.line_w(rx, cy, rx - 4.0 * k, cy + 4.0 * k, w, color);
 }

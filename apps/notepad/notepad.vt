@@ -1,6 +1,7 @@
 // VoltPad — a classic Notepad built on vyto/ui.
 //
-// Menu bar (File / Help), a multi-line editor, and a status line — all from
+// Menu bar (File / Edit / Help — the OS's own on Windows, via
+// vyto/desktop/menu), a multi-line editor, and a status line — all from
 // stdlib widgets, zero platform code. Directory-listing file picker for
 // Open / Save As uses the listdir/isdir builtins.
 //
@@ -8,7 +9,8 @@
 //   VYTO_NOTE_DIR=/path            starting directory for the file picker
 
 import { Window, Column, Row, Spacer, Label, TextArea,
-         MenuBar, Menu, FilePicker, MessageDialog } from "vyto/ui";
+         FilePicker, MessageDialog } from "vyto/ui";
+import { AppMenu } from "vyto/desktop/menu";
 
 extern "C" {
     fn getenv(name: cstring): cstring;
@@ -96,22 +98,22 @@ fn main() {
 
     pad.editor.onChange = () => pad.touched();
 
-    let bar = new MenuBar();
-    let file = bar.add_menu(new Menu("File"));
-    file.add("New").onSelect = () => pad.do_new();
-    file.add("Open...").onSelect = () => { open_pk.reload(); win.open_overlay(open_pk); };
-    file.add("Save").onSelect = () => {
+    let menus = new AppMenu(win);
+    let file = menus.file();
+    file.item("&New", "Ctrl+N", () => pad.do_new());
+    file.item("&Open…", "Ctrl+O", () => { open_pk.reload(); win.open_overlay(open_pk); });
+    file.item("&Save", "Ctrl+S", () => {
         if (pad.path.len > 0) { pad.save_to(pad.path); }
         else { save_pk.reload(); win.open_overlay(save_pk); }
-    };
-    file.add("Save As...").onSelect = () => { save_pk.reload(); win.open_overlay(save_pk); };
-    file.add("Exit").onSelect = () => win.close();
-
-    let help = bar.add_menu(new Menu("Help"));
-    help.add("About").onSelect = () => win.open_overlay(about);
-
-    win.menubar = bar;
-    win.close_on_esc = false; // Esc dismisses menus/dialogs, never the editor
+    });
+    file.item("Save &As…", "Ctrl+Shift+S", () => { save_pk.reload(); win.open_overlay(save_pk); });
+    file.separator();
+    menus.addQuit(file);
+    menus.addClipboard(menus.edit());
+    menus.help().item("&About VoltPad", "", () => win.open_overlay(about));
+    // Also turns off close_on_esc: Esc dismisses menus and dialogs, never
+    // the editor.
+    menus.attach();
     win.root = new Column([
         pad.editor,
         new Row([pad.status, new Spacer()]),

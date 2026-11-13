@@ -1,0 +1,67 @@
+// vyto/desktop/menu off Windows: AppMenu falls back to the drawn MenuBar, and
+// that bar behaves like a desktop one — bound shortcuts, Alt+letter and F10,
+// arrows that skip separators and disabled rows, submenus that cascade on
+// Right and on hover, Left/Right across titles, pointing at another title
+// switching menus, and a click outside closing without firing.
+//
+// The model dump at the top is the shortcut parser and the & markup: what
+// each item draws, which key it is bound to, and which shortcuts are only
+// hints (Edit's clipboard keys belong to the focused widget).
+import { Window, Column, TextField } from "vyto/ui";
+import { MenuItem } from "vyto/ui/menu";
+import { AppMenu, nativeMenusAvailable } from "vyto/desktop/menu";
+
+fn dump(it: MenuItem): string {
+    if (it.separator) { return "  ---"; }
+    let s = "  " + it.label + " mn=" + it.mnemonic;
+    if (it.shortcut.len > 0) {
+        s = s + " [" + it.shortcut + "]";
+        if (it.accel_key == 0) { s = s + " hint"; }
+        else { s = s + " key=" + it.accel_key + " mods=" + it.accel_mods; }
+    }
+    if (!it.enabled) { s = s + " disabled"; }
+    if (it.checkable) { s = s + " checked=" + it.checked; }
+    if (it.submenu != null) { s = s + " >"; }
+    return s;
+}
+
+fn main() {
+    let win = new Window("AppMenu", 400, 300);
+    let field = new TextField("");
+    let menus = new AppMenu(win);
+
+    let file = menus.file();
+    file.item("&New", "Ctrl+N", () => print("fire:new"));
+    let recent = file.submenu("Open &Recent");
+    recent.item("&a.txt", "", () => print("fire:recent a.txt"));
+    recent.item("&b.txt", "", () => print("fire:recent b.txt"));
+    file.separator();
+    file.item("&Disabled", "Ctrl+D", () => print("WRONG: disabled fired")).set_enabled(false);
+    file.item("&Print", "Ctrl+Shift+P", () => print("fire:print clip=" + win.surface().clipboard()));
+    file.separator();
+    menus.addQuit(file);
+
+    let edit = menus.edit();
+    edit.item("&Undo", "Ctrl+Z", () => print("fire:undo"));
+    edit.separator();
+    edit.check("Word &Wrap", "", false, (on) => print("wrap=" + on));
+    edit.separator();
+    menus.addClipboard(edit);
+
+    menus.search().item("Find &Next", "F3", () => print("fire:find next"));
+    menus.settings().item("&Preferences…", "Ctrl+,", () => print("fire:prefs"));
+
+    win.root = new Column([field]);
+    print("available=" + nativeMenusAvailable() + " native=" + menus.attach());
+    for (let m in menus.bar.menus) {
+        print(m.title + " mn=" + m.mnemonic);
+        for (let it in m.items) {
+            print(dump(it));
+            if (it.submenu != null) {
+                for (let s in it.submenu.items) { print("  " + dump(s)); }
+            }
+        }
+    }
+    win.run();
+    print("overlay_after=" + (win.overlay != null) + " done");
+}

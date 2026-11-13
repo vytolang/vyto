@@ -35,7 +35,11 @@ enum {
        sees exactly what it always did; BUTTON_DOWN never repeats a right
        press, and BUTTON_UP is where the right release arrives. */
     VS_EV_BUTTON_DOWN = 13, /* middle, back or forward pressed */
-    VS_EV_BUTTON_UP = 14    /* right, middle, back or forward released */
+    VS_EV_BUTTON_UP = 14,   /* right, middle, back or forward released */
+    /* A native menu item was chosen (Win32 WM_COMMAND from a menu bar that
+       vyto/desktop/menu attached). vs_key() gives the item's id. No other
+       backend has native menus, so none of them ever emits it. */
+    VS_EV_COMMAND = 15
 };
 
 /* vs_button() for VS_EV_BUTTON_DOWN / VS_EV_BUTTON_UP */
