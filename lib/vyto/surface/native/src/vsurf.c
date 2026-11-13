@@ -439,6 +439,8 @@ typedef struct VSurf {
     HBITMAP bmp0; /* original 1x1 bitmap of memdc, restored before delete */
     uint32_t *bits; /* the backbuffer's pixels (a DIB section), or NULL when
                        only a device-dependent bitmap could be made */
+    int bb_gen;     /* bumped each time the backbuffer is remade or adopted;
+                       see vs_adopt_pixels */
     HFONT font;
     HICON icon;   /* from vs_set_icon, owned here; NULL = class/exe icon */
     HCURSOR cursor; /* shown over the client area; NULL = hidden */
@@ -607,6 +609,8 @@ static void make_backbuffer(VSurf *s) {
         DeleteObject(s->bmp);
         DeleteDC(s->memdc);
     }
+    s->bb_gen++; /* a painter that lent its pixels (vs_adopt_pixels) is
+                    no longer the backbuffer, and copies until it lends again */
     s->memdc = mem;
     s->bmp = bmp;
     s->bmp0 = b0;
@@ -1442,6 +1446,46 @@ int vs_take_scale_change(void *vs) {
     s->in.scale_changed = 0;
     return 1;
 }
+
+/* Make a painter's own pixels the backbuffer, so its frames reach the window
+   with no copy: `section` is a file-mapping HANDLE holding w*h top-down
+   32-bit pixels (BGRX in memory, stride w*4, offset 0), which becomes the
+   DIB section GDI presents from. D2DPainter is the user.
+
+   The painter keeps the section and its own view of it; GDI maps a second
+   view of the same pages, so neither side can free the other's memory. The
+   next resize (or another adopt) puts a fresh backbuffer of the surface's
+   own back and bumps the generation, which is how the painter knows its
+   pixels are no longer on screen and it must copy, through vs_blit_rect,
+   until it lends a new section. Returns the new generation (> 0) on success,
+   0 when the size does not match the window, headless, or GDI refuses. */
+int vs_adopt_pixels(void *vs, void *section, int w, int h) {
+    VSurf *s = vs;
+    if (!s || !s->hwnd || !section || w != s->w || h != s->h || w <= 0 || h <= 0) return 0;
+    BITMAPINFO bmi;
+    memset(&bmi, 0, sizeof bmi);
+    bmi.bmiHeader.biSize = sizeof bmi.bmiHeader;
+    bmi.bmiHeader.biWidth = w;
+    bmi.bmiHeader.biHeight = -h;
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+    void *bits = NULL;
+    HDC wdc = GetDC(s->hwnd);
+    HBITMAP bmp = CreateDIBSection(wdc, &bmi, DIB_RGB_COLORS, &bits, (HANDLE)section, 0);
+    ReleaseDC(s->hwnd, wdc);
+    if (!bmp || !bits) {
+        if (bmp) DeleteObject(bmp);
+        return 0;
+    }
+    GdiFlush();
+    SelectObject(s->memdc, bmp);
+    DeleteObject(s->bmp);
+    s->bmp = bmp;
+    s->bits = (uint32_t *)bits;
+    return ++s->bb_gen;
+}
+int vs_backbuffer_gen(void *vs) { return vs ? ((VSurf *)vs)->bb_gen : 0; }
 
 int vs_text_width(void *vs, const char *str) {
     VSurf *s = vs;
@@ -3758,6 +3802,14 @@ int vs_take_scale_change(void *vs) {
     s->in.scale_changed = 0;
     return 1;
 }
+
+/* X11 presents from a server-side Pixmap, which cannot be made of a client's
+   memory: painters copy in through vs_blit_rect. */
+int vs_adopt_pixels(void *vs, void *section, int w, int h) {
+    (void)vs; (void)section; (void)w; (void)h;
+    return 0;
+}
+int vs_backbuffer_gen(void *vs) { (void)vs; return 0; }
 
 void *vs_native_display(void *vs) { return ((VSurf *)vs)->dpy; }
 unsigned long vs_native_window(void *vs) { return (unsigned long)((VSurf *)vs)->win; }

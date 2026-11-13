@@ -76,10 +76,20 @@ Measured on Windows 7 against `GfxPainter` (blend2d), November 2026:
 | blur, backdrop | equal (same algorithm) |
 | fills and geometry (paths, polygons, arcs) | about 2× slower |
 
-Rendering is on the CPU, into a bitmap the painter owns, then copied to the
-window the same way `GfxPainter` does. That keeps `Window.repaint()`'s
-partial redraw working and lets the painter run headless (`VS_HEADLESS=1`),
-which is how it is tested.
+Rendering is on the CPU, into memory the painter owns. In a window that
+memory is also the window's backbuffer: the painter lends it to the window
+(`Surface.adopt_pixels`), so presenting a frame is only the window's own blit,
+with no copy of the frame in between. That copy was most of what a windowed
+frame cost over a headless one on Windows 7 (about 0.6 ms). After a resize
+the painter lends a fresh buffer at the new size; until it has, and headless,
+it copies the frame in the way `GfxPainter` does. Either way the backbuffer
+persists between frames, so `Window.repaint()`'s partial redraw keeps working.
+
+The lent memory is a pagefile section with a small `IWICBitmap` of the
+painter's own over it, because WIC's `WICCreateBitmapFromSection` maps a
+section read-only on Windows 7. A probe draw checks that Direct2D really draws
+into it; if not, the painter keeps the copy path for good. `zero_copy()` says
+which one is in use.
 
 ## Caveats
 
@@ -147,7 +157,12 @@ never needed it.
 ## Tests
 
 - `tests/win/d2d_props.vt`: 32 pixel-level checks, run on real Windows by
-  `make test-win`. All 32 held on Windows 7 SP1.
+  `make test-win`. All 32 hold on Windows 7 SP1, drawing into the lent
+  buffer (2026-11-13).
+- `tests/win/d2d_zerocopy.vt`: a real window read back from the screen: the
+  lent frame reaches it, a stale lend after a resize falls back to copying
+  instead of losing the frame, and a new lend after `on_resize` takes over.
+  All hold on Windows 7 SP1 (2026-11-13).
 - `tests/fixtures/d2d_stub.vt`: run by `make test`, checks the package links
   and reports itself unavailable off Windows; a second check builds it
   freestanding and asserts the stub references no external symbol.

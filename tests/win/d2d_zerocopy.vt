@@ -1,0 +1,65 @@
+// D2DPainter presenting with no copy (staged by run_tests_win.sh). A real,
+// visible window, not headless: the point is what reaches the screen, read
+// back from the window itself with capture_window.
+//
+// The painter draws into a section it lends the window (Surface.adopt_pixels),
+// so present() is only the window's own blit. A resize gives the window a
+// fresh backbuffer of its own; until the painter is told (on_resize) it must
+// fall back to copying, or the frame would never reach the screen. Each step
+// is checked on screen. The window has to stay uncovered while this runs: a
+// window read back from the screen shows whatever is on top of it.
+import { Window } from "vyto/ui";
+import { D2DPainter, d2d_usable } from "vyto/win/d2d";
+import { Rect, Surface, capture_window } from "vyto/surface";
+import { sleepMs } from "vyto/util/time";
+
+fn on_screen(s: Surface, x: int, y: int): int {
+    let c = capture_window(s.native_window());
+    if (c == null || x >= c.w || y >= c.h) { return -1; }
+    return (c.pixels[y * c.w + x] as int) & 0xFFFFFF;
+}
+
+fn frame(p: D2DPainter, w: float, h: float, color: int) {
+    p.fill(Rect(0.0, 0.0, w, h), 0xFF000000 | color);
+    p.present();
+}
+
+// Let the window come up before reading it back.
+fn settle(s: Surface) {
+    for (let i in 0..10) {
+        while (s.poll() != 0) { }
+        sleepMs(30);
+    }
+}
+
+fn main() {
+    let win = new Window("d2d zero copy", 320, 200);
+    let s = win.surface();
+    if (!d2d_usable(s)) {
+        print("d2d unusable");
+        return;
+    }
+    let p = new D2DPainter(s, 15.0);
+    settle(s);
+    print(`lent at open: {p.zero_copy()}`);
+    frame(p, 320.0, 200.0, 0xC02040);
+    print(`frame on screen: {on_screen(s, 160, 100) == 0xC02040}`);
+
+    // The window remakes its backbuffer; the painter has not heard yet.
+    s.set_size(400, 260);
+    settle(s);
+    print(`stale lend refused: {!p.zero_copy()}`);
+    frame(p, 320.0, 200.0, 0x20A050);
+    print(`copied frame on screen: {on_screen(s, 160, 100) == 0x20A050}`);
+
+    // Told: it lends a new section at the new size.
+    p.on_resize(s.width(), s.height());
+    print(`lent after resize: {p.zero_copy()}`);
+    frame(p, 400.0, 260.0, 0x3060D0);
+    print(`resized frame on screen: {on_screen(s, 380, 240) == 0x3060D0}`);
+
+    // A partial present is the window's blit of just that rect.
+    p.fill(Rect(10.0, 10.0, 50.0, 50.0), 0xFFE0C020);
+    p.present_rect(Rect(10.0, 10.0, 50.0, 50.0));
+    print(`partial present on screen: {on_screen(s, 30, 30) == 0xE0C020}`);
+}

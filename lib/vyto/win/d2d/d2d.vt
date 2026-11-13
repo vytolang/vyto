@@ -91,6 +91,8 @@ extern "C" {
     fn d2d_stride(c: rawptr): i32;
     fn d2d_unlock(c: rawptr);
     fn d2d_pixel_at(c: rawptr, x: i32, y: i32): i32;
+    fn d2d_lend(c: rawptr, w: i32, h: i32): rawptr;
+    fn d2d_is_lent(c: rawptr): i32;
 }
 
 // Render-target modes, as d2d_mode reports them.
@@ -122,6 +124,9 @@ export class D2DPainter extends Painter {
     weight: WEIGHT;
     size_stack: float[];
     weight_stack: WEIGHT[];
+    // The backbuffer generation our lent pixels became (Surface.adopt_pixels),
+    // or 0. While it is current, frames reach the window with no copy.
+    lent_gen: int;
 
     // fontSize is in 96-dpi pixels; the painter applies the surface's scale
     // itself, so the same call is right on every display.
@@ -137,6 +142,27 @@ export class D2DPainter extends Painter {
             panic("vyto/win/d2d: Direct2D is unavailable (needs Windows 7 or later)");
         }
         d2d_set_font(this.ctx, fontSize * surf.scale(), 0);
+        this.lend(this.w, this.h);
+    }
+
+    // Draw into memory the window presents from directly (Windows; see
+    // d2d_lend in the shim). True when it took: headless, or where this
+    // Direct2D will not draw into lent memory, the painter keeps its own
+    // bitmap and present() copies, exactly as before.
+    fn lend(w: int, h: int): bool {
+        this.lent_gen = 0;
+        let sec = d2d_lend(this.ctx, w as i32, h as i32);
+        if (sec == null) { return false; }
+        this.w = w;
+        this.h = h;
+        this.lent_gen = this.surf.adopt_pixels(sec, w, h);
+        return true;
+    }
+
+    // True while frames reach the window with no copy. A test hook.
+    fn zero_copy(): bool {
+        return this.lent_gen > 0 && d2d_is_lent(this.ctx) as int != 0 &&
+               this.surf.backbuffer_gen() == this.lent_gen;
     }
 
     deinit {
@@ -161,8 +187,11 @@ export class D2DPainter extends Painter {
     }
 
     // The buffer is undefined after a resize; the Window repaints in full.
+    // The window made itself a new backbuffer, so lend it a new section at
+    // the new size; only if that fails, keep a bitmap of our own.
     override fn on_resize(w: int, h: int) {
         if (w == this.w && h == this.h) { return; }
+        if (this.lend(w, h)) { return; }
         if (d2d_resize(this.ctx, w as i32, h as i32) as int != 0) {
             this.w = w;
             this.h = h;
@@ -359,6 +388,11 @@ export class D2DPainter extends Painter {
 
     // -- presenting --------------------------------------------------------
     override fn present() {
+        if (this.zero_copy()) {
+            d2d_end(this.ctx);
+            this.surf.present();
+            return;
+        }
         let p = d2d_lock(this.ctx);
         if (p != null) {
             let stride = d2d_stride(this.ctx) as int / 4;
@@ -380,6 +414,13 @@ export class D2DPainter extends Painter {
         if (y < 0) { h += y; y = 0; }
         if (x + w > this.w) { w = this.w - x; }
         if (y + h > this.h) { h = this.h - y; }
+        if (this.zero_copy()) {
+            d2d_end(this.ctx);
+            if (w > 0 && h > 0) {
+                this.surf.present_rect(Rect(x as float, y as float, w as float, h as float));
+            }
+            return;
+        }
         let p = d2d_lock(this.ctx);
         if (w <= 0 || h <= 0) {
             if (p != null) { d2d_unlock(this.ctx); }

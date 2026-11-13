@@ -323,6 +323,12 @@ int vs_scale_pct(void *s);
 /* 1 once after the window's scale changed (Win32 WM_DPICHANGED, headless
    `scale N`), else 0. Read on each VS_EV_RESIZE. */
 int vs_take_scale_change(void *s);
+/* Win32: make a painter's file-mapping section (w*h BGRX pixels, stride w*4,
+   offset 0) the backbuffer, so frames present with no copy. Returns the new
+   backbuffer generation, or 0 (size mismatch, headless, not Win32). A resize
+   bumps vs_backbuffer_gen and puts the surface's own backbuffer back. */
+int vs_adopt_pixels(void *s, void *section, int w, int h);
+int vs_backbuffer_gen(void *s);
 int vs_x(void *s);
 int vs_y(void *s);
 int vs_wheel(void *s);       /* last VS_EV_MOUSE_WHEEL delta (positive = down) */

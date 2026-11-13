@@ -785,5 +785,10 @@ void *vs_native_gc(void *s)             { (void)s; return NULL; }
 /* A density change arrives as a configuration change and a new surface size,
    which AndroidWindow re-reads on every arrange; nothing to report here. */
 int vs_take_scale_change(void *s)       { (void)s; return 0; }
+int vs_adopt_pixels(void *s, void *section, int w, int h) {
+    (void)s; (void)section; (void)w; (void)h;
+    return 0;
+}
+int vs_backbuffer_gen(void *s)          { (void)s; return 0; }
 
 #endif /* __ANDROID__ */

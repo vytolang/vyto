@@ -183,6 +183,8 @@ typedef struct D2dCtx {
     D2dWidth *wc;
     int wc_used;
     UINT stride;
+    int lent;                      /* bmp is a D2dLent: see d2d_lend */
+    int lend_broken;               /* this Direct2D refused a lent bitmap */
 } D2dCtx;
 
 /* Process-wide factories, created on first use and kept for the process's
@@ -299,6 +301,7 @@ static void release_target(D2dCtx *c) {
     if (c->brush) { ID2D1SolidColorBrush_Release(c->brush); c->brush = NULL; }
     if (c->rt) { ID2D1RenderTarget_Release(c->rt); c->rt = NULL; }
     if (c->bmp) { IWICBitmap_Release(c->bmp); c->bmp = NULL; }
+    c->lent = 0;
 }
 
 static int make_brush(D2dCtx *c) {
@@ -363,6 +366,312 @@ static int make_wic(D2dCtx *c, int cw, int ch) {
     c->cap_h = ch;
     c->gen = ++g_gen;
     return 1;
+}
+
+/* ---- pixels lent to the window ------------------------------------------
+
+   The copy path above renders into a WIC bitmap and then copies every frame
+   into the window's backbuffer (lock, Surface.blitRect, unlock): about 0.6 ms
+   a frame on Windows 7, most of what separated a windowed frame from a
+   headless one. d2d_lend removes the copy by rendering into memory the window
+   presents from directly.
+
+   The memory is a pagefile section this painter creates. The painter maps a
+   view of it for Direct2D, and vsurf (vs_adopt_pixels) makes a DIB section
+   over the same section, so GDI presents from the very pages Direct2D drew.
+   Each side holds its own mapping: neither can free the other's memory, which
+   is what makes every order of resize, rebind and teardown safe.
+
+   Direct2D needs an IWICBitmap to render into, and WIC's own way to wrap a
+   section, WICCreateBitmapFromSection, maps it read-only on Windows 7 (the Ex
+   variant that can ask for read-write is Windows 8). So this is a minimal
+   IWICBitmap of our own over the view: size, format, and Lock handing out the
+   pointer. It is checked with a probe draw before it is used: if this
+   Direct2D renders anywhere but into our memory, lending is off for good and
+   the copy path carries on. */
+
+static const GUID d2d_IID_IUnknown =
+    {0x00000000, 0x0000, 0x0000, {0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46}};
+static const GUID d2d_IID_IWICBitmapSource =
+    {0x00000120, 0xa8f2, 0x4877, {0xba, 0x0a, 0xfd, 0x2b, 0x66, 0x45, 0xfb, 0x94}};
+static const GUID d2d_IID_IWICBitmap =
+    {0x00000121, 0xa8f2, 0x4877, {0xba, 0x0a, 0xfd, 0x2b, 0x66, 0x45, 0xfb, 0x94}};
+static const GUID d2d_IID_IWICBitmapLock =
+    {0x00000123, 0xa8f2, 0x4877, {0xba, 0x0a, 0xfd, 0x2b, 0x66, 0x45, 0xfb, 0x94}};
+
+typedef struct D2dLent {
+    IWICBitmap iface;              /* first: the object is its interface */
+    LONG refs;
+    HANDLE section;
+    BYTE *view;
+    UINT w, h, stride;
+    GUID fmt;
+} D2dLent;
+
+typedef struct D2dLentLock {
+    IWICBitmapLock iface;
+    LONG refs;
+    D2dLent *owner;                /* holds a reference while locked */
+    BYTE *ptr;                     /* first byte of the locked rect */
+    UINT w, h;
+} D2dLentLock;
+
+static void end_draw(D2dCtx *c);
+
+static int same_guid(REFIID a, const GUID *b) { return memcmp(a, b, sizeof(GUID)) == 0; }
+
+/* -- the lock -- */
+static HRESULT STDMETHODCALLTYPE lk_qi(IWICBitmapLock *t, REFIID riid, void **out) {
+    if (!out) return E_POINTER;
+    if (same_guid(riid, &d2d_IID_IUnknown) || same_guid(riid, &d2d_IID_IWICBitmapLock)) {
+        *out = t;
+        t->lpVtbl->AddRef(t);
+        return S_OK;
+    }
+    *out = NULL;
+    return E_NOINTERFACE;
+}
+static ULONG STDMETHODCALLTYPE lk_addref(IWICBitmapLock *t) {
+    return (ULONG)InterlockedIncrement(&((D2dLentLock *)t)->refs);
+}
+static ULONG STDMETHODCALLTYPE lk_release(IWICBitmapLock *t) {
+    D2dLentLock *k = (D2dLentLock *)t;
+    LONG n = InterlockedDecrement(&k->refs);
+    if (n == 0) {
+        IWICBitmap_Release(&k->owner->iface);
+        free(k);
+    }
+    return (ULONG)n;
+}
+static HRESULT STDMETHODCALLTYPE lk_size(IWICBitmapLock *t, UINT *w, UINT *h) {
+    D2dLentLock *k = (D2dLentLock *)t;
+    if (!w || !h) return E_INVALIDARG;
+    *w = k->w;
+    *h = k->h;
+    return S_OK;
+}
+static HRESULT STDMETHODCALLTYPE lk_stride(IWICBitmapLock *t, UINT *stride) {
+    if (!stride) return E_INVALIDARG;
+    *stride = ((D2dLentLock *)t)->owner->stride;
+    return S_OK;
+}
+static HRESULT STDMETHODCALLTYPE lk_data(IWICBitmapLock *t, UINT *size, BYTE **data) {
+    D2dLentLock *k = (D2dLentLock *)t;
+    if (!size || !data) return E_INVALIDARG;
+    /* From the rect's first byte to the end of its last row. */
+    *size = k->h ? (k->h - 1) * k->owner->stride + k->w * 4 : 0;
+    *data = k->ptr;
+    return S_OK;
+}
+static HRESULT STDMETHODCALLTYPE lk_format(IWICBitmapLock *t, WICPixelFormatGUID *f) {
+    if (!f) return E_INVALIDARG;
+    *f = ((D2dLentLock *)t)->owner->fmt;
+    return S_OK;
+}
+static IWICBitmapLockVtbl g_lock_vtbl = {
+    lk_qi, lk_addref, lk_release, lk_size, lk_stride, lk_data, lk_format,
+};
+
+/* -- the bitmap -- */
+static HRESULT STDMETHODCALLTYPE lb_qi(IWICBitmap *t, REFIID riid, void **out) {
+    if (!out) return E_POINTER;
+    if (same_guid(riid, &d2d_IID_IUnknown) || same_guid(riid, &d2d_IID_IWICBitmapSource) ||
+        same_guid(riid, &d2d_IID_IWICBitmap)) {
+        *out = t;
+        t->lpVtbl->AddRef(t);
+        return S_OK;
+    }
+    *out = NULL;
+    return E_NOINTERFACE;
+}
+static ULONG STDMETHODCALLTYPE lb_addref(IWICBitmap *t) {
+    return (ULONG)InterlockedIncrement(&((D2dLent *)t)->refs);
+}
+static ULONG STDMETHODCALLTYPE lb_release(IWICBitmap *t) {
+    D2dLent *b = (D2dLent *)t;
+    LONG n = InterlockedDecrement(&b->refs);
+    if (n == 0) {
+        /* The window's DIB keeps its own mapping of these pages. */
+        if (b->view) UnmapViewOfFile(b->view);
+        if (b->section) CloseHandle(b->section);
+        free(b);
+    }
+    return (ULONG)n;
+}
+static HRESULT STDMETHODCALLTYPE lb_size(IWICBitmap *t, UINT *w, UINT *h) {
+    D2dLent *b = (D2dLent *)t;
+    if (!w || !h) return E_INVALIDARG;
+    *w = b->w;
+    *h = b->h;
+    return S_OK;
+}
+static HRESULT STDMETHODCALLTYPE lb_format(IWICBitmap *t, WICPixelFormatGUID *f) {
+    if (!f) return E_INVALIDARG;
+    *f = ((D2dLent *)t)->fmt;
+    return S_OK;
+}
+static HRESULT STDMETHODCALLTYPE lb_res(IWICBitmap *t, double *x, double *y) {
+    (void)t;
+    if (!x || !y) return E_INVALIDARG;
+    *x = 96.0;
+    *y = 96.0;
+    return S_OK;
+}
+static HRESULT STDMETHODCALLTYPE lb_copy_palette(IWICBitmap *t, IWICPalette *p) {
+    (void)t; (void)p;
+    return WINCODEC_ERR_PALETTEUNAVAILABLE;
+}
+/* A NULL rect is the whole bitmap; anything outside it is refused. */
+static int lent_rect(const D2dLent *b, const WICRect *r, UINT *x, UINT *y, UINT *w, UINT *h) {
+    if (!r) { *x = 0; *y = 0; *w = b->w; *h = b->h; return 1; }
+    if (r->X < 0 || r->Y < 0 || r->Width < 0 || r->Height < 0) return 0;
+    if ((UINT)r->X + (UINT)r->Width > b->w || (UINT)r->Y + (UINT)r->Height > b->h) return 0;
+    *x = (UINT)r->X; *y = (UINT)r->Y; *w = (UINT)r->Width; *h = (UINT)r->Height;
+    return 1;
+}
+static HRESULT STDMETHODCALLTYPE lb_copy_pixels(IWICBitmap *t, const WICRect *r, UINT stride,
+                                                UINT size, BYTE *out) {
+    D2dLent *b = (D2dLent *)t;
+    UINT x, y, w, h;
+    if (!out || !lent_rect(b, r, &x, &y, &w, &h)) return E_INVALIDARG;
+    if (stride < w * 4 || (h && size < (h - 1) * stride + w * 4)) return E_INVALIDARG;
+    for (UINT i = 0; i < h; i++)
+        memcpy(out + (size_t)i * stride, b->view + (size_t)(y + i) * b->stride + (size_t)x * 4,
+               (size_t)w * 4);
+    return S_OK;
+}
+static HRESULT STDMETHODCALLTYPE lb_lock(IWICBitmap *t, const WICRect *r, DWORD flags,
+                                         IWICBitmapLock **out) {
+    D2dLent *b = (D2dLent *)t;
+    (void)flags; /* one thread, and the caller orders its reads and writes */
+    if (!out) return E_INVALIDARG;
+    *out = NULL;
+    UINT x, y, w, h;
+    if (!lent_rect(b, r, &x, &y, &w, &h)) return E_INVALIDARG;
+    D2dLentLock *k = (D2dLentLock *)calloc(1, sizeof *k);
+    if (!k) return E_OUTOFMEMORY;
+    k->iface.lpVtbl = &g_lock_vtbl;
+    k->refs = 1;
+    k->owner = b;
+    k->ptr = b->view + (size_t)y * b->stride + (size_t)x * 4;
+    k->w = w;
+    k->h = h;
+    IWICBitmap_AddRef(t);
+    *out = &k->iface;
+    return S_OK;
+}
+static HRESULT STDMETHODCALLTYPE lb_set_palette(IWICBitmap *t, IWICPalette *p) {
+    (void)t; (void)p;
+    return WINCODEC_ERR_UNSUPPORTEDOPERATION;
+}
+static HRESULT STDMETHODCALLTYPE lb_set_res(IWICBitmap *t, double x, double y) {
+    (void)t; (void)x; (void)y;
+    return WINCODEC_ERR_UNSUPPORTEDOPERATION;
+}
+static IWICBitmapVtbl g_lent_vtbl = {
+    lb_qi, lb_addref, lb_release, lb_size, lb_format, lb_res, lb_copy_palette,
+    lb_copy_pixels, lb_lock, lb_set_palette, lb_set_res,
+};
+
+/* w*h pixels in a fresh section, mapped for us. NULL on failure. */
+static D2dLent *lent_new(int w, int h, const GUID *fmt) {
+    size_t bytes = (size_t)w * (size_t)h * 4;
+    if (bytes == 0 || bytes > 0x7fffffffu) return NULL;
+    HANDLE sec = CreateFileMappingW(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0,
+                                    (DWORD)bytes, NULL);
+    if (!sec) return NULL;
+    BYTE *view = (BYTE *)MapViewOfFile(sec, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, bytes);
+    if (!view) { CloseHandle(sec); return NULL; }
+    D2dLent *b = (D2dLent *)calloc(1, sizeof *b);
+    if (!b) { UnmapViewOfFile(view); CloseHandle(sec); return NULL; }
+    b->iface.lpVtbl = &g_lent_vtbl;
+    b->refs = 1;
+    b->section = sec;
+    b->view = view;
+    b->w = (UINT)w;
+    b->h = (UINT)h;
+    b->stride = (UINT)w * 4;
+    b->fmt = *fmt;
+    return b;
+}
+
+/* A target over a lent bitmap, proven to draw into its memory. On success
+   the bitmap's reference moves into *rt's context; on failure it is released. */
+static int lent_target(D2dLent *b, D2D1_ALPHA_MODE alpha, ID2D1RenderTarget **rt) {
+    D2D1_RENDER_TARGET_PROPERTIES p = rt_props(D2D1_RENDER_TARGET_TYPE_SOFTWARE, alpha);
+    *rt = NULL;
+    if (FAILED(ID2D1Factory_CreateWicBitmapRenderTarget(g_d2d, &b->iface, &p, rt))) return 0;
+    /* The probe: clear to a colour no fresh section holds (it is zeroed),
+       then read our own memory back. */
+    D2D1_COLOR_F probe = colf((int32_t)0xFF123456u);
+    ID2D1RenderTarget_BeginDraw(*rt);
+    ID2D1RenderTarget_Clear(*rt, &probe);
+    HRESULT hr = ID2D1RenderTarget_EndDraw(*rt, NULL, NULL);
+    const BYTE *px = b->view;
+    if (FAILED(hr) || px[0] != 0x56 || px[1] != 0x34 || px[2] != 0x12) {
+        ID2D1RenderTarget_Release(*rt);
+        *rt = NULL;
+        return 0;
+    }
+    return 1;
+}
+
+/* Render from now on into a w x h section the window can present from with
+   no copy; returns that section's HANDLE for Surface.adopt_pixels, or NULL,
+   leaving the current target untouched, if Direct2D will not draw into it.
+   The contents start undefined: the Window redraws in full after this, as
+   after any resize. */
+void *d2d_lend(void *p, int32_t w, int32_t h) {
+    D2dCtx *c = (D2dCtx *)p;
+    if (!c || c->lend_broken || w < 1 || h < 1) return NULL;
+    end_draw(c);
+    if (c->lock) return NULL;
+    int mode = D2D_MODE_WIC_BGR;
+    D2dLent *b = lent_new(w, h, &d2d_GUID_WICPixelFormat32bppBGR);
+    if (!b) return NULL;
+    ID2D1RenderTarget *rt = NULL;
+    if (!lent_target(b, D2D1_ALPHA_MODE_IGNORE, &rt)) {
+        IWICBitmap_Release(&b->iface);
+        /* As in make_wic: PBGRA where an opaque target is refused. The DIB
+           ignores the alpha byte, and every frame is opaque anyway. */
+        mode = D2D_MODE_WIC_PBGRA;
+        b = lent_new(w, h, &d2d_GUID_WICPixelFormat32bppPBGRA);
+        if (!b) return NULL;
+        if (!lent_target(b, D2D1_ALPHA_MODE_PREMULTIPLIED, &rt)) {
+            IWICBitmap_Release(&b->iface);
+            c->lend_broken = 1;
+            return NULL;
+        }
+    }
+    reset_state(c);
+    release_target(c);
+    c->bmp = &b->iface;
+    c->rt = rt;
+    c->mode = mode;
+    if (!make_brush(c)) {
+        release_target(c);
+        c->lend_broken = 1;
+        make_wic(c, round_up(w, D2D_CAP_ROUND), round_up(h, D2D_CAP_ROUND));
+        c->w = w;
+        c->h = h;
+        return NULL;
+    }
+    apply_text_mode(c);
+    c->lent = 1;
+    c->cap_w = w;
+    c->cap_h = h;
+    c->w = w;
+    c->h = h;
+    c->gen = ++g_gen;
+    return b->section;
+}
+
+/* 1 while the target is a lent section: what lets present skip the copy.
+   Anything that rebuilds the target (a resize without a new lend, a lost
+   device) drops it back to 0. */
+int32_t d2d_is_lent(void *p) {
+    D2dCtx *c = (D2dCtx *)p;
+    return (c && c->lent) ? 1 : 0;
 }
 
 /* Apply clip i to the target, under the transform it was pushed with. The
@@ -608,7 +917,11 @@ int32_t d2d_resize(void *p, int32_t w, int32_t h) {
     reset_state(c);
     if (w < 1) w = 1;
     if (h < 1) h = 1;
-    if ((w > c->cap_w || h > c->cap_h)) {
+    if (c->lent && (w != c->w || h != c->h)) {
+        /* A lent section is exactly the old size. Back to a bitmap of our
+           own; the painter lends a new section after this if it can. */
+        if (!make_wic(c, round_up(w, D2D_CAP_ROUND), round_up(h, D2D_CAP_ROUND))) return 0;
+    } else if ((w > c->cap_w || h > c->cap_h)) {
         int cw = w > c->cap_w ? round_up(w, D2D_CAP_ROUND) : c->cap_w;
         int ch = h > c->cap_h ? round_up(h, D2D_CAP_ROUND) : c->cap_h;
         if (!make_wic(c, cw, ch)) {
@@ -2054,6 +2367,8 @@ int32_t d2d_ok(void) { return 0; }
 void *d2d_new(int32_t w, int32_t h) { (void)w; (void)h; return 0; }
 void d2d_free(void *p) { (void)p; }
 int32_t d2d_mode(void *p) { (void)p; return 0; }
+void *d2d_lend(void *p, int32_t w, int32_t h) { (void)p; (void)w; (void)h; return 0; }
+int32_t d2d_is_lent(void *p) { (void)p; return 0; }
 int32_t d2d_resize(void *p, int32_t w, int32_t h) {
     (void)p; (void)w; (void)h; return 0;
 }

@@ -135,6 +135,7 @@ examples/49_poll_server.vt|49_poll_server|eq|
 examples/50_worker_pool.vt|50_worker_pool|eq|
 apps/motiondemo/motiondemo.vt|motiondemo|contains||VS_HEADLESS=1 VS_EVENTS=motiondemo.events|--with-assets
 tests/win/d2d_props.vt|d2d_props|eq||VS_HEADLESS=1
+tests/win/d2d_zerocopy.vt|d2d_zerocopy|eq|
 tests/fixtures/win_gui_app.vt|win_gui_app|eq|||--manifest tests/fixtures/win_gui_manifest.vt
 tests/fixtures/win_console_app.vt|win_console_app|eq|
 tests/win/desktop_dirs_win.vt|desktop_dirs_win|eq|
@@ -494,6 +495,10 @@ echo), so its output does not depend on which tools are on PATH.
 Note on bigfile_win: it writes one byte just past 2 GB. NTFS is not sparse
 by default, so that really writes ~2 GB of zeros next to the exe (removed
 afterwards): it needs the free space and can take a minute on a slow disk.
+
+Note on d2d_zerocopy: it opens a real window and reads it back from the
+screen. Leave it uncovered while it runs (a few seconds); anything on top of
+it is what gets read.
 
 Note on worker_win: about 5 seconds. It starts workers that die at once, and
 a worker whose parent exits in the middle of its job.
