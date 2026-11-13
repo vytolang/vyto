@@ -1678,6 +1678,19 @@ int main(int argc, char **argv) {
        skip it there (tcc is only the default for fast debug builds anyway). */
     if (strcmp(cc, "tcc") != 0)
         fsflags = arena_printf(&g_arena, "%s -ffunction-sections -fdata-sections", fsflags);
+    /* ...which does nothing on Windows while unwind tables are on. Every x64
+       function gets a .pdata entry pointing at its code, and the PE linker
+       keeps all of .pdata, so nothing it points at is ever collected: a bare
+       vyto/ui window carried the whole chart module and linked at 908 KB,
+       against 232 KB on Linux. Dropping the tables: 298 KB. A newer linker
+       does not help — binutils 2.47 (gas and ld both) gave 907 KB.
+       Release only, so debug builds keep the tables a debugger or a crash
+       dump needs to walk the stack. Nothing in the runtime or any shim unwinds:
+       no SEH, no setjmp/longjmp (curl's sigsetjmp path is off on Windows).
+       C++ still gets the tables its exceptions need — -fexceptions emits those
+       regardless. The cost: a release exe's crash dump has no usable stack. */
+    if (win_target && release && strcmp(cc, "tcc") != 0)
+        fsflags = arena_printf(&g_arena, "%s -fno-asynchronous-unwind-tables", fsflags);
     /* Debug builds also trap overflow at the C level (defense in depth beyond
        the emitter's checked arithmetic), catching overflow in native/FFI code.
        Native host compilers only; skipped for cross/tcc/freestanding (ubsan
@@ -1690,10 +1703,15 @@ int main(int argc, char **argv) {
        cannot be reused for a --bundle/release link (which omits the ubsan
        runtime), so debug+san and plain builds must not share the same path;
        the freestanding profile likewise needs its own objects, and a PIC object
-       is not interchangeable with the non-PIC one built from the same C. */
-    const char *prof = arena_printf(&g_arena, "%s%s%s%s", freestanding ? "_fs" : "",
+       is not interchangeable with the non-PIC one built from the same C.
+       A Windows release object built without unwind tables gets its own name
+       too: these objects are rebuilt on a source change, not a flag change, so
+       a cache from before that flag would otherwise keep linking the old fat
+       objects (see -fno-asynchronous-unwind-tables above). */
+    const char *prof = arena_printf(&g_arena, "%s%s%s%s%s", freestanding ? "_fs" : "",
                                     shared ? "_pic" : "", no_float ? "_nf" : "",
-                                    no_fs ? "_nofs" : "");
+                                    no_fs ? "_nofs" : "",
+                                    (win_target && release && strcmp(cc, "tcc") != 0) ? "_nuw" : "");
     const char *osuf = arena_printf(&g_arena, "%s%s", release ? "_rel" : (san[0] ? "_dbg" : ""),
                                     prof);
 
