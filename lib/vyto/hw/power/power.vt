@@ -1,8 +1,7 @@
 // vyto/hw/power — battery, AC adapter, and thermal status, the Vyto-way
-// (docs/HARDWARE.md). Pure sysfs reads (/sys/class/power_supply, /sys/class/thermal),
-// soft: a missing attribute reads as empty / 0. Read-only status (laptop battery %,
-// charging state, temperatures) — exactly what a status bar or a thermal-aware daemon
-// needs.
+// (docs/HARDWARE.md). Soft reads: a missing attribute reads as empty / 0.
+// Read-only status (laptop battery %, charging state, temperatures) — exactly
+// what a status bar or a thermal-aware daemon needs.
 //
 //     for (let s in power_supplies()) {
 //         if (s.isBattery()) { print(s.name + ": " + s.capacity() + "% " + s.status()); }
@@ -10,14 +9,21 @@
 //     }
 //     for (let z in thermal_zones()) { print(z.kind() + ": " + z.tempC() + "C"); }
 //
-// Linux; other platforms return empty lists.
+// Linux reads sysfs (/sys/class/power_supply, /sys/class/thermal). Windows
+// asks GetSystemPowerStatus and shows the same shape: "AC" (Mains) and "BAT0"
+// (Battery; Windows sums all batteries into one). Windows has no voltage
+// (voltage() is 0) and no thermal zones without administrator rights (the
+// list is empty). macOS returns empty lists.
 
 extern "C" {
     fn sysfs_read(path: cstring): cstring;
+    fn pwr_list(): cstring;
+    fn pwr_attr(name: cstring, attr: cstring): cstring;
+    fn pwr_has_thermal(): i32;
 }
 
 fn ps_attr(name: string, attr: string): string {
-    return str(sysfs_read(("/sys/class/power_supply/" + name + "/" + attr).cstr()));
+    return str(pwr_attr(name.cstr(), attr.cstr()));
 }
 fn ps_int(name: string, attr: string, fallback: int): int {
     let s = ps_attr(name, attr);
@@ -25,7 +31,8 @@ fn ps_int(name: string, attr: string, fallback: int): int {
     return s.to_int();
 }
 
-// A power supply: a battery, or a mains/USB adapter. Each accessor re-reads sysfs.
+// A power supply: a battery, or a mains/USB adapter. Each accessor reads the
+// current state again.
 export class PowerSupply {
     name: string;               // "BAT0", "AC", "USB", ...
 
@@ -67,13 +74,14 @@ export class ThermalZone {
     }
 }
 
-// Every power supply (batteries + adapters). Empty when there is no sysfs.
+// Every power supply (batteries + adapters), sorted by name. Empty when the
+// system reports none (a desktop on Linux usually has no entries at all).
 export fn power_supplies(): PowerSupply[] {
     let out: PowerSupply[] = [];
-    if (!isdir("/sys/class/power_supply")) { return out; }
-    for (let name in listdir("/sys/class/power_supply")) {
-        if (name.starts_with(".")) { continue; }
-        out.push(new PowerSupply(name));
+    let names = str(pwr_list());
+    if (names == "") { return out; }
+    for (let name in names.split("\n")) {
+        if (name != "") { out.push(new PowerSupply(name)); }
     }
     return out;
 }
@@ -81,7 +89,7 @@ export fn power_supplies(): PowerSupply[] {
 // Every thermal zone, in index order. Empty when there is no sysfs.
 export fn thermal_zones(): ThermalZone[] {
     let out: ThermalZone[] = [];
-    if (!isdir("/sys/class/thermal")) { return out; }
+    if (pwr_has_thermal() as int == 0 || !isdir("/sys/class/thermal")) { return out; }
     for (let name in listdir("/sys/class/thermal")) {
         if (!name.starts_with("thermal_zone")) { continue; }
         out.push(new ThermalZone(name.slice(12, name.len).to_int()));

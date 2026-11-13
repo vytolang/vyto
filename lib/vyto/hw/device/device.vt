@@ -13,15 +13,39 @@
 //
 // This does NOT understand ioctl-driven devices (V4L2 /dev/video*, gpiochip, i2c) —
 // those need vyto/hw/ioctl or a typed package (vyto/hw/camera, vyto/hw/gpio, ...).
-// The fd lives in Device and is closed by deinit. Linux + macOS; Windows is a later
-// backend.
+// The fd lives in Device and is closed by deinit.
+//
+// hid_devices() lists HID devices with the path device_open takes: /dev/hidrawN on
+// Linux, the HID interface path on Windows ("\\?\hid#vid_046d&pid_c52b#..."). On
+// Windows, keyboards and mice are held by the system and refuse to be opened for
+// reading; vendor-defined collections (scanners, scales, custom boards) open fine.
+//
+// Windows takes any path CreateFile does, including "\\.\" device names and
+// named pipes. A non-blocking open there gets a small C thread that reads the device
+// into a loopback socket, which is what pollFd() returns (runtime/vyto_win_pump.h);
+// a blocking open has no pollFd (-1) and seek() works only on it. Linux + macOS +
+// Windows.
+
+#link "ws2_32" if "windows"
+#link "setupapi" if "windows"
+#link "cfgmgr32" if "windows"
 
 extern "C" {
     fn dev_open(path: cstring, mode: i32, nonblock: i32): i32;
     fn dev_read(fd: i32, buf: cstring, cap: i64): i64;
     fn dev_write(fd: i32, buf: cstring, n: i64): i64;
     fn dev_seek(fd: i32, off: i64, whence: i32): i64;
+    fn dev_poll_fd(fd: i32): i32;
+    fn dev_raw(fd: i32): i64;
     fn dev_close(fd: i32);
+
+    fn hid_list(): rawptr;
+    fn hid_count(h: rawptr): i32;
+    fn hid_path(h: rawptr, i: i32): cstring;
+    fn hid_name(h: rawptr, i: i32): cstring;
+    fn hid_vid(h: rawptr, i: i32): i32;
+    fn hid_pid(h: rawptr, i: i32): i32;
+    fn hid_free(h: rawptr);
 }
 
 // Open modes.
@@ -49,26 +73,31 @@ fn take(buf: byte[], n: int): byte[] {
 // object releases the descriptor).
 export class Device {
     fd: i32;
+    ended: bool;   // a read hit end of file, or the device went away
 
-    fn init(fd: i32) { this.fd = fd; }
+    fn init(fd: i32) { this.fd = fd; this.ended = false; }
 
     fn ensure() { if ((this.fd as int) < 0) { panic("vyto/hw/device: operation on a closed device"); } }
-    fn isValid(): bool { return (this.fd as int) >= 0; }
+    // False once closed, or once a read found the end (EOF, or the device was
+    // removed). Stop polling then: an ended device stays readable for ever.
+    fn isValid(): bool { return (this.fd as int) >= 0 && !this.ended; }
 
-    // The fd to register in a PollSet (POLL_READ / POLL_WRITE). Also the fd to pass to
-    // vyto/hw/ioctl for device-specific control calls.
-    fn pollFd(): int { return this.fd as int; }
-    fn rawFd(): int { return this.fd as int; }
+    // The fd to register in a PollSet (POLL_READ / POLL_WRITE). -1 for a blocking
+    // open on Windows, which has nothing to poll.
+    fn pollFd(): int { return dev_poll_fd(this.fd) as int; }
+    // What vyto/hw/ioctl takes: the descriptor on POSIX, the HANDLE on Windows.
+    fn rawFd(): int { return dev_raw(this.fd) as int; }
 
     // Read up to `n` bytes; result length is what was available (empty on would-block /
     // EOF / error). Read after a PollSet reports the fd readable for streaming nodes.
     fn read(n: int): byte[] {
         this.ensure();
-        if (n <= 0) { return bytes(0); }
+        if (n <= 0 || this.ended) { return bytes(0); }
         let buf = bytes(n);
         let got = dev_read(this.fd, buf as cstring, n as i64) as int;
-        if (got <= 0) { return bytes(0); }
-        return take(buf, got);
+        if (got > 0) { return take(buf, got); }
+        if (got != -1) { this.ended = true; }   // 0 = end, -2 = failed
+        return bytes(0);
     }
     // strbytes, not str(... as cstring): read returns an exactly-sized buffer
     // with no NUL terminator (see vyto/net/socket recvText for the same fix).
@@ -109,4 +138,51 @@ export fn device_open(path: string, mode: int, nonblock: bool): Device {
     let fd = dev_open(path.cstr(), mode as i32, nb as i32) as int;
     if (fd < 0) { return null; }
     return new Device(fd as i32);
+}
+
+// A HID device present on this machine (a snapshot).
+export class HidInfo {
+    path: string;   // what device_open takes
+    name: string;   // the product name it reports
+    vid: int;       // USB vendor id (0 when not USB)
+    pid: int;       // USB product id
+
+    fn init(path: string, name: string, vid: int, pid: int) {
+        this.path = path;
+        this.name = name;
+        this.vid = vid;
+        this.pid = pid;
+    }
+
+    // "vvvv:pppp" in lowercase hex.
+    fn id(): string { return hex4(this.vid) + ":" + hex4(this.pid); }
+}
+
+// Every HID device present, sorted by path on Linux. Empty, never null, when
+// there are none or the platform cannot list them (macOS).
+export fn hid_devices(): HidInfo[] {
+    let out: HidInfo[] = [];
+    let h = hid_list();
+    if (h == null) { return out; }
+    let n = hid_count(h) as int;
+    for (let k in 0..n) {
+        let i = k as i32;
+        out.push(new HidInfo(str(hid_path(h, i)), str(hid_name(h, i)), hid_vid(h, i) as int,
+                             hid_pid(h, i) as int));
+    }
+    hid_free(h);
+    return out;
+}
+
+// Lowercase 4-digit hex (USB ids are 16-bit).
+fn hex4(v: int): string {
+    let digits = "0123456789abcdef";
+    let out = "";
+    let shift = 12;
+    while (shift >= 0) {
+        let nib = (v >> shift) & 0xF;
+        out = out + digits.slice(nib, nib + 1);
+        shift -= 4;
+    }
+    return out;
 }

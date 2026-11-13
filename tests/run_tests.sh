@@ -2414,6 +2414,20 @@ else
     fail=1
 fi
 
+# --- vyto/hw property fixtures: machine-independent shape checks ---------------
+# Each prints only properties (true/false), so one golden holds on this machine,
+# on any other, and on Windows (the same files are in the Windows kit).
+for t in power_props usb_props device_props input_props; do
+    got=$(timeout 60 ./vytoc run "tests/hw/$t.vt" 2>&1)
+    if [ "$got" = "$(cat "tests/hw/$t.expected")" ]; then
+        echo "PASS hw_$t"
+    else
+        echo "FAIL hw_$t"
+        printf '%s\n' "$got" | diff "tests/hw/$t.expected" - | head -20
+        fail=1
+    fi
+done
+
 # --- vyto/hw/serial over a socat pty pair --------------------------------------
 # Two connected ptys stand in for a null-modem cable: echo both ways, every byte
 # value, 64 KiB in order, reconfigure, reopen, and a teardown (socat killed)

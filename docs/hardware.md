@@ -1,8 +1,8 @@
 # Hardware & peripherals in Vyto
 
-> **Status: experimental.** The `vyto/hw/*` packages are young and Linux-first.
-> They cover real devices today, but APIs may shift and some backends
-> (Windows/macOS) are unfinished. Great for prototyping device tools and
+> **Status: experimental.** The `vyto/hw/*` packages are young. They cover real
+> devices on Linux and most of them on Windows, but APIs may shift and macOS has
+> little beyond serial. Great for prototyping device tools and
 > embedded/MCU control; validate on your hardware before relying on it.
 
 Vyto talks to cameras, sensors, input devices, GPIO, serial, USB, and GPS through
@@ -504,8 +504,15 @@ Everything above is **Linux-first and verified there**. Current state elsewhere:
 
 - **macOS** — serial works (POSIX). USB enumeration has an IOKit backend that is
   **untested** and opt-in. Other packages return empty/`null`.
-- **Windows** — a serial COM-port backend exists but is **untested** and does not
-  yet integrate with `PollSet`. Other packages return empty/`null`.
+- **Windows** — serial (COM ports with options and listing), device (any
+  `CreateFile` path, `hid_devices()`), ioctl (`DeviceIoControl`, `ctlCode`),
+  input (keyboards and mice through Raw Input, with Linux key codes), uevent
+  (device arrival/removal and AC/battery changes), power (AC and the combined
+  battery), usb (listing), and location/sdr on top of them. Every streaming
+  device joins a `PollSet` like on Linux: a small C thread per open device
+  copies its data into a loopback socket, and `pollFd()` is that socket.
+  camera, sensors, gpio, i2c and spi return empty/`null`. Tested under Wine
+  and on Windows 7 SP1; serial over a com0com pair, not yet real adapters.
 - **Displays / external monitors** are *not* part of `hw/*` — that is the
   `vyto/surface` layer (windowing), and multi-monitor support is not yet built.
 

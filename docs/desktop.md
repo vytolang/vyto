@@ -995,8 +995,10 @@ So you can plan around them:
   use ([Section 9.5](#95-silent-installs-for-it-departments)).
 - **`vyto/intl`** (ICU-based formatting and translation) does not build for
   Windows yet.
-- **Linux-only packages:** `vyto/hw/*`, and `vyto/net/link`, `wifi` and `raw`
-  do not build for Windows. The full list of what is portable is in
+- **Linux-only packages:** `vyto/net/link`, `wifi` and `raw` do not build for
+  Windows, and `vyto/hw`'s camera, sensors, gpio, i2c and spi return nothing
+  there (serial ports, HID devices, keyboards and mice, USB listing, power and
+  device events do work). The full list of what is portable is in
   [getting-started.md §8](getting-started.md#what-is-portable-today).
 
 ---

@@ -11,19 +11,34 @@
 //     while (true) {
 //         if (ps.wait(-1) > 0) {
 //             let e = mon.next();
-//             if (e != null && e.subsystem() == "power_supply") {
-//                 print(e.action() + " " + e.name() + " online=" + e.get("POWER_SUPPLY_ONLINE"));
+//             if (e != null && e.subsystem == "power_supply") {
+//                 print(e.action + " " + e.name() + " online=" + e.get("POWER_SUPPLY_ONLINE"));
 //             }
 //         }
 //     }
 //
 // Thresholds (battery < 20%, link down) are applied in your handler on each event — the
 // kernel has no "below 20%" event, it just tells you something changed; you read the
-// value and compare. Receiving kernel uevents is normally unprivileged. Linux only.
+// value and compare. Receiving kernel uevents is normally unprivileged.
+//
+// Windows has no kernel event stream; the monitor reports what Windows tells a
+// window instead, in the same shape: a device interface arriving or leaving
+// ("add"/"remove", SUBSYSTEM usb, tty, hidraw, input, block, net or unknown,
+// DEVPATH the interface path, PRODUCT=vid/pid/0 for USB) and AC/battery changes
+// ("change", SUBSYSTEM power_supply, POWER_SUPPLY_NAME AC with POWER_SUPPLY_ONLINE,
+// or BAT0 with POWER_SUPPLY_CAPACITY). A small C thread owns the window and feeds
+// a loopback socket, which is what pollFd() returns. One physical device usually
+// brings several events, one per interface it offers, as on Linux.
+//
+//     let e = mon.next();
+//     if (e != null && e.action == "add" && e.subsystem == "tty") { rescan(); }
+
+#link "ws2_32" if "windows"
 
 extern "C" {
     fn uevent_open(): i32;
     fn uevent_read(fd: i32, buf: cstring, cap: i64): i64;
+    fn uevent_poll_fd(fd: i32): i32;
     fn uevent_close(fd: i32);
 }
 
@@ -52,6 +67,16 @@ export class UEvent {
     fn name(): string {
         if (this.get("INTERFACE") != "") { return this.get("INTERFACE"); }
         if (this.get("POWER_SUPPLY_NAME") != "") { return this.get("POWER_SUPPLY_NAME"); }
+        // Windows: "\\?\USB#VID_0403&PID_6001#A50285BI#{a5dcbf10-...}" names the
+        // device by everything between the prefix and the interface class.
+        if (this.devpath.starts_with("\\\\?\\")) {
+            let p = this.devpath.slice(4, this.devpath.len);
+            let cls = p.last_index_of("#{");
+            if (cls > 0) { p = p.slice(0, cls); }
+            // WPD interfaces put an empty part before the class: "...&0##{...}".
+            while (p.len > 0 && p[p.len - 1] == 35) { p = p.slice(0, p.len - 1); }   // '#'
+            return p;
+        }
         let slash = this.devpath.last_index_of("/");
         if (slash >= 0) { return this.devpath.slice(slash + 1, this.devpath.len); }
         return this.devpath;
@@ -98,7 +123,7 @@ export class UEventMonitor {
     fn isValid(): bool { return (this.fd as int) >= 0; }
 
     // The fd to register in a PollSet (POLL_READ).
-    fn pollFd(): int { return this.fd as int; }
+    fn pollFd(): int { return uevent_poll_fd(this.fd) as int; }
 
     // The next buffered event, or null when none is ready. Read after the PollSet
     // reports the fd readable.

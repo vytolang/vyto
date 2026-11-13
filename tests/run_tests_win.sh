@@ -142,6 +142,10 @@ tests/win/desktop_dirs_win.vt|desktop_dirs_win|eq|
 tests/fixtures/mkdirs_backslash.vt|mkdirs_backslash|eq|
 tests/win/worker_win.vt|worker_win|eq|
 tests/win/bigfile_win.vt|bigfile_win|eq|
+tests/hw/power_props.vt|power_props|eq|
+tests/hw/usb_props.vt|usb_props|eq|
+tests/hw/device_props.vt|device_props|eq|
+tests/hw/input_props.vt|input_props|eq|
 EOF
 )
 
@@ -238,6 +242,14 @@ else
     cat "$STAGE/.serial.err"
     fail=1
 fi
+# The hardware event monitor, for a person to plug things in (README).
+if ./vytoc build examples/69_uevent.vt --target "$TRIPLE" --cc "$CC_CMD" \
+        -o "$STAGE/69_uevent.exe" >/dev/null 2>"$STAGE/.uevent.err"; then
+    echo "BUILT 69_uevent"
+    rm -f "$STAGE/.uevent.err"
+else
+    echo "FAIL build 69_uevent"; cat "$STAGE/.uevent.err"; fail=1
+fi
 # dpi_demo is the per-monitor DPI check: it needs two displays of different
 # scale on Windows 8.1+, so it is staged for a person, not run.
 # vyto/desktop's dialogs one after another (desktop_demo) and HTTPS against a
@@ -255,7 +267,7 @@ for t in srv cli gui_probe; do
         echo "FAIL build channel/$t"; cat "$STAGE/.ch_$t.err"; fail=1
     fi
 done
-for t in desktop_demo https_local service_demo dpi_demo; do
+for t in desktop_demo https_local service_demo dpi_demo input_watch; do
     if ./vytoc build "tests/win/$t.vt" --target "$TRIPLE" --cc "$CC_CMD" \
             -o "$STAGE/$t.exe" >/dev/null 2>"$STAGE/.$t.err"; then
         echo "BUILT $t"
@@ -577,6 +589,21 @@ By hand, after run.ps1 (these need a person or a network):
       - a warning box with no owner, then example.com opens in the browser
     desktop_dirs_win.exe prints its checks (also in run.ps1).
 
+  Device events (vyto/hw/uevent):  69_uevent.exe
+    Run it from cmd, not by double-click: it watches for 10 seconds and then
+    exits, and a double-clicked console closes with it (which looks like a
+    crash). Plug in a USB stick or any USB device, then pull it out: each prints "add usb/..." and "remove usb/..." lines (often
+    several, one per interface: usb, block, hidraw, ...). On a laptop,
+    pulling the charger prints "change power_supply/AC".
+
+  Keyboards and mice (vyto/hw/input):  input_watch.exe
+    Lists every keyboard and mouse, then prints what each sends for 15 s,
+    named by device. Click another window so it has the focus, then type
+    and move the mouse: events still arrive. Keys print Linux codes (A is
+    30, Enter 28, Up 103) with value 1 down, 0 up, 2 repeat; the mouse
+    prints rel code 0/1 (motion), 8 (wheel) and key 272/273 (buttons). A
+    second keyboard or a USB barcode scanner shows under its own name.
+
   Per-monitor DPI (Windows 8.1 or later, two displays set to different
   scales, e.g. 100% and 150%):  dpi_demo.exe
     Drag the window to the other display. Once most of it is across, it
@@ -608,8 +635,9 @@ By hand, after run.ps1 (these need a person or a network):
           channel_probe.exe vyto-cafe-suite stock steal     -> steal: refused
       (another program cannot take a service's port: SO_EXCLUSIVEADDRUSE)
 
-Not covered here: vyto/hw/* (Linux device interfaces) and vyto/intl (ICU) are
-not portable to Windows yet. Everything else in the stdlib is staged above.
+Not covered here: vyto/intl (ICU) is not portable to Windows yet, and vyto/hw's
+camera, sensors, gpio, i2c and spi have no Windows backend. Everything else in the
+stdlib is staged above.
 TXT
 
 if command -v zip >/dev/null 2>&1; then

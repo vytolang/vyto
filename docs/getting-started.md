@@ -523,8 +523,10 @@ honoured on POSIX; on Windows only `WILLNEED` does anything (via
 and the rest are successful no-ops.
 
 **Not portable**, and excluded from the Windows suite: `vyto/net/link`, `wifi`
-and `raw` (Linux netlink/AF_PACKET), all of `vyto/hw/*` (Linux device
-interfaces), and `vyto/intl` (ICU).
+and `raw` (Linux netlink/AF_PACKET), and `vyto/intl` (ICU). Of `vyto/hw/*`,
+serial, device, ioctl, input, uevent, power, usb (listing), location and sdr work
+on Windows; camera, sensors, gpio, i2c and spi return empty lists or `null` there
+([`lib/vyto/hw/README.md`](../lib/vyto/hw/README.md#platform-support)).
 
 Three Windows-specific behaviours worth knowing: `vyto/os`'s `run()` and
 `capture()` go through `cmd.exe`, not a POSIX shell, so shell built-ins differ;

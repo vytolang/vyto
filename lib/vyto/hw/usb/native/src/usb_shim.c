@@ -9,8 +9,12 @@
    over /dev/bus/usb via USBDEVFS ioctls, or libusb) are a later step; this proves
    the enumeration + ownership pattern end to end.
 
-   Non-Linux builds compile to an empty list (macOS would use IOKit; noted). */
+   Windows lists through SetupAPI (below). Other builds compile to an empty
+   list (macOS would use IOKit; noted). */
 
+#if defined(_WIN32) && !defined(_WIN32_WINNT)
+#define _WIN32_WINNT 0x0601   /* SetupDiGetDevicePropertyW is Vista+ */
+#endif
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -165,6 +169,106 @@ UsbList *usb_enumerate(void) {
         IOObjectRelease(dev);
     }
     IOObjectRelease(it);
+    return l;
+}
+
+#elif defined(_WIN32) && !defined(VT_NO_LIBC)
+/* Windows: SetupAPI over every present device the USB bus driver created.
+
+   Each physical device appears once as "USB\VID_xxxx&PID_xxxx\<instance>";
+   a composite device's interfaces appear again as "...&MI_nn\..." and are
+   skipped, as Linux skips "1-3:1.0". Root hubs carry no VID and are skipped
+   too (Linux lists them under the 1d6b vendor).
+
+   What Windows does not hand out without opening the hub: the manufacturer
+   string descriptor (mfr is the driver's manufacturer instead, empty for
+   Microsoft's generic "(Standard ...)" drivers) and the link speed (empty).
+   bus/addr are the hub and port numbers from the location information;
+   usb_open does not take them on Windows (transfers are Linux-only). */
+#include <windows.h>
+#include <setupapi.h>
+#include <devpropdef.h>
+
+static const DEVPROPKEY usb_PKEY_BusReportedDeviceDesc =
+    {{0x540b947e, 0x8b40, 0x45bc, {0xa8, 0xa2, 0x6a, 0x0b, 0x89, 0x4c, 0xbd, 0xa2}}, 4};
+
+static void usb_utf8(const WCHAR *w, char *out, size_t cap) {
+    int k = WideCharToMultiByte(CP_UTF8, 0, w, -1, out, (int)cap, NULL, NULL);
+    if (k <= 0) out[0] = 0;
+    else out[cap - 1] = 0;
+}
+
+static void usb_prop(HDEVINFO set, SP_DEVINFO_DATA *dd, DWORD prop, char *out, size_t cap) {
+    WCHAR w[512];
+    out[0] = 0;
+    if (SetupDiGetDeviceRegistryPropertyW(set, dd, prop, NULL, (BYTE *)w, sizeof w - 4, NULL)) {
+        w[510] = 0;
+        w[511] = 0;
+        usb_utf8(w, out, cap);
+    }
+}
+
+static int usb_hex_after(const char *s, const char *tag, int digits) {
+    const char *p = strstr(s, tag);
+    if (!p) return -1;
+    char b[8];
+    memcpy(b, p + strlen(tag), (size_t)digits);
+    b[digits] = 0;
+    return (int)strtol(b, NULL, 16);
+}
+
+UsbList *usb_enumerate(void) {
+    UsbList *l = (UsbList *)calloc(1, sizeof *l);
+    if (!l) return NULL;
+    HDEVINFO set = SetupDiGetClassDevsW(NULL, L"USB", NULL, DIGCF_ALLCLASSES | DIGCF_PRESENT);
+    if (set == INVALID_HANDLE_VALUE) return l;
+    SP_DEVINFO_DATA dd;
+    for (DWORD i = 0;; i++) {
+        memset(&dd, 0, sizeof dd);
+        dd.cbSize = sizeof dd;
+        if (!SetupDiEnumDeviceInfo(set, i, &dd)) break;
+        WCHAR wid[512];
+        char id[512];
+        if (!SetupDiGetDeviceInstanceIdW(set, &dd, wid, 511, NULL)) continue;
+        usb_utf8(wid, id, sizeof id);
+        if (_strnicmp(id, "USB\\VID_", 8) != 0 || strstr(id, "&MI_")) continue;
+        UsbDev d;
+        memset(&d, 0, sizeof d);
+        d.vid = usb_hex_after(id, "VID_", 4);
+        d.pid = usb_hex_after(id, "PID_", 4);
+        if (d.vid < 0 || d.pid < 0) continue;
+        /* The serial number is the instance part, when Windows did not make
+           one up (made-up ones contain '&'). */
+        const char *last = strrchr(id, '\\');
+        if (last && last[1] && !strchr(last, '&')) {
+            strncpy(d.serial, last + 1, sizeof d.serial - 1);
+        }
+        /* The product string the device itself reports (Windows 7+), else the
+           driver's description of it. */
+        WCHAR w[256];
+        DEVPROPTYPE pt = 0;
+        if (SetupDiGetDevicePropertyW(set, &dd, &usb_PKEY_BusReportedDeviceDesc, &pt, (BYTE *)w,
+                                      sizeof w - 2, NULL, 0) &&
+            pt == DEVPROP_TYPE_STRING) {
+            w[255] = 0;
+            usb_utf8(w, d.product, sizeof d.product);
+        }
+        if (!d.product[0]) usb_prop(set, &dd, SPDRP_DEVICEDESC, d.product, sizeof d.product);
+        usb_prop(set, &dd, SPDRP_MFG, d.mfr, sizeof d.mfr);
+        if (d.mfr[0] == '(') d.mfr[0] = 0;   /* "(Standard USB Host Controller)" */
+        char compat[512];
+        usb_prop(set, &dd, SPDRP_COMPATIBLEIDS, compat, sizeof compat);
+        int cls = usb_hex_after(compat, "Class_", 2);
+        d.cls = cls < 0 ? 0 : cls;
+        char loc[128];
+        usb_prop(set, &dd, SPDRP_LOCATION_INFORMATION, loc, sizeof loc);
+        const char *pp = strstr(loc, "Port_#");
+        const char *hp = strstr(loc, "Hub_#");
+        d.addr = pp ? atoi(pp + 6) : 0;
+        d.bus = hp ? atoi(hp + 5) : 0;
+        list_push(l, &d);
+    }
+    SetupDiDestroyDeviceInfoList(set);
     return l;
 }
 

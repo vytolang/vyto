@@ -1,7 +1,7 @@
 # vyto/hw — peripherals: serial, input, GPIO, I2C, SPI, sensors, USB, camera, GPS
 
-> **Status: experimental, Linux-first.** These packages drive real devices today,
-> but the APIs may still shift and the macOS/Windows backends are unfinished. See
+> **Status: experimental.** These packages drive real devices on Linux, and most of
+> them on Windows; the APIs may still shift, and macOS has little beyond serial. See
 > [Platform support](#platform-support) before you depend on one.
 
 Fourteen packages, one shape. Every peripheral here reduces to a **poll-able fd**
@@ -87,20 +87,32 @@ handle lives in the object and closes in `deinit`.
 ## `vyto/hw/serial`
 
 ```vyto
-export fn serial_open(path: string, baud: int): Serial   // null on failure
+export fn serial_open(path: string, baud: int): Serial                // null on failure
+export fn serial_open_with(path: string, o: SerialOptions): Serial    // null on failure
+export fn serial_ports(): SerialPortInfo[]                            // never null
 ```
 
 | `Serial` | |
 |---|---|
 | `pollFd(): int` | for a `PollSet` |
 | `read(n: int): byte[]` · `readText(n: int): string` | non-blocking — empty when nothing is buffered |
-| `write(data: byte[]): int` · `writeText(s: string): int` | bytes written |
-| `setBaud(baud: int): bool` | reconfigure without reopening |
+| `write(data: byte[]): int` · `writeText(s: string): int` | bytes written; -1 when flow control holds the line off |
+| `setBaud(baud: int): bool` · `configure(o: SerialOptions): bool` | reconfigure without reopening |
+| `setDtr(on: bool): bool` · `setRts(on: bool): bool` · `modem(): int` | control lines; `modem()` is `MODEM_CTS/DSR/RI/DCD` bits, -1 when the port cannot tell |
+| `sendBreak(ms: int): bool` | |
 | `drain(): bool` | block until the output buffer has actually gone out |
 | `flush(): bool` | discard both buffers |
-| `isValid(): bool` · `close()` | |
+| `isValid(): bool` · `error(): string` · `close()` | `isValid()` turns false when the device goes away; `error()` says why |
 
-Opens raw 8N1. Reads never block, so read only after the `PollSet` says readable.
+| `SerialOptions` | `new SerialOptions(baud)`, then `.dataBits(5..8)`, `.parity(PARITY_NONE/ODD/EVEN/MARK/SPACE)`, `.stopBits(1/2)`, `.flow(FLOW_NONE/RTSCTS/XONXOFF)`, `.dtr(bool)`, `.rts(bool)` |
+|---|---|
+| `SerialPortInfo` | fields `path`, `name`, `manufacturer`, `serial`, `kind` (`usb`/`native`/`bluetooth`/`virtual`), `vid`, `pid`; `id()` |
+
+`serial_open` is 8N1, no flow control, DTR and RTS asserted (USB CDC boards wait
+for DTR; it also resets an Arduino Uno, as its IDE does). Reads never block, so
+read only after the `PollSet` says readable. On Windows the path is `"COM3"` (or
+`"CNCA0"` for a com0com port); `serial_ports()` lists what is present on Linux and
+Windows.
 
 ## `vyto/hw/input`
 
@@ -120,6 +132,11 @@ Constants: `EV_SYN` `EV_KEY` `EV_REL` `EV_ABS`; `BTN_LEFT` `BTN_RIGHT`
 
 For `EV_KEY`, `value` is 1 press, 0 release, 2 autorepeat. Prefer `drain()` — one
 physical action emits several events plus an `EV_SYN` separator.
+
+On Windows this is Raw Input, keyboards and mice only, with the same evdev numbers
+(Linux `KEY_*` codes for keys). Input arrives even while another app has the focus,
+which is what lets a USB barcode scanner be read apart from the keyboard. HID
+gamepads are read as raw reports through `vyto/hw/device` instead.
 
 ## `vyto/hw/gpio`
 
@@ -212,7 +229,7 @@ export fn usb_devices(): UsbDevice[]                    // enumeration needs no 
 | fields `vid`, `pid`, `bus`, `addr`, `cls`, `manufacturer`, `product`, `serial`, `speed` | `speed` is Mbit/s as text: `"480"`, `"5000"` |
 | `id(): string` | `"0bda:5520"` |
 | `name(): string` | manufacturer + product, falling back to the id |
-| `open(): UsbHandle` | **null without write access to the device node** |
+| `open(): UsbHandle` | **null without write access to the device node**, and always null off Linux |
 
 | `UsbHandle` | |
 |---|---|
@@ -258,7 +275,8 @@ export fn thermal_zones(): ThermalZone[]
 | `ThermalZone` | field `index`; `kind(): string`, `tempC(): float` |
 
 World-readable — no group needed. These are **snapshots**; for change
-notifications use `hw/uevent`.
+notifications use `hw/uevent`. On Windows there are at most two supplies, `AC` and
+`BAT0` (Windows sums all batteries), no voltage, and no thermal zones.
 
 ## `vyto/hw/uevent`
 
@@ -275,7 +293,9 @@ export fn parse_uevent(msg: string): UEvent             // pure, so it is testab
 > `e.action()`. `name()` and `get()` are methods.
 
 One unprivileged netlink fd carries every kernel device change: AC unplugged,
-battery level moved, USB attached, cable pulled.
+battery level moved, USB attached, cable pulled. On Windows the monitor reports
+device interfaces arriving and leaving (`add`/`remove`, `SUBSYSTEM` `usb`, `tty`,
+`hidraw`, `input`, `block`, `net`) and AC/battery changes, in the same shape.
 
 ## `vyto/hw/location`
 
@@ -385,8 +405,13 @@ suite reports them as `SKIP`. Run them directly against your own hardware.
 | | State |
 |---|---|
 | **Linux** | everything above, verified |
-| **macOS** | `hw/serial` works (POSIX). `hw/usb` has an IOKit backend that is **untested**. The rest return empty/`null`. |
-| **Windows** | a serial COM-port backend exists, **untested**, and does not yet join a `PollSet`. The rest return empty/`null`. |
+| **macOS** | `hw/serial` works (POSIX), without port listing. `hw/usb` has an IOKit backend that is **untested**. The rest return empty/`null`. |
+| **Windows** | `serial` (COM ports, options, listing), `device` (any CreateFile path, plus `hid_devices()`), `ioctl` (DeviceIoControl, `ctlCode`), `input` (keyboards and mice via Raw Input), `uevent` (device arrival/removal, AC/battery), `power` (AC and battery), `usb` (listing only), and `location`/`sdr` on top of them. `camera`, `sensors`, `gpio`, `i2c` and `spi` return empty/`null`. Tested under Wine and Windows 7 SP1; serial on a com0com pair, not yet on real USB adapters. |
+
+On Windows a device handle cannot be waited on next to sockets, so every streaming
+package there runs one small C thread per open device that copies what arrives into
+a loopback socket, and `pollFd()` is that socket (`runtime/vyto_win_pump.h`). The
+Vyto side is the same code on both platforms.
 
 Nothing fails to *compile* off Linux — a package returns an empty list or `null`
 instead, so a cross-platform program keeps building.

@@ -19,11 +19,21 @@
 // C shim; the typed packages (hw/gpio, hw/i2c) are this pattern, encapsulated.
 //
 // ioctl can't map memory, so devices needing an mmap ring (V4L2 /dev/video*) still want
-// a typed package (vyto/hw/camera). Linux/POSIX.
+// a typed package (vyto/hw/camera).
+//
+// Windows: the same calls are DeviceIoControl on the HANDLE a Device's rawFd() gives,
+// with `arg` as both the input and the output buffer, and the result is the number of
+// bytes the driver returned. Request numbers there are CTL_CODEs: build them with
+// ctlCode (io/ior/iow/iowr return 0 on Windows).
+//
+//     let d = device_open(hid.path, RDWR, false);
+//     let info = bytes(64);
+//     let IOCTL_HID_GET_MANUFACTURER_STRING = ctlCode(0x0B, 110, METHOD_OUT_DIRECT, 0);
+//     if (ioctl(d.rawFd(), IOCTL_HID_GET_MANUFACTURER_STRING, info) > 0) { ... }
 
 extern "C" {
-    fn vt_ioctl_buf(fd: i32, req: i64, buf: cstring): i64;
-    fn vt_ioctl_int(fd: i32, req: i64, val: i64): i64;
+    fn vt_ioctl_buf(fd: i64, req: i64, buf: cstring, len: i64): i64;
+    fn vt_ioctl_int(fd: i64, req: i64, val: i64): i64;
     fn vt_ioc(dir: i32, type: i32, nr: i32, size: i32): i64;
     fn vt_ioc_none(): i32;
     fn vt_ioc_read(): i32;
@@ -33,12 +43,24 @@ extern "C" {
 // ioctl with a byte[] argument (the struct-pointer form). Read-direction requests fill
 // `arg` in place. Returns the driver's result (>=0), or -1 on error.
 export fn ioctl(fd: int, req: int, arg: byte[]): int {
-    return vt_ioctl_buf(fd as i32, req as i64, arg as cstring) as int;
+    return vt_ioctl_buf(fd as i64, req as i64, arg as cstring, arg.len as i64) as int;
 }
 
 // ioctl with a scalar argument passed by value (the _IO form). Result (>=0), or -1.
+// On Windows the value is sent as a 4-byte input (none when 0).
 export fn ioctlInt(fd: int, req: int, val: int): int {
-    return vt_ioctl_int(fd as i32, req as i64, val as i64) as int;
+    return vt_ioctl_int(fd as i64, req as i64, val as i64) as int;
+}
+
+// Windows request numbers: the CTL_CODE macro. `deviceType` is the FILE_DEVICE_*
+// number, `method` one of METHOD_*, `access` FILE_ANY_ACCESS (0), FILE_READ_ACCESS (1)
+// or FILE_WRITE_ACCESS (2), or both.
+export const METHOD_BUFFERED: int = 0;
+export const METHOD_IN_DIRECT: int = 1;
+export const METHOD_OUT_DIRECT: int = 2;
+export const METHOD_NEITHER: int = 3;
+export fn ctlCode(deviceType: int, function: int, method: int, access: int): int {
+    return (deviceType << 16) | (access << 14) | (function << 2) | method;
 }
 
 // Request-number builders — the _IO / _IOR / _IOW / _IOWR macros, arch-correct. `type`

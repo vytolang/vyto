@@ -1,0 +1,40 @@
+// Manual check of vyto/hw/input on Windows (Raw Input), staged in the kit.
+// Opens every keyboard and mouse and prints what each one sends for 15
+// seconds, with the device's name, while another window has the focus too.
+// Type, click, scroll: each line names the device it came from, so a second
+// keyboard (or a USB barcode scanner) shows up separately from the first.
+import { input_devices, input_open, InputDevice, InputInfo, EV_KEY, EV_REL, EV_ABS,
+         EV_SYN } from "vyto/hw/input";
+import { PollSet, POLL_READ } from "vyto/net/socket";
+import { monoMs } from "vyto/util/time";
+
+fn main() {
+    let infos: InputInfo[] = [];
+    let devs: InputDevice[] = [];
+    let ps = new PollSet();
+    for (let d in input_devices()) {
+        let dev = input_open(d.path);
+        print(`{d.name} [{d.id()}]: {dev != null}`);
+        if (dev != null) {
+            infos.push(d);
+            devs.push(dev);
+            ps.addFd(dev.pollFd(), POLL_READ);
+        }
+    }
+    print("watching for 15 s: type, click, move, scroll...");
+    let end = monoMs() + 15000;
+    while (monoMs() < end) {
+        if (ps.wait(200) <= 0) { continue; }
+        for (let i in 0..devs.len) {
+            for (let e in devs[i].drain()) {
+                if (e.type == EV_SYN) { continue; }
+                let kind = "?";
+                if (e.type == EV_KEY) { kind = "key"; }
+                if (e.type == EV_REL) { kind = "rel"; }
+                if (e.type == EV_ABS) { kind = "abs"; }
+                print(`  {infos[i].name}: {kind} code={e.code} value={e.value}`);
+            }
+        }
+    }
+    print("done");
+}

@@ -22,8 +22,23 @@
 // Reads are non-blocking: drain() returns whatever events are buffered (empty when
 // nothing is ready), so read only after the PollSet reports the fd readable. The fd
 // lives in InputDevice and is closed by deinit. Opening event nodes usually needs the
-// `input` group; a denied open is soft (null). Linux today; other platforms return an
-// empty list and null opens.
+// `input` group; a denied open is soft (null).
+//
+// Windows: keyboards and mice, through Raw Input. input_devices() lists them by
+// interface path ("\\?\HID#VID_046D&PID_C52B&MI_00#..."), input_open takes that
+// path, and events arrive with the same evdev numbers: EV_KEY with Linux KEY_* codes
+// (value 1 press, 0 release, 2 autorepeat), mouse buttons as BTN_*, motion and wheel
+// as EV_REL, each packet closed by EV_SYN. Input arrives whether or not this program
+// has the focus — which is what lets a barcode scanner (a keyboard to Windows) be read
+// apart from the real keyboard while another app is in front — but not input aimed at
+// an elevated window. Events nobody reads are dropped once about 5,000 are waiting.
+// Gamepads and other HID devices are not here on Windows: read their reports with
+// vyto/hw/device (hid_devices, device_open). macOS returns an empty list and null
+// opens.
+
+#link "ws2_32" if "windows"
+#link "setupapi" if "windows"
+#link "cfgmgr32" if "windows"
 
 extern "C" {
     fn input_enumerate(): rawptr;
@@ -40,6 +55,7 @@ extern "C" {
     fn evdev_code(): i32;
     fn evdev_value(): i32;
     fn evdev_close(fd: i32);
+    fn evdev_poll_fd(fd: i32): i32;
 }
 
 // evdev event types (linux/input-event-codes.h). EV_KEY covers keyboard keys and
@@ -56,8 +72,12 @@ export const BTN_RIGHT:  int = 0x111;
 export const BTN_MIDDLE: int = 0x112;
 export const BTN_SOUTH:  int = 0x130;   // gamepad "A"
 export const BTN_EAST:   int = 0x131;   // gamepad "B"
+export const BTN_SIDE:   int = 0x113;   // mouse "back"
+export const BTN_EXTRA:  int = 0x114;   // mouse "forward"
 export const REL_X: int = 0x00;
 export const REL_Y: int = 0x01;
+export const REL_HWHEEL: int = 0x06;
+export const REL_WHEEL: int = 0x08;
 export const ABS_X: int = 0x00;
 export const ABS_Y: int = 0x01;
 
@@ -91,21 +111,28 @@ export class InputInfo {
 // dropping the object releases the descriptor deterministically).
 export class InputDevice {
     fd: i32;
+    gone: bool;    // the device was unplugged (or failed)
 
-    fn init(fd: i32) { this.fd = fd; }
+    fn init(fd: i32) { this.fd = fd; this.gone = false; }
 
     fn ensure() { if ((this.fd as int) < 0) { panic("vyto/hw/input: operation on a closed device"); } }
-    fn isValid(): bool { return (this.fd as int) >= 0; }
+    // False once closed or unplugged. Stop polling then: a gone device stays
+    // readable for ever.
+    fn isValid(): bool { return (this.fd as int) >= 0 && !this.gone; }
 
     // The fd to register in a PollSet (POLL_READ) — the device joins the shared loop.
-    fn pollFd(): int { return this.fd as int; }
+    fn pollFd(): int { return evdev_poll_fd(this.fd) as int; }
 
     // One buffered event, or null when none is ready (would-block / EOF / error).
     // Read after the PollSet reports the fd readable.
     fn poll(): InputEvent {
         this.ensure();
-        if (evdev_next(this.fd) as int != 1) { return null; }
-        return new InputEvent(evdev_type() as int, evdev_code() as int, evdev_value() as int);
+        let r = evdev_next(this.fd) as int;
+        if (r == 1) {
+            return new InputEvent(evdev_type() as int, evdev_code() as int, evdev_value() as int);
+        }
+        if (r < 0) { this.gone = true; }
+        return null;
     }
 
     // Every event currently buffered, drained until would-block. Typical use: call
@@ -113,8 +140,14 @@ export class InputDevice {
     fn drain(): InputEvent[] {
         this.ensure();
         let out: InputEvent[] = [];
-        while (evdev_next(this.fd) as int == 1) {
-            out.push(new InputEvent(evdev_type() as int, evdev_code() as int, evdev_value() as int));
+        while (true) {
+            let r = evdev_next(this.fd) as int;
+            if (r == 1) {
+                out.push(new InputEvent(evdev_type() as int, evdev_code() as int, evdev_value() as int));
+            } else {
+                if (r < 0) { this.gone = true; }
+                break;
+            }
         }
         return out;
     }

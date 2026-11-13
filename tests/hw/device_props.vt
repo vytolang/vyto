@@ -1,0 +1,88 @@
+// vyto/hw/device, ioctl and uevent: properties that hold on any machine.
+//
+// The device half goes through a scratch file: written blocking, then read back
+// non-blocking through pollFd(). On Windows that is the overlapped path with
+// the pump thread, so it covers file offsets and end-of-file through the pump.
+import { device_open, hid_devices, READ, RDWR, CREATE } from "vyto/hw/device";
+import { ioctl, ctlCode, leInt, METHOD_OUT_DIRECT, METHOD_BUFFERED } from "vyto/hw/ioctl";
+import { uevent_open_monitor, parse_uevent } from "vyto/hw/uevent";
+import { PollSet, POLL_READ } from "vyto/net/socket";
+import { platform, tempDir } from "vyto/os";
+import { file_remove } from "vyto/io/file";
+import { monoMs } from "vyto/util/time";
+
+fn main() {
+    let path = tempDir() + "/vyto_device_props.bin";
+    if (platform() == "windows") { path = tempDir() + "\\vyto_device_props.bin"; }
+
+    let w = device_open(path, CREATE, false);
+    print(`create: {w != null}`);
+    if (w == null) { return; }
+    let payload = bytes(10000);
+    for (let i in 0..10000) { payload[i] = (i % 251) as byte; }
+    print(`write: {w.write(payload) == 10000}`);
+    w.close();
+
+    // Non-blocking until the device says it has ended. The read is tried on
+    // every pass, not only when the PollSet says so: Linux's epoll refuses a
+    // regular file (it is always ready), while Windows reads it through the
+    // pump's socket, which the PollSet does watch.
+    let r = device_open(path, READ, true);
+    print(`open non-blocking: {r != null && r.pollFd() >= 0}`);
+    if (r == null) { return; }
+    let ps = new PollSet();
+    ps.addFd(r.pollFd(), POLL_READ);
+    let got = 0;
+    let same = true;
+    let end = monoMs() + 5000;
+    while (r.isValid() && monoMs() < end) {
+        ps.wait(50);
+        let b = r.read(4096);
+        for (let k in 0..b.len) { if ((b[k] as int) != (got + k) % 251) { same = false; } }
+        got += b.len;
+    }
+    print(`read back in order: {same && got == 10000}`);
+    print(`ended at end of file: {!r.isValid()}`);
+    r.close();
+
+    // A real control call on a blocking handle to the same file.
+    let f = device_open(path, RDWR, false);
+    let ok = false;
+    if (f != null) {
+        if (platform() == "windows") {
+            // FSCTL_SET_SPARSE: NTFS marks the file sparse and returns no
+            // bytes. (Wine has it too; it lacks FSCTL_GET_COMPRESSION.)
+            ok = ioctl(f.rawFd(), ctlCode(9, 49, METHOD_BUFFERED, 0), bytes(0)) == 0;
+        } else {
+            // FIONREAD: bytes left to read, here the whole file
+            let out = bytes(4);
+            ok = ioctl(f.rawFd(), 0x541B, out) >= 0 && leInt(out) == 10000;
+        }
+        f.close();
+    }
+    print(`ioctl round trip: {ok}`);
+    // IOCTL_HID_GET_MANUFACTURER_STRING, from the Windows DDK headers.
+    print(`ctlCode matches CTL_CODE: {ctlCode(0x0B, 110, METHOD_OUT_DIRECT, 0) == 0xB01BA}`);
+    file_remove(path);
+
+    let fmt = true;
+    for (let h in hid_devices()) {
+        if (h.path == "" || h.id().len != 9) { fmt = false; }
+    }
+    print(`hid list entries have a path and an id: {fmt}`);
+
+    // The shape the Windows monitor writes, parsed like a kernel event.
+    let e = parse_uevent("add@\\\\?\\USB#VID_0403&PID_6001#A50285BI#{a5dcbf10-6530-11d2-901f-00c04fb951ed}\n" +
+                         "ACTION=add\nSUBSYSTEM=usb\nPRODUCT=403/6001/0\n");
+    print(`windows event parses: {e.action == "add" && e.subsystem == "usb" && e.name() == "USB#VID_0403&PID_6001#A50285BI" && e.get("PRODUCT") == "403/6001/0"}`);
+    // A WPD interface, as Windows 7 reported one for a USB stick: "##" before the class.
+    let wpd = parse_uevent("remove@\\\\?\\WpdBusEnumRoot#UMB#2&37c186b&0&STORAGE#VOLUME#_??_USBSTOR#DISK&VEN_GENERIC&PROD_FLASH_DISK&REV_8.07#745AFE92&0##{6ac27878-a6fa-4155-ba85-f98f491d4f33}\n");
+    print(`wpd name has no trailing #: {wpd.name() == "WpdBusEnumRoot#UMB#2&37c186b&0&STORAGE#VOLUME#_??_USBSTOR#DISK&VEN_GENERIC&PROD_FLASH_DISK&REV_8.07#745AFE92&0"}`);
+
+    let mon = uevent_open_monitor();
+    print(`uevent monitor opens: {mon != null && mon.pollFd() >= 0}`);
+    if (mon != null) {
+        mon.close();
+        print(`uevent monitor closes: {!mon.isValid()}`);
+    }
+}
