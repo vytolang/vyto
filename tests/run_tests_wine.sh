@@ -90,6 +90,38 @@ while IFS='|' read -r name mode argstr envstr; do
     fi
 done < "$STAGE/manifest.txt"
 
+# --- vyto/hw/serial: the Windows COM-port code over two ptys ------------------
+# A socat pty pair, mapped into the prefix as CNCA0/CNCB0 (dosdevices names
+# resolve \\.\CNCA0 the way com0com's driver does on Windows), so the same
+# serial_loopback.exe and golden as run.ps1 exercise the overlapped reads,
+# the pump thread and the bounded writes.
+if [ -f "$STAGE/serial_loopback.exe" ]; then
+    if command -v socat >/dev/null 2>&1; then
+        dd_="$WINEPREFIX/dosdevices"
+        socat pty,raw,echo=0,link="$tmp/ser_a" pty,raw,echo=0,link="$tmp/ser_b" 2>/dev/null &
+        spid=$!
+        i=0
+        while [ ! -e "$tmp/ser_b" ] && [ $i -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+        ln -sf "$(readlink -f "$tmp/ser_a")" "$dd_/cnca0"
+        ln -sf "$(readlink -f "$tmp/ser_b")" "$dd_/cncb0"
+        (cd "$STAGE" && timeout 120 "$WINE" ./serial_loopback.exe CNCA0 CNCB0 > "$tmp/ser.out" 2>&1)
+        kill "$spid" 2>/dev/null; wait "$spid" 2>/dev/null
+        rm -f "$dd_/cnca0" "$dd_/cncb0"
+        norm "$tmp/ser.out" > "$tmp/got"
+        norm "$STAGE/serial_loopback.expected" > "$tmp/want"
+        if cmp -s "$tmp/want" "$tmp/got"; then
+            echo "PASS wine_serial_loopback"
+            pass=$((pass + 1))
+        else
+            echo "FAIL wine_serial_loopback"
+            diff "$tmp/want" "$tmp/got" | head -20
+            fail=$((fail + 1))
+        fi
+    else
+        echo "SKIP wine_serial_loopback (socat not installed)"
+    fi
+fi
+
 # --- input: drive input_demo.exe with real X events ---------------------------
 # The Win32 window code's input handling, end to end: buttons, wheel sign,
 # tilt and Shift+wheel, capture on a drag that leaves the window, Unicode text

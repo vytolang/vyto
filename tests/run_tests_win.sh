@@ -225,6 +225,19 @@ else
     cat "$STAGE/.input_demo.err"
     fail=1
 fi
+# vyto/hw/serial over a com0com pair: run by its own block in run.ps1 (it needs
+# com0com installed, and says SKIP when it is not) and by run_tests_wine.sh
+# over two ptys, so it is staged here rather than in the manifest.
+if ./vytoc build tests/hw/serial_loopback.vt --target "$TRIPLE" --cc "$CC_CMD" \
+        -o "$STAGE/serial_loopback.exe" >/dev/null 2>"$STAGE/.serial.err"; then
+    cp tests/hw/serial_loopback.expected "$STAGE/serial_loopback.expected"
+    echo "BUILT serial_loopback"
+    rm -f "$STAGE/.serial.err"
+else
+    echo "FAIL build serial_loopback"
+    cat "$STAGE/.serial.err"
+    fail=1
+fi
 # dpi_demo is the per-monitor DPI check: it needs two displays of different
 # scale on Windows 8.1+, so it is staged for a person, not run.
 # vyto/desktop's dialogs one after another (desktop_demo) and HTTPS against a
@@ -451,6 +464,32 @@ foreach ($line in Get-Content -LiteralPath "manifest.txt") {
     }
 }
 
+# vyto/hw/serial over com0com's default pair (README: how to install it). Not
+# in the manifest because it needs that driver; without it this says SKIP.
+function Run-Serial {
+    $c0c = Test-Path -LiteralPath "HKLM:\SYSTEM\CurrentControlSet\Services\com0com"
+    if (-not $c0c) { Emit "SKIP serial_loopback (com0com is not installed)"; return }
+    $outFile = [System.IO.Path]::GetTempFileName()
+    $errFile = [System.IO.Path]::GetTempFileName()
+    [VytoRun]::Run((Join-Path $root "serial_loopback.exe"), "CNCA0 CNCB0", $root,
+                   $outFile, $errFile) | Out-Null
+    $got = Normalize ((ReadAll $outFile) + (ReadAll $errFile))
+    Remove-Item -LiteralPath $outFile -Force
+    Remove-Item -LiteralPath $errFile -Force
+    $want = Normalize (ReadAll (Join-Path $root "serial_loopback.expected"))
+    if ($got -eq $want) {
+        Emit "PASS serial_loopback"
+    } else {
+        Emit "FAIL serial_loopback"
+        Emit "--- expected ---"
+        Emit $want
+        Emit "--- got ---"
+        Emit $got
+        $script:fail = 1
+    }
+}
+Run-Serial
+
 # The system DLL exports this Windows has, for `vytoc audit`. Copy
 # win7_exports.txt back as lib/vyto/win/win7_exports.txt when this is Windows 7.
 $dump = Join-Path $root "dump_exports.exe"
@@ -499,6 +538,11 @@ afterwards): it needs the free space and can take a minute on a slow disk.
 Note on d2d_zerocopy: it opens a real window and reads it back from the
 screen. Leave it uncovered while it runs (a few seconds); anything on top of
 it is what gets read.
+
+Note on serial_loopback: it needs com0com, a free virtual null-modem driver
+(com0com.sourceforge.net; the signed x64 build installs on Windows 7 x64).
+Install it with its default pair, CNCA0 <-> CNCB0, and leave the names as
+they are. Without it run.ps1 prints "SKIP serial_loopback", not a failure.
 
 Note on worker_win: about 5 seconds. It starts workers that die at once, and
 a worker whose parent exits in the middle of its job.

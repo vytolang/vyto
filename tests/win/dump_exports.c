@@ -31,6 +31,8 @@ static const char *k_default[] = {
     "msvcrt.dll",   "ole32.dll",  "oleaut32.dll", "ws2_32.dll",   "bcrypt.dll",
     "d2d1.dll",     "dwrite.dll", "windowscodecs.dll", "psapi.dll", "comdlg32.dll",
     "imm32.dll",    "shcore.dll",
+    /* vyto/hw: device listing (SetupAPI, CfgMgr), HID, WinUSB */
+    "setupapi.dll", "cfgmgr32.dll", "hid.dll", "winusb.dll",
 };
 
 typedef LONG(WINAPI *RtlGetVersionFn)(OSVERSIONINFOW *);

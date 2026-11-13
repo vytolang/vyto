@@ -1,31 +1,124 @@
-// vyto/hw/serial — serial / TTY ports, the Vyto-way (docs/HARDWARE.md). A port
-// is a non-blocking fd, so it folds into a PollSet event loop alongside sockets,
-// windows, and workers — one wait() covers the network AND the wire. Raw 8N1 at
-// a configurable baud; bytes in, bytes out, no line discipline.
+// vyto/hw/serial — serial ports, the Vyto-way (docs/HARDWARE.md). An open port
+// gives a pollable fd, so it folds into a PollSet event loop alongside sockets,
+// windows and workers: one wait() covers the network AND the wire. Raw bytes
+// in and out, no line discipline.
 //
-//     let port = serial_open("/dev/ttyUSB0", 115200);
+//     let port = serial_open("/dev/ttyUSB0", 115200);    // "COM3" on Windows
 //     if (port == null) { print("no port"); return; }
 //     let ps = new PollSet();
 //     ps.addFd(port.pollFd(), POLL_READ);   // drive it from the shared loop
 //     port.writeText("AT\r\n");
-//     while (true) {
+//     while (port.isValid()) {
 //         if (ps.wait(-1) > 0) { print(port.readText(256)); }
 //     }
+//     print("port gone: " + port.error());
 //
-// Reads are non-blocking: readText/read return whatever is buffered (empty when
-// nothing is ready yet), so only read after the PollSet reports the fd readable.
-// The fd lives in Serial and is closed by deinit. POSIX today (Linux + macOS); a
-// Windows COM-port backend exists in the shim but is UNTESTED (no Windows toolchain
-// here) and does not yet fold into the epoll PollSet — see serial_shim.c.
+// Reads never block: read/readText return what is buffered, empty when nothing
+// is, so read after the PollSet reports the fd readable. When the device goes
+// away (a USB adapter pulled out) the read that finds out returns empty too, and
+// the port turns invalid: isValid() is false and error() says why.
+//
+// serial_open is 8N1 with no flow control and DTR/RTS asserted. Anything else:
+//
+//     let o = new SerialOptions(9600).parity(PARITY_EVEN).stopBits(2).dtr(false);
+//     let port = serial_open_with("COM4", o);
+//
+// Asserting DTR is what USB CDC boards (Pico, Leonardo, ESP32-S2) wait for
+// before they send anything, and it resets an Arduino Uno on open, as the
+// Arduino IDE does. Pass dtr(false) to open one without the reset.
+//
+// serial_ports() lists the ports present, with their USB ids where they have
+// them. Linux reads /sys/class/tty; Windows asks SetupAPI and the SERIALCOMM
+// map (so com0com and Bluetooth ports appear too); macOS lists none yet.
+//
+// On Windows a COM port is a HANDLE, which WSAPoll cannot wait on, so each open
+// port has a small C thread copying what arrives into a loopback socket, and
+// pollFd() is that socket (runtime/vyto_win_pump.h). The API is the same.
+
+#link "ws2_32" if "windows"
+#link "setupapi" if "windows"
+#link "cfgmgr32" if "windows"
 
 extern "C" {
     fn ser_open(path: cstring, baud: i32): i32;
+    fn ser_open_ex(path: cstring, baud: i32, databits: i32, parity: i32, stopbits: i32,
+                   flow: i32, dtr: i32, rts: i32): i32;
     fn ser_configure(fd: i32, baud: i32): i32;
+    fn ser_set_line(fd: i32, baud: i32, databits: i32, parity: i32, stopbits: i32,
+                    flow: i32): i32;
+    fn ser_poll_fd(fd: i32): i32;
     fn ser_read(fd: i32, buf: cstring, cap: i64): i64;
     fn ser_write(fd: i32, buf: cstring, n: i64): i64;
     fn ser_drain(fd: i32): i32;
     fn ser_flush(fd: i32): i32;
+    fn ser_set_dtr(fd: i32, on: i32): i32;
+    fn ser_set_rts(fd: i32, on: i32): i32;
+    fn ser_modem(fd: i32): i32;
+    fn ser_break(fd: i32, ms: i32): i32;
+    fn ser_error(fd: i32): cstring;
     fn ser_close(fd: i32);
+
+    fn ser_ports(): rawptr;
+    fn ser_port_count(h: rawptr): i32;
+    fn ser_port_path(h: rawptr, i: i32): cstring;
+    fn ser_port_name(h: rawptr, i: i32): cstring;
+    fn ser_port_mfr(h: rawptr, i: i32): cstring;
+    fn ser_port_serial(h: rawptr, i: i32): cstring;
+    fn ser_port_kind(h: rawptr, i: i32): cstring;
+    fn ser_port_vid(h: rawptr, i: i32): i32;
+    fn ser_port_pid(h: rawptr, i: i32): i32;
+    fn ser_ports_free(h: rawptr);
+}
+
+export const PARITY_NONE: int = 0;
+export const PARITY_ODD: int = 1;
+export const PARITY_EVEN: int = 2;
+export const PARITY_MARK: int = 3;    // not on macOS/BSD (no CMSPAR there)
+export const PARITY_SPACE: int = 4;
+
+export const FLOW_NONE: int = 0;
+export const FLOW_RTSCTS: int = 1;
+export const FLOW_XONXOFF: int = 2;
+
+// Bits of Serial.modem(): the input lines the other side drives.
+export const MODEM_CTS: int = 1;
+export const MODEM_DSR: int = 2;
+export const MODEM_RI: int = 4;
+export const MODEM_DCD: int = 8;
+
+// Line settings for serial_open_with. Starts at 8N1, no flow control, DTR and
+// RTS asserted; each builder changes one thing.
+export class SerialOptions {
+    baud_rate: int;
+    data_bits: int;
+    parity_mode: int;
+    stop_bits: int;
+    flow_mode: int;
+    dtr_on: bool;
+    rts_on: bool;
+
+    fn init(baud: int) {
+        this.baud_rate = baud;
+        this.data_bits = 8;
+        this.parity_mode = PARITY_NONE;
+        this.stop_bits = 1;
+        this.flow_mode = FLOW_NONE;
+        this.dtr_on = true;
+        this.rts_on = true;
+    }
+
+    builder fn dataBits(n: int) { this.data_bits = n; return this; }     // 5..8
+    builder fn parity(p: int) { this.parity_mode = p; return this; }     // PARITY_*
+    builder fn stopBits(n: int) { this.stop_bits = n; return this; }     // 1 or 2
+    builder fn flow(f: int) { this.flow_mode = f; return this; }         // FLOW_*
+    builder fn dtr(on: bool) { this.dtr_on = on; return this; }
+    // Ignored under FLOW_RTSCTS, where the driver owns RTS.
+    builder fn rts(on: bool) { this.rts_on = on; return this; }
+}
+
+fn flag(b: bool): i32 {
+    if (b) { return 1 as i32; }
+    return 0 as i32;
 }
 
 // Copy the first `n` bytes of `buf` into a right-sized array.
@@ -40,26 +133,48 @@ fn take(buf: byte[], n: int): byte[] {
 
 export class Serial {
     fd: i32;
+    dead: bool;    // the device went away or failed; see error()
+    why: string;
 
-    fn init(fd: i32) { this.fd = fd; }
+    fn init(fd: i32) {
+        this.fd = fd;
+        this.dead = false;
+        this.why = "";
+    }
 
     fn ensure() { if ((this.fd as int) < 0) { panic("vyto/hw/serial: operation on a closed port"); } }
-    fn isValid(): bool { return (this.fd as int) >= 0; }
 
-    // The fd to register in a PollSet (POLL_READ). The whole point of the
-    // streaming shape: the wire joins the same wait() as everything else.
-    fn pollFd(): int { return this.fd as int; }
+    // False once closed, or once the device has gone away.
+    fn isValid(): bool { return (this.fd as int) >= 0 && !this.dead; }
 
-    // Non-blocking read of up to `n` bytes; result length is what was actually
-    // available (empty when nothing is ready). Read after PollSet reports the fd
-    // readable.
+    // Why the port stopped working, once isValid() turned false because of the
+    // device; otherwise why the last call on it failed. "" when nothing did.
+    fn error(): string {
+        if (this.dead) { return this.why; }
+        if ((this.fd as int) < 0) { return ""; }
+        return str(ser_error(this.fd));
+    }
+
+    fn markDead() {
+        if (this.dead) { return; }
+        this.dead = true;
+        this.why = str(ser_error(this.fd));
+        if (this.why == "") { this.why = "the port was closed by the device"; }
+    }
+
+    // The fd to register in a PollSet (POLL_READ). After the device goes away
+    // it reports readable once more, and the read that follows finds out.
+    fn pollFd(): int { return ser_poll_fd(this.fd) as int; }
+
+    // Up to `n` bytes of what has arrived; empty when nothing has. Never blocks.
     fn read(n: int): byte[] {
         this.ensure();
-        if (n <= 0) { return bytes(0); }
+        if (n <= 0 || this.dead) { return bytes(0); }
         let buf = bytes(n);
         let got = ser_read(this.fd, buf as cstring, n as i64) as int;
-        if (got <= 0) { return bytes(0); } // would-block, EOF, or error
-        return take(buf, got);
+        if (got > 0) { return take(buf, got); }
+        if (got != -1) { this.markDead(); }    // 0 = hung up, -2 = failed
+        return bytes(0);
     }
     // strbytes, not str(... as cstring): read returns an exactly-sized buffer
     // with no NUL terminator (see vyto/net/socket recvText for the same fix).
@@ -68,8 +183,9 @@ export class Serial {
         return strbytes(b, b.len);
     }
 
-    // Write bytes; returns the count written (>=0), or a negative encoded status
-    // (-1 would-block, -2 error). On a fast local port a short write is rare.
+    // Bytes written (>= 0), or -1 when the line is held off (flow control) and
+    // nothing went out, -2 on an error. Windows waits at most a second for the
+    // line before giving up.
     fn write(data: byte[]): int {
         this.ensure();
         return ser_write(this.fd, data as cstring, data.len as i64) as int;
@@ -79,9 +195,25 @@ export class Serial {
         return ser_write(this.fd, s.cstr(), s.len as i64) as int;
     }
 
-    // Change the line speed on the fly (raw 8N1 at the new baud). True on success.
+    // Change the speed, keeping framing and flow control. True on success.
     fn setBaud(baud: int): bool { this.ensure(); return ser_configure(this.fd, baud as i32) as int == 0; }
-    // Block until queued output has physically transmitted.
+    // Change the whole line: speed, framing, flow control. DTR/RTS are left as
+    // they are; use setDtr/setRts for those.
+    fn configure(o: SerialOptions): bool {
+        this.ensure();
+        return ser_set_line(this.fd, o.baud_rate as i32, o.data_bits as i32, o.parity_mode as i32,
+                            o.stop_bits as i32, o.flow_mode as i32) as int == 0;
+    }
+
+    // Drive the output control lines.
+    fn setDtr(on: bool): bool { this.ensure(); return ser_set_dtr(this.fd, flag(on)) as int == 0; }
+    fn setRts(on: bool): bool { this.ensure(); return ser_set_rts(this.fd, flag(on)) as int == 0; }
+    // The input lines as MODEM_* bits, or -1 when the port cannot tell (a pty).
+    fn modem(): int { this.ensure(); return ser_modem(this.fd) as int; }
+    // Hold the line in break for `ms` milliseconds (250 if 0). Blocks that long.
+    fn sendBreak(ms: int): bool { this.ensure(); return ser_break(this.fd, ms as i32) as int == 0; }
+
+    // Block until queued output has physically gone out.
     fn drain(): bool { this.ensure(); return ser_drain(this.fd) as int == 0; }
     // Discard buffered input and unsent output.
     fn flush(): bool { this.ensure(); return ser_flush(this.fd) as int == 0; }
@@ -92,10 +224,80 @@ export class Serial {
     deinit { this.close(); }
 }
 
-// Open a serial port (e.g. "/dev/ttyUSB0", "/dev/ttyACM0") at `baud`, raw 8N1.
-// Null on failure (missing device, unsupported baud, no permission).
+// Open a port ("/dev/ttyUSB0", "/dev/ttyACM0"; "COM3" on Windows) at `baud`,
+// 8N1, no flow control, DTR and RTS asserted. Null on failure (missing
+// device, in use, unsupported baud, no permission).
 export fn serial_open(path: string, baud: int): Serial {
     let fd = ser_open(path.cstr(), baud as i32) as int;
     if (fd < 0) { return null; }
     return new Serial(fd as i32);
+}
+
+// Open a port with explicit line settings. Null on failure, including settings
+// the port refuses (an unsupported baud, 5 data bits with 2 stop bits).
+export fn serial_open_with(path: string, o: SerialOptions): Serial {
+    let fd = ser_open_ex(path.cstr(), o.baud_rate as i32, o.data_bits as i32,
+                         o.parity_mode as i32, o.stop_bits as i32, o.flow_mode as i32,
+                         flag(o.dtr_on), flag(o.rts_on)) as int;
+    if (fd < 0) { return null; }
+    return new Serial(fd as i32);
+}
+
+// A port present on this machine (a snapshot).
+export class SerialPortInfo {
+    path: string;          // what serial_open takes: "/dev/ttyUSB0", "COM3"
+    name: string;          // the system's name for it: "USB Serial Port (COM3)"
+    manufacturer: string;
+    serial: string;        // the USB serial number, when the device has one
+    kind: string;          // "usb", "native", "bluetooth", "virtual"
+    vid: int;              // USB vendor id, 0 when not USB
+    pid: int;              // USB product id
+
+    fn init(path: string, name: string, manufacturer: string, serial: string, kind: string,
+            vid: int, pid: int) {
+        this.path = path;
+        this.name = name;
+        this.manufacturer = manufacturer;
+        this.serial = serial;
+        this.kind = kind;
+        this.vid = vid;
+        this.pid = pid;
+    }
+
+    // "vvvv:pppp" in lowercase hex, or "" for a port with no USB id.
+    fn id(): string {
+        if (this.vid == 0 && this.pid == 0) { return ""; }
+        return hex4(this.vid) + ":" + hex4(this.pid);
+    }
+}
+
+// Every serial port present, sorted by path (COM2 before COM10). Empty, never
+// null, when there are none or the platform cannot list them.
+export fn serial_ports(): SerialPortInfo[] {
+    let out: SerialPortInfo[] = [];
+    let h = ser_ports();
+    if (h == null) { return out; }
+    let n = ser_port_count(h) as int;
+    for (let k in 0..n) {
+        let i = k as i32;
+        out.push(new SerialPortInfo(str(ser_port_path(h, i)), str(ser_port_name(h, i)),
+                                    str(ser_port_mfr(h, i)), str(ser_port_serial(h, i)),
+                                    str(ser_port_kind(h, i)), ser_port_vid(h, i) as int,
+                                    ser_port_pid(h, i) as int));
+    }
+    ser_ports_free(h);
+    return out;
+}
+
+// Lowercase 4-digit hex (USB ids are 16-bit).
+fn hex4(v: int): string {
+    let digits = "0123456789abcdef";
+    let out = "";
+    let shift = 12;
+    while (shift >= 0) {
+        let nib = (v >> shift) & 0xF;
+        out = out + digits.slice(nib, nib + 1);
+        shift -= 4;
+    }
+    return out;
 }

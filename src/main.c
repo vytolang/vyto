@@ -1770,11 +1770,13 @@ int main(int argc, char **argv) {
             shared_digest *= 1099511628211ULL;
         }
         /* Shims may include the runtime's shared Windows helpers (vyto_win.h,
-           found via -I<runtime dir> below), so an edit there is an input of
-           every shim object too. Only that one header: keying shims on the
-           whole runtime would recompile every package for any runtime edit. */
-        {
-            const char *wh = arena_printf(&g_arena, "%s/vyto_win.h", rtdir);
+           and vyto_win_pump.h for vyto/hw), found via -I<runtime dir> below,
+           so an edit there is an input of every shim object too. Only those
+           headers: keying shims on the whole runtime would recompile every
+           package for any runtime edit. */
+        static const char *const shim_headers[] = { "vyto_win.h", "vyto_win_pump.h" };
+        for (size_t hi = 0; hi < sizeof shim_headers / sizeof shim_headers[0]; hi++) {
+            const char *wh = arena_printf(&g_arena, "%s/%s", rtdir, shim_headers[hi]);
             long t = file_mtime(wh);
             if (t > shared_newest) shared_newest = t;
             size_t wlen = 0;

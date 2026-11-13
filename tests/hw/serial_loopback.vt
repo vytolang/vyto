@@ -1,0 +1,134 @@
+// vyto/hw/serial over a connected pair of ports, given as two arguments:
+//   Linux:   the two ptys of `socat pty,raw,echo=0 pty,raw,echo=0`
+//   Wine:    the same ptys, mapped to COMn in the prefix's dosdevices
+//   Windows: a com0com pair (CNCA0 CNCB0, or the COM names it was given)
+// An optional third argument is a command that tears the pair down (kills
+// socat); the fixture runs it and checks the port reports itself gone.
+//
+// Everything printed is a property, so one golden holds on every platform.
+import { serial_open, serial_open_with, serial_ports, Serial, SerialOptions,
+         PARITY_EVEN, FLOW_NONE } from "vyto/hw/serial";
+import { PollSet, POLL_READ } from "vyto/net/socket";
+import { run } from "vyto/os";
+import { monoMs } from "vyto/util/time";
+
+// Read from `q` until `want` bytes arrived or `ms` passed; the text read.
+fn recv_text(q: Serial, ps: PollSet, want: int, ms: int): string {
+    let out = "";
+    let end = monoMs() + (ms as i64);
+    while (out.len < want && monoMs() < end) {
+        let left = (end - monoMs()) as int;
+        if (left < 1) { left = 1; }
+        if (ps.wait(left) > 0) { out = out + q.readText(4096); }
+        if (!q.isValid()) { break; }
+    }
+    return out;
+}
+
+// Send n bytes (0..255 repeating) from p to q, interleaving writes with reads
+// so neither side's buffers fill; true when all arrived intact and in order.
+fn stream(p: Serial, q: Serial, ps: PollSet, n: int): bool {
+    let chunk = bytes(1024);
+    for (let i in 0..1024) { chunk[i] = (i & 255) as byte; }
+    let sent = 0;
+    let got = 0;
+    let ok = true;
+    let end = monoMs() + 20000;
+    while (got < n && monoMs() < end) {
+        if (sent < n) {
+            let w = p.write(chunk);
+            if (w > 0) { sent += w; }
+            // A partial write leaves the pattern out of phase; keep it simple:
+            // only whole chunks are counted as aligned.
+            if (w > 0 && w < 1024) { ok = false; }
+        }
+        if (ps.wait(5) > 0) {
+            let b = q.read(65536);
+            for (let k in 0..b.len) {
+                if ((b[k] as int) != ((got + k) & 255)) { ok = false; }
+            }
+            got += b.len;
+        }
+    }
+    return ok && got == n;
+}
+
+fn main() {
+    let a = args();
+    if (a.len < 2) {
+        print("usage: serial_loopback <portA> <portB> [teardown command]");
+        return;
+    }
+    let p = serial_open(a[0], 115200);
+    let q = serial_open(a[1], 115200);
+    print(`opened both: {p != null && q != null}`);
+    if (p == null || q == null) { return; }
+    print(`valid: {p.isValid() && q.isValid()}`);
+
+    let pq = new PollSet();
+    pq.addFd(q.pollFd(), POLL_READ);
+    let pp = new PollSet();
+    pp.addFd(p.pollFd(), POLL_READ);
+
+    // Nothing has been sent: a read is empty and does not block.
+    print(`empty read: {q.read(16).len == 0 && q.isValid()}`);
+
+    p.writeText("hello\n");
+    print(`a to b: {recv_text(q, pq, 6, 3000) == "hello\n"}`);
+    q.writeText("world\n");
+    print(`b to a: {recv_text(p, pp, 6, 3000) == "world\n"}`);
+
+    // Every byte value, including 0x00, 0x11/0x13 (XON/XOFF) and 0xFF.
+    let all = bytes(256);
+    for (let i in 0..256) { all[i] = i as byte; }
+    print(`all byte values written: {p.write(all) == 256}`);
+    let seen = 0;
+    let same = true;
+    let end = monoMs() + 3000;
+    while (seen < 256 && monoMs() < end) {
+        if (pq.wait(100) > 0) {
+            let b = q.read(512);
+            for (let k in 0..b.len) { if ((b[k] as int) != seen + k) { same = false; } }
+            seen += b.len;
+        }
+    }
+    print(`all byte values arrived: {same && seen == 256}`);
+
+    print(`64 KiB streamed in order: {stream(p, q, pq, 65536)}`);
+
+    // Line settings are accepted (a pty or com0com carries the bytes either
+    // way; what they do on a real wire needs real hardware).
+    print(`setBaud: {p.setBaud(9600) && p.setBaud(115200)}`);
+    let o = new SerialOptions(115200).parity(PARITY_EVEN).stopBits(2).flow(FLOW_NONE);
+    print(`configure 8E2: {p.configure(o)}`);
+    print(`bad options refused: {!p.configure(new SerialOptions(115200).dataBits(9))}`);
+
+    // Close one end and open it again with explicit options.
+    q.close();
+    print(`closed: {!q.isValid()}`);
+    let q2 = serial_open_with(a[1], new SerialOptions(115200).dtr(false));
+    print(`reopened with options: {q2 != null}`);
+    if (q2 != null) {
+        let p2 = new PollSet();
+        p2.addFd(q2.pollFd(), POLL_READ);
+        p.writeText("again\n");
+        print(`after reopen: {recv_text(q2, p2, 6, 3000) == "again\n"}`);
+    }
+
+    print(`missing port: {serial_open("vyto-no-such-port", 9600) == null}`);
+    print(`bad data bits: {serial_open_with(a[0], new SerialOptions(9600).dataBits(4)) == null}`);
+    let listed = serial_ports();
+    print(`listing works: {listed.len >= 0}`);
+
+    if (a.len >= 3) {
+        run(a[2]);
+        let t = monoMs() + 5000;
+        while (p.isValid() && monoMs() < t) {
+            if (pp.wait(200) > 0) { p.read(256); }
+        }
+        print(`gone after teardown: {!p.isValid()}`);
+        print(`with a reason: {p.error() != ""}`);
+        print(`read after gone is empty: {p.read(16).len == 0}`);
+    }
+    print("done");
+}

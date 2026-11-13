@@ -2414,6 +2414,31 @@ else
     fail=1
 fi
 
+# --- vyto/hw/serial over a socat pty pair --------------------------------------
+# Two connected ptys stand in for a null-modem cable: echo both ways, every byte
+# value, 64 KiB in order, reconfigure, reopen, and a teardown (socat killed)
+# that the port must report as gone, with a reason. The same fixture runs on
+# Windows over com0com (run.ps1) and under Wine over these ptys (test-wine).
+if command -v socat >/dev/null 2>&1; then
+    sd=tests/tmp/serial_pty
+    rm -rf "$sd"; mkdir -p "$sd"
+    socat pty,raw,echo=0,link="$sd/a" pty,raw,echo=0,link="$sd/b" 2>/dev/null &
+    spid=$!
+    i=0
+    while [ ! -e "$sd/b" ] && [ $i -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+    got=$(timeout 60 ./vytoc run tests/hw/serial_loopback.vt -- "$sd/a" "$sd/b" "kill $spid" 2>&1)
+    kill "$spid" 2>/dev/null; wait "$spid" 2>/dev/null
+    if [ "$got" = "$(cat tests/hw/serial_loopback_teardown.expected)" ]; then
+        echo "PASS hw_serial_loopback"
+    else
+        echo "FAIL hw_serial_loopback"
+        printf '%s\n' "$got" | diff tests/hw/serial_loopback_teardown.expected - | head -20
+        fail=1
+    fi
+else
+    echo "SKIP hw_serial_loopback (socat not installed: sudo apt-get install socat)"
+fi
+
 # --- conditional #link: platform-filtered libraries stay off the link line ---
 got=$(./vytoc run tests/fixtures/condlink.vt 2>&1)
 if [ "$got" = "conditional link ok" ]; then
