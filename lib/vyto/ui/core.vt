@@ -2207,6 +2207,15 @@ export class Widget {
     // animating one is pure cost. See Window.set_press.
     virtual fn shows_press(): bool { return true; }
 
+    // Does this widget's appearance depend on hover (`hovered` / anim_hover)?
+    // Default yes. A widget that never draws a hover state overrides it to
+    // false, and then entering or leaving it neither starts the hover spring
+    // nor repaints its bounds. That matters more than it sounds: a spring
+    // repaints the widget's whole bounds every frame until it settles, so a
+    // cursor swept across a screen of large hover-blind widgets kept several
+    // big springs alive at once — See Window.set_hover.
+    virtual fn shows_hover(): bool { return true; }
+
     virtual fn on_hover_enter(): bool {
         return false;
     }
@@ -3352,17 +3361,20 @@ export class Window {
         let old = this.hover_w;
         this.hover_w = w;
         this.sync_cursor();
+        // Only a widget that draws hover is animated and repainted; one whose
+        // enter/leave callback reports a change is repainted too. A widget
+        // that does neither costs nothing to cross (shows_hover).
         if (old != null) {
             old.hovered = false;
-            old.drive_hover(0.0);
-            old.on_hover_leave();
-            this.mark_dirty(old.bounds);
+            let shows = old.shows_hover();
+            if (shows) { old.drive_hover(0.0); }
+            if (old.on_hover_leave() || shows) { this.mark_dirty(old.bounds); }
         }
         if (w != null) {
             w.hovered = true;
-            w.drive_hover(1.0);
-            w.on_hover_enter();
-            this.mark_dirty(w.bounds);
+            let shows = w.shows_hover();
+            if (shows) { w.drive_hover(1.0); }
+            if (w.on_hover_enter() || shows) { this.mark_dirty(w.bounds); }
         }
         this.repaint();
     }
