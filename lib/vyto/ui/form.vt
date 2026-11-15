@@ -1966,16 +1966,26 @@ export class Dropdown extends Widget {
 }
 
 // Dropdown popup overlay
+// The open list of a Dropdown. A list taller than the window is clamped to it
+// and scrolls (wheel, arrow keys, Home/End): a column-mapping or country
+// picker easily has 30+ entries, and an unclamped popup ran off the screen
+// with its last items unreachable.
 class DropdownPopup extends Widget {
     dd: Dropdown;
     sel: int;
     row_h: float;
+    first: int;      // the first row shown
+    rows: int;       // how many rows fit
+    placed: bool;
 
     fn init(dd: Dropdown) {
         super.init();
         this.dd = dd;
         this.sel = dd.selected;
         this.row_h = 20.0;
+        this.first = 0;
+        this.rows = dd.labels.len;
+        this.placed = false;
     }
 
     override fn place(s: Painter, th: Theme) {
@@ -1985,12 +1995,45 @@ class DropdownPopup extends Widget {
             let iw = s.text_width(it) + 16.0;
             if (iw > w) { w = iw; }
         }
-        let h = (this.dd.labels.len as float) * this.row_h + 2.0;
+        let n = this.dd.labels.len;
+        let margin = 8.0;
+        let below = s.height() - this.dd.bounds.bottom() - margin;
+        let above = this.dd.bounds.y - margin;
+        let room = below;
+        let full = (n as float) * this.row_h + 2.0;
+        // below when it fits, else above when that fits, else the roomier side
+        let up = full > below && (full <= above || above > below);
+        if (up) { room = above; }
+        if (room < this.row_h * 3.0 + 2.0) { room = s.height() - 2.0 * margin; up = false; }
+        let fit = ((room - 2.0) / this.row_h) as int;
+        if (fit < 1) { fit = 1; }
+        this.rows = n;
+        if (this.rows > fit) { this.rows = fit; }
+        let h = (this.rows as float) * this.row_h + 2.0;
+        if (this.rows < n) { w += 6.0; }   // the scroll indicator
         let x = this.dd.bounds.x;
         let y = this.dd.bounds.bottom();
+        if (up) { y = this.dd.bounds.y - h; }
+        if (y + h > s.height() - margin) { y = s.height() - margin - h; }
+        if (y < margin) { y = margin; }
         if (x + w > s.width()) { x = s.width() - w; }
-        if (y + h > s.height()) { y = this.dd.bounds.y - h; }
+        if (x < 0.0) { x = 0.0; }
         this.bounds = Rect(x, y, w, h);
+        if (!this.placed) { this.placed = true; this.keep_visible(); }
+        this.clamp_first();
+    }
+
+    fn clamp_first() {
+        let most = this.dd.labels.len - this.rows;
+        if (most < 0) { most = 0; }
+        if (this.first > most) { this.first = most; }
+        if (this.first < 0) { this.first = 0; }
+    }
+
+    fn keep_visible() {
+        if (this.sel < this.first) { this.first = this.sel; }
+        if (this.sel >= this.first + this.rows) { this.first = this.sel - this.rows + 1; }
+        this.clamp_first();
     }
 
     fn choose() {
@@ -2011,9 +2054,14 @@ class DropdownPopup extends Widget {
         let radius = th.radius_md;
         // elevated dropdown menu: a soft shadow trails the panel
         win.skin.panel.paint(s, th, this.bounds, radius, th.surface_raised, th.border, 2);
-        for (let i in 0..this.dd.labels.len) {
-            let r = Rect(this.bounds.x + 2.0, this.bounds.y + 1.0 + (i as float) * this.row_h,
-                         this.bounds.w - 4, this.row_h);
+        let n = this.dd.labels.len;
+        let rw = this.bounds.w - 4.0;
+        if (this.rows < n) { rw -= 6.0; }
+        let last = this.first + this.rows;
+        if (last > n) { last = n; }
+        for (let i in this.first..last) {
+            let r = Rect(this.bounds.x + 2.0, this.bounds.y + 1.0 + ((i - this.first) as float) * this.row_h,
+                         rw, this.row_h);
             if (i == this.sel) {
                 s.fill_round(r, th.radius_sm, th.selection);
                 s.set_weight(WEIGHT.BOLD);
@@ -2023,18 +2071,36 @@ class DropdownPopup extends Widget {
                 s.text_in(r, 8, this.dd.labels[i], th.on_surface);
             }
         }
+        if (this.rows < n) {
+            // where the shown rows sit in the whole list
+            let track = this.bounds.h - 8.0;
+            let th_h = track * (this.rows as float) / (n as float);
+            if (th_h < 12.0) { th_h = 12.0; }
+            let ty = this.bounds.y + 4.0 + (track - th_h) * (this.first as float) / ((n - this.rows) as float);
+            s.fill_round(Rect(this.bounds.x + this.bounds.w - 7.0, ty, 4.0, th_h), 2.0, th.border);
+        }
     }
 
     override fn on_key(k: int, ch: string): bool {
-        if (k == KEY_UP) { if (this.sel > 0) { this.sel -= 1; } return true; }
-        if (k == KEY_DOWN) { if (this.sel < this.dd.labels.len - 1) { this.sel += 1; } return true; }
+        let n = this.dd.labels.len;
+        if (k == KEY_UP) { if (this.sel > 0) { this.sel -= 1; } this.keep_visible(); this.invalidate(); return true; }
+        if (k == KEY_DOWN) { if (this.sel < n - 1) { this.sel += 1; } this.keep_visible(); this.invalidate(); return true; }
+        if (k == KEY_HOME) { this.sel = 0; this.keep_visible(); this.invalidate(); return true; }
+        if (k == KEY_END) { this.sel = n - 1; this.keep_visible(); this.invalidate(); return true; }
         if (k == KEY_ENTER || k == KEY_SPACE) { this.choose(); return true; }
         return false;
     }
 
+    override fn on_scroll(delta: int): bool {
+        this.first += delta;
+        this.clamp_first();
+        this.invalidate();
+        return true;
+    }
+
     override fn on_click(x: int, y: int): bool {
-        let row = ((y as float - this.bounds.y - 1.0) / this.row_h) as int;
-        if (row >= 0 && row < this.dd.labels.len) {
+        let row = this.first + ((y as float - this.bounds.y - 1.0) / this.row_h) as int;
+        if (y as float >= this.bounds.y && row >= this.first && row < this.first + this.rows && row < this.dd.labels.len) {
             this.sel = row;
             this.choose();
         }
@@ -2066,10 +2132,14 @@ export class ProgressBar extends Widget {
         this.sweep_t = 0.0;
     }
 
+    // Repaints itself when the value moves: a bar driven from a loop or a
+    // timer otherwise kept showing its old fill until something else redrew.
     fn set_progress(p: float) {
         if (p < 0.0) { p = 0.0; }
         if (p > 1.0) { p = 1.0; }
+        if (p == this.progress) { return; }
         this.progress = p;
+        this.invalidate();
     }
 
     override fn measure(s: Painter, th: Theme): Size {
