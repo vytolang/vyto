@@ -53,47 +53,57 @@ export fn csv_semicolon(): Dialect { return Dialect(59, 34, 0, false, false); }
 // Pipe-separated.
 export fn csv_pipe(): Dialect { return Dialect(124, 34, 0, false, false); }
 
-// Guess the delimiter from a sample of the file: whichever of `,` `\t` `;` `|`
-// appears the same number of times on every one of the first few lines, most
-// often. Quoted regions are skipped, so a comma inside a quoted field does not
-// vote. Falls back to comma when nothing is consistent.
+// Guess the delimiter from a sample of the file: for each of `,` `\t` `;` `|`,
+// count it per line (outside quotes) over the first 20 non-blank lines. The
+// count most lines share is that candidate's arity, and it must hold on at
+// least half of them; the candidate held by the most lines wins, then the one
+// with more fields. Blank lines do not vote (Excel leaves them at the end), and
+// neither does a title row or two above the header, which is how supplier
+// price lists start. Falls back to comma when nothing qualifies.
 export fn csv_sniff(sample: string): Dialect {
     let cands = [44, 9, 59, 124];
     let bestDelim = 44;
-    let bestScore = 0;
+    let bestFreq = 0;
+    let bestArity = 0;
     let c = 0;
     while (c < cands.len) {
         let delim = cands[c];
         c += 1;
-        // Count this candidate per line, outside quotes, for up to 10 lines.
         let counts: int[] = [];
         let n = 0;
+        let blank = true;
         let inQuote = false;
         let i = 0;
-        while (i < sample.len && counts.len < 10) {
+        while (i < sample.len && counts.len < 20) {
             let ch = sample[i];
-            if (ch == CHAR_DQUOTE) { inQuote = !inQuote; }   // "
-            else {
-                if (!inQuote) {
-                    if (ch == delim) { n += 1; }
-                    if (ch == CHAR_LF) { counts.push(n); n = 0; }   // newline
-                }
+            if (ch == CHAR_DQUOTE) { inQuote = !inQuote; blank = false; }
+            else if (inQuote) { blank = false; }
+            else if (ch == delim) { n += 1; blank = false; }
+            else if (ch == CHAR_LF) {
+                if (!blank) { counts.push(n); }
+                n = 0;
+                blank = true;
             }
+            else if (ch != 13 && ch != 32 && ch != 9) { blank = false; }
             i += 1;
         }
-        if (counts.len == 0 && n > 0) { counts.push(n); }
-        if (counts.len == 0) { continue; }
-        // Consistent and non-zero is the signal; the first count is the arity.
-        let want = counts[0];
-        if (want == 0) { continue; }
-        let consistent = true;
-        let j = 1;
+        if (!blank && counts.len < 20) { counts.push(n); }
+        // the most common non-zero count, and how many lines have it
+        let arity = 0;
+        let freq = 0;
+        let j = 0;
         while (j < counts.len) {
-            if (counts[j] != want) { consistent = false; }
+            let v = counts[j];
             j += 1;
+            if (v == 0) { continue; }
+            let f = 0;
+            for (let x in counts) { if (x == v) { f += 1; } }
+            if (f > freq || (f == freq && v > arity)) { freq = f; arity = v; }
         }
-        if (consistent && want > bestScore) {
-            bestScore = want;
+        if (arity == 0 || freq * 2 < counts.len) { continue; }
+        if (freq > bestFreq || (freq == bestFreq && arity > bestArity)) {
+            bestFreq = freq;
+            bestArity = arity;
             bestDelim = delim;
         }
     }
