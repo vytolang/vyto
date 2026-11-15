@@ -1,0 +1,127 @@
+// vyto/media/image — decoding from memory (stb_image) and shrinking.
+//
+// Decoding used to need vyto/gfx and blend2d, which is not in git and not in
+// Windows builds. decodeImageBytes is vendored and works everywhere; this
+// example runs on a fresh clone. It round-trips through the encoders, so it
+// needs no image files in the tree.
+
+import { Image, encodePNGBytes, encodeJPEGBytes, encodeBMPBytes,
+         decodeImageBytes, decodeImageAvailable, imageInfo,
+         shrinkImage, fitWithin, hasAlpha } from "vyto/media/image";
+
+fn check(name: string, got: string, want: string) {
+    if (got == want) {
+        print("ok    " + name);
+    } else {
+        print("FAIL  " + name);
+        print("        got  " + got);
+        print("        want " + want);
+    }
+}
+
+fn hex(v: int): string {
+    let d = "0123456789ABCDEF";
+    let out = "";
+    let i = 7;
+    while (i >= 0) {
+        let n = (v >> (i * 4)) & 15;
+        out = out + d.slice(n, n + 1);
+        i -= 1;
+    }
+    return out;
+}
+
+// within tol of each other in every channel
+fn near(a: int, b: int, tol: int): bool {
+    let s = 0;
+    while (s < 32) {
+        let x = (a >> s) & 255;
+        let y = (b >> s) & 255;
+        let d = x - y;
+        if (d < 0) { d = 0 - d; }
+        if (d > tol) { return false; }
+        s += 8;
+    }
+    return true;
+}
+
+fn main() {
+    check("decoder available", `{decodeImageAvailable()}`, "true");
+
+    // ---- PNG round trip: lossless, alpha included
+    let img = new Image(5, 3);
+    img.fill(0xFF204060);
+    img.set(0, 0, 0xFFFF0000);
+    img.set(4, 2, 0x8000FF00);
+    img.set(2, 1, 0x00000000);
+    let png = encodePNGBytes(img);
+    let wh = imageInfo(png);
+    check("png info", `{wh[0]}x{wh[1]}`, "5x3");
+    let back = decodeImageBytes(png);
+    check("png decodes", `{back != null}`, "true");
+    check("png size", `{back.width}x{back.height}`, "5x3");
+    let same = true;
+    let i = 0;
+    while (i < 15) {
+        if ((back.pixels[i] as int) & 0xFFFFFFFF != (img.pixels[i] as int) & 0xFFFFFFFF) { same = false; }
+        i += 1;
+    }
+    check("png pixels exact", `{same}`, "true");
+    check("png corner", hex(back.get(0, 0)), "FFFF0000");
+    check("png half alpha", hex(back.get(4, 2)), "8000FF00");
+    check("png has alpha", `{hasAlpha(back)}`, "true");
+
+    // ---- JPEG: lossy, so dimensions and an approximate colour
+    let solid = new Image(16, 16);
+    solid.fill(0xFF3070C0);
+    let jpg = encodeJPEGBytes(solid, 90);
+    let j = decodeImageBytes(jpg);
+    check("jpeg decodes", `{j != null}`, "true");
+    check("jpeg size", `{j.width}x{j.height}`, "16x16");
+    check("jpeg colour close", `{near(j.get(8, 8), 0xFF3070C0, 6)}`, "true");
+    check("jpeg is opaque", `{hasAlpha(j)}`, "false");
+
+    // ---- BMP
+    let bmp = decodeImageBytes(encodeBMPBytes(solid));
+    check("bmp decodes", `{bmp != null && bmp.get(3, 3) == 0xFF3070C0}`, "true");
+
+    // ---- refusals
+    check("garbage refused", `{decodeImageBytes([1 as byte, 2 as byte, 3 as byte]) == null}`, "true");
+    check("garbage has no size", `{imageInfo([1 as byte, 2 as byte])[0]}`, "0");
+    let big = new Image(40, 30);
+    big.fill(0xFF000000);
+    let bigpng = encodePNGBytes(big);
+    check("over maxSide refused", `{decodeImageBytes(bigpng, 32) == null}`, "true");
+    check("within maxSide decodes", `{decodeImageBytes(bigpng, 40) != null}`, "true");
+
+    // ---- shrinking: a 4x2 of two colours to 2x1 averages each half
+    let pat = new Image(4, 2);
+    pat.fill(0xFF000000);
+    pat.set(0, 0, 0xFFFFFFFF);
+    pat.set(1, 0, 0xFFFFFFFF);
+    pat.set(0, 1, 0xFFFFFFFF);
+    pat.set(1, 1, 0xFFFFFFFF);
+    let small = shrinkImage(pat, 2, 1);
+    check("shrink size", `{small.width}x{small.height}`, "2x1");
+    check("shrink left white", hex(small.get(0, 0)), "FFFFFFFF");
+    check("shrink right black", hex(small.get(1, 0)), "FF000000");
+    // half black, half white averages to mid grey
+    let mid = shrinkImage(pat, 1, 1);
+    check("shrink averages", `{near(mid.get(0, 0), 0xFF808080, 1)}`, "true");
+    // a transparent pixel does not darken its opaque neighbour
+    let edge = new Image(2, 1);
+    edge.set(0, 0, 0xFFFF0000);
+    edge.set(1, 0, 0x00000000);
+    let e = shrinkImage(edge, 1, 1);
+    check("transparent ignored in colour", hex(e.get(0, 0) & 0xFFFFFF), "00FF0000");
+    check("alpha averaged", `{near(e.get(0, 0), 0x80FF0000, 1)}`, "true");
+    check("no upscaling", `{shrinkImage(pat, 8, 4) == null}`, "true");
+
+    // ---- fitting a photo into a thumbnail box
+    let f = fitWithin(4000, 3000, 512);
+    check("fit landscape", `{f[0]}x{f[1]}`, "512x384");
+    let g = fitWithin(1000, 2000, 512);
+    check("fit portrait", `{g[0]}x{g[1]}`, "256x512");
+    let k = fitWithin(300, 200, 512);
+    check("small stays", `{k[0]}x{k[1]}`, "300x200");
+}

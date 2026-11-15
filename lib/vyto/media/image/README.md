@@ -18,19 +18,35 @@ let bytes = encodePNGBytes(img);      // or to memory, for an HTTP body
 ```
 
 ```vyto
-import { decodeFile } from "vyto/media/image/decode";   // separate module
+import { decodeImageBytes, imageInfo, shrinkImage, fitWithin } from "vyto/media/image";
 
-let photo = decodeFile("photo.jpg");
-if (photo == null) { print("not decodable in this build"); return; }
-photo.get(10, 10);                    // 0xAARRGGBB
+let data = file_open("photo.jpg", "rb").readBytes();
+let wh = imageInfo(data);                 // [w, h] from the header, nothing decoded
+let photo = decodeImageBytes(data);       // PNG, JPEG, BMP, GIF; null if not one,
+                                          // or if over 8000 px on a side
+let fit = fitWithin(photo.width, photo.height, 512);
+let thumb = shrinkImage(photo, fit[0], fit[1]);   // area-averaged, shrink only
 ```
 
-## Two modules, because they cost different things
+## Modules, and what they cost
 
 | Module | Backend | In git? | Always works? |
 |---|---|---|---|
-| `vyto/media/image` | stb_image_write, **vendored** | yes | yes |
+| `vyto/media/image` (encode) | stb_image_write, **vendored** | yes | yes |
+| `vyto/media/image` (decode from memory) | stb_image, **vendored** (2026-11) | yes | yes |
 | `vyto/media/image/decode` | blend2d via `vyto/gfx` | **no** | only where blend2d was built |
+
+**Decoding from memory joined this module in 2026-11.** Windows builds do not
+include blend2d, so before that a Windows program could write an image and
+never read one back; a till that stores product pictures has to.
+
+`vyto/media/image/decode` is unchanged and still the blend2d route. That
+leaves two decoders in one tree, which was the reason stb_image was turned down
+before. They agree exactly on lossless formats (PNG, BMP); on JPEG they may
+differ by a level or two per channel. Prefer `decodeImageBytes` unless you need
+blend2d specifically.
+
+The original split, kept for `vyto/media/image/decode`:
 
 The split is a link-cost decision, not tidiness. blend2d is a 2.5 MB C++ library
 built by `lib/vyto/gfx/native/build-blend2d.sh`. If the encoder imported the

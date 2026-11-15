@@ -58,4 +58,15 @@ void vimg_set_png_compression(int level);
 /* 1 when this was built with a real libc, 0 on the freestanding arm. */
 int vimg_available(void);
 
+/* Decoding (stb_image: PNG, JPEG, BMP, GIF first frame), from memory.
+   vimg_info writes width and height into wh[0], wh[1] without decoding;
+   vimg_decode_into fills w*h ints of 0xAARRGGBB, refusing other dimensions.
+   Both return 1 on success, 0 otherwise. */
+int vimg_info(const void *data, int len, void *wh);
+int vimg_decode_into(const void *data, int len, void *px, int w, int h);
+int vimg_decode_available(void);
+
+/* Area-average downscale of 0xAARRGGBB pixels; dw <= sw and dh <= sh. */
+int vimg_shrink(const void *src, int sw, int sh, void *dst, int dw, int dh);
+
 #endif /* VYTO_IMAGE_SHIM_H */

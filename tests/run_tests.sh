@@ -256,9 +256,23 @@ fi
 # freestanding build of anything importing the package. The fixture imports only
 # the encoder, never vyto/media/image/decode, which reaches blend2d (C++) and
 # could never build here; that module split is what makes this test possible.
+#
+# The archive is read with nm rather than trusting the exit status (ar resolves
+# nothing, so a bypassed guard would still "build"): the object defining the
+# decoder entry point (stb_image joined stb_image_write in 2026-11) must
+# reference no external symbol at all.
 if ./vytoc build tests/fixtures/image_freestanding.vt --freestanding --cc gcc \
         -o examples/.vyto-cache/libimg_fs.a >/dev/null 2>&1; then
-    echo "PASS freestanding_image_stub"
+    img_obj=$(nm -A examples/.vyto-cache/libimg_fs.a 2>/dev/null \
+        | awk '/ T vimg_decode_into$/ { split($1, a, ":"); print a[2]; exit }')
+    img_undef=$(nm -A examples/.vyto-cache/libimg_fs.a 2>/dev/null \
+        | grep -c ":$img_obj: *U ")
+    if [ -n "$img_obj" ] && [ "$img_undef" -eq 0 ]; then
+        echo "PASS freestanding_image_stub"
+    else
+        echo "FAIL freestanding_image_stub (stub object '$img_obj' has $img_undef undefined symbols)"
+        fail=1
+    fi
 else
     echo "FAIL freestanding_image_stub (vyto/media/image's VT_NO_LIBC arm does not build)"
     fail=1

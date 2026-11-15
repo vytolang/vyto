@@ -5,7 +5,7 @@
 //     encodePNG(img, "out.png");
 //
 //     let bytes = encodePNGBytes(img);    // or straight to memory
-//     let back = decodeFile("photo.jpg"); // needs vyto/gfx — see below
+//     let back = decodeImageBytes(readBytesOf("photo.jpg"));   // PNG, JPEG, BMP, GIF
 //
 // Before this module no Vyto program could write an image file at all.
 // vyto/gfx decodes (blend2d has PNG/JPEG/BMP/QOI codecs built in) but has no
@@ -41,19 +41,20 @@
 // why it is in git rather than fetched. No provisioning, no build script, and
 // it cross-compiles unchanged.
 //
-// DECODE lives in a SEPARATE MODULE, `vyto/media/image/decode`, and is not
-// reachable from here. That is deliberate and it is a link-cost decision:
-// decoding goes through vyto/gfx and therefore blend2d, a 2.5 MB C++ library
-// that is not in git and has to be built. If this module imported it, every
-// program that merely writes a PNG would link blend2d — or fail to build on a
-// clone where it was never provisioned.
+// DECODE from memory is here too, since 2026-11: decodeImageBytes, backed by
+// stb_image (also vendored: PNG, JPEG, BMP, GIF first frame). It works on
+// every target, Windows included, where blend2d is deliberately not built.
+// imageInfo reads the dimensions first, so a caller can refuse an oversized
+// image before a byte is decompressed; shrinkImage downsizes (a thumbnail).
 //
-//     import { decodeFile } from "vyto/media/image/decode";   // opt in
-//
-// So encoding always works and costs one vendored header; decoding costs
-// blend2d and you ask for it by name. Vendoring a second decoder to avoid that
-// was considered and rejected: two PNG decoders in one tree have to agree
-// forever, and blend2d's is already here and already tested.
+// `vyto/media/image/decode` (blend2d) still exists and is unchanged. It was
+// once the only decoder, and vendoring stb_image to avoid blend2d was turned
+// down then because two decoders in one tree have to agree. What changed is
+// Windows: a till that stores product pictures must decode them there, and
+// blend2d is not in the Windows build. So the two now coexist, and the cost is
+// the one foreseen: they are not guaranteed to agree to the last bit on JPEG
+// (lossless PNG they do). Prefer this module's decoder unless you need blend2d
+// specifically.
 
 extern "C" {
     fn vimg_write_png(path: cstring, px: rawptr, w: i32, h: i32): i32;
@@ -73,6 +74,11 @@ extern "C" {
 
     fn vimg_set_png_compression(level: i32);
     fn vimg_available(): i32;
+
+    fn vimg_info(data: rawptr, len: i32, wh: rawptr): i32;
+    fn vimg_decode_into(data: rawptr, len: i32, px: rawptr, w: i32, h: i32): i32;
+    fn vimg_decode_available(): i32;
+    fn vimg_shrink(src: rawptr, sw: i32, sh: i32, dst: rawptr, dw: i32, dh: i32): i32;
 }
 
 // ---- Image ------------------------------------------------------------------
@@ -261,3 +267,62 @@ export fn setPNGCompression(level: int) {
 // Whether encoding works. False only on a --freestanding build, where the shim
 // compiles to stubs because stb needs a libc.
 export fn encodeAvailable(): bool { return (vimg_available() as int) == 1; }
+
+// ---- decoding ---------------------------------------------------------------
+
+// [width, height] of an encoded image (PNG, JPEG, BMP, GIF), read from its
+// header without decoding; [0, 0] when it is not an image this can read.
+export fn imageInfo(data: byte[]): int[] {
+    let wh: i32[] = [0 as i32, 0 as i32];
+    if (data.len == 0) { return [0, 0]; }
+    if ((vimg_info(data as rawptr, data.len as i32, wh as rawptr) as int) != 1) { return [0, 0]; }
+    return [wh[0] as int, wh[1] as int];
+}
+
+// Decode PNG, JPEG, BMP or GIF (first frame) bytes into an Image. Null when
+// the bytes are not such an image, or when it is larger than maxSide on
+// either axis: the check uses the header, before anything is decompressed,
+// so an image bomb costs nothing.
+export fn decodeImageBytes(data: byte[], maxSide: int = 8000): Image {
+    let wh = imageInfo(data);
+    let w = wh[0];
+    let h = wh[1];
+    if (w <= 0 || h <= 0 || w > maxSide || h > maxSide) { return null; }
+    let img = new Image(w, h);
+    if ((vimg_decode_into(data as rawptr, data.len as i32, img.pixels as rawptr, w as i32, h as i32) as int) != 1) {
+        return null;
+    }
+    return img;
+}
+
+// Whether decodeImageBytes works: false only on a --freestanding build.
+export fn decodeImageAvailable(): bool { return (vimg_decode_available() as int) == 1; }
+
+// A smaller copy, area-averaged (good for thumbnails). Only shrinks: a target
+// larger than the source on either axis returns null.
+export fn shrinkImage(img: Image, w: int, h: int): Image {
+    if (img == null || img.isEmpty() || w <= 0 || h <= 0 || w > img.width || h > img.height) { return null; }
+    let out = new Image(w, h);
+    if ((vimg_shrink(img.pixels as rawptr, img.width as i32, img.height as i32, out.pixels as rawptr,
+                     w as i32, h as i32) as int) != 1) {
+        return null;
+    }
+    return out;
+}
+
+// The size that fits w x h inside maxSide x maxSide, keeping the aspect
+// ratio and never enlarging: [w, h].
+export fn fitWithin(w: int, h: int, maxSide: int): int[] {
+    if (w <= maxSide && h <= maxSide) { return [w, h]; }
+    if (w >= h) { return [maxSide, (h * maxSide + w / 2) / w]; }
+    return [(w * maxSide + h / 2) / h, maxSide];
+}
+
+// Whether any pixel is not fully opaque (keep PNG, not JPEG, for it).
+export fn hasAlpha(img: Image): bool {
+    if (img == null) { return false; }
+    for (let p in img.pixels) {
+        if (((p as int) >> 24) & 0xFF != 0xFF) { return true; }
+    }
+    return false;
+}

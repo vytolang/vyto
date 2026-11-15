@@ -324,7 +324,7 @@ and never re-arm one from `render()`.
 blend2d (`vyto/gfx`) and ICU (`vyto/intl`) binaries are **not in git** — they
 are built by `lib/vyto/*/native/build-*.sh`. On a fresh clone the gfx tests
 silently skip rather than fail. `vyto/regex` (pcre2), `vyto/crypto/ecc`
-(micro-ecc), `vyto/media/image` (stb_image_write), `vyto/db/sqlite` (the
+(micro-ecc), `vyto/media/image` (stb_image_write + stb_image), `vyto/db/sqlite` (the
 amalgamation) and `vyto/compress` (zlib) *are* vendored and need nothing; each
 carries a `native/refresh-*.sh --verify` that checks the committed tree against
 its sha256 manifest. So is **vyto/net's windows-x64 curl + mbedTLS + Mozilla CA
@@ -338,7 +338,8 @@ their vendored trees goes unnoticed until the next refresh silently reverts it.
 
 That silent skip is exactly why those three are vendored — a must-have module
 whose tests quietly do not run on a fresh clone is worse than one that is
-missing. It is also why `vyto/media/image` splits encode from decode: encode is
-vendored and always works, and `vyto/media/image/decode` is a separate module
-because it reaches blend2d.
+missing. It is also why `vyto/media/image` keeps everything it does vendored:
+encode, and since 2026-11 decode from memory (`decodeImageBytes`, stb_image,
+needed on Windows where blend2d is not built). `vyto/media/image/decode` is the
+separate blend2d route and stays opt-in because it reaches blend2d.
 

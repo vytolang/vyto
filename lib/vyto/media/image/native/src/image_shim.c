@@ -54,6 +54,14 @@ int vimg_buf_take(void *h, void *d, int c) { (void)h; (void)d; (void)c; return 0
 void vimg_set_png_compression(int level) { (void)level; }
 int  vimg_available(void)                { return 0; }
 
+int vimg_info(const void *d, int n, void *wh)
+                        { (void)d; (void)n; (void)wh; return 0; }
+int vimg_decode_into(const void *d, int n, void *px, int w, int h)
+                        { (void)d; (void)n; (void)px; (void)w; (void)h; return 0; }
+int vimg_shrink(const void *s, int sw, int sh, void *d, int dw, int dh)
+                        { (void)s; (void)sw; (void)sh; (void)d; (void)dw; (void)dh; return 0; }
+int vimg_decode_available(void)          { return 0; }
+
 /* ------------------------------------------------------------------------ */
 #else
 
@@ -69,6 +77,18 @@ int  vimg_available(void)                { return 0; }
    toolchains. Keep the HDR path out entirely. */
 #define STBI_WRITE_NO_STDIO_HDR
 #include "stb/stb_image_write.h"
+
+/* Decoding: PNG, JPEG, BMP and GIF (first frame), from memory only, so no
+   stdio and no other formats are compiled in. STBI_MAX_DIMENSIONS caps what
+   stb will even try; vimg_info lets a caller refuse earlier still. */
+#define STB_IMAGE_IMPLEMENTATION
+#define STBI_ONLY_PNG
+#define STBI_ONLY_JPEG
+#define STBI_ONLY_BMP
+#define STBI_ONLY_GIF
+#define STBI_NO_STDIO
+#define STBI_MAX_DIMENSIONS 16384
+#include "stb/stb_image.h"
 
 /* ---- pixel repacking ---------------------------------------------------
 
@@ -271,5 +291,106 @@ void vimg_set_png_compression(int level)
 }
 
 int vimg_available(void) { return 1; }
+
+/* ---- decode ---------------------------------------------------------------
+
+   Two calls, so the caller allocates: vimg_info reads the dimensions from the
+   header (cheap: nothing is decompressed), the caller checks them against its
+   own limit and allocates w*h ints, and vimg_decode_into fills them. */
+
+int vimg_info(const void *data, int len, void *wh)
+{
+    int w = 0, h = 0, comp = 0;
+    int *out = (int *)wh;
+    if (!data || len <= 0 || !out) return 0;
+    if (!stbi_info_from_memory((const stbi_uc *)data, len, &w, &h, &comp)) return 0;
+    out[0] = w;
+    out[1] = h;
+    return 1;
+}
+
+/* Decode into px, w*h ints of 0xAARRGGBB. The dimensions must be what
+   vimg_info said; anything else is refused rather than overrun. */
+int vimg_decode_into(const void *data, int len, void *px, int w, int h)
+{
+    int dw = 0, dh = 0, comp = 0;
+    long long n, i;
+    unsigned char *rgba;
+    unsigned int *dst = (unsigned int *)px;
+    if (!data || len <= 0 || !px || w <= 0 || h <= 0) return 0;
+    rgba = stbi_load_from_memory((const stbi_uc *)data, len, &dw, &dh, &comp, 4);
+    if (!rgba) return 0;
+    if (dw != w || dh != h) { stbi_image_free(rgba); return 0; }
+    n = (long long)w * (long long)h;
+    for (i = 0; i < n; i++) {
+        dst[i] = ((unsigned int)rgba[i * 4 + 3] << 24) |
+                 ((unsigned int)rgba[i * 4 + 0] << 16) |
+                 ((unsigned int)rgba[i * 4 + 1] <<  8) |
+                  (unsigned int)rgba[i * 4 + 2];
+    }
+    stbi_image_free(rgba);
+    return 1;
+}
+
+int vimg_decode_available(void) { return 1; }
+
+/* ---- shrink -----------------------------------------------------------------
+
+   Area-average downscale (a box filter): every destination pixel is the mean
+   of the source pixels it covers, with fractional coverage at the edges.
+   That is the right filter for making pictures SMALLER, which is all this is
+   for (a photo to a product thumbnail); it does not upscale. Colour is
+   averaged weighted by alpha, so transparent pixels do not darken edges.
+   Pixel boundaries are in 16.16 fixed point. */
+int vimg_shrink(const void *src, int sw, int sh, void *dst, int dw, int dh)
+{
+    const unsigned int *s = (const unsigned int *)src;
+    unsigned int *d = (unsigned int *)dst;
+    int dx, dy;
+    if (!src || !dst || sw <= 0 || sh <= 0 || dw <= 0 || dh <= 0) return 0;
+    if (dw > sw || dh > sh) return 0;
+    for (dy = 0; dy < dh; dy++) {
+        long long y0 = ((long long)dy * sh << 16) / dh;
+        long long y1 = ((long long)(dy + 1) * sh << 16) / dh;
+        for (dx = 0; dx < dw; dx++) {
+            long long x0 = ((long long)dx * sw << 16) / dw;
+            long long x1 = ((long long)(dx + 1) * sw << 16) / dw;
+            double a = 0, r = 0, g = 0, b = 0, area = 0;
+            int sy, sx;
+            for (sy = (int)(y0 >> 16); sy < sh && ((long long)sy << 16) < y1; sy++) {
+                long long top = (long long)sy << 16, bot = top + 65536;
+                double wy = (double)((bot < y1 ? bot : y1) - (top > y0 ? top : y0)) / 65536.0;
+                for (sx = (int)(x0 >> 16); sx < sw && ((long long)sx << 16) < x1; sx++) {
+                    long long lft = (long long)sx << 16, rgt = lft + 65536;
+                    double wx = (double)((rgt < x1 ? rgt : x1) - (lft > x0 ? lft : x0)) / 65536.0;
+                    double wgt = wx * wy;
+                    unsigned int v = s[(long long)sy * sw + sx];
+                    double pa = (double)((v >> 24) & 0xFF);
+                    a += pa * wgt;
+                    r += (double)((v >> 16) & 0xFF) * pa * wgt;
+                    g += (double)((v >>  8) & 0xFF) * pa * wgt;
+                    b += (double)( v        & 0xFF) * pa * wgt;
+                    area += wgt;
+                }
+            }
+            if (area <= 0) { d[(long long)dy * dw + dx] = 0; continue; }
+            {
+                unsigned int oa = (unsigned int)(a / area + 0.5);
+                unsigned int or_ = 0, og = 0, ob = 0;
+                if (a > 0) {
+                    or_ = (unsigned int)(r / a + 0.5);
+                    og = (unsigned int)(g / a + 0.5);
+                    ob = (unsigned int)(b / a + 0.5);
+                }
+                if (oa > 255) oa = 255;
+                if (or_ > 255) or_ = 255;
+                if (og > 255) og = 255;
+                if (ob > 255) ob = 255;
+                d[(long long)dy * dw + dx] = (oa << 24) | (or_ << 16) | (og << 8) | ob;
+            }
+        }
+    }
+    return 1;
+}
 
 #endif /* VT_NO_LIBC */
