@@ -2422,6 +2422,11 @@ export class Window {
     pending_full: bool;     // a full redraw is owed at the next vsync
     pending_partial: bool;  // a dirty-rect repaint is owed (region is `dirty`)
     hover_w: Widget;     // WS6: widget currently under the cursor (draws hover state)
+    // Hover changes in one frame instead of easing in on a spring. A spring
+    // repaints its widget every frame for its whole settle time, so sweeping
+    // the cursor across a row of buttons keeps several alive at once and
+    // repaints the union of them each frame. See set_instant_hover.
+    instant_hover: bool;
     cursor_now: int;     // CURSOR_* last handed to the surface
     ime_x: int;          // caret position last handed to the IME (-1 = none)
     ime_y: int;
@@ -2704,6 +2709,13 @@ export class Window {
     fn surface(): Surface { return this.surf; }
     // The window's icon from w x h 0xAARRGGBB pixels; see Surface.set_icon.
     fn set_icon(argb: i32[], w: int, h: int) { this.surf.set_icon(argb, w, h); }
+
+    // Hover without animation: a widget that shows hover switches to its hover
+    // look in a single repaint of its own bounds, rather than ~15 frames of a
+    // spring. For screens dense with buttons on slow renderers (software D2D,
+    // old CPUs), where the eased hover costs more than it is worth. Press and
+    // toggle animations are unaffected.
+    fn set_instant_hover(on: bool) { this.instant_hover = on; }
 
     // opt into a custom painter (e.g. vyto/gfx GfxPainter for AA rendering).
     // Call before run(); the painter draws and presents each frame.
@@ -3367,13 +3379,13 @@ export class Window {
         if (old != null) {
             old.hovered = false;
             let shows = old.shows_hover();
-            if (shows) { old.drive_hover(0.0); }
+            if (shows && !this.instant_hover) { old.drive_hover(0.0); }
             if (old.on_hover_leave() || shows) { this.mark_dirty(old.bounds); }
         }
         if (w != null) {
             w.hovered = true;
             let shows = w.shows_hover();
-            if (shows) { w.drive_hover(1.0); }
+            if (shows && !this.instant_hover) { w.drive_hover(1.0); }
             if (w.on_hover_enter() || shows) { this.mark_dirty(w.bounds); }
         }
         this.repaint();

@@ -85,6 +85,11 @@ export class DtColumn {
     // Optional conditional background: (df, vrow, dfcol) → packed color, 0 = none.
     // Drawn behind the cell for color-by-value / heat cells / data-bar tints.
     cellBg: fn(DataFrame, int, int): int;
+    // Optional custom cell drawing: (painter, cell rect, df, vrow, dfcol). When
+    // set it replaces the cell's text (a thumbnail, a swatch, a sparkline); the
+    // background, focus ring and grid line are still drawn around it. Copy and
+    // CSV export still use the text (format, else the value).
+    cellPaint: fn(Painter, Rect, DataFrame, int, int);
 
     fn init(title: string, width: float, col: int) {
         this.title = title;
@@ -136,6 +141,10 @@ export class DataTable extends Widget {
     selected: int;      // visible-row index, -1 = none
     sel_src: int;       // stable source row of the selection (survives sort/filter), -1
     hover_row: int;     // visible-row index under the cursor, -1
+    // The dirty rect of the partial repaint in progress, so render() skips
+    // the rows and bands it cannot touch; paint_partial is false on a full draw.
+    paint_d: Rect;
+    paint_partial: bool;
     // Sort keys, primary first: sort_cols[k] is a DataFrame column, sort_dirs[k]
     // > 0 ascending / < 0 descending. Empty = unsorted. sort_col / sort_asc
     // mirror the primary key for back-compat.
@@ -284,6 +293,8 @@ export class DataTable extends Widget {
         this.selected = -1;
         this.sel_src = -1;
         this.hover_row = -1;
+        this.paint_d = Rect(0.0, 0.0, 0.0, 0.0);
+        this.paint_partial = false;
         this.sort_cols = [];
         this.sort_dirs = [];
         this.sort_col = -1;
@@ -806,6 +817,12 @@ export class DataTable extends Widget {
         if (i >= 0 && i < this.cols.len) { this.cols[i].cellBg = f; this.invalidate(); }
     }
 
+    // Draw column i's cells yourself (see DtColumn.cellPaint). Null restores
+    // the text.
+    fn setCellPainter(i: int, f: fn(Painter, Rect, DataFrame, int, int)) {
+        if (i >= 0 && i < this.cols.len) { this.cols[i].cellPaint = f; this.invalidate(); }
+    }
+
     // ---- sticky totals row -----------------------------------------------
 
     fn showTotals(b: bool) { this.totals_row = b; this.clamp(); this.invalidate(); }
@@ -1063,7 +1080,13 @@ export class DataTable extends Widget {
         let c = this.cols[this.cur_col];
         let dfcol = c.col;
         let k = this.df.colKind(dfcol);
-        if (k == CK_STR || k == CK_CAT || k == CK_BOOL) {
+        if (k == CK_BOOL) {
+            // setCellStr ignores a BOOL column (coltable stores it as an int),
+            // so the edit used to vanish. Accept the usual spellings.
+            let t = this.edit_buf.trim().to_lower();
+            if (t == "true" || t == "yes" || t == "y" || t == "1") { this.df.setCellInt(this.selected, dfcol, 1); }
+            else if (t == "false" || t == "no" || t == "n" || t == "0") { this.df.setCellInt(this.selected, dfcol, 0); }
+        } else if (k == CK_STR || k == CK_CAT) {
             this.df.setCellStr(this.selected, dfcol, this.edit_buf);
         } else {
             let box: float[] = [0.0];
@@ -1385,6 +1408,23 @@ export class DataTable extends Widget {
         return false;
     }
 
+    // True when visible row `vrow` is ticked: in the checked set only. The
+    // active (cursor) row is NOT implied, which is what lets a box be unticked
+    // while it is also the row under the cursor.
+    fn is_checked(vrow: int): bool {
+        if (this.sel_set.len == 0) { return false; }
+        return this.set_in(this.df.srcRow(vrow));
+    }
+
+    // The ticked rows, as stable source rows (DataFrame.srcRow), in the order
+    // they were ticked. Survives sorting and filtering; a ticked row that a
+    // filter now hides is still in it.
+    fn checkedRows(): int[] {
+        let out: int[] = [];
+        for (let r in this.sel_set) { out.push(r); }
+        return out;
+    }
+
     fn set_in(src: int): bool {
         for (let i in 0..this.sel_set.len) { if (this.sel_set[i] == src) { return true; } }
         return false;
@@ -1448,7 +1488,9 @@ export class DataTable extends Widget {
             this.set_toggle(src);
             this.selected = vrow; this.sel_src = src;
         } else {
-            this.sel_set = [src];
+            // With checkboxes the ticks are the selection and a plain click
+            // only moves the cursor; without them it replaces the selection.
+            if (!this.checkboxes) { this.sel_set = [src]; }
             this.selected = vrow; this.sel_src = src;
         }
     }
@@ -1893,6 +1935,12 @@ export class DataTable extends Widget {
             if (this.grid) { s.line(cx + c.width, ry, cx + c.width, ry + rh, th.divider); }
             return;
         }
+        if (c.cellPaint != null) {
+            c.cellPaint(s, Rect(cx, ry, c.width, rh), this.df, vrow, c.col);
+            if (focused) { s.stroke_round(Rect(cx + 1, ry + 1, c.width - 2, rh - 2), th.radius_sm, 1, th.primary); }
+            if (this.grid) { s.line(cx + c.width, ry, cx + c.width, ry + rh, th.divider); }
+            return;
+        }
         let txt = this.cell_text(vrow, c);
         if (this.wrap && rh > this.row_h) {
             let lines = this.wrap_lines(s, txt, c.width - 12);
@@ -2028,6 +2076,11 @@ export class DataTable extends Widget {
         }
 
         let hy = b.y + DT_SEARCH_H;
+        // What this frame must paint: everything on a full draw, the dirty
+        // rect on a partial one (a hover moving between rows repaints two row
+        // strips, not every cell of the grid).
+        let pd = b;
+        if (this.paint_partial) { pd = this.paint_d; }
         let base = this.base_x();
         let sl = this.scroll_left();
         let right = b.right();
@@ -2036,16 +2089,18 @@ export class DataTable extends Widget {
         let bh = this.body_h();
 
         // --- header ---
-        s.fill(Rect(b.x, hy, b.w, DT_HDR_H), th.surface_sunken);
-        s.set_weight(WEIGHT.BOLD);
-        // scrolling header columns
-        s.clip_push(Rect(sl, hy, right - sl, DT_HDR_H), 0.0);
-        let sc = this.first_scroll_col();
-        while (sc < this.cols.len) {
-            let cx = base - this.scroll_off_x + this.colx[sc];
-            if (cx >= right) { break; }
-            this.draw_header_cell(s, th, sc, cx, hy);
-            sc += 1;
+        // skipped when the dirty rect is only body rows
+        if (span_hits(pd, hy, hy + DT_HDR_H)) {
+            s.fill(Rect(b.x, hy, b.w, DT_HDR_H), th.surface_sunken);
+            s.set_weight(WEIGHT.BOLD);
+            // scrolling header columns
+            s.clip_push(Rect(sl, hy, right - sl, DT_HDR_H), 0.0);
+            let sc = this.first_scroll_col();
+            while (sc < this.cols.len) {
+                let cx = base - this.scroll_off_x + this.colx[sc];
+                if (cx >= right) { break; }
+                this.draw_header_cell(s, th, sc, cx, hy);
+                sc += 1;
         }
         s.clip_pop();
         // frozen header columns (drawn on top of the scrolling pane's left edge)
@@ -2056,9 +2111,9 @@ export class DataTable extends Widget {
         }
         s.set_weight(WEIGHT.REG);
         // checkbox gutter header = select-all
-        if (this.checkboxes) { this.draw_checkbox(s, th, hy + DT_HDR_H / 2, this.selectionCount() > 0); }
-        if (fc > 0 || this.checkboxes) { s.line(sl, hy, sl, b.bottom() - DT_FOOT_H, th.border); }
+        if (this.checkboxes) { this.draw_checkbox(s, th, hy + DT_HDR_H / 2, this.sel_set.len > 0); }
         s.line(b.x, hy + DT_HDR_H, right, hy + DT_HDR_H, th.divider);
+        }
 
         // --- filter row ---
         if (this.filter_row) {
@@ -2100,6 +2155,7 @@ export class DataTable extends Widget {
                 let vh = this.vr_h[iv];
                 let kind = this.vr_kind[iv];
                 let rowi = this.vr_row[iv];
+                if (!span_hits(pd, vy, vy + vh + 1.0)) { iv += 1; continue; }
                 switch (kind) {
                 case VROW.DATA: {
                     if (this.is_selected(rowi)) {
@@ -2109,7 +2165,7 @@ export class DataTable extends Widget {
                     } else if (this.zebra && (rowi & 1) == 1) {
                         s.fill(Rect(b.x, vy, b.w, vh), mix(th.surface_raised, th.on_surface, 0.03));
                     }
-                    if (this.checkboxes) { this.draw_checkbox(s, th, vy + this.row_h / 2, this.is_selected(rowi)); }
+                    if (this.checkboxes) { this.draw_checkbox(s, th, vy + this.row_h / 2, this.is_checked(rowi)); }
                     this.draw_row_cells(s, th, rowi, vy, vh, base, sl, right, fc);
                     // The rule goes under the cells, not over them: a cell's
                     // own clip stops at its column, so drawing it first would
@@ -2132,6 +2188,7 @@ export class DataTable extends Widget {
                 let vrow = firstRow + i;
                 if (vrow >= vlen) { break; }
                 let ry = by - off + (i as float) * this.row_h;
+                if (!span_hits(pd, ry, ry + this.row_h + 1.0)) { continue; }
                 if (this.is_selected(vrow)) {
                     s.fill(Rect(b.x, ry, b.w, this.row_h), th.selection);
                 } else if (vrow == this.hover_row) {
@@ -2139,7 +2196,7 @@ export class DataTable extends Widget {
                 } else if (this.zebra && (vrow & 1) == 1) {
                     s.fill(Rect(b.x, ry, b.w, this.row_h), mix(th.surface_raised, th.on_surface, 0.03));
                 }
-                if (this.checkboxes) { this.draw_checkbox(s, th, ry + this.row_h / 2, this.is_selected(vrow)); }
+                if (this.checkboxes) { this.draw_checkbox(s, th, ry + this.row_h / 2, this.is_checked(vrow)); }
             }
             // pass 2: scrolling cells (clipped to the scrolling pane)
             s.clip_push(Rect(sl, by, right - sl, bh), 0.0);
@@ -2147,6 +2204,7 @@ export class DataTable extends Widget {
                 let vrow = firstRow + i;
                 if (vrow >= vlen) { break; }
                 let ry = by - off + (i as float) * this.row_h;
+                if (!span_hits(pd, ry, ry + this.row_h + 1.0)) { continue; }
                 let cj = this.first_scroll_col();
                 while (cj < this.cols.len) {
                     let cx = base - this.scroll_off_x + this.colx[cj];
@@ -2163,6 +2221,7 @@ export class DataTable extends Widget {
                     let vrow = firstRow + i;
                     if (vrow >= vlen) { break; }
                     let ry = by - off + (i as float) * this.row_h;
+                    if (!span_hits(pd, ry, ry + this.row_h + 1.0)) { continue; }
                     for (let j in 0..fc) { this.draw_body_cell(s, th, vrow, j, base + this.colx[j], ry, this.row_h); }
                 }
                 s.clip_pop();
@@ -2175,11 +2234,13 @@ export class DataTable extends Widget {
                     let vrow = firstRow + i;
                     if (vrow >= vlen) { break; }
                     let ry = by - off + (i as float) * this.row_h;
+                    if (!span_hits(pd, ry, ry + this.row_h + 1.0)) { continue; }
                     s.line(b.x, ry + this.row_h, right, ry + this.row_h, th.divider);
                 }
             }
         }
         s.clip_pop();
+        if (fc > 0 || this.checkboxes) { s.line(sl, hy, sl, b.bottom() - DT_FOOT_H, th.border); }
 
         // reorder drop indicator: a vertical bar at the target insert position
         if (this.drag_col >= 0 && this.drag_to >= 0 && this.drag_to <= this.cols.len) {
@@ -2244,7 +2305,52 @@ export class DataTable extends Widget {
         let b = this.bounds;
         if (b.right() <= d.x || d.right() <= b.x ||
             b.bottom() <= d.y || d.bottom() <= b.y) { return; }
+        this.paint_d = d;
+        this.paint_partial = true;
         this.draw(s, th);
+        this.paint_partial = false;
+    }
+
+    // The table draws no hover or press look of its own (only the hovered
+    // row, tracked in hit()), so crossing or clicking it must not start a
+    // spring: that repaints the whole grid every frame until it settles.
+    override fn shows_hover(): bool { return false; }
+    override fn shows_press(): bool { return false; }
+
+    // The strip of body a data row occupies on screen, clipped to the body;
+    // zero height when it is scrolled out of view. Used to repaint only the rows a
+    // hover change touches.
+    fn row_strip(vrow: int): Rect {
+        let none = Rect(0.0, 0.0, 0.0, 0.0);
+        if (vrow < 0) { return none; }
+        let by = this.body_top();
+        let bh = this.body_h();
+        let y = 0.0;
+        let h = this.row_h;
+        if (this.ensure_visual()) {
+            let found = -1;
+            for (let iv in 0..this.vr_kind.len) {
+                if (this.vr_kind[iv] == VROW.DATA && this.vr_row[iv] == vrow) { found = iv; break; }
+            }
+            if (found < 0) { return none; }
+            y = by + this.vr_y[found] - this.scroll_off_y;
+            h = this.vr_h[found];
+        } else {
+            y = by + (vrow as float) * this.row_h - this.scroll_off_y;
+        }
+        let top = y;
+        let bot = y + h + 1.0;   // the row rule sits on the bottom edge
+        if (top < by) { top = by; }
+        if (bot > by + bh) { bot = by + bh; }
+        if (bot <= top) { return none; }
+        return Rect(this.bounds.x, top, this.bounds.w, bot - top);
+    }
+
+    fn mark_row(vrow: int) {
+        let w = this.win;
+        if (w == null) { return; }
+        let r = this.row_strip(vrow);
+        if (r.h > 0.0) { w.mark_dirty(r); }
     }
 
     // ---- events -----------------------------------------------------------
@@ -2525,7 +2631,9 @@ export class DataTable extends Widget {
         if (v >= vlen) { v = vlen - 1; }
         this.selected = v;
         this.sel_src = this.df.srcRow(v);
-        this.sel_set = [this.sel_src];   // keyboard nav is a single selection
+        // keyboard nav is a single selection, except that ticked checkboxes
+        // stay ticked: they are only changed by ticking
+        if (!this.checkboxes) { this.sel_set = [this.sel_src]; }
         this.ensure_visible(v);
         this.notify_cell();
         if (this.onSelect != null) { this.onSelect(v); }
@@ -2563,14 +2671,22 @@ export class DataTable extends Widget {
             let hr = this.row_at(py);
             // don't leave a row highlighted while the cursor is over a scrollbar
             if (this.scrollbar_hit(px, py)) { hr = -1; }
-            if (hr != this.hover_row) { this.hover_row = hr; this.invalidate(); }
+            if (hr != this.hover_row) {
+                this.mark_row(this.hover_row);
+                this.hover_row = hr;
+                this.mark_row(hr);
+            }
             return this;
         }
         return null;
     }
 
+    // Leaving the table clears the hovered row: repaint that row only.
     override fn on_hover_leave(): bool {
-        if (this.hover_row != -1) { this.hover_row = -1; return true; }
+        if (this.hover_row != -1) {
+            this.mark_row(this.hover_row);
+            this.hover_row = -1;
+        }
         return false;
     }
 
@@ -2583,9 +2699,16 @@ export class DataTable extends Widget {
         this.onHeaderContext = null;
         this.onCellContext = null;
         this.detailText = null;
-        for (let i in 0..this.cols.len) { this.cols[i].format = null; this.cols[i].cellBg = null; }
+        for (let i in 0..this.cols.len) {
+            this.cols[i].format = null;
+            this.cols[i].cellBg = null;
+            this.cols[i].cellPaint = null;
+        }
     }
 }
+
+// Does the vertical span [y0, y1) reach into r?
+fn span_hits(r: Rect, y0: float, y1: float): bool { return y1 > r.y && y0 < r.bottom(); }
 
 // Build a DataTable bound to `df` with auto-generated columns.
 export fn dataTable(df: DataFrame): DataTable { return new DataTable(df); }

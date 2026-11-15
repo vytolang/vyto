@@ -1,0 +1,62 @@
+// DataTable checkboxes and edits, the bugs fixed in 2026-11:
+//   * unticking a box did nothing (the cursor row counted as ticked)
+//   * a plain row click, or an arrow key, wiped every tick
+//   * editing a bool cell never reached the frame
+// plus checkedRows() and setCellPainter(); and the hover cost fixes: moving
+// between rows repaints two row strips, not the grid; the table runs no hover
+// or press spring; Window.set_instant_hover lifts a Button at once. The table is the window's root, so
+// the geometry is fixed: body starts at 34 (search) + 30 (header) = 64, rows
+// are 26 high, the checkbox gutter is 28 wide.
+import { Window, Button } from "vyto/ui";
+import { DataTable } from "vyto/ui/datatable";
+import { DataFrame, CK_I64, CK_STR, CK_BOOL } from "vyto/data/frame";
+import { Painter } from "vyto/surface/painter";
+import { Rect } from "vyto/surface";
+
+fn ints(xs: int[]): string {
+    let out = "";
+    for (let i in 0..xs.len) {
+        if (i > 0) { out = out + ","; }
+        out = out + str(xs[i]);
+    }
+    return out;
+}
+
+fn main() {
+    let df = new DataFrame(8);
+    let id = df.addColumn("id", CK_I64);
+    let name = df.addColumn("name", CK_STR);
+    let flag = df.addColumn("flag", CK_BOOL);
+    for (let i in 0..5) {
+        df.beginRow().setInt(id, i).setStr(name, "row" + str(i)).setBool(flag, false).endRow();
+    }
+
+    let win = new Window("DT", 500, 300);
+    let dt = new DataTable(df);
+    dt.showCheckboxes(true);
+    dt.setEditable(true);
+    let painted: int[] = [0];
+    dt.setCellPainter(1, (s, r, d, vrow, c) => { painted[0] = painted[0] + 1; });
+    win.root = dt;
+    win.run();
+
+    print("checked=" + ints(dt.checkedRows()));
+    print("row1 ticked=" + str(dt.is_checked(1)) + " row3 ticked=" + str(dt.is_checked(3)));
+    print("cursor=" + str(dt.selected));
+    print("flag4=" + str(df.cellInt(4, flag)));
+    print("painter called=" + str(painted[0] > 0));
+
+    // hover: moving from row 0 to row 1 dirties those two strips only
+    dt.hit(200, 77);
+    win.has_dirty = false;
+    dt.hit(200, 103);
+    print("hover dirty y=" + str(win.dirty.y as int) + " h=" + str(win.dirty.h as int) +
+          " (table h=" + str(dt.bounds.h as int) + ")");
+    print("table springs: hover=" + str(dt.shows_hover()) + " press=" + str(dt.shows_press()));
+
+    let b = new Button("Lift");
+    b.win = win;
+    win.set_instant_hover(true);
+    b.on_hover_enter();
+    print("instant lift=" + str(b.lift) + " tween=" + str(b.lift_tw != null));
+}
