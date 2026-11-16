@@ -1,0 +1,136 @@
+// vyto/desktop/print — the printers installed in the OS, and raw printing
+// through their queues.
+//
+//     import { printers, printer_state, print_raw, job_state, cancel_job,
+//              print_error, PS_READY, JOB_DONE } from "vyto/desktop/print";
+//
+//     for (let p in printers()) { print(p.name + "  " + state_text(p.state)); }
+//     if (printer_state("XP-80") == PS_READY) {
+//         let job = print_raw("XP-80", escpos_bytes, "Receipt T1-000042");
+//         if (job <= 0) { print(print_error()); }
+//     }
+//
+// Raw printing hands the bytes to the queue untouched: it is the connection
+// for a device that speaks its own language (ESC/POS receipt printers, ZPL
+// label printers). Nothing is drawn or rendered. Windows uses winspool;
+// Linux and macOS use CUPS's lpstat, lp and cancel, run from an argument
+// list (never a shell) and given 5 seconds to answer.
+//
+// A queue accepts a job even when the printer is off, and prints it when the
+// printer comes back. That is the queue doing its job, so this package only
+// reports states faithfully; what a job that has not printed means is the
+// app's decision (a till must cancel it rather than let a cash-drawer kick
+// fire later, unattended). See README.md.
+//
+// A sibling of vyto/desktop, not part of it, so an app that never prints
+// does not link winspool.
+
+extern "C" {
+    fn vprint_available(): i32;
+    fn vprint_printers(): rawptr;
+    fn vprint_count(h: rawptr): i32;
+    fn vprint_name(h: rawptr, i: i32): cstring;
+    fn vprint_port(h: rawptr, i: i32): cstring;
+    fn vprint_is_default(h: rawptr, i: i32): i32;
+    fn vprint_pstate(h: rawptr, i: i32): i32;
+    fn vprint_free(h: rawptr);
+    fn vprint_error(): cstring;
+    fn vprint_state(name: cstring): i32;
+    fn vprint_raw(name: cstring, data: rawptr, len: i64, title: cstring): i32;
+    fn vprint_job(name: cstring, job: i32): i32;
+    fn vprint_cancel(name: cstring, job: i32): i32;
+}
+
+#link "winspool" if "windows"
+
+// A printer's state.
+export const PS_READY: int = 0;
+export const PS_BUSY: int = 1;        // printing or warming up: it will take the job
+export const PS_OFFLINE: int = 2;
+export const PS_ERROR: int = 3;       // jammed, door open, not accepting jobs...
+export const PS_PAPER_OUT: int = 4;
+export const PS_PAUSED: int = 5;      // Windows paused; CUPS disabled
+export const PS_UNKNOWN: int = 6;
+export const PS_MISSING: int = 7;     // no printer by that name
+export const PS_UNAVAILABLE: int = 8; // no printing system here
+
+// A job's state.
+export const JOB_QUEUED: int = 0;
+export const JOB_PRINTING: int = 1;
+export const JOB_DONE: int = 2;       // printed, or no longer in the queue
+export const JOB_ERROR: int = 3;
+export const JOB_UNKNOWN: int = 4;
+
+export class PrinterInfo {
+    name: string;
+    port: string;        // Windows: the port (USB001, COM3, an IP); CUPS: the device URI
+    is_default: bool;
+    state: int;
+    fn init(name: string, port: string, is_default: bool, state: int) {
+        this.name = name;
+        this.port = port;
+        this.is_default = is_default;
+        this.state = state;
+    }
+}
+
+// True where this platform has a printing system to ask.
+export fn print_available(): bool { return vprint_available() != 0; }
+
+// Every printer the OS knows (Windows: local and connected; CUPS: every
+// queue), in the order the OS lists them. Empty when there are none or no
+// printing system answers; print_error() then says why, when there is a why.
+export fn printers(): PrinterInfo[] {
+    let out: PrinterInfo[] = [];
+    let h = vprint_printers();
+    if (h == null) { return out; }
+    let n = vprint_count(h) as int;
+    for (let k in 0..n) {
+        let i = k as i32;
+        out.push(new PrinterInfo(str(vprint_name(h, i)), str(vprint_port(h, i)),
+                                 vprint_is_default(h, i) != 0, vprint_pstate(h, i) as int));
+    }
+    vprint_free(h);
+    return out;
+}
+
+// One printer's state now (PS_*).
+export fn printer_state(name: string): int { return vprint_state(name.cstr()) as int; }
+
+// Queue `data` on printer `name`, untouched (RAW). The job id (> 0), or 0 or
+// less when it was not queued, with print_error() saying why. Queued is not
+// printed: follow it with job_state().
+export fn print_raw(name: string, data: byte[], title: string): int {
+    return vprint_raw(name.cstr(), data as rawptr, data.len as i64, title.cstr()) as int;
+}
+
+// A queued job's state (JOB_*). A job that is no longer in the queue is
+// JOB_DONE.
+export fn job_state(name: string, job: int): int { return vprint_job(name.cstr(), job as i32) as int; }
+
+// Take a job out of the queue. True when the OS accepted the cancel.
+export fn cancel_job(name: string, job: int): bool { return vprint_cancel(name.cstr(), job as i32) != 0; }
+
+// Why the last call failed, or "".
+export fn print_error(): string { return str(vprint_error()); }
+
+// A state in a few words, for a status line.
+export fn state_text(state: int): string {
+    if (state == PS_READY) { return "ready"; }
+    if (state == PS_BUSY) { return "busy"; }
+    if (state == PS_OFFLINE) { return "offline"; }
+    if (state == PS_ERROR) { return "error"; }
+    if (state == PS_PAPER_OUT) { return "out of paper"; }
+    if (state == PS_PAUSED) { return "paused"; }
+    if (state == PS_MISSING) { return "not found"; }
+    if (state == PS_UNAVAILABLE) { return "no printing system"; }
+    return "unknown";
+}
+
+export fn job_text(state: int): string {
+    if (state == JOB_QUEUED) { return "waiting in the queue"; }
+    if (state == JOB_PRINTING) { return "printing"; }
+    if (state == JOB_DONE) { return "printed"; }
+    if (state == JOB_ERROR) { return "error"; }
+    return "unknown";
+}

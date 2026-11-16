@@ -1,0 +1,45 @@
+// vyto/desktop/print against a real CUPS queue (tests/run_tests_print.sh):
+//   print_real print <queue> <file>   ready, queue the file raw, follow it
+//                                     until it leaves the queue
+//   print_real held <queue> <file>    the queue is paused: the job is
+//                                     accepted and stays queued (the trap),
+//                                     then is cancelled and is gone
+import { readfile } from "vyto/io/file";
+import { sleepMs } from "vyto/util/time";
+import { printers, printer_state, print_raw, job_state, cancel_job, print_error, state_text, job_text,
+         JOB_DONE, JOB_QUEUED } from "vyto/desktop/print";
+
+fn data_of(path: string): byte[] {
+    let text = readfile(path);
+    let b = bytes(text.len);
+    for (let i in 0..text.len) { b[i] = text[i] as byte; }
+    return b;
+}
+
+fn main() {
+    let a = args();
+    let mode = a[0];
+    let q = a[1];
+    let found = false;
+    for (let p in printers()) { if (p.name == q) { found = true; } }
+    print(`listed: {found}`);
+    print("state: " + state_text(printer_state(q)));
+    let job = print_raw(q, data_of(a[2]), "vyto print test");
+    if (job <= 0) { print("not queued: " + print_error()); return; }
+    print("queued: true");
+    if (mode == "print") {
+        let st = job_state(q, job);
+        for (let i in 0..100) {
+            if (st == JOB_DONE) { break; }
+            sleepMs(100);
+            st = job_state(q, job);
+        }
+        print("job: " + job_text(st));
+        return;
+    }
+    sleepMs(1500);
+    print("held: " + job_text(job_state(q, job)));
+    print(`cancelled: {cancel_job(q, job)}`);
+    sleepMs(300);
+    print("after cancel: " + job_text(job_state(q, job)));
+}

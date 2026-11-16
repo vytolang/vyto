@@ -1,0 +1,108 @@
+// vyto/desktop/print's CUPS arm against fake lpstat/lp/cancel
+// (tests/fixtures/print/fake_cups.sh, found through VYTO_PRINT_BIN_DIR).
+// Prints what the package made of each canned answer; tests/run_tests.sh
+// then appends the fakes' argv log and diffs both against
+// print_cli.expected. The hostile names and titles are the injection check:
+// they must arrive as one argument each, and `pwned` must never exist.
+import { getenv } from "vyto/os";
+import { file_open, file_remove, file_exists, readfile } from "vyto/io/file";
+import { monoMs } from "vyto/util/time";
+import { printers, printer_state, print_raw, job_state, cancel_job, print_error, state_text, job_text,
+         PrinterInfo } from "vyto/desktop/print";
+
+fn put(dir: string, name: string, text: string) {
+    let fh = file_open(dir + "/" + name, "wb");
+    fh.writeText(text);
+    fh.close();
+}
+
+fn drop(dir: string, name: string) {
+    if (file_exists(dir + "/" + name)) { file_remove(dir + "/" + name); }
+}
+
+fn show(ps: PrinterInfo[]) {
+    print(`printers: {ps.len}`);
+    for (let p in ps) {
+        print(`  {p.name} default={p.is_default} state=` + state_text(p.state) + " port=" + p.port);
+    }
+}
+
+fn main() {
+    let d = getenv("FAKE_DIR");
+    let nl = "\n";
+
+    // ---- no queues at all: lpstat says so and exits 1
+    put(d, "lpstat_-p.out", "lpstat: No destinations added." + nl);
+    put(d, "lpstat_-p.rc", "1");
+    show(printers());
+    drop(d, "lpstat_-p.rc");
+
+    // ---- two queues, one the default, one disabled
+    put(d, "lpstat_-p.out", "printer XP80 is idle.  enabled since Mon Nov 16 20:33:57 2026" + nl +
+        "printer Office disabled since Mon Nov 16 20:34:00 2026 -" + nl + "\tPaused" + nl);
+    put(d, "lpstat_-d.out", "system default destination: Office" + nl);
+    put(d, "lpstat_-v.out", "device for XP80: usb://Xprinter/XP-80?serial=123" + nl +
+        "device for Office: ipp://192.168.1.20/ipp/print" + nl);
+    show(printers());
+
+    // ---- one printer's state, from lpstat -l -p, then -a
+    put(d, "lpstat_-l.out", "printer XP80 is idle.  enabled since Mon" + nl + "\tAlerts: none" + nl);
+    put(d, "lpstat_-a.out", "XP80 accepting requests since Mon" + nl);
+    print("ready: " + state_text(printer_state("XP80")));
+    put(d, "lpstat_-l.out", "printer XP80 now printing XP80-7.  enabled since Mon" + nl + "\tAlerts: none" + nl);
+    print("busy: " + state_text(printer_state("XP80")));
+    put(d, "lpstat_-l.out", "printer XP80 disabled since Mon -" + nl + "\tPaused" + nl + "\tAlerts: paused" + nl);
+    print("paused: " + state_text(printer_state("XP80")));
+    put(d, "lpstat_-l.out", "printer XP80 is idle.  enabled since Mon" + nl + "\tAlerts: media-empty-error" + nl);
+    print("paper: " + state_text(printer_state("XP80")));
+    put(d, "lpstat_-l.out", "printer XP80 is idle.  enabled since Mon" + nl + "\tAlerts: offline-report" + nl);
+    print("offline: " + state_text(printer_state("XP80")));
+    put(d, "lpstat_-l.out", "printer XP80 is idle.  enabled since Mon" + nl + "\tAlerts: none" + nl);
+    put(d, "lpstat_-a.out", "XP80 not accepting requests since Mon -" + nl + "\tRejecting Jobs" + nl);
+    print("rejecting: " + state_text(printer_state("XP80")));
+    put(d, "lpstat_-l.out", "lpstat: Invalid destination name in list \"Gone\"." + nl);
+    put(d, "lpstat_-l.rc", "1");
+    let gone = printer_state("Gone");
+    print("missing: " + state_text(gone) + " | " + print_error());
+    drop(d, "lpstat_-l.rc");
+    // operands evaluate right to left: call first, then read the error
+    let bad = printer_state("-dEvil");
+    print("bad name: " + state_text(bad) + " | " + print_error());
+
+    // ---- printing: the bytes go through a file, untouched
+    put(d, "lp_-dXP80.out", "request id is XP80-12 (1 file(s))" + nl);
+    let data: byte[] = [0x1b, 0x40, 0x41, 0x0a, 0x00, 0xff, 0x1d, 0x56, 0x42, 0x00];
+    let job = print_raw("XP80", data, "Receipt T1-000001");
+    print(`job: {job}`);
+    let got = readfile(d + "/printed.bin");
+    print(`bytes through: {got.len} {got[0]} {got[4]} {got[5]} {got[9]}`);
+    // a title that tries to run a command, and one that looks like an option
+    put(d, "lp_-dXP80.out", "request id is XP80-13 (1 file(s))" + nl);
+    print(`hostile title job: {print_raw("XP80", data, "x; touch pwned")}`);
+    print(`option title job: {print_raw("XP80", data, "-o evil")}`);
+    let badjob = print_raw("-dEvil", data, "t");
+    print(`bad name job: {badjob} | ` + print_error());
+    put(d, "lp_-dXP80.out", "lp: Destination \"XP80\" is not accepting jobs." + nl);
+    put(d, "lp_-dXP80.rc", "1");
+    let refused = print_raw("XP80", data, "t");
+    print(`refused: {refused} | ` + print_error());
+    drop(d, "lp_-dXP80.rc");
+
+    // ---- a job: queued, printing, then gone (done)
+    put(d, "lpstat_-W.out", "XP80-120   eric  1024   Mon" + nl + "XP80-12     eric  1024   Mon" + nl);
+    put(d, "lpstat_-p.out", "printer XP80 is idle.  enabled since Mon" + nl);
+    print("queued: " + job_text(job_state("XP80", 12)));
+    put(d, "lpstat_-p.out", "printer XP80 now printing XP80-12.  enabled since Mon" + nl);
+    print("printing: " + job_text(job_state("XP80", 12)));
+    put(d, "lpstat_-W.out", "XP80-120   eric  1024   Mon" + nl);
+    print("done: " + job_text(job_state("XP80", 12)));
+    print(`cancel: {cancel_job("XP80", 12)}`);
+
+    // ---- a print system that hangs: given up after 5 s
+    put(d, "lpstat_-l.sleep", "8");
+    let t0 = monoMs();
+    let st = printer_state("XP80");
+    let took = (monoMs() - t0) as int;
+    print("hung: " + state_text(st) + " | " + print_error() + ` | within 4-7 s: {took >= 4000 && took < 7000}`);
+    drop(d, "lpstat_-l.sleep");
+}

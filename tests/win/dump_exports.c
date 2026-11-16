@@ -33,6 +33,8 @@ static const char *k_default[] = {
     "imm32.dll",    "shcore.dll",
     /* vyto/hw: device listing (SetupAPI, CfgMgr), HID, WinUSB */
     "setupapi.dll", "cfgmgr32.dll", "hid.dll", "winusb.dll",
+    /* vyto/desktop/print: the OS print queues */
+    "winspool.drv",
 };
 
 typedef LONG(WINAPI *RtlGetVersionFn)(OSVERSIONINFOW *);

@@ -1,0 +1,36 @@
+// vyto/desktop/print on a Windows box: list the printers, then (with a name
+// and a file) print the file RAW and follow the job until it leaves the
+// queue, or cancel it after 10 seconds. Built by run_tests_win.sh; run by
+// hand next to a receipt printer:
+//
+//     print_demo.exe                       list printers and their states
+//     print_demo.exe "XP-80" receipt.bin   print a file raw, watch, cancel
+import { readfile } from "vyto/io/file";
+import { sleepMs } from "vyto/util/time";
+import { printers, printer_state, print_raw, job_state, cancel_job, print_error, state_text, job_text,
+         JOB_DONE } from "vyto/desktop/print";
+
+fn main() {
+    let a = args();
+    for (let p in printers()) {
+        let d = "";
+        if (p.is_default) { d = " (default)"; }
+        print(p.name + d + "  port " + p.port + "  " + state_text(p.state));
+    }
+    if (a.len < 2) { return; }
+    let name = a[0];
+    print("state: " + state_text(printer_state(name)));
+    let text = readfile(a[1]);
+    let data = bytes(text.len);
+    for (let i in 0..text.len) { data[i] = text[i] as byte; }
+    let job = print_raw(name, data, "print_demo");
+    if (job <= 0) { print("not queued: " + print_error()); return; }
+    print(`queued as job {job}`);
+    for (let i in 0..100) {
+        let st = job_state(name, job);
+        if (st == JOB_DONE) { print("printed"); return; }
+        if (i % 10 == 0) { print("  " + job_text(st)); }
+        sleepMs(100);
+    }
+    print(`not printed in 10 s: cancelled {cancel_job(name, job)}`);
+}

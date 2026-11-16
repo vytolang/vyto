@@ -22,7 +22,7 @@ vytobind: src/vytobind.c src/util.c src/util.h
 vytopack: vytoc $(wildcard src/vytopack/*.vt)
 	./vytoc build src/vytopack/vytopack.vt -o $@ --modpath src --release
 
-.PHONY: all test test-charts test-mobile test-win test-wine test-desktop test-pack test-dev clean clean-cache
+.PHONY: all test test-charts test-mobile test-win test-wine test-desktop test-print test-pack test-dev clean clean-cache
 
 test: vytoc vytobind
 	./tests/run_tests.sh
@@ -68,6 +68,11 @@ test-wine: test-win
 # dialog). Needs Xvfb, xdotool and a dialog program; SKIPs without them.
 test-desktop: vytoc
 	./tests/run_tests_desktop.sh
+
+# vyto/desktop/print against the real CUPS: a temporary raw queue (needs
+# lpadmin, socat), and the winspool arm under Wine. SKIPs what is missing.
+test-print: vytoc
+	sh tests/run_tests_print.sh
 
 # Every .vyto-cache in the tree, including apps/* which `clean` does not cover
 # and the shared object cache at the repo root (also a .vyto-cache, so the same

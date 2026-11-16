@@ -630,6 +630,43 @@ else
     echo "FAIL desktop_dirs (got: $got | $got2)"
     fail=1
 fi
+# --- vyto/desktop/print: CUPS's lpstat/lp/cancel as fakes ---
+# fake_cups.sh logs each argv element and replays canned answers, so the
+# exact command lines and the parsing of every answer are checked against a
+# golden. The hostile title is the shell-injection check (one argument, and
+# no `pwned`); the temp file the bytes travel in must be gone afterwards;
+# the hung lpstat must be given up on.
+pc=tests/tmp/print_cli; rm -rf "$pc"; mkdir -p "$pc/bin" "$pc/tmp"
+for p in lp lpstat cancel; do cp tests/fixtures/print/fake_cups.sh "$pc/bin/$p"; done
+got=$(cd "$pc" && FAKE_DIR=$(pwd) VYTO_PRINT_BIN_DIR=$(pwd)/bin TMPDIR=$(pwd)/tmp \
+      ../../../vytoc run ../../../tests/fixtures/print_cli.vt 2>&1
+      echo "--- argv log ---"
+      sed 's|/vyto-print-[A-Za-z0-9]*|/vyto-print-XXXXXX|; s|'"$(pwd)"'|<dir>|' log)
+if [ "$got" = "$(cat tests/fixtures/print_cli.expected)" ] && [ ! -e "$pc/pwned" ] &&
+   [ -z "$(ls "$pc/tmp")" ]; then
+    echo "PASS print_cli"
+else
+    echo "FAIL print_cli"
+    echo "$got" | diff tests/fixtures/print_cli.expected - | head -20
+    ls "$pc/tmp"
+    fail=1
+fi
+# Freestanding, as for vyto/desktop below
+if ./vytoc build tests/fixtures/print_freestanding.vt --freestanding --cc gcc \
+        -o examples/.vyto-cache/libprint_fs.a >/dev/null 2>&1; then
+    pobj=$(nm -A examples/.vyto-cache/libprint_fs.a 2>/dev/null \
+        | awk '/ T vprint_available$/ { split($1, a, ":"); print a[2]; exit }')
+    pund=$(nm -A examples/.vyto-cache/libprint_fs.a 2>/dev/null | grep -c ":$pobj: *U ")
+    if [ -n "$pobj" ] && [ "$pund" -eq 0 ]; then
+        echo "PASS freestanding_print_stub"
+    else
+        echo "FAIL freestanding_print_stub (shim object '$pobj' has $pund undefined symbols)"
+        fail=1
+    fi
+else
+    echo "FAIL freestanding_print_stub (vyto/desktop/print's stub arm does not build freestanding)"
+    fail=1
+fi
 # Freestanding: the stub arm must build with no libc, and its object must
 # reference nothing external (nm, not the exit status — see d2d above).
 if ./vytoc build tests/fixtures/desktop_freestanding.vt --freestanding --cc gcc \

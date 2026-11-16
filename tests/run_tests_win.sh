@@ -268,7 +268,7 @@ for t in srv cli gui_probe; do
         echo "FAIL build channel/$t"; cat "$STAGE/.ch_$t.err"; fail=1
     fi
 done
-for t in desktop_demo menu_demo https_local service_demo dpi_demo input_watch; do
+for t in desktop_demo menu_demo https_local service_demo dpi_demo input_watch print_demo; do
     if ./vytoc build "tests/win/$t.vt" --target "$TRIPLE" --cc "$CC_CMD" \
             -o "$STAGE/$t.exe" >/dev/null 2>"$STAGE/.$t.err"; then
         echo "BUILT $t"
