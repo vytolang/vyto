@@ -155,6 +155,13 @@ void vs_set_min_size(void *s, int w, int h);
    before the first present. */
 void vs_set_decorated(void *s, int on);
 
+/* A display-only window (a customer screen, signage): clicks never make it the
+   active window, so the keyboard stays with the window the user works in. It
+   was activated when it opened, so turning this on hands the focus back to
+   whatever had it then. Win32: WS_EX_NOACTIVATE + MA_NOACTIVATE; X11: WM_HINTS
+   input = False. fbdev, headless and Android ignore it. */
+void vs_set_no_activate(void *s, int on);
+
 /* Where the window's top-left corner sits on screen, and how to move it.
    Meaningful for a chromeless window doing its own dragging; also how a future
    multi-monitor placement API positions a window. */

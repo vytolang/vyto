@@ -280,6 +280,21 @@ else if (e == EV_EXPOSE || e == EV_RESIZE) { draw(s); }
 **Closing.** There is no [x]. A fullscreen chromeless window with no exit path
 means killing the process — on a kiosk, a reboot. Give it a key or a hit region.
 
+**Display-only windows.** A customer screen or signage beside a window people
+type into must never take the keyboard — on a till, a barcode scanner *types*,
+so one touch on the customer's screen would send the next scan into the wrong
+window:
+
+```js
+show.set_no_activate(true);
+```
+
+A click then leaves the active window as it was (Win32 `WS_EX_NOACTIVATE` and
+`MA_NOACTIVATE`; X11 `WM_HINTS` input = False). A new window is activated when
+it opens, so turning this on hands the focus back to whatever had it then.
+Such a window gets no keys — give it no exit key; close it from the window
+that has the keyboard.
+
 ## 6. Previewing one window inside another
 
 For a control room or a video wall — thumbnails of each display inside the
@@ -401,6 +416,7 @@ Monitor geometry is in the same coordinate space `move_to` uses.
 
 ```js
 s.set_decorated(on: bool)
+s.set_no_activate(on: bool)         // display-only: clicks never take the keyboard
 s.drag_start(edge: EDGE, x: int, y: int): bool
 
 enum EDGE {

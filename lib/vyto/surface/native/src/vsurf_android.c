@@ -483,6 +483,12 @@ void vs_set_decorated(void *s, int on) {
      * has no frame to drop. A no-op by nature, not an unimplemented arm. */
 }
 
+void vs_set_no_activate(void *s, int on) {
+    (void)s; (void)on;
+    /* One surface, owned by the Activity: there is no other window to keep
+     * the keyboard. A no-op by nature. */
+}
+
 void vs_get_position(void *s, int *x, int *y) {
     (void)s;
     /* The surface is always at the origin of its own window. */

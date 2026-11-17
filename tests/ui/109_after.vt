@@ -1,0 +1,49 @@
+// Window.after / cancel_after: one-shot timers fired between events, in due
+// order, re-armable from their own callback, cancellable; and
+// set_no_activate taken headless without faulting. Headless time is the
+// synthetic clock (+16 ms per scripted event), so the order is exact.
+import { Window, Column, Button } from "vyto/ui";
+import { Surface } from "vyto/surface";
+
+// Re-arms itself twice from its own callback: closures capture by value, so
+// the count lives in an object.
+class Repeat {
+    win: weak Window;
+    log: string[];
+    n: int;
+    fn init(win: Window, log: string[]) { this.win = win; this.log = log; this.n = 0; }
+    fn arm() {
+        let self = this;
+        if (this.win == null) { return; }
+        this.win.after(30, () => { self.fire(); });
+    }
+    fn fire() {
+        this.n += 1;
+        this.log.push(`D{this.n}`);
+        if (this.n < 3) { this.arm(); }
+    }
+}
+
+fn main() {
+    let win = new Window("After", 200, 120);
+    win.root = new Column([new Button("x")]);
+    let log: string[] = [];
+    win.after(40, () => { log.push("A"); });
+    win.after(20, () => { log.push("B"); });
+    let c = win.after(100, () => { log.push("C (cancelled: must not fire)"); });
+    win.cancel_after(c);
+    win.cancel_after(9999);             // unknown: ignored
+    print("pending before run: " + win.timers_pending());
+    let rep = new Repeat(win, log);
+    rep.arm();
+    win.run();
+    for (let s in log) { print(s); }
+    print("pending after run: " + win.timers_pending());
+
+    // a display-only second window: headless has no focus to give, so the
+    // call must simply be taken
+    let k = new Surface("Kiosk", 100, 80);
+    k.set_no_activate(true);
+    k.set_no_activate(false);
+    print("set_no_activate taken");
+}

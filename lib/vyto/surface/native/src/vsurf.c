@@ -458,6 +458,8 @@ typedef struct VSurf {
     VsInput in;   /* this window's input state; see VsInput above */
     QEv evq[64];  /* this window's pending events */
     int evq_head, evq_len;
+    int no_activate; /* vs_set_no_activate: clicks never make it the active window */
+    HWND prev_fg;    /* the foreground window just before this one was shown */
 } VSurf;
 
 /* WndProc -> vs_wait event queue. One ring PER SURFACE: a shared ring let
@@ -624,6 +626,11 @@ static void make_backbuffer(VSurf *s) {
 static LRESULT CALLBACK vs_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     VSurf *s = (VSurf *)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
     switch (msg) {
+    case WM_MOUSEACTIVATE:
+        /* a click on a display-only window (a customer screen) must not take
+           the keyboard from the window the cashier types and scans into */
+        if (s && s->no_activate) return MA_NOACTIVATE;
+        break;
     case WM_PAINT: {
         PAINTSTRUCT ps;
         HDC dc = BeginPaint(hwnd, &ps);
@@ -896,6 +903,7 @@ void *vs_open(const char *title, int w, int h) {
     }
     s->font = GetStockObject(ANSI_FIXED_FONT);
     make_backbuffer(s);
+    s->prev_fg = GetForegroundWindow();   /* for vs_set_no_activate */
     ShowWindow(s->hwnd, SW_SHOW);
     UpdateWindow(s->hwnd);
     return s;
@@ -1064,6 +1072,24 @@ void vs_set_decorated(void *vs, int on) {
     SetWindowLongPtr(s->hwnd, GWL_STYLE, style);
     SetWindowPos(s->hwnd, NULL, 0, 0, 0, 0,
                  SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
+}
+
+/* WS_EX_NOACTIVATE keeps a click from activating the window and keeps it off
+   Alt+Tab; WM_MOUSEACTIVATE answering MA_NOACTIVATE (vs_wndproc) covers the
+   click itself. The window was activated when vs_open showed it, so turning
+   this on hands the foreground back to whatever had it then. */
+void vs_set_no_activate(void *vs, int on) {
+    VSurf *s = vs;
+    if (!s || !s->hwnd) return;
+    s->no_activate = on ? 1 : 0;
+    LONG_PTR ex = GetWindowLongPtr(s->hwnd, GWL_EXSTYLE);
+    if (on) ex |= WS_EX_NOACTIVATE; else ex &= ~(LONG_PTR)WS_EX_NOACTIVATE;
+    SetWindowLongPtr(s->hwnd, GWL_EXSTYLE, ex);
+    SetWindowPos(s->hwnd, NULL, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+    if (on && GetForegroundWindow() == s->hwnd && s->prev_fg && IsWindow(s->prev_fg)) {
+        SetForegroundWindow(s->prev_fg);
+    }
 }
 
 void vs_get_position(void *vs, int *x, int *y) {
@@ -1811,6 +1837,7 @@ typedef struct VSurf {
     int fb_expose;     /* deliver one EV_EXPOSE on the first wait */
 
     VsInput in;   /* this window's input state; see VsInput above */
+    Window prev_focus; /* the input focus just before this window was mapped */
 } VSurf;
 
 static XFontStruct *font;       /* one bitmap UI font, shared, never freed */
@@ -2611,6 +2638,10 @@ void *vs_open(const char *title, int w, int h) {
                           XNClientWindow, s->win, XNFocusWindow, s->win, NULL);
         if (!s->ic) { XCloseIM(s->im); s->im = NULL; }
     }
+    {
+        int revert = 0;
+        XGetInputFocus(dpy, &s->prev_focus, &revert);   /* for vs_set_no_activate */
+    }
     XMapWindow(dpy, s->win);
     return s;
 }
@@ -2759,6 +2790,30 @@ void vs_set_decorated(void *vs, int on) {
     hints[2] = on ? 1 : 0;
     XChangeProperty(s->dpy, s->win, a, a, 32, PropModeReplace,
                     (unsigned char *)hints, 5);
+    XFlush(s->dpy);
+}
+
+/* WM_HINTS input = False: the window manager never gives this window the
+   keyboard (ICCCM's "No Input" model), so a customer screen cannot take it
+   from the till. If the WM already focused it on map, the focus goes back to
+   what had it before. fbdev and headless have no focus to give. */
+void vs_set_no_activate(void *vs, int on) {
+    VSurf *s = vs;
+    if (!s || !s->dpy) return;
+    XWMHints *h = XAllocWMHints();
+    if (!h) return;
+    h->flags = InputHint;
+    h->input = on ? False : True;
+    XSetWMHints(s->dpy, s->win, h);
+    XFree(h);
+    if (on) {
+        Window f = 0;
+        int revert = 0;
+        XGetInputFocus(s->dpy, &f, &revert);
+        if (f == s->win && s->prev_focus != None && s->prev_focus != PointerRoot && s->prev_focus != s->win) {
+            XSetInputFocus(s->dpy, s->prev_focus, RevertToParent, CurrentTime);
+        }
+    }
     XFlush(s->dpy);
 }
 

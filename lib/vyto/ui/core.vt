@@ -647,55 +647,68 @@ export enum BTN { FILLED, TONAL, GHOST }
 //
 // A blinking text caret, shared by every widget that draws one.
 //
-// It is a TIMER, not an animation. `Widget.ticker` is passive — it never
-// repaints on its own account — and its callback runs once per frame, so the
-// interval is enforced here against the clock and `invalidate()` is called only
-// on the frame the caret actually flips. A looping `animate()` would repaint
-// the widget 60 times a second to toggle one 1px bar, which is enough to pin a
-// core on a window that is doing nothing but holding a cursor.
+// It is a TIMER, not an animation: Window.after, re-armed at each flip, so a
+// window holding a cursor wakes twice a second and sleeps in between. It used
+// to be a passive `Widget.ticker`, which repainted only on a flip but still
+// kept the loop turning at 60 Hz — measured on SpeccalPOS's idle till (its
+// search box always has the caret): ~58 wakeups/s and ~14 % of a core with
+// GfxPainter, for one blinking 1px bar (2026-11-17).
 //
-// The widget reference is `weak`: the widget owns the CaretBlink, the blink's
-// ticker closure captures the widget, and a strong link there is a cycle that
-// nothing collects (CLAUDE.md's rule for any back-reference).
+// The widget and window references are `weak`: the widget owns the
+// CaretBlink, and the timer's closure captures it; a strong link back is a
+// cycle that nothing collects (CLAUDE.md's rule for any back-reference).
 //
 // 530ms is the interval every desktop toolkit landed on.
 export const CARET_BLINK_MS: int = 530;
 
 export class CaretBlink {
     on: bool;
-    last: int;          // monoMs at the last flip
-    tw: Tween;
+    last: int;          // monoMs at the last flip, or at start/wake
+    timer: int;         // the pending Window.after id; 0 when not blinking
     w: weak Widget;
+    win: weak Window;
 
     fn init() {
         this.on = true;
         this.last = 0;
-        this.tw = null;
+        this.timer = 0;
     }
 
     // Begin blinking for `w`. Idempotent, and always starts the caret SOLID:
     // a caret that appears mid-blink reads as a glitch rather than a cursor.
+    // A widget not on a window yet keeps a solid caret.
     fn start(w: Widget) {
         this.on = true;
         this.last = monoMs() as int;
-        if (this.tw != null) { return; }
+        if (this.timer != 0) { return; }
         this.w = w;
-        let self = this;
-        this.tw = w.ticker(CARET_BLINK_MS, () => { self.tick(); });
+        this.win = w.win;
+        this.arm();
     }
 
-    fn tick() {
-        let now = monoMs() as int;
-        if (now - this.last < CARET_BLINK_MS) { return; }
-        this.last = now;
-        this.on = !this.on;
+    fn arm() {
+        let win = this.win;
+        if (win == null) { this.timer = 0; return; }
+        let self = this;
+        this.timer = win.after(CARET_BLINK_MS, () => { self.flip(); });
+    }
+
+    fn flip() {
+        this.timer = 0;
         let w = this.w;
-        if (w != null) { w.invalidate(); }
+        if (w == null) { return; }
+        this.on = !this.on;
+        this.last = monoMs() as int;
+        w.invalidate();
+        this.arm();
     }
 
     fn stop() {
-        if (this.tw != null) { this.tw.cancel(); this.tw = null; }
+        let win = this.win;
+        if (win != null && this.timer != 0) { win.cancel_after(this.timer); }
+        this.timer = 0;
         this.w = null;
+        this.win = null;
         this.on = true;
     }
 
@@ -704,13 +717,18 @@ export class CaretBlink {
     fn wake() {
         this.on = true;
         this.last = monoMs() as int;
+        let win = this.win;
+        if (win != null && this.timer != 0) {
+            win.cancel_after(this.timer);
+            this.arm();
+        }
         let w = this.w;
         if (w != null) { w.invalidate(); }
     }
 
-    // Draw the caret? True when not blinking at all (no ticker running) so a
+    // Draw the caret? True when not blinking at all (no timer pending) so a
     // widget that never called start() is unaffected.
-    fn visible(): bool { return this.tw == null || this.on; }
+    fn visible(): bool { return this.timer == 0 || this.on; }
 }
 
 export class ButtonChrome {
@@ -2399,6 +2417,9 @@ export const DRAG_SLOP: int = 4;
 // against the ~60 this replaces, and no poll source has ever promised better
 // than "once per turn of the loop".
 const POLL_IDLE_MS: int = 250;
+// The ceiling when every poll source drains its fd (add_poll_fd `drains`):
+// a sanity wake once a minute, not four times a second.
+const POLL_DRAIN_IDLE_MS: int = 60000;
 
 export class Window {
     surf: Surface;
@@ -2478,6 +2499,17 @@ export class Window {
     // gains no dependency on vyto/net — the toolkit must not import the
     // networking tree, and a descriptor is just a number.
     poll_fds: int[];
+    // Per source: its callback empties everything its fd signalled (see
+    // add_poll_fd's `drains`), so the fd going quiet really means nothing is
+    // waiting and the loop needs no periodic wake for it.
+    poll_drains: bool[];
+    // One-shot timers (after / cancel_after): id, due time on the surface's
+    // clock (now_ms), and the callback. While any is pending the idle wait
+    // times out at the earliest instead of blocking forever; with none it is
+    // the plain wait() it always was, so an idle app still never wakes.
+    timer_ids: int[];
+    timer_due: int[];
+    timer_cbs: fn()[];
     mods: int;           // MOD_* bitmask at the event being dispatched — widgets
                          // read it via Widget.mods() in on_key/on_click/on_drag
     scale: float;        // UI scale factor (1.0 = 96dpi); themes are scaled by
@@ -2494,7 +2526,11 @@ export class Window {
         this.poll_cbs = [];
         this.poll_ids = [];
         this.poll_fds = [];
+        this.poll_drains = [];
         this.poll_next_id = 1;
+        this.timer_ids = [];
+        this.timer_due = [];
+        this.timer_cbs = [];
         this.toasts = [];
         this.focusables = [];
         this.focus_i = -1;
@@ -2587,12 +2623,21 @@ export class Window {
     // sockets and degrades to 16ms per call for anything else), so this is
     // always correct and sometimes cheaper. Pass -1 to say "no descriptor",
     // which is what add_poll_source does.
-    fn add_poll_fd(fd: int, body: fn()): int {
+    //
+    // `drains`: the callback empties everything the fd signalled — every
+    // message, every queued event — so a quiet fd means nothing is waiting.
+    // When every registered source says so, the loop sleeps on them without
+    // its POLL_IDLE_MS safety wake (which exists for sources that read one
+    // message per call and can leave the rest buffered in user space). A
+    // second window's event connection, drained with poll() until EV_NONE,
+    // is the case it is for.
+    fn add_poll_fd(fd: int, body: fn(), drains: bool = false): int {
         let id = this.poll_next_id;
         this.poll_next_id += 1;
         this.poll_cbs.push(body);
         this.poll_ids.push(id);
         this.poll_fds.push(fd);
+        this.poll_drains.push(drains && fd >= 0);
         return id;
     }
 
@@ -2611,7 +2656,8 @@ export class Window {
             if (this.poll_ids[i] == id) {
                 this.poll_ids.remove_at(i);
                 this.poll_cbs.remove_at(i);
-                this.poll_fds.remove_at(i);   // three arrays, one index
+                this.poll_fds.remove_at(i);   // four arrays, one index
+                this.poll_drains.remove_at(i);
                 return;
             }
             i += 1;
@@ -2619,6 +2665,85 @@ export class Window {
     }
 
     fn poll_sources(): int { return this.poll_ids.len; }
+
+    // Run `cb` once, `ms` from now, on the UI thread, between events — a
+    // slideshow's next picture, a message that clears itself. Returns an id
+    // for cancel_after. Re-arm from inside the callback for a repeating
+    // timer. Like a poll source, the callback repaints what it changes
+    // (invalidate() or redraw()); nothing is redrawn for it.
+    //
+    // Costs nothing while none is pending: the idle loop blocks in wait().
+    // While one is, the loop sleeps until it is due — one wake per timer, not
+    // a 60 Hz tick (that is what an animation is for).
+    fn after(ms: int, cb: fn()): int {
+        let id = this.poll_next_id;      // shares the id space with poll sources
+        this.poll_next_id += 1;
+        let d = ms;
+        if (d < 0) { d = 0; }
+        this.timer_ids.push(id);
+        this.timer_due.push(this.surf.now_ms() + d);
+        this.timer_cbs.push(cb);
+        return id;
+    }
+
+    // Drop a timer that has not fired; an unknown or fired id is ignored.
+    fn cancel_after(id: int) {
+        let i = 0;
+        while (i < this.timer_ids.len) {
+            if (this.timer_ids[i] == id) {
+                this.timer_ids.remove_at(i);
+                this.timer_due.remove_at(i);
+                this.timer_cbs.remove_at(i);
+                return;
+            }
+            i += 1;
+        }
+    }
+
+    fn timers_pending(): int { return this.timer_ids.len; }
+
+    // Milliseconds until the earliest timer is due (0 when one already is),
+    // or -1 with none pending.
+    fn timer_wait_ms(): int {
+        if (this.timer_ids.len == 0) { return -1; }
+        let now = this.surf.now_ms();
+        let best = -1;
+        for (let d in this.timer_due) {
+            let rem = d - now;
+            if (rem < 0) { rem = 0; }
+            if (best < 0 || rem < best) { best = rem; }
+        }
+        return best;
+    }
+
+    // Fire every timer that is due, earliest first. The due ones are taken
+    // out before any callback runs, so a callback may arm or cancel freely —
+    // one that re-arms itself waits for its new time, never fires twice now.
+    fn fire_timers() {
+        if (this.timer_ids.len == 0) { return; }
+        let now = this.surf.now_ms();
+        let due_at: int[] = [];
+        let due_cb: fn()[] = [];
+        let i = 0;
+        while (i < this.timer_ids.len) {
+            if (this.timer_due[i] <= now) {
+                // keep the batch ordered by due time
+                let k = 0;
+                while (k < due_at.len && due_at[k] <= this.timer_due[i]) { k += 1; }
+                due_at.insert(k, this.timer_due[i]);
+                due_cb.insert(k, this.timer_cbs[i]);
+                this.timer_ids.remove_at(i);
+                this.timer_due.remove_at(i);
+                this.timer_cbs.remove_at(i);
+            } else {
+                i += 1;
+            }
+        }
+        for (let cb in due_cb) { cb(); }
+        // a callback that invalidate()d something gets its frame here, once,
+        // as a passive ticker's does in tick(): it has no dispatch to end
+        if (due_cb.len > 0 && this.has_dirty) { this.repaint(); }
+    }
 
     // Run every source once. Callbacks may remove sources (a query that just
     // finished removes its own), so this iterates over a snapshot rather than
@@ -3557,6 +3682,8 @@ export class Window {
                 }
             }
             let ev = 0;
+            // ms until the next one-shot timer, -1 with none (see after())
+            let tw = this.timer_wait_ms();
             if (this.animations.len > 0) {
                 ev = this.surf.wait_timeout(16);
                 let now = this.surf.now_ms();
@@ -3566,6 +3693,7 @@ export class Window {
                 if (dt > 0) { this.tick(dt); }
             } else if (pressing) {
                 let rem = LONG_PRESS_MS - (this.surf.now_ms() - this.press_ms);
+                if (tw >= 0 && tw < rem) { rem = tw; }
                 if (rem < 1) { rem = 1; }
                 ev = this.surf.wait_timeout(rem);
                 last_ms = this.surf.now_ms();
@@ -3587,16 +3715,30 @@ export class Window {
                     // polled, so the ceiling stays at 16ms whenever one exists;
                     // with every source waitable the loop may sleep properly.
                     let ceil = POLL_IDLE_MS;
+                    // every source drains its fd: nothing can be left waiting
+                    // unseen, so sleep long (select needs a finite timeout)
+                    let all_drain = true;
+                    for (let dr in this.poll_drains) { if (!dr) { all_drain = false; } }
+                    if (all_drain) { ceil = POLL_DRAIN_IDLE_MS; }
                     if (wfds.len < this.poll_ids.len) { ceil = 16; }
+                    if (tw >= 0 && tw < ceil) { ceil = tw; }
+                    if (ceil < 1) { ceil = 1; }
                     ev = this.surf.waitTimeoutFds(ceil, wfds);
                 } else {
                     ev = this.surf.wait_timeout(16);
                 }
                 last_ms = this.surf.now_ms();
+            } else if (tw >= 0) {
+                // idle but for a timer: sleep exactly until it is due
+                let t = tw;
+                if (t < 1) { t = 1; }
+                ev = this.surf.wait_timeout(t);
+                last_ms = this.surf.now_ms();
             } else {
                 ev = this.surf.wait();
                 last_ms = this.surf.now_ms(); // idle wait: don't bank the gap
             }
+            this.fire_timers();
             // Before dispatch, so a source that finishes work can update state
             // the event about to be handled will read.
             this.pump_poll_sources();
@@ -3686,6 +3828,10 @@ export class Window {
         // one's on_tick closure strong-captures its widget + itself.
         for (let t in this.animations) { t.cancel(); }
         this.animations = [];
+        // a pending timer's callback captures whatever it updates
+        this.timer_ids = [];
+        this.timer_due = [];
+        this.timer_cbs = [];
         if (this.root != null) { this.root.release_all(); }
         if (this.menubar != null) { this.menubar.release_all(); }
         if (this.overlay != null) { this.overlay.release_all(); }

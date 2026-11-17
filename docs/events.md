@@ -265,6 +265,13 @@ it:
 | `win.add_poll_fd(fd, body)` | the work **is** a descriptor: a socket, a pipe, a worker's channel (`WorkerPool.workerFds()`). The loop sleeps on it, so an idle app stays asleep |
 | `win.add_poll_source(body)` | work that is not a descriptor: a flag another thread sets, a file's mtime. The loop wakes about every 16 ms while it is registered |
 | `win.remove_poll_source(id)` | both return an id; remove the source when the work is done |
+| `win.after(ms, body)` | run `body` once, `ms` from now: a slideshow's next picture, a message that clears itself. Returns an id; re-arm from `body` to repeat |
+| `win.cancel_after(id)` | drop a timer that has not fired |
+
+A pending `after` costs one wake when it is due, nothing before: the idle loop
+sleeps exactly until the earliest timer instead of blocking in `wait()`, and
+goes back to `wait()` once none is pending. Like a poll source, `body` repaints
+what it changes itself.
 
 `body` runs once per pass of the loop while the source is registered. It does
 **not** repaint: call `redraw()` or `invalidate()` when something visible
@@ -528,7 +535,8 @@ measures your own timer.
 menu should open on the press, as it does today.
 
 **`add_poll_source` is not a timer.** Left registered, it wakes the loop every
-16 ms forever. For a descriptor use `add_poll_fd`; for animation, a `Tween`.
+16 ms forever. For a descriptor use `add_poll_fd`; for something later, `after`;
+for animation, a `Tween`.
 
 **On Android, a custom text widget without `wants_text()` never sees a key.**
 It takes focus and draws a caret, and the keyboard never comes up.
