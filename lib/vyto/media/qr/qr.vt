@@ -1,0 +1,548 @@
+// vyto/media/qr — QR Code (ISO/IEC 18004) encoder, pure Vyto.
+//
+//     let q = qrEncode("https://example.com", QR_ECC_M);
+//     if (q == null) { ... }               // longer than version 40 holds
+//     for (let y in 0..q.size) {
+//         for (let x in 0..q.size) { if (q.get(x, y)) { /* dark */ } }
+//     }
+//
+// What it does: byte mode (any UTF-8 or binary payload), the four error
+// correction levels, versions 1-40 picked automatically (the smallest that
+// fits), and all eight masks scored by the standard's penalty rules. That is
+// the whole of what a receipt, a label or a payment link needs. Numeric,
+// alphanumeric and kanji segments are NOT implemented: they only make a code a
+// version or two smaller, and every reader accepts byte mode.
+//
+// What it gives you is the module grid, nothing else. Drawing it is the
+// caller's business — a Painter fills rects, a thermal printer wants a 1-bit
+// raster, a PDF wants a path — so this package imports nothing and stays
+// freestanding-safe. `q.modules` is ONE flat bool[] of size*size, row-major,
+// true = dark; no quiet zone is included (readers want 4 modules of light
+// border around it; leave it when you draw).
+//
+// The algorithm follows Project Nayuki's reference encoder (MIT), which is the
+// usual yardstick for "does this match the standard", restricted to byte mode.
+//
+// Testing note: tests/unit/qr_encode.vt checks the parts that have published
+// known answers (Reed-Solomon codewords, format and version bit strings) and
+// reads every generated symbol back through an independent placement walk.
+// Conformance of the finished symbol is judged by a real reader (zbarimg, or a
+// phone); see that file.
+
+export const QR_ECC_L: int = 0;   // ~7% of codewords recoverable
+export const QR_ECC_M: int = 1;   // ~15%
+export const QR_ECC_Q: int = 2;   // ~25%
+export const QR_ECC_H: int = 3;   // ~30%
+
+export class QrCode {
+    version: int;       // 1..40
+    size: int;          // version * 4 + 17 modules per side
+    ecc: int;           // QR_ECC_*
+    mask: int;          // 0..7, the one the penalty score chose
+    modules: bool[];    // size * size, row-major, true = dark
+    is_fn: bool[];      // true where the module is a function pattern (finder,
+                        // timing, alignment, format, version), not data
+
+    fn init(version: int, ecc: int) {
+        this.version = version;
+        this.size = version * 4 + 17;
+        this.ecc = ecc;
+        this.mask = 0;
+        let n = this.size * this.size;
+        this.modules = [];
+        this.modules.reserve(n);
+        this.is_fn = [];
+        this.is_fn.reserve(n);
+        for (let i in 0..n) {
+            this.modules.push(false);
+            this.is_fn.push(false);
+        }
+    }
+
+    // Out of range reads light, so a caller drawing a quiet zone can sample
+    // past the edge without a bounds check.
+    fn get(x: int, y: int): bool {
+        if (x < 0 || y < 0 || x >= this.size || y >= this.size) { return false; }
+        return this.modules[y * this.size + x];
+    }
+
+    fn set_fn(x: int, y: int, dark: bool) {
+        let i = y * this.size + x;
+        this.modules[i] = dark;
+        this.is_fn[i] = true;
+    }
+}
+
+// ---- public entry points ----------------------------------------------------
+
+// Encode a string's bytes. Null when the payload is longer than a version 40
+// symbol at this error correction level holds (2953 bytes at L, 1273 at H).
+export fn qrEncode(text: string, ecc: int = 1): QrCode {
+    let b = bytes(text.len);
+    for (let i in 0..text.len) { b[i] = text[i] as byte; }
+    return qrEncodeBytes(b, ecc);
+}
+
+export fn qrEncodeBytes(data: byte[], ecc: int = 1): QrCode {
+    if (ecc < QR_ECC_L || ecc > QR_ECC_H) { return null; }
+    // Smallest version whose data capacity holds mode + count + payload.
+    let ver = 0;
+    for (let v in 1..41) {
+        let need = 4 + count_bits(v) + data.len * 8;
+        if (need <= data_codewords(v, ecc) * 8) { ver = v; break; }
+    }
+    if (ver == 0) { return null; }
+
+    let cw = data_with_padding(data, ver, ecc);
+    let all = add_ecc_and_interleave(cw, ver, ecc);
+
+    let q = new QrCode(ver, ecc);
+    draw_function_patterns(q);
+    draw_codewords(q, all);
+
+    // Try every mask; keep the lowest penalty. apply_mask is an involution
+    // (XOR), so applying it twice undoes it.
+    let best = 0;
+    let best_score = -1;
+    for (let m in 0..8) {
+        apply_mask(q, m);
+        draw_format_bits(q, m);
+        let s = penalty(q);
+        if (best_score < 0 || s < best_score) { best = m; best_score = s; }
+        apply_mask(q, m);
+    }
+    apply_mask(q, best);
+    draw_format_bits(q, best);
+    q.mask = best;
+    return q;
+}
+
+// ---- exposed for tests: the parts with published known answers -------------
+
+// The 15-bit format word for an error correction level and mask, after the
+// BCH(15,5) code and the 0x5412 XOR. ISO 18004 Table C.1.
+export fn qrFormatBits(ecc: int, mask: int): int {
+    let data = (ecc_format_bits(ecc) << 3) | mask;
+    let rem = data;
+    for (let i in 0..10) { rem = (rem << 1) ^ ((rem >> 9) * 0x537); }
+    return ((data << 10) | (rem & 0x3FF)) ^ 0x5412;
+}
+
+// The 18-bit version word (versions 7+), BCH(18,6). ISO 18004 Table D.1.
+export fn qrVersionBits(ver: int): int {
+    let rem = ver;
+    for (let i in 0..12) { rem = (rem << 1) ^ ((rem >> 11) * 0x1F25); }
+    return (ver << 12) | (rem & 0xFFF);
+}
+
+// The `degree` Reed-Solomon error correction codewords of `data`, over
+// GF(2^8) with the QR polynomial 0x11D.
+export fn qrReedSolomon(data: int[], degree: int): int[] {
+    let div = rs_divisor(degree);
+    let res: int[] = [];
+    for (let i in 0..degree) { res.push(0); }
+    for (let k in 0..data.len) {
+        let factor = data[k] ^ res[0];
+        for (let i in 0..degree - 1) { res[i] = res[i + 1]; }
+        res[degree - 1] = 0;
+        for (let i in 0..degree) { res[i] = res[i] ^ gf_mul(div[i], factor); }
+    }
+    return res;
+}
+
+// Data codewords (before error correction) a version/level holds.
+export fn qrDataCodewords(ver: int, ecc: int): int { return data_codewords(ver, ecc); }
+
+// ---- the tables -------------------------------------------------------------
+//
+// A const array is not a constant expression in Vyto, so each table is a fn.
+// Index [ecc * 41 + version]; column 0 is unused.
+
+fn ecc_per_block(ecc: int, ver: int): int {
+    let t: int[] = [
+        -1,  7, 10, 15, 20, 26, 18, 20, 24, 30, 18, 20, 24, 26, 30, 22, 24, 28, 30, 28, 28, 28, 28, 30, 30, 26, 28, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30,
+        -1, 10, 16, 26, 18, 24, 16, 18, 22, 22, 26, 30, 22, 22, 24, 24, 28, 28, 26, 26, 26, 26, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28,
+        -1, 13, 22, 18, 26, 18, 24, 18, 22, 20, 24, 28, 26, 24, 20, 30, 24, 28, 28, 26, 30, 28, 30, 30, 30, 30, 28, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30,
+        -1, 17, 28, 22, 16, 22, 28, 26, 26, 24, 28, 24, 28, 22, 24, 24, 30, 28, 28, 26, 28, 30, 24, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30];
+    return t[ecc * 41 + ver];
+}
+
+fn ecc_blocks(ecc: int, ver: int): int {
+    let t: int[] = [
+        -1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 4,  4,  4,  4,  4,  6,  6,  6,  6,  7,  8,  8,  9,  9, 10, 12, 12, 12, 13, 14, 15, 16, 17, 18, 19, 19, 20, 21, 22, 24, 25,
+        -1, 1, 1, 1, 2, 2, 4, 4, 4, 5, 5,  5,  8,  9,  9, 10, 10, 11, 13, 14, 16, 17, 17, 18, 20, 21, 23, 25, 26, 28, 29, 31, 33, 35, 37, 38, 40, 43, 45, 47, 49,
+        -1, 1, 1, 2, 2, 4, 4, 6, 6, 8, 8,  8, 10, 12, 16, 12, 17, 16, 18, 21, 20, 23, 23, 25, 27, 29, 34, 34, 35, 38, 40, 43, 45, 48, 51, 53, 56, 59, 62, 65, 68,
+        -1, 1, 1, 2, 4, 4, 4, 5, 6, 8, 8, 11, 11, 16, 16, 18, 16, 19, 21, 25, 25, 25, 34, 30, 32, 35, 37, 40, 42, 45, 48, 51, 54, 57, 60, 63, 66, 70, 74, 77, 81];
+    return t[ecc * 41 + ver];
+}
+
+// Format-word encoding of the level: L=01, M=00, Q=11, H=10.
+fn ecc_format_bits(ecc: int): int {
+    if (ecc == QR_ECC_L) { return 1; }
+    if (ecc == QR_ECC_M) { return 0; }
+    if (ecc == QR_ECC_Q) { return 3; }
+    return 2;
+}
+
+// Byte-mode character count field width.
+fn count_bits(ver: int): int {
+    if (ver <= 9) { return 8; }
+    return 16;
+}
+
+// Modules available for data + error correction, after every function
+// pattern is taken out.
+fn raw_data_modules(ver: int): int {
+    let r = (16 * ver + 128) * ver + 64;
+    if (ver >= 2) {
+        let na = ver / 7 + 2;
+        r -= (25 * na - 10) * na - 55;
+        if (ver >= 7) { r -= 36; }
+    }
+    return r;
+}
+
+fn data_codewords(ver: int, ecc: int): int {
+    return raw_data_modules(ver) / 8 - ecc_per_block(ecc, ver) * ecc_blocks(ecc, ver);
+}
+
+fn align_positions(ver: int): int[] {
+    let out: int[] = [];
+    if (ver == 1) { return out; }
+    let na = ver / 7 + 2;
+    let step = (ver * 8 + na * 3 + 5) / (na * 4 - 4) * 2;
+    for (let i in 0..na) { out.push(0); }
+    out[0] = 6;
+    let pos = ver * 4 + 17 - 7;
+    let i = na - 1;
+    while (i >= 1) {
+        out[i] = pos;
+        pos -= step;
+        i -= 1;
+    }
+    return out;
+}
+
+// ---- data codewords ---------------------------------------------------------
+
+fn data_with_padding(data: byte[], ver: int, ecc: int): int[] {
+    let cap_bits = data_codewords(ver, ecc) * 8;
+    // Bits as 0/1 ints in one array; at most 23648 for version 40.
+    let bits: int[] = [];
+    bits.reserve(cap_bits);
+    push_bits(bits, 4, 4);                       // byte mode 0100
+    push_bits(bits, data.len, count_bits(ver));
+    for (let i in 0..data.len) { push_bits(bits, data[i] as int, 8); }
+    // Terminator (up to 4 zeros), then zero-fill to a byte boundary.
+    let term = cap_bits - bits.len;
+    if (term > 4) { term = 4; }
+    push_bits(bits, 0, term);
+    while (bits.len % 8 != 0) { bits.push(0); }
+    let out: int[] = [];
+    out.reserve(cap_bits / 8);
+    let i = 0;
+    while (i < bits.len) {
+        let v = 0;
+        for (let j in 0..8) { v = (v << 1) | bits[i + j]; }
+        out.push(v);
+        i += 8;
+    }
+    // Alternating pad bytes fill the rest.
+    let pad = 0xEC;
+    while (out.len < cap_bits / 8) {
+        out.push(pad);
+        if (pad == 0xEC) { pad = 0x11; } else { pad = 0xEC; }
+    }
+    return out;
+}
+
+fn push_bits(bits: int[], val: int, n: int) {
+    let i = n - 1;
+    while (i >= 0) {
+        bits.push((val >> i) & 1);
+        i -= 1;
+    }
+}
+
+// Split into blocks, append each block's error correction, interleave.
+// Blocks live in one flat array of stride (short_len + 1): the short blocks
+// carry a placeholder at the position where a long block has its last data
+// byte, and the interleave skips it.
+fn add_ecc_and_interleave(data: int[], ver: int, ecc: int): int[] {
+    let nb = ecc_blocks(ecc, ver);
+    let eb = ecc_per_block(ecc, ver);
+    let raw = raw_data_modules(ver) / 8;
+    let n_short = nb - raw % nb;
+    let short_len = raw / nb;
+    let stride = short_len + 1;
+
+    let blocks: int[] = [];
+    blocks.reserve(nb * stride);
+    let k = 0;
+    for (let i in 0..nb) {
+        let dlen = short_len - eb;
+        if (i >= n_short) { dlen += 1; }
+        let dat: int[] = [];
+        for (let j in 0..dlen) { dat.push(data[k + j]); }
+        k += dlen;
+        let ec = qrReedSolomon(dat, eb);
+        for (let j in 0..dat.len) { blocks.push(dat[j]); }
+        if (i < n_short) { blocks.push(0); }
+        for (let j in 0..ec.len) { blocks.push(ec[j]); }
+    }
+
+    let out: int[] = [];
+    out.reserve(raw);
+    for (let i in 0..stride) {
+        for (let j in 0..nb) {
+            if (i != short_len - eb || j >= n_short) {
+                out.push(blocks[j * stride + i]);
+            }
+        }
+    }
+    return out;
+}
+
+// ---- Reed-Solomon over GF(2^8) ----------------------------------------------
+
+fn gf_mul(x: int, y: int): int {
+    let z = 0;
+    let i = 7;
+    while (i >= 0) {
+        z = (z << 1) ^ ((z >> 7) * 0x11D);
+        z = z ^ (((y >> i) & 1) * x);
+        i -= 1;
+    }
+    return z;
+}
+
+fn rs_divisor(degree: int): int[] {
+    let res: int[] = [];
+    for (let i in 0..degree - 1) { res.push(0); }
+    res.push(1);
+    let root = 1;
+    for (let i in 0..degree) {
+        for (let j in 0..degree) {
+            res[j] = gf_mul(res[j], root);
+            if (j + 1 < degree) { res[j] = res[j] ^ res[j + 1]; }
+        }
+        root = gf_mul(root, 0x02);
+    }
+    return res;
+}
+
+// ---- drawing the symbol -----------------------------------------------------
+
+fn draw_function_patterns(q: QrCode) {
+    let n = q.size;
+    for (let i in 0..n) {
+        q.set_fn(6, i, i % 2 == 0);
+        q.set_fn(i, 6, i % 2 == 0);
+    }
+    draw_finder(q, 3, 3);
+    draw_finder(q, n - 4, 3);
+    draw_finder(q, 3, n - 4);
+
+    let al = align_positions(q.version);
+    let na = al.len;
+    for (let i in 0..na) {
+        for (let j in 0..na) {
+            let corner = (i == 0 && j == 0) || (i == 0 && j == na - 1) || (i == na - 1 && j == 0);
+            if (!corner) { draw_align(q, al[i], al[j]); }
+        }
+    }
+    draw_format_bits(q, 0);     // reserve the area; the real word comes later
+    draw_version(q);
+}
+
+fn draw_finder(q: QrCode, x: int, y: int) {
+    for (let dy in -4..5) {
+        for (let dx in -4..5) {
+            let d = dx.abs().max(dy.abs());
+            let xx = x + dx;
+            let yy = y + dy;
+            if (xx >= 0 && xx < q.size && yy >= 0 && yy < q.size) {
+                q.set_fn(xx, yy, d != 2 && d != 4);
+            }
+        }
+    }
+}
+
+fn draw_align(q: QrCode, x: int, y: int) {
+    for (let dy in -2..3) {
+        for (let dx in -2..3) {
+            q.set_fn(x + dx, y + dy, dx.abs().max(dy.abs()) != 1);
+        }
+    }
+}
+
+fn bit(v: int, i: int): bool { return ((v >> i) & 1) != 0; }
+
+fn draw_format_bits(q: QrCode, mask: int) {
+    let b = qrFormatBits(q.ecc, mask);
+    let n = q.size;
+    // Copy 1, around the top-left finder.
+    for (let i in 0..6) { q.set_fn(8, i, bit(b, i)); }
+    q.set_fn(8, 7, bit(b, 6));
+    q.set_fn(8, 8, bit(b, 7));
+    q.set_fn(7, 8, bit(b, 8));
+    for (let i in 9..15) { q.set_fn(14 - i, 8, bit(b, i)); }
+    // Copy 2, split between the other two finders.
+    for (let i in 0..8) { q.set_fn(n - 1 - i, 8, bit(b, i)); }
+    for (let i in 8..15) { q.set_fn(8, n - 15 + i, bit(b, i)); }
+    q.set_fn(8, n - 8, true);   // the always-dark module
+}
+
+fn draw_version(q: QrCode) {
+    if (q.version < 7) { return; }
+    let b = qrVersionBits(q.version);
+    for (let i in 0..18) {
+        let d = bit(b, i);
+        let a = q.size - 11 + i % 3;
+        let c = i / 3;
+        q.set_fn(a, c, d);
+        q.set_fn(c, a, d);
+    }
+}
+
+// The zigzag: two-module columns from the right edge, alternating up and
+// down, skipping the vertical timing column.
+fn draw_codewords(q: QrCode, data: int[]) {
+    let n = q.size;
+    let i = 0;
+    let total = data.len * 8;
+    let right = n - 1;
+    while (right >= 1) {
+        if (right == 6) { right = 5; }
+        let upward = ((right + 1) & 2) == 0;
+        for (let vert in 0..n) {
+            for (let j in 0..2) {
+                let x = right - j;
+                let y = vert;
+                if (upward) { y = n - 1 - vert; }
+                let k = y * n + x;
+                if (!q.is_fn[k] && i < total) {
+                    q.modules[k] = bit(data[i >> 3], 7 - (i & 7));
+                    i += 1;
+                }
+            }
+        }
+        right -= 2;
+    }
+}
+
+fn mask_bit(mask: int, x: int, y: int): bool {
+    if (mask == 0) { return (x + y) % 2 == 0; }
+    if (mask == 1) { return y % 2 == 0; }
+    if (mask == 2) { return x % 3 == 0; }
+    if (mask == 3) { return (x + y) % 3 == 0; }
+    if (mask == 4) { return (x / 3 + y / 2) % 2 == 0; }
+    if (mask == 5) { return x * y % 2 + x * y % 3 == 0; }
+    if (mask == 6) { return (x * y % 2 + x * y % 3) % 2 == 0; }
+    return ((x + y) % 2 + x * y % 3) % 2 == 0;
+}
+
+fn apply_mask(q: QrCode, mask: int) {
+    let n = q.size;
+    for (let y in 0..n) {
+        for (let x in 0..n) {
+            let k = y * n + x;
+            if (!q.is_fn[k] && mask_bit(mask, x, y)) {
+                q.modules[k] = !q.modules[k];
+            }
+        }
+    }
+}
+
+// ---- mask penalty (ISO 18004 §7.8.3) ----------------------------------------
+
+const P_N1: int = 3;
+const P_N2: int = 3;
+const P_N3: int = 40;
+const P_N4: int = 10;
+
+fn penalty(q: QrCode): int {
+    let n = q.size;
+    let res = 0;
+    let hist: int[] = [0, 0, 0, 0, 0, 0, 0];
+
+    // Runs and finder-like patterns, rows then columns.
+    for (let dir in 0..2) {
+        for (let a in 0..n) {
+            let color = false;
+            let run = 0;
+            for (let h in 0..7) { hist[h] = 0; }
+            for (let b in 0..n) {
+                let m = false;
+                if (dir == 0) { m = q.modules[a * n + b]; } else { m = q.modules[b * n + a]; }
+                if (m == color) {
+                    run += 1;
+                    if (run == 5) { res += P_N1; } else if (run > 5) { res += 1; }
+                } else {
+                    hist_add(hist, run, n);
+                    if (!color) { res += hist_count(hist) * P_N3; }
+                    color = m;
+                    run = 1;
+                }
+            }
+            // Terminate: a light border follows the edge.
+            if (color) {
+                hist_add(hist, run, n);
+                run = 0;
+            }
+            run += n;
+            hist_add(hist, run, n);
+            res += hist_count(hist) * P_N3;
+        }
+    }
+
+    // 2x2 blocks of one colour.
+    for (let y in 0..n - 1) {
+        for (let x in 0..n - 1) {
+            let c = q.modules[y * n + x];
+            if (c == q.modules[y * n + x + 1] && c == q.modules[(y + 1) * n + x] && c == q.modules[(y + 1) * n + x + 1]) {
+                res += P_N2;
+            }
+        }
+    }
+
+    // Dark/light balance.
+    let dark = 0;
+    for (let i in 0..n * n) { if (q.modules[i]) { dark += 1; } }
+    let total = n * n;
+    let k = ((dark * 20 - total * 10).abs() + total - 1) / total - 1;
+    res += k * P_N4;
+    return res;
+}
+
+// The run-length history is the last 7 runs, newest first. The first run of
+// a line is lengthened by the (light) quiet zone.
+fn hist_add(hist: int[], run: int, n: int) {
+    let r = run;
+    if (hist[0] == 0) { r += n; }
+    let i = 6;
+    while (i > 0) {
+        hist[i] = hist[i - 1];
+        i -= 1;
+    }
+    hist[0] = r;
+}
+
+// 1:1:3:1:1 dark-light pattern with 4 light on either side.
+fn hist_count(hist: int[]): int {
+    let n = hist[1];
+    let core = n > 0 && hist[2] == n && hist[3] == n * 3 && hist[4] == n && hist[5] == n;
+    let c = 0;
+    if (core && hist[0] >= n * 4 && hist[6] >= n) { c += 1; }
+    if (core && hist[6] >= n * 4 && hist[0] >= n) { c += 1; }
+    return c;
+}
+
+// Block structure for a version/level: [blocks, ecc codewords per block].
+// Exposed so a test can de-interleave a symbol independently.
+export fn qrBlocks(ver: int, ecc: int): int[] {
+    return [ecc_blocks(ecc, ver), ecc_per_block(ecc, ver)];
+}
+
+// Total codewords (data + error correction) a version holds.
+export fn qrRawCodewords(ver: int): int { return raw_data_modules(ver) / 8; }

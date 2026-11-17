@@ -1,0 +1,260 @@
+// tests/unit/qr_encode.vt — vyto/media/qr.
+//
+// Two kinds of check, and why both:
+//
+//  1. KNOWN ANSWERS for the pieces that have published values: the
+//     Reed-Solomon codewords of the "HELLO WORLD" 1-M example (Thonky's QR
+//     tutorial, which reproduces ISO 18004 Annex I), and format and version
+//     bit strings from the standard's Tables C.1 / D.1, plus data capacities
+//     from Table 7. These pin the arithmetic to the standard, not to itself.
+//
+//  2. A READ-BACK through an independent walk of the finished symbol:
+//     read the format word off the grid, unmask with a mask formula written
+//     here, walk the zigzag, de-interleave the blocks, check each block's
+//     error correction, and parse the payload back out. This proves the
+//     encoder's placement, masking, padding and interleave agree with one
+//     another and with the format word it wrote.
+//
+// What neither proves is that a REAL READER accepts the symbol. That check is
+// external: tests/fixtures/qr_scan.vt writes PNGs, judged by `zbarimg` when it
+// is installed (`sudo apt install zbar-tools`), or by a phone camera.
+import { suite } from "vyto/dev/test";
+import { chr } from "vyto/util/text";
+import { exitWith } from "vyto/dev/test/exit";
+import { qrEncode, qrEncodeBytes, qrReedSolomon, qrFormatBits, qrVersionBits,
+         qrDataCodewords, qrBlocks, qrRawCodewords, QrCode,
+         QR_ECC_L, QR_ECC_M, QR_ECC_Q, QR_ECC_H } from "vyto/media/qr";
+
+fn bin(s: string): int {
+    let v = 0;
+    for (let i in 0..s.len) {
+        v = v * 2;
+        if (s[i] == 49) { v += 1; }
+    }
+    return v;
+}
+
+fn repeat(c: string, n: int): string {
+    let out = "";
+    for (let i in 0..n) { out = out + c; }
+    return out;
+}
+
+fn mask_at(mask: int, x: int, y: int): bool {
+    // Table 10 of ISO 18004, written out again rather than imported.
+    let i = y;
+    let j = x;
+    if (mask == 0) { return (i + j) % 2 == 0; }
+    if (mask == 1) { return i % 2 == 0; }
+    if (mask == 2) { return j % 3 == 0; }
+    if (mask == 3) { return (i + j) % 3 == 0; }
+    if (mask == 4) { return ((i / 2) + (j / 3)) % 2 == 0; }
+    if (mask == 5) { return (i * j) % 2 + (i * j) % 3 == 0; }
+    if (mask == 6) { return ((i * j) % 2 + (i * j) % 3) % 2 == 0; }
+    return ((i + j) % 2 + (i * j) % 3) % 2 == 0;
+}
+
+// Read the symbol back. Returns the payload, or a string starting "!" naming
+// the first thing that disagreed.
+fn read_back(q: QrCode): string {
+    let n = q.size;
+    // Format word, copy 1 (bits 0-5 down column 8, then 7,8 / 8,8 / 8,7, then
+    // row 8 leftwards). Compare against every (level, mask).
+    let fw = 0;
+    let pos_x: int[] = [8, 8, 8, 8, 8, 8, 8, 8, 7, 5, 4, 3, 2, 1, 0];
+    let pos_y: int[] = [0, 1, 2, 3, 4, 5, 7, 8, 8, 8, 8, 8, 8, 8, 8];
+    for (let b in 0..15) {
+        if (q.get(pos_x[b], pos_y[b])) { fw = fw | (1 << b); }
+    }
+    let mask = -1;
+    for (let m in 0..8) {
+        if (qrFormatBits(q.ecc, m) == fw) { mask = m; }
+    }
+    if (mask < 0) { return "!format word matches no mask at this level"; }
+    if (mask != q.mask) { return "!format word names mask " + str(mask); }
+    // Copy 2 must agree.
+    let fw2 = 0;
+    for (let b in 0..8) { if (q.get(n - 1 - b, 8)) { fw2 = fw2 | (1 << b); } }
+    for (let b in 8..15) { if (q.get(8, n - 15 + b)) { fw2 = fw2 | (1 << b); } }
+    if (fw2 != fw) { return "!format copies disagree"; }
+    if (!q.get(8, n - 8)) { return "!dark module missing"; }
+
+    // Zigzag walk.
+    let raw = qrRawCodewords(q.version);
+    let cw: int[] = [];
+    let cur = 0;
+    let nbits = 0;
+    let x = n - 1;
+    let up = true;
+    while (x > 0) {
+        if (x == 6) { x = 5; }
+        for (let t in 0..n) {
+            let y = t;
+            if (up) { y = n - 1 - t; }
+            for (let c in 0..2) {
+                let xx = x - c;
+                if (!q.is_fn[y * n + xx]) {
+                    let v = q.get(xx, y);
+                    if (mask_at(mask, xx, y)) { v = !v; }
+                    cur = cur * 2;
+                    if (v) { cur += 1; }
+                    nbits += 1;
+                    if (nbits == 8) {
+                        if (cw.len < raw) { cw.push(cur); }
+                        cur = 0;
+                        nbits = 0;
+                    }
+                }
+            }
+        }
+        up = !up;
+        x -= 2;
+    }
+    if (cw.len != raw) { return "!walk found " + str(cw.len) + " codewords, want " + str(raw); }
+
+    // De-interleave.
+    let bl = qrBlocks(q.version, q.ecc);
+    let nb = bl[0];
+    let eb = bl[1];
+    let short_len = raw / nb;
+    let n_short = nb - raw % nb;
+    let dlen: int[] = [];
+    for (let i in 0..nb) {
+        let d = short_len - eb;
+        if (i >= n_short) { d += 1; }
+        dlen.push(d);
+    }
+    let blocks: int[][] = [];
+    for (let i in 0..nb) { let e: int[] = []; blocks.push(e); }
+    let k = 0;
+    let maxd = short_len - eb + 1;
+    for (let i in 0..maxd) {
+        for (let j in 0..nb) {
+            if (i < dlen[j]) { blocks[j].push(cw[k]); k += 1; }
+        }
+    }
+    for (let i in 0..eb) {
+        for (let j in 0..nb) { blocks[j].push(cw[k]); k += 1; }
+    }
+    let data: int[] = [];
+    for (let j in 0..nb) {
+        let d: int[] = [];
+        for (let i in 0..dlen[j]) { d.push(blocks[j][i]); data.push(blocks[j][i]); }
+        let ec = qrReedSolomon(d, eb);
+        for (let i in 0..eb) {
+            if (ec[i] != blocks[j][dlen[j] + i]) { return "!block " + str(j) + " ecc wrong"; }
+        }
+    }
+    if (data.len != qrDataCodewords(q.version, q.ecc)) { return "!data length"; }
+
+    // Parse: mode 0100, count, bytes.
+    let bitpos = 0;
+    let mode = take_bits(data, bitpos, 4);
+    bitpos += 4;
+    if (mode != 4) { return "!mode " + str(mode); }
+    let cb = 8;
+    if (q.version >= 10) { cb = 16; }
+    let count = take_bits(data, bitpos, cb);
+    bitpos += cb;
+    let out = "";
+    for (let i in 0..count) {
+        out = out + chr(take_bits(data, bitpos, 8));
+        bitpos += 8;
+    }
+    // Pad bytes after the terminator alternate EC 11.
+    return out;
+}
+
+fn take_bits(data: int[], at: int, n: int): int {
+    let v = 0;
+    for (let i in 0..n) {
+        let p = at + i;
+        v = v * 2 + ((data[p / 8] >> (7 - p % 8)) & 1);
+    }
+    return v;
+}
+
+
+fn main() {
+    let t = suite("qr_encode");
+
+    t.section("Reed-Solomon known answer (HELLO WORLD, 1-M)");
+    let hw: int[] = [32, 91, 11, 120, 209, 114, 220, 77, 67, 64, 236, 17, 236, 17, 236, 17];
+    t.eqIntArr("rs_hello_world_1m", qrReedSolomon(hw, 10),
+               [196, 35, 39, 119, 235, 215, 231, 226, 93, 23]);
+
+    t.section("format words, ISO 18004 Table C.1");
+    t.eqInt("fmt_L0", qrFormatBits(QR_ECC_L, 0), bin("111011111000100"));
+    t.eqInt("fmt_L4", qrFormatBits(QR_ECC_L, 4), bin("110011000101111"));
+    t.eqInt("fmt_M0", qrFormatBits(QR_ECC_M, 0), bin("101010000010010"));
+    t.eqInt("fmt_M1", qrFormatBits(QR_ECC_M, 1), bin("101000100100101"));
+    t.eqInt("fmt_Q0", qrFormatBits(QR_ECC_Q, 0), bin("011010101011111"));
+    t.eqInt("fmt_H0", qrFormatBits(QR_ECC_H, 0), bin("001011010001001"));
+
+    t.section("version words, Table D.1");
+    t.eqInt("ver_7", qrVersionBits(7), bin("000111110010010100"));
+    t.eqInt("ver_40", qrVersionBits(40), bin("101000110001101001"));
+
+    t.section("data capacity, Table 7");
+    t.eqInt("cap_1L", qrDataCodewords(1, QR_ECC_L), 19);
+    t.eqInt("cap_1M", qrDataCodewords(1, QR_ECC_M), 16);
+    t.eqInt("cap_1Q", qrDataCodewords(1, QR_ECC_Q), 13);
+    t.eqInt("cap_1H", qrDataCodewords(1, QR_ECC_H), 9);
+    t.eqInt("cap_5Q", qrDataCodewords(5, QR_ECC_Q), 62);
+    t.eqInt("cap_10M", qrDataCodewords(10, QR_ECC_M), 216);
+    t.eqInt("cap_40L", qrDataCodewords(40, QR_ECC_L), 2956);
+    t.eqInt("cap_40H", qrDataCodewords(40, QR_ECC_H), 1276);
+
+    t.section("version choice at the byte-mode boundaries");
+    t.eqInt("v1M_14", qrEncode(repeat("a", 14), QR_ECC_M).version, 1);
+    t.eqInt("v2M_15", qrEncode(repeat("a", 15), QR_ECC_M).version, 2);
+    t.eqInt("v1L_17", qrEncode(repeat("a", 17), QR_ECC_L).version, 1);
+    t.eqInt("v40L_2953", qrEncode(repeat("a", 2953), QR_ECC_L).version, 40);
+    t.ok("null_L_2954", qrEncode(repeat("a", 2954), QR_ECC_L) == null);
+    t.eqInt("v40H_1273", qrEncode(repeat("a", 1273), QR_ECC_H).version, 40);
+    t.ok("null_H_1274", qrEncode(repeat("a", 1274), QR_ECC_H) == null);
+    t.ok("bad_level", qrEncode("x", 9) == null);
+    t.eqInt("size_v1", qrEncode("x").size, 21);
+
+    t.section("read back through an independent walk");
+    let payloads: string[] = [
+        "", "HELLO WORLD", "01234567",
+        "https://itax.kra.go.ke/KRA-Portal/invoiceChk.htm?actionCode=loadPage&invoiceNo=0040799830000000123",
+        "CU KRACU0300000123 / 0040799830000000123 / 2026-11-17 10:42:07",
+        repeat("Speccal POS ", 40),
+        repeat("x", 600)];
+    let levels: int[] = [QR_ECC_L, QR_ECC_M, QR_ECC_Q, QR_ECC_H];
+    for (let p in 0..payloads.len) {
+        for (let l in 0..levels.len) {
+            let q = qrEncode(payloads[p], levels[l]);
+            let label = "readback_p" + str(p) + "_l" + str(l);
+            if (q == null) { t.fail(label, "encode returned null"); continue; }
+            let got = read_back(q);
+            if (got.len > 0 && got[0] == 33) { t.fail(label, got.slice(1, got.len)); }
+            else { t.eq(label, got, payloads[p]); }
+        }
+    }
+
+    t.section("every version 1..40 reads back");
+    for (let v in 1..41) {
+        // A payload sized to land exactly at version v, level M.
+        let cap = qrDataCodewords(v, QR_ECC_M);
+        let cb = 8;
+        if (v >= 10) { cb = 16; }
+        let n = (cap * 8 - 4 - cb) / 8;
+        let q = qrEncode(repeat("v", n), QR_ECC_M);
+        let label = "version_" + str(v);
+        if (q == null || q.version != v) { t.fail(label, "landed elsewhere"); continue; }
+        let got = read_back(q);
+        if (got.len > 0 && got[0] == 33) { t.fail(label, got.slice(1, got.len)); }
+        else { t.eqInt(label, got.len, n); }
+    }
+
+    t.section("binary payload");
+    let bin_data = bytes(256);
+    for (let i in 0..256) { bin_data[i] = i as byte; }
+    let qb = qrEncodeBytes(bin_data, QR_ECC_M);
+    t.ok("binary_encodes", qb != null);
+
+    exitWith(t.done());
+}

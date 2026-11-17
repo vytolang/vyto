@@ -1,6 +1,6 @@
 # vyto/media — images, audio, video, fonts
 
-> **Status: one module implemented, five stubs.** `vyto/media/image` works.
+> **Status: two modules implemented, five stubs.** `vyto/media/image` and `vyto/media/qr` work.
 > `audio`, `video`, `font`, `codec` and `camera` declare their APIs and every
 > entry point panics — see [Status](#status) before depending on one.
 
@@ -27,6 +27,7 @@ encodePNG(imageFromRGB(px, 2, 2), "out.png");
 | Module | What it gives you | Status | Native |
 |--------|-------------------|:------:|:------:|
 | `vyto/media/image` | PNG/JPEG/BMP/TGA **encode**, decode to a readable `i32[]`, `Image` | ✅ | stb_image_write, vendored |
+| `vyto/media/qr` | QR Code encoder: module grid for any payload, byte mode, ECC L/M/Q/H | ✅ | none, pure Vyto |
 | `vyto/media/audio` | miniaudio playback, capture, device enumeration | 🚧 stub | planned |
 | `vyto/media/video` | FFmpeg demux, decode and scale to `Image` frames | 🚧 stub | planned |
 | `vyto/media/font` | FreeType/HarfBuzz shaping — Arabic, Indic, ligatures | 🚧 stub | planned |

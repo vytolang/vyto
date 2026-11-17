@@ -1,0 +1,49 @@
+// tests/fixtures/qr_scan.vt — the conformance half of vyto/media/qr's tests.
+//
+// tests/unit/qr_encode.vt proves the encoder agrees with itself and with the
+// standard's published tables. Whether a real reader accepts the result can
+// only be judged by a real reader, so this writes the symbols as PNGs:
+//
+//     ./vytoc build tests/fixtures/qr_scan.vt -o tests/tmp/qr_scan && tests/tmp/qr_scan
+//     for f in tests/tmp/qr/*.png; do zbarimg -q --raw "$f"; done   # zbar-tools
+//
+// Each file's expected text is in tests/tmp/qr/<name>.txt. Or point a phone
+// camera at tests/tmp/qr/index.png, which tiles them.
+import { qrEncode, QrCode, QR_ECC_L, QR_ECC_M, QR_ECC_Q, QR_ECC_H } from "vyto/media/qr";
+import { Image, encodePNG } from "vyto/media/image";
+import { file_open, file_mkdirs } from "vyto/io/file";
+
+fn to_image(q: QrCode, scale: int): Image {
+    let border = 4;
+    let side = (q.size + border * 2) * scale;
+    let img = new Image(side, side);
+    for (let y in 0..side) {
+        for (let x in 0..side) {
+            let dark = q.get(x / scale - border, y / scale - border);
+            if (dark) { img.set(x, y, 0xFF000000); } else { img.set(x, y, 0xFFFFFFFF); }
+        }
+    }
+    return img;
+}
+
+fn main() {
+    file_mkdirs("tests/tmp/qr");
+    let texts: string[] = [
+        "HELLO WORLD",
+        "https://itax.kra.go.ke/KRA-Portal/invoiceChk.htm?actionCode=loadPage&invoiceNo=0040799830000000123",
+        "SpeccalPOS receipt T1-000042, KES 1,250.00",
+        "Pay to till 123456"];
+    let levels: int[] = [QR_ECC_L, QR_ECC_M, QR_ECC_Q, QR_ECC_H];
+    let names: string[] = ["L", "M", "Q", "H"];
+    for (let i in 0..texts.len) {
+        for (let l in 0..levels.len) {
+            let q = qrEncode(texts[i], levels[l]);
+            let base = "tests/tmp/qr/t" + str(i) + "_" + names[l];
+            encodePNG(to_image(q, 4), base + ".png");
+            let fh = file_open(base + ".txt", "w");
+            fh.writeText(texts[i]);
+            fh.close();
+            print(base + ".png  v" + str(q.version) + " mask " + str(q.mask));
+        }
+    }
+}
