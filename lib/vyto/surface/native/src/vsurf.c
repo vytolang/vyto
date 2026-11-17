@@ -1070,8 +1070,11 @@ void vs_set_decorated(void *vs, int on) {
     LONG_PTR style = on ? (WS_OVERLAPPEDWINDOW | WS_VISIBLE)
                         : (WS_POPUP | WS_VISIBLE);
     SetWindowLongPtr(s->hwnd, GWL_STYLE, style);
+    /* SetWindowPos without SWP_NOACTIVATE activates the window: a
+       display-only one must not take the foreground back from the app. */
     SetWindowPos(s->hwnd, NULL, 0, 0, 0, 0,
-                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED |
+                 (s->no_activate ? SWP_NOACTIVATE : 0));
 }
 
 /* WS_EX_NOACTIVATE keeps a click from activating the window and keeps it off
@@ -1137,16 +1140,20 @@ int vs_set_fullscreen(void *vs, int on) {
         MONITORINFO mi;
         mi.cbSize = sizeof mi;
         if (!GetMonitorInfo(mon, &mi)) return 0;
+        /* SWP_NOACTIVATE for a display-only window (vs_set_no_activate):
+           without it SetWindowPos activates, and a customer screen going
+           fullscreen took the keyboard from the till beside it. */
         SetWindowLongPtr(s->hwnd, GWL_STYLE, WS_POPUP | WS_VISIBLE);
         SetWindowPos(s->hwnd, HWND_TOP,
                      mi.rcMonitor.left, mi.rcMonitor.top,
                      mi.rcMonitor.right - mi.rcMonitor.left,
                      mi.rcMonitor.bottom - mi.rcMonitor.top,
-                     SWP_FRAMECHANGED);
+                     SWP_FRAMECHANGED | (s->no_activate ? SWP_NOACTIVATE : 0));
     } else {
         SetWindowLongPtr(s->hwnd, GWL_STYLE, WS_OVERLAPPEDWINDOW | WS_VISIBLE);
         SetWindowPos(s->hwnd, NULL, 0, 0, 0, 0,
-                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED |
+                     (s->no_activate ? SWP_NOACTIVATE : 0));
     }
     return 1;
 }

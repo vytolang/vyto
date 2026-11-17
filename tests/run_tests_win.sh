@@ -268,7 +268,7 @@ for t in srv cli gui_probe; do
         echo "FAIL build channel/$t"; cat "$STAGE/.ch_$t.err"; fail=1
     fi
 done
-for t in desktop_demo menu_demo https_local service_demo dpi_demo input_watch print_demo; do
+for t in desktop_demo menu_demo https_local service_demo dpi_demo input_watch print_demo kiosk_demo; do
     if ./vytoc build "tests/win/$t.vt" --target "$TRIPLE" --cc "$CC_CMD" \
             -o "$STAGE/$t.exe" >/dev/null 2>"$STAGE/.$t.err"; then
         echo "BUILT $t"
@@ -307,14 +307,23 @@ else
 fi
 mkdir -p "$STAGE/tls"
 cp tests/fixtures/tls/root.crt tests/fixtures/tls/other-root.crt "$STAGE/tls/"
-if ! ./vytoc audit "$STAGE"/*.exe "$STAGE"/inst/*/*-setup.exe "$STAGE"/channel/*.exe; then fail=1; fi
+# winspool.drv (vyto/desktop/print) is not in the Win7 dump yet: audit against
+# the real list plus the hand-made provisional overlay, as that file says,
+# until run.ps1's next dump replaces both. Every other DLL is still checked
+# against the real list.
+W7_LIST=lib/vyto/win/win7_exports.txt
+if [ -f lib/vyto/win/win7_exports_provisional.txt ]; then
+    W7_LIST="$STAGE/.win7_exports_audit.txt"
+    cat lib/vyto/win/win7_exports.txt lib/vyto/win/win7_exports_provisional.txt > "$W7_LIST"
+fi
+if ! WIN7_EXPORTS="$W7_LIST" ./vytoc audit "$STAGE"/*.exe "$STAGE"/inst/*/*-setup.exe "$STAGE"/channel/*.exe; then fail=1; fi
 # The DLLs shipped beside the exes are skipped by the exe audit (they are the
 # app's own), so audit them as binaries of their own. No exceptions: curl used
 # to be a UCRT-linked DLL here and was reported KNOWN; it is now built from
 # source into each exe (lib/vyto/net/native/refresh-curl.sh).
 for dll in "$STAGE"/*.dll; do
     [ -f "$dll" ] || continue
-    if ! ./vytoc audit "$dll"; then fail=1; fi
+    if ! WIN7_EXPORTS="$W7_LIST" ./vytoc audit "$dll"; then fail=1; fi
 done
 
 # --- the Windows-side runner ---------------------------------------------

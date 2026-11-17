@@ -367,6 +367,65 @@ WANT
 }
 menu_check
 
+# --- a display-only second window, and Window.after on Win32 ----------------
+# kiosk_demo.exe is the shape of SpeccalPOS's Kiosk Window: a till with a text
+# field and an undecorated second Surface with set_no_activate. Checked: the
+# till's after() timers fire through the Win32 wait in due order, re-arm from
+# their own callback, and a cancelled one never fires; opening the second
+# window (no-activate, then moved, sized, fullscreen: SpeccalPOS's order)
+# leaves the keyboard with the till; a click on it reaches it but leaves the
+# focus with the till, so the keys typed next land in the till's field. Fault-injected (VYTO_KIOSK_ACTIVATE=1 leaves
+# no-activate off): the keys then go to the second window and the till gets
+# nothing, so the check can fail.
+kiosk_check() {
+    for t in Xvfb xdotool; do
+        command -v "$t" >/dev/null 2>&1 || { echo "SKIP wine_kiosk (no $t)"; return 0; }
+    done
+    [ -f "$STAGE/kiosk_demo.exe" ] || { echo "FAIL wine_kiosk (not staged)"; fail=$((fail + 1)); return 0; }
+    Xvfb -displayfd 3 -screen 0 1280x800x24 -nolisten tcp 3>"$tmp/kdpy" >/dev/null 2>&1 &
+    xp=$!
+    i=0; while [ ! -s "$tmp/kdpy" ] && [ $i -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+    DISPLAY=":$(cat "$tmp/kdpy")"; export DISPLAY
+    (cd "$STAGE" && VYTO_KIOSK_LOG="$tmp/kiosk.log" "$WINE" ./kiosk_demo.exe > /dev/null 2>&1) &
+    dp=$!
+    i=0; while ! grep -q '^ready' "$tmp/kiosk.log" 2>/dev/null && [ $i -lt 300 ]; do sleep 0.1; i=$((i + 1)); done
+    T=$(timeout 10 xdotool search --sync --name "^Vyto Till\$" 2>/dev/null | head -1)
+    K=$(timeout 10 xdotool search --sync --name "^Vyto Kiosk\$" 2>/dev/null | head -1)
+    if [ -z "$T" ] || [ -z "$K" ] || ! grep -q '^ready' "$tmp/kiosk.log" 2>/dev/null; then
+        echo "FAIL wine_kiosk (kiosk_demo did not come up)"
+        fail=$((fail + 1)); kill "$dp" "$xp" 2>/dev/null; unset DISPLAY; return 0
+    fi
+    # the kiosk is fullscreen over the till: the first scan, before anything
+    # is clicked, then a customer's tap on the kiosk and the next scan
+    eval "$(xdotool getwindowgeometry --shell "$K")"; kx=$X; ky=$Y
+    xdotool type --delay 80 "111" 2>/dev/null; sleep 0.3
+    xdotool key Return 2>/dev/null; sleep 0.6
+    xdotool mousemove $((kx + 300)) $((ky + 300)) click 1 2>/dev/null; sleep 0.6
+    xdotool type --delay 80 "12345" 2>/dev/null; sleep 0.3
+    xdotool key Return 2>/dev/null; sleep 0.6
+    xdotool key --window "$T" alt+F4 2>/dev/null
+    i=0; while kill -0 "$dp" 2>/dev/null && [ $i -lt 100 ]; do sleep 0.1; i=$((i + 1)); done
+    if kill -0 "$dp" 2>/dev/null; then echo "  kiosk_demo still running after Alt+F4"; kill "$dp" 2>/dev/null; fi
+    kill "$xp" 2>/dev/null
+    tr -d '\r' < "$tmp/kiosk.log" > "$tmp/kiosk.got"
+    printf 'chain 1\nafter 200\nchain 2\nafter 400\nchain 3\nready\n' > "$tmp/kiosk.want"
+    if head -6 "$tmp/kiosk.got" | cmp -s "$tmp/kiosk.want" -; then
+        echo "PASS wine_kiosk_after"; pass=$((pass + 1))
+    else
+        echo "FAIL wine_kiosk_after"; diff "$tmp/kiosk.want" "$tmp/kiosk.got" | head -20
+        fail=$((fail + 1))
+    fi
+    if tail -n +7 "$tmp/kiosk.got" | tr '\n' '|' | grep -qx 'till got: 111|kiosk click 1|till got: 12345|'; then
+        echo "PASS wine_kiosk_no_activate"; pass=$((pass + 1))
+    else
+        echo "FAIL wine_kiosk_no_activate (want: till got: 111, kiosk click 1, till got: 12345)"
+        sed 's/^/  /' "$tmp/kiosk.got"
+        fail=$((fail + 1))
+    fi
+    unset DISPLAY
+}
+kiosk_check
+
 # --- HTTPS: the vendored curl + mbedTLS against a local server ----------------
 # No network: openssl s_server on loopback with the test PKI in
 # tests/fixtures/tls. Trusting the fixture root must succeed — from a path

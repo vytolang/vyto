@@ -1,0 +1,118 @@
+// A till and a display-only second window, the shape SpeccalPOS's Kiosk
+// Window has, for the Wine check in tests/run_tests_wine.sh (and by hand on
+// Windows 7 with two monitors).
+//
+// What it proves on the Win32 backend:
+//   - Window.after timers fire through the Win32 wait (vs_wait_timeout), in
+//     due order, re-armed from their own callback; a cancelled one never fires
+//   - opening the second window (set_no_activate, then moved, sized and made
+//     fullscreen) leaves the keyboard with the till: the first scan lands
+//   - a click on the second window reaches it but does not take the focus:
+//     keys typed afterwards still land in the till's field
+//
+// VYTO_KIOSK_LOG names a file the log is rewritten to on every line (stdout
+// to a file is block buffered, so a script would see nothing until exit).
+// VYTO_KIOSK_ACTIVATE=1 leaves set_no_activate off: the fault injection that
+// shows the focus check can fail.
+import { Window, TextField, Label, Column } from "vyto/ui";
+import { Surface, Rect, EV_NONE, EV_MOUSE_DOWN } from "vyto/surface";
+import { SurfacePainter } from "vyto/surface/painter";
+import { getenv } from "vyto/os";
+
+class Log {
+    lines: string[];
+    path: string;
+    fn init(path: string) { this.lines = []; this.path = path; }
+    fn add(s: string) {
+        print(s);
+        this.lines.push(s);
+        if (this.path != "") { writefile(this.path, this.lines.join("\n") + "\n"); }
+    }
+}
+
+// Re-arms itself from its own callback until it has fired three times.
+// Closures capture by value, so the count lives in an object.
+class Chain {
+    win: weak Window;
+    log: Log;
+    n: int;
+    fn init(win: Window, log: Log) { this.win = win; this.log = log; this.n = 0; }
+    fn arm() {
+        let self = this;
+        if (this.win == null) { return; }
+        this.win.after(150, () => { self.fire(); });
+    }
+    fn fire() {
+        this.n += 1;
+        this.log.add(`chain {this.n}`);
+        if (this.n < 3) { this.arm(); }
+    }
+}
+
+// Watches the second window's own queue on a slow timer: a click there
+// must still arrive (it is display-only, not dead).
+class Kiosk {
+    win: weak Window;
+    log: Log;
+    surf: Surface;
+    painter: SurfacePainter;
+    clicks: int;
+    fn init(win: Window, log: Log, activate: bool) {
+        this.win = win;
+        this.log = log;
+        this.clicks = 0;
+        // SpeccalPOS's open order (src/kiosk.vt), fullscreen last: every
+        // call after set_no_activate must leave the till in front
+        let s = new Surface("Vyto Kiosk", 300, 200);
+        s.set_decorated(false);
+        if (!activate) { s.set_no_activate(true); }
+        s.move_to(760, 120);
+        s.set_size(300, 200);
+        s.set_fullscreen(true);
+        this.surf = s;
+        let p = new SurfacePainter(s);
+        p.on_resize(s.width(), s.height());
+        p.fill(Rect(0.0, 0.0, s.width() as float, s.height() as float), 0xFF1E6FD9);
+        p.present();
+        this.painter = p;
+    }
+    fn watch() {
+        let self = this;
+        if (this.win == null) { return; }
+        this.win.after(100, () => { self.drain(); });
+    }
+    fn drain() {
+        let ev = this.surf.poll();
+        while (ev != EV_NONE) {
+            if (ev == EV_MOUSE_DOWN) {
+                this.clicks += 1;
+                this.log.add(`kiosk click {this.clicks}`);
+            }
+            ev = this.surf.poll();
+        }
+        this.watch();
+    }
+}
+
+fn main() {
+    let log = new Log(getenv("VYTO_KIOSK_LOG"));
+    let win = new Window("Vyto Till", 480, 240);
+    let field = new TextField("scan here");
+    field.onSubmit = (t) => log.add("till got: " + t);
+    win.root = new Column([field, new Label("the till keeps the keyboard")]);
+
+    win.after(400, () => { log.add("after 400"); });
+    win.after(200, () => { log.add("after 200"); });
+    let gone = win.after(300, () => { log.add("cancelled timer fired"); });
+    win.cancel_after(gone);
+    let chain = new Chain(win, log);
+    chain.arm();
+    win.after(1000, () => { log.add("ready"); });
+    // the till's field has the keyboard from the start, as the till's
+    // search box does: nobody clicks it before the first scan
+    win.after(50, () => { win.focus_widget(field); });
+
+    let k = new Kiosk(win, log, getenv("VYTO_KIOSK_ACTIVATE") == "1");
+    k.watch();
+    win.run();
+}
