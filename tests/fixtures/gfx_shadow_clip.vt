@@ -1,0 +1,50 @@
+// gfx_shadow_round computes only what the clip lets through (a partial
+// repaint's dirty rect), widened by what the blur can carry. Every pixel
+// inside the clip must come out exactly as when the whole shadow is
+// computed. The edge cases put the window's cut where the coverage varies:
+// with the window widened by the blur radius instead of 3x it, they differ.
+import { Canvas } from "vyto/gfx";
+
+fn one(name: string, cx: int, cy: int, cw: int, ch: int, x: float, y: float, w: float, h: float,
+        r: float, blur: float, dy: float, tx: float, ty: float): int {
+    let a = new Canvas(400, 300);
+    a.clear(0xFFEEF0F3);
+    a.translate(tx, ty);
+    a.shadowRound(x, y, w, h, r, blur, dy, 0x2D141E28);
+    a.flush();
+    let b = new Canvas(400, 300);
+    b.clear(0xFFEEF0F3);
+    b.translate(tx, ty);
+    b.clipPush((cx as float) - tx, (cy as float) - ty, cw as float, ch as float, 0.0);
+    b.shadowRound(x, y, w, h, r, blur, dy, 0x2D141E28);
+    b.clipPop();
+    b.flush();
+    let bad = 0;
+    let shaded = 0;
+    for (let yy in cy..(cy + ch)) {
+        for (let xx in cx..(cx + cw)) {
+            if (xx < 0 || yy < 0 || xx >= 400 || yy >= 300) { continue; }
+            let pa = a.pixelAt(xx, yy);
+            if (pa != 0xFFEEF0F3) { shaded += 1; }
+            if (pa != b.pixelAt(xx, yy)) { bad += 1; }
+        }
+    }
+    print(name + `: {bad} differ, {shaded} shaded pixels compared`);
+    return bad;
+}
+
+fn main() {
+    let bad = 0;
+    bad += one("sliver of the left edge", 40, 10, 30, 280, 60.0, 40.0, 200.0, 220.0, 14.0, 10.0, 3.0, 0.0, 0.0);
+    bad += one("corner", 230, 220, 60, 60, 60.0, 40.0, 200.0, 220.0, 14.0, 10.0, 3.0, 0.0, 0.0);
+    bad += one("inside the caster", 100, 100, 40, 40, 60.0, 40.0, 200.0, 220.0, 14.0, 10.0, 3.0, 0.0, 0.0);
+    bad += one("fractional position", 50, 30, 90, 50, 60.4, 40.7, 200.3, 220.5, 9.0, 7.0, 2.5, 0.0, 0.0);
+    bad += one("translated", 50, 30, 90, 60, 20.0, 10.0, 200.0, 220.0, 14.0, 10.0, 3.0, 30.0, 25.0);
+    bad += one("whole canvas", 0, 0, 400, 300, 60.0, 40.0, 200.0, 220.0, 14.0, 10.0, 3.0, 0.0, 0.0);
+    bad += one("big blur, small clip", 10, 150, 20, 20, 60.0, 40.0, 200.0, 220.0, 14.0, 24.0, 6.0, 0.0, 0.0);
+    bad += one("just inside the left edge", 66, 20, 30, 260, 60.0, 40.0, 200.0, 220.0, 14.0, 10.0, 3.0, 0.0, 0.0);
+    bad += one("just under the top edge", 40, 50, 250, 25, 60.0, 40.0, 200.0, 220.0, 14.0, 10.0, 3.0, 0.0, 0.0);
+    bad += one("just inside the right edge", 245, 20, 30, 260, 60.0, 40.0, 200.0, 220.0, 14.0, 10.0, 3.0, 0.0, 0.0);
+    bad += one("clip away from it", 330, 5, 60, 20, 60.0, 40.0, 200.0, 220.0, 14.0, 10.0, 3.0, 0.0, 0.0);
+    print(`total differing: {bad}`);
+}

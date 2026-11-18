@@ -618,10 +618,42 @@ void gfx_shadow_round(GfxCanvas *c, double x, double y, double w, double h,
     int lh = (int)ceil(h) + pad * 2;
     if (lw <= 0 || lh <= 0) return;
 
+    /* Only what the clip lets through is worth computing. A partial repaint
+       clips to its dirty rect, and a big card's shadow (the till's order
+       panel: ~530x770 px) cost ~30 ms per call when computed whole, even when
+       the dirty rect was a caret's text field that only grazed it.
+
+       out = the clip box in layer coordinates (layer pixel (0,0) sits at
+       x - pad, y + dy - pad); in = out grown by `pad`, which is further than
+       the three box passes can carry anything (3*rad), so every pixel in
+       `out` comes out exactly as from the whole layer. Under a scale or
+       rotation the clip box is not mapped, and the whole layer is done. */
+    int ox0 = 0, oy0 = 0, ox1 = lw, oy1 = lh;
+    BLMatrix2D m;
+    bl_context_get_final_transform(&c->ctx, &m);
+    if (m.m00 == 1.0 && m.m11 == 1.0 && m.m01 == 0.0 && m.m10 == 0.0) {
+        int cx = 0, cy = 0, cw = c->w, ch = c->h;
+        if (c->clip_top > 0 && c->clip_top <= c->clip_cap) {
+            const GfxClip *cl = &c->clip[c->clip_top - 1];
+            cx = cl->cx; cy = cl->cy; cw = cl->cw; ch = cl->ch;
+        }
+        double lx = x - (double)pad + m.m20, ly = y + dy - (double)pad + m.m21;
+        int a0 = (int)floor((double)cx - lx) - 1, b0 = (int)floor((double)cy - ly) - 1;
+        int a1 = (int)ceil((double)(cx + cw) - lx) + 1, b1 = (int)ceil((double)(cy + ch) - ly) + 1;
+        if (a0 > ox0) ox0 = a0;
+        if (b0 > oy0) oy0 = b0;
+        if (a1 < ox1) ox1 = a1;
+        if (b1 < oy1) oy1 = b1;
+        if (ox1 <= ox0 || oy1 <= oy0) return;   /* none of it shows */
+    }
+    int ix0 = ox0 - pad > 0 ? ox0 - pad : 0, iy0 = oy0 - pad > 0 ? oy0 - pad : 0;
+    int ix1 = ox1 + pad < lw ? ox1 + pad : lw, iy1 = oy1 + pad < lh ? oy1 + pad : lh;
+    int iw = ix1 - ix0, ih = iy1 - iy0;
+
     /* grow the cached scratch layer if needed, then reuse it */
-    if (lw > c->sl_w || lh > c->sl_h) {
-        int nw = lw > c->sl_w ? lw : c->sl_w;
-        int nh = lh > c->sl_h ? lh : c->sl_h;
+    if (iw > c->sl_w || ih > c->sl_h) {
+        int nw = iw > c->sl_w ? iw : c->sl_w;
+        int nh = ih > c->sl_h ? ih : c->sl_h;
         free_shadow_layer(c);
         if (bl_image_init_as(&c->sl_img, nw, nh, BL_FORMAT_PRGB32) != BL_SUCCESS) return;
         if (bl_context_init_as(&c->sl_ctx, &c->sl_img, NULL) != BL_SUCCESS) {
@@ -639,13 +671,14 @@ void gfx_shadow_round(GfxCanvas *c, double x, double y, double w, double h,
        (Skipping this made frames non-deterministic run to run.) */
     bl_context_flush(&c->ctx, BL_CONTEXT_FLUSH_SYNC);
     /* clear only the sub-rect this shadow uses, not the whole cached layer */
-    BLRect clear_rc = { 0.0, 0.0, (double)lw, (double)lh };
+    BLRect clear_rc = { 0.0, 0.0, (double)iw, (double)ih };
     bl_context_set_comp_op(lctxp, BL_COMP_OP_SRC_COPY);
     bl_context_set_fill_style_rgba32(lctxp, 0x00000000u);
     bl_context_fill_geometry(lctxp, BL_GEOMETRY_TYPE_RECTD, &clear_rc);
     bl_context_set_comp_op(lctxp, BL_COMP_OP_SRC_OVER);
-    /* rasterise pure coverage; the colour is applied after the blur */
-    BLRoundRect shape = { (double)pad, (double)pad, w, h, r, r };
+    /* rasterise pure coverage; the colour is applied after the blur. The
+       scratch holds the window `in`, so the shape moves by its origin. */
+    BLRoundRect shape = { (double)(pad - ix0), (double)(pad - iy0), w, h, r, r };
     bl_context_set_fill_style_rgba32(lctxp, 0xFFFFFFFFu);
     bl_context_fill_geometry(lctxp, BL_GEOMETRY_TYPE_ROUND_RECT, &shape);
     bl_context_flush(lctxp, BL_CONTEXT_FLUSH_SYNC);
@@ -654,17 +687,21 @@ void gfx_shadow_round(GfxCanvas *c, double x, double y, double w, double h,
     bl_image_get_data(&c->sl_img, &ld);
     uint8_t *lp = (uint8_t *)ld.pixel_data;
     for (int pass = 0; pass < 3; pass++) {
-        box_blur_h1(lp, (intptr_t)ld.stride, lw, lh, rad, 3);
-        box_blur_v1(lp, (intptr_t)ld.stride, lw, lh, rad, 3);
+        box_blur_h1(lp, (intptr_t)ld.stride, iw, ih, rad, 3);
+        box_blur_v1(lp, (intptr_t)ld.stride, iw, ih, rad, 3);
     }
-    shadow_recolor(lp, (intptr_t)ld.stride, lw, lh, col);
+    /* from here on only `out` is used: recolour and knock out just that */
+    int ow = ox1 - ox0, oh = oy1 - oy0;
+    uint8_t *op = lp + (intptr_t)(oy0 - iy0) * ld.stride + (intptr_t)(ox0 - ix0) * 4;
+    shadow_recolor(op, (intptr_t)ld.stride, ow, oh, col);
 
     /* Knock the caster's own shape out of the shadow, the way CSS box-shadow
        does. It is invisible under an opaque panel, but a translucent one would
-       otherwise blur and show its own shadow as a dark patch behind the glass. */
-    for (int yy = 0; yy < lh; yy++) {
-        uint8_t *row = lp + (intptr_t)yy * ld.stride;
-        for (int xx = 0; xx < lw; xx++) {
+       otherwise blur and show its own shadow as a dark patch behind the glass.
+       xx, yy are layer coordinates, as the whole-layer version had them. */
+    for (int yy = oy0; yy < oy1; yy++) {
+        uint8_t *row = lp + (intptr_t)(yy - iy0) * ld.stride - (intptr_t)ix0 * 4;
+        for (int xx = ox0; xx < ox1; xx++) {
             double sd = rrect_sd((double)xx + 0.5, (double)yy + 0.5,
                                  (double)pad, (double)pad - dy, w, h, r);
             double cov = 0.5 - sd;               /* 1 inside the caster */
@@ -677,8 +714,8 @@ void gfx_shadow_round(GfxCanvas *c, double x, double y, double w, double h,
         }
     }
 
-    BLPoint at = { x - (double)pad, y + dy - (double)pad };
-    BLRectI src = { 0, 0, lw, lh };
+    BLPoint at = { x - (double)pad + (double)ox0, y + dy - (double)pad + (double)oy0 };
+    BLRectI src = { ox0 - ix0, oy0 - iy0, ow, oh };
     bl_context_blit_image_d(&c->ctx, &at, &c->sl_img, &src);
 }
 

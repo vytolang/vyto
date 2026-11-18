@@ -2040,6 +2040,16 @@ if [ -f lib/vyto/gfx/native/linux-x64/libblend2d.so ]; then
         echo "--- got ---"; echo "$got"
         fail=1
     fi
+    # A shadow computed only inside the clip is pixel-identical to a whole one.
+    got=$(VS_HEADLESS=1 ./vytoc run tests/fixtures/gfx_shadow_clip.vt 2>&1)
+    if [ "$got" = "$(cat tests/fixtures/gfx_shadow_clip.expected)" ]; then
+        echo "PASS gfx_shadow_clip"
+    else
+        echo "FAIL gfx_shadow_clip"
+        echo "--- expected ---"; cat tests/fixtures/gfx_shadow_clip.expected
+        echo "--- got ---"; echo "$got"
+        fail=1
+    fi
     # vyto/ui rendered through GfxPainter (blend2d rich tier)
     uigfx_bin=apps/uigfx/.vyto-cache/uigfx_test
     if ./vytoc build apps/uigfx/uigfx.vt -o "$uigfx_bin" >/dev/null 2>&1; then
