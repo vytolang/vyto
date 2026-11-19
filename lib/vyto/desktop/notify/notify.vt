@@ -1,0 +1,107 @@
+// vyto/desktop/notify — the operating system's own notifications.
+//
+//     import { notify, notify_app, notify_replace, NOTIFY_WARNING } from "vyto/desktop/notify";
+//
+//     notify_app("SpeccalPOS");                       // once, before the first notice
+//     let id = notify("Printer offline", "Receipts are queued until it is back", NOTIFY_WARNING);
+//     ...
+//     notify_replace(id, "Printer back", "3 queued receipts printed", NOTIFY_INFO);
+//
+// Linux: the freedesktop Notifications service on the session bus (GNOME,
+// KDE, Xfce, dunst, mako...), spoken directly over D-Bus with libdbus loaded at
+// run time. No notify-send, no process per notice, no quoting: every argument
+// travels typed. Windows: the app's tray icon and its balloon, which Windows 10
+// and later show as a toast. Elsewhere — macOS, Android, freestanding — every
+// call answers "unavailable", so a program needs no platform conditional.
+//
+// A notice is for the person who is NOT looking at the app: the window is
+// minimised, behind another one, or on a screen nobody faces. For someone who
+// is looking at it, vyto/ui's Toast and AlertBanner are the right tools; a
+// notice there is noise.
+//
+// No call waits for the notification service. GNOME 42 shows a banner at once
+// but answers 2.5-6 s later, which would freeze a UI thread that waited, so on
+// Linux a notice is queued and a C worker thread does the talking — in order,
+// so a replace or close always follows the notice it refers to. Only the first
+// call of a process asks the service anything directly (who it is and what it
+// supports, answered in well under a millisecond, bounded at one second).
+// At exit the process waits up to two seconds for queued notices to be
+// written to the bus, so a tool that notifies and exits at once still shows.
+// Windows' shell answers at once and needs none of this.
+//
+// VYTO_NOTIFY=off in the environment makes everything answer "unavailable",
+// which is how the no-notifications path is tested.
+
+#link "dl" if "linux"
+#link "pthread" if "linux"
+#link "shell32" if "windows"
+#link "user32" if "windows"
+
+extern "C" {
+    fn vnot_available(): i32;
+    fn vnot_server(): cstring;
+    fn vnot_set_app(name: cstring);
+    fn vnot_set_quiet(on: i32);
+    fn vnot_show(replaces: i32, title: cstring, body: cstring, kind: i32, timeout_ms: i32): i32;
+    fn vnot_close(id: i32): i32;
+}
+
+// How serious a notice is. INFO and WARNING are "normal" urgency on Linux and
+// differ by icon; ERROR is "critical", which most desktops keep on screen until
+// it is dismissed. On Windows they pick the balloon's icon.
+export const NOTIFY_INFO: int = 0;
+export const NOTIFY_WARNING: int = 1;
+export const NOTIFY_ERROR: int = 2;
+
+// Whether notices can be shown at all: a notification service answered on the
+// session bus (Linux), or the tray icon could be added (Windows). False on a
+// headless box, over SSH without a session bus, and on every other target.
+// notify() on an unavailable system returns 0 and does nothing else, so
+// checking first is only needed to tell a person why nothing appeared.
+export fn notify_available(): bool { return vnot_available() != 0; }
+
+// Who answered — "gnome-shell", "Plasma", "dunst", "Shell_NotifyIcon" — or ""
+// when nothing did. For diagnostics and logs, not for branching on.
+export fn notify_server(): string { return str(vnot_server()); }
+
+// The name notices are shown under: the app name on Linux, the tray icon's
+// tooltip on Windows. Set it before the first notice; Windows reads it when the
+// icon is added. Defaults to "Vyto".
+export fn notify_app(name: string) { vnot_set_app(name.cstr()); }
+
+// Ask the OS not to play its own sound with a notice. For an app that plays
+// its own alert sounds (vyto/media/audio), so one event is not two noises.
+// A hint, not a guarantee: some Linux servers ignore it.
+export fn notify_quiet(on: bool) {
+    let v = 0;
+    if (on) { v = 1; }
+    vnot_set_quiet(v as i32);
+}
+
+// Show a notice. Returns its id, for notify_replace and notify_close, or 0
+// when nothing was shown. Ids count up from 1 within a process. The body is plain text: on a server that reads markup
+// it is escaped, so "Tea & <milk>" arrives as written. Malformed UTF-8 becomes
+// U+FFFD rather than reaching D-Bus, which would abort the process.
+export fn notify(title: string, body: string, kind: int): int {
+    return notify_replace(0, title, body, kind);
+}
+
+// Show a notice in place of an earlier one (by its id), so a changing state
+// is one notice that updates rather than a pile of them. Returns the same id,
+// or 0 when nothing was shown. An id of 0, or one this process never handed
+// out, makes a new notice with a new id.
+export fn notify_replace(id: int, title: string, body: string, kind: int): int {
+    return vnot_show(id as i32, title.cstr(), body.cstr(), kind as i32, 0 as i32) as int;
+}
+
+// The same, gone after `timeout_ms` instead of the desktop's default. Windows
+// from Vista on decides for itself and ignores this.
+export fn notify_for(title: string, body: string, kind: int, timeout_ms: int): int {
+    return vnot_show(0 as i32, title.cstr(), body.cstr(), kind as i32, timeout_ms as i32) as int;
+}
+
+// Take a notice down. False for an id this process never handed out, and on
+// Windows for one a later notice has replaced (there is one balloon there).
+// On Linux true means the close was sent: whether the notice was still on
+// screen is the server's business, and it does not say.
+export fn notify_close(id: int): bool { return vnot_close(id as i32) != 0; }

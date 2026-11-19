@@ -1,0 +1,162 @@
+// cue_demo — listen to vyto/media/audio/cue on a real machine.
+//
+//     cue_demo.exe            a menu: play each alert, bursts, overlap, volume, a WAV
+//     cue_demo.exe --auto     play everything once and check it mechanically;
+//                             exit status 0 when every check passed
+//     --volume <pct>          start at that master volume (0 = silent, real device)
+//
+// Built for windows-x64 by tests/run_tests_win.sh, and staged with a golden for
+// `--auto` under VYTO_AUDIO=null (silent, so run.ps1 makes no noise). Run it
+// by hand, without that variable, to hear the real thing on WASAPI.
+// Text is ASCII on purpose: a Windows 7 console is not UTF-8.
+import { alert_sounds, AlertSounds, cue_play, cue_playing, cue_volume, cue_frames_mixed,
+         cue_available, cue_stop_all, cue_load_wav, Cue } from "vyto/media/audio/cue";
+import { audio_backend, audio_devices, AUDIO_PLAYBACK } from "vyto/media/audio";
+import { ask } from "vyto/cli/ask";
+import { sleepMs, monoMs, monoUs } from "vyto/util/time";
+import { exit } from "vyto/os";
+
+fn wait_quiet(ms: int): bool {
+    let t0 = monoMs();
+    while (cue_playing() > 0 && monoMs() - t0 < ms) { sleepMs(5); }
+    return cue_playing() == 0;
+}
+
+// Play one cue and say how long the mixer took to start producing it: the
+// time from play() returning until the device consumed the first mixed frames.
+// That is output latency as software can see it (the DAC adds a little more).
+fn play_timed(name: string, c: Cue): bool {
+    let before = cue_frames_mixed();
+    let t0 = monoUs();
+    let ok = cue_play(c);
+    let waited = 0 as i64;
+    while (ok && cue_frames_mixed() == before && monoUs() - t0 < 1000000) { sleepMs(1); }
+    waited = monoUs() - t0;
+    let quiet = wait_quiet(3000);
+    print(`  {name}: {c.ms()} ms long, play {ok}, first frames after ~{waited / 1000} ms, ended {quiet}`);
+    return ok && quiet && cue_frames_mixed() > before;
+}
+
+fn header() {
+    print(`backend: {audio_backend()}`);
+    for (let d in audio_devices()) {
+        if (d.kind == AUDIO_PLAYBACK) { print(`  output: {d.name} ({d.channels} ch, {d.defaultRate} Hz)`); }
+    }
+}
+
+fn check(label: string, ok: bool): int {
+    if (ok) { print(`PASS {label}`); return 0; }
+    print(`FAIL {label}`);
+    return 1;
+}
+
+fn auto(s: AlertSounds): int {
+    let bad = 0;
+    bad += check("mixer open", cue_available());
+    bad += check("success", play_timed("success", s.success));
+    bad += check("warning", play_timed("warning", s.warning));
+    bad += check("error", play_timed("error", s.error));
+    bad += check("attention", play_timed("attention", s.attention));
+    bad += check("click", play_timed("click", s.click));
+    // the same alert five times in quick succession is one sound restarted
+    for (let i in 0..5) { cue_play(s.error); sleepMs(40); }
+    bad += check("burst of one alert stays one voice", cue_playing() == 1);
+    wait_quiet(2000);
+    cue_play(s.success);
+    cue_play(s.warning);
+    cue_play(s.error);
+    cue_play(s.attention);
+    cue_play(s.click);
+    bad += check("five different alerts overlap", cue_playing() == 5);
+    cue_stop_all();
+    bad += check("stop all", wait_quiet(500));
+    return bad;
+}
+
+fn menu(s: AlertSounds) {
+    let vol = 100;
+    print("");
+    print("  1 success    2 warning    3 error    4 attention    5 click");
+    print("  6 all five, one after another");
+    print("  7 error x5 fast (should restart, not pile up)");
+    print("  8 all five at once (overlap)");
+    print("  v volume (100 -> 50 -> 20 -> 100 %)");
+    print("  w play a WAV file");
+    print("  d devices    q quit");
+    while (true) {
+        let k = ask(">", "q").trim();
+        if (k == "q" || k == "") { return; }
+        if (k == "1") { play_timed("success", s.success); }
+        else if (k == "2") { play_timed("warning", s.warning); }
+        else if (k == "3") { play_timed("error", s.error); }
+        else if (k == "4") { play_timed("attention", s.attention); }
+        else if (k == "5") { play_timed("click", s.click); }
+        else if (k == "6") {
+            play_timed("success", s.success);
+            sleepMs(300);
+            play_timed("warning", s.warning);
+            sleepMs(300);
+            play_timed("error", s.error);
+            sleepMs(300);
+            play_timed("attention", s.attention);
+            sleepMs(300);
+            play_timed("click", s.click);
+        }
+        else if (k == "7") {
+            for (let i in 0..5) { cue_play(s.error); sleepMs(60); }
+            print(`  voices sounding after the burst: {cue_playing()} (want 1)`);
+            wait_quiet(2000);
+        }
+        else if (k == "8") {
+            cue_play(s.success);
+            cue_play(s.warning);
+            cue_play(s.error);
+            cue_play(s.attention);
+            cue_play(s.click);
+            print(`  voices sounding: {cue_playing()} (want 5)`);
+            wait_quiet(2000);
+        }
+        else if (k == "v") {
+            if (vol == 100) { vol = 50; } else if (vol == 50) { vol = 20; } else { vol = 100; }
+            cue_volume((vol as float) / 100.0);
+            print(`  volume {vol} %`);
+            play_timed("attention", s.attention);
+        }
+        else if (k == "w") {
+            let p = ask("WAV path", "C:\\Windows\\Media\\chord.wav").trim();
+            let c = cue_load_wav(p);
+            if (c == null) { print("  not a WAV this reads (PCM or float, up to 30 s)"); }
+            else { play_timed(p, c); }
+        }
+        else if (k == "d") { header(); }
+        else { print("  ?"); }
+    }
+}
+
+fn main() {
+    let t0 = monoMs();
+    let s = alert_sounds();
+    print(`cue_demo: sounds built and mixer opened in {monoMs() - t0} ms`);
+    header();
+    let a = args();
+    let auto_mode = false;
+    for (let i in 0..a.len) {
+        if (a[i] == "--auto") { auto_mode = true; }
+        if (a[i] == "--volume" && i + 1 < a.len) {
+            let pct = a[i + 1].to_int();
+            cue_volume((pct as float) / 100.0);
+            print(`volume {pct} %`);
+        }
+    }
+    if (!cue_available()) {
+        print("no audio output on this machine: every play is a no-op");
+        if (auto_mode) { exit(1); }
+        return;
+    }
+    if (auto_mode) {
+        let bad = auto(s);
+        if (bad == 0) { print("ALL PASS"); } else { print(`{bad} FAILED`); exit(1); }
+        return;
+    }
+    menu(s);
+}

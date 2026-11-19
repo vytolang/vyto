@@ -1,0 +1,68 @@
+// vyto/media/audio against miniaudio's null backend (VYTO_AUDIO=null):
+// a device that consumes samples at real-time pace and plays nothing, so the
+// whole ring path runs on a machine with no sound card. Run by run_tests.sh.
+import { audio_available, audio_backend, audio_devices, audio_open_playback,
+         audio_open_playback_device, audio_open_capture, AUDIO_PLAYBACK, AUDIO_CAPTURE } from "vyto/media/audio";
+import { sleepMs, monoMs } from "vyto/util/time";
+
+fn tone(n: int): f32[] {
+    let out: f32[] = [];
+    for (let i in 0..n) { out.push(0.25 as f32); }
+    return out;
+}
+
+fn main() {
+    print(`available: {audio_available()}`);
+    print(`backend: {audio_backend()}`);
+
+    let play = 0;
+    let cap = 0;
+    let pid = "";
+    for (let d in audio_devices()) {
+        if (d.kind == AUDIO_PLAYBACK) { play += 1; pid = d.id; }
+        if (d.kind == AUDIO_CAPTURE) { cap += 1; }
+    }
+    // the null device's id is all zero bytes, so it hex-encodes to "" — the default
+    print(`devices: playback {play > 0}, capture {cap > 0}, id "{pid}"`);
+
+    let p = audio_open_playback(48000, 2);
+    print(`open: {p != null}`);
+    if (p == null) { return; }
+    // half a second of stereo at 48 kHz
+    print(`writable empty: {p.writable()}`);
+    print(`write 1000: {p.write(tone(1000))}`);
+    print(`write 3 (one partial frame dropped): {p.write(tone(3))}`);
+    print(`writable after: {p.writable()}`);
+    // fill to the brim: backpressure, not an error
+    print(`write 60000 into a full-ish ring: {p.write(tone(60000))}`);
+    print(`writable full: {p.writable()}`);
+    print(`played before start: {p.framesPlayed()}`);
+    print(`start: {p.start()}, again: {p.start()}`);
+    let t0 = monoMs();
+    while (p.framesPlayed() == 0 && monoMs() - t0 < 2000) { sleepMs(5); }
+    print(`played after start: {p.framesPlayed() > 0}`);
+    print(`ring draining: {p.writable() > 0}`);
+    print(`stop: {p.stop()}`);
+    let held = p.framesPlayed();
+    sleepMs(60);
+    print(`stopped holds: {p.framesPlayed() == held}`);
+
+    // an id from the list opens the same device; a malformed one does not
+    let q = audio_open_playback_device(pid, 44100, 1);
+    print(`open by id: {q != null}`);
+    print(`open bad id: {audio_open_playback_device("zz", 44100, 1) == null}`);
+    print(`open 3 channels: {audio_open_playback(48000, 3) == null}`);
+    print(`open rate 0: {audio_open_playback(0, 2) == null}`);
+
+    let c = audio_open_capture(16000, 1);
+    print(`capture open: {c != null}`);
+    if (c == null) { return; }
+    print(`capture read before start: {c.read(100).len}`);
+    print(`capture start: {c.start()}`);
+    let t1 = monoMs();
+    while (c.readable() < 100 && monoMs() - t1 < 2000) { sleepMs(5); }
+    let got = c.read(100);
+    print(`capture read 100: {got.len}`);
+    print(`capture overruns: {c.overruns()}`);
+    c.stop();
+}

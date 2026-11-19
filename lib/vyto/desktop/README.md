@@ -6,7 +6,9 @@ default app", and the per-user folders an app keeps its files in.
 Running as a Windows or systemd service is the sibling package
 [`vyto/desktop/service`](service/README.md). A menu bar — the OS's own on Windows,
 drawn on Linux — is [`vyto/desktop/menu`](menu/README.md). Raw printing through the
-OS print queues is [`vyto/desktop/print`](print/README.md).
+OS print queues is [`vyto/desktop/print`](print/README.md). The OS's own
+notifications, a desktop banner on Linux and a tray balloon or toast on Windows,
+are [`vyto/desktop/notify`](notify/README.md).
 
 ```vyto
 import { FileDialog, message, confirm, openUrl, configDir, MSG_INFO } from "vyto/desktop";

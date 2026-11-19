@@ -1,0 +1,228 @@
+// vyto/media/audio/cue — short sounds, fire and forget: alerts, clicks, chimes.
+//
+//     import { alert_sounds, cue_play } from "vyto/media/audio/cue";
+//
+//     let s = alert_sounds();          // built once, kept for the app's life
+//     cue_play(s.error);               // returns at once; the sound plays on
+//
+// vyto/media/audio moves a stream of samples you keep feeding. A cue is the
+// other shape: a clip loaded once into C memory, then played with one call
+// that never blocks and never needs feeding. Up to eight play at once, mixed
+// in the device callback; playing a cue that is still sounding restarts it
+// instead of stacking a copy, so a burst of the same alert stays one sound.
+//
+// It obeys the same rule as the rest of the package: the device thread touches
+// C memory only. A Cue's samples are copied into the mixer when it is made and
+// freed (on this thread) only once no voice is playing them, so dropping a Cue
+// mid-sound is safe — the sound finishes.
+//
+// The built-in sounds are synthesised here, not shipped as files: a few
+// hundred lines of nothing beats a licence and an asset. A program that wants
+// its own sounds loads a WAV (cue_load_wav) or builds samples with note(),
+// buzz() and rest().
+//
+// The mixer opens the default output device once and keeps it running: an
+// idle mixer writes silence every ~10 ms, which costs nothing measurable, and a
+// running device answers play() in one period. Opening is the slow part —
+// 415 ms on PulseAudio here, most of it the backend's own setup — so do it at
+// startup, not on the first alert: alert_sounds() does, and cue_available()
+// does for an app with its own sounds. cue_close() releases the device. With no sound card every play returns false and
+// nothing else happens, so a program needs no "has audio?" branch.
+
+import { sin, exp, PI } from "vyto/math";
+import { file_exists } from "vyto/io/file";
+
+extern "C" {
+    fn vcue_open(): i32;
+    fn vcue_close();
+    fn vcue_clip(pcm: rawptr, n: i64, rate: i32): rawptr;
+    fn vcue_clip_wav(data: rawptr, len: i64): rawptr;
+    fn vcue_clip_frames(c: rawptr): i64;
+    fn vcue_clip_drop(c: rawptr);
+    fn vcue_play(c: rawptr, gain_milli: i32): i32;
+    fn vcue_stop_all();
+    fn vcue_set_volume(milli: i32);
+    fn vcue_playing(): i32;
+    fn vcue_frames(): i64;
+}
+
+// The mixer's rate. Samples given at another rate are resampled once, when the
+// Cue is made; synthesise at this one and nothing is resampled at all.
+export const CUE_RATE: int = 48000;
+
+// ---- cues -------------------------------------------------------------------
+
+// A clip in the mixer. Make one with cue_from_samples, cue_from_wav or
+// cue_load_wav; keep it as long as it may be played.
+export class Cue {
+    handle: rawptr;
+    frames: int;
+
+    fn init(handle: rawptr) {
+        this.handle = handle;
+        this.frames = vcue_clip_frames(handle) as int;
+    }
+
+    deinit { vcue_clip_drop(this.handle); }
+
+    // Its length in milliseconds.
+    fn ms(): int { return this.frames * 1000 / CUE_RATE; }
+}
+
+// Mono samples, -1..1, at `rate` Hz. Null for an empty clip, a rate outside
+// 8-384 kHz, or one longer than 30 seconds (these are alerts, not music).
+export fn cue_from_samples(samples: f32[], rate: int): Cue {
+    if (samples.len == 0) { return null; }
+    let h = vcue_clip(samples as rawptr, samples.len as i64, rate as i32);
+    if (h == null) { return null; }
+    return new Cue(h);
+}
+
+// A WAV file's bytes: PCM 8/16/24/32-bit or 32-bit float, any channel count
+// (mixed down to mono), up to 30 seconds. Null for anything else, compressed
+// WAVs included.
+export fn cue_from_wav(data: byte[]): Cue {
+    if (data.len == 0) { return null; }
+    let h = vcue_clip_wav(data as rawptr, data.len as i64);
+    if (h == null) { return null; }
+    return new Cue(h);
+}
+
+// The same, from a file. Null when it is missing or not a WAV this reads.
+export fn cue_load_wav(path: string): Cue {
+    if (!file_exists(path) || isdir(path)) { return null; }
+    let s = readfile(path);
+    if (s.len == 0) { return null; }
+    let h = vcue_clip_wav(s.cstr() as rawptr, s.len as i64);
+    if (h == null) { return null; }
+    return new Cue(h);
+}
+
+// ---- playing ----------------------------------------------------------------
+
+// Whether cues can be heard: the mixer's device opened. Opens it if not yet.
+export fn cue_available(): bool { return vcue_open() != 0; }
+
+// Play a cue at full gain. Returns at once. True when it is sounding — started,
+// or restarted because it already was; false with no device, a null cue, or
+// all eight voices busy.
+export fn cue_play(c: Cue): bool { return cue_play_gain(c, 1.0); }
+
+// Play at `gain` (1.0 = as made; up to 4.0). Restarting a sounding cue takes
+// the new gain.
+export fn cue_play_gain(c: Cue, gain: float): bool {
+    if (c == null) { return false; }
+    return vcue_play(c.handle, (gain * 1000.0) as i32) != 0;
+}
+
+// Master volume for every cue, 0.0-1.0. Applies to sounds already playing.
+export fn cue_volume(v: float) { vcue_set_volume((v * 1000.0) as i32); }
+
+// Silence everything, within one device period.
+export fn cue_stop_all() { vcue_stop_all(); }
+
+// How many cues are sounding right now.
+export fn cue_playing(): int { return vcue_playing() as int; }
+
+// Frames the mixer has produced while at least one cue was sounding. For tests
+// and diagnostics: it rising is proof the device is consuming the mix.
+export fn cue_frames_mixed(): int { return vcue_frames() as int; }
+
+// Release the device. Cues stay valid, and the next play reopens it.
+export fn cue_close() { vcue_close(); }
+
+// ---- synthesis --------------------------------------------------------------
+// Three building blocks, all at CUE_RATE, all ending at exactly zero so that
+// joined pieces never click.
+
+// A struck tone: a 3 ms attack, then an exponential decay to silence by the
+// end, with a quiet octave above for some body. Sounds like a soft bell, which
+// is less fatiguing over a shift than a flat beep.
+export fn note(hz: float, ms: int, gain: float): f32[] {
+    let n = ms * CUE_RATE / 1000;
+    let out: f32[] = [];
+    out.reserve(n);
+    let attack = 3 * CUE_RATE / 1000;
+    let w = 2.0 * PI * hz / (CUE_RATE as float);
+    for (let i in 0..n) {
+        let t = i as float / (n as float);
+        let env = exp(-4.0 * t) * (1.0 - t);
+        if (i < attack) { env = env * (i as float) / (attack as float); }
+        let x = sin(w * (i as float)) + 0.25 * sin(2.0 * w * (i as float));
+        out.push((x * env * gain * 0.8) as f32);
+    }
+    return out;
+}
+
+// A flat, buzzy tone: the first four odd harmonics (a softened square wave),
+// 5 ms fades at each end. Unmistakably "no", without being harsh.
+export fn buzz(hz: float, ms: int, gain: float): f32[] {
+    let n = ms * CUE_RATE / 1000;
+    let out: f32[] = [];
+    out.reserve(n);
+    let fade = 5 * CUE_RATE / 1000;
+    let w = 2.0 * PI * hz / (CUE_RATE as float);
+    for (let i in 0..n) {
+        let p = w * (i as float);
+        let x = sin(p) + sin(3.0 * p) / 3.0 + sin(5.0 * p) / 5.0 + sin(7.0 * p) / 7.0;
+        let env = 1.0;
+        if (i < fade) { env = (i as float) / (fade as float); }
+        if (n - i < fade) { env = ((n - i) as float) / (fade as float); }
+        out.push((x * env * gain * 0.6) as f32);
+    }
+    return out;
+}
+
+// Silence, for gaps between pieces.
+export fn rest(ms: int): f32[] {
+    let out: f32[] = [];
+    let n = ms * CUE_RATE / 1000;
+    out.reserve(n);
+    for (let i in 0..n) { out.push(0 as f32); }
+    return out;
+}
+
+// `b` appended to `a`; returns `a`, so pieces chain:
+// then(then(note(...), rest(40)), note(...)).
+export fn then(a: f32[], b: f32[]): f32[] {
+    a.extend(b);
+    return a;
+}
+
+// ---- the built-in alert sounds ----------------------------------------------
+
+// The five sounds a till, a kiosk or a desktop tool needs, each under half a
+// second and recognisable without looking:
+//
+//   success    two rising notes        a sale done, a scan accepted
+//   warning    one note, twice         look at the screen when you can
+//   error      a low falling buzz      that did not work (unknown barcode)
+//   attention  three rising notes      someone is needed (a PIN, a manager)
+//   click      a tick                  a key or button acknowledged
+//
+// Any field is null when the mixer could not take the clip (no memory), and
+// cue_play(null) is a no-op, so an app need not check.
+export class AlertSounds {
+    success: Cue;
+    warning: Cue;
+    error: Cue;
+    attention: Cue;
+    click: Cue;
+
+    fn init() {
+        this.success = cue_from_samples(then(note(1318.5, 70, 0.45), note(1760.0, 160, 0.45)), CUE_RATE);
+        this.warning = cue_from_samples(then(then(note(880.0, 120, 0.5), rest(60)), note(880.0, 120, 0.5)), CUE_RATE);
+        this.error = cue_from_samples(then(buzz(392.0, 130, 0.35), buzz(261.6, 220, 0.35)), CUE_RATE);
+        this.attention = cue_from_samples(then(then(note(784.0, 100, 0.45), note(987.8, 100, 0.45)),
+                                               note(1174.7, 200, 0.45)), CUE_RATE);
+        this.click = cue_from_samples(note(2400.0, 14, 0.3), CUE_RATE);
+    }
+}
+
+// Builds the five sounds and opens the mixer's device, so the first alert is
+// not the one that waits for it. Call it at startup.
+export fn alert_sounds(): AlertSounds {
+    let s = new AlertSounds();
+    vcue_open();
+    return s;
+}

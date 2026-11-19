@@ -1,0 +1,33 @@
+// vyto/desktop/notify against tests/fixtures/desktop/fake_notifyd.py on a
+// private session bus. The fake logs every typed argument it receives; this
+// prints what the Vyto side sees. run_tests.sh compares both.
+import { notify, notify_app, notify_replace, notify_for, notify_close, notify_quiet,
+         notify_available, notify_server, NOTIFY_INFO, NOTIFY_WARNING, NOTIFY_ERROR } from "vyto/desktop/notify";
+
+import { chr } from "vyto/util/text";
+import { monoMs } from "vyto/util/time";
+
+fn main() {
+    notify_app("Till 1");
+    print(`available: {notify_available()} server: {notify_server()}`);
+    // the fake holds each Notify reply back 400 ms, like GNOME: nothing below
+    // may wait for one
+    let t0 = monoMs();
+    let a = notify("Printer offline", "Receipts queue until it is back", NOTIFY_WARNING);
+    print(`first id > 0: {a > 0}`);
+    let b = notify_replace(a, "Printer back", "3 receipts printed", NOTIFY_INFO);
+    print(`replace keeps the id: {b == a}`);
+    notify_quiet(true);
+    let c = notify_for("Drawer open", "Tea & <milk> \"quoted\" 'single' $(touch pwned)", NOTIFY_ERROR, 2500);
+    print(`third is new: {c != a && c > 0}`);
+    notify_quiet(false);
+    // before the next notice: on Windows there is one balloon, and a later
+    // notice would already have replaced this one
+    print(`close: {notify_close(c)}`);
+    // a byte that is not UTF-8 must not reach libdbus, which would abort
+    let bad = "A" + chr(255) + "B";
+    print(`bad utf-8 shown: {notify(bad, "", NOTIFY_INFO) > 0}`);
+    print(`close 0: {notify_close(0)}`);
+    print(`close unknown: {notify_close(999)}`);
+    print(`no call waited: {monoMs() - t0 < 300}`);
+}

@@ -147,6 +147,9 @@ tests/hw/usb_props.vt|usb_props|eq|
 tests/hw/device_props.vt|device_props|eq|
 tests/hw/input_props.vt|input_props|eq|
 tests/hw/serial_props.vt|serial_props|eq|
+tests/fixtures/audio_null.vt|audio_null|eq||VYTO_AUDIO=null
+tests/fixtures/notify_demo.vt|notify_demo|eq|
+tests/win/cue_demo.vt|cue_demo|contains|--auto|VYTO_AUDIO=null
 EOF
 )
 

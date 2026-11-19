@@ -277,6 +277,55 @@ else
     echo "FAIL freestanding_image_stub (vyto/media/image's VT_NO_LIBC arm does not build)"
     fail=1
 fi
+# vyto/media/audio: miniaudio needs pthreads, dlopen and libm, so both shim
+# TUs carry a VT_NO_LIBC arm (audio_ma.c becomes empty). Read with nm, not the
+# exit status: the object defining vaud_open must reference nothing, and no
+# object in the archive may reference pthread_create — which is what a
+# bypassed guard around the miniaudio implementation would leave behind.
+if ./vytoc build tests/fixtures/audio_freestanding.vt --freestanding --cc gcc \
+        -o examples/.vyto-cache/libaud_fs.a >/dev/null 2>&1; then
+    aud_obj=$(nm -A examples/.vyto-cache/libaud_fs.a 2>/dev/null \
+        | awk '/ T vaud_open$/ { split($1, a, ":"); print a[2]; exit }')
+    aud_undef=$(nm -A examples/.vyto-cache/libaud_fs.a 2>/dev/null \
+        | grep -c ":$aud_obj: *U ")
+    aud_thr=$(nm -A examples/.vyto-cache/libaud_fs.a 2>/dev/null | grep -c " U pthread_create")
+    # cue_shim.c is in the same native/src, so it is compiled too: its stub
+    # object must be as clean
+    cue_obj=$(nm -A examples/.vyto-cache/libaud_fs.a 2>/dev/null \
+        | awk '/ T vcue_play$/ { split($1, a, ":"); print a[2]; exit }')
+    cue_undef=$(nm -A examples/.vyto-cache/libaud_fs.a 2>/dev/null \
+        | grep -c ":$cue_obj: *U ")
+    [ -n "$cue_obj" ] || cue_undef=1
+    aud_undef=$((aud_undef + cue_undef))
+    if [ -n "$aud_obj" ] && [ "$aud_undef" -eq 0 ] && [ "$aud_thr" -eq 0 ]; then
+        echo "PASS freestanding_audio_stub"
+    else
+        echo "FAIL freestanding_audio_stub (stub '$aud_obj' has $aud_undef undefined, $aud_thr pthread refs)"
+        fail=1
+    fi
+else
+    echo "FAIL freestanding_audio_stub (vyto/media/audio's VT_NO_LIBC arm does not build)"
+    fail=1
+fi
+# vyto/desktop/notify: its Linux arm dlopens libdbus and starts a pthread, so
+# the stub arm must answer alone. Same nm reading: the object defining
+# vnot_show references nothing.
+if ./vytoc build tests/fixtures/notify_freestanding.vt --freestanding --cc gcc \
+        -o examples/.vyto-cache/libnot_fs.a >/dev/null 2>&1; then
+    not_obj=$(nm -A examples/.vyto-cache/libnot_fs.a 2>/dev/null \
+        | awk '/ T vnot_show$/ { split($1, a, ":"); print a[2]; exit }')
+    not_undef=$(nm -A examples/.vyto-cache/libnot_fs.a 2>/dev/null \
+        | grep -c ":$not_obj: *U ")
+    if [ -n "$not_obj" ] && [ "$not_undef" -eq 0 ]; then
+        echo "PASS freestanding_notify_stub"
+    else
+        echo "FAIL freestanding_notify_stub (stub '$not_obj' has $not_undef undefined symbols)"
+        fail=1
+    fi
+else
+    echo "FAIL freestanding_notify_stub (vyto/desktop/notify's VT_NO_LIBC arm does not build)"
+    fail=1
+fi
 # vyto/win/d2d off Windows. Its shim is all COM and Direct2D behind
 # `#if defined(_WIN32) && !defined(VT_NO_LIBC)`; everywhere else a stub arm
 # answers. Two checks, because they catch different rot: the hosted run proves
@@ -918,6 +967,105 @@ else
     echo "FAIL net_vendored_curl_unmodified (native/windows-x64/ differs from refresh-curl.sh's output)"
     fail=1
 fi
+
+# --- vyto/media/audio: the vendored miniaudio header is byte-identical ---
+# Same reasoning as the SQLite check. Local configuration belongs in
+# audio_config.h, never in native/src/miniaudio/.
+if sh lib/vyto/media/audio/native/refresh-miniaudio.sh --verify >/dev/null 2>&1; then
+    echo "PASS audio_vendored_miniaudio_unmodified"
+else
+    echo "FAIL audio_vendored_miniaudio_unmodified (native/src/miniaudio/ has been edited)"
+    fail=1
+fi
+
+# --- vyto/desktop/notify over D-Bus, against a fake notification server ---
+# tests/fixtures/desktop/fake_notifyd.py owns org.freedesktop.Notifications on
+# a private bus (dbus-run-session) and logs every typed argument it receives,
+# so the golden is what really crossed D-Bus: urgency, suppress-sound, the
+# server id a replace carries, the close. It holds each reply back 400 ms the
+# way GNOME 42 does (2.5-6 s), and the fixture asserts no call waited for one.
+# Run twice: a plain server, and one advertising body-markup, which must get
+# & < > escaped. Needs dbus-run-session and python3-gi; SKIPs without them.
+if command -v dbus-run-session >/dev/null 2>&1 && python3 -c 'from gi.repository import Gio' 2>/dev/null; then
+    ./vytoc build tests/fixtures/notify_demo.vt -o tests/tmp/notify_demo >/dev/null 2>&1
+    for nm in plain markup; do
+        nd=$(pwd)/tests/tmp/notify_$nm; rm -rf "$nd"; mkdir -p "$nd"
+        mk=0; [ "$nm" = markup ] && mk=1
+        FAKE_DIR=$nd FAKE_MARKUP=$mk FAKE_DELAY_MS=400 dbus-run-session -- sh -c '
+            python3 tests/fixtures/desktop/fake_notifyd.py & fp=$!
+            for _ in $(seq 50); do [ -e "$FAKE_DIR/ready" ] && break; sleep 0.1; done
+            ./tests/tmp/notify_demo > "$FAKE_DIR/out" 2>&1
+            sleep 0.5; kill $fp' >/dev/null 2>&1
+        if [ "$(cat "$nd/out" 2>/dev/null)" = "$(cat tests/fixtures/notify_demo.expected)" ] &&
+           [ "$(cat "$nd/notify.log" 2>/dev/null)" = "$(cat tests/fixtures/notify_dbus_$nm.expected)" ]; then
+            echo "PASS notify_dbus_$nm"
+        else
+            echo "FAIL notify_dbus_$nm"
+            diff tests/fixtures/notify_demo.expected "$nd/out" | head -10
+            diff tests/fixtures/notify_dbus_$nm.expected "$nd/notify.log" | head -10
+            fail=1
+        fi
+    done
+else
+    echo "SKIP notify_dbus (needs dbus-run-session and python3-gi)"
+fi
+# No session bus at all, and VYTO_NOTIFY=off: unavailable, every call 0/false,
+# and no libdbus autolaunch of a bus nobody asked for.
+for how in nobus off; do
+    if [ "$how" = nobus ]; then
+        got=$(env -u DBUS_SESSION_BUS_ADDRESS -u XDG_RUNTIME_DIR ./vytoc run tests/fixtures/notify_demo.vt 2>&1)
+    else
+        got=$(VYTO_NOTIFY=off ./vytoc run tests/fixtures/notify_demo.vt 2>&1)
+    fi
+    if [ "$got" = "$(cat tests/fixtures/notify_off.expected)" ]; then
+        echo "PASS notify_$how"
+    else
+        echo "FAIL notify_$how"
+        echo "$got" | diff tests/fixtures/notify_off.expected - | head -10
+        fail=1
+    fi
+done
+
+# --- vyto/media/audio against miniaudio's null backend, and with none ---
+# VYTO_AUDIO=null is a device that consumes samples at real-time pace and plays
+# nothing, so the whole ring path (backpressure, partial frames, start/stop,
+# framesPlayed, capture) runs with no sound card. VYTO_AUDIO=off is the machine
+# with no sound card: available() false and every open null, never a panic.
+# null must never be picked unasked; that is what makes the off case honest.
+for m in null off; do
+    got=$(VYTO_AUDIO=$m ./vytoc run tests/fixtures/audio_null.vt 2>&1)
+    if [ "$got" = "$(cat tests/fixtures/audio_$m.expected)" ]; then
+        echo "PASS audio_$m"
+    else
+        echo "FAIL audio_$m"
+        echo "$got" | diff tests/fixtures/audio_$m.expected - | head -20
+        fail=1
+    fi
+done
+# tests/win/cue_demo.vt is the hand-run listening test for Windows; its --auto
+# mode is staged by run_tests_win.sh. Run it here too so it cannot rot.
+got=$(VYTO_AUDIO=null ./vytoc run tests/win/cue_demo.vt -- --auto 2>&1)
+if echo "$got" | grep -qx "ALL PASS"; then
+    echo "PASS cue_demo_auto"
+else
+    echo "FAIL cue_demo_auto"
+    echo "$got" | grep -v "^PASS" | head -10
+    fail=1
+fi
+# vyto/media/audio/cue, the fire-and-forget mixer, on the same two backends:
+# replay restarts rather than stacks, eight voices then refusal, stop_all,
+# dropping a Cue mid-sound, WAV parsing and resampling (22.05 kHz stereo in,
+# 48 kHz mono out), and with no device every play false and nothing else.
+for m in null off; do
+    got=$(VYTO_AUDIO=$m ./vytoc run tests/fixtures/audio_cue.vt 2>&1)
+    if [ "$got" = "$(cat tests/fixtures/audio_cue_$m.expected)" ]; then
+        echo "PASS audio_cue_$m"
+    else
+        echo "FAIL audio_cue_$m"
+        echo "$got" | diff tests/fixtures/audio_cue_$m.expected - | head -20
+        fail=1
+    fi
+done
 
 # --- vyto/compress: does our gzip interoperate with the system gzip? ---
 #

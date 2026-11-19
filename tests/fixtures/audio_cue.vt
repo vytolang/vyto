@@ -1,0 +1,101 @@
+// vyto/media/audio/cue on miniaudio's null backend (VYTO_AUDIO=null), and
+// with no backend (VYTO_AUDIO=off). Run by run_tests.sh.
+import { alert_sounds, cue_play, cue_play_gain, cue_playing, cue_stop_all, cue_volume,
+         cue_available, cue_frames_mixed, cue_from_samples, cue_from_wav, cue_load_wav,
+         cue_close, note, rest, then, CUE_RATE, Cue } from "vyto/media/audio/cue";
+import { sleepMs, monoMs } from "vyto/util/time";
+
+fn wait_quiet(ms: int): bool {
+    let t0 = monoMs();
+    while (cue_playing() > 0 && monoMs() - t0 < ms) { sleepMs(5); }
+    return cue_playing() == 0;
+}
+
+fn put16(b: byte[], at: int, v: int) {
+    b[at] = (v & 255) as byte;
+    b[at + 1] = ((v >> 8) & 255) as byte;
+}
+
+fn put32(b: byte[], at: int, v: int) {
+    put16(b, at, v & 65535);
+    put16(b, at + 2, (v >> 16) & 65535);
+}
+
+fn tag(b: byte[], at: int, s: string) {
+    for (let i in 0..4) { b[at + i] = s[i] as byte; }
+}
+
+// 0.1 s of 16-bit stereo at 22050 Hz: should come out as 4800 frames at 48 kHz
+fn wav16(): byte[] {
+    let frames = 2205;
+    let data = frames * 4;
+    let b = bytes(44 + data);
+    tag(b, 0, "RIFF");
+    put32(b, 4, 36 + data);
+    tag(b, 8, "WAVE");
+    tag(b, 12, "fmt ");
+    put32(b, 16, 16);
+    put16(b, 20, 1);
+    put16(b, 22, 2);
+    put32(b, 24, 22050);
+    put32(b, 28, 22050 * 4);
+    put16(b, 32, 4);
+    put16(b, 34, 16);
+    tag(b, 36, "data");
+    put32(b, 40, data);
+    for (let i in 0..frames) {
+        put16(b, 44 + i * 4, 8000);
+        put16(b, 46 + i * 4, 65536 - 8000);
+    }
+    return b;
+}
+
+fn main() {
+    let s = alert_sounds();
+    print(`lengths ms: success {s.success.ms()} warning {s.warning.ms()} error {s.error.ms()} attention {s.attention.ms()} click {s.click.ms()}`);
+    print(`available: {cue_available()}`);
+    print(`play null cue: {cue_play(null)}`);
+
+    let before = cue_frames_mixed();
+    print(`play error: {cue_play(s.error)}, playing {cue_playing()}`);
+    print(`replay restarts, not stacks: {cue_play(s.error)}, playing {cue_playing()}`);
+    print(`finishes on its own: {wait_quiet(2000)}`);
+    print(`mixed while sounding: {cue_frames_mixed() > before}`);
+
+    cue_play(s.success);
+    cue_play(s.warning);
+    cue_play(s.error);
+    cue_play(s.attention);
+    cue_play(s.click);
+    print(`five at once: {cue_playing()}`);
+    print(`still sounding before stop: {cue_playing() > 0}`);
+    cue_stop_all();
+    print(`stopped: {wait_quiet(500)}`);
+
+    // eight voices, then the ninth distinct cue is refused
+    let many: Cue[] = [];
+    for (let i in 0..9) { many.push(cue_from_samples(note(500.0 + (i as float) * 50.0, 400, 0.3), CUE_RATE)); }
+    let took = 0;
+    for (let c in many) { if (cue_play(c)) { took += 1; } }
+    print(`voices taken of 9: {took}`);
+    // dropping a sounding cue is safe: it finishes, then the mixer frees it
+    many = [];
+    print(`dropped while sounding, still playing: {cue_playing()}`);
+    cue_volume(0.2);
+    print(`quiet after drop: {wait_quiet(2000)}`);
+    cue_volume(1.0);
+
+    let w = cue_from_wav(wav16());
+    if (w != null) { print(`wav 22050 stereo 0.1 s -> frames {w.frames}`); } else { print("wav: null"); }
+    print(`wav plays: {cue_play_gain(w, 0.5)}`);
+    print(`not a wav: {cue_from_wav(bytes(64)) == null}`);
+    print(`missing file: {cue_load_wav("/nonexistent/x.wav") == null}`);
+    print(`empty samples: {cue_from_samples(rest(0), CUE_RATE) == null}`);
+    print(`bad rate: {cue_from_samples(rest(10), 100) == null}`);
+    print(`resampled 24 kHz: {cue_from_samples(rest(100), 24000).frames}`);
+
+    wait_quiet(1000);
+    cue_close();
+    print(`plays again after close: {cue_play(s.click)}`);
+    wait_quiet(1000);
+}

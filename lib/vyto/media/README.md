@@ -1,7 +1,7 @@
 # vyto/media — images, audio, video, fonts
 
-> **Status: two modules implemented, five stubs.** `vyto/media/image` and `vyto/media/qr` work.
-> `audio`, `video`, `font`, `codec` and `camera` declare their APIs and every
+> **Status: three modules implemented, four stubs.** `vyto/media/image`, `vyto/media/qr` and
+> `vyto/media/audio` work. `video`, `font`, `codec` and `camera` declare their APIs and every
 > entry point panics — see [Status](#status) before depending on one.
 
 Media is where a systems language meets a pile of large C libraries, and the
@@ -28,7 +28,7 @@ encodePNG(imageFromRGB(px, 2, 2), "out.png");
 |--------|-------------------|:------:|:------:|
 | `vyto/media/image` | PNG/JPEG/BMP/TGA **encode**, decode to a readable `i32[]`, `Image` | ✅ | stb_image_write, vendored |
 | `vyto/media/qr` | QR Code encoder: module grid for any payload, byte mode, ECC L/M/Q/H | ✅ | none, pure Vyto |
-| `vyto/media/audio` | miniaudio playback, capture, device enumeration | 🚧 stub | planned |
+| `vyto/media/audio` | playback, capture, device enumeration; `audio/cue` for alert sounds | ✅ | miniaudio, vendored |
 | `vyto/media/video` | FFmpeg demux, decode and scale to `Image` frames | 🚧 stub | planned |
 | `vyto/media/font` | FreeType/HarfBuzz shaping — Arabic, Indic, ligatures | 🚧 stub | planned |
 | `vyto/media/codec` | container mux/demux and stream metadata, below `video` | 🚧 stub | planned |
