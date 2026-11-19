@@ -267,11 +267,16 @@ it:
 | `win.remove_poll_source(id)` | both return an id; remove the source when the work is done |
 | `win.after(ms, body)` | run `body` once, `ms` from now: a slideshow's next picture, a message that clears itself. Returns an id; re-arm from `body` to repeat |
 | `win.cancel_after(id)` | drop a timer that has not fired |
+| `win.last_input_ms` | when the user last keyed, clicked, touched, moved or scrolled, on `surf.now_ms()`'s clock. For an idle rule, check it from an `after` timer |
 
 A pending `after` costs one wake when it is due, nothing before: the idle loop
 sleeps exactly until the earliest timer instead of blocking in `wait()`, and
 goes back to `wait()` once none is pending. Like a poll source, `body` repaints
 what it changes itself.
+
+An idle lock is one repeating `after` that compares `win.last_input_ms` with
+`win.surf.now_ms()`: the loop stamps the field on every input event, so no
+per-event hook and no extra wake is needed.
 
 `body` runs once per pass of the loop while the source is registered. It does
 **not** repaint: call `redraw()` or `invalidate()` when something visible
