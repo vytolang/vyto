@@ -14,6 +14,7 @@
 // No Window: this drives the widget's own methods, which is what on_key calls.
 import { DataTable } from "vyto/ui/datatable";
 import { DataFrame, CK_I64, CK_STR } from "vyto/data/frame";
+import { KEY_ENTER, KEY_BACKSPACE } from "vyto/surface";
 
 fn build(): DataFrame {
     let df = new DataFrame(8);
@@ -73,4 +74,39 @@ fn main() {
     dt3.begin_edit_with("9");
     dt3.commit_edit();
     print("numeric frame=" + df3.cellStr(0, 0));
+
+    // ---- an input column: opened by the mouse, its text selected ----------
+    let df4 = build();
+    let dt4 = new DataTable(df4);
+    dt4.setEditable(true);
+    dt4.cols[1].input = true;
+    print("input   col0=" + str(dt4.input_at(0)) + " col1=" + str(dt4.input_at(1)));
+    let seen: int[] = [0];
+    dt4.onCellEdit = (vrow, cpos, text) => { seen[0] = seen[0] + 1; return true; };
+    dt4.selected = 0;
+    dt4.cur_col = 1;
+    dt4.begin_edit_all();
+    print("opened  all=" + str(dt4.edit_all) + " buf=" + dt4.edit_buf);
+    // the first key replaces the selected text, the next ones add to it
+    dt4.edit_cell_key(0, "4");
+    dt4.edit_cell_key(0, "2");
+    print("typed   buf=" + dt4.edit_buf + " all=" + str(dt4.edit_all));
+    // Enter keeps it and steps down a row, ready for the next
+    dt4.edit_cell_key(KEY_ENTER, "");
+    print("enter   frame=" + df4.cellStr(0, 1) + " row=" + str(dt4.selected) + " editing=" + str(dt4.editing));
+    // Backspace on the selected text clears it all
+    dt4.begin_edit_all();
+    dt4.edit_cell_key(KEY_BACKSPACE, "");
+    print("cleared buf=[" + dt4.edit_buf + "]");
+    // opened and left unchanged: the owner is not asked
+    dt4.editing = false;
+    let before = seen[0];
+    dt4.begin_edit_all();
+    dt4.edit_cell_key(KEY_ENTER, "");
+    print("same    asked=" + str(seen[0] - before));
+    // an owner about to act keeps what is being typed
+    dt4.selected = 2;
+    dt4.begin_edit_with("7");
+    dt4.finish_edit();
+    print("finish  frame=" + df4.cellStr(2, 1) + " editing=" + str(dt4.editing));
 }

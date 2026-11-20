@@ -90,6 +90,13 @@ export class DtColumn {
     // background, focus ring and grid line are still drawn around it. Copy and
     // CSV export still use the text (format, else the value).
     cellPaint: fn(Painter, Rect, DataFrame, int, int);
+    // A column of input boxes, in a grid that is setEditable. Each cell draws
+    // as a box, so it reads as "type here" at a glance, and a click on one
+    // opens it with its text selected: typing replaces it. Enter keeps the
+    // value and steps down a row, ready for the next. Off by default — a
+    // click on a plain editable cell only selects it, because grids like a
+    // product list use double-click to open the row instead.
+    input: bool;
 
     fn init(title: string, width: float, col: int) {
         this.title = title;
@@ -101,6 +108,7 @@ export class DtColumn {
         this.min_w = 40;
         this.filter_text = "";
         this.type_tag = "";
+        this.input = false;
     }
 }
 
@@ -179,6 +187,11 @@ export class DataTable extends Widget {
     // Null means "no opinion": the frame is written, which is the local
     // spreadsheet behaviour a grid over in-memory data wants.
     onCellEdit: fn(int, int, string): bool;
+    // A single click on a body cell: (visible row, rendered column position),
+    // after the row is selected and the cursor moved there. True means the
+    // owner handled it — an action drawn in the cell with cellPaint, say —
+    // and the click goes no further.
+    onCellClick: fn(int, int): bool;
     // Right-click on a header: (rendered column position, absolute x, y).
     onHeaderContext: fn(int, int, int);
     // Right-click on a body cell: (visible row, rendered column position, x, y).
@@ -262,6 +275,8 @@ export class DataTable extends Widget {
     editable: bool;
     editing: bool;      // the focused cell is being edited
     edit_buf: string;   // in-progress edit text
+    edit_all: bool;     // edit_buf is selected: the next key replaces it
+    edit_orig: string;  // the cell's text when the edit opened
     // type-ahead-to-select
     ta_buf: string;     // accumulated prefix
     ta_ms: int;         // time of last type-ahead key (reset window)
@@ -336,6 +351,8 @@ export class DataTable extends Widget {
         this.editable = false;
         this.editing = false;
         this.edit_buf = "";
+        this.edit_all = false;
+        this.edit_orig = "";
         this.ta_buf = "";
         this.ta_ms = 0;
         this.ta_col = -1;
@@ -1041,14 +1058,35 @@ export class DataTable extends Widget {
     fn begin_edit() {
         if (this.selected < 0 || this.cur_col < 0) { return; }
         this.editing = true;
+        this.edit_all = false;
         this.edit_buf = this.cell_text(this.selected, this.cols[this.cur_col]);
+        this.edit_orig = this.edit_buf;
         this.invalidate();
     }
     fn begin_edit_with(ch: string) {
         if (this.selected < 0 || this.cur_col < 0) { return; }
         this.editing = true;
+        this.edit_all = false;
+        this.edit_orig = this.cell_text(this.selected, this.cols[this.cur_col]);
         this.edit_buf = ch;
         this.invalidate();
+    }
+    // Opened by the mouse: the cell's text, selected, so typing replaces it
+    // and Enter alone keeps it.
+    fn begin_edit_all() {
+        this.begin_edit();
+        if (this.editing) { this.edit_all = true; }
+    }
+
+    // Is rendered column position `ci` a column of input boxes right now?
+    fn input_at(ci: int): bool {
+        return this.editable && this.cell_focus && ci >= 0 && ci < this.cols.len && this.cols[ci].input;
+    }
+
+    // Keep what is being typed, if anything: for an owner about to act on
+    // the grid's values (a Save button), and for a click elsewhere.
+    fn finish_edit() {
+        if (this.editing) { this.commit_edit(); }
     }
 
     // Write the edited buffer back into the cell via the engine's random-access
@@ -1068,6 +1106,13 @@ export class DataTable extends Widget {
     // redrew the cell with it, and sent nothing anywhere. The grid showed a
     // value the database did not have, and said nothing about it.
     fn commit_edit() {
+        this.edit_all = false;
+        if (this.edit_buf == this.edit_orig) {
+            // nothing changed: an edit opened and left, not a new value
+            this.editing = false;
+            this.invalidate();
+            return;
+        }
         if (this.onCellEdit != null
             && !this.onCellEdit(this.selected, this.cur_col, this.edit_buf)) {
             // The owner is writing the value somewhere else and will update the
@@ -1100,8 +1145,20 @@ export class DataTable extends Widget {
     }
 
     fn edit_cell_key(k: int, ch: string): bool {
-        if (k == KEY_ENTER) { this.commit_edit(); return true; }
-        if (k == KEY_ESC) { this.editing = false; this.invalidate(); return true; }
+        if (k == KEY_ENTER) {
+            let down = this.input_at(this.cur_col);
+            this.commit_edit();
+            if (down && this.selected + 1 < this.df.viewLen()) { this.move_sel(1); }
+            return true;
+        }
+        if (k == KEY_ESC) { this.editing = false; this.edit_all = false; this.invalidate(); return true; }
+        if (this.edit_all) {
+            // the selected text goes on the first key that changes it
+            this.edit_all = false;
+            if (k == KEY_BACKSPACE || k == KEY_DELETE) { this.edit_buf = ""; this.invalidate(); return true; }
+            if (ch.len > 0 && (this.mods() & MOD_CTRL) == 0) { this.edit_buf = ch; this.invalidate(); return true; }
+            this.invalidate();
+        }
         if (k == KEY_BACKSPACE) {
             if (this.edit_buf.len > 0) { this.edit_buf = this.edit_buf.slice(0, this.edit_buf.len - 1); this.invalidate(); }
             return true;
@@ -1931,9 +1988,23 @@ export class DataTable extends Widget {
             let er = Rect(cx + 2, ry + 3, c.width - 4, this.row_h - 6);
             s.fill_round(er, th.radius_sm, th.surface_raised);
             s.stroke_round(er, th.radius_sm, 1, th.primary);
+            let tw = s.text_width(this.edit_buf);
+            let fh = s.font_height();
+            if (this.edit_all && tw > 0) {
+                s.fill(Rect(er.x + 5, er.y + (er.h - fh) / 2.0, tw + 2, fh), mix(th.primary, th.surface_raised, 0.65));
+            }
+            s.clip_push(er, 0.0);
             s.text_in(er, 6, this.edit_buf, th.on_surface);
+            s.clip_pop();
+            if (!this.edit_all || tw == 0) { s.fill(Rect(er.x + 6 + tw + 1, er.y + (er.h - fh) / 2.0, 1, fh), th.primary); }
             if (this.grid) { s.line(cx + c.width, ry, cx + c.width, ry + rh, th.divider); }
             return;
+        }
+        if (this.input_at(ci)) {
+            // an input box, so the column reads as somewhere to type
+            let ib = Rect(cx + 2, ry + 3, c.width - 4, this.row_h - 6);
+            s.fill_round(ib, th.radius_sm, th.surface_raised);
+            s.stroke_round(ib, th.radius_sm, 1, th.border);
         }
         if (c.cellPaint != null) {
             c.cellPaint(s, Rect(cx, ry, c.width, rh), this.df, vrow, c.col);
@@ -1959,7 +2030,8 @@ export class DataTable extends Widget {
                     s.fill(Rect(cx + px, ry + 3, hw, rh - 6), mix(th.primary, th.surface_raised, 0.55));
                 }
             }
-            if (txt == "") { this.draw_cell(s, c, cx, ry, rh, this.na_text, th.on_surface_subtle); }
+            // an empty input box stays empty: a placeholder there reads as "disabled"
+            if (txt == "") { if (!this.input_at(ci)) { this.draw_cell(s, c, cx, ry, rh, this.na_text, th.on_surface_subtle); } }
             else { this.draw_cell(s, c, cx, ry, rh, txt, th.on_surface); }
         }
         if (focused) { s.stroke_round(Rect(cx + 1, ry + 1, c.width - 2, rh - 2), th.radius_sm, 1, th.primary); }
@@ -2406,6 +2478,17 @@ export class DataTable extends Widget {
         this.resize_idx = -1; this.press_idx = -1; this.drag_col = -1; this.drag_to = -1;
         this.drag_px = fx;
         if (this.filter_edit >= 0) { this.stop_filter_edit(); }   // any click blurs the box unless it re-focuses below
+        if (this.editing) {
+            // a click in the box being edited leaves it be; anywhere else
+            // keeps what was typed, as a spreadsheet does
+            let erow = this.row_at(y);
+            let ecol = this.col_at_content(this.content_x_at(fx));
+            if (erow == this.selected && ecol == this.cur_col) {
+                if (this.edit_all) { this.edit_all = false; this.invalidate(); }
+                return true;
+            }
+            this.commit_edit();
+        }
         // checkbox gutter: header toggles select-all, a row toggles its own row
         if (this.checkboxes && fx >= b.x && fx < b.x + DT_CB_W) {
             if (fy >= hy && fy < hy + DT_HDR_H) {
@@ -2458,13 +2541,13 @@ export class DataTable extends Widget {
         let vrow = this.row_at(y);
         if (vrow >= 0) {
             this.select_click(vrow);
-            if (this.cell_focus) {
-                let cc = this.col_at_content(this.content_x_at(fx));
-                if (cc >= 0) { this.cur_col = cc; }
-            }
+            let cc = this.col_at_content(this.content_x_at(fx));
+            if (this.cell_focus && cc >= 0) { this.cur_col = cc; }
             this.notify_cell();
             if (this.onSelect != null) { this.onSelect(vrow); }
             this.invalidate();
+            if (this.onCellClick != null && cc >= 0 && this.onCellClick(vrow, cc)) { return true; }
+            if (this.input_at(cc) && this.selected == vrow) { this.begin_edit_all(); }
         }
         return true;
     }
@@ -2474,6 +2557,9 @@ export class DataTable extends Widget {
     override fn on_double_click(x: int, y: int): bool {
         let fx = x as float; let fy = y as float;
         let vrow = this.row_at(y);
+        // an input box: the first press opened it, and a second is not an
+        // activation of the row
+        if (vrow >= 0 && this.input_at(this.col_at_content(this.content_x_at(fx)))) { return true; }
         if (vrow >= 0) {
             this.selected = vrow; this.sel_src = this.df.srcRow(vrow);
             if (this.detailText != null) { this.expandRow(vrow); }
@@ -2683,6 +2769,12 @@ export class DataTable extends Widget {
     }
 
     // Leaving the table clears the hovered row: repaint that row only.
+    // Focus going elsewhere (a Save button, another field) keeps the edit.
+    override fn on_blur(): bool {
+        if (this.editing) { this.commit_edit(); return true; }
+        return false;
+    }
+
     override fn on_hover_leave(): bool {
         if (this.hover_row != -1) {
             this.mark_row(this.hover_row);
@@ -2696,6 +2788,7 @@ export class DataTable extends Widget {
         this.onActivate = null;
         this.onCell = null;
         this.onCellEdit = null;
+        this.onCellClick = null;
         this.onSort = null;
         this.onHeaderContext = null;
         this.onCellContext = null;
