@@ -142,6 +142,7 @@ tests/win/desktop_dirs_win.vt|desktop_dirs_win|eq|
 tests/fixtures/mkdirs_backslash.vt|mkdirs_backslash|eq|
 tests/win/worker_win.vt|worker_win|eq|
 tests/win/bigfile_win.vt|bigfile_win|eq|
+tests/win/secret_win.vt|secret_win|eq|
 tests/hw/power_props.vt|power_props|eq|
 tests/hw/usb_props.vt|usb_props|eq|
 tests/hw/device_props.vt|device_props|eq|

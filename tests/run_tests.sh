@@ -251,6 +251,19 @@ else
     echo "FAIL freestanding_openssl_stub (vyto/crypto/openssl's VT_NO_LIBC arm does not build)"
     fail=1
 fi
+# And for vyto/desktop/secret, whose shim reaches open/fopen/rename and, on
+# Windows, crypt32. Read with nm, not the exit status (ar resolves nothing, so
+# a bypassed guard would still "build"): the stub arm defines every vsec_*
+# entry point and needs no file call at all.
+if ./vytoc build tests/fixtures/secret_freestanding.vt --freestanding --cc gcc \
+        -o examples/.vyto-cache/libsecret_fs.a >/dev/null 2>&1 &&
+   nm examples/.vyto-cache/libsecret_fs.a 2>/dev/null | grep -q ' T vsec_save$' &&
+   ! nm examples/.vyto-cache/libsecret_fs.a 2>/dev/null | grep -qE ' U (open|fopen|rename|unlink|fchmod)$'; then
+    echo "PASS freestanding_secret_stub"
+else
+    echo "FAIL freestanding_secret_stub (vyto/desktop/secret's VT_NO_LIBC arm does not build, or reaches libc)"
+    fail=1
+fi
 # And for vyto/media/image, whose shim instantiates stb_image_write — a header
 # that needs malloc, stdio and sprintf, so an unguarded include would break the
 # freestanding build of anything importing the package. The fixture imports only

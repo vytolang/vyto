@@ -8,7 +8,9 @@ Running as a Windows or systemd service is the sibling package
 drawn on Linux — is [`vyto/desktop/menu`](menu/README.md). Raw printing through the
 OS print queues is [`vyto/desktop/print`](print/README.md). The OS's own
 notifications, a desktop banner on Linux and a tray balloon or toast on Windows,
-are [`vyto/desktop/notify`](notify/README.md).
+are [`vyto/desktop/notify`](notify/README.md). An API key or passkey kept out of the
+app's database and backups, encrypted with DPAPI on Windows, is
+[`vyto/desktop/secret`](secret/README.md).
 
 ```vyto
 import { FileDialog, message, confirm, openUrl, configDir, MSG_INFO } from "vyto/desktop";
