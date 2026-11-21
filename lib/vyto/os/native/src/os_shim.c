@@ -189,6 +189,46 @@ int os_gethostname(char *buf, int cap) {
     return (int)strlen(buf);
 }
 
+/* The OS install's identity: HKLM\SOFTWARE\Microsoft\Cryptography\MachineGuid,
+   written when Windows is installed (present on Win7). KEY_WOW64_64KEY reads
+   the 64-bit view even from a 32-bit process. advapi32 is looked up at run
+   time rather than #link-ed, so vyto/os keeps needing no link entries; every
+   Win32 process already has it loaded. 0 (and "") on any failure. */
+typedef LONG (WINAPI *os_RegOpenKeyExW)(HKEY, LPCWSTR, DWORD, REGSAM, HKEY *);
+typedef LONG (WINAPI *os_RegQueryValueExW)(HKEY, LPCWSTR, LPDWORD, LPDWORD, LPBYTE, LPDWORD);
+typedef LONG (WINAPI *os_RegCloseKey)(HKEY);
+int os_machine_id(char *buf, int cap) {
+    if (cap <= 0) return 0;
+    buf[0] = 0;
+    HMODULE adv = LoadLibraryW(L"advapi32.dll");
+    if (!adv) return 0;
+    os_RegOpenKeyExW open = (os_RegOpenKeyExW)(void *)GetProcAddress(adv, "RegOpenKeyExW");
+    os_RegQueryValueExW query = (os_RegQueryValueExW)(void *)GetProcAddress(adv, "RegQueryValueExW");
+    os_RegCloseKey close = (os_RegCloseKey)(void *)GetProcAddress(adv, "RegCloseKey");
+    int n = 0;
+    HKEY k;
+    if (open && query && close &&
+        open(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Cryptography", 0,
+             KEY_READ | KEY_WOW64_64KEY, &k) == ERROR_SUCCESS) {
+        WCHAR w[128];
+        DWORD type = 0, sz = sizeof w - sizeof(WCHAR);
+        if (query(k, L"MachineGuid", NULL, &type, (LPBYTE)w, &sz) == ERROR_SUCCESS &&
+            type == REG_SZ && sz >= sizeof(WCHAR)) {
+            w[sz / sizeof(WCHAR)] = 0;
+            char *u = vt_utf8_from_w(w);
+            if (u) {
+                strncpy(buf, u, (size_t)cap - 1);
+                buf[cap - 1] = 0;
+                free(u);
+                n = (int)strlen(buf);
+            }
+        }
+        close(k);
+    }
+    FreeLibrary(adv);
+    return n;
+}
+
 /* The environment, not GetUserNameA/SHGetFolderPath — keeps advapi32/shell32
    off the link line. Both variables are set for every interactive session. */
 const char *os_username(void) {
@@ -224,6 +264,26 @@ int os_gethostname(char *buf, int cap) {
     if (gethostname(buf, (size_t)cap) != 0) { if (cap > 0) buf[0] = 0; return 0; }
     buf[cap - 1] = 0;
     return (int)strlen(buf);
+}
+
+/* The OS install's identity: systemd's /etc/machine-id, else the older D-Bus
+   copy. First line only, trailing whitespace dropped. 0 (and "") when neither
+   exists — macOS, BSDs, minimal containers. */
+int os_machine_id(char *buf, int cap) {
+    static const char *paths[] = { "/etc/machine-id", "/var/lib/dbus/machine-id" };
+    if (cap <= 0) return 0;
+    buf[0] = 0;
+    for (int i = 0; i < 2; i++) {
+        FILE *f = fopen(paths[i], "r");
+        if (!f) continue;
+        if (!fgets(buf, cap, f)) buf[0] = 0;
+        fclose(f);
+        size_t n = strlen(buf);
+        while (n > 0 && (buf[n - 1] == '\n' || buf[n - 1] == '\r' ||
+                         buf[n - 1] == ' ' || buf[n - 1] == '\t')) buf[--n] = 0;
+        if (n > 0) return (int)n;
+    }
+    return 0;
 }
 
 const char *os_username(void) {
