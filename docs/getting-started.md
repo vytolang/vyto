@@ -529,7 +529,9 @@ on Windows; camera, sensors, gpio, i2c and spi return empty lists or `null` ther
 ([`lib/vyto/hw/README.md`](../lib/vyto/hw/README.md#platform-support)).
 
 Three Windows-specific behaviours worth knowing: `vyto/os`'s `run()` and
-`capture()` go through `cmd.exe`, not a POSIX shell, so shell built-ins differ;
+`capture()` go through `cmd.exe`, not a POSIX shell, so shell built-ins differ
+(`runArgs()` and `spawnDetached()` take a path and an argument list and use no
+shell on either platform, so prefer them for a computed path);
 `vyto/util/date`'s `parse()` runs on a strptime written for this port (Windows
 ships none), covering the conversions `format()` can round-trip — anything else
 returns the invalid-date sentinel rather than guessing; and `PollSet` uses

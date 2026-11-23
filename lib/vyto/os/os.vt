@@ -10,6 +10,9 @@
 // Runtime failures are soft (missing env var -> "", failed chdir -> false).
 // `capture` returns a ProcResult whose native buffer is freed deterministically
 // by its deinit — no manual cleanup. Linux + macOS.
+//
+// spawnDetached / runArgs start a program by PATH with an argument list and
+// no shell, so a space or a quote in a computed path cannot change what runs.
 
 extern "C" {
     fn os_getenv(k: cstring): cstring;
@@ -34,6 +37,13 @@ extern "C" {
     fn os_capture_len(h: rawptr): i64;
     fn os_capture_code(h: rawptr): i32;
     fn os_capture_free(h: rawptr);
+    fn os_argv_new(): rawptr;
+    fn os_argv_add(h: rawptr, s: cstring);
+    fn os_argv_free(h: rawptr);
+    fn os_spawn_detached(exe: cstring, h: rawptr): i32;
+    fn os_run_args(exe: cstring, h: rawptr, ms: i32): i32;
+    fn os_pid_alive(pid: i32): i32;
+    fn os_wait_pid_exit(pid: i32, ms: i32): i32;
 }
 
 // ---- environment --------------------------------------------------------
@@ -121,4 +131,44 @@ export fn capture(cmd: string): ProcResult {
     let h = os_capture(cmd.cstr());
     if (h == null) { return null; }
     return new ProcResult(h);
+}
+
+// ---- programs by path, no shell -----------------------------------------
+// The argument list as a native argv, freed on teardown.
+class Argv {
+    h: rawptr;
+    fn init(args: string[]) {
+        this.h = os_argv_new();
+        for (let a in args) { os_argv_add(this.h, a.cstr()); }
+    }
+    deinit {
+        if (this.h != null) { os_argv_free(this.h); this.h = null; }
+    }
+}
+
+// Start `exe` (a path: no PATH search) with `args` and let it go. It outlives
+// this process, holds none of its stdio (POSIX: /dev/null), and is never left
+// as this process's zombie. Returns its pid, or -1 if it could not be
+// started — on POSIX that includes an exe that exists but fails to exec.
+export fn spawnDetached(exe: string, args: string[]): int {
+    let a = new Argv(args);
+    return os_spawn_detached(exe.cstr(), a.h) as int;
+}
+
+// Start `exe` with `args`, inheriting stdio, and wait for it. Returns its
+// exit code; -1 if it could not be started; -2 if it was still running after
+// `timeoutMs` (it is then killed). A negative `timeoutMs` waits for ever.
+export fn runArgs(exe: string, args: string[], timeoutMs: int): int {
+    let a = new Argv(args);
+    return os_run_args(exe.cstr(), a.h, timeoutMs as i32) as int;
+}
+
+// Whether a process with this id is running (one owned by another user
+// counts). False for pid <= 0.
+export fn pidAlive(pid: int): bool { return os_pid_alive(pid as i32) as int != 0; }
+
+// Wait until no process has this id, up to `ms` (negative: for ever). True
+// once it is gone, false on timeout.
+export fn waitPidExit(pid: int, ms: int): bool {
+    return os_wait_pid_exit(pid as i32, ms as i32) as int != 0;
 }
