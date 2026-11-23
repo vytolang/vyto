@@ -28,7 +28,7 @@ import { DataFrame, CK_STR, CK_CAT, CK_BOOL, CK_F64, CK_F32,
          AGG_SUM, AGG_MIN, AGG_MAX, AGG_AVG, AGG_COUNT } from "vyto/data/frame";
 import { SIDE } from "vyto/ui/scrollbar";
 import { ALIGN } from "vyto/ui/display";
-import { csvWriter } from "vyto/util/csv";
+import { csvWriter, csv_sheet_safe } from "vyto/util/csv";
 import { StringBuilder } from "vyto/util/text";
 
 const DT_SEARCH_H: float = 34.0;
@@ -939,11 +939,16 @@ export class DataTable extends Widget {
     // Quoting and the O(n) build both come from vyto/util/csv — this used to
     // carry its own RFC-4180 quoter and concatenate the whole table one field
     // at a time, which is quadratic in the number of cells.
+    //
+    // Every field goes through csv_sheet_safe: a cell that would start a
+    // formula (= + - @) gets a leading apostrophe, unless it is a plain
+    // number. An export is opened in a spreadsheet, and the cells are
+    // whatever someone typed into the app.
     fn exportCsv(): string {
         let w = csvWriter();
         for (let ci in 0..this.cols.len) {
             let c = this.cols[ci];
-            if (c.visible) { w.field(c.title); }
+            if (c.visible) { w.field(csv_sheet_safe(c.title)); }
         }
         w.endRow();
         let vlen = this.df.viewLen();
@@ -953,7 +958,7 @@ export class DataTable extends Widget {
                 // full, not the drawn text: a CSV is data, and writing the
                 // 255 bytes that fit on screen would be silent truncation on
                 // the way out.
-                if (c.visible) { w.field(this.cell_text_full(r, c)); }
+                if (c.visible) { w.field(csv_sheet_safe(this.cell_text_full(r, c))); }
             }
             w.endRow();
         }
@@ -978,7 +983,8 @@ export class DataTable extends Widget {
                 let c = this.cols[ci];
                 if (!c.visible) { continue; }
                 if (!firstCol) { sb.append("\t"); }
-                sb.append(this.cell_text_full(rows[ri], c));
+                // pasted into a spreadsheet, a formula would run there too
+                sb.append(csv_sheet_safe(this.cell_text_full(rows[ri], c)));
                 firstCol = false;
             }
             sb.append("\n");
