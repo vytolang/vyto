@@ -17,7 +17,7 @@
 
 import { Widget, Painter, Theme, Size, CaretBlink, WEIGHT } from "vyto/ui/core";
 import { utf8_prev, utf8_next } from "vyto/util/helper";
-import { SearchField } from "vyto/ui/form";
+import { SearchField, Button, Dropdown } from "vyto/ui/form";
 import { Menu, MenuPopup } from "vyto/ui/menu";
 import { Rect, contains, mix, KEY_UP, KEY_DOWN, KEY_HOME, KEY_END,
          KEY_LEFT, KEY_RIGHT, KEY_ENTER, KEY_BACKSPACE, KEY_ESC,
@@ -70,6 +70,12 @@ export class DtColumn {
     align: ALIGN;
     col: int;
     sortable: bool;
+    // While the table is paged and holds only part of the rows (setPaging),
+    // a header sorts only when this is set: the owner sorts in its database
+    // (onSort) and loads the first page again. Sorting one page locally would
+    // order that page alone, which reads as the top of the whole range when it
+    // is not. When every row fits on one page, `sortable` alone decides.
+    server_sort: bool;
     visible: bool;      // hidden columns take zero width and are skipped
     min_w: float;       // floor for interactive resize
     filter_text: string; // raw text in this column's inline filter box
@@ -104,6 +110,7 @@ export class DtColumn {
         this.align = ALIGN.LEFT;
         this.col = col;
         this.sortable = true;
+        this.server_sort = false;
         this.visible = true;
         this.min_w = 40;
         this.filter_text = "";
@@ -247,6 +254,35 @@ export class DataTable extends Widget {
     // page this is — is the caller's fact, not the grid's. "" appends nothing.
     footer_note: string;
 
+    // ---- paging (opt-in: setPaging) ---------------------------------------
+    //
+    // For an owner that loads one page of a large result at a time (a database
+    // query with LIMIT and OFFSET). The frame holds that page; the footer says
+    // which rows they are ("Rows 501–1,000 of 70,412") and carries First, Prev,
+    // Next, Last and a rows-per-page choice. They do not move rows themselves:
+    // they fire onPage(offset, size), the owner queries, then hands back the
+    // rows (setFrame) and what it found (setPage).
+    //
+    // `remote` sends the search box to the owner as well (onRemoteQuery, 300 ms
+    // after typing stops) instead of filtering the frame, which would search
+    // only the page. Keep it on while a search the owner ran is in force: its
+    // rows may match on fields the grid does not show.
+    paging: bool;
+    page_sizes: int[];
+    page_size: int;
+    page_offset: int;
+    page_total: int;    // rows in the whole result, -1 when the owner does not know
+    page_more: bool;    // the owner says there are rows after this page (total unknown)
+    remote: bool;
+    onPage: fn(int, int);
+    onRemoteQuery: fn(string);
+    pg_first: Button;
+    pg_prev: Button;
+    pg_next: Button;
+    pg_last: Button;
+    pg_size: Dropdown;
+    q_timer: int;       // a pending remote search, -1 for none
+
     resize_idx: int;    // column position being resized, -1
     press_idx: int;     // header column pending sort on release, -1
     drag_col: int;      // column position being reordered, -1
@@ -333,6 +369,21 @@ export class DataTable extends Widget {
         this.fit_max_w = 0.0;
         this.fit_done = false;
         this.footer_note = "";
+        this.paging = false;
+        this.page_sizes = [];
+        this.page_size = 0;
+        this.page_offset = 0;
+        this.page_total = -1;
+        this.page_more = false;
+        this.remote = false;
+        this.onPage = null;
+        this.onRemoteQuery = null;
+        this.pg_first = null;
+        this.pg_prev = null;
+        this.pg_next = null;
+        this.pg_last = null;
+        this.pg_size = null;
+        this.q_timer = -1;
         this.resize_idx = -1;
         this.press_idx = -1;
         this.drag_col = -1;
@@ -859,6 +910,120 @@ export class DataTable extends Widget {
         this.invalidate();
     }
 
+    // ---- paging --------------------------------------------------------------
+
+    // Turn the pager on: the page sizes offered, and the one to start with
+    // (added to the list when it is not in it).
+    fn setPaging(sizes: int[], size: int) {
+        if (this.paging) { return; }
+        this.paging = true;
+        this.page_sizes = sizes;
+        if (!sizes.contains(size)) { this.page_sizes.push(size); }
+        this.page_size = size;
+        let self = this;
+        this.pg_first = new Button("First").ghost();
+        this.pg_prev = new Button("Prev").ghost();
+        this.pg_next = new Button("Next").ghost();
+        this.pg_last = new Button("Last").ghost();
+        this.pg_first.onClick = (b) => { self.go_page(0); };
+        this.pg_prev.onClick = (b) => { self.go_page(self.page_offset - self.page_size); };
+        this.pg_next.onClick = (b) => { self.go_page(self.page_offset + self.page_size); };
+        this.pg_last.onClick = (b) => { self.go_page(self.last_offset()); };
+        let labels: string[] = [];
+        let at = 0;
+        for (let i in 0..this.page_sizes.len) {
+            labels.push(group3(this.page_sizes[i]) + " rows");
+            if (this.page_sizes[i] == size) { at = i; }
+        }
+        this.pg_size = new Dropdown(labels);
+        this.pg_size.selected = at;
+        // a new size keeps the rows in view: the page holding the first row
+        // shown (as VytoDBA's pager), not the first page
+        this.pg_size.onSelect = (i) => {
+            let n = self.page_sizes[i];
+            self.page_size = n;
+            self.go_page((self.page_offset / n) * n);
+        };
+        for (let w in [this.pg_first as Widget, this.pg_prev, this.pg_next, this.pg_last, this.pg_size]) { this.add(w); }
+        this.sync_pager();
+    }
+
+    // What the owner loaded: where this page starts, how many rows the whole
+    // result has (-1 when unknown), and, when unknown, whether more follow.
+    fn setPage(offset: int, total: int, more: bool) {
+        this.page_offset = offset;
+        if (this.page_offset < 0) { this.page_offset = 0; }
+        this.page_total = total;
+        this.page_more = more;
+        this.sync_pager();
+        this.invalidate();
+    }
+
+    // The page holds only part of the rows.
+    fn paged_over(): bool {
+        if (!this.paging) { return false; }
+        if (this.page_offset > 0 || this.page_more) { return true; }
+        return this.page_total > this.page_size;
+    }
+
+    fn has_next(): bool {
+        if (this.page_total >= 0) { return this.page_offset + this.page_size < this.page_total; }
+        return this.page_more;
+    }
+
+    fn last_offset(): int {
+        if (this.page_total <= 0 || this.page_size <= 0) { return 0; }
+        return ((this.page_total - 1) / this.page_size) * this.page_size;
+    }
+
+    fn go_page(offset: int) {
+        let o = offset;
+        if (o < 0) { o = 0; }
+        if (this.onPage != null) { this.onPage(o, this.page_size); }
+    }
+
+    fn sync_pager() {
+        if (!this.paging) { return; }
+        this.pg_first.disabled = this.page_offset == 0;
+        this.pg_prev.disabled = this.page_offset == 0;
+        this.pg_next.disabled = !this.has_next();
+        this.pg_last.disabled = this.page_total < 0 || !this.has_next();
+    }
+
+    // Which rows these are: "Rows 501–1,000 of 70,412", "Rows 1–500 · more".
+    fn page_label(vlen: int): string {
+        if (vlen == 0) {
+            if (this.page_offset > 0) { return "No rows on this page"; }
+            return "0 rows";
+        }
+        let t = "Rows " + group3(this.page_offset + 1) + "–" + group3(this.page_offset + vlen);
+        if (this.page_total >= 0) {
+            t = t + " of " + group3(this.page_total);
+            if (this.page_total > this.page_size && this.page_size > 0) {
+                let pages = (this.page_total + this.page_size - 1) / this.page_size;
+                t = t + " · page " + group3(this.page_offset / this.page_size + 1) + " of " + group3(pages);
+            }
+            return t;
+        }
+        if (this.page_more) { return t + " · more"; }
+        return t;
+    }
+
+    // Swap in another page of rows. The columns, their widths and order, the
+    // frozen band and the pager stay; the selection and vertical scroll reset.
+    // The new frame must have the old one's columns.
+    fn setFrame(df: DataFrame) {
+        this.df = df;
+        this.selected = -1;
+        this.sel_src = -1;
+        this.sel_set = [];
+        this.hover_row = -1;
+        this.editing = false;
+        this.scroll_off_y = 0;
+        this.apply_view();
+        this.invalidate();
+    }
+
     // ---- column selection -------------------------------------------------
 
     fn columnSelected(pos: int): bool {
@@ -944,13 +1109,30 @@ export class DataTable extends Widget {
     // formula (= + - @) gets a leading apostrophe, unless it is a plain
     // number. An export is opened in a spreadsheet, and the cells are
     // whatever someone typed into the app.
-    fn exportCsv(): string {
+    fn exportCsv(): string { return this.csv_of(true); }
+
+    // Another page of the same columns as CSV, written as this table writes
+    // its own (formats, visible columns), with or without the title row: a
+    // paged owner exports the whole result a page at a time. The table and
+    // what it shows are left as they were.
+    fn exportCsvOf(df: DataFrame, header: bool): string {
+        let mine = this.df;
+        this.df = df;
+        df.resetView();
+        let out = this.csv_of(header);
+        this.df = mine;
+        return out;
+    }
+
+    fn csv_of(header: bool): string {
         let w = csvWriter();
-        for (let ci in 0..this.cols.len) {
-            let c = this.cols[ci];
-            if (c.visible) { w.field(csv_sheet_safe(c.title)); }
+        if (header) {
+            for (let ci in 0..this.cols.len) {
+                let c = this.cols[ci];
+                if (c.visible) { w.field(csv_sheet_safe(c.title)); }
+            }
+            w.endRow();
         }
-        w.endRow();
         let vlen = this.df.viewLen();
         for (let r in 0..vlen) {
             for (let ci in 0..this.cols.len) {
@@ -1676,7 +1858,7 @@ export class DataTable extends Widget {
     fn apply_view() {
         this.df.resetView();
         this.apply_filters();
-        if (this.query != "") {
+        if (this.query != "" && !this.remote) {
             if (this.search_col >= 0) { this.df.filterStr(this.search_col, OP_CONTAINS, this.query); }
             else { this.df.search(this.query); }
         }
@@ -1733,6 +1915,21 @@ export class DataTable extends Widget {
 
     fn set_query(q: string) {
         this.query = q;
+        if (this.remote && this.onRemoteQuery != null) {
+            // one query when typing pauses, not one per key
+            let w = this.win;
+            if (w != null) {
+                if (this.q_timer >= 0) { w.cancel_after(this.q_timer); }
+                let self = this;
+                this.q_timer = w.after(300, () => {
+                    self.q_timer = -1;
+                    if (self.onRemoteQuery != null) { self.onRemoteQuery(self.query); }
+                });
+            } else {
+                this.onRemoteQuery(q);
+            }
+            return;
+        }
         this.scroll_off_y = 0;
         this.apply_view();
         this.invalidate();
@@ -1844,6 +2041,19 @@ export class DataTable extends Widget {
             }
         }
         this.search.arrange(s, th, Rect(sx, r.y + 4, sw, h));
+        if (this.paging) {
+            // right end of the footer: First Prev Next Last, then the page size
+            let fy = r.bottom() - DT_FOOT_H + 3.0;
+            let bh = DT_FOOT_H - 6.0;
+            let dw = this.pg_size.measure(s, th).w;
+            let x = r.right() - 8.0 - dw;
+            this.pg_size.arrange(s, th, Rect(x, fy, dw, bh));
+            for (let b in [this.pg_last, this.pg_next, this.pg_prev, this.pg_first]) {
+                let bw = s.text_width(b.label) + 20.0;
+                x = x - 4.0 - bw;
+                b.arrange(s, th, Rect(x, fy, bw, bh));
+            }
+        }
         this.clamp();
     }
 
@@ -2362,6 +2572,7 @@ export class DataTable extends Widget {
         let label = `{vlen} rows`;
         if (vlen == 1) { label = "1 row"; }
         if (vlen != this.df.nrow()) { label = `{vlen} of {this.df.nrow()} rows`; }
+        if (this.paged_over() || (this.paging && this.remote)) { label = this.page_label(vlen); }
         if (this.footer_note != "") { label = label + `   ·   {this.footer_note}`; }
         // the aggregates already have their own row when totals is on — don't
         // repeat them (and mangle) in the footer.
@@ -2371,7 +2582,14 @@ export class DataTable extends Widget {
                 label = label + `   {this.df.colName(a.col)} {this.agg_tag(a.kind)}={this.fmt_num(this.df.agg(a.col, a.kind))}`;
             }
         }
-        s.text_in(Rect(b.x + 8, fy, b.w - 16, DT_FOOT_H), 0, label, th.on_surface_muted);
+        let lw = b.w - 16;
+        if (this.paging) { lw = this.pg_first.bounds.x - b.x - 16; }
+        s.clip_push(Rect(b.x + 8, fy, lw, DT_FOOT_H), 0.0);
+        s.text_in(Rect(b.x + 8, fy, lw, DT_FOOT_H), 0, label, th.on_surface_muted);
+        s.clip_pop();
+        if (this.paging) {
+            for (let w in [this.pg_first as Widget, this.pg_prev, this.pg_next, this.pg_last, this.pg_size]) { w.draw(s, th); }
+        }
 
         this.search.draw(s, th);
         if (this.search_accessory != null) { this.search_accessory.draw(s, th); }
@@ -2656,7 +2874,8 @@ export class DataTable extends Widget {
         if (this.resize_idx >= 0) { this.resize_idx = -1; return true; }
         if (this.press_idx >= 0) {
             let ci = this.press_idx; this.press_idx = -1;
-            if (ci >= 0 && ci < this.cols.len && this.cols[ci].sortable) {
+            if (ci >= 0 && ci < this.cols.len && this.cols[ci].sortable &&
+                (!this.paged_over() || this.cols[ci].server_sort)) {
                 this.toggle_sort(this.cols[ci].col);
                 return true;
             }
@@ -2796,6 +3015,13 @@ export class DataTable extends Widget {
         this.onCellEdit = null;
         this.onCellClick = null;
         this.onSort = null;
+        this.onPage = null;
+        this.onRemoteQuery = null;
+        if (this.q_timer >= 0) {
+            let w = this.win;
+            if (w != null) { w.cancel_after(this.q_timer); }
+            this.q_timer = -1;
+        }
         this.onHeaderContext = null;
         this.onCellContext = null;
         this.detailText = null;
@@ -2805,6 +3031,25 @@ export class DataTable extends Widget {
             this.cols[i].cellPaint = null;
         }
     }
+}
+
+// 70412 -> "70,412", for row counts.
+fn group3(n: int): string {
+    let neg = n < 0;
+    let v = n;
+    if (neg) { v = 0 - v; }
+    let d = `{v}`;
+    let out = "";
+    let k = 0;
+    let i = d.len - 1;
+    while (i >= 0) {
+        if (k > 0 && k % 3 == 0) { out = "," + out; }
+        out = d.slice(i, i + 1) + out;
+        k += 1;
+        i -= 1;
+    }
+    if (neg) { return "-" + out; }
+    return out;
 }
 
 // Does the vertical span [y0, y1) reach into r?

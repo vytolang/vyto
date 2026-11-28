@@ -1,0 +1,82 @@
+// DataTable's pager (setPaging): the owner loads one page at a time. The
+// table is the window's root, 600 x 300, so the footer is y 270-300 and its
+// buttons sit at its right end. Each click is printed by the owner's onPage,
+// which loads that page as a real owner would.
+//
+//   * Next / Prev / First / Last fire onPage with the right offsets
+//   * Last is off while the total is unknown; Next follows "more"
+//   * a header that is not server_sort does not sort a page that holds only
+//     part of the rows; one that is, does (and tells the owner)
+//   * remote search goes to the owner once typing pauses, not to the frame
+//   * a new page size keeps the rows in view (the page holding the first)
+//   * setFrame keeps a column width set before it
+import { Window } from "vyto/ui";
+import { getenv } from "vyto/os";
+import { DataTable } from "vyto/ui/datatable";
+import { DataFrame, CK_I64, CK_STR } from "vyto/data/frame";
+
+const TOTAL: int = 23;
+
+fn page_of(offset: int, size: int): DataFrame {
+    let df = new DataFrame(size + 1);
+    let id = df.addColumn("id", CK_I64);
+    let name = df.addColumn("name", CK_STR);
+    let i = offset;
+    while (i < offset + size && i < TOTAL) {
+        df.beginRow().setInt(id, i).setStr(name, "row" + str(i)).endRow();
+        i += 1;
+    }
+    return df;
+}
+
+fn first_id(dt: DataTable): string {
+    if (dt.df.viewLen() == 0) { return "-"; }
+    return str(dt.df.cellInt(0, 0));
+}
+
+fn main() {
+    let win = new Window("Paging", 600, 300);
+    let dt = new DataTable(page_of(0, 10));
+    dt.setPaging([5, 10, 20], 10);
+    dt.setColumnWidth(1, 222.0);
+    dt.cols[0].server_sort = true;
+    dt.remote = true;
+    let total: int[] = [TOTAL];
+    dt.setPage(0, total[0], false);
+    let log: string[] = [];
+    dt.onPage = (offset, size) => {
+        dt.setFrame(page_of(offset, size));
+        dt.setPage(offset, total[0], offset + size < TOTAL);
+        log.push(`page {offset}+{size} first={first_id(dt)}`);
+    };
+    dt.onSort = () => { log.push("owner sorts"); };
+    dt.onRemoteQuery = (q) => { log.push("search " + q + " frame rows=" + str(dt.df.viewLen())); };
+    win.root = dt;
+    win.run();
+
+    for (let l in log) { print(l); }
+    print("sorted by=" + str(dt.sort_col) + " frame rows after search=" + str(dt.df.viewLen()));
+    print("label=" + dt.page_label(dt.df.viewLen()));
+    // closing the window dropped the handlers, so the size choice is checked
+    // on a table of its own
+    let t2 = new DataTable(page_of(40, 10));
+    t2.setPaging([5, 10, 20], 10);
+    t2.setPage(40, 100, false);
+    print("before: " + t2.page_label(10));
+    let got: string[] = [];
+    t2.onPage = (offset, size) => { got.push(`{offset}+{size}`); };
+    t2.pg_size.pick(0);
+    print("size 5 asks for " + got.join(",") + ", size now " + str(t2.page_size));
+    print("width kept=" + str(dt.cols[1].width as int));
+    dt.setPage(0, -1, true);
+    print("unknown total: last off=" + str(dt.pg_last.disabled) + " next on=" + str(!dt.pg_next.disabled) +
+          " label=" + dt.page_label(10));
+    dt.setPage(20, -1, false);
+    print("end: next off=" + str(dt.pg_next.disabled));
+    if (getenv("GEOM") != "") {
+        for (let b in [dt.pg_first, dt.pg_prev, dt.pg_next, dt.pg_last]) {
+            print(b.label + " x=" + str((b.bounds.x + b.bounds.w / 2.0) as int) + " y=" + str((b.bounds.y + b.bounds.h / 2.0) as int));
+        }
+        print("size x=" + str((dt.pg_size.bounds.x + 10.0) as int));
+    }
+}
