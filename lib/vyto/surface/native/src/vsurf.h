@@ -15,6 +15,8 @@
 #ifndef VSURF_H
 #define VSURF_H
 
+#include <stdint.h>   /* int64_t: vs_wait_timeout_fds takes a Vyto int[] */
+
 /* event classes returned by vs_wait */
 enum {
     VS_EV_NONE = 0,
@@ -386,8 +388,13 @@ int vs_events_pending(void *s);
    selectable) and degrade to the plain bounded wait, which is the same polling
    the caller would have done by hand.
 
-   fds==NULL or n<=0 is exactly vs_wait_timeout. */
-int vs_wait_timeout_fds(void *s, int ms, const int *fds, int n);
+   fds==NULL or n<=0 is exactly vs_wait_timeout.
+
+   fds is int64_t, not int: it is a Vyto int[] (64-bit elements) handed over
+   as a pointer. Read as int*, [7, 8] arrived as [7, 0] — every second fd went
+   unwatched and fd 0 was selected instead, which on a stdin of /dev/null is
+   always readable: a window with two extra fds spun at 100% CPU. */
+int vs_wait_timeout_fds(void *s, int ms, const int64_t *fds, int n);
 
 /* Whether vs_wait_timeout_fds really waits on the caller's fds (1) or degrades
    to a bounded poll (0). Callers use it to decide whether they may block

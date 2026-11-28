@@ -663,7 +663,7 @@ int vs_damage(void *s, VsRect *out) {
  * indefinitely instead of ticking so a backgrounded app stops burning battery.
  * Correctness of the lifecycle beats power on the path that is already the
  * fallback. */
-int vs_wait_timeout_fds(void *s, int ms, const int *fds, int n) {
+int vs_wait_timeout_fds(void *s, int ms, const int64_t *fds, int n) {
     (void)fds; (void)n;
     return vs_wait_timeout(s, ms);
 }

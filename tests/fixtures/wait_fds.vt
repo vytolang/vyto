@@ -1,0 +1,40 @@
+// Surface.waitTimeoutFds hands a Vyto int[] (64-bit elements) to C. The C
+// side read it as int*, so [a, b] arrived as [a, 0]: the second fd was never
+// watched, and fd 0 was selected in its place. With stdin on /dev/null (as a
+// launched GUI app has it) fd 0 is always readable, and a window folding two
+// extra connections into its loop spun at 100% CPU (SpeccalPOS kiosk
+// monitors, 2026-11-28).
+//
+// Needs a real X display: headless ignores the fds. The fds are two local
+// listening sockets, so what is ready is decided here, not by X timing.
+//
+//   MODE=idle    stdin on /dev/null, neither ready: the wait lasts its timeout
+//   MODE=second  stdin on an idle pipe, only the SECOND ready: it ends at once
+import { Surface, EV_TIMER } from "vyto/surface";
+import { socket_listen_on, socket_connect } from "vyto/net/socket";
+import { getenv } from "vyto/os";
+import { monoMs } from "vyto/util/time";
+
+fn main() {
+    let s = new Surface("wait_fds", 200, 100);
+    if (!s.canWaitFds()) { print("SKIP no display to wait on"); return; }
+    // let the new window settle: its map and Expose arrive late, and a
+    // window event ends a wait as it should
+    let ev = s.wait_timeout(200);
+    while (ev != EV_TIMER) { ev = s.wait_timeout(200); }
+    let quiet = socket_listen_on("127.0.0.1", 0, 4);
+    let other = socket_listen_on("127.0.0.1", 0, 4);
+    if (getenv("MODE") == "second") {
+        // a connection waiting to be accepted: `other` is readable
+        let c = socket_connect("127.0.0.1", other.localPort());
+        let t0 = monoMs();
+        s.waitTimeoutFds(2000, [quiet.fd as int, other.fd as int]);
+        let dt = monoMs() - t0;
+        print(`second fd watched: {c.isValid() && dt < 1000}`);
+        return;
+    }
+    let t0 = monoMs();
+    s.waitTimeoutFds(400, [quiet.fd as int, other.fd as int]);
+    let dt = monoMs() - t0;
+    print(`idle wait lasts its timeout: {dt >= 300}`);
+}

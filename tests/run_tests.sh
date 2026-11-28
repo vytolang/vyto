@@ -517,6 +517,25 @@ else
     echo "SKIP channel_gui (no Xvfb)"
 fi
 unset VYTO_CHANNEL_DIR
+# Surface.waitTimeoutFds with two fds: C read the Vyto int[] as int*, so the
+# second fd went unwatched and fd 0 was selected in its place (a window with
+# two extra connections spun at 100% CPU on a stdin of /dev/null). Needs a
+# real X display; each mode sets up the stdin that shows the bug.
+wf_=tests/tmp/wait_fds; rm -rf "$wf_"; mkdir -p "$wf_"
+if command -v Xvfb >/dev/null 2>&1 && ./vytoc build tests/fixtures/wait_fds.vt -o "$wf_/wait_fds" >/dev/null 2>&1; then
+    Xvfb -displayfd 3 -screen 0 640x480x24 -nolisten tcp 3>"$wf_/dpy" >/dev/null 2>&1 & xp=$!
+    i=0; while [ ! -s "$wf_/dpy" ] && [ $i -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+    got=$(DISPLAY=":$(cat "$wf_/dpy")" MODE=idle timeout 15 "$wf_/wait_fds" </dev/null 2>&1)
+    got2=$(sleep 5 | DISPLAY=":$(cat "$wf_/dpy")" MODE=second timeout 15 "$wf_/wait_fds" 2>&1)
+    kill $xp 2>/dev/null; wait $xp 2>/dev/null
+    if [ "$got" = "idle wait lasts its timeout: true" ] && [ "$got2" = "second fd watched: true" ]; then
+        echo "PASS wait_fds"
+    else
+        echo "FAIL wait_fds (got: $got / $got2)"; fail=1
+    fi
+else
+    echo "SKIP wait_fds (no Xvfb)"
+fi
 # --- vyto/desktop/service ---
 # As an ordinary program: SIGTERM (what systemd sends) must reach stopping()
 # and wake a 60 s wait() at once. Under a NOTIFY_SOCKET it must also report

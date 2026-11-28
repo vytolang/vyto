@@ -1658,7 +1658,7 @@ typedef HANDLE (WINAPI *vs_wsa_create_fn)(void);
 typedef int (WINAPI *vs_wsa_select_fn)(UINT_PTR, HANDLE, long);
 typedef BOOL (WINAPI *vs_wsa_close_fn)(HANDLE);
 
-int vs_wait_timeout_fds(void *vs, int ms, const int *fds, int n) {
+int vs_wait_timeout_fds(void *vs, int ms, const int64_t *fds, int n) {
     VSurf *s = vs;
     if (!s->hwnd || n <= 0) return vs_wait_timeout(vs, ms);
     if (s->evq_len) return q_pop(s);
@@ -1675,7 +1675,7 @@ int vs_wait_timeout_fds(void *vs, int ms, const int *fds, int n) {
     for (int i = 0; i < n && k < MAXIMUM_WAIT_OBJECTS - 1; i++) {
         HANDLE ev = wcreate();
         if (ev == NULL || ev == INVALID_HANDLE_VALUE) { ok = 0; break; }
-        if (wselect((UINT_PTR)(unsigned)fds[i], ev,
+        if (wselect((UINT_PTR)fds[i], ev,
                     VS_FD_READ | VS_FD_ACCEPT | VS_FD_CLOSE) != 0) {
             wclose(ev);
             ok = 0;
@@ -1689,7 +1689,7 @@ int vs_wait_timeout_fds(void *vs, int ms, const int *fds, int n) {
                                         MWMO_INPUTAVAILABLE);
     }
     for (int i = 0; i < k; i++) {
-        wselect((UINT_PTR)(unsigned)fds[i], NULL, 0);
+        wselect((UINT_PTR)fds[i], NULL, 0);
         wclose(evs[i]);
     }
     if (!ok) return vs_wait_timeout(vs, fallback);
@@ -3748,7 +3748,7 @@ int vs_wait_timeout(void *vs, int ms) {
    lands, and burns nothing in between.
 
    fds==NULL/n<=0 is exactly vs_wait_timeout, and the two share this body. */
-int vs_wait_timeout_fds(void *vs, int ms, const int *fds, int n) {
+int vs_wait_timeout_fds(void *vs, int ms, const int64_t *fds, int n) {
     VSurf *s = vs;
     if (s->fb_on) return fb_next(s, 1, ms >= 0 ? ms : 0);
     if (!s->dpy) return headless_wait(&s->in, &s->w, &s->h);
@@ -3766,11 +3766,12 @@ int vs_wait_timeout_fds(void *vs, int ms, const int *fds, int n) {
         FD_SET(xfd, &rf);
         int maxfd = xfd;
         for (int i = 0; i < n; i++) {
-            int f = fds[i];
             /* FD_SETSIZE is the hard ceiling of select(2); a descriptor past it
                corrupts the caller's stack rather than failing, so skip it. A UI
-               app watching >1024 fds wants vyto/os/reactor, not this. */
-            if (f < 0 || f >= FD_SETSIZE) continue;
+               app watching >1024 fds wants vyto/os/reactor, not this. Checked
+               on the 64-bit value, before it is narrowed. */
+            if (fds[i] < 0 || fds[i] >= FD_SETSIZE) continue;
+            int f = (int)fds[i];
             FD_SET(f, &rf);
             if (f > maxfd) maxfd = f;
         }
