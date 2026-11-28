@@ -1,0 +1,89 @@
+// A closure must outlive its own call.
+//
+// A handler stored in a field is called through that field. If the handler
+// drops the field (a click handler that releases its own widget), the
+// closure that is running loses its last reference. Before the fix it was
+// freed under itself, with its env and every capture: a use-after-free that
+// read fine until the pool reused the memory. The compiler now holds a
+// reference to a closure read from a field or an element for the length of
+// the call (src/emit.c, "closure call").
+//
+// The probe is a weak field: it reads null as soon as its target is freed.
+
+class Watch {
+    p: weak Page;
+}
+
+class Btn {
+    onClick: fn();
+    fn init() { this.onClick = null; }
+    fn press() {
+        if (this.onClick != null) { this.onClick(); }
+    }
+}
+
+class Page {
+    btn: Btn;
+    fn init(w: Watch) {
+        this.btn = new Btn();
+        let self = this;
+        let watch = w;
+        // the closure captures the page, and the page owns the button that
+        // holds the closure: a cycle, which the handler breaks itself
+        this.btn.onClick = () => {
+            let ww = watch;
+            self.btn.onClick = null;
+            if (ww.p == null) { print("page freed during its own handler"); }
+            else { print("page alive until the handler returns"); }
+        };
+    }
+}
+
+// The same through an element: a closure called as bus.subs[0]() that
+// replaces its own slot.
+class Box {
+    v: string;
+    fn init(v: string) { this.v = v; }
+}
+
+class Probe {
+    b: weak Box;
+}
+
+class Bus {
+    subs: fn()[];
+    fn init() { this.subs = []; }
+}
+
+// The box lives only in the returned closure's env.
+fn make(bus: Bus, probe: Probe, other: fn()): fn() {
+    let bx = new Box("captured");
+    probe.b = bx;
+    return () => {
+        let pr = probe;
+        bus.subs[0] = other;
+        if (pr.b == null) { print("element: env freed during its own call"); }
+        else { print("element: env alive until the call returns"); }
+        if (pr.b == null) { return; }
+        print("element: still reads " + bx.v);
+    };
+}
+
+fn main() {
+    let w = new Watch();
+    let p = new Page(w);
+    w.p = p;
+    let b = p.btn;
+    p = null;            // only the cycle keeps the page alive now
+    b.press();
+    if (w.p == null) { print("freed once the handler returned"); }
+    else { print("still alive: leaked"); }
+
+    let bus = new Bus();
+    let probe = new Probe();
+    let other: fn() = () => { print("unused"); };
+    bus.subs.push(make(bus, probe, other));
+    bus.subs[0]();
+    if (probe.b == null) { print("element: freed once the call returned"); }
+    else { print("element: still alive: leaked"); }
+}

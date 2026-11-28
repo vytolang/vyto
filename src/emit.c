@@ -1108,8 +1108,23 @@ static char *emit_call(Em *em, Expr *e, bool *fresh) {
 
     /* closure call */
     Type *ft = e->lhs->type;
-    const char *tc = newtemp(em, ft, false);
-    char *cv = ex_b(em, e->lhs);
+    /* The closure must outlive its own call. Read from a field or an element
+       it is only borrowed, and the call can drop the last other reference:
+       a click handler that releases its widget nulls `onClick`, the closure
+       that is running. Its env (and every capture) was then freed under it
+       — a use-after-free that reads fine until the pool reuses the memory.
+       So such a closure is retained into an owned temp, released at the end
+       of the statement. A local, a parameter or a capture needs no retain:
+       nothing the callee does can reassign it. A fresh value is already
+       owned. examples/121_closure_self_release.vt */
+    bool cfresh = false;
+    char *cv0 = ex(em, e->lhs, &cfresh);
+    bool stable = !cfresh && e->lhs->kind == EX_IDENT &&
+                  (e->lhs->ref == REF_LOCAL || e->lhs->ref == REF_PARAM || e->lhs->ref == REF_CAPTURE);
+    const char *tc = newtemp(em, ft, !stable);
+    char *cv = cv0;
+    if (!stable && !cfresh)
+        cv = arena_printf(&g_arena, "((%s)vt_retain(%s))", c_type(ft), cv0);
     char *sig = fnptr_sig(ft->ret, "VtObj*", ft->params, ft->nparams, NULL);
     char *args = args_list(em, e->args, e->nargs, NULL, ft->params);
     /* Guard the temp: `((VtClosure*)f)->fn` on a null fn value is a segfault
