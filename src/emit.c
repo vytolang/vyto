@@ -1255,6 +1255,11 @@ static char *ex(Em *em, Expr *e, bool *fresh) {
             sb_printf(ax, "    return vt_closure_new((void*)v_%s__bm%d, (VtObj*)e);\n}\n", mn, id);
 
             *fresh = true;
+            /* A subclass receiver (sq.area where area is Shape's) is a pointer
+               to the subclass: cast it up to the owner the maker takes. GCC 14
+               made the implicit conversion an error (CI, ubuntu-26.04). */
+            if (!is_struct)
+                return arena_printf(&g_arena, "v_%s__mkbm%d((%s)%s)", mn, id, rct, ex_b(em, e->lhs));
             return arena_printf(&g_arena, "v_%s__mkbm%d(%s)", mn, id, ex_b(em, e->lhs));
         }
         if (e->ref == REF_BUILTIN && e->builtin == B_LEN)
