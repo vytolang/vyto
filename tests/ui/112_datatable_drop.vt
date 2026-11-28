@@ -1,0 +1,90 @@
+// A DataTable dropped without release_all() is freed.
+//
+// Its own closures (the search field's onChange, the pager's buttons) used to
+// capture the table, and the table owns those widgets: a cycle, so a table an
+// app dropped by replacing children or the window's root was never freed, with
+// its whole DataFrame. They now reach the table through a weak holder
+// (datatable.vt DtRef). The probes are weak fields: null once the target is
+// freed.
+import { DataTable } from "vyto/ui/datatable";
+import { SearchField, TextField, TextArea, Text, Widget } from "vyto/ui";
+import { DataFrame, CK_I64, CK_STR } from "vyto/data/frame";
+
+class Probe {
+    t: weak DataTable;
+    s: weak SearchField;
+}
+
+// Any text widget: its SelectionModel's text came from a closure over the
+// widget, the same cycle (now read through the model's weak host).
+class WProbe {
+    w: weak Widget;
+}
+
+fn verdict(what: string, p: WProbe) {
+    if (p.w == null) { print(what + " dropped: freed"); } else { print(what + " dropped: ALIVE (leaked)"); }
+}
+
+// Each made and dropped inside its own function: a widget passed in as an
+// argument is still held by the caller's statement.
+fn drop_field() {
+    let p = new WProbe();
+    let w = new TextField("name");
+    p.w = w;
+    w = null;
+    verdict("TextField", p);
+}
+
+fn drop_area() {
+    let p = new WProbe();
+    let w = new TextArea();
+    p.w = w;
+    w = null;
+    verdict("TextArea", p);
+}
+
+fn drop_para() {
+    let p = new WProbe();
+    let w = new Text("a paragraph");
+    p.w = w;
+    w = null;
+    verdict("Text", p);
+}
+
+fn frame(n: int): DataFrame {
+    let df = new DataFrame(n);
+    let id = df.addColumn("id", CK_I64);
+    let name = df.addColumn("name", CK_STR);
+    for (let i in 0..n) { df.beginRow().setInt(id, i).setStr(name, "row" + str(i)).endRow(); }
+    return df;
+}
+
+fn say(what: string, p: Probe) {
+    let t = "freed";
+    if (p.t != null) { t = "ALIVE (leaked)"; }
+    let s = "freed";
+    if (p.s != null) { s = "ALIVE (leaked)"; }
+    print(what + ": table " + t + ", its search field " + s);
+}
+
+fn main() {
+    let p = new Probe();
+    let dt = new DataTable(frame(50));
+    p.t = dt;
+    p.s = dt.search;
+    dt = null;
+    say("plain table dropped", p);
+
+    let q = new Probe();
+    let pt = new DataTable(frame(50));
+    pt.setPaging([10, 50], 10);
+    pt.setPage(0, 500, false);
+    q.t = pt;
+    q.s = pt.search;
+    pt = null;
+    say("paged table dropped", q);
+
+    drop_field();
+    drop_area();
+    drop_para();
+}

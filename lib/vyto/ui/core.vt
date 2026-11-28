@@ -4,9 +4,21 @@
 // everything through the vyto/ui barrel.
 //
 // Reference cycles: handler closures (onClick, onSubmit, ...) usually capture
-// the object that owns the widget tree. Window.run() breaks those cycles on
-// exit by walking the tree and nulling every handler field
-// (release_all/drop_handlers), so apps never need a manual teardown.
+// the object that owns the widget tree, so a widget and its owner keep each
+// other alive. release_all() breaks them: it walks a subtree and calls every
+// widget's drop_handlers(), which nulls its handler fields. It runs for you
+//   * on exit: Window.run() releases the root, menubar, overlay and toasts;
+//   * on drop_child() and when an exit transition finishes.
+// Nothing else frees a subtree whose closures hold it. An app that swaps
+// screens by assigning `children = [...]` or `win.root = ...`, or keeps a
+// widget in a field that is not a child, must call release_all() on what it
+// discarded — not from inside one of that subtree's own handlers if it can
+// avoid it; deferring with win.after(0, ...) is simplest (SpeccalPOS:
+// widgets.vt discard). A custom widget that stores a closure in its own
+// field must override drop_handlers() and null it, and a widget's own
+// children should reach it through a weak reference rather than a closure
+// over `this` (DataTable's DtRef, SelectionModel's weak host), so that it is
+// freed even when nobody releases it. docs/memory.md §3.
 
 import { Surface, Rect, contains, rgb, rgba, with_alpha, alpha_of, mix,
           EV_EXPOSE, EV_KEY, EV_KEY_UP, EV_MOUSE_DOWN, EV_MOUSE_UP, EV_MOUSE_MOVE, EV_MOUSE_WHEEL, EV_MOUSE_RDOWN,
@@ -1187,6 +1199,14 @@ export class Widget {
     children: Widget[];
     focusable: bool;
     focused: bool;
+    // Set from on_key() when the key was taken but nothing on screen changed
+    // (a till buffering a scanner's digits): the Window then skips the
+    // repaint it does after a handled key, and clears the flag. A full-window
+    // widget that takes keys would otherwise repaint the whole window per key
+    // (85 ms each, 13 per barcode, on SpeccalPOS's till). A key that does
+    // change something repaints as before; one that redraws on its own may
+    // set it too, so the window is not painted twice.
+    quiet_key: bool;
     hovered: bool;     // WS6: cursor is over this widget
     pressed: bool;     // WS6: a button is held down over this widget
     disabled: bool;    // C5: inert + dimmed; event dispatch skips it
@@ -2324,6 +2344,13 @@ export class Widget {
     // release_all() does the tree walk; overrides never recurse)
     virtual fn drop_handlers() { }
 
+    // The text a SelectionModel hosted by this widget selects in, when the
+    // model has no text_fn. Read through the model's weak host, so a text
+    // widget need not hand its model a closure over itself: that closure is a
+    // cycle (widget -> model -> closure -> widget), and a widget dropped
+    // without release_all() was never freed.
+    virtual fn selection_text(): string { return ""; }
+
     fn release_all() {
         this.drop_handlers();
         // Not left to drop_handlers: this one is set by a *parent* (Scaffold
@@ -2515,6 +2542,11 @@ export class Window {
     // until then. An app's idle rule ("lock after 5 minutes") compares it
     // with now_ms from an after() timer, so nothing wakes per event.
     last_input_ms: int;
+    // How many times the window system asked for a repaint (EV_EXPOSE). The
+    // first one means the window is on screen: an app that paints a splash
+    // and then blocks loading waits for it, or the window sits black until
+    // the loading is done (a fixed delay is too short when mapping is slow).
+    exposes: int;
     mods: int;           // MOD_* bitmask at the event being dispatched — widgets
                          // read it via Widget.mods() in on_key/on_click/on_drag
     scale: float;        // UI scale factor (1.0 = 96dpi); themes are scaled by
@@ -2537,6 +2569,7 @@ export class Window {
         this.timer_due = [];
         this.timer_cbs = [];
         this.last_input_ms = this.surf.now_ms();
+        this.exposes = 0;
         this.toasts = [];
         this.focusables = [];
         this.focus_i = -1;
@@ -3238,8 +3271,11 @@ export class Window {
         } else {
             let f = this.focused_widget();
             if (f != null && f.on_key(k, ch)) {
-                this.mark_dirty(f.bounds);
-                this.repaint();
+                if (f.quiet_key) { f.quiet_key = false; }
+                else {
+                    this.mark_dirty(f.bounds);
+                    this.repaint();
+                }
             } else {
                 // Nothing focused wanted it: the app gets last refusal, so a
                 // bare key can still be a shortcut without stealing typing.
@@ -3769,6 +3805,7 @@ export class Window {
                 // can be; paint whatever that owed and present exactly once.
                 this.flush_frame();
             } else if (ev == EV_EXPOSE) {
+                this.exposes += 1;
                 // Repaint only what the server actually lost, when it tells us.
                 // Uncovering a strip of a window is otherwise a full redraw,
                 // which on the rich tier is a whole-canvas rasterization.

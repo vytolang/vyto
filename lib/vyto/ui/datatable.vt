@@ -425,8 +425,11 @@ export class DataTable extends Widget {
         this.search = new SearchField("Search");
         this.add(this.search);
         this.search_accessory = null;
-        let self = this;
-        this.search.onChange = (q) => { self.set_query(q); };
+        // through a weak holder, not `this`: the table owns the field, so a
+        // closure holding the table is a cycle and a table dropped without
+        // release_all() would never be freed (tests/ui/112_datatable_drop)
+        let r = new DtRef(this);
+        this.search.onChange = (q) => { let t = r.t; if (t != null) { t.set_query(q); } };
         this.autoColumns();
     }
 
@@ -920,15 +923,16 @@ export class DataTable extends Widget {
         this.page_sizes = sizes;
         if (!sizes.contains(size)) { this.page_sizes.push(size); }
         this.page_size = size;
-        let self = this;
+        // the buttons are the table's children: weak, as for the search field
+        let r = new DtRef(this);
         this.pg_first = new Button("First").ghost();
         this.pg_prev = new Button("Prev").ghost();
         this.pg_next = new Button("Next").ghost();
         this.pg_last = new Button("Last").ghost();
-        this.pg_first.onClick = (b) => { self.go_page(0); };
-        this.pg_prev.onClick = (b) => { self.go_page(self.page_offset - self.page_size); };
-        this.pg_next.onClick = (b) => { self.go_page(self.page_offset + self.page_size); };
-        this.pg_last.onClick = (b) => { self.go_page(self.last_offset()); };
+        this.pg_first.onClick = (b) => { let t = r.t; if (t != null) { t.go_page(0); } };
+        this.pg_prev.onClick = (b) => { let t = r.t; if (t != null) { t.go_page(t.page_offset - t.page_size); } };
+        this.pg_next.onClick = (b) => { let t = r.t; if (t != null) { t.go_page(t.page_offset + t.page_size); } };
+        this.pg_last.onClick = (b) => { let t = r.t; if (t != null) { t.go_page(t.last_offset()); } };
         let labels: string[] = [];
         let at = 0;
         for (let i in 0..this.page_sizes.len) {
@@ -940,9 +944,11 @@ export class DataTable extends Widget {
         // a new size keeps the rows in view: the page holding the first row
         // shown (as VytoDBA's pager), not the first page
         this.pg_size.onSelect = (i) => {
-            let n = self.page_sizes[i];
-            self.page_size = n;
-            self.go_page((self.page_offset / n) * n);
+            let t = r.t;
+            if (t == null) { return; }
+            let n = t.page_sizes[i];
+            t.page_size = n;
+            t.go_page((t.page_offset / n) * n);
         };
         for (let w in [this.pg_first as Widget, this.pg_prev, this.pg_next, this.pg_last, this.pg_size]) { this.add(w); }
         this.sync_pager();
@@ -3031,6 +3037,13 @@ export class DataTable extends Widget {
             this.cols[i].cellPaint = null;
         }
     }
+}
+
+// The table, weakly: what its own children's closures hold, so that the table
+// and the widgets it owns are not a cycle.
+class DtRef {
+    t: weak DataTable;
+    fn init(t: DataTable) { this.t = t; }
 }
 
 // 70412 -> "70,412", for row counts.

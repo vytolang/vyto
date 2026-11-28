@@ -146,6 +146,36 @@ reference, so storing the closure back onto the object it captured
 reproduces the same cycle as the bound-method case above. Clear the field
 during teardown, or keep the back-reference `weak`, if you go this route.
 
+A closure cannot capture weakly, so the `weak` route goes through a small
+holder object: the closure captures the holder, and the holder's field is
+`weak`. That is how `vyto/ui`'s DataTable wires its own search field and
+pager buttons (`DtRef`), so a table dropped without teardown is still freed:
+
+```js
+class DtRef { t: weak DataTable; fn init(t: DataTable) { this.t = t; } }
+
+let r = new DtRef(this);
+this.pg_next.onClick = (b) => { let t = r.t; if (t != null) { t.go_page(1); } };
+```
+
+**In a widget tree** the teardown is `release_all()`: it calls every
+widget's `drop_handlers()`, which nulls its handler fields. `Window.run()`
+does it on exit and `drop_child()` does it for what it removes — nothing else
+does. A screen swapped out by assigning `children` or `win.root`, or a widget
+kept in a field while not a child, stays in its cycle until the app releases
+it. SpeccalPOS leaked 1.15 MB per visit to its back office that way
+(`~/vytoapps/POS/docs/SPEED.md` §5b). A custom widget that keeps a closure in
+its own field must override `drop_handlers()` to null it.
+
+**A closure keeps itself alive while it runs.** A handler is usually called
+through a field (`this.onClick()`); if it drops that field — a button whose
+handler discards its own page — it holds the last reference to the closure
+that is running. The compiler retains a closure read from a field or an
+element for the length of the call, so its env and captures survive until it
+returns (`examples/121_closure_self_release.vt`). A local, a parameter or a
+capture is called without that retain: nothing the callee does can reassign
+it.
+
 ## 4. Arenas — opt-in bulk teardown, not a GC alternative
 
 For a batch of objects that all die together — build a tree, walk it, throw
